@@ -12,6 +12,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import { t, setLanguage, resetToSystemLanguage } from "../../i18n.js";
+import { installOcrEngine } from "./ocr.js";
 
 
 function esc(s: string): string {
@@ -86,6 +87,13 @@ function buildGeneralPane(hotkey: string, autoStart: boolean): string {
       <div class="settings-row">
         <span class="settings-label">${t("settings.language")}</span>
         ${langSelectHtml}
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.ocr_engine")}</span>
+        <div class="settings-bg-actions">
+          <span id="settings-ocr-status" style="font-size:0.72rem;color:var(--text-dim);margin-right:8px;"></span>
+          <button id="settings-ocr-install" class="settings-btn">${t("ocr.engine_download")}</button>
+        </div>
       </div>
       <div class="settings-row">
         <span class="settings-label">${t("settings.background_title")}</span>
@@ -1169,6 +1177,38 @@ export async function attachSettingsListeners(container: HTMLElement) {
     bgClear.addEventListener("click", () => {
       try { localStorage.removeItem("lunac-bg-image"); } catch {}
       (window as any).__lunac_apply_bg?.(null);
+    });
+  }
+
+  // ── OCR 引擎（按需下载，不随发行包分发）──────────────────────
+  const ocrInstallBtn = container.querySelector("#settings-ocr-install") as HTMLButtonElement | null;
+  const ocrStatusEl = container.querySelector("#settings-ocr-status") as HTMLElement | null;
+  if (ocrInstallBtn) {
+    const syncOcrEngineState = async () => {
+      let installed = false;
+      try { installed = await invoke<boolean>("ocr_engine_status"); } catch { /* 查询失败按未安装显示 */ }
+      ocrInstallBtn.disabled = installed;
+      ocrInstallBtn.textContent = installed ? t("ocr.engine_installed") : t("ocr.engine_download");
+      if (ocrStatusEl) ocrStatusEl.textContent = installed ? "" : t("ocr.engine_missing");
+    };
+    void syncOcrEngineState();
+    ocrInstallBtn.addEventListener("click", async () => {
+      if (ocrInstallBtn.disabled) return;
+      ocrInstallBtn.disabled = true;
+      ocrInstallBtn.textContent = t("ocr.engine_downloading").replace("{percent}", "0");
+      const ok = await installOcrEngine(({ percent, mb }) => {
+        ocrInstallBtn.textContent = percent > 0
+          ? t("ocr.engine_downloading").replace("{percent}", String(percent))
+          : t("ocr.engine_downloading_unknown").replace("{mb}", mb.toFixed(1));
+      });
+      if (ok) {
+        ocrInstallBtn.textContent = t("ocr.engine_installed");
+        if (ocrStatusEl) ocrStatusEl.textContent = t("ocr.engine_ready");
+      } else {
+        ocrInstallBtn.disabled = false;
+        ocrInstallBtn.textContent = t("ocr.engine_retry");
+        if (ocrStatusEl) ocrStatusEl.textContent = t("ocr.engine_failed");
+      }
     });
   }
 

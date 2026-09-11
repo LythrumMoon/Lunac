@@ -56,7 +56,7 @@ Lunac 是一个 **uTools 风格的桌面启动器 / 搜索工具**，由 Tauri 2
 | 设置面板 | `builtin/settings.ts` | 快捷键绑定 / 模型配置 |
 | 工具编辑器 | `builtin/tool-editor.ts` | MCP tool JSON 编辑管理 |
 | AI 代理 | `builtin/ai-agent.ts` | Agent 对话 — 委托 `main.ts` 启动 cli.exe 子进程 + cli-output 事件渲染 |
-| OCR 识别 | `builtin/ocr.ts` | 离线 OCR 图片文字识别 (Tesseract.js · 中英文) |
+| OCR 识别 | `builtin/ocr.ts` | 离线 OCR 图片文字识别 (PaddleOCR-json · PP-OCRv4 · 中/英/日/韩/俄) |
 | 样式 | `app/src/styles.css` | 毛玻璃 Catppuccin 主题 |
 | 国际化 | `app/src/i18n.ts` | 多语言翻译模块 — 跟随 Windows 系统语言 |
 
@@ -98,6 +98,7 @@ Lunac 自动检测 Windows 系统显示语言（`GetUserDefaultUILanguage`），
 | 幽灵点击 | `styles.css` | `#app { pointer-events: none }` + 子元素逐一手动 `pointer-events: auto` |
 | AI 后台预加载 | `main.rs` + `commands.rs` | 启动时后台 `thread::spawn` 启动 proxy_server 内置代理，就绪后 `AI_READY` 置位 + emit `ai-ready`；退出时 `WindowEvent::Destroyed` 统一 kill |
 | 子进程清理 | `main.rs` | `Destroyed` 事件 kill CLI + proxy 两个进程 + `taskkill` 清端口 5173 |
+| OCR 引擎按需部署 | `paddle_ocr.rs` + `commands.rs` | PaddleOCR-json（`.7z` 约 88MB / 解压约 300MB）**不入库**；`ocr_engine_status` 查询、`ocr_engine_install` 后台下载 GitHub Release → `sevenz-rust` 解压到 staging → 校验 exe+config → 原子替换到 `<exe 根>\paddle-ocr`，进度经 `ocr-engine-progress`/`ready`/`error` 事件回传 |
 
 ### 2.3 热键 — 双后端 + 三层兜底（2026-09 修订）
 
@@ -345,7 +346,7 @@ app/
 │           ├── settings.ts
 │           ├── tool-editor.ts
 │           ├── ai-agent.ts
-│           └── ocr.ts            # OCR 文字识别 (Tesseract.js)
+│           └── ocr.ts            # OCR 文字识别 (PaddleOCR-json)
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs                  # Tauri 入口 — 窗口/托盘/子进程
@@ -401,6 +402,29 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式
 
 **日常修改不打包** — 仅编译验证即可。
 
+### 8.3 开源发布 / 仓库卫生（2026-09）
+
+**红线（违反会造成密钥泄露或侵权，且不可撤销）**：
+
+1. **`core/` 与所有 `cli.exe` 绝不入库** —— `core/` 是 Anthropic 的 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。构建所需的 `core/cli.exe` 由使用者自备（README 已说明）。
+2. **`.env` 绝不入库** —— `core/.env`（`ANTHROPIC_API_KEY` 等）与 `app/src-tauri/.env`（`AI_API_KEY`）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
+3. **大二进制不入库** —— GitHub 单文件硬上限 100MB（`cli.exe` 121MB 必然失败）、仓库 >1GB 告警。以下均已 gitignore：`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
+
+**必备文件**：`.gitignore`、`LICENSE`（MIT，版权人 `LythrumMoon`）、`README.md`、`.env.example`。
+
+**运行时按需下载的第三方资产**：`paddle-ocr/`（PaddleOCR-json，`hiroi-sora/PaddleOCR-json` v1.4.1，Apache-2.0 兼容）体积过大且属第三方产物，不入库也不随发行包分发。用户侧由前端触发 `ocr_engine_install` 从 GitHub Release 自动下载到 exe 根；构建侧由 [download-paddle-ocr.ps1](file:///d:/cc/claude-code-cli-master/scripts/download-paddle-ocr.ps1) 预置（打包离线版时才需要）。注意该 Release 的 **Windows 资产是 `.7z` 而非 `.zip`**，`Expand-Archive` 解不了，必须走 `sevenz-rust`（Rust 侧）或 7z.exe / bsdtar（脚本侧）。
+
+**首次提交前必须验证**（缺一不可）：
+
+```powershell
+git add -A
+git diff --cached --name-only | Select-String "\.env"      # 只应出现 .env.example
+git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinue } |
+  Sort-Object Length -Descending | Select-Object -First 10  # 不应出现 MB 级文件
+```
+
+**其他**：commit message 含中文时，用 `git commit -F <UTF8 文件>` 或先设 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`，避免 PowerShell 传参转码成乱码。远端仓库需手动创建（本机未装 `gh`）。
+
 ## 9. 当前问题
 
 | 问题 | 状态 |
@@ -415,7 +439,7 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式
 | Agent 模式前端接入 | `main.ts` 监听 `cli-output` SSE 事件，流式渲染 Agent 对话 | ✅ 已完成 |
 | Start Menu 实时模糊搜索 | ✅ 已集成（`main.ts` `search_apps`） |
 | 计算器/编码/JSON 插件 | ❌ 已移除 — 2026-07-22 删除，功能由 AI Agent 替代 |
-| OCR 文字识别插件 | ✅ 新增 `ocr.ts` — Tesseract.js 离线 OCR (中英文) |
+| OCR 文字识别插件 | ✅ 新增 `ocr.ts` — PaddleOCR-json 离线 OCR（多语言） |
 | 硬件 AI Agent Tools | ✅ 新增 `tools/system_info.json` — Agent 模式 MCP Tools |
 
 ## 10. 待办路线
@@ -449,6 +473,7 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式
 10. **文件附件省略折叠**（搜索栏 / AI 聊天输入栏共用）：前 **3** 个文件为独立泡泡，第 4 个起收进一个“省略泡泡”分支；点击 ⋯ 展开，展开项仍以泡泡框子分支显示，可单删；省略号内提供一键删除全部（仅作用于省略号内容，不影响前 3 个）；**Backspace 空输入删除同步**该按钮：折叠态下清空省略分支，展开或无分支时删最后一个泡泡。**进入任意插件界面自动隐藏**搜索栏泡泡（AI 聊天除外——其泡泡改在聊天输入栏内展示）；退出插件恢复搜索栏原样。Ctrl+V 粘贴支持文件/纯文本路径/**纯位图**（截图、ShareX 等经 Rust 原生剪贴板兜底存临时文件后成泡泡）。
 11. **自定义文件启动（快速启动 / Custom Launch）**：持久注册表为 `<exe 根>\ModuleData\custom\app_registry.json`（业务数据同根统一管理；旧 exe 同目录 / LOCALAPPDATA 文件首读自动迁移）。面板打开即列出**全部已注册项**（可启动 / 逐条删除 / 「添加启动项」），重启不丢失、数据不再“消失”；删除 = 注销注册表 + 摘除对应气泡。拖入/粘贴路径进搜索栏即自动注册；入口词多语言/拼音覆盖（launch/open/启动/qidong/dakai/自定义/快速启动…，中文由 pluginRegistry 自动生成拼音索引）。
 12. **卸载清理**：NSIS `installerHooks`（[nsis-hooks.nsh](file:///d:/cc/claude-code-cli-master/app/src-tauri/nsis-hooks.nsh)）`NSIS_HOOK_POSTUNINSTALL` 做**双清理**：① 递归删除 exe 安装根内的运行时数据子目录（ModuleData / temp / skills / tools / config / paddle-ocr）；② 删除旧版本遗留的 `%LOCALAPPDATA%\Lunac(-dev)`，实现干净卸载。
+13. **OCR 引擎按需下载**：PaddleOCR-json 引擎不随发行包分发，落到 `<exe 根>\paddle-ocr`（与数据根一致）。前端两条入口复用 `ocr.ts` 导出的 `installOcrEngine()`（监听 `ocr-engine-progress`/`ready`/`error`）：① OCR 面板执行识别前先 `ocr_engine_status()`，缺失则在状态行内联「下载并安装」按钮；② 设置 · 常规面板常驻「OCR 引擎」行（状态 + 下载/重试）。**安装必须原子化**：下载 → 解压到 `temp\paddle-ocr-staging` → 校验 `PaddleOCR-json.exe` + `models/config_chinese.txt` → 才删除并 `rename` 到目标目录，任一环节失败清理半成品，避免 `paddle_ocr_dir()` 定位到残缺目录导致 OCR 永久失败且无从诊断。
 
 ## 12. Agent Plan 模式规范
 

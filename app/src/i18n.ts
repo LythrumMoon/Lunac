@@ -713,6 +713,63 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "인식 결과가 여기에 표시됩니다...",
     "en": "Recognition result will appear here...",
   },
+  // PaddleOCR-json 引擎按需下载（引擎不随仓库分发，见 paddle_ocr.rs）
+  "ocr.engine_missing": {
+    "zh-CN": "未安装 OCR 引擎",
+    "zh-TW": "未安裝 OCR 引擎",
+    "ja": "OCR エンジン未インストール",
+    "ko": "OCR 엔진 미설치",
+    "en": "OCR engine not installed",
+  },
+  "ocr.engine_download": {
+    "zh-CN": "下载并安装",
+    "zh-TW": "下載並安裝",
+    "ja": "ダウンロードしてインストール",
+    "ko": "다운로드 및 설치",
+    "en": "Download & Install",
+  },
+  "ocr.engine_downloading": {
+    "zh-CN": "下载中 {percent}%",
+    "zh-TW": "下載中 {percent}%",
+    "ja": "ダウンロード中 {percent}%",
+    "ko": "다운로드 중 {percent}%",
+    "en": "Downloading {percent}%",
+  },
+  "ocr.engine_downloading_unknown": {
+    "zh-CN": "下载中 {mb} MB",
+    "zh-TW": "下載中 {mb} MB",
+    "ja": "ダウンロード中 {mb} MB",
+    "ko": "다운로드 중 {mb} MB",
+    "en": "Downloading {mb} MB",
+  },
+  "ocr.engine_installed": {
+    "zh-CN": "已安装",
+    "zh-TW": "已安裝",
+    "ja": "インストール済み",
+    "ko": "설치됨",
+    "en": "Installed",
+  },
+  "ocr.engine_ready": {
+    "zh-CN": "引擎已就绪",
+    "zh-TW": "引擎已就緒",
+    "ja": "エンジン準備完了",
+    "ko": "엔진 준비 완료",
+    "en": "Engine ready",
+  },
+  "ocr.engine_failed": {
+    "zh-CN": "安装失败，请检查网络后重试",
+    "zh-TW": "安裝失敗，請檢查網路後重試",
+    "ja": "インストール失敗。ネットワークを確認して再試行",
+    "ko": "설치 실패. 네트워크 확인 후 재시도",
+    "en": "Install failed — check network and retry",
+  },
+  "ocr.engine_retry": {
+    "zh-CN": "重试",
+    "zh-TW": "重試",
+    "ja": "再試行",
+    "ko": "재시도",
+    "en": "Retry",
+  },
 
   // ── Memo ───────────────────────────────────────────────────
   "memo.placeholder": {
@@ -947,6 +1004,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "リセット",
     "ko": "재설정",
     "en": "Reset",
+  },
+  "settings.ocr_engine": {
+    "zh-CN": "OCR 引擎",
+    "zh-TW": "OCR 引擎",
+    "ja": "OCR エンジン",
+    "ko": "OCR 엔진",
+    "en": "OCR engine",
   },
   "settings.hotkey_record": {
     "zh-CN": "点击录制新热键",

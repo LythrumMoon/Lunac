@@ -106,6 +106,8 @@ npm run tauri:build
 powershell -ExecutionPolicy Bypass -File scripts\download-paddle-ocr.ps1
 ```
 
+> 已打包的发行版无需手动处理：首次使用 OCR 时会提示「下载并安装」，也可在 **设置 → 常规 → OCR 引擎** 中一键获取（从 GitHub Release 自动下载并解压到 `<exe 根>\paddle-ocr`，含进度显示）。脚本侧需要 7-Zip 或系统自带 `tar`（该发行包为 `.7z`）。
+
 ---
 
 ## 配置

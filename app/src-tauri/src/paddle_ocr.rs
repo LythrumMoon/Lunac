@@ -11,13 +11,124 @@
 // 部署：paddle-ocr/ 目录与 core/ 平级，发行版通过 NSIS 打包到 lunac.exe 同目录。
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-// ── PaddleOCR-json 输出结构 ──────────────────────────────────────
+// ── 引擎部署 / 按需下载 ───────────────────────────────────────────
+//
+// PaddleOCR-json 体积大（.7z 约 88MB，解压后约 300MB），不随仓库分发
+// （见 .gitignore）。运行时若缺失，由前端按需触发下载到 `<exe 根>\paddle-ocr`。
+
+/// PaddleOCR-json v1.4.1 Windows x64 发行包。
+/// 注意：该 Release 的 Windows 资产只有 `.7z`（没有 `.zip`），
+/// 用 `Expand-Archive` 解不了，故使用纯 Rust 的 sevenz-rust 解压。
+pub const PADDLE_OCR_URL: &str = "https://github.com/hiroi-sora/PaddleOCR-json/releases/download/v1.4.1/PaddleOCR-json_v1.4.1_windows_x64.7z";
+
+/// 引擎安装根目录：`<exe 根>\paddle-ocr`（与 storage.rs 数据根一致）。
+pub fn engine_root() -> PathBuf {
+    crate::storage::lunac_root_dir().join("paddle-ocr")
+}
+
+/// 引擎是否已就绪（能定位到 PaddleOCR-json.exe 且默认中文模型配置存在）。
+pub fn engine_installed() -> bool {
+    match paddle_ocr_dir() {
+        Ok(dir) => dir.join(paddle_ocr_config_for_lang("chs")).exists(),
+        Err(_) => false,
+    }
+}
+
+/// 下载并安装 PaddleOCR-json 引擎。
+///
+/// 流程：下载 .7z → 解压到 staging → 校验 → 原子替换到 `<exe 根>\paddle-ocr`。
+/// 任何一步失败都会清理半成品，不会留下损坏目录（否则 `paddle_ocr_dir()`
+/// 会定位到残缺目录、OCR 永久失败却看不出原因）。
+///
+/// `on_progress(已下载字节, 总字节)`：总字节未知时为 0。
+pub fn install_engine<F: FnMut(u64, u64)>(mut on_progress: F) -> Result<(), String> {
+    let root_dir = crate::storage::lunac_root_dir();
+    let temp_dir = root_dir.join("temp");
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    let archive = temp_dir.join("paddle-ocr.7z");
+    let staging = temp_dir.join("paddle-ocr-staging");
+
+    // ── 1. 下载 ──────────────────────────────────────────────────
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    let mut resp = client
+        .get(PADDLE_OCR_URL)
+        .send()
+        .map_err(|e| format!("下载失败（网络不可达？）: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载失败: HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    {
+        let mut out = fs::File::create(&archive).map_err(|e| format!("创建文件失败: {e}"))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done: u64 = 0;
+        loop {
+            let n = resp
+                .read(&mut buf)
+                .map_err(|e| format!("读取响应失败: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])
+                .map_err(|e| format!("写入文件失败: {e}"))?;
+            done += n as u64;
+            on_progress(done, total);
+        }
+    }
+
+    // ── 2. 解压到 staging（先不碰正式目录）───────────────────────
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(|e| format!("创建解压目录失败: {e}"))?;
+    if let Err(e) = sevenz_rust::decompress_file(&archive, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_file(&archive);
+        return Err(format!("7z 解压失败: {e}"));
+    }
+    let _ = fs::remove_file(&archive);
+
+    // ── 3. 校验 staging（必须含 exe + 默认中文模型配置）──────────
+    let verify = |dir: &PathBuf| -> bool {
+        dir.join("PaddleOCR-json.exe").exists()
+            && dir.join(paddle_ocr_config_for_lang("chs")).exists()
+    };
+    let staged_dir = match find_engine_dir(&staging) {
+        Some(d) if verify(&d) => d,
+        _ => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(
+                "解压后未找到可用的 PaddleOCR-json.exe / models 配置，安装包可能不完整".into(),
+            );
+        }
+    };
+
+    // ── 4. 原子替换到 <exe 根>\paddle-ocr ───────────────────────
+    let target = engine_root();
+    if target.exists() {
+        fs::remove_dir_all(&target).map_err(|e| format!("清理旧引擎目录失败: {e}"))?;
+    }
+    // staged_dir 可能已是 staging 本身；统一 rename（同盘，原子）
+    fs::rename(&staged_dir, &target).map_err(|e| format!("移动到目标目录失败: {e}"))?;
+    let _ = fs::remove_dir_all(&staging);
+
+    // ── 5. 最终验证（以运行时实际查找结果为准）──────────────────
+    if !engine_installed() {
+        return Err("安装完成但引擎仍无法定位，请检查目录权限".into());
+    }
+    Ok(())
+}
+
+/// PaddleOCR-json 输出结构 ────────────────────────────────────────
 //
 // 成功：{"code":100,"data":[{"text":"...","box":[...],"score":0.99}]}
 // 错误：{"code":200,"data":"Image path does not exist. ..."}
@@ -40,76 +151,75 @@ struct PaddleOcrBlock {
 
 // ── 路径解析 ─────────────────────────────────────────────────────
 
-/// 返回 PaddleOCR-json 可执行文件目录。
-///
-/// 目录结构可能有三种形态：
-///   A. 扁平：paddle-ocr/PaddleOCR-json.exe（models/ 与 exe 同级）
-///   B. 嵌套：paddle-ocr/PaddleOCR-json/PaddleOCR-json_v1.4.1/PaddleOCR-json.exe（dev repo 结构）
-///   C. NSIS 安装后：%LOCALAPPDATA%\Lunac\paddle-ocr\PaddleOCR-json\PaddleOCR-json_v1.4.1\...
-///
-/// 搜索优先级：
-///   1. %LOCALAPPDATA%\Lunac\paddle-ocr\ — NSIS 安装（扁平和嵌套两种结构）
-///   2. exe 同目录下的 paddle-ocr\      — 手动放置
-///   3. 项目根目录下的 paddle-ocr/（dev 嵌套结构）
-///   4. 当前工作目录（兜底）
-fn paddle_ocr_dir() -> Result<PathBuf, String> {
-    /// 在给定目录下搜索 PaddleOCR-json.exe，支持扁平和嵌套两种结构
-    fn find_exe_in_dir(root: &PathBuf) -> Option<PathBuf> {
-        // A. 扁平：exe 直接在 root 下
-        if root.join("PaddleOCR-json.exe").exists() {
-            return Some(root.clone());
+/// 在给定目录下查找 PaddleOCR-json.exe **所在目录**，支持两种发行结构：
+///   A. 扁平：root/PaddleOCR-json.exe（models/ 与 exe 同级）
+///   B. 嵌套：root/<子目录>/PaddleOCR-json.exe（最多两层，兼容
+///      `paddle-ocr/PaddleOCR-json/PaddleOCR-json_v1.4.1/` 这种解包结构）
+pub fn find_engine_dir(root: &Path) -> Option<PathBuf> {
+    if root.join("PaddleOCR-json.exe").exists() {
+        return Some(root.to_path_buf());
+    }
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
         }
-        // B. 嵌套：root/PaddleOCR-json/PaddleOCR-json_v*/PaddleOCR-json.exe
-        // 遍历 root 下的一级子目录，再找 PaddleOCR-json_v* 子目录
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    // 尝试 p/PaddleOCR-json.exe（扁平嵌套）
-                    if p.join("PaddleOCR-json.exe").exists() {
-                        return Some(p);
-                    }
-                    // 尝试 p/*/PaddleOCR-json.exe（深层嵌套）
-                    if let Ok(sub_entries) = std::fs::read_dir(&p) {
-                        for sub in sub_entries.flatten() {
-                            let sp = sub.path();
-                            if sp.is_dir() && sp.join("PaddleOCR-json.exe").exists() {
-                                return Some(sp);
-                            }
-                        }
-                    }
+        if p.join("PaddleOCR-json.exe").exists() {
+            return Some(p);
+        }
+        if let Ok(sub_entries) = fs::read_dir(&p) {
+            for sub in sub_entries.flatten() {
+                let sp = sub.path();
+                if sp.is_dir() && sp.join("PaddleOCR-json.exe").exists() {
+                    return Some(sp);
                 }
             }
         }
-        None
     }
+    None
+}
 
-    // Priority 1: <exe_dir>\paddle-ocr\（安装根/数据根，见 storage.rs）
+/// 返回 PaddleOCR-json 可执行文件所在目录。
+///
+/// 搜索优先级：
+///   1. `<exe 根>\paddle-ocr\`  — 安装根/数据根（见 storage.rs），也是自动下载的落点
+///   2. 项目根目录下的 `paddle-ocr/`（dev 模式：从 target/ 向上导航）
+///   3. 当前工作目录（兜底）
+fn paddle_ocr_dir() -> Result<PathBuf, String> {
     let exe_dir = std::env::current_exe()
-        .unwrap()
+        .map_err(|e| format!("无法获取 exe 路径: {e}"))?
         .parent()
-        .unwrap()
-        .to_path_buf();
-    let release_dir = exe_dir.join("paddle-ocr");
-    if let Some(found) = find_exe_in_dir(&release_dir) {
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Priority 1: <exe 根>\paddle-ocr\
+    if let Some(found) = find_engine_dir(&exe_dir.join("paddle-ocr")) {
         return Ok(found);
     }
 
     // Priority 2: 从 target/ 向上导航到项目根（dev mode）
-    if let Some(found) = find_exe_in_dir(
-        &exe_dir.join("..").join("..").join("..").join("..").join("paddle-ocr")
+    if let Some(found) = find_engine_dir(
+        &exe_dir
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("paddle-ocr"),
     ) {
         return Ok(found);
     }
 
     // Priority 3: 相对当前工作目录（兜底）
-    if let Some(found) = find_exe_in_dir(
-        &std::env::current_dir().unwrap_or_default().join("paddle-ocr")
-    ) {
+    if let Some(found) =
+        find_engine_dir(&std::env::current_dir().unwrap_or_default().join("paddle-ocr"))
+    {
         return Ok(found);
     }
 
-    Err("PaddleOCR-json.exe not found. Place it in the app data root (<exe_dir>\\paddle-ocr) or run scripts/download-paddle-ocr.ps1 first.".into())
+    Err(format!(
+        "OCR 引擎未安装。请点击「下载并安装」自动获取，或手动放置到 {}",
+        engine_root().display()
+    ))
 }
 
 /// PaddleOCR-json v1.4.1 支持的识别语言配置

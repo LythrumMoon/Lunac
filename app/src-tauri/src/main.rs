@@ -42,6 +42,8 @@ use commands::{
     open_file_in_vscode,
     get_system_language,
     run_paddle_ocr,
+    ocr_engine_status,
+    ocr_engine_install,
     hide_lunac,
 };
 use std::process::Command as StdCommand;
@@ -346,6 +348,8 @@ fn main() {
             open_file_in_vscode,
             get_system_language,
             run_paddle_ocr,
+            ocr_engine_status,
+            ocr_engine_install,
             hide_lunac,
         ])
         .run(tauri::generate_context!())

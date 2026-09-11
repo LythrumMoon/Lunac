@@ -271,6 +271,30 @@ Write-Host ""
 Write-Host "[8/9] PaddleOCR-json (offline OCR)..." -ForegroundColor Yellow
 $PaddleDir = "$AppDir\paddle-ocr"
 
+# 解压 .7z：优先 7z.exe，其次系统自带 bsdtar（Windows 10 1803+）。
+# PowerShell 的 Expand-Archive 不支持 7z，而 PaddleOCR-json 的 Windows 资产是 .7z。
+function Expand-SevenZip {
+  param([string]$Archive, [string]$Destination)
+  $candidates = @(
+    "$env:ProgramFiles\7-Zip\7z.exe",
+    "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+  )
+  $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $exe) {
+    $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($cmd) { $exe = $cmd.Source }
+  }
+  if ($exe) {
+    & $exe x $Archive "-o$Destination" -y | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "7z exited with code $LASTEXITCODE" }
+    return
+  }
+  & tar -xf $Archive -C $Destination
+  if ($LASTEXITCODE -ne 0) {
+    throw "解压 $Archive 失败：请安装 7-Zip 后重试（tar 返回 $LASTEXITCODE）"
+  }
+}
+
 # Always start clean — remove any stale/partial copy from previous builds.
 # The "Already staged" shortcut was unreliable: if a previous build was
 # interrupted after copying the exe but before models/DLLs, the partial
@@ -301,21 +325,23 @@ if (Test-Path (Join-Path $LocalPaddle "PaddleOCR-json.exe")) {
   }
 } else {
   # Priority 2: download from GitHub releases
+  # NOTE: the v1.4.1 Windows asset is a .7z (no .zip); Expand-Archive cannot read it.
   $PaddleVersion = "v1.4.1"
-  $PaddleZip = "PaddleOCR-json_v1.4.1_windows_x64.zip"
-  $PaddleUrl = "https://github.com/hiroi-sora/PaddleOCR-json/releases/download/$PaddleVersion/$PaddleZip"
-  $TempZip = "$env:TEMP\$PaddleZip"
+  $PaddleArchive = "PaddleOCR-json_v1.4.1_windows_x64.7z"
+  $PaddleUrl = "https://github.com/hiroi-sora/PaddleOCR-json/releases/download/$PaddleVersion/$PaddleArchive"
+  $TempArchive = "$env:TEMP\$PaddleArchive"
   $TempExtract = "$env:TEMP\paddle-ocr-extract"
 
   try {
     Write-Host "  Downloading $PaddleVersion from GitHub..."
-    Invoke-WebRequest -Uri $PaddleUrl -OutFile $TempZip -UseBasicParsing
+    Invoke-WebRequest -Uri $PaddleUrl -OutFile $TempArchive -UseBasicParsing
     Write-Host "  Download complete." -ForegroundColor DarkGray
 
     if (Test-Path $TempExtract) { Remove-Item -Recurse -Force $TempExtract }
-    Expand-Archive -Path $TempZip -DestinationPath $TempExtract -Force
+    New-Item -ItemType Directory -Path $TempExtract -Force | Out-Null
+    Expand-SevenZip -Archive $TempArchive -Destination $TempExtract
 
-    # The ZIP contains a PaddleOCR-json_v1.4.1/ folder; copy its contents flat
+    # The archive contains a PaddleOCR-json_v1.4.1/ folder; copy its contents flat
     New-Item -ItemType Directory -Path $PaddleDir -Force | Out-Null
     $innerDir = Get-ChildItem -Path $TempExtract -Directory | Select-Object -First 1
     if ($innerDir) {
@@ -336,7 +362,7 @@ if (Test-Path (Join-Path $LocalPaddle "PaddleOCR-json.exe")) {
     if (Test-Path $PaddleDir) { Remove-Item -Recurse -Force $PaddleDir -ErrorAction SilentlyContinue }
   } finally {
     Remove-Item -Recurse -Force $TempExtract -ErrorAction SilentlyContinue
-    Remove-Item $TempZip -ErrorAction SilentlyContinue
+    Remove-Item $TempArchive -ErrorAction SilentlyContinue
   }
 }
 Write-Host ""

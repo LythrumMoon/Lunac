@@ -15,7 +15,76 @@
 
 import type { Plugin, PluginResult } from "../registry";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { t } from "../../i18n.js";
+
+// ── 引擎部署（按需下载）───────────────────────────────────────────
+// PaddleOCR-json 引擎体积大（解压后约 300MB），不随发行包分发（见 .gitignore）。
+// 运行时若缺失，由前端触发从 GitHub Release 下载到 `<exe 根>\paddle-ocr`。
+
+/** 触发引擎下载安装。进度经 `ocr-engine-progress`/`ready`/`error` 事件回传。
+ *  返回 Promise<boolean>：true = 安装成功。供 OCR 面板与设置面板共用。 */
+export function installOcrEngine(
+  onProgress?: (info: { percent: number; mb: number }) => void,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const unlisteners: Array<() => void> = [];
+    const cleanup = () => {
+      for (const fn of unlisteners) { try { fn(); } catch { /* ignore */ } }
+    };
+    void (async () => {
+      unlisteners.push(await listen("ocr-engine-progress", (ev) => {
+        const { downloaded, total } = ev.payload as { downloaded: number; total: number };
+        onProgress?.({
+          percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+          mb: downloaded / 1048576,
+        });
+      }));
+      unlisteners.push(await listen("ocr-engine-ready", () => { cleanup(); resolve(true); }));
+      unlisteners.push(await listen("ocr-engine-error", () => { cleanup(); resolve(false); }));
+      try {
+        await invoke("ocr_engine_install");
+      } catch {
+        cleanup();
+        resolve(false);
+      }
+    })();
+  });
+}
+
+/** 引擎缺失时在状态行内联「下载并安装」按钮。 */
+function renderEngineInstallPrompt(statusEl: HTMLElement | null) {
+  if (!statusEl) return;
+  statusEl.innerHTML = `\u26A0\uFE0F ${t("ocr.engine_missing")} `;
+  const btn = document.createElement("button");
+  btn.className = "ocr-action-btn ocr-primary-btn";
+  btn.style.marginLeft = "6px";
+  btn.textContent = t("ocr.engine_download");
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = t("ocr.engine_downloading").replace("{percent}", "0");
+    const ok = await installOcrEngine(({ percent, mb }) => {
+      btn.textContent = percent > 0
+        ? t("ocr.engine_downloading").replace("{percent}", String(percent))
+        : t("ocr.engine_downloading_unknown").replace("{mb}", mb.toFixed(1));
+    });
+    statusEl.textContent = ok
+      ? `\u2705 ${t("ocr.engine_ready")}`
+      : `\u274C ${t("ocr.engine_failed")}`;
+  });
+  statusEl.appendChild(btn);
+}
+
+/** 执行 OCR 前确认引擎就绪；缺失则渲染安装提示并返回 false。 */
+async function ensureEngineReady(statusEl: HTMLElement | null): Promise<boolean> {
+  try {
+    if (await invoke<boolean>("ocr_engine_status")) return true;
+  } catch {
+    return true; // 状态查询异常时不拦截，交由 run_paddle_ocr 报真实错误
+  }
+  renderEngineInstallPrompt(statusEl);
+  return false;
+}
 
 // ── 剪贴板图片读取 ────────────────────────────────────────────────
 // 使用原生 Win32 FFI（CF_HDROP + CF_DIB/CF_DIBV5），避免 arboard 插件在
@@ -167,6 +236,7 @@ export async function autoStartClipboardOcr() {
     previewEl.innerHTML = `<img src="${img}" class="ocr-preview-img" alt="Clipboard image" />`;
   }
 
+  if (!(await ensureEngineReady(statusEl))) return;
   if (statusEl) statusEl.textContent = "\u23F3 " + t("ocr.recognizing");
   try {
     const result = await ocrFromDataUrl(img);
@@ -187,6 +257,8 @@ export async function ocrImageFile(imagePath: string) {
   const previewEl = document.getElementById("ocr-image-preview");
 
   if (statusEl) statusEl.textContent = "\u23F3 " + t("ocr.loading_image");
+
+  if (!(await ensureEngineReady(statusEl))) return;
 
   // Show image preview
   if (previewEl) {
@@ -235,6 +307,7 @@ export function attachOcrListeners(doc: Document) {
     if (previewEl) {
       previewEl.innerHTML = `<img src="${img}" class="ocr-preview-img" alt="Clipboard image" />`;
     }
+    if (!(await ensureEngineReady(s))) return;
     if (s) s.textContent = "\u23F3 " + t("ocr.recognizing");
     try {
       const result = await ocrFromDataUrl(img);
@@ -256,6 +329,7 @@ export function attachOcrListeners(doc: Document) {
       const s = doc.getElementById("ocr-status-line");
       const r = doc.getElementById("ocr-result") as HTMLTextAreaElement | null;
       const previewEl = doc.getElementById("ocr-image-preview");
+      if (!(await ensureEngineReady(s))) return;
       if (s) s.textContent = "\u23F3 " + t("ocr.recognizing");
       if (r) r.value = "";
       try {

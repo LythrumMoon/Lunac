@@ -16,6 +16,8 @@ arboard = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+# 纯 Rust 7z 解压 —— PaddleOCR-json 的 Windows 发行包是 .7z（无 .zip 资产）
+sevenz-rust = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 tokio = { version = "1", features = ["sync", "macros"] }
 futures = "0.3"

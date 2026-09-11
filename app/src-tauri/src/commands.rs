@@ -1449,6 +1449,54 @@ pub fn run_paddle_ocr(path: String, lang: Option<String>) -> Result<String, Stri
     paddle_ocr::recognize_image(&path, &lang)
 }
 
+// ── OCR 引擎（PaddleOCR-json）按需安装 ───────────────────────────
+//
+// 引擎体积大（.7z 约 88MB / 解压后约 300MB），不随仓库分发。缺失时前端
+// 弹出「下载并安装」入口 → 本命令后台下载解压到 <exe 根>\paddle-ocr。
+// 进度与结果通过事件回传，避免长耗时的 IPC 阻塞。
+
+/// 安装是否进行中（防重入：下载是长任务，重复触发会浪费带宽并产生竞态）
+static OCR_ENGINE_INSTALLING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 引擎是否已就绪。
+#[tauri::command]
+pub fn ocr_engine_status() -> bool {
+    paddle_ocr::engine_installed()
+}
+
+/// 下载并安装 OCR 引擎（后台线程执行，立即返回）。
+/// 事件：
+///   `ocr-engine-progress` { downloaded, total }  下载进度（total=0 表示未知）
+///   `ocr-engine-ready`    ()                     安装成功
+///   `ocr-engine-error`    String                 失败原因
+#[tauri::command]
+pub fn ocr_engine_install(app: AppHandle) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if OCR_ENGINE_INSTALLING.swap(true, Ordering::SeqCst) {
+        return Err("OCR 引擎正在安装中，请稍候".into());
+    }
+    let handle = app.clone();
+    thread::spawn(move || {
+        let result = paddle_ocr::install_engine(|downloaded, total| {
+            let _ = handle.emit(
+                "ocr-engine-progress",
+                serde_json::json!({ "downloaded": downloaded, "total": total }),
+            );
+        });
+        OCR_ENGINE_INSTALLING.store(false, Ordering::SeqCst);
+        match result {
+            Ok(()) => {
+                let _ = handle.emit("ocr-engine-ready", ());
+            }
+            Err(e) => {
+                let _ = handle.emit("ocr-engine-error", e);
+            }
+        }
+    });
+    Ok(())
+}
+
 // ── Window control ──────────────────────────────────────────────
 /// Directly hide the Lunac window via ShowWindow(SW_HIDE).
 /// Bypasses Tauri's Window API to avoid any IPC queue delays.
