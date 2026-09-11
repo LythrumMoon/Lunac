@@ -15,6 +15,7 @@
 //          --dangerously-skip-permissions → 忽略工作区锁
 //          --permission-prompt-tool stdio → 写类工具先发 can_use_tool 请前端审批
 //          --disallowedTools <name…>      → 这些工具不进请求体
+//          --mcp-server stdio:<exe 路径>  → 拉起该 exe 的 MCP server，接入其工具（P3）
 //          其余 CLI 风格参数接受并忽略
 //   stdin  每行一条 JSON
 //            {"type":"user","session_id":"","message":{"role":"user",
@@ -35,7 +36,9 @@
 //   ✅ P1 内置工具 + tool_use/tool_result 往返循环（工具实现见 tools.rs）
 //   ✅ P2 权限审批：写类工具发 can_use_tool → 阻塞等 control_response（超时按拒绝）
 //   ✅ 上下文预算 + 压缩：按端点实测体积走瘦身/丢弃两级水位，400 超限再强制压缩重试
-//   ❌ P3 MCP 工具桥 / P4 skills
+//   ✅ P3 MCP 工具桥：连 `lunac.exe --mcp-server`，把 <exe 根>\tools\*.json 的用户工具
+//      以 `mcp__<名>` 接进请求体（实现见 mcp.rs）
+//   ❌ P4 skills
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
 
@@ -50,6 +53,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+mod mcp;
 mod tools;
 
 /// 单次回复的 token 上限（无思考时的基线）
@@ -493,6 +497,9 @@ struct CliArgs {
     skip_permissions: bool,
     ask_permission: bool,
     disallowed: Vec<String>,
+    /// `--mcp-server stdio:<exe 路径>` —— 上游把 lunac.exe 路径交给我们，
+    /// 由 agent 侧拉起它的 MCP server（见 mcp.rs）
+    mcp_server: Option<String>,
 }
 
 impl CliArgs {
@@ -522,6 +529,12 @@ impl CliArgs {
                     }
                 }
                 "--dangerously-skip-permissions" => out.skip_permissions = true,
+                "--mcp-server" => {
+                    if let Some(v) = args.get(i + 1) {
+                        out.mcp_server = Some(v.clone());
+                        i += 1;
+                    }
+                }
                 "--disallowedTools" => {
                     // variadic：吃到下一个 --flag 为止（与上游 commander 语义一致）
                     let mut j = i + 1;
@@ -547,10 +560,6 @@ fn main() {
         println!("agent 0.2.0 (lunac self-developed agent core, P1)");
         return;
     }
-    if args.iter().any(|a| a == "--mcp-server") {
-        eprintln!("[agent] --mcp-server 已接受但未实现（MCP 工具桥为 P3）");
-    }
-
     let cli = CliArgs::parse(&args);
     let tools_ctx = tools::Ctx {
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -559,11 +568,43 @@ fn main() {
         locked: std::env::var("LUNAC_WORKSPACE_LOCKED").ok().as_deref() == Some("1")
             && !cli.skip_permissions,
     };
-    let tool_defs = tools::defs(&cli.disallowed);
-    let tool_names = tools::names(&tool_defs);
+
+    // P3 MCP 工具桥：把 <exe 根>\tools\*.json 的用户工具接进工具池。
+    // 连不上只是少一批工具 —— 六件内置工具必须照常可用，所以这里只记一行。
+    // plan（只读）档不接：MCP 工具的 handler 能跑 shell / 发 HTTP，接进来也只会
+    // 每次都被拒绝，还会让工具清单随档位漂移。
+    let mut mcp_bridge = if tools_ctx.read_only {
+        eprintln!("[agent] 只读（plan）档：不接入 MCP 工具");
+        None
+    } else {
+        match cli.mcp_server.as_deref() {
+            Some(spec) => match mcp::Bridge::connect(spec, &cli.disallowed) {
+                Ok(b) => {
+                    eprintln!(
+                        "[agent] MCP 桥已接通，用户工具 {} 个: [{}]",
+                        b.defs().len(),
+                        tools::names(b.defs()).join(",")
+                    );
+                    Some(b)
+                }
+                Err(e) => {
+                    eprintln!("[agent] MCP 桥未接通（继续用内置工具）: {e}");
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+
+    let mut tool_defs = tools::defs(&cli.disallowed);
+    let mut tool_names = tools::names(&tool_defs);
+    if let Some(b) = &mcp_bridge {
+        tool_defs.extend(b.defs().iter().cloned());
+        tool_names.extend(tools::names(b.defs()));
+    }
 
     eprintln!(
-        "[agent] P1/P2 就绪 cwd={} 工具=[{}]{}{}",
+        "[agent] P1/P2/P3 就绪 cwd={} 工具=[{}]{}{}",
         tools_ctx.cwd.display(),
         tool_names.join(","),
         if tools_ctx.read_only { " 只读模式" } else { "" },
@@ -631,6 +672,7 @@ fn main() {
                     &tool_defs,
                     &tool_names,
                     cli.ask_permission,
+                    mcp_bridge.as_mut(),
                 );
             }
             // 没被认领的 control_response（如请求已超时）在这里丢弃即可
@@ -679,6 +721,33 @@ struct Block {
     input: Value,
 }
 
+/// 需要审批的工具：内置写类三件（Write/Edit/Bash）+ 全部 MCP 工具 ——
+/// 后者的 handler 能跑 shell / 发 HTTP，且定义来自用户 JSON，agent 侧
+/// 无权替用户判断安全性，一律交前端卡片决定。
+fn needs_approval(name: &str) -> bool {
+    tools::needs_approval(name) || mcp::is_mcp(name)
+}
+
+/// 分发一次工具调用：MCP 工具走桥（P3），其余走内置实现（P1）。
+fn run_tool(
+    tctx: &tools::Ctx,
+    mcp_bridge: Option<&mut mcp::Bridge>,
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    if !mcp::is_mcp(name) {
+        return tools::run(tctx, name, input);
+    }
+    // plan（只读）档：MCP 工具同样不许动手
+    if tctx.read_only {
+        return Err("MCP tools are disabled in read-only (plan) mode".into());
+    }
+    let Some(bridge) = mcp_bridge else {
+        return Err(format!("MCP bridge is not connected, cannot call {name}"));
+    };
+    bridge.call(name, input).map(tools::truncate)
+}
+
 fn run_query(
     cfg: &Cfg,
     history: &mut Vec<Value>,
@@ -687,6 +756,7 @@ fn run_query(
     tool_defs: &[Value],
     tool_names: &[String],
     ask_permission: bool,
+    mut mcp_bridge: Option<&mut mcp::Bridge>,
 ) {
     let started = Instant::now();
     emit_init(&cfg.model, tool_names);
@@ -1054,7 +1124,7 @@ fn run_query(
         let gate = ask_permission && !tctx.read_only;
         let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
-            if gate && tools::needs_approval(name) {
+            if gate && needs_approval(name) {
                 pendings.push(Some(open_approval(name, id, input)));
             } else {
                 pendings.push(None);
@@ -1080,7 +1150,7 @@ fn run_query(
                 Some(msg) => (format!("Error: {msg}"), true),
                 None => {
                     eprintln!("[agent] 执行工具 {name}");
-                    match tools::run(tctx, name, &run_input) {
+                    match run_tool(tctx, mcp_bridge.as_deref_mut(), name, &run_input) {
                         Ok(s) => (s, false),
                         Err(e) => (format!("Error: {e}"), true),
                     }

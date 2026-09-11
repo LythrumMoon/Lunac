@@ -38,7 +38,7 @@
 | `AskUserQuestion` | `core/tools/AskUserQuestionTool/` | **高** | 结构化提问（多选项）—— 现在只能靠模型在文本里问，用户没法点选 |
 | `TodoWrite` | `core/tools/TodoWriteTool/` | **中高** | 长任务的进度可见性；旧 CLI 用它支撑多步任务，不需要任务框架也能用 |
 | `Skill` | `core/tools/SkillTool/` | **中高** | P4 计划内；设置面板已有「技能扩展」且 UI 文案声称 agent.exe 会加载 —— 目前不读，属明显缺口 |
-| `ListMcpResourcesTool` / `ReadMcpResourceTool` / `mcp`（动态工具代理） | `core/tools/MCPTool/`、`core/services/mcp/` | **中高** | P3 计划内；设置面板的「插件 (MCP 工具)」与 `<exe 根>\tools\*.json` 现在完全空转 |
+| `ListMcpResourcesTool` / `ReadMcpResourceTool` / `mcp`（动态工具代理） | `core/tools/MCPTool/`、`core/services/mcp/` | **中高** | ✅ **动态工具代理已完成（P3，2026-09）**：`<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 进请求体，见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。`ListMcpResourcesTool` / `ReadMcpResourceTool` 两件仍未做（`mcp_server.rs` 只实现了 `resources/list`） |
 | `Agent`（子代理，legacy 名 `Task`） | `core/tools/AgentTool/` | 中 | 长任务并行探索；代价是要配一整套子代理生命周期，收益不如上面几项直接 |
 | `TaskCreate` / `TaskGet` / `TaskUpdate` / `TaskList`（任务 v2）与 `TodoWrite` 二选一 | `core/tools/Task*Tool/` | 中 | 选了 `TodoWrite` 就不必再上任务 v2 |
 | `EnterPlanMode` / `ExitPlanMode` | `core/tools/Enter/ExitPlanModeTool/` | 中 | 先出计划再动手；需前端配合新增计划卡片 UI（目前前端**零相关代码**） |
@@ -79,7 +79,7 @@
 
 | 子系统 | 旧 CLI 位置 | 依赖/说明 |
 |---|---|---|
-| MCP 全栈 | `core/services/mcp/`（stdio / sse / http / WebSocket 传输、tools、resources、prompts、roots、elicitation、OAuth、`.mcp.json`） | = P3；是 §1.1 里三个 MCP 工具的前提 |
+| MCP 全栈 | `core/services/mcp/`（stdio / sse / http / WebSocket 传输、tools、resources、prompts、roots、elicitation、OAuth、`.mcp.json`） | **stdio + tools 部分已完成（P3，2026-09）**：agent 侧作 client 连本机 `lunac.exe --mcp-server`、注册并调用其工具。仍缺：远程传输（sse/http/ws）、resources/prompts/roots/elicitation/OAuth、`.mcp.json` 配置（目前工具来源只有 `<exe 根>\tools\*.json`） |
 | Skills（含 inline / fork / remote 三模式） | `core/skills/`、`core/tools/SkillTool/` | = P4；`core/skills/bundled/` 里旧 CLI 自带 12+ 个内置技能 |
 | 插件市场 / 插件命令 | `core/plugins/`、`core/utils/plugins/` | 桌面端的「插件」面板目前只读展示 `list_tool_files`，没有下发通道 |
 | 权限 hooks（19 类事件） | `core/services/tools/toolHooks.ts`、`core/utils/hooks/`、`core/schemas/hooks.ts`、`core/hooks/useCanUseTool.tsx` | PreToolUse / PostToolUse / SessionStart / PreCompact / PermissionRequest … 供用户脚本介入 |
@@ -143,7 +143,7 @@
 ## 6. 建议实施顺序
 
 1. ~~**上下文预算 + 压缩**（§2.1）——唯一「用久了必然坏掉」的缺口，属防回归性质~~ ✅ **已完成（2026-09）**
-2. **P3 MCP 工具桥** —— 让「插件」面板与 `tools\*.json` 真正生效
+2. ~~**P3 MCP 工具桥** —— 让「插件」面板与 `tools\*.json` 真正生效~~ ✅ **已完成（2026-09）**；resources 两件未做
 3. **P4 Skills** —— 让「技能扩展」面板生效，并修掉失实文案
 4. **低成本高收益**：`PowerShell` 工具、工具黑名单候选列表刷新、`WebFetch`/`WebSearch`、`AskUserQuestion`、`TodoWrite`
 5. 视需要：权限 hooks、自动权限分类器、模型输出重试、Bash AST 安全分析

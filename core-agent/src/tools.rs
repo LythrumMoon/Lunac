@@ -619,7 +619,8 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|&b| b == 0)
 }
 
-fn truncate(mut s: String) -> String {
+/// 单条工具结果上限（MCP 桥的结果也走这里，见 main.rs `run_tool`）
+pub fn truncate(mut s: String) -> String {
     if s.chars().count() > MAX_RESULT_CHARS {
         let cut: String = s.chars().take(MAX_RESULT_CHARS).collect();
         s = format!("{cut}\n… (truncated at {MAX_RESULT_CHARS} chars)");
