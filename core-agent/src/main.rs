@@ -13,30 +13,37 @@
 //   args   --add-dir <dir>（可重复）工作区外追加目录
 //          --permission-mode plan → 只读
 //          --dangerously-skip-permissions → 忽略工作区锁
+//          --permission-prompt-tool stdio → 写类工具先发 can_use_tool 请前端审批
 //          --disallowedTools <name…>      → 这些工具不进请求体
 //          其余 CLI 风格参数接受并忽略
 //   stdin  每行一条 JSON
 //            {"type":"user","session_id":"","message":{"role":"user",
 //             "content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}
+//            {"type":"control_response","response":{"subtype":"success",
+//             "request_id":"…","response":{"behavior":"allow"|"deny",…}}}
 //   stdout 每行一条 JSON（非 JSON 行会被前端忽略）
 //            {"type":"system","subtype":"init","tools":[…]}
 //            {"type":"stream_event","event":{…content_block_delta…}}
 //            {"type":"assistant","message":{"content":[…]}}   ← 含 tool_use
 //            {"type":"user","message":{"content":[{tool_result}]}}
+//            {"type":"control_request","request":{"subtype":"can_use_tool",…}}
 //            {"type":"result","subtype":"success","usage":{…}}
 //
 // 已实现范围
 //   ✅ P0 多轮上下文、SSE 增量打字、用量上报、错误回传
 //   ✅ P0 思考档位跨模型自适应（MAX_THINKING_TOKENS → thinking 形态 + 400 降级）
 //   ✅ P1 内置工具 + tool_use/tool_result 往返循环（工具实现见 tools.rs）
-//   ❌ P2 权限审批（can_use_tool）/ P3 MCP 工具桥 / P4 skills
+//   ✅ P2 权限审批：写类工具发 can_use_tool → 阻塞等 control_response（超时按拒绝）
+//   ❌ P3 MCP 工具桥 / P4 skills
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,6 +58,8 @@ const REQUEST_TIMEOUT_SECS: u64 = 1800;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// 一轮用户提问内最多允许的「模型→工具→模型」往返次数
 const MAX_TOOL_ROUNDS: usize = 16;
+/// 审批等待上限：超时按拒绝处理，并通知前端撤掉卡片（避免 UI 丢了以后永久挂住）
+const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
 const SYSTEM_PROMPT: &str = "You are Lunac's built-in assistant, running inside a Windows desktop launcher. \
@@ -202,12 +211,139 @@ fn emit_init(model: &str, tool_names: &[String]) {
     }));
 }
 
+// ── 权限审批（P2：can_use_tool control 协议）──────────────────────
+//
+// 协议（前端 app/src/main.ts 与 vscode-extension/src/chatView.ts 都按这个形状解析）：
+//   发出：{"type":"control_request","request_id":"…","request":{
+//           "subtype":"can_use_tool","tool_name":"Bash","input":{…},"tool_use_id":"…"}}
+//   收回：{"type":"control_response","response":{"subtype":"success",
+//           "request_id":"…","response":{"behavior":"allow","updatedInput":{…}}}}
+//         behavior=deny 时另带 message / interrupt。
+//
+// stdin 读取线程负责分发（查询线程此时正阻塞等回包），所以用一个
+// request_id → Sender 的登记表把两边接起来。
+
+fn pending_approvals() -> &'static Mutex<HashMap<String, mpsc::Sender<Value>>> {
+    static REG: OnceLock<Mutex<HashMap<String, mpsc::Sender<Value>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_request_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!("req_{}_{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 把一条 `control_response` 投递给正在等它的工具调用。
+/// 返回 false 表示没有匹配的等待者（交给主循环按普通消息忽略）。
+fn route_control_response(msg: &Value) -> bool {
+    let Some(req_id) = msg
+        .pointer("/response/request_id")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let sender = pending_approvals()
+        .lock()
+        .ok()
+        .and_then(|reg| reg.get(req_id).cloned());
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(msg.clone());
+            true
+        }
+        None => {
+            eprintln!("[agent] 收到无对应请求的 control_response（{req_id}），已忽略");
+            false
+        }
+    }
+}
+
+enum Decision {
+    /// allow；值为最终输入（前端回 `updatedInput: {}` 表示「用原参数」）
+    Allow(Value),
+    /// deny：拒绝原因 + 是否中断整轮
+    Deny(String, bool),
+}
+
+/// 一个已发出、等待回包的审批请求
+struct Pending {
+    request_id: String,
+    rx: mpsc::Receiver<Value>,
+}
+
+/// 只登记 + 发请求，不阻塞 —— 一批工具先全部发出，前端才能把连续
+/// Bash 合并成一行（`findLastBashGroup`）再让用户一次性决定。
+fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::channel::<Value>();
+    if let Ok(mut reg) = pending_approvals().lock() {
+        reg.insert(request_id.clone(), tx);
+    }
+    eprintln!("[agent] 等待审批 {tool_name}");
+    emit(json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": tool_name,
+            "input": input,
+            "tool_use_id": tool_use_id,
+        },
+    }));
+    Pending { request_id, rx }
+}
+
+/// 阻塞等回包（带超时）
+fn await_approval(pending: Pending, original: &Value) -> Decision {
+    let reply = pending.rx.recv_timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS));
+    if let Ok(mut reg) = pending_approvals().lock() {
+        reg.remove(&pending.request_id);
+    }
+
+    let Ok(msg) = reply else {
+        eprintln!("[agent] 审批超时，按拒绝处理");
+        emit(json!({
+            "type": "control_cancel_request",
+            "request_id": pending.request_id,
+        }));
+        return Decision::Deny(format!("审批超时（{APPROVAL_TIMEOUT_SECS} 秒无响应）"), true);
+    };
+
+    let inner = &msg["response"]["response"];
+    match inner.get("behavior").and_then(Value::as_str).unwrap_or("deny") {
+        "allow" => {
+            match inner.get("updatedInput") {
+                // 非空对象 = 用户/前端改过参数；空对象 = 按原参数执行
+                Some(v)
+                    if v.is_object()
+                        && v.as_object().map(|o| !o.is_empty()).unwrap_or(false) =>
+                {
+                    Decision::Allow(v.clone())
+                }
+                _ => Decision::Allow(original.clone()),
+            }
+        }
+        _ => {
+            eprintln!("[agent] 用户拒绝");
+            Decision::Deny(
+                inner
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("User denied this action in Lunac")
+                    .to_string(),
+                inner.get("interrupt").and_then(Value::as_bool).unwrap_or(false),
+            )
+        }
+    }
+}
+
 // ── 启动参数 ─────────────────────────────────────────────────────
 //
-// src-tauri 传的是上游 CLI 风格命令行，这里只挑对 P1 有意义的几个：
+// src-tauri 传的是上游 CLI 风格命令行，这里只挑对 P1/P2 有意义的几个：
 //   --add-dir <dir>                工作区之外追加可访问目录（可重复）
 //   --permission-mode <mode>       plan = 只读；acceptEdits/其他 = 可写
 //   --dangerously-skip-permissions 忽略工作区锁（full 档）
+//   --permission-prompt-tool stdio 审批走 stdout/stdin 的 control 协议（P2）
 //   --disallowedTools <name…>      variadic：这些工具不进请求体
 // 其余（--print / --verbose / --input-format …）一律接受并忽略。
 #[derive(Default)]
@@ -215,6 +351,7 @@ struct CliArgs {
     add_dirs: Vec<PathBuf>,
     permission_mode: String,
     skip_permissions: bool,
+    ask_permission: bool,
     disallowed: Vec<String>,
 }
 
@@ -233,6 +370,14 @@ impl CliArgs {
                 "--permission-mode" => {
                     if let Some(v) = args.get(i + 1) {
                         out.permission_mode = v.clone();
+                        i += 1;
+                    }
+                }
+                "--permission-prompt-tool" => {
+                    // 只有 stdio 才能把审批路由到前端；没这个开关就别问，
+                    // 否则会对着没人应答的通道干等（VSCode 扩展/桌面端都会传）
+                    if let Some(v) = args.get(i + 1) {
+                        out.ask_permission = v.starts_with("stdio");
                         i += 1;
                     }
                 }
@@ -278,10 +423,11 @@ fn main() {
     let tool_names = tools::names(&tool_defs);
 
     eprintln!(
-        "[agent] P1 就绪 cwd={} 工具=[{}]{}",
+        "[agent] P1/P2 就绪 cwd={} 工具=[{}]{}{}",
         tools_ctx.cwd.display(),
         tool_names.join(","),
-        if tools_ctx.read_only { " 只读模式" } else { "" }
+        if tools_ctx.read_only { " 只读模式" } else { "" },
+        if cli.ask_permission && !tools_ctx.read_only { " 写操作需审批" } else { "" }
     );
 
     let cfg = match Cfg::from_env() {
@@ -301,8 +447,8 @@ fn main() {
     };
 
     // stdin 读取线程 → 查询线程（mpsc 解耦）。
-    // 解耦的意义：查询期间仍能持续 drain stdin，否则 P2 的
-    // control_response（审批回包）在模型思考期间根本读不到。
+    // 解耦的意义：查询线程在等审批回包时会阻塞，stdin 必须另有线程持续 drain，
+    // 否则 control_response 根本读不到（这正是 P2 的前提）。
     let (tx, rx) = mpsc::channel::<Value>();
     thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -314,6 +460,10 @@ fn main() {
             }
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(v) => {
+                    // 审批回包直接投给等它的工具调用，不进主队列
+                    if route_control_response(&v) {
+                        continue;
+                    }
                     if tx.send(v).is_err() {
                         break;
                     }
@@ -333,9 +483,17 @@ fn main() {
                 if prompt.trim().is_empty() {
                     continue;
                 }
-                run_query(&cfg, &mut history, &prompt, &tools_ctx, &tool_defs, &tool_names);
+                run_query(
+                    &cfg,
+                    &mut history,
+                    &prompt,
+                    &tools_ctx,
+                    &tool_defs,
+                    &tool_names,
+                    cli.ask_permission,
+                );
             }
-            // P1 不产生 can_use_tool，收到审批回包直接忽略
+            // 没被认领的 control_response（如请求已超时）在这里丢弃即可
             Some("control_response") => {}
             other => eprintln!("[agent] 忽略输入类型: {other:?}"),
         }
@@ -388,6 +546,7 @@ fn run_query(
     tctx: &tools::Ctx,
     tool_defs: &[Value],
     tool_names: &[String],
+    ask_permission: bool,
 ) {
     let started = Instant::now();
     emit_init(&cfg.model, tool_names);
@@ -697,13 +856,43 @@ fn run_query(
         }
 
         // ── 执行工具 → 回灌 tool_result ─────────────────────────
+        // 写类工具先请用户审批（P2）：一批先全部发出，前端才能把连续 Bash
+        // 合并成一行（findLastBashGroup）一次决定；随后按顺序阻塞等回包。
         // 工具报错不中断整轮：转成 is_error=true 的 tool_result，模型可自行纠正。
-        let mut results: Vec<Value> = Vec::new();
+        let gate = ask_permission && !tctx.read_only;
+        let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
-            eprintln!("[agent] 执行工具 {name}");
-            let (text, is_error) = match tools::run(tctx, name, input) {
-                Ok(s) => (s, false),
-                Err(e) => (format!("Error: {e}"), true),
+            if gate && tools::needs_approval(name) {
+                pendings.push(Some(open_approval(name, id, input)));
+            } else {
+                pendings.push(None);
+            }
+        }
+
+        let mut results: Vec<Value> = Vec::new();
+        let mut interrupted = false;
+        for ((id, name, input), pending) in calls.iter().zip(pendings.into_iter()) {
+            let mut run_input = input.clone();
+            let mut denied: Option<String> = None;
+            if let Some(p) = pending {
+                match await_approval(p, input) {
+                    Decision::Allow(approved) => run_input = approved,
+                    Decision::Deny(msg, stop) => {
+                        interrupted |= stop;
+                        denied = Some(msg);
+                    }
+                }
+            }
+
+            let (text, is_error) = match denied {
+                Some(msg) => (format!("Error: {msg}"), true),
+                None => {
+                    eprintln!("[agent] 执行工具 {name}");
+                    match tools::run(tctx, name, &run_input) {
+                        Ok(s) => (s, false),
+                        Err(e) => (format!("Error: {e}"), true),
+                    }
+                }
             };
             let mut blk = json!({
                 "type": "tool_result",
@@ -718,6 +907,12 @@ fn run_query(
         let tool_msg = json!({ "role": "user", "content": results });
         emit(json!({ "type": "user", "message": tool_msg.clone() }));
         history.push(tool_msg);
+
+        // 用户点了「拒绝并中断」→ 结果已回灌，本轮到此为止
+        if interrupted {
+            eprintln!("[agent] 用户要求中断本轮");
+            break;
+        }
 
         rounds += 1;
         if rounds >= MAX_TOOL_ROUNDS {

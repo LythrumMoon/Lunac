@@ -162,6 +162,18 @@ pub fn names(tools: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// 是否需要先过用户审批（P2 的 `can_use_tool`）。
+///
+/// 只读三件不需要（工作区锁已是硬边界）；写类三件一律先问 —— 前端
+/// `classifyRequest()` 会自行处理「白名单 / 内置安全前缀自动放行」与
+/// 「危险命令只给手动确认」，所以 agent 侧不做二次判断，问就完了。
+/// 返回真实改动前用户应看到提示的调用也在此列（含 Bash 的只读命令）。
+///
+/// `plan` 档不在此判断：那三件工具会被 tools::run 直接拒绝，压根到不了审批。
+pub fn needs_approval(name: &str) -> bool {
+    matches!(name, "Write" | "Edit" | "Bash")
+}
+
 // ── 分发 ─────────────────────────────────────────────────────────
 
 /// 执行一个工具调用。Err 会成为 is_error=true 的 tool_result
