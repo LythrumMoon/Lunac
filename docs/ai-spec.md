@@ -401,16 +401,22 @@ core-agent/
 └── Cargo.toml
 
 scripts/
+├── _env.ps1                         # 公共环境准备（把 cargo / mingw64\bin 追加进 PATH，供其它脚本 dot-source）
+├── verify-git.ps1                   # 新克隆自检（npm run verify），退出码 0/1
 ├── tauri-dev.ps1                    # 开发启动脚本
 └── build-core.ps1                   # bun build --compile 构建脚本
 ```
 
+> 所有 ps1 脚本必须用 `$PSScriptRoot` / `Split-Path -Parent $PSScriptRoot` 推导仓库根，**禁止硬编码本机绝对路径**；统一包管理器为 `npm`。
+> **ps1 含中文必须以 UTF-8 with BOM 保存** —— Windows PowerShell 5.1 对无 BOM 文件按 ANSI(GBK) 解码，中文字符会把紧随其后的引号/换行吞进双字节，导致「字符串缺少终止符」等解析错误（`download-paddle-ocr.ps1`、`build-release.ps1` 曾因此无法运行）。
+
 ## 7. 开发命令
 
 ```powershell
+npm run verify               # 新克隆自检（仓库根，缺什么一次列清）
 cd app
 npm install                  # 安装前端依赖
-npm run tauri:dev            # 启动 Vite + Tauri 开发模式
+npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173）
 ```
 
 ## 8. 发布与版本管理约定
@@ -437,11 +443,15 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式
 
 ### 8.3 开源发布 / 仓库卫生（2026-09）
 
+**当前状态：仓库为 private（`LythrumMoon/Lunac`），开发完成后才公开。** 公开前必须重跑下面的红线和首次提交验证；README 作为对外「详细页」不展示 CLI 相关实现细节。
+
 **红线（违反会造成密钥泄露或侵权，且不可撤销）**：
 
-1. **`core/` 与所有 `cli.exe` 绝不入库** —— `core/` 是 Anthropic 的 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。构建所需的 `core/cli.exe` 由使用者自备（README 已说明）。
+1. **`core/` 与所有 `cli.exe` 绝不入库** —— `core/` 是 Anthropic 的 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。构建所需的 `core/cli.exe` 由使用者自备 —— 该要求只记录在本规范，**README 等对外页面一律不提**（自研 `core-agent/` 上线后将彻底不依赖它）。
 2. **`.env` 绝不入库** —— `core/.env`（`ANTHROPIC_API_KEY` 等）与 `app/src-tauri/.env`（`AI_API_KEY`）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
 3. **大二进制不入库** —— GitHub 单文件硬上限 100MB（`cli.exe` 121MB 必然失败）、仓库 >1GB 告警。以下均已 gitignore：`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
+
+**README 对外页面纪律**：不出现 Claude Code CLI / `core/cli.exe` 相关说明，不设「快速开始」栏目（构建与自检步骤仅在 `docs/` 与本规范内维护）。
 
 **必备文件**：`.gitignore`、`LICENSE`（MIT，版权人 `LythrumMoon`）、`README.md`、`.env.example`。
 
