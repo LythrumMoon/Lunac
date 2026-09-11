@@ -179,8 +179,8 @@ async function buildSearchPane(): Promise<string> {
 
 // ── AI 供应商/模型预设（单一数据源）─────────────────────────────
 // buildAIPane 与 attachSettingsListeners 共用，避免两处漂移。
-// 接口地址默认不带 /v1 —— 与主流供应商文档一致；实际 Anthropic 端点
-// 由 cli.exe 启动时在 base 上派生（commands.rs 已处理 /v1 双重路径）。
+// 接口地址默认不带 /v1 —— 与主流供应商文档一致；agent 端点由
+// agent.exe 启动时在 base 上派生（commands.rs 已处理 /v1 双重路径）。
 interface ModelPreset { name: string; default_model: string; default_url: string; }
 const PROVIDER_PRESETS: Record<string, ModelPreset> = {
   "openai":       { name: "OpenAI",         default_model: "gpt-5.5",            default_url: "https://api.openai.com" },
@@ -1537,23 +1537,23 @@ export async function attachSettingsListeners(container: HTMLElement) {
       const model = modelOpt?.getAttribute("data-value") || "";
       const baseUrl = (container.querySelector("#settings-baseurl") as HTMLInputElement)?.value || "";
       const apiKey = (container.querySelector("#settings-apikey") as HTMLInputElement)?.value || "";
-      // Preserve existing anthropic_url if set (don't overwrite with empty)
-      let anthropicUrl = "";
+      // Preserve existing agent_url if set (don't overwrite with empty)
+      let agentUrl = "";
       try {
-        const cur = await invoke<{ anthropic_url?: string }>("get_ai_config");
-        anthropicUrl = cur.anthropic_url || "";
+        const cur = await invoke<{ agent_url?: string }>("get_ai_config");
+        agentUrl = cur.agent_url || "";
       } catch {}
       await invoke("set_ai_config", {
         provider,
         url: baseUrl,
         key: apiKey,
         model,
-        anthropic_url: anthropicUrl,
+        agent_url: agentUrl,
       });
       // Persist to localStorage so config survives restart
       try {
         localStorage.setItem("lunac-ai-config", JSON.stringify({
-          provider, url: baseUrl, key: apiKey, model, anthropic_url: anthropicUrl,
+          provider, url: baseUrl, key: apiKey, model, agent_url: agentUrl,
         }));
       } catch {}
     } catch (e) {

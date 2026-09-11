@@ -1,7 +1,7 @@
 // src/proxy_server.rs
 // Mini Anthropic-compatible HTTP proxy — built into lunac.exe.
 // Listens on 127.0.0.1:8788, accepts Anthropic Messages API requests
-// from cli.exe, translates to OpenAI/DeepSeek, streams back Anthropic SSE.
+// from agent.exe, translates to OpenAI/DeepSeek, streams back Anthropic SSE.
 //
 // This eliminates the need for proxy.exe. The protocol translation
 // happens in-process, no subprocess overhead.
@@ -303,7 +303,7 @@ fn status_text(code: u16) -> &'static str {
 
 // ── Core: handle Anthropic POST /v1/messages ──────────────────────
 
-fn handle_anthropic_request(
+fn handle_messages_request(
     stream: &mut TcpStream,
     body: &str,
     api_url: &str,
@@ -345,7 +345,7 @@ fn handle_anthropic_request(
         return Err(format!("{} returned {}: {}", api_url, status, text));
     }
 
-    // Stream SSE back to cli.exe in Anthropic format
+    // Stream SSE back to agent.exe in Anthropic format
     let mut raw = stream.try_clone().map_err(|e| e.to_string())?;
     // Send HTTP headers first (chunked for streaming)
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -468,7 +468,7 @@ fn handle_connection(
         // Anthropic API
         if req_line.starts_with("POST /v1/messages") {
             if let Err(e) =
-                handle_anthropic_request(&mut stream, &body, &api_url, &api_key, &model)
+                handle_messages_request(&mut stream, &body, &api_url, &api_key, &model)
             {
                 let error_body = serde_json::json!({
                     "type": "error",

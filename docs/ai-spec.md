@@ -36,8 +36,8 @@ Lunac 是一个 **uTools 风格的桌面启动器 / 搜索工具**，由 Tauri 2
 └────────────────────────────┬─────────────────────────────────────┘
                              │ 子进程 (spawn)
 ┌────────────────────────────▼─────────────────────────────────────┐
-│                  core/ 核心模块 (Agent 后端)                       │
-│  cli.exe   → Claude Code CLI (stream-json 模式，后台运行)          │
+│               core-agent/ 自研 Agent 后端 (agent.exe)              │
+│  agent.exe → lunac 自带，stream-json 模式，后台运行                │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +55,7 @@ Lunac 是一个 **uTools 风格的桌面启动器 / 搜索工具**，由 Tauri 2
 | 剪贴板历史 | `builtin/clipboard-history.ts` | 剪贴板历史管理 — 自动保存复制内容 |
 | 设置面板 | `builtin/settings.ts` | 快捷键绑定 / 模型配置 |
 | 工具编辑器 | `builtin/tool-editor.ts` | MCP tool JSON 编辑管理 |
-| AI 代理 | `builtin/ai-agent.ts` | Agent 对话 — 委托 `main.ts` 启动 cli.exe 子进程 + cli-output 事件渲染 |
+| AI 代理 | `builtin/ai-agent.ts` | Agent 对话 — 委托 `main.ts` 启动 agent.exe 子进程 + cli-output 事件渲染 |
 | OCR 识别 | `builtin/ocr.ts` | 离线 OCR 图片文字识别 (PaddleOCR-json · PP-OCRv4 · 中/英/日/韩/俄) |
 | 样式 | `app/src/styles.css` | 毛玻璃 Catppuccin 主题 |
 | 国际化 | `app/src/i18n.ts` | 多语言翻译模块 — 跟随 Windows 系统语言 |
@@ -139,13 +139,13 @@ Lunac 自动检测 Windows 系统显示语言（`GetUserDefaultUILanguage`），
 
 ## 3. AI 对话系统 — Agent 单模式架构
 
-Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移除）：所有 AI 对话统一走 Claude Code CLI（`cli.exe`）子进程，具备完整工具链（工具调用、文件读写、Shell、权限审批）。
+Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移除）：所有 AI 对话统一走后端子进程 `agent.exe`（自研 [core-agent](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)，见 §3.5），具备完整工具链（工具调用、文件读写、Shell、权限审批）。
 
 ```
 用户输入
   │
-  └── Agent 模式 (cli.exe 直连)
-       └─ spawn cli.exe + 直连供应商 Anthropic 兼容端点
+  └── Agent 模式 (agent.exe 直连)
+       └─ spawn agent.exe + 直连供应商 Anthropic 兼容端点
        └─ 完整工具链 + 技能 + 提示词 + 权限审批 (control_request)
        └─ 可选工作区 (workspace) — 限定 Agent 文件操作目录
 ```
@@ -154,7 +154,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 维度 | Agent 模式 |
 |------|:---:|
-| **后端** | `cli.exe` 直连供应商（内置代理已停用） |
+| **后端** | `agent.exe`（自研 core-agent）直连供应商（内置代理已停用） |
 | **API 调用** | N 次（工具循环） |
 | **Token 消耗** | ~4000+/轮 |
 | **权限** | `can_use_tool` 审批走前端卡片（批量整合 + 对话暂停） |
@@ -164,16 +164,16 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 - **对话模式**：应用始终运行 Agent 进程（`ai_mode` 恒为 "agent"；`set_ai_mode` 拒绝其他值），但提供**对话级模式切换**：
   - **Agent 模式**（默认）：完整工具链 + skills + 权限审批
-  - **简单问答模式**：复用同一 cli.exe，发送消息时注入"直接回答、勿用工具/skills"软约束提示词（`buildSimpleChatHint`），替代已删除的 chat.rs 简单模式；前端按钮 `#chat-mode-btn` 切换，localStorage `lunac-chat-mode` 持久化
-- **权限审批**：CLI 发 `can_use_tool` control_request，前端展示审批卡片并**阻塞等待**用户允许/拒绝（CLI 天然暂停）
-- **工作区**：`AppState.workspace` 决定 cli.exe 的 cwd 与 `--add-dir`；为空回退用户主目录（整个系统可访问，敏感操作走 ask 弹卡）
+  - **简单问答模式**：复用同一 agent.exe，发送消息时注入"直接回答、勿用工具/skills"软约束提示词（`buildSimpleChatHint`），替代已删除的 chat.rs 简单模式；前端按钮 `#chat-mode-btn` 切换，localStorage `lunac-chat-mode` 持久化
+- **权限审批**：agent 发 `can_use_tool` control_request，前端展示审批卡片并**阻塞等待**用户允许/拒绝（agent 天然暂停）
+- **工作区**：`AppState.workspace` 决定 agent.exe 的 cwd 与 `--add-dir`；为空回退用户主目录（整个系统可访问，敏感操作走 ask 弹卡）
 
-### 3.3 技术实现 (`cli.exe` 直连)
+### 3.3 技术实现 (`agent.exe` 直连)
 
-- **直连**：`cli.exe` 直接连供应商原生 Anthropic 兼容端点（`AI_ANTHROPIC_URL` 或 `{base}/anthropic`），完整支持 tool_use
-- **启动**：`start_cli` / `ensure_agent_running` → 设 `ANTHROPIC_BASE_URL` → spawn `cli.exe`（内置代理 `proxy_server.rs` 已停用 — 其 Anthropic→OpenAI 翻译会**丢弃 tools 数组**，导致模型无法输出 tool_use、退化为文本式 XML 工具调用）
+- **直连**：`agent.exe` 直接连供应商原生 Anthropic 兼容端点（`AI_AGENT_URL` 或 `{base}/anthropic`），完整支持 tool_use
+- **启动**：`start_cli` / `ensure_agent_running` → `ai_credentials()` + `configure_agent_env()` 注入 `LUNAC_AGENT_BASE_URL` / `LUNAC_AGENT_TOKEN` / `LUNAC_AGENT_MODEL` → spawn `agent.exe`（内置代理 `proxy_server.rs` 已停用 — 其 Anthropic→OpenAI 翻译会**丢弃 tools 数组**，导致模型无法输出 tool_use、退化为文本式 XML 工具调用）
 - **通信**：`send_message` stdin 写入，stdout stream-json SSE 流式读取（`cli-output` 事件）
-- **停止**：`stop_cli` → kill cli.exe
+- **停止**：`stop_cli` → kill agent.exe
 - **工作区**：`set_workspace(path)` canonicalize 校验目录后存入 `AppState.workspace`；`start_cli_process` 以其为 cwd + `--add-dir`（空值回退用户主目录 → 整个系统可访问，敏感操作仍走 ask 审批弹卡）；前端 localStorage `lunac-agent-workspace` 持久化，启动时恢复
 
 ### 3.4 前端接入
@@ -186,34 +186,41 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 简单问答切换 | `main.ts` `#chat-mode-btn` + `buildSimpleChatHint` | 软约束"勿用工具/skills"，状态栏显示当前模式 |
 | Token 仪表盘 | `main.ts` `updateTokenDashboard` | 完整计费口径：Hit=缓存读取，Miss=普通输入+缓存写入，Total=四类 token 之和 |
 
-### 3.5 自研 agent 核心 `core-agent/`（P0，2026-09）
+### 3.5 自研 agent 核心 `core-agent/`（2026-09，已接线）
 
-`core/cli.exe` 是 Anthropic 的 Claude Code CLI 编译产物，版权不可分发。**架构与 stream-json 协议本身不受版权保护**，故自研 [core-agent](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 以**同一契约**实现同类 agent 循环，作为 drop-in 替代——src-tauri 与前端本来就不关心二进制是谁，因此**零改动**。
+后端二进制 `agent.exe` 由本仓库自研（[core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)），遵守下列 stream-json 契约。src-tauri 的 `start_cli` / `ensure_agent_running` / `start_agent_http` 统一经 `commands.rs` 的 `core_dir()` 定位二进制，按优先级：
 
-**契约（即前端/[main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts#L2924-L3073) 的既有约定）**
+1. `<exe_dir>\resources\agent.exe`（Tauri 打包资源，`bundle.resources` 用 map 形式平铺）
+2. `<exe_dir>\agent.exe`（便携版 / NSIS 安装根，与 lunac.exe 同级）
+3. dev：`<repo>\core-agent\target\{release,debug}\agent.exe`（cargo 产物）
+4. 兜底 `<repo>\core`（历史目录）
+
+**命名纪律**：自研侧不得再出现 `ANTHROPIC_*` / `CLAUDE_CODE_*` 环境变量；仅保留协议必需的 `anthropic-version` 请求头与供应商侧的 `/anthropic` 路由（外部协议名，改了就不通）。IPC 名 `start_cli` / `stop_cli` / `cli-output` / `cli-status` / `cli_bridge` **保持历史命名**（前端与本文档的既有契约，与二进制文件名无关）。
+
+**契约（前端既有约定，不得改动）**
 
 | 面 | 内容 |
 |---|---|
-| env | `ANTHROPIC_BASE_URL`（已是完整 anthropic 端点，请求拼 `/v1/messages`）、`ANTHROPIC_AUTH_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`ANTHROPIC_MODEL` |
-| 启动参数 | 兼容 cli.exe 的 `--print` / `--input-format stream-json` / `--output-format stream-json` / `--include-partial-messages` / `--permission-prompt-tool stdio` / `--mcp-server stdio:<path>` / `--add-dir <ws>`；P0 一律接受并忽略（不因此报错退出） |
+| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED` |
+| 启动参数 | `--print` / `--input-format stream-json` / `--output-format stream-json` / `--include-partial-messages` / `--permission-prompt-tool stdio` / `--mcp-server stdio:<path>` / `--add-dir <ws>`；P0 一律接受并忽略（不因此报错退出） |
 | stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response",…}` 为审批回包 |
 | stdout | 每行一条 JSON：`system/init` → `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，仅无增量时前端兜底）→ `result`（`subtype` / `is_error` / `usage`） |
 
 **P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮自动回滚 history，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
 
-**思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、Anthropic 新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
+**思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、原生 Messages 端点的新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
 
 | 输入 | 首选形态 | `max_tokens` |
 |---|---|---|
 | `MAX_THINKING_TOKENS=0` | `{"type":"disabled"}` | 8192 基线 |
-| `MAX_THINKING_TOKENS=n>0` | `{"type":"enabled","budget_tokens":n}` | `max(n+4096, 8192)` —— Anthropic 要求 `budget_tokens < max_tokens`，deep 档 32768 配 8192 会被判非法 |
+| `MAX_THINKING_TOKENS=n>0` | `{"type":"enabled","budget_tokens":n}` | `max(n+4096, 8192)` —— 端点要求 `budget_tokens < max_tokens`，deep 档 32768 配 8192 会被判非法 |
 | 未设置 | 完全不发该字段 | 8192 基线 |
 
 **400 降级链**（仅当错误正文含 `thinking`/`adaptive`/`budget_tokens` 才触发，避免把「模型名不存在」这类无关 400 也白重试）：`enabled+budget → adaptive → 不带字段`；fast 档为 `disabled → 不带字段`（**不退到 adaptive**，否则等于反过来把思考打开）。降级结果缓存在进程内，后续轮次不再试错，并往 stderr 打一行说明。
 
 **P1–P4 待做**：P1 内置工具（read/write/edit/bash/glob/grep）+ `tool_use`/`tool_result` 循环；P2 `can_use_tool` 权限审批（发 `control_request` 并阻塞等 stdin `control_response`）；P3 MCP 工具桥（作 client 连 `lunac.exe --mcp-server`，读 `<exe 根>\tools\*.json`）；P4 skills / 系统提示词 / 工作区锁（`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`）。
 
-**构建与切换**：`cd core-agent; cargo build --release` → `core-agent/target/release/agent.exe`（约 1.5MB，对比 `cli.exe` 121MB）。接线时只需让 `start_cli_process` 的 `cli_exe` 指向 `core\agent.exe`。
+**构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 1.5MB。打包链路：`bundle.resources` 把它平铺成 `resources\agent.exe`，NSIS 由 `release\lunac-installer.nsi` 装到安装根；`build-release.ps1` 的 **[4/9]** 步必须在 Rust 构建之前跑，否则 resources 缺文件会打包失败。
 
 ### 3.6 数学公式渲染
 
@@ -258,9 +265,9 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
 
 **D. VSCode 插件 = Trae 右侧 AI 窗口形态**
 - 活动栏 Lunac 图标 → 侧边栏 AI 聊天面板（`lunac.chatView`），样式参考 Trae 右侧窗口但保留自身前端风格。
-- **直接驱动 cli.exe**（stream-json 协议），不依赖 Lunac 桌面应用 / HTTP bridge → **Lunac 无需打包安装包**（便携目录 release/Lunac 即可）。
-- cli.exe 发现顺序：配置 `lunac.cliPath` → `release/Lunac/cli.exe` → `%USERPROFILE%/.lunac/cli.exe` → `LUNAC_CLI_PATH`。
-- provider 通过 `lunac.provider/apiKey/apiUrl/model` 配置映射为 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL 环境变量；ripgrep 随附目录加入 PATH。
+- **直接驱动 agent.exe**（stream-json 协议），不依赖 Lunac 桌面应用 / HTTP bridge → **Lunac 无需打包安装包**（便携目录 release/Lunac 即可）。
+- agent.exe 发现顺序：配置 `lunac.cliPath` → `release/Lunac/agent.exe` → `%USERPROFILE%/.lunac/agent.exe` → `LUNAC_AGENT_PATH`。
+- provider 通过 `lunac.provider/apiKey/apiUrl/model` 配置映射为 LUNAC_AGENT_BASE_URL / LUNAC_AGENT_TOKEN / LUNAC_AGENT_MODEL 环境变量；ripgrep 随附目录加入 PATH。
 - webview 内实现：流式渲染（text_delta）、思考折叠、工具卡片、审批卡片（允许/拒绝）、状态指示；进程生命周期随 webview 打开/关闭。
 
 ## 4. 插件系统 + Agent Tools 体系
@@ -274,17 +281,17 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
 硬件 AI Tools 不走前端插件体系，而是集成到 Agent 模式：
 - **定义位置**：`app/src-tauri/tools/*.json` (MCP tool JSON 定义)
 - **运行时路径**：`%LOCALAPPDATA%\Lunac\tools\` (用户可自定义增删)
-- **调用链路**：用户输入 → cli.exe (Agent) → MCP Bridge → `lunac.exe --mcp-server` → 执行 shell/http handler
+- **调用链路**：用户输入 → agent.exe (Agent) → MCP Bridge → `lunac.exe --mcp-server` → 执行 shell/http handler
 - **管理方式**：tool-editor 前端插件提供 UI 管理
 
 ```
 用户输入 (Agent 模式)
   │
-  └─ cli.exe 解析意图
+  └─ agent.exe 解析意图
        └─ 匹配 MCP Tool
             └─ MCP Bridge (lunac.exe --mcp-server)
                  └─ 执行 Shell / HTTP
-                      └─ 返回结果 → cli.exe → 前端渲染
+                      └─ 返回结果 → agent.exe → 前端渲染
 ```
 
 **内置 Agent Tools：**
@@ -392,19 +399,19 @@ app/
 ├── tsconfig.json
 └── package.json
 
-core/
-├── cli.exe                          # 编译后的 Claude Code CLI (121MB，Anthropic 版权，不入库)
-└── ...                              # 数百个 TypeScript 源文件 (休眠)
-
 core-agent/
-├── src/main.rs                      # 自研 agent 核心（P0，drop-in 替代 cli.exe，见 §3.5）
-└── Cargo.toml
+├── src/main.rs                      # 自研 agent 核心 —— lunac 的 agent 后端，见 §3.5
+├── Cargo.toml
+└── target/release/agent.exe          # 编译产物（cargo build --release，约 1.5MB，不入库）
 
 scripts/
 ├── _env.ps1                         # 公共环境准备（把 cargo / mingw64\bin 追加进 PATH，供其它脚本 dot-source）
 ├── verify-git.ps1                   # 新克隆自检（npm run verify），退出码 0/1
-├── tauri-dev.ps1                    # 开发启动脚本
-└── build-core.ps1                   # bun build --compile 构建脚本
+├── commit.ps1                       # 一键提交（npm run commit）：暂存 → 敏感/超大文件检查 → 提交；-Push 才推送
+├── build-core.ps1                   # 编译自研 agent 后端 core-agent → agent.exe（cargo build --release）
+├── dev.ps1 / tauri-dev.ps1          # 开发启动（缺 agent.exe 时先自动构建）
+├── build.ps1 / tauri-build.ps1      # 打包封装
+└── download-paddle-ocr.ps1          # 预置离线 OCR 引擎
 ```
 
 > 所有 ps1 脚本必须用 `$PSScriptRoot` / `Split-Path -Parent $PSScriptRoot` 推导仓库根，**禁止硬编码本机绝对路径**；统一包管理器为 `npm`。
@@ -414,6 +421,11 @@ scripts/
 
 ```powershell
 npm run verify               # 新克隆自检（仓库根，缺什么一次列清）
+npm run commit               # 一键提交当前全部变更（自动生成提交信息）
+npm run build                # 前端编译验证
+# 提交脚本带参数时必须直接调用 .ps1 —— npm run commit -- -xxx 在本机 PowerShell 下不会转发参数：
+powershell -ExecutionPolicy Bypass -File scripts\commit.ps1 -DryRun                       # 只看不提交
+powershell -ExecutionPolicy Bypass -File scripts\commit.ps1 -Message "fix: …" -Push        # 指定信息并推送
 cd app
 npm install                  # 安装前端依赖
 npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173）
@@ -434,10 +446,11 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173
 
 仅在用户明确说"打包"或"生成安装包"时执行：
 
-1. `cd app && cargo build --release` — Rust 编译
-2. `npm run build` — 前端编译
-3. 复制 `lunac.exe` + `cli.exe` + `WebView2Loader.dll` → `release/Lunac/`
-4. NSIS 编译 → `release/Lunac-0.x.0-Setup.exe`
+1. `powershell -File scripts\build-core.ps1` — 编译自研后端 `core-agent` → `agent.exe`（必须在第 2 步前，`bundle.resources` 会引用它）
+2. `cd app && cargo build --release` — Rust 编译
+3. `npm run build` — 前端编译
+4. 复制 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` → `release/Lunac/`
+5. NSIS 编译 → `release/Lunac-0.x.0-Setup.exe`
 
 **日常修改不打包** — 仅编译验证即可。
 
@@ -447,11 +460,11 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173
 
 **红线（违反会造成密钥泄露或侵权，且不可撤销）**：
 
-1. **`core/` 与所有 `cli.exe` 绝不入库** —— `core/` 是 Anthropic 的 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。构建所需的 `core/cli.exe` 由使用者自备 —— 该要求只记录在本规范，**README 等对外页面一律不提**（自研 `core-agent/` 上线后将彻底不依赖它）。
-2. **`.env` 绝不入库** —— `core/.env`（`ANTHROPIC_API_KEY` 等）与 `app/src-tauri/.env`（`AI_API_KEY`）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
-3. **大二进制不入库** —— GitHub 单文件硬上限 100MB（`cli.exe` 121MB 必然失败）、仓库 >1GB 告警。以下均已 gitignore：`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
+1. **`core/` 绝不入库** —— `core/` 是上游 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。**自研 `core-agent/` 已上线，构建与运行都不再依赖它**，该目录仅作历史参考保留在本地（已 gitignore）。
+2. **`.env` 绝不入库** —— `core/.env` 与 `app/src-tauri/.env`（`AI_API_KEY` 等）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
+3. **大二进制不入库** —— GitHub 单文件硬上限 100MB、仓库 >1GB 告警。以下均已 gitignore：`core/`、`core-agent/target`、`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
 
-**README 对外页面纪律**：不出现 Claude Code CLI / `core/cli.exe` 相关说明，不设「快速开始」栏目（构建与自检步骤仅在 `docs/` 与本规范内维护）。
+**README 对外页面纪律**：不出现上游 CLI / `cli.exe` 相关说明，不设「快速开始」栏目（构建与自检步骤仅在 `docs/` 与本规范内维护）。
 
 **必备文件**：`.gitignore`、`LICENSE`（MIT，版权人 `LythrumMoon`）、`README.md`、`.env.example`。
 
@@ -478,7 +491,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | Esc 行为 | ✅ 有内容清空；空白时隐藏（全由 Rust 统一处理） |
 | 设置按钮进入设置面板 | ✅ 支持 toggle：已打开设置时再点击关闭；ESC 关闭任意插件面板 |
 | 幽灵框透明区点击穿透 | ✅ `pointer-events: none` 策略 |
-| AI 对话 (Agent 模式) | ✅ Agent 单模式 — cli.exe 直连 + cli-output 流式渲染（简单模式已移除） |
+| AI 对话 (Agent 模式) | ✅ Agent 单模式 — agent.exe（自研 core-agent）直连 + cli-output 流式渲染（简单模式已移除） |
 | Agent 模式前端接入 | `main.ts` 监听 `cli-output` SSE 事件，流式渲染 Agent 对话 | ✅ 已完成 |
 | Start Menu 实时模糊搜索 | ✅ 已集成（`main.ts` `search_apps`） |
 | 计算器/编码/JSON 插件 | ❌ 已移除 — 2026-07-22 删除，功能由 AI Agent 替代 |
@@ -504,9 +517,9 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
    - 供应商预设与模型建议为单一数据源：PROVIDER_PRESETS / MODEL_SUGGESTIONS（pp/src/plugins/builtin/settings.ts），禁止两处重复维护。
    - 供应商 = 大节点：模型下拉只含**当前供应商**的预设模型 + 该供应商已保存的自定义模型；切换供应商时回落其默认模型，不把上一家模型带入。
    - 自定义模型确认 = 在**当前供应商模型列表内新增一项**，预设全部保留；内联编辑器只“追加编辑行”，禁止覆盖 dropdown 整体 innerHTML。
-   - 接口地址默认**不带 /v1**；cli.exe 组 Anthropic 端点时先剥离末尾 /v1 再拼 /anthropic。
+   - 接口地址默认**不带 /v1**；启动 agent 后端时先剥离末尾 /v1 再拼供应商的 /anthropic 路由（`AI_AGENT_URL` 可整体覆盖该端点）。
    - 模型建议名必须与供应商**实际可用名**一致：DeepSeek 的 Anthropic 兼容端点只认 `deepseek-v4-pro` / `deepseek-flash`（实测臆造名如 `deepseek-v4.1-flash` 会直接 400 并回报支持列表）—— MODEL_SUGGESTIONS 已按此修正。
-3. **设置 · 技能扩展**：固定目录 `<exe 根>\skills`（布局 `<技能key>/SKILL.md`）；lunac 负责 raw SKILL.md URL 安装 / 新建粘贴 / 编辑 / 删除；cli.exe 经 `LUNAC_SKILLS_DIR` 读取该目录，与编译内置技能互不影响；key 由 frontmatter.name 安全 slug 派生。
+3. **设置 · 技能扩展**：固定目录 `<exe 根>\skills`（布局 `<技能key>/SKILL.md`）；lunac 负责 raw SKILL.md URL 安装 / 新建粘贴 / 编辑 / 删除；agent.exe 经 `LUNAC_SKILLS_DIR` 读取该目录，与编译内置技能互不影响；key 由 frontmatter.name 安全 slug 派生。
 4. **搜索性能**：Start Menu 扫描 Rust 侧带 30s TTL 缓存（增删自定义应用主动失效，并同时删除落盘文件防复活）。**三级策略（stale-while-revalidate）**：① TTL 内直接返回；② 过期则**立即返回旧数据 + 后台重建**（搜索路径永不因目录扫描阻塞）；③ 无任何缓存才同步扫一次。扫描结果**落盘到 `<exe 根>\temp\app-index-cache.json`**（含版本号 + 保存时间戳，>7 天视为不可信丢弃），**启动时优先从该文件预热**（跨重启秒出，不再等首次扫描），**热键唤出 / 托盘显示时若缓存过期则后台刷新**（方案A，热键路径非阻塞）。前端输入 60ms 去抖并丢弃过期输入，**内容检测（latest-wins）**：`search_apps` 晚回包时校验键入序号（`_searchSeq`），过期或期间已进插件态直接丢弃、不触碰 UI——快速键入只显示最终结果，杜绝旧结果覆盖/一次键入多次渲染闪烁；结果渲染不保留入场 / 开合动画。**窗口高度**：搜索路径懒测量（双 rAF 后实测），`setSize` 串行化（latest-wins，在途期间只记最新期望高度，完成后补发一次），杜绝快速键入时逐键 setSize IPC 风暴 / onResized 回环。
    - **窗口高度「滑动」动画（正式，2026-09）**：非插件/搜索态高度变化默认逐帧滑动（rail 模式——每步等上一 setSize 经 onResized 落地再走下一步），默认参数定稿 `rigidity 0.22`（每帧逼近比例，大=刚性/跟手，小=柔滑拖尾）/ `maxStep 14`（单步最大位移 px）/ `stepHz 120`（步频上限）/ `suppressMs 400`（唤出/启动抑制期）；DevTools Console `__lunac_resize_anim`（含 `enabled=false` 即回退原直设路径）可实时调节，`__lunac_resize_anim_stats` 记录步数/耗时。首次高度落位直设防启动滑屏；插件态离散跳变不走动画。**唤出抑制**：热键/托盘唤出（`lunac-window-shown`）后 `suppressMs` 内的高度变化一律直设并在期内顺延（内容分批到达：剪贴板探测 → 加泡泡 → 重跑搜索 → 实测），保证窗口**瞬时完整展开**——否则会看到结果区被物理窗口裁剪、逐帧“撑开”（WebView2 无法渲染超出窗口的内容）。
 5. **通用自定义下拉框**：固定约 4 行（≈120px）可见，更多项内部滚动；滚轮强制内部滚动（`passive:false`）+ `overscroll-behavior:contain`；WebView2 透明窗口禁止原生 `<select>`。
@@ -1108,6 +1121,8 @@ Rust 侧新增 `cleanup_session` IPC（调用 Node.js 的 `cleanupSession()` 需
 ## 19. 用户自定义 Agent 工具/技能 — 双路径执行计划
 
 > **状态：路径 1 已完成 ✅ / 路径 2 已完成 ✅，2026-07-21 执行完毕**
+>
+> ⚠️ **2026-09 架构变更提示**：本节所述的 MCP 客户端 / SkillTool / 技能加载等基础设施来自**上游 Claude Code 源码（`core/`）**，该目录已停用；自研 `agent.exe` 侧的对应能力（P3 MCP 工具桥、P4 skills）尚未落地，见 §3.5「P1–P4 待做」。下文凡涉及 `core/...` 路径的条目均指旧实现，接入 core-agent 时需按 §3.5 契约重做。
 
 ### 背景
 
@@ -1117,10 +1132,10 @@ Rust 侧新增 `cleanup_session` IPC（调用 Node.js 的 `cleanupSession()` 需
 现有：
   App 插件 (registry.ts)  ←→  UI 层（搜索/计算/编码）
   Core 工具 (tools.ts)    ←→  编译时硬编码，用户不可扩展
-  唯一动态机制：MCP 协议（已实现但未暴露给用户）
+  唯一动态机制：MCP 协议（旧实现于 core/，现待 core-agent 重做）
 ```
 
-cli.exe 已具备完善的基础设施：
+旧上游 core 曾具备完善的基础设施（**均已随 `core/` 停用**）：
 - **MCP 客户端** (`core/services/mcp/client.ts`) — 动态发现 MCP server 的工具列表并注入 Agent
 - **插件市场 Schema** (`core/utils/plugins/schemas.ts`) — 完整 Zod schema，支持 7 种安装来源
 - **SkillTool** (`core/tools/SkillTool/SkillTool.ts`) — inline/fork/remote 三种执行模式
@@ -1135,8 +1150,8 @@ cli.exe 已具备完善的基础设施：
 用户自定义工具定义 (JSON/YAML 配置文件)
     ↓ 读取
 Lunac 内置 MCP Server  (app/src-tauri/src/mcp_server.rs)
-    ↓ stdio (cli.exe 启动时作为 MCP server spawn)
-cli.exe MCP Client  (core/services/mcp/client.ts)
+    ↓ stdio（agent.exe 启动时以 `--mcp-server stdio:<path>` 挂载）
+agent.exe MCP Client  （旧实现 core/services/mcp/client.ts，core-agent 侧待 P3 重做）
     ↓ tools/list → tools/call
 Agent 工具池自动注入 → LLM 可调用
 ```
@@ -1178,7 +1193,7 @@ Agent 工具池自动注入 → LLM 可调用
 |------|------|------|
 | 1 | `app/src-tauri/src/mcp_server.rs` | 实现 MCP stdio server：从 `%LOCALAPPDATA%\Lunac\tools\` 读取所有 JSON → 构造 `tools/list` 响应 → `tools/call` 时匹配 handler 类型并执行 |
 | 2 | `app/src-tauri/Cargo.toml` | 确保 `serde_json` 已存在，无需额外依赖（MCP 协议纯 JSON over stdio） |
-| 3 | `app/src-tauri/src/commands.rs` | 修改 `start_cli_process()` 或 `start_cli()`：启动 cli.exe 时追加 `--mcp-server stdio:<lunac-mcp.exe>` 参数（或启动一个嵌入 MCP server 的子进程） |
+| 3 | `app/src-tauri/src/commands.rs` | `start_cli_process()` / `start_cli()` 已在启动 agent.exe 时追加 `--mcp-server stdio:<path>`（P0 侧仅接受并忽略）；待 core-agent 侧 P3 实现 MCP client 后即可真正消费 |
 | 4 | `app/src/plugins/builtin/` | 新增 `tool-editor` 插件：JSON 编辑器 UI，搜索 "tool" / "工具" 进入，可视化创建/编辑/删除工具定义 |
 | 5 | `app/src-tauri/src/mcp_server.rs` | 实现 `resources/list`（可选）：将工具定义文件列作 resource，支持 `resources/read` 读取详情 |
 | 6 | `docs/` | 新建 `tools.md`：用户文档，格式说明 + 示例（天气/翻译/文件批处理） |
@@ -1257,7 +1272,7 @@ Agent 获得新工具 + 新技能 + 新钩子
         ↓                    ↓                    ↓
    MCP Server          Plugin Registry        File Scanner
         ↓                    ↓                    ↓
-        └──────────────── cli.exe Agent 工具池 ──────────────┘
+        └──────────────── agent.exe Agent 工具池 ─────────────┘
                                   ↓
                           LLM 可调用的完整工具集合
 ```
@@ -1266,7 +1281,7 @@ Agent 获得新工具 + 新技能 + 新钩子
 
 ```
 路径 1 (MCP 桥接)
-  └─ 无依赖，cli.exe MCP 客户端已完备 ✓
+  └─ 无依赖，MCP Server 侧（mcp_server.rs）已完备 ✓；agent.exe 侧 MCP 客户端待 P3 重做
   └─ 产物：mcp_server.rs + tools/*.json 约定
 
 路径 2 (插件市场)

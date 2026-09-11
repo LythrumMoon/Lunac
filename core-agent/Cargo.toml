@@ -2,7 +2,7 @@
 name = "agent"
 version = "0.1.0"
 edition = "2021"
-description = "Lunac self-developed agent core — drop-in for the Claude Code CLI stream-json contract"
+description = "Lunac self-developed agent core — lunac 桌面端的 agent 后端（stream-json 契约）"
 
 [[bin]]
 name = "agent"

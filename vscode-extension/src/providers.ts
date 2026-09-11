@@ -81,11 +81,10 @@ export function resolveConfig(providerName: string): ResolvedConfig {
   const config = PROVIDERS[providerName];
 
   if (config) {
-    // API key: settings → env var → ANTHROPIC_API_KEY legacy fallback
+    // API key: settings → provider-specific env var（不再从 ANTHROPIC_API_KEY 全局回退）
     const apiKey =
       getSetting("apiKey") ||
       getEnv(config.keyEnv) ||
-      getEnv("ANTHROPIC_API_KEY") ||
       "";
     const model = getSetting("model") || config.defaultModel;
     const apiUrl = getSetting("apiUrl") || config.defaultUrl;
@@ -101,8 +100,7 @@ export function resolveConfig(providerName: string): ResolvedConfig {
   // Custom provider
   if (providerName === "custom") {
     const apiUrl = getSetting("apiUrl");
-    const apiKey =
-      getSetting("apiKey") || getEnv("ANTHROPIC_API_KEY") || "";
+    const apiKey = getSetting("apiKey") || "";
     const model = getSetting("model");
     const format = (getSetting("apiFormat") as "openai" | "anthropic") || "openai";
 

@@ -1,4 +1,4 @@
-﻿# scripts/verify-git.ps1
+# scripts/verify-git.ps1
 # 「新克隆自检」—— 把本仓库克隆到新机器后先跑这个，一次列清缺什么。
 #
 # 用法:  powershell -ExecutionPolicy Bypass -File scripts\verify-git.ps1
@@ -42,7 +42,7 @@ foreach ($tool in @("node", "npm", "cargo")) {
 if (Get-Command bun -ErrorAction SilentlyContinue) {
   Ok "bun → $(& bun --version 2>&1 | Select-Object -First 1)"
 } else {
-  Warn "未安装 bun（仅当你打算自己编译 core/cli.exe 时才需要）"
+  Warn "未安装 bun（本仓库已改用 cargo 构建 agent 后端，通常不再需要）"
 }
 $nsis = Get-Command makensis -ErrorAction SilentlyContinue
 if (-not $nsis) {
@@ -64,15 +64,14 @@ if (Test-Path (Join-Path $appDir "node_modules")) {
 }
 
 # ── 3. Agent 后端 ───────────────────────────────────────────────
-Write-Host "[3/7] Agent 后端 core\cli.exe" -ForegroundColor Cyan
-$cli = Join-Path $root "core\cli.exe"
-if (Test-Path $cli) {
-  Ok ("core\cli.exe 存在（{0} MB）" -f [math]::Round((Get-Item $cli).Length / 1MB, 1))
+Write-Host "[3/7] Agent 后端 core-agent\target\release\agent.exe" -ForegroundColor Cyan
+$agent = Join-Path $root "core-agent\target\release\agent.exe"
+if (Test-Path $agent) {
+  Ok ("agent.exe 已编译（{0} MB）" -f [math]::Round((Get-Item $agent).Length / 1MB, 1))
 } else {
-  Bad "core\cli.exe 缺失 —— 仓库不含该文件（Anthropic 版权，禁止再分发）"
-  Note "后果: AI 对话报 'cli.exe not found'；tauri build 也会失败（bundle.resources 引用了它）"
-  Note "方案 A: 自带 core\cli.exe 放到 core\cli.exe"
-  Note "方案 B: 用自研后端 —— cd core-agent ; cargo build --release（见 docs/ai-spec.md §3.5）"
+  Warn "agent.exe 未编译 —— AI 对话将报 'agent.exe not found'"
+  Note "修复: powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1"
+  Note "（等价于 cd core-agent ; cargo build --release；首次约需数分钟，产物约 1.5MB）"
 }
 
 # ── 4. AI 配置 ──────────────────────────────────────────────────

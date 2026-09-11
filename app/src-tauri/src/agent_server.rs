@@ -2,12 +2,12 @@
 // HTTP server for VSCode extension → Agent mode bridge.
 // Listens on 127.0.0.1:8789, provides 3 endpoints:
 //
-//   POST /agent/start   → spawn cli.exe (one-time)
-//   POST /agent/message  → write JSON to cli.exe stdin
-//   GET  /agent/stream   → SSE stream of cli.exe stdout (stream-json)
+//   POST /agent/start   → spawn agent.exe (one-time)
+//   POST /agent/message  → write JSON to agent.exe stdin
+//   GET  /agent/stream   → SSE stream of agent.exe stdout (stream-json)
 //
 // The VSCode webview uses fetch() + EventSource to drive Agent mode
-// without Tauri IPC, while sharing the same cli.exe process as the
+// without Tauri IPC, while sharing the same agent.exe process as the
 // desktop app.
 
 use crate::cli_bridge;
@@ -102,7 +102,7 @@ fn stream_sse(stream: &mut TcpStream) -> Result<(), String> {
         }
     }
 
-    // Send done event when cli.exe exits (channel closed)
+    // Send done event when agent.exe exits (channel closed)
     let done = "event: done\ndata: {}\n\n";
     let _ = stream.write_all(done.as_bytes());
     let _ = stream.flush();
@@ -170,7 +170,7 @@ fn handle_connection(mut stream: TcpStream) {
 // ── Public API ────────────────────────────────────────────────────
 
 /// Start the Agent HTTP bridge on 127.0.0.1:8789.
-/// The desktop app can also drive Agent via Tauri IPC on the same cli.exe process.
+/// The desktop app can also drive Agent via Tauri IPC on the same agent.exe process.
 pub fn start() -> Result<(), String> {
     if SERVER_RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(());

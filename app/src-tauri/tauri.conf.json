@@ -45,9 +45,9 @@
     "icon": [
       "icons/icon.ico"
     ],
-    "resources": [
-          "../../core/cli.exe"
-        ],
+    "resources": {
+      "../../core-agent/target/release/agent.exe": "agent.exe"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

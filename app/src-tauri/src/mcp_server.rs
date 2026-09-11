@@ -1,8 +1,8 @@
-// MCP stdio server — bridges user-defined tools to cli.exe Agent
+// MCP stdio server — bridges user-defined tools to agent.exe Agent
 //
 // Reads tool definitions from %LOCALAPPDATA%\Lunac\tools\*.json
 // Implements MCP stdio transport (JSON-RPC 2.0 over stdin/stdout)
-// Spawned by cli.exe as a child process: --mcp-server stdio:lunac.exe,--mcp-server
+// Spawned by agent.exe as a child process: --mcp-server stdio:lunac.exe,--mcp-server
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

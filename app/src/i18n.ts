@@ -2066,11 +2066,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Installed Skills",
   },
   "settings.skills_installed_hint": {
-    "zh-CN": "安装目录：Lunac 数据根（exe 所在目录）\\skills，与 cli.exe 共用；cli.exe 启动时自动加载该目录下的技能。",
-    "zh-TW": "安裝目錄：Lunac 資料根（exe 所在目錄）\\skills，與 cli.exe 共用；cli.exe 啟動時自動載入該目錄下的技能。",
-    "ja": "インストール先: Lunac データルート(exe のあるフォルダ)\\skills。cli.exe と共有し、cli.exe 起動時に自動で読み込みます。",
-    "ko": "설치 폴더: Lunac 데이터 루트(exe 위치)\\skills. cli.exe와 공유하며 cli.exe 시작 시 자동 로드됩니다.",
-    "en": "Directory: Lunac data root (where the exe lives)\\skills, shared with cli.exe; cli.exe auto-loads skills here at start.",
+    "zh-CN": "安装目录：Lunac 数据根（exe 所在目录）\\skills，与 agent.exe 共用；agent.exe 启动时自动加载该目录下的技能。",
+    "zh-TW": "安裝目錄：Lunac 資料根（exe 所在目錄）\\skills，與 agent.exe 共用；agent.exe 啟動時自動載入該目錄下的技能。",
+    "ja": "インストール先: Lunac データルート(exe のあるフォルダ)\\skills。agent.exe と共有し、agent.exe 起動時に自動で読み込みます。",
+    "ko": "설치 폴더: Lunac 데이터 루트(exe 위치)\\skills. agent.exe와 공유하며 agent.exe 시작 시 자동 로드됩니다.",
+    "en": "Directory: Lunac data root (where the exe lives)\\skills, shared with agent.exe; agent.exe auto-loads skills here at start.",
   },
   "settings.skills_none": {
     "zh-CN": "暂无已安装技能。可通过上方「从 URL 安装」导入 SKILL.md，或用「新建 / 粘贴」创建。",

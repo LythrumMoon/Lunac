@@ -4,11 +4,11 @@
 #   .\build-release.ps1 0.6.0     - explicit version
 #
 # Steps:
-#   1. Pre-flight checks (bun / cargo / makensis)
+#   1. Pre-flight checks (cargo / makensis)
 #   2. Kill existing processes
 #   3. Build web assets (tsc + vite)
-#   4. Build Rust binary (cargo build --release)
-#   5. Build cli.exe (bun build --compile)
+#   4. Build agent.exe (cargo build --release, core-agent/)
+#   5. Build Rust binary (cargo build --release)
 #   6. Copy binaries to release/Lunac/
 #   7. Package VSCode extension (.vsix)
 #   8. Stage PaddleOCR-json for offline OCR
@@ -61,7 +61,6 @@ Write-Host ""
 Write-Host "[1/9] Pre-flight checks..." -ForegroundColor Yellow
 
 $Checks = @{
-  "bun"      = { bun --version 2>&1 | Out-Null; $LASTEXITCODE -eq 0 }
   "cargo"    = { cargo --version 2>&1 | Out-Null; $LASTEXITCODE -eq 0 }
   "makensis" = { [bool]$Makensis }
 }
@@ -81,7 +80,7 @@ foreach ($tool in $Checks.Keys) {
 $RequiredDirs = @(
   "$Root\app",
   "$Root\app\src-tauri",
-  "$Root\core",
+  "$Root\core-agent",
   "$Root\release"
 )
 foreach ($dir in $RequiredDirs) {
@@ -102,7 +101,7 @@ Write-Host ""
 
 Write-Host "[2/9] Killing running processes..." -ForegroundColor Yellow
 $Killed = $false
-foreach ($name in @("lunac", "cli")) {
+foreach ($name in @("lunac", "agent")) {
   $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
   if ($proc) {
     taskkill /F /IM "$name.exe" 2>$null | Out-Null
@@ -131,30 +130,32 @@ try {
 Write-Host ""
 
 # ═══════════════════════════════════════════════════════════════════
-# 4. Build Rust release binary (lunac.exe)
+# 4. Build agent.exe (self-developed agent backend, core-agent/)
+#    Must run BEFORE the Rust build: tauri.conf.json 的 bundle.resources
+#    指向 core-agent\target\release\agent.exe，缺文件会让打包失败。
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[4/9] Building Rust binary (cargo build --release)..." -ForegroundColor Yellow
-Push-Location "$Root\app\src-tauri"
+Write-Host "[4/9] Building agent.exe (cargo build --release, core-agent)..." -ForegroundColor Yellow
+Push-Location "$Root\core-agent"
 try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   cargo build --release
-  if ($LASTEXITCODE -ne 0) { throw "Rust build failed (exit $LASTEXITCODE)" }
+  if ($LASTEXITCODE -ne 0) { throw "agent.exe build failed (exit $LASTEXITCODE)" }
   $sw.Stop()
   Write-Host "  Done in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s" -ForegroundColor Green
 } finally { Pop-Location }
 Write-Host ""
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. Build cli.exe (Bun standalone binary)
+# 5. Build Rust release binary (lunac.exe)
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[5/9] Building cli.exe (bun build --compile)..." -ForegroundColor Yellow
-Push-Location "$Root\core"
+Write-Host "[5/9] Building Rust binary (cargo build --release)..." -ForegroundColor Yellow
+Push-Location "$Root\app\src-tauri"
 try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  bun build --compile entrypoints/cli.tsx --outfile cli.exe
-  if ($LASTEXITCODE -ne 0) { throw "cli.exe build failed (exit $LASTEXITCODE)" }
+  cargo build --release
+  if ($LASTEXITCODE -ne 0) { throw "Rust build failed (exit $LASTEXITCODE)" }
   $sw.Stop()
   Write-Host "  Done in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s" -ForegroundColor Green
 } finally { Pop-Location }
@@ -172,7 +173,7 @@ New-Item -ItemType Directory $AppDir -Force | Out-Null
 
 $Binaries = @{
   "lunac.exe"           = "$Root\app\src-tauri\target\release\lunac.exe"
-  "cli.exe"             = "$Root\core\cli.exe"
+  "agent.exe"           = "$Root\core-agent\target\release\agent.exe"
   "WebView2Loader.dll"  = "$Root\app\src-tauri\target\release\WebView2Loader.dll"
 }
 

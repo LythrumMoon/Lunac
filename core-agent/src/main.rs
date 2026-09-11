@@ -1,15 +1,15 @@
 // core-agent/src/main.rs
 // Lunac 自研 agent 核心 —— P0：纯文本流式对话闭环
 //
-// 本程序是 Claude Code CLI（core/cli.exe）的 **drop-in 替代**：遵守 lunac
-// 既有的 stream-json 契约（见 docs/ai-spec.md §3、app/src/main.ts 对
-// `cli-output` 的逐行解析），因此 src-tauri 与前端 **无需任何改动**，
-// 只要把 core/cli.exe 换成 core/agent.exe 即可。
+// 本程序是 lunac 桌面端的唯一 agent 后端：遵守既有 stream-json 契约
+// （见 docs/ai-spec.md §3、app/src/main.ts 对 `cli-output` 的逐行解析），
+// 由 src-tauri 的 start_cli 拉起（二进制落点见 core_dir()）。
 //
 // 契约速查
-//   env    ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL
-//          （由 src-tauri 的 start_cli 按设置面板配置注入；鉴权必须走
-//            Bearer，用 x-api-key 会被兼容端点判 401）
+//   env    LUNAC_AGENT_BASE_URL（完整端点，请求再拼 /v1/messages）
+//          LUNAC_AGENT_TOKEN     （鉴权必须走 Bearer；用 x-api-key 会被
+//                                 兼容端点判 401）
+//          LUNAC_AGENT_MODEL
 //   stdin  每行一条 JSON
 //            {"type":"user","session_id":"","message":{"role":"user",
 //             "content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}
@@ -48,12 +48,11 @@ You currently have NO tools available — do not claim to read files, run comman
 // ── 思考档位：跨模型自适应 ───────────────────────────────────────
 //
 // lunac 的思考档位由 src-tauri 经 `MAX_THINKING_TOKENS` 传入
-// （0=fast 不思考 / 8192=think / 32768=deep），并用
-// `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING` 阻止 core 对未知模型走 adaptive。
+// （0=fast 不思考 / 8192=think / 32768=deep）。
 //
-// 但各供应商的 Anthropic 兼容端点对 `thinking` 字段的接受度不一样：
+// 但各供应商的兼容端点对 `thinking` 字段的接受度不一样：
 //   · DeepSeek   —— 只认 enabled / disabled，传 adaptive 会 400
-//   · Anthropic  —— 新模型要求 adaptive，传 enabled+budget 可能 400
+//   · 原生 Messages 端点的新模型 —— 要求 adaptive，传 enabled+budget 可能 400
 //   · Kimi 等兼容层 —— 可能整个字段都不支持，带了就 400
 //
 // 所以这里**不硬编码模型名单**：按 env 决定首选形态，遇到「与 thinking
@@ -66,7 +65,7 @@ enum Thinking {
     Disabled,
     /// `{"type":"enabled","budget_tokens":n}` —— think/deep 档
     Budget(u32),
-    /// `{"type":"adaptive"}` —— Anthropic 新模型
+    /// `{"type":"adaptive"}` —— 原生 Messages 端点的新模型
     Adaptive,
     /// 完全不发该字段，交由端点默认（未设置 env 时即是此态）
     Omit,
@@ -104,7 +103,7 @@ impl Thinking {
     }
 }
 
-/// Anthropic 要求 `budget_tokens < max_tokens`，故思考档必须抬高 max_tokens，
+/// 端点要求 `budget_tokens < max_tokens`，故思考档必须抬高 max_tokens，
 /// 否则 deep 档（32768）配 8192 会被判参数非法。
 fn max_tokens_for(plan: Thinking) -> u32 {
     match plan {
@@ -134,18 +133,18 @@ struct Cfg {
 
 impl Cfg {
     fn from_env() -> Result<Self, String> {
-        let base = std::env::var("ANTHROPIC_BASE_URL")
+        let base = std::env::var("LUNAC_AGENT_BASE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-        let token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .ok_or("LUNAC_AGENT_BASE_URL is not set")?;
+        let token = std::env::var("LUNAC_AGENT_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .ok_or("ANTHROPIC_AUTH_TOKEN is not set")?;
-        let model = std::env::var("ANTHROPIC_MODEL")
+            .ok_or("LUNAC_AGENT_TOKEN is not set")?;
+        let model = std::env::var("LUNAC_AGENT_MODEL")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "claude-sonnet-4-5".to_string());
+            .ok_or("LUNAC_AGENT_MODEL is not set")?;
 
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
@@ -191,7 +190,7 @@ fn emit_init(model: &str) {
 // ── 入口 ─────────────────────────────────────────────────────────
 
 fn main() {
-    // 兼容 cli.exe 的调用方式：参数一律接受并忽略（P0 无工具/无 MCP）。
+    // src-tauri 传入的 CLI 风格参数一律接受并忽略（P0 无工具/无 MCP）。
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-v") {
         println!("agent 0.1.0 (lunac self-developed agent core, P0)");
@@ -241,7 +240,7 @@ fn main() {
         // stdin 关闭 ⇒ 上游（lunac.exe）已退出
     });
 
-    // system/init 由 run_query 每轮发出（与 cli.exe 行为一致），启动时不必发
+    // system/init 由 run_query 每轮发出（前端据此推进 agentState），启动时不必发
     let mut history: Vec<Value> = Vec::new();
     for msg in rx {
         match msg.get("type").and_then(Value::as_str) {

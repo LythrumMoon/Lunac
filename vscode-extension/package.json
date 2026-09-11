@@ -88,7 +88,7 @@
         "lunac.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key. Falls back to provider-specific env vars (DEEPSEEK_API_KEY, OPENAI_API_KEY, etc.) and ANTHROPIC_API_KEY."
+          "description": "API key. Falls back to provider-specific env vars (DEEPSEEK_API_KEY, OPENAI_API_KEY, etc.)."
         },
         "lunac.model": {
           "type": "string",
@@ -109,7 +109,7 @@
         "lunac.cliPath": {
           "type": "string",
           "default": "",
-          "description": "Absolute path to cli.exe. Leave empty for auto-discovery (release/Lunac, %USERPROFILE%/.lunac, or LUNAC_CLI_PATH)."
+          "description": "Absolute path to agent.exe. Leave empty for auto-discovery (release/Lunac, %USERPROFILE%/.lunac, or LUNAC_AGENT_PATH)."
         }
       }
     }

@@ -1,8 +1,8 @@
 // src-tauri/src/commands.rs
-// Tauri IPC commands — CLI subprocess management and message relay.
+// Tauri IPC commands — agent subprocess management and message relay.
 // Note: Simple AI chat is handled directly by chat.rs (no proxy needed).
-// cli.exe is the full Agent backend (tools, skills, prompts).
-// It is optional and started on demand via start_cli.
+// agent.exe（自研 core-agent，见 docs/ai-spec.md §3.5）是 Agent 后端，
+// 可选、按需经 start_cli 拉起。
 
 use crate::AppState;
 use crate::proxy_server;
@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter, State};
 pub struct StatusPayload {
     pub state: String,
     pub message: String,
-    /// CLI process instance id. Every cli.exe spawn gets a fresh id; the
+    /// Agent process instance id. Every agent.exe spawn gets a fresh id; the
     /// frontend ignores "closed" events whose instance doesn't match the
     /// currently-known one — a stale close from a stopped CLI can no longer
     /// tear down a newly started session.
@@ -41,12 +41,15 @@ pub struct CliOutput {
 
 // ── Path helpers ──────────────────────────────────────────────────
 
-/// Returns the directory containing compiled CLI and proxy binaries.
-/// In dev mode this is the `core/` project directory.
-/// In release mode checks multiple locations (in priority order):
-///   1. exe_dir/resources/  — Tauri's built-in bundler puts resources here
-///   2. exe_dir/            — our custom NSIS installer puts cli.exe alongside lunac.exe
-///   3. ../../../../core    — dev mode fallback (navigate up from src-tauri/target/debug/)
+/// 自研 agent 后端二进制名（core-agent 的 cargo 产物）。
+const AGENT_EXE: &str = "agent.exe";
+
+/// Returns the directory containing the compiled agent binary (`agent.exe`).
+/// Priority:
+///   1. exe_dir/resources/  — Tauri 打包资源解压目录
+///   2. exe_dir/            — 便携版 / NSIS 安装根（agent.exe 与 lunac.exe 同目录）
+///   3. dev: <repo>/core-agent/target/{release,debug}  — cargo 产物
+///   4. dev: <repo>/core    — 兜底（历史 agent.exe 所在目录）
 fn core_dir() -> std::path::PathBuf {
     let exe_dir = std::env::current_exe()
         .unwrap()
@@ -56,18 +59,25 @@ fn core_dir() -> std::path::PathBuf {
 
     // Release: Tauri's bundle extraction directory
     let resources_dir = exe_dir.join("resources");
-    if resources_dir.join("cli.exe").exists() {
+    if resources_dir.join(AGENT_EXE).exists() {
         return resources_dir;
     }
 
-    // Release: our custom NSIS installer puts cli.exe alongside lunac.exe
-    if exe_dir.join("cli.exe").exists() {
+    // Release: 便携版 / NSIS 安装根（agent.exe 与 lunac.exe 同级）
+    if exe_dir.join(AGENT_EXE).exists() {
         return exe_dir;
     }
 
-    // Dev mode: navigate up from src-tauri/target/{debug,release}/ to core/
-    exe_dir
-        .join("..").join("..").join("..").join("..")
+    // Dev: navigate up from src-tauri/target/{debug,release}/ to the repo root
+    let repo_root = exe_dir.join("..").join("..").join("..").join("..");
+    for rel in ["core-agent/target/release", "core-agent/target/debug"] {
+        let dir = repo_root.join(rel);
+        if dir.join(AGENT_EXE).exists() {
+            return dir.canonicalize().unwrap_or(dir);
+        }
+    }
+
+    repo_root
         .join("core")
         .canonicalize()
         .unwrap_or_else(|_| std::env::current_dir().unwrap().join("..").join("core"))
@@ -76,7 +86,7 @@ fn core_dir() -> std::path::PathBuf {
 // ── Subprocess management ─────────────────────────────────────────
 
 // ── Windows Job Object：子进程严格绑定 lunac.exe 生命周期 ────────
-// spawn 的子进程（cli.exe / llama-server.exe）由 OS 记录父子关系，
+// spawn 的子进程（agent.exe / llama-server.exe）由 OS 记录父子关系，
 // 任务管理器"进程"页展开 Lunac 分组即可看到（CREATE_NO_WINDOW 只是
 // 不弹控制台，进程本身可见）。但父进程崩溃时子进程会变孤儿；
 // Job Object + KILL_ON_JOB_CLOSE 保证 lunac.exe 以任何方式退出
@@ -173,37 +183,22 @@ mod job {
 // ── Agent HTTP bridge (VSCode extension) ─────────────────────────
 // Same logic as start_cli but without Tauri AppHandle/State dependencies.
 // Called by agent_server.rs via POST /agent/start.
-// The desktop app can also drive Agent via Tauri IPC on the same cli.exe process.
+// The desktop app can also drive the agent via Tauri IPC on the same agent.exe process.
 
 pub fn start_agent_http() -> Result<String, String> {
     if cli_bridge::is_running() {
         return Ok("already running".into());
     }
 
-    let api_url = env::var("AI_API_URL")
-        .or_else(|_| env::var("DEEPSEEK_URL"))
-        .unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let api_key = env::var("AI_API_KEY")
-        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
-        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
-        .map_err(|_| "No AI_API_KEY configured".to_string())?;
-    let model = env::var("AI_MODEL")
-        .unwrap_or_else(|_| "deepseek-v4-pro".into());
+    let (api_url, api_key, model) = ai_credentials()?;
 
     proxy_server::stop();
-
-    let anth_url = env::var("AI_ANTHROPIC_URL")
-        .unwrap_or_else(|_| format!("{}/anthropic", api_url.trim_end_matches('/')));
-    env::set_var("ANTHROPIC_BASE_URL", anth_url);
-    env::set_var("ANTHROPIC_AUTH_TOKEN", &api_key);
-    env::remove_var("ANTHROPIC_API_KEY");
-    env::set_var("ANTHROPIC_MODEL", &model);
-    env::set_var("ANTHROPIC_SMALL_FAST_MODEL", &model);
+    configure_agent_env(&api_url, &api_key, &model);
 
     let dir = core_dir();
-    let cli_exe = dir.join("cli.exe");
-    if !cli_exe.exists() {
-        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+    let agent_exe = dir.join(AGENT_EXE);
+    if !agent_exe.exists() {
+        return Err(format!("agent.exe not found at {}", agent_exe.display()));
     }
 
     // Ripgrep vendor path
@@ -217,7 +212,7 @@ pub fn start_agent_http() -> Result<String, String> {
         env::set_var("USE_BUILTIN_RIPGREP", "0");
     }
 
-    let cli_path = cli_exe.to_string_lossy().to_string();
+    let agent_path = agent_exe.to_string_lossy().to_string();
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--verbose".into(),
@@ -238,7 +233,7 @@ pub fn start_agent_http() -> Result<String, String> {
     args.push(".".into());
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let mut child = spawn_child(&cli_path, &args_refs, &dir, &[])?;
+    let mut child = spawn_child(&agent_path, &args_refs, &dir, &[])?;
 
     let stdin = child.stdin.take();
     if let Some(stdin) = stdin {
@@ -426,13 +421,13 @@ fn start_cli_process(
         }
     };
 
-    let cli_exe = core_dir.join("cli.exe");
-    if !cli_exe.exists() {
-        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+    let agent_exe = core_dir.join(AGENT_EXE);
+    if !agent_exe.exists() {
+        return Err(format!("agent.exe not found at {}", agent_exe.display()));
     }
-    let cli_path = cli_exe.to_string_lossy().to_string();
+    let agent_path = agent_exe.to_string_lossy().to_string();
 
-    // Args for the compiled standalone CLI (no "bun run" prefix needed)
+    // Args for the compiled standalone agent (no "bun run" prefix needed)
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--verbose".into(),
@@ -445,14 +440,14 @@ fn start_cli_process(
         "--include-partial-messages".into(),
         // Route permission "ask" decisions to the frontend via the
         // can_use_tool control_request protocol (approval cards in UI).
-        // Without this the CLI decides everything silently by itself.
+        // Without this the agent decides everything silently by itself.
         "--permission-prompt-tool".into(),
         "stdio".into(),
     ];
 
-    // ── MCP bridge: connect cli.exe to lunac.exe's built-in MCP server.
-    // cli.exe parses --mcp-server stdio:<path> and generates a temporary
-    // --mcp-config that launches lunac.exe --mcp-server as a child process.
+    // ── MCP bridge: connect agent.exe to lunac.exe's built-in MCP server.
+    // agent.exe parses --mcp-server stdio:<path> and spawns
+    // lunac.exe --mcp-server as a child process.
     // The MCP server reads user-defined tools from <exe 根>\tools\
     {
         let lunac_exe = std::env::current_exe()
@@ -485,15 +480,15 @@ fn start_cli_process(
     if workspace_locked {
         envs.push(("LUNAC_WORKSPACE_LOCKED", "1".into()));
     }
-    // 已安装技能固定目录 → cli.exe（core 侧经 LUNAC_SKILLS_DIR 额外扫描
+    // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
     // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
     envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
 
-    // DeepSeek 思考模式三档 → cli.exe 环境变量（点2/7）。
-    // core 侧依据 MAX_THINKING_TOKENS 决定 thinking 开关与预算
-    // （0=disabled，>0=enabled+budgetTokens）；DeepSeek 官方 Anthropic 兼容
-    // 端点只接受 enabled/disabled，故必须 CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1
-    // 阻止 core 对未知模型默认走 {type:"adaptive"}。
+    // 思考档位 → agent.exe 环境变量。
+    // core-agent 依据 MAX_THINKING_TOKENS 决定 thinking 形态与预算
+    // （0=disabled，>0=enabled+budgetTokens），并对不接受该字段的供应商
+    // 自动走 400 降级链（见 docs/ai-spec.md §3.5），无需再注入
+    // Claude 专有的 adaptive 抑制变量。
     //   fast : MAX_THINKING_TOKENS=0            → 不思考
     //   think: MAX_THINKING_TOKENS=8192         → 思考（8k budget）
     //   deep : MAX_THINKING_TOKENS=32768        → 深度思考（32k budget）
@@ -503,22 +498,14 @@ fn start_cli_process(
         .map(|g| g.clone())
         .unwrap_or_else(|_| "fast".into());
     match thinking_mode.as_str() {
-        "think" => {
-            envs.push(("MAX_THINKING_TOKENS", "8192".into()));
-            envs.push(("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "1".into()));
-        }
-        "deep" => {
-            envs.push(("MAX_THINKING_TOKENS", "32768".into()));
-            envs.push(("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "1".into()));
-        }
-        _ => {
-            envs.push(("MAX_THINKING_TOKENS", "0".into()));
-        }
+        "think" => envs.push(("MAX_THINKING_TOKENS", "8192".into())),
+        "deep" => envs.push(("MAX_THINKING_TOKENS", "32768".into())),
+        _ => envs.push(("MAX_THINKING_TOKENS", "0".into())),
     }
 
-    let mut child = spawn_child(&cli_path, &args_refs, &workdir, &envs)?;
+    let mut child = spawn_child(&agent_path, &args_refs, &workdir, &envs)?;
 
-    // Unique instance id for this cli.exe spawn — the frontend uses it to
+    // Unique instance id for this agent spawn — the frontend uses it to
     // discard stale "closed" events after a stop/restart.
     let instance = next_cli_instance();
 
@@ -589,10 +576,33 @@ fn start_cli_process(
     Ok(())
 }
 
-/// 构造 Anthropic 兼容端点。
+/// 解析 AI 凭据（`.env` 由 main.rs 载入进程环境）。
+/// 返回 (api_url, api_key, model)。
+fn ai_credentials() -> Result<(String, String, String), String> {
+    let api_url = env::var("AI_API_URL")
+        .or_else(|_| env::var("DEEPSEEK_URL"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".into());
+    let api_key = env::var("AI_API_KEY")
+        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+        .map_err(|_| "No AI_API_KEY configured".to_string())?;
+    let model = env::var("AI_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
+    Ok((api_url, api_key, model))
+}
+
+/// 把凭据注入自研 agent 后端（core-agent）读取的三个环境变量。
+/// 鉴权必须走 `authorization: Bearer`；用 `x-api-key` 会被兼容端点判 401。
+fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
+    let agent_url = agent_endpoint(api_url, env::var("AI_AGENT_URL").ok().as_deref());
+    env::set_var("LUNAC_AGENT_BASE_URL", agent_url);
+    env::set_var("LUNAC_AGENT_TOKEN", api_key);
+    env::set_var("LUNAC_AGENT_MODEL", model);
+}
+
+/// 构造 agent 后端要连接的端点。
 /// api_url 若带末尾 `/v1`（OpenAI 兼容风格的地址栏/预设），先剥离再拼
-/// `/anthropic`，避免出现 `/v1/anthropic` 双重路径；explicit 优先（AI_ANTHROPIC_URL）。
-fn anthropic_endpoint(api_url: &str, explicit: Option<&str>) -> String {
+/// 供应商的兼容路由 `/anthropic`（外部路由，非本项目命名），避免出现
+/// `/v1/anthropic` 双重路径；explicit 优先（`AI_AGENT_URL`）。
+fn agent_endpoint(api_url: &str, explicit: Option<&str>) -> String {
     if let Some(a) = explicit {
         let a = a.trim();
         if !a.is_empty() {
@@ -612,41 +622,23 @@ fn anthropic_endpoint(api_url: &str, explicit: Option<&str>) -> String {
 
 #[tauri::command]
 pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    let api_url = env::var("AI_API_URL")
-        .or_else(|_| env::var("DEEPSEEK_URL"))
-        .unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let api_key = env::var("AI_API_KEY")
-        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
-        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
-        .map_err(|_| "No AI_API_KEY configured".to_string())?;
-    let model = env::var("AI_MODEL")
-        .unwrap_or_else(|_| "deepseek-v4-pro".into());
+    let (api_url, api_key, model) = ai_credentials()?;
 
-    // Agent mode: connect cli.exe DIRECTLY to the provider's native
-    // Anthropic-compatible endpoint. This gives full tool-calling
-    // support — the old proxy dropped `tools` from requests, so the
-    // model could never emit tool_use blocks.
-    // Auth MUST be Bearer via ANTHROPIC_AUTH_TOKEN; x-api-key → 401.
+    // 直连供应商的兼容端点（自带工具调用链）。内置代理 proxy_server.rs
+    // 已停用 —— 它的 Anthropic→OpenAI 翻译会丢掉 `tools`，模型永远发不出
+    // tool_use，只能退化成文本式 XML 工具调用。
     proxy_server::stop();
-    // Providers whose Anthropic endpoint is NOT base+"/anthropic"
-    // (e.g. Zhipu GLM) set AI_ANTHROPIC_URL explicitly via set_ai_config.
-    let anth_url = anthropic_endpoint(&api_url, env::var("AI_ANTHROPIC_URL").ok().as_deref());
-    env::set_var("ANTHROPIC_BASE_URL", anth_url);
-    env::set_var("ANTHROPIC_AUTH_TOKEN", &api_key);
-    env::remove_var("ANTHROPIC_API_KEY"); // avoid x-api-key overriding Bearer
-    env::set_var("ANTHROPIC_MODEL", &model);
-    env::set_var("ANTHROPIC_SMALL_FAST_MODEL", &model);
+    configure_agent_env(&api_url, &api_key, &model);
 
     let dir = core_dir();
-    let cli_exe = dir.join("cli.exe");
-    if !cli_exe.exists() {
+    let agent_exe = dir.join(AGENT_EXE);
+    if !agent_exe.exists() {
         proxy_server::stop();
-        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+        return Err(format!("agent.exe not found at {}", agent_exe.display()));
     }
 
-    // Ripgrep for the compiled cli.exe: the bundled path points into Bun's
-    // virtual filesystem (B:\~BUN\...) where rg.exe was never packed.
-    // Force system-PATH mode and prepend the on-disk vendor dir to PATH.
+    // ripgrep：把随附目录（<core>\utils\vendor\ripgrep\x64-win32）前置进 PATH，
+    // 并强制走系统 PATH 模式。
     let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
     if rg_dir.join("rg.exe").exists() {
         let rg_str = rg_dir.display().to_string();
@@ -657,20 +649,20 @@ pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<Str
         env::set_var("USE_BUILTIN_RIPGREP", "0");
     }
 
-    // Only emit starting if CLI is not already running — avoid spurious
+    // Only emit starting if the agent is not already running — avoid spurious
     // cliReady=false with no follow-up stdout. ensure_agent_running()
     // (called before ai-mode-changed) already handles the first spawn.
     let already_running = cli_bridge::is_running();
     if !already_running {
         app.emit("cli-status", StatusPayload {
             state: "starting".into(),
-            message: format!("Mode agent, CLI at {}", dir.display()),
+            message: format!("Mode agent, agent.exe at {}", dir.display()),
             instance: 0, // informational — not tied to a specific spawn
         }).ok();
     }
 
     start_cli_process(&state, app.clone(), &dir)?;
-    Ok("CLI started".into())
+    Ok("Agent started".into())
 }
 
 #[tauri::command]
@@ -841,16 +833,16 @@ pub fn set_detached(detached: bool) {
 
 /// Update AI provider config at runtime (from the settings plugin).
 /// Values become process env vars, inherited by chat.rs (simple mode,
-/// per-request) and cli.exe (agent mode, next start_cli).
-/// `anthropic_url` overrides base+"/anthropic" for providers with a
-/// non-standard Anthropic endpoint (e.g. Zhipu GLM); empty = default rule.
+/// per-request) and agent.exe (agent mode, next start_cli).
+/// `agent_url` overrides base+"/anthropic" for providers with a
+/// non-standard route (e.g. Zhipu GLM); empty = default rule.
 #[tauri::command]
 pub async fn set_ai_config(
     provider: String,
     url: String,
     key: String,
     model: String,
-    anthropic_url: Option<String>,
+    agent_url: Option<String>,
 ) -> Result<String, String> {
     if url.trim().is_empty() || model.trim().is_empty() {
         return Err("url / model must not be empty".into());
@@ -861,9 +853,9 @@ pub async fn set_ai_config(
     env::set_var("AI_API_URL", url.trim());
     env::set_var("AI_API_KEY", key.trim());
     env::set_var("AI_MODEL", model.trim());
-    match anthropic_url.as_deref().map(str::trim) {
-        Some(a) if !a.is_empty() => env::set_var("AI_ANTHROPIC_URL", a),
-        _ => env::remove_var("AI_ANTHROPIC_URL"),
+    match agent_url.as_deref().map(str::trim) {
+        Some(a) if !a.is_empty() => env::set_var("AI_AGENT_URL", a),
+        _ => env::remove_var("AI_AGENT_URL"),
     }
     Ok("AI config updated".into())
 }
@@ -876,11 +868,12 @@ pub fn get_ai_config() -> serde_json::Value {
         "base_url": env::var("AI_API_URL").unwrap_or_default(),
         "model": env::var("AI_MODEL").unwrap_or_default(),
         "api_key": env::var("AI_API_KEY").unwrap_or_default(),
+        "agent_url": env::var("AI_AGENT_URL").unwrap_or_default(),
     })
 }
 
 // ── AI Workspace ──────────────────────────────────────────────────
-// Simple mode removed (2026-08-04): the app runs Agent (cli.exe) only.
+// Simple mode removed (2026-08-04): the app runs Agent (agent.exe) only.
 // The workspace is the directory the agent may operate in — used as the
 // CLI working directory and --add-dir scope. Empty string = user home dir
 // (whole system reachable; edits elsewhere go through ask approval).
@@ -920,7 +913,7 @@ pub fn get_workspace(state: State<'_, AppState>) -> String {
 }
 
 /// Set the user-custom tool blacklist (第 19 点缓存优化)。
-/// Merged with DEFAULT_TOOL_BLACKLIST on the next cli.exe start.
+/// Merged with DEFAULT_TOOL_BLACKLIST on the next agent.exe start.
 /// The caller should stop_cli + start_cli to apply the new list.
 #[tauri::command]
 pub fn set_tool_blacklist(
@@ -935,47 +928,29 @@ pub fn set_tool_blacklist(
     Ok("Tool blacklist updated".into())
 }
 
-/// Internal: start CLI (direct provider connection). Does NOT start local model (caller decides).
+/// Internal: start the agent (direct provider connection). Does NOT start local model (caller decides).
 fn ensure_agent_running(state: &AppState, app: &AppHandle) -> Result<(), String> {
     // Already running? (cli_bridge owns the process since the HTTP bridge refactor)
     if cli_bridge::is_running() {
         return Ok(());
     }
 
-    let api_url = env::var("AI_API_URL")
-        .or_else(|_| env::var("DEEPSEEK_URL"))
-        .unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let api_key = env::var("AI_API_KEY")
-        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
-        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
-        .map_err(|_| "No AI_API_KEY configured".to_string())?;
-    let model = env::var("AI_MODEL")
-        .unwrap_or_else(|_| "deepseek-v4-pro".into());
+    let (api_url, api_key, model) = ai_credentials()?;
 
-    // Connect cli.exe DIRECTLY to the provider's native Anthropic-compatible
-    // endpoint — identical to start_cli(). The old built-in proxy strips the
-    // `tools` array from requests, so the model can never emit tool_use blocks
-    // and falls back to raw XML tool text (`<toolcall ...>`), which renders as
-    // garbage in the agent chat bubble.
+    // 直连供应商的兼容端点 —— 与 start_cli() 一致。内置代理会丢掉
+    // `tools` 数组，模型永远发不出 tool_use，只能返回原始 XML 工具文本
+    // （`<toolcall ...>`），在对话气泡里渲染成乱码。
     proxy_server::stop();
-    let anth_url = anthropic_endpoint(&api_url, env::var("AI_ANTHROPIC_URL").ok().as_deref());
-    env::set_var("ANTHROPIC_BASE_URL", anth_url);
-    // Auth MUST be Bearer via ANTHROPIC_AUTH_TOKEN; x-api-key → 401.
-    env::set_var("ANTHROPIC_AUTH_TOKEN", &api_key);
-    env::remove_var("ANTHROPIC_API_KEY"); // avoid x-api-key overriding Bearer
-    env::set_var("ANTHROPIC_MODEL", &model);
-    env::set_var("ANTHROPIC_SMALL_FAST_MODEL", &model);
+    configure_agent_env(&api_url, &api_key, &model);
 
     let dir = core_dir();
-    let cli_exe = dir.join("cli.exe");
-    if !cli_exe.exists() {
+    let agent_exe = dir.join(AGENT_EXE);
+    if !agent_exe.exists() {
         proxy_server::stop();
-        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+        return Err(format!("agent.exe not found at {}", agent_exe.display()));
     }
 
-    // Ripgrep vendor path — same as start_cli(): the bundled path points into
-    // Bun's virtual filesystem where rg.exe was never packed. Force system-PATH
-    // mode and prepend the on-disk vendor dir to PATH.
+    // ripgrep：与 start_cli() 相同 —— 随附目录前置进 PATH 并强制走系统 PATH 模式。
     let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
     if rg_dir.join("rg.exe").exists() {
         let rg_str = rg_dir.display().to_string();
@@ -1036,7 +1011,7 @@ pub async fn set_thinking_mode(
         *guard = mode.clone();
     }
 
-    // 思考模式通过环境变量在 cli.exe spawn 时生效。restart=true（用户显式
+    // 思考模式通过环境变量在 agent.exe spawn 时生效。restart=true（用户显式
     // 切换）才重启 CLI；startup 同步只存值、不拉起 CLI（保持懒启动）。
     if restart {
         cli_bridge::kill_and_cleanup();
@@ -1182,7 +1157,7 @@ fn mcp_tools_dir() -> std::path::PathBuf {
 
 // ── 已安装技能（设置「技能扩展」）──────────────────────────────
 // 固定技能目录：<exe_dir>\skills，布局 <技能名>/SKILL.md。
-// cli.exe（独立编译）通过 LUNAC_SKILLS_DIR 环境变量读取同一目录（core 补丁）；
+// agent.exe 通过 LUNAC_SKILLS_DIR 环境变量读取同一目录；
 // lunac 前端在此列出 / 新建 / 编辑 / 删除。
 
 /// 固定技能根目录（与 MCP tools 同级，均在 exe 安装根下）。

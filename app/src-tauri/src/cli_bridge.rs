@@ -1,10 +1,10 @@
 // src/cli_bridge.rs
 // Global CLI state — shared between Tauri commands and HTTP agent server.
 // Allows VSCode extension to drive Agent mode via HTTP while the desktop
-// app uses Tauri IPC on the same cli.exe process.
+// app uses Tauri IPC on the same agent.exe process.
 //
 // Architecture:
-//   CLI_STDIN   → write user messages to cli.exe
+//   CLI_STDIN   → write user messages to agent.exe
 //   CLI_PROCESS → lifecycle (kill on stop)
 //   CLI_OUTPUT  → mpsc broadcast for SSE streaming (HTTP) + Tauri events
 
@@ -18,7 +18,7 @@ type OutputRx = mpsc::Receiver<String>;
 
 /// Bounded per-subscriber buffer. If an SSE client stops reading (half-open
 /// socket), sends fail and the subscriber is dropped instead of buffering
-/// cli.exe output forever — prevents unbounded background memory growth.
+/// agent.exe output forever — prevents unbounded background memory growth.
 const OUTPUT_CHANNEL_CAPACITY: usize = 512;
 
 static CLI_PROCESS: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
@@ -62,7 +62,7 @@ pub fn is_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Write a JSON line to cli.exe stdin. Used by both Tauri command and HTTP endpoint.
+/// Write a JSON line to agent.exe stdin. Used by both Tauri command and HTTP endpoint.
 pub fn write_to_cli(json_line: &str) -> Result<(), String> {
     let mut guard = CLI_STDIN
         .get()
@@ -78,9 +78,9 @@ pub fn write_to_cli(json_line: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Kill cli.exe and clean up all state. Called on stop or app shutdown.
+/// Kill agent.exe and clean up all state. Called on stop or app shutdown.
 /// Never blocks indefinitely: TerminateProcess is asynchronous, so we poll
-/// try_wait for up to 2s instead of an unbounded wait() (a hung cli.exe
+/// try_wait for up to 2s instead of an unbounded wait() (a hung agent.exe
 /// must not freeze stop_cli).
 pub fn kill_and_cleanup() {
     // Kill process
@@ -116,7 +116,7 @@ pub fn kill_and_cleanup() {
 /// Register a new subscriber. Returns a Receiver for SSE streaming.
 /// The stdout reader thread in commands.rs will send each line to all registrants.
 /// Bounded channel: a subscriber that stops reading gets dropped (send fails)
-/// instead of accumulating cli.exe output in memory.
+/// instead of accumulating agent.exe output in memory.
 pub fn subscribe_output() -> OutputRx {
     let (tx, rx) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
     if let Ok(mut guard) = ensure_txs().lock() {
@@ -125,7 +125,7 @@ pub fn subscribe_output() -> OutputRx {
     rx
 }
 
-/// Broadcast a line from cli.exe stdout to all registered SSE subscribers.
+/// Broadcast a line from agent.exe stdout to all registered SSE subscribers.
 /// Cleans up dead subscribers (receivers that have been dropped).
 pub fn broadcast_output(line: String) {
     let txs = ensure_txs();

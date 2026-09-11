@@ -655,7 +655,7 @@ let lastAgentTokens = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 }; // 
 //   "fast"  = 不思考（MAX_THINKING_TOKENS=0，直接回答）
 //   "think" = 思考（8k 思考预算）
 //   "deep"  = 深度思考（32k 思考预算）
-// 三档共用同一 cli.exe 完整工具链，仅思考深度不同；由 Rust 端
+// 三档共用同一 agent.exe 完整工具链，仅思考深度不同；由 Rust 端
 // set_thinking_mode → start_cli_process 写入环境变量。
 type ThinkingMode = "fast" | "think" | "deep";
 let chatMode: ThinkingMode = "think";
@@ -1148,7 +1148,7 @@ async function showChatHistory() {
 }
 
 // ── AI Chat state ───────────────────────────────────────────────
-// Simple mode removed (2026-08-04): the app always runs Agent (cli.exe).
+// Simple mode removed (2026-08-04): the app always runs Agent (agent.exe).
 
 function forceResetPluginUI() {
   // Exit any detached mode
@@ -1205,7 +1205,7 @@ function forceResetPluginUI() {
         url: cfg.url,
         key: cfg.key || "",
         model: cfg.model,
-        anthropic_url: cfg.anthropic_url || null,
+        agent_url: cfg.agent_url || null,
       }).catch(() => {});
     }
   } catch { /* keep .env defaults */ }
@@ -1222,7 +1222,7 @@ function forceResetPluginUI() {
   } catch { /* no workspace configured */ }
 
   // Restore custom tool blacklist (第19点) — Rust merges it with defaults
-  // on the next cli.exe start.
+  // on the next agent.exe start.
   try {
     const bl = localStorage.getItem("lunac-tool-blacklist");
     if (bl) {
@@ -1234,7 +1234,7 @@ function forceResetPluginUI() {
   } catch { /* no blacklist saved */ }
 
   // Sync DeepSeek thinking mode (fast/think/deep) to Rust on startup.
-  // restart=false → 只存值，不拉起 cli.exe（保持懒启动）。
+  // restart=false → 只存值，不拉起 agent.exe（保持懒启动）。
   invoke("set_thinking_mode", { mode: chatMode, restart: false }).catch(() => {});
 })();
 
@@ -1584,7 +1584,7 @@ document.addEventListener("click", (e) => {
   }
 });
 // 保存流程（用户需求顺序）：点击保存 → 按钮原位切换提醒 → 保存历史 →
-// 退出 cli.exe → 重启 cli.exe 应用新黑名单（具体在 __lunac_save_tool_blacklist）
+// 退出 agent.exe → 重启 agent.exe 应用新黑名单（具体在 __lunac_save_tool_blacklist）
 chatToolsSave?.addEventListener("click", async () => {
   if (!chatToolsSave) return;
   const custom: string[] = [];
@@ -1792,7 +1792,7 @@ async function stopAIChat() {
   isStreaming = false;
   setStreamingUI(false);
 
-  // Stop the CLI (agent mode) — kills cli.exe and clears its context.
+  // Stop the CLI (agent mode) — kills agent.exe and clears its context.
   await invoke("stop_cli").catch(() => {});
   cliReady = false;
   agentView = null;
@@ -2559,7 +2559,7 @@ function agentToolResult(isError: boolean, content: unknown) {
 }
 
 // ── Agent permission dialogs (can_use_tool control protocol) ────
-// When a tool needs approval, cli.exe emits a control_request on stdout
+// When a tool needs approval, agent.exe emits a control_request on stdout
 // and BLOCKS until a control_response arrives on stdin. Without this UI
 // the agent would hang forever on any gated tool (e.g. Bash commands).
 const pendingPermissionCards = new Map<string, HTMLElement>();
@@ -3073,7 +3073,7 @@ listen<{ line: string }>("cli-output", (event) => {
   } catch { /* ignore non-JSON lines */ }
 });
 
-// Instance id of the currently-known cli.exe. Every cli-status event carries
+// Instance id of the currently-known agent.exe. Every cli-status event carries
 // the instance it belongs to; a "closed" from an older instance (arriving
 // after a stop+restart) is ignored so it can't tear down a fresh session.
 let cliCurrentInstance: number | null = null;
@@ -3095,7 +3095,7 @@ listen<{ state: string; message: string; instance?: number }>("cli-status", (eve
       startAgentChat(retryQuery);
     }
   } else if (event.payload.state === "closed") {
-    // Stale close from a previous cli.exe instance (stop + fast restart) →
+    // Stale close from a previous agent.exe instance (stop + fast restart) →
     // ignore, it must not null cliReady or end the new session's turn.
     if (event.payload.instance && cliCurrentInstance && event.payload.instance !== cliCurrentInstance) {
       console.warn(`[cli] ignoring stale closed event (instance ${event.payload.instance} != ${cliCurrentInstance})`);
@@ -4372,7 +4372,7 @@ async function startAIChat(query: string, files?: string[]) {
 // 1) localStorage 持久化用户自定义清单
 // 2) 保存当前会话历史（避免重启丢失）
 // 3) 交给 Rust 合并默认黑名单（set_tool_blacklist）
-// 4) 退出 cli.exe → 重启 cli.exe（新 --disallowedTools 生效）
+// 4) 退出 agent.exe → 重启 agent.exe（新 --disallowedTools 生效）
 (window as any).__lunac_save_tool_blacklist = async (custom: string[]) => {
   try { localStorage.setItem("lunac-tool-blacklist", JSON.stringify(custom)); } catch {}
   try { await saveCurrentSession(); } catch (e) { console.warn("[lunac] save history before restart:", e); }

@@ -61,7 +61,7 @@ pub struct AppState {
     pub ai_mode: Mutex<String>, // "agent" (simple mode removed 2026-08-04)
     pub thinking_mode: Mutex<String>, // DeepSeek thinking level: "fast" | "think" | "deep"
     pub workspace: Mutex<String>, // AI agent workspace dir; empty = user home dir (whole system)
-    pub tool_blacklist: Mutex<Vec<String>>, // user-custom tool blacklist; merged with defaults on cli.exe start
+    pub tool_blacklist: Mutex<Vec<String>>, // user-custom tool blacklist; merged with defaults on agent.exe start
 }
 
 fn kill_port(port: u16) {
@@ -97,7 +97,7 @@ fn kill_port(port: u16) {
 
 fn main() {
     // ── MCP stdio server mode ──────────────────────────────────
-    // Spawned by cli.exe as: lunac.exe --mcp-server
+    // Spawned by agent.exe as: lunac.exe --mcp-server
     // Runs the MCP protocol bridge, reading user tools from
     // <exe 根>\tools\*.json and serving them via stdio.
     if std::env::args().any(|a| a == "--mcp-server") {

@@ -1,6 +1,6 @@
 // ── Lunac AI Chat WebviewView (sidebar, Trae-style right panel) ───
-// Directly drives cli.exe via the stream-json protocol — NO dependency on
-// the Lunac desktop app or its HTTP bridge, so Lunac needs no installer.
+// Directly drives agent.exe（自研 core-agent）via the stream-json protocol —
+// NO dependency on the Lunac desktop app or its HTTP bridge.
 //
 // Stream-json protocol (same as the desktop frontend):
 //   stdin  line:  {"type":"user","message":{"role":"user","content":"..."}}
@@ -9,7 +9,7 @@
 //   stdout line:  {"type":"system"|"assistant"|"user"|"stream_event"|"control_request"|...}
 //
 // Spawn args mirror app/src-tauri/src/commands.rs start_cli_process:
-//   cli.exe --print --verbose --input-format stream-json --output-format
+//   agent.exe --print --verbose --input-format stream-json --output-format
 //   stream-json --include-partial-messages --permission-prompt-tool stdio
 //   --permission-mode acceptEdits --add-dir <workdir> .
 
@@ -38,19 +38,19 @@ class CliAgentSession {
     return this.child !== null && this.child.exitCode === null;
   }
 
-  /** Resolve cli.exe: config → extension dir release/Lunac → user home .lunac → env. */
+  /** Resolve agent.exe: config → extension dir release/Lunac → user home .lunac → env. */
   static resolveCliPath(context: vscode.ExtensionContext): string | null {
     const cfg = vscode.workspace.getConfiguration("lunac");
     const configured = cfg.get<string>("cliPath");
     if (configured && existsSync(configured)) return configured;
 
     const candidates = [
-      join(context.extensionPath, "..", "release", "Lunac", "cli.exe"),
-      join(context.extensionPath, "cli.exe"),
-      join(process.env.USERPROFILE || process.env.HOME || "", ".lunac", "cli.exe"),
+      join(context.extensionPath, "..", "release", "Lunac", "agent.exe"),
+      join(context.extensionPath, "agent.exe"),
+      join(process.env.USERPROFILE || process.env.HOME || "", ".lunac", "agent.exe"),
     ];
-    if (process.env.LUNAC_CLI_PATH && existsSync(process.env.LUNAC_CLI_PATH)) {
-      candidates.unshift(process.env.LUNAC_CLI_PATH);
+    if (process.env.LUNAC_AGENT_PATH && existsSync(process.env.LUNAC_AGENT_PATH)) {
+      candidates.unshift(process.env.LUNAC_AGENT_PATH);
     }
     for (const p of candidates) {
       if (existsSync(p)) return p;
@@ -58,13 +58,13 @@ class CliAgentSession {
     return null;
   }
 
-  /** Start cli.exe with the stream-json agent protocol. */
+  /** Start agent.exe with the stream-json agent protocol. */
   start(context: vscode.ExtensionContext, onEvent: (obj: Record<string, unknown>) => void): { ok: boolean; error?: string } {
     if (this.running) return { ok: true };
 
-    const cliPath = CliAgentSession.resolveCliPath(context);
-    if (!cliPath) {
-      return { ok: false, error: "cli.exe not found. Install Lunac (portable) or set lunac.cliPath." };
+    const agentPath = CliAgentSession.resolveCliPath(context);
+    if (!agentPath) {
+      return { ok: false, error: "agent.exe not found. Build it with scripts/build-core.ps1 or set lunac.cliPath." };
     }
 
     // Workspace root = agent working directory (falls back to home dir)
@@ -80,23 +80,20 @@ class CliAgentSession {
     try {
       const cfg = resolveConfig(provider);
       const base = cfg.apiUrl.replace(/\/+$/, "");
-      // Providers whose Anthropic endpoint is NOT base+"/anthropic" (e.g. Zhipu)
-      // are handled via lunac.apiUrl already pointing at the anthropic route.
+      // Providers whose agent endpoint is NOT base+"/anthropic" (e.g. Zhipu)
+      // are handled via lunac.apiUrl already pointing at that route.
       env = {
         ...process.env,
-        ANTHROPIC_BASE_URL: provider === "anthropic" ? base : `${base}/anthropic`,
-        ANTHROPIC_AUTH_TOKEN: cfg.apiKey,
-        ANTHROPIC_MODEL: cfg.model,
-        ANTHROPIC_SMALL_FAST_MODEL: cfg.model,
-        ANTHROPIC_CLI_DISABLE_TELEMETRY: "true",
+        LUNAC_AGENT_BASE_URL: provider === "anthropic" ? base : `${base}/anthropic`,
+        LUNAC_AGENT_TOKEN: cfg.apiKey,
+        LUNAC_AGENT_MODEL: cfg.model,
       };
-      delete env.ANTHROPIC_API_KEY; // avoid x-api-key overriding Bearer auth
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       return { ok: false, error: `Provider config: ${msg}` };
     }
 
-    // Ripgrep vendor dir must be on PATH for the compiled cli.exe
+    // Ripgrep vendor dir must be on PATH for the agent's grep/glob tools
     const rgDir = join(context.extensionPath, "..", "release", "Lunac", "utils", "vendor", "ripgrep", "x64-win32");
     if (existsSync(join(rgDir, "rg.exe"))) {
       env = { ...env, PATH: `${rgDir};${env.PATH || ""}`, USE_BUILTIN_RIPGREP: "0" };
@@ -115,14 +112,14 @@ class CliAgentSession {
     ];
 
     try {
-      this.child = spawn(cliPath, args, {
+      this.child = spawn(agentPath, args, {
         cwd: workdir,
         env,
         windowsHide: true,
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      return { ok: false, error: `Failed to start cli.exe: ${msg}` };
+      return { ok: false, error: `Failed to start agent.exe: ${msg}` };
     }
 
     const child = this.child;
@@ -163,7 +160,7 @@ class CliAgentSession {
     return { ok: true };
   }
 
-  /** Write one JSON line to cli.exe stdin. */
+  /** Write one JSON line to agent.exe stdin. */
   send(obj: unknown): boolean {
     if (!this.running || !this.child) return false;
     this.child.stdin.write(JSON.stringify(obj) + "\n");
