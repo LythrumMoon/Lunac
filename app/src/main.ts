@@ -1517,35 +1517,20 @@ function renderWorkspaceMenuLabels() {
 }
 
 // ── AI tool blacklist (第19点缓存优化 — 入口在 AI 对话界面 🛠) ──
-// locked 项 = 保守默认黑名单（与 Rust DEFAULT_TOOL_BLACKLIST 对齐，
-// 锁定不可取消，Rust 侧恒加）；其余为可选工具，用户可再勾选禁用。
-// 勾选 = 从请求体 tools schema 中剔除 → 缩减 DeepSeek 前缀缓存
-// 尾部每轮恒定 miss 的体积（工具数组更短且不再随 MCP 漂移）。
+// 勾选 = 从请求体 tools schema 中剔除 → tools 数组更短，且前缀里不再有
+// 用不上的工具定义（DeepSeek 自动前缀缓存按最长公共前缀命中）。
+// 名单 = agent.exe 的真实内置工具 + Skill（MCP 用户工具名在运行期才知道，
+// 不在此列出；要禁用它们请从 `--disallowedTools` 侧或删掉 tools\*.json）。
 interface BlacklistTool { name: string; locked?: boolean; }
 const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
-  { name: "ToolSearch", locked: true },
-  { name: "ListMcpResourcesTool", locked: true },
-  { name: "ReadMcpResourceTool", locked: true },
-  { name: "SendMessage", locked: true },
-  { name: "EnterWorktree", locked: true },
-  { name: "ExitWorktree", locked: true },
-  { name: "Config", locked: true },
-  { name: "TeamCreate", locked: true },
-  { name: "TeamDelete", locked: true },
-  { name: "CronCreate", locked: true },
-  { name: "CronDelete", locked: true },
-  { name: "CronList", locked: true },
-  { name: "RemoteTrigger", locked: true },
-  { name: "LSP", locked: true },
-  { name: "NotebookEdit", locked: true },
-  { name: "Brief", locked: true },
-  { name: "WebFetch" },
-  { name: "WebSearch" },
-  { name: "Agent" },
-  { name: "TaskCreate" },
-  { name: "TaskGet" },
-  { name: "TaskUpdate" },
-  { name: "TaskList" },
+  { name: "Read" },
+  { name: "Write" },
+  { name: "Edit" },
+  { name: "Bash" },
+  { name: "PowerShell" },
+  { name: "Glob" },
+  { name: "Grep" },
+  { name: "Skill" },
 ];
 
 function loadCustomBlacklist(): string[] {

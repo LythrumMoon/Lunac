@@ -314,38 +314,16 @@ fn spawn_child(
 
 // ── CLI process ───────────────────────────────────────────────────
 
-/// 保守默认工具黑名单（第 19 点 — DeepSeek 缓存命中率优化）。
-/// Lunac 桌面助手用不到的实验性工具，经 `--disallowedTools` 从请求体
-/// tools schema 中剔除：既让工具数组更短（尾部每轮恒定 miss 体积变小），
-/// 又避免随 MCP 工具增减漂移。用户可在设置面板追加禁用更多工具
-/// （存入 AppState.tool_blacklist，start_cli_process 时与此合并）。
-/// 注意：多数受 feature flag 控制、默认就不在工具池中，禁入无害。
-const DEFAULT_TOOL_BLACKLIST: &[&str] = &[
-    "ToolSearch",
-    "ListMcpResourcesTool",
-    "ReadMcpResourceTool",
-    "SendMessage",
-    "EnterWorktree",
-    "ExitWorktree",
-    "Config",
-    "TeamCreate",
-    "TeamDelete",
-    "CronCreate",
-    "CronDelete",
-    "CronList",
-    "RemoteTrigger",
-    "LSP",
-    "NotebookEdit",
-    "Brief",
-];
-
-/// Build the `--disallowedTools` args (defaults + user-custom, deduped).
-/// Empty when nothing to deny — keeps the CLI arg list minimal.
+/// 手动禁用的工具名 → `--disallowedTools` 参数（第 19 点 — 前缀缓存优化：
+/// tools 数组更短，前缀里不再有永远用不上的工具定义）。
+///
+/// 这里**不再内置任何默认黑名单**：旧 CLI 时代那批名字（`ToolSearch` /
+/// `LSP` / `Brief` …）对自研 agent.exe 全是空转项，而 agent.exe 侧的过滤是
+/// 按名字精确比较的 —— 万一用户的自定义 MCP 工具正好叫这些名字，会被无声
+/// 禁用。名单完全交前台（`set_tool_blacklist`）决定，UI 候选见 main.ts
+/// 的 TOOL_BLACKLIST_CANDIDATES。
 fn tool_blacklist_args(custom: &[String]) -> Vec<String> {
-    let mut list: Vec<String> = DEFAULT_TOOL_BLACKLIST
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut list: Vec<String> = Vec::new();
     for name in custom {
         let name = name.trim();
         if !name.is_empty() && !list.iter().any(|b| b == name) {
@@ -913,8 +891,7 @@ pub fn get_workspace(state: State<'_, AppState>) -> String {
 }
 
 /// Set the user-custom tool blacklist (第 19 点缓存优化)。
-/// Merged with DEFAULT_TOOL_BLACKLIST on the next agent.exe start.
-/// The caller should stop_cli + start_cli to apply the new list.
+/// 下次 agent.exe 启动时生效（tool_blacklist_args）——调用方负责 stop_cli + start_cli。
 #[tauri::command]
 pub fn set_tool_blacklist(
     state: State<'_, AppState>,

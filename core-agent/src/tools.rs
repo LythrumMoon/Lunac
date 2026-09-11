@@ -1,13 +1,14 @@
 // core-agent/src/tools.rs
-// P1 内置工具：Read / Write / Edit / Bash / Glob / Grep
+// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep
 //
-// 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" 有专门的命令展示分支
-// （agentToolArgsDelta / classifyRequest），改名会破坏既有 UI 契约。
+// 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" / "PowerShell" 有专门的
+// 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
+// findLastBashGroup），改名会破坏既有 UI 契约。
 //
 // 权限策略（P1 无审批通道，按启动参数静态裁决；P2 接入 can_use_tool 后
 // 改为「先问前端，再执行」）：
-//   · --permission-mode plan      → 只读：Write / Edit / Bash 直接拒绝
-//   · 其余档位（默认 acceptEdits）→ 六件工具全开
+//   · --permission-mode plan      → 只读：Write / Edit / Bash / PowerShell 直接拒绝
+//   · 其余档位（默认 acceptEdits）→ 内置工具全开
 //   · LUNAC_WORKSPACE_LOCKED=1    → 文件类工具限制在工作区内，越界拒绝
 //   · --dangerously-skip-permissions → 忽略工作区锁
 //
@@ -117,6 +118,20 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "PowerShell",
+            "description": "Run a PowerShell command (powershell -NoProfile -Command) in the working \
+                directory and return its combined output. Use this instead of Bash on Windows when \
+                you need cmdlets or .ps1 syntax. Long-running commands are killed on timeout.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "timeout": { "type": "integer", "description": "Timeout in milliseconds (default 120000, max 600000)" }
+                },
+                "required": ["command"]
+            }
+        }),
+        json!({
             "name": "Glob",
             "description": "Find files by glob pattern (** recurses, * does not cross directories). \
                 Returns matching file paths.",
@@ -164,14 +179,14 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 
 /// 是否需要先过用户审批（P2 的 `can_use_tool`）。
 ///
-/// 只读三件不需要（工作区锁已是硬边界）；写类三件一律先问 —— 前端
-/// `classifyRequest()` 会自行处理「白名单 / 内置安全前缀自动放行」与
+/// 只读三件不需要（工作区锁已是硬边界）；写类三件 + PowerShell 一律先问 ——
+/// 前端 `classifyRequest()` 会自行处理「白名单 / 内置安全前缀自动放行」与
 /// 「危险命令只给手动确认」，所以 agent 侧不做二次判断，问就完了。
-/// 返回真实改动前用户应看到提示的调用也在此列（含 Bash 的只读命令）。
+/// 返回真实改动前用户应看到提示的调用也在此列（含 Bash / PowerShell 的只读命令）。
 ///
-/// `plan` 档不在此判断：那三件工具会被 tools::run 直接拒绝，压根到不了审批。
+/// `plan` 档不在此判断：那几件工具会被 tools::run 直接拒绝，压根到不了审批。
 pub fn needs_approval(name: &str) -> bool {
-    matches!(name, "Write" | "Edit" | "Bash")
+    matches!(name, "Write" | "Edit" | "Bash" | "PowerShell")
 }
 
 // ── 分发 ─────────────────────────────────────────────────────────
@@ -184,6 +199,7 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "Write" => write(ctx, input),
         "Edit" => edit(ctx, input),
         "Bash" => bash(ctx, input),
+        "PowerShell" => powershell(ctx, input),
         "Glob" => glob(ctx, input),
         "Grep" => grep(ctx, input),
         other => Err(format!("Unknown tool: {other}")),
@@ -359,18 +375,17 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     ))
 }
 
-// ── Bash ─────────────────────────────────────────────────────────
+// ── Bash / PowerShell ────────────────────────────────────────────
+//
+// 两个工具除了「怎么起进程」之外完全一样：并发读干管道防死锁、超时 kill、
+// 结果拼成「exit code + stdout + stderr」再走同一个上限截断，故共用 run_shell。
 
 fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
     if ctx.read_only {
         return Err("Bash is disabled in plan mode (read-only)".into());
     }
     let command = str_arg(input, "command")?;
-    let timeout = input
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .unwrap_or(BASH_TIMEOUT_MS)
-        .min(BASH_MAX_TIMEOUT_MS);
+    let timeout = timeout_arg(input);
 
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -381,6 +396,41 @@ fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
         c.arg("-c").arg(&command);
         c
     };
+    run_shell(ctx, &mut cmd, timeout)
+}
+
+fn powershell(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    if ctx.read_only {
+        return Err("PowerShell is disabled in plan mode (read-only)".into());
+    }
+    let command = str_arg(input, "command")?;
+    let timeout = timeout_arg(input);
+
+    // `-NoProfile` 跳过用户 profile（更干净也更快）；`-NonInteractive` 防
+    // 脚本卡在 Read-Host 之类的地方干等到超时。
+    // 前缀的两行是编码兜底：重定向到管道时 PowerShell 5.1 按控制台的
+    // ANSI 码页输出（中文 Windows = GBK），而我们把管道当 UTF-8 解码，
+    // 不切 UTF-8 的话中文输出会整片变成替换字符。
+    let mut cmd = Command::new("powershell");
+    cmd.arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(format!(
+            "$OutputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;{command}"
+        ));
+    run_shell(ctx, &mut cmd, timeout)
+}
+
+fn timeout_arg(input: &Value) -> u64 {
+    input
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(BASH_TIMEOUT_MS)
+        .min(BASH_MAX_TIMEOUT_MS)
+}
+
+/// 起进程 → 读干输出 → 超时 kill → 拼结果文本。
+fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, String> {
     cmd.current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

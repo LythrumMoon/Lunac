@@ -574,7 +574,7 @@ fn main() {
     };
 
     // P3 MCP 工具桥：把 <exe 根>\tools\*.json 的用户工具接进工具池。
-    // 连不上只是少一批工具 —— 六件内置工具必须照常可用，所以这里只记一行。
+    // 连不上只是少一批工具 —— 七件内置工具必须照常可用，所以这里只记一行。
     // plan（只读）档不接：MCP 工具的 handler 能跑 shell / 发 HTTP，接进来也只会
     // 每次都被拒绝，还会让工具清单随档位漂移。
     let mut mcp_bridge = if tools_ctx.read_only {
@@ -750,7 +750,7 @@ struct Block {
     input: Value,
 }
 
-/// 需要审批的工具：内置写类三件（Write/Edit/Bash）+ 全部 MCP 工具 ——
+/// 需要审批的工具：内置可写四件（Write/Edit/Bash/PowerShell）+ 全部 MCP 工具 ——
 /// 后者的 handler 能跑 shell / 发 HTTP，且定义来自用户 JSON，agent 侧
 /// 无权替用户判断安全性，一律交前端卡片决定。
 fn needs_approval(name: &str) -> bool {

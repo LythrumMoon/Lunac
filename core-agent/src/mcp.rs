@@ -146,10 +146,17 @@ impl Bridge {
     }
 
     /// 把 `tools/list` 的结果转成请求体的工具 schema。
+    ///
+    /// **按工具名排序后再入列**：`read_dir` 的返回顺序不保证稳定，而 tools
+    /// 数组是请求前缀的一部分 —— 顺序一变，端点侧的前缀缓存整段失效。
     fn adopt_tools(&mut self, tools: Option<&Value>, disallowed: &[String]) {
         let Some(list) = tools.and_then(Value::as_array) else {
             return;
         };
+        let mut accepted: Vec<(String, String, Value)> = Vec::new();
+        // 已占用的名字（含本批已接受的）—— 名字在循环结束后才写回 self，
+        // 所以这里得自己维护一份，否则重名工具会撞车
+        let mut taken: Vec<String> = self.names.keys().cloned().collect();
         for tool in list {
             let Some(raw) = tool.get("name").and_then(Value::as_str) else {
                 continue;
@@ -158,12 +165,13 @@ impl Bridge {
             if raw.is_empty() {
                 continue;
             }
-            let name = self.unique_name(raw);
+            let name = unique_name(&taken, raw);
             // 黑名单按原名或带前缀名任一命中即不接入
             if disallowed.iter().any(|d| d == raw || d == &name) {
                 eprintln!("[agent] MCP 工具 {name} 已被 --disallowedTools 禁用");
                 continue;
             }
+            taken.push(name.clone());
             let description = tool
                 .get("description")
                 .and_then(Value::as_str)
@@ -172,37 +180,17 @@ impl Bridge {
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-            self.names.insert(name.clone(), raw.to_string());
-            self.defs.push(json!({
-                "name": name,
-                "description": description,
-                "input_schema": schema,
-            }));
+            accepted.push((
+                name.clone(),
+                raw.to_string(),
+                json!({ "name": name, "description": description, "input_schema": schema }),
+            ));
         }
-    }
-
-    fn unique_name(&self, raw: &str) -> String {
-        let cleaned: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(MAX_RAW_NAME)
-            .collect();
-        let mut name = format!("{PREFIX}{cleaned}");
-        let mut n = 2;
-        while self.names.contains_key(&name) {
-            name = format!("{PREFIX}{cleaned}_{n}");
-            n += 1;
+        accepted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, raw, def) in accepted {
+            self.names.insert(name, raw);
+            self.defs.push(def);
         }
-        if cleaned != raw {
-            eprintln!("[agent] MCP 工具名 {raw} → {name}（含非法字符或超长）");
-        }
-        name
     }
 
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
@@ -261,6 +249,32 @@ impl Drop for Bridge {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// `mcp__<清洗后的原名>`，重名追加 `_2`。
+/// 前缀必须稳定（前端「始终允许」白名单按完整名字记），清洗规则改动等于废掉用户白名单。
+fn unique_name(taken: &[String], raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_RAW_NAME)
+        .collect();
+    let mut name = format!("{PREFIX}{cleaned}");
+    let mut n = 2;
+    while taken.iter().any(|t| t == &name) {
+        name = format!("{PREFIX}{cleaned}_{n}");
+        n += 1;
+    }
+    if cleaned != raw {
+        eprintln!("[agent] MCP 工具名 {raw} → {name}（含非法字符或超长）");
+    }
+    name
 }
 
 /// MCP 的 `content` 是 block 数组（`[{type:"text",text:"…"}]`），
