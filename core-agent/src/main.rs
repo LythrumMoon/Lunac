@@ -34,6 +34,7 @@
 //   ✅ P0 思考档位跨模型自适应（MAX_THINKING_TOKENS → thinking 形态 + 400 降级）
 //   ✅ P1 内置工具 + tool_use/tool_result 往返循环（工具实现见 tools.rs）
 //   ✅ P2 权限审批：写类工具发 can_use_tool → 阻塞等 control_response（超时按拒绝）
+//   ✅ 上下文预算 + 压缩：按端点实测体积走瘦身/丢弃两级水位，400 超限再强制压缩重试
 //   ❌ P3 MCP 工具桥 / P4 skills
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
@@ -60,6 +61,141 @@ const CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_TOOL_ROUNDS: usize = 16;
 /// 审批等待上限：超时按拒绝处理，并通知前端撤掉卡片（避免 UI 丢了以后永久挂住）
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+// ── 上下文预算 ───────────────────────────────────────────────────
+//
+// 端点的上下文窗口是硬限制，超了就是 400；而每轮失败都会把 history 整体回滚，
+// 所以不管理体积的话对话会「越用越死」——压不进去就再也发不出去。
+//
+// 两级处理，都不额外调用模型（省 token、无副作用、可离线推理）：
+//   ① 瘦身：把较旧轮次里的大块 tool_result 就地替换成占位串
+//      （文件内容 / Grep 结果通常是体积大头，且对后续推理价值递减）
+//   ② 丢弃：仍然超预算时，从最老的整条消息开始丢，只保留尾部若干条
+// 另对「上下文超限」这类 400 做一次强制压缩后重试，兜住估算误差。
+
+/// 上下文预算（token），可用环境变量覆盖；低于下限的取值视为无效
+const MAX_CONTEXT_ENV: &str = "LUNAC_MAX_CONTEXT_TOKENS";
+const DEFAULT_MAX_CONTEXT_TOKENS: u64 = 128_000;
+const MIN_CONTEXT_TOKENS: u64 = 8_000;
+/// 超过预算的该比例 → 先瘦身；超过更高水位 → 直接丢弃
+const ELIDE_RATIO: f64 = 0.70;
+const DROP_RATIO: f64 = 0.90;
+/// 压缩时始终保留最近的消息条数
+const COMPACT_KEEP_TAIL: usize = 8;
+/// tool_result 内容超过该字符数才算「值得瘦身的大块」
+const ELIDE_TOOL_RESULT_CHARS: usize = 2_000;
+/// 单条用户输入上限（防一次粘贴把整个窗口顶爆）
+const MAX_USER_CHARS: usize = 100_000;
+/// 历史被丢弃后插在开头的提示（保证历史以 user 文本消息开头）
+const TRIMMED_MARKER: &str =
+    "[earlier conversation was trimmed to fit the model context window]";
+
+fn max_context_tokens() -> u64 {
+    std::env::var(MAX_CONTEXT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n >= MIN_CONTEXT_TOKENS)
+        .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS)
+}
+
+/// 该消息是否是 tool_result 载体（这类消息不能作为历史开头）
+fn is_tool_result_msg(msg: &Value) -> bool {
+    msg.get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+        .unwrap_or(false)
+}
+
+/// 判断 400 是否由「上下文超限」引起 —— 只有这类才值得压缩后重试
+fn context_related_error(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("context") || d.contains("too long") || d.contains("input length")
+}
+
+/// 压缩历史。返回「被丢弃的消息条数」，调用方据此修正失败回滚锚点。
+///
+/// `force = true` 跳过水位判断直接丢弃（用于 400 兜底 / 硬水位）。
+fn compact_history(history: &mut Vec<Value>, force: bool) -> usize {
+    // ① 瘦身：只动尾部以外的消息，正在用的最近几轮保持原样。
+    //    强制模式下连尾部也瘦（只留最近 2 条）—— 否则尾部若塞了多个超大
+    //    tool_result，光靠「丢弃更老的消息」根本压不下来。
+    let elide_keep = if force { 2 } else { COMPACT_KEEP_TAIL };
+    let tail_start = history.len().saturating_sub(elide_keep);
+    let mut elided = 0usize;
+    for msg in history.iter_mut().take(tail_start) {
+        let Some(blocks) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            if let Some(Value::String(s)) = block.get("content") {
+                let n = s.chars().count();
+                if n > ELIDE_TOOL_RESULT_CHARS {
+                    block["content"] =
+                        json!(format!("[elided: {n} chars dropped to save context]"));
+                    elided += 1;
+                }
+            }
+        }
+    }
+
+    // ② 丢弃：强制模式，或压根没有可瘦身的东西（说明体积在对话本身）。
+    //    始终保留开头那条用户提问 —— 它是任务目标，丢了模型就不知道要干什么。
+    let mut dropped = 0usize;
+    if force || elided == 0 {
+        let head = if history
+            .first()
+            .map(|m| {
+                m.get("role").and_then(Value::as_str) == Some("user") && !is_tool_result_msg(m)
+            })
+            .unwrap_or(false)
+        {
+            1
+        } else {
+            0
+        };
+        let mut cut = history.len().saturating_sub(COMPACT_KEEP_TAIL).max(head);
+        // 不能以 tool_result 开头（它必须紧跟对应的 tool_use）
+        while cut < history.len() && is_tool_result_msg(&history[cut]) {
+            cut += 1;
+        }
+        if cut > head {
+            history.drain(head..cut);
+            dropped = cut - head;
+        }
+    }
+
+    // 历史必须以 user 文本消息开头，否则端点可能拒绝
+    let starts_ok = history
+        .first()
+        .map(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user") && !is_tool_result_msg(m)
+        })
+        .unwrap_or(false);
+    if !starts_ok {
+        history.insert(
+            0,
+            json!({ "role": "user", "content": [{ "type": "text", "text": TRIMMED_MARKER }] }),
+        );
+    }
+
+    if elided > 0 || dropped > 0 {
+        eprintln!("[agent] 上下文压缩：瘦身 {elided} 个 tool_result，丢弃 {dropped} 条旧消息");
+        emit(json!({
+            "type": "system",
+            "subtype": "context_compacted",
+            "elided": elided,
+            "dropped": dropped,
+        }));
+    }
+    dropped
+}
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
 const SYSTEM_PROMPT: &str = "You are Lunac's built-in assistant, running inside a Windows desktop launcher. \
@@ -153,6 +289,9 @@ struct Cfg {
     model: String,
     /// 当前生效的思考形态；400 降级后会被就地改写并缓存（Cell 便于 &Cfg 共享）
     thinking: Cell<Thinking>,
+    /// 上一轮请求实测的上下文体积（token）。跨轮保留：新的一轮要在发请求
+    /// 之前先按它判断水位，否则第一发就可能超限。
+    last_input: Cell<u64>,
 }
 
 impl Cfg {
@@ -182,6 +321,7 @@ impl Cfg {
             token,
             model,
             thinking: Cell::new(Thinking::from_env()),
+            last_input: Cell::new(0),
         })
     }
 }
@@ -551,12 +691,29 @@ fn run_query(
     let started = Instant::now();
     emit_init(&cfg.model, tool_names);
 
-    // 回滚锚点：本轮压入的所有消息（user / assistant / tool_result）都在其后
-    let base = history.len();
+    // 单条输入过长就直接截断：一次粘贴可能把整个上下文窗口顶爆，
+    // 与其让端点 400 不如先留个明确的截断标记。
+    let prompt_owned;
+    let prompt = if prompt.chars().count() > MAX_USER_CHARS {
+        eprintln!("[agent] 用户输入过长（> {MAX_USER_CHARS} 字符），已截断");
+        prompt_owned = format!(
+            "{}\n\n[truncated: input exceeded {MAX_USER_CHARS} chars]",
+            prompt.chars().take(MAX_USER_CHARS).collect::<String>()
+        );
+        prompt_owned.as_str()
+    } else {
+        prompt
+    };
+
+    // 回滚锚点：本轮压入的所有消息（user / assistant / tool_result）都在其后。
+    // 压缩会丢掉历史开头的消息，锚点需同步左移（见 compact_history 的返回值）。
+    let mut base = history.len();
     history.push(json!({
         "role": "user",
         "content": [{ "type": "text", "text": prompt }],
     }));
+
+    let budget = max_context_tokens();
 
     // 整轮累计用量（跨多次往返；前端按累计值做差，故不能只报最后一次）
     let mut in_tokens: u64 = 0;
@@ -570,6 +727,26 @@ fn run_query(
 
     loop {
         turns += 1;
+
+        // ── 上下文水位检查（发请求之前）─────────────────────────
+        // 用上一轮实测的输入体积作基准（比按字符估算准），过了 ELIDE 水位
+        // 先瘦身、过了 DROP 水位直接丢弃。
+        let measured = cfg.last_input.get();
+        if measured > 0 {
+            let ratio = measured as f64 / budget as f64;
+            if ratio > DROP_RATIO {
+                let dropped = compact_history(history, true);
+                base = base.saturating_sub(dropped);
+                cfg.last_input.set(0);
+            } else if ratio > ELIDE_RATIO {
+                let dropped = compact_history(history, false);
+                base = base.saturating_sub(dropped);
+                cfg.last_input.set(0);
+            }
+        }
+
+        // 兜底：本轮内被 400 判为上下文超限时，强制压缩后再试一次
+        let mut compacted_for_retry = false;
 
         // 发送（思考形态可降级重试）：只有「与 thinking 相关的 400」才沿降级链
         // 前进一次，并把可用的形态写回 cfg 缓存，后续轮次不再试错。
@@ -624,6 +801,15 @@ fn run_query(
                     continue;
                 }
             }
+            // 上下文超限 → 强制压缩后再试一次（水位估算失准时靠这条兜底）
+            if status == 400 && !compacted_for_retry && context_related_error(&detail) {
+                compacted_for_retry = true;
+                let dropped = compact_history(history, true);
+                base = base.saturating_sub(dropped);
+                cfg.last_input.set(0);
+                eprintln!("[agent] 端点回报上下文超限 → 压缩 {dropped} 条后重试");
+                continue;
+            }
             let detail: String = detail.trim().chars().take(800).collect();
             return finish_error(history, base, &format!("HTTP {status}: {detail}"), started, turns);
         };
@@ -651,15 +837,21 @@ fn run_query(
             match ev.get("type").and_then(Value::as_str).unwrap_or("") {
                 "message_start" => {
                     let u = &ev["message"]["usage"];
-                    in_tokens += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                    cache_read += u
+                    let req_in = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let req_read = u
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    cache_create += u
+                    let req_create = u
                         .get("cache_creation_input_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
+                    // 真实上下文体积 = 三类输入之和（input_tokens 不含缓存那两项），
+                    // 水位检查用这个值比按字符估算准得多。
+                    cfg.last_input.set(req_in + req_read + req_create);
+                    in_tokens += req_in;
+                    cache_read += req_read;
+                    cache_create += req_create;
                 }
                 "content_block_start" => {
                     let cb = &ev["content_block"];
