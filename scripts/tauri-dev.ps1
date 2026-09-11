@@ -1,4 +1,5 @@
-# Set PATH for cargo and mingw64
-$env:PATH = "$env:USERPROFILE\.cargo\bin;D:\cc\claude-code-cli-master\mingw64\bin;$env:PATH"
+﻿# scripts/tauri-dev.ps1 — 开发模式（Vite 5173 + Tauri 窗口）
+. "$PSScriptRoot\_env.ps1"
+
 Set-Location "$PSScriptRoot\..\app"
-bun run tauri:dev
+npm run tauri:dev

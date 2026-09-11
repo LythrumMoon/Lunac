@@ -1,4 +1,4 @@
-# Lunac Release Build Script
+﻿# Lunac Release Build Script
 # Usage: .\build-release.ps1 [version]
 #   .\build-release.ps1           - reads version from package.json
 #   .\build-release.ps1 0.6.0     - explicit version
@@ -21,6 +21,16 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSCommandPath
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# ── makensis 定位（NSIS 可能装在 x64 / x86 Program Files，或已在 PATH 中）──
+$Makensis = @(
+  "${env:ProgramFiles}\NSIS\makensis.exe",
+  "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $Makensis) {
+  $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+  if ($cmd) { $Makensis = $cmd.Source }
+}
 
 # ═══════════════════════════════════════════════════════════════════
 # 1. Pre-flight checks
@@ -53,7 +63,7 @@ Write-Host "[1/9] Pre-flight checks..." -ForegroundColor Yellow
 $Checks = @{
   "bun"      = { bun --version 2>&1 | Out-Null; $LASTEXITCODE -eq 0 }
   "cargo"    = { cargo --version 2>&1 | Out-Null; $LASTEXITCODE -eq 0 }
-  "makensis" = { Test-Path "C:\Program Files (x86)\NSIS\Bin\makensis.exe" }
+  "makensis" = { [bool]$Makensis }
 }
 
 $AllOk = $true
@@ -393,9 +403,8 @@ if ($NsiContent -notmatch [regex]::Escape($NewDefine)) {
 [System.IO.File]::WriteAllText($NsiFile, $NsiContent, [System.Text.UTF8Encoding]::new($true))
 Write-Host "  Version in NSI: $Version" -ForegroundColor DarkGray
 
-$Makensis = "C:\Program Files (x86)\NSIS\Bin\makensis.exe"
 if (-not (Test-Path $Makensis)) {
-  throw "makensis not found at $Makensis"
+  throw "makensis not found（NSIS 未安装或不在默认路径；已尝试 Program Files / x86 与 PATH）"
 }
 
 Push-Location $ReleaseDir

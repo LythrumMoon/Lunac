@@ -7,6 +7,7 @@
 //   cd core && bun run ../scripts/make-icon.ts <src> [out]
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const SIZES = [256, 128, 64, 48, 32, 16];
 
@@ -15,8 +16,13 @@ async function main() {
   const sharp = (await import("../core/node_modules/sharp/lib/index.js")).default;
 
   const args = process.argv.slice(2);
-  const srcPath = args[0] || "C:\\Users\\15242\\Desktop\\图库\\twitter_Dino(@Dino_illus)_20230323-194953_1638991477417168911_photo.png";
-  const outPath = args[1] || "app/src-tauri/icons/icon.ico";
+  if (!args[0]) {
+    console.error("用法: bun run scripts/make-icon.ts <source.png> [output.ico]");
+    process.exit(1);
+  }
+  const srcPath = args[0];
+  // 默认输出到仓库内的图标位置（按脚本自身位置解析，不依赖当前工作目录）
+  const outPath = args[1] || fileURLToPath(new URL("../app/src-tauri/icons/icon.ico", import.meta.url));
 
   const srcBuffer = readFileSync(srcPath);
 

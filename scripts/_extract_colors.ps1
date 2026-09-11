@@ -1,6 +1,8 @@
-Add-Type -AssemblyName System.Drawing
+﻿Add-Type -AssemblyName System.Drawing
 
-$src = Get-ChildItem -Path 'D:\cc\claude-code-cli-master' -Filter '*.jpg' | Where-Object { $_.Name -like 'twitter*' } | Select-Object -First 1
+# 从仓库根目录下的 twitter*.jpg 采样，统计均色与高频色（图标配色参考用）
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$src = Get-ChildItem -Path $repoRoot -Filter '*.jpg' | Where-Object { $_.Name -like 'twitter*' } | Select-Object -First 1
 if (-not $src) { Write-Output 'NO_JPG_FOUND'; exit 1 }
 
 $tmp = Join-Path $env:TEMP 'lunac_sample.jpg'

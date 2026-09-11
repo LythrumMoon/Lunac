@@ -1,8 +1,9 @@
 {
-  "name": "claude-code-gui",
+  "name": "lunac",
   "version": "1.0.0",
-  "description": "Claude Code GUI - Native Desktop Client (Tauri)",
+  "description": "Lunac - uTools 风格的 Windows 桌面启动器 / 搜索工具（Tauri 2 + WebView2）",
   "scripts": {
+    "verify": "powershell -ExecutionPolicy Bypass -File scripts/verify-git.ps1",
     "dev": "powershell -ExecutionPolicy Bypass -File scripts/dev.ps1",
     "build": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1",
     "tauri:dev": "powershell -ExecutionPolicy Bypass -File scripts/tauri-dev.ps1",

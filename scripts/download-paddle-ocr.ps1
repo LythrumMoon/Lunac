@@ -1,4 +1,4 @@
-# Download PaddleOCR-json v1.4.1 for release packaging
+﻿# Download PaddleOCR-json v1.4.1 for release packaging
 # Called by tauri-build.ps1 → extracts to release/Lunac/paddle-ocr/
 #
 # NOTE: the v1.4.1 Windows asset is a .7z (there is NO .zip for Windows x64).

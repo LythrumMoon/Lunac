@@ -1,4 +1,4 @@
-# Build standalone binaries for CLI and Proxy (self-contained, no Bun runtime needed)
+﻿# Build standalone binaries for CLI and Proxy (self-contained, no Bun runtime needed)
 # Run from project root
 param(
     [switch]$SkipCli

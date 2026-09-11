@@ -1,10 +1,9 @@
-# Set PATH for cargo and mingw64
-$env:PATH = "$env:USERPROFILE\.cargo\bin;D:\cc\claude-code-cli-master\mingw64\bin;$env:PATH"
+﻿# scripts/dev.ps1 — 开发模式；缺 cli.exe 时先尝试用本机 core 源码编译
+. "$PSScriptRoot\_env.ps1"
 
-# Build standalone binaries if missing
 $projectRoot = "$PSScriptRoot\.."
 if (-not (Test-Path "$projectRoot\core\cli.exe")) {
-    Write-Host "Building standalone binaries (one-time)..." -ForegroundColor Yellow
+    Write-Host "core\cli.exe 缺失，尝试用本机 core 源码编译（一次性）..." -ForegroundColor Yellow
     & "$PSScriptRoot\build-core.ps1"
 }
 
