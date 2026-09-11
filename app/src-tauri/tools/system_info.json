@@ -1,0 +1,19 @@
+{
+  "name": "system_info",
+  "description": "Get Windows system hardware and performance information: CPU model/cores/usage, total & available RAM, GPU info, disk space, and system uptime. Useful for hardware-aware AI reasoning and local model deployment decisions.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "info_type": {
+        "type": "string",
+        "description": "Type of info to query: 'cpu' (CPU details & usage), 'memory' (RAM info), 'gpu' (GPU details), 'disk' (disk space), 'all' (full system overview)",
+        "enum": ["cpu", "memory", "gpu", "disk", "all"]
+      }
+    },
+    "required": []
+  },
+  "handler": {
+    "type": "shell",
+    "command": "powershell -NoProfile -Command \"$t='{{info_type}}'; if($t -eq 'cpu' -or $t -eq 'all' -or -not $t) { $cpu=Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,LoadPercentage | Format-List; Write-Output '=== CPU ==='; Write-Output $cpu }; if($t -eq 'memory' -or $t -eq 'all' -or -not $t) { $os=Get-CimInstance Win32_OperatingSystem; $total=[math]::Round($os.TotalVisibleMemorySize/1MB,1); $free=[math]::Round($os.FreePhysicalMemory/1MB,1); $used=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,1); Write-Output ''; Write-Output '=== RAM ==='; Write-Output \\\"Total: $total GB\\\"; Write-Output \\\"Used: $used GB\\\"; Write-Output \\\"Free: $free GB\\\"; Write-Output \\\"Usage: $([math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)*100/$os.TotalVisibleMemorySize,1))%\\\" }; if($t -eq 'gpu' -or $t -eq 'all' -or -not $t) { try { $gpu=Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion,CurrentHorizontalResolution,CurrentVerticalResolution,CurrentRefreshRate | Format-List; Write-Output ''; Write-Output '=== GPU ==='; Write-Output $gpu } catch {} }; if($t -eq 'disk' -or $t -eq 'all' -or -not $t) { $disk=Get-CimInstance Win32_LogicalDisk -Filter \\\"DriveType=3\\\" | Select-Object DeviceID,@{N='TotalGB';E={[math]::Round($_.Size/1GB,1)}},@{N='FreeGB';E={[math]::Round($_.FreeSpace/1GB,1)}},@{N='UsedPercent';E={[math]::Round(($_.Size-$_.FreeSpace)*100/$_.Size,1)}} | Format-Table -AutoSize; Write-Output ''; Write-Output '=== DISK ==='; Write-Output $disk }; Write-Output ''; Write-Output \\\"Query time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')\\\" \""
+  }
+}

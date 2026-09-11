@@ -1,0 +1,56 @@
+# ══════════════════════════════════════════════════════════════
+# Lunac .gitignore
+# ══════════════════════════════════════════════════════════════
+
+# ── 密钥 / 环境变量（绝不入库）─────────────────────────────────
+# 注意：一旦提交过，即使后续删除，密钥仍留在 commit 历史里，必须换新密钥。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ── 依赖 ──────────────────────────────────────────────────────
+node_modules/
+**/node_modules/
+
+# ── 构建产物 ──────────────────────────────────────────────────
+app/dist/
+ui/dist/
+app/src-tauri/target/
+app/src-tauri/target-e2e/
+app/src-tauri/gen/
+# 随附的 cli.exe（Claude Code CLI 编译产物，不随本仓库分发）
+app/src-tauri/binaries/
+# VS Code 扩展的编译输出（源在 vscode-extension/src/）
+vscode-extension/out/
+
+# ── 上游 / 第三方（不随本仓库分发）────────────────────────────
+# core/ = Claude Code CLI 源码与 cli.exe（Anthropic 版权，禁止再分发）
+core/
+# 离线 OCR 引擎与模型（体积大）→ 用 scripts/download-paddle-ocr.ps1 获取
+paddle-ocr/
+# 本地 gcc 工具链
+mingw64/
+# 本地模型
+local-models/
+
+# ── 发布产物 ──────────────────────────────────────────────────
+release/
+*.vsix
+
+# ── 调试残留 ──────────────────────────────────────────────────
+.tmp-zoom-test/
+_t_in.txt
+_t_out.txt
+_t_err.txt
+testapi.txt
+*.log
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

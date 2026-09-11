@@ -1,0 +1,2690 @@
+/* ── Reset & base ──────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* Impression palette — 复古褪色风（参考图 twitter_ヒトこもる(...).jpg）：
+     尘玫瑰 × 藕紫 × 尘蓝(periwinkle) × 奶油 × 中性灰。本地像素采样：
+     gray 38% / white 29% / red(尘玫瑰 #C0A0A0) 10% / blue(#8080A0) 9% /
+     purple(#A080A0) 7% / pink 5%，98% 低饱和、54% 高亮度 → 低饱和偏中性。 */
+  --surface-glass: rgba(28, 26, 32, 0.88);
+  --surface-glass-hover: rgba(48, 44, 54, 0.80);
+  --border-glass: rgba(232, 216, 202, 0.10);
+  --text: #eae2da;
+  --text-dim: #b2a9a3;
+  --text-muted: #837a78;
+  --accent: #c0a0a0;
+  --accent-bg: rgba(192, 160, 160, 0.14);
+  --accent-border: rgba(192, 160, 160, 0.32);
+  --green: #9db4ac;
+  --red: #c08a8a;
+  --yellow: #c9b896;
+  --blue: #9490b4;
+  --radius: 14px;
+  --search-height: 52px;
+
+  /* ── 印象派按钮设计说明 ──────────────────────────────────────
+     按用户要求取消按钮背景的全部元素：点彩（--imp-dots）/ 圣光（--imp-glow）/
+     扫笔纹理（--imp-brush）/ 双光源光效（--imp-sheen）均已移除，按钮背景
+     保持全透明（background-image:none; box-shadow:none）。印象派风格改由
+     按钮内部 icon（SVG 图案）承载，图案语言源自参考肖像图：水平扫笔+左斜
+     笔触、细密高光点、左上亮区、不对称构图。 */
+}
+
+html, body {
+  height: 100%;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: transparent;
+  color: var(--text);
+  overflow: hidden;
+  user-select: none;
+}
+
+#app {
+  height: auto;            /* 内容驱动高度（方案A实测驱动）：窗口高由 JS 按实测内容 setSize */
+  min-height: 38px;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  pointer-events: none;
+  /* 高度策略（方案A，2026-08-16 实测驱动）：
+     搜索/结果/空态 —— #app height:auto，内容多高窗口就多高；JS 用
+     getBoundingClientRect()（含 zoom，单位=DIPs）实测面板高度 setSize 窗口，
+     根治「窗口尺寸与结果区渲染区域不一致」（此前 heightMap 预测漏计搜索栏+
+     状态栏高度、且未正确换算 zoom 尺度）。
+     插件/分离模式 —— #app.plugin-active / #app.detached 撑满固定高窗口
+     （height:100%），面板内部滚动，高度由 JS 按 600/360/520 设计值下发。 */
+}
+#app.plugin-active,
+#app.detached {
+  height: 100%;            /* 插件/分离模式：窗口固定高，面板撑满 */
+}
+
+/* ── 自定义背景双图层（需求5：无默认图；嵌入结果区；两层处理） ──────
+   层叠顺序（#results-container 为 stacking context，backdrop-filter 触发）：
+     ① 最下方 —— #app-bg-image 自定义图片层（z:-2）：opacity 透明效果 +
+        自身 filter: blur() 毛玻璃化，避免细节干扰文字阅读；
+     ② 上方   —— #results-container::before 默认背景层/原配色层（z:-1）：
+        var(--surface-glass) 半透明玻璃底色承托，构成毛玻璃观感；
+     ③ 内容（普通流）。
+   图片 absolute 贴合容器（结果区/插件界面）随面板缩放，圆角由容器
+   overflow:hidden 裁剪。透明度/模糊度可在此调整。 */
+#app-bg-image {
+  position: absolute;
+  inset: 0;
+  z-index: -2; /* 最下方：自定义图片层 */
+  pointer-events: none;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  opacity: 0.5; /* 透明效果 */
+  filter: blur(4px) saturate(0.92); /* 毛玻璃化，柔和背景 */
+}
+
+/* 需求：自定义背景只在「搜索功能主界面」生效，插件/分离模式下隐藏。
+   #app.plugin-active 由 applyWindowSize 统一切换（覆盖 executePlugin、
+   restoreSession / startAIChat 直进 AI 对话等所有插件路径），
+   #app.detached 覆盖分离模式。 */
+#app.plugin-active #app-bg-image,
+#app.detached #app-bg-image {
+  display: none;
+}
+
+/* Removed body pointer-events:auto — the fix below is the correct approach */
+
+/* ── Custom context menu (results area right-click) ────────── */
+#context-menu {
+  position: fixed;
+  background: var(--surface-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 160px;
+  z-index: 1000;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  pointer-events: auto;
+}
+
+/* Plugin open state — the panel must fill the fixed-height plugin window and
+   let the inner #results-list scroll (root cause of "can't scroll long chat":
+   overflow:visible + max-height:none made the list grow to content height,
+   clipping everything beyond the window with no scrollbar).
+   NOTE (方案A 2026-08-16): 此前用 calc(100vh-80px) 限高，但 CSS zoom 不缩放
+   vh 单位（Chromium 已知缺陷），zoom≠1 时面板超窗。现改为 flex:1 撑满 ——
+   #app.plugin-active 已把 #app 设为 height:100%，本容器填满余下空间即可。
+   选择器挂在 #app.plugin-active（applyWindowSize 统一切换）而非 .plugin-open，
+   以覆盖 AI 对话直进/历史恢复等不经 executePlugin 的插件路径。 */
+#app.plugin-active #results-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+.context-menu-item {
+  padding: 8px 14px;
+  font-size: 0.8rem;
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.1s;
+  white-space: nowrap;
+}
+.context-menu-item:hover {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+.context-menu-item.danger {
+  color: var(--red);
+}
+.context-menu-item.danger:hover {
+  background: rgba(192, 138, 138, 0.12);
+}
+.context-menu-item-active {
+  color: var(--accent) !important;
+  background: var(--accent-bg) !important;
+}
+
+/* ── Clipboard history items ───────────────────────────────── */
+.clip-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.1s;
+  margin-bottom: 2px;
+}
+.clip-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.clip-item-preview {
+  flex: 1;
+  font-size: 0.82rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.clip-item-meta {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.clip-item-copy {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 0.68rem;
+  background: var(--accent-bg);
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.clip-item-copy:hover {
+  background: rgba(192, 160, 160, 0.2);
+}
+
+/* ── Search bar ────────────────────────────────────────────────── */
+#search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  padding: 6px 16px;
+  min-height: 38px;
+  /* 搜索路径无开合/过渡动画：结果出现/收起即时切换，避免打字时过渡重绘导致卡顿 */
+  transition: none;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  flex-shrink: 0;
+  pointer-events: auto;
+  margin: 0; /* edge-to-edge glass — no invisible border */
+}
+
+#search-bar:focus-within {
+  border-color: var(--accent-border);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(192, 160, 160, 0.12);
+}
+
+#search-bar.has-results {
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+/* Input area: chips stacked above, input below. Auto-grows height. */
+#search-input-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+#search-input {
+  width: 100%;
+  min-width: 0;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 1.05rem;
+  line-height: 1.3;
+  outline: none;
+  caret-color: var(--accent);
+  resize: none;
+}
+
+#search-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.45;
+}
+
+#search-hint {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  opacity: 0.55;
+  flex-shrink: 0;
+  padding: 2px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+}
+
+/* ── File chips (vertical stack in search bar, auto-grows height) ── */
+#file-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: auto;
+  width: 100%;
+}
+
+#file-chips.hidden {
+  display: none;
+}
+
+/* 插件锁定态（除 AI 聊天外的任意插件界面）：搜索栏泡泡整体隐藏，避免漂浮
+   在原位遮挡插件内容。AI 聊天的泡泡改由 #chat-file-chips（聊天输入栏内）承载。 */
+#search-bar.plugin-locked #file-chips {
+  display: none !important;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  background: rgba(157, 180, 172, 0.1);
+  border: 1px solid rgba(157, 180, 172, 0.25);
+  border-radius: 12px;
+  font-size: 0.72rem;
+  color: var(--text);
+  max-width: 100%;
+  flex-shrink: 0;
+  transition: background 0.1s;
+}
+
+.file-chip:hover {
+  background: rgba(157, 180, 172, 0.18);
+}
+
+.file-chip-icon {
+  flex-shrink: 0;
+  font-size: 0.85rem;
+}
+
+/* Image chip thumbnail preview (asset protocol via convertFileSrc) */
+.file-chip-preview {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.file-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-chip-remove {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background: rgba(192, 138, 138, 0.2);
+  color: var(--red);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 0.65rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.file-chip-remove:hover {
+  background: rgba(192, 138, 138, 0.4);
+}
+
+/* ── 省略泡泡（分支折叠：超过阈值文件收进 ⋯，可展开 + 一键删除）── */
+.file-chip-more {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  pointer-events: auto;
+}
+.file-chip-more-btn {
+  padding: 3px 10px;
+  background: rgba(157, 180, 172, 0.12);
+  border: 1px dashed rgba(157, 180, 172, 0.4);
+  border-radius: 12px;
+  font-size: 0.72rem;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.file-chip-more-btn:hover {
+  background: rgba(157, 180, 172, 0.24);
+}
+.file-chip-more-clear {
+  padding: 3px 10px;
+  background: rgba(192, 138, 138, 0.12);
+  border: 1px solid rgba(192, 138, 138, 0.3);
+  border-radius: 12px;
+  font-size: 0.7rem;
+  color: var(--red);
+  cursor: pointer;
+}
+.file-chip-more-clear:hover {
+  background: rgba(192, 138, 138, 0.3);
+}
+/* 展开后的该分支文件列表（省略泡泡的分支） */
+.file-chip-more-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 2px 8px;
+  padding-left: 10px;
+  border-left: 1px dashed rgba(157, 180, 172, 0.35);
+}
+
+/* ── Drag-over highlight ──────────────────────────────────── */
+#search-bar.drag-over,
+#chat-input-bar.drag-over {
+  border-color: rgba(157, 180, 172, 0.6) !important;
+  box-shadow: 0 0 12px rgba(157, 180, 172, 0.2) !important;
+}
+
+/* ── Plugin bar (replaces input when plugin active) ──────────── */
+#plugin-bar-title {
+  flex: 1;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 4px;
+}
+
+#plugin-bar-exit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+#plugin-bar-exit:hover {
+  opacity: 1;
+  color: var(--red);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* Search bar locked (plugin active) — hide input, show plugin bar */
+/* !important needed to override .hidden { display: none !important } */
+#search-bar.plugin-locked #search-input { display: none !important; }
+#search-bar.plugin-locked #settings-btn { display: none !important; }
+#search-bar.plugin-locked #plugin-bar-title { display: block !important; }
+#search-bar.plugin-locked #plugin-bar-exit { display: flex !important; }
+
+/* ── Settings button ──────────────────────────────────────────── */
+#settings-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+#settings-btn:hover {
+  opacity: 1;
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.hidden { display: none !important; }
+
+/* ── Detached panel mode (double-click search bar) ────────────── */
+#app.detached {
+  padding: 2px;
+}
+
+#app.detached #search-bar {
+  display: none !important;
+}
+
+#app.detached #results-container {
+  flex: 1;
+  min-height: auto;
+  max-height: none;
+  border-radius: var(--radius) !important;
+  border-top: 1px solid var(--border-glass) !important;
+  position: relative;
+}
+
+/* ── Detached header (replaces search bar) ────────────────────── */
+#detached-header {
+  display: none !important;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  flex-shrink: 0;
+  pointer-events: auto;
+  min-height: 40px;
+  margin: 0; /* edge-to-edge — no invisible border */
+}
+
+#app.detached #detached-header {
+  display: flex !important;
+}
+
+#detached-back-btn,
+#detached-vscode-btn,
+#detached-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+#detached-back-btn:hover,
+#detached-vscode-btn:hover,
+#detached-close-btn:hover {
+  opacity: 1;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+#detached-vscode-btn:hover {
+  color: var(--blue);
+}
+
+#detached-close-btn:hover {
+  color: var(--red);
+}
+
+#detached-title {
+  flex: 1;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── OCR Detached Two-Panel Layout ────────────────────────────── */
+
+.ocr-detached-layout {
+  display: flex;
+  flex: 1;
+  height: 100%;
+  min-height: 0;       /* allow flex shrink */
+  gap: 0;
+  overflow: hidden;
+}
+
+/* Left panel: image preview */
+.ocr-image-panel {
+  flex: 0 0 50%;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-glass);
+  background: rgba(0, 0, 0, 0.12);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ocr-image-preview {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 12px;
+  min-height: 0;
+}
+
+.ocr-image-placeholder {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  text-align: center;
+  opacity: 0.6;
+}
+
+.ocr-preview-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+.ocr-image-actions {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-glass);
+  flex-shrink: 0;
+}
+
+.ocr-action-btn {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 0.72rem;
+  border-radius: 5px;
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.ocr-action-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
+.ocr-primary-btn {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.ocr-primary-btn:hover {
+  background: var(--accent-bg);
+  filter: brightness(1.2);
+}
+
+/* Right panel: text editor */
+.ocr-text-panel {
+  flex: 0 0 50%;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.12);
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.ocr-status-line {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  padding: 8px 12px 4px;
+  flex-shrink: 0;
+  line-height: 1.3;
+  min-height: 28px;
+}
+
+.ocr-copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  padding: 3px 10px;
+  font-size: 0.65rem;
+  border-radius: 4px;
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  cursor: pointer;
+  z-index: 1;
+  transition: background 0.15s;
+}
+
+.ocr-copy-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+
+.ocr-copy-btn.ocr-copied {
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+
+.ocr-textarea {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  padding: 0 12px 12px;
+  resize: none;
+  font-family: inherit;
+  outline: none;
+  overflow-y: auto;
+  min-height: 0;
+  pointer-events: auto;
+}
+
+.ocr-textarea::placeholder {
+  color: var(--text-dim);
+  opacity: 0.4;
+}
+
+/* ── Detached chat input ─────────────────────────────────────── */
+#chat-input-bar {
+  display: none;
+  flex-direction: column;
+  gap: 0;
+  border-top: 1px solid var(--border-glass);
+  background: rgba(0, 0, 0, 0.15);
+  flex-shrink: 0;
+  pointer-events: auto;
+  overflow: visible; /* allow mode dropdown to extend above */
+}
+
+/* Chat file chips — same style as search bar chips */
+#chat-file-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 10px 0 10px;
+  pointer-events: auto;
+}
+
+#chat-file-chips:empty {
+  display: none;
+}
+
+/* Chat input row — add-file button + textarea + controls */
+#chat-input-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  position: relative; /* anchor for mode dropdown */
+}
+
+/* Show chat input bar when AI chat is active */
+#results-container.ai-chat #chat-input-bar {
+  display: flex !important;
+}
+/* (The old `#results-container.ai-chat { overflow: visible }` was removed —
+   it defeated #results-list scrolling so long chats were clipped by the
+   window with no way to scroll. The mode dropdown it existed for is gone;
+   chat UI now scrolls inside #results-list.) */
+/* Hide clipboard hint in status bar during AI chat — status bar shows token dashboard instead */
+#results-container.ai-chat #status-hint {
+  display: none;
+}
+
+#chat-add-file-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: rgba(157, 180, 172, 0.1);
+  border: 1px solid rgba(157, 180, 172, 0.25);
+  border-radius: 6px;
+  color: var(--green);
+  cursor: pointer;
+  font-size: 1.1rem;
+  font-weight: 600;
+  line-height: 1;
+  flex-shrink: 0;
+  transition: background 0.1s;
+}
+#chat-add-file-btn:hover {
+  background: rgba(157, 180, 172, 0.2);
+}
+
+#chat-input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.82rem;
+  line-height: 1.3;
+  outline: none;
+  caret-color: var(--accent);
+  resize: none;
+  min-width: 0;
+  /* 动态高度 30~60px */
+  min-height: 30px !important;
+  max-height: 60px !important;
+  overflow-y: auto;
+}
+#chat-input:focus {
+  border-color: var(--accent-border);
+}
+#chat-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.4;
+}
+
+#chat-history-btn,
+#chat-send-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+#chat-history-btn:hover {
+  opacity: 1;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+#chat-send-btn {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
+  opacity: 1;
+}
+#chat-send-btn:hover {
+  background: rgba(192, 160, 160, 0.2);
+}
+
+/* Stop button — same accent theme as send button */
+#chat-stop-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  opacity: 1;
+  flex-shrink: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+}
+#chat-stop-btn:hover {
+  background: rgba(192, 160, 160, 0.2);
+}
+
+/* ── Humanize button — same style as other chat row buttons ──── */
+#humanize-btn {
+  width: 30px;
+  height: 30px;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  opacity: 0.55;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-radius: 6px;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+#humanize-btn:hover {
+  opacity: 1;
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+/* Security warning block — yellow border + semi-transparent bg */
+.tool-warn {
+  border: 1px solid rgba(201, 184, 150, 0.4) !important;
+  background: rgba(201, 184, 150, 0.08) !important;
+  padding: 8px 10px !important;
+  margin: 4px 0 !important;
+  border-radius: 6px !important;
+  font-size: 0.78rem !important;
+  color: var(--text) !important;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+  line-height: 1.5 !important;
+}
+
+/* ── Results container ─────────────────────────────────────────── */
+#results-container {
+  position: relative;
+  /* 玻璃底色移到 ::before，使 #app-bg-image (z:-1) 能画在玻璃之上、
+     内容之下（backdrop-filter 使本容器成为 stacking context） */
+  background: transparent;
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-top: none;
+  border-radius: 0;
+  margin: -1px 0 0 0; /* overlap search-bar border, edge-to-edge */
+  overflow: hidden;
+  min-height: 120px;
+  max-height: 380px; /* 搜索模式封顶（≥5 条内部滚动）；此前 300px 会截断 5 条结果 */
+  display: flex;
+  flex-direction: column;
+  pointer-events: auto;
+}
+/* 默认背景层/原配色层（z:-1，在图片层 #app-bg-image (z:-2) 之上、内容之下） */
+#results-container::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--surface-glass);
+}
+
+#results-list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 6px 0;
+  min-height: 0;
+}
+
+/* ── Status bar (below results, always visible) ────────────────── */
+#status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  min-height: 26px;
+  pointer-events: auto;
+  margin: 0; /* edge-to-edge glass — no invisible border */
+}
+
+/* ── Token dashboard (visible only in AI chat) ───────────────── */
+#token-dashboard {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.65rem;
+  font-weight: 500;
+}
+#token-dashboard.visible {
+  display: flex;
+}
+
+/* Mini cache-hit ratio bar */
+.tk-bar {
+  display: inline-flex;
+  width: 48px;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+.tk-bar-fill {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.tk-bar-hit {
+  background: var(--green);
+}
+.tk-bar-miss {
+  background: rgba(201, 184, 150, 0.6);
+}
+
+.tk-pct {
+  color: var(--green);
+  min-width: 28px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.tk-total {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+.result-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.08s;
+}
+
+.result-item:hover,
+.result-item.selected {
+  background: rgba(192, 160, 160, 0.1);
+}
+
+.result-item-icon {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+
+.result-item-icon-img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
+
+.result-item-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.result-item-title {
+  font-size: 0.88rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.result-item-desc {
+  font-size: 0.74rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+
+.result-item-badge {
+  font-size: 0.65rem;
+  padding: 2px 8px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-radius: 4px;
+  flex-shrink: 0;
+  font-weight: 500;
+}
+
+/* App badge — distinct color to separate from plugin badges */
+.result-item-badge.app-badge {
+  background: rgba(157, 180, 172, 0.15);
+  color: var(--green);
+}
+
+/* Remove button on launch results (quick-launch panel) */
+.result-item-remove {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(192, 138, 138, 0.12);
+  color: var(--red);
+  border: 1px solid rgba(192, 138, 138, 0.25);
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 0.8rem;
+  line-height: 1;
+  opacity: 0.6;
+  transition: opacity 0.12s, background 0.12s;
+}
+.result-item-remove:hover {
+  opacity: 1;
+  background: rgba(192, 138, 138, 0.28);
+}
+
+/* ── Quick-launch panel toolbar / empty state ────────────────── */
+.ql-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  pointer-events: auto;
+}
+.ql-title {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  opacity: 0.7;
+}
+.ql-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  background: rgba(157, 180, 172, 0.12);
+  border: 1px solid rgba(157, 180, 172, 0.3);
+  border-radius: 8px;
+  color: var(--green);
+  font-size: 0.74rem;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.ql-add-btn:hover {
+  background: rgba(157, 180, 172, 0.24);
+}
+.ql-empty {
+  padding: 14px 4px;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.7;
+  text-align: center;
+}
+
+/* ── Plugin result panel ───────────────────────────────────────── */
+.plugin-result {
+  padding: 14px 16px;
+  font-size: 0.88rem;
+  line-height: 1.6;
+  animation: plugin-in 0.2s ease both;
+}
+
+@keyframes plugin-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.plugin-result-title {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin-bottom: 10px;
+  opacity: 0.7;
+}
+
+.plugin-result-content {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.plugin-result-content.error {
+  color: var(--red);
+}
+
+.plugin-result-loading {
+  color: var(--text-dim);
+  animation: pulse-text 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-text {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ── Agent ordered-block flow ──────────────────────────────────── */
+.agent-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.agent-text {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Markdown images in AI responses — 不再内联渲染 <img>（WebView2 asset 协议
+   内联显示不可靠），改为「查看图片」按钮，点击打开独立全窗查看界面（需求5） */
+.agent-md-view {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 92%;
+  margin: 6px 0;
+  padding: 5px 10px;
+  font-size: 0.72rem;
+  color: var(--blue);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.agent-md-view:hover {
+  background: rgba(148, 144, 180, 0.22);
+  color: var(--text);
+}
+.agent-md-view svg {
+  flex-shrink: 0;
+}
+.agent-md-view span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 独立图片查看界面（全窗遮罩层） */
+#image-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 8, 12, 0.72);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  pointer-events: auto;
+  cursor: zoom-out;
+}
+#image-viewer.visible {
+  display: flex;
+}
+.image-viewer-img {
+  max-width: 94%;
+  max-height: 94%;
+  object-fit: contain;
+  border-radius: 10px;
+  border: 1px solid var(--border-glass);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+}
+
+/* Thinking — small, collapsed-by-default expandable header (Hermes-style) */
+.think-block {
+  border-left: 2px solid var(--border-glass);
+  padding-left: 8px;
+  margin: 2px 0;
+}
+
+.think-block summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 11px;
+  user-select: none;
+  list-style: none;
+}
+
+.think-block summary::-webkit-details-marker {
+  display: none;
+}
+
+.think-block summary:hover {
+  color: var(--text);
+}
+
+.think-content {
+  margin-top: 4px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* No max-height / inner scrollbar (point 7/17): an inner scrollbar made
+     the wheel scroll the inner box first and only then the whole chat —
+     thinking content now expands fully and scrolls with the conversation. */
+}
+
+/* Tool invocation row */
+.tool-row {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 3px 8px;
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-row .tool-name {
+  color: var(--blue);
+}
+
+.tool-row .tool-args {
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.tool-row.auto-approved {
+  color: var(--green);
+  background: rgba(157, 180, 172, 0.08);
+}
+
+.tool-row.tool-ok {
+  color: var(--text-dim);
+  background: rgba(157, 180, 172, 0.05);
+}
+.tool-row.tool-ok summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--green);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tool-row.tool-ok summary::-webkit-details-marker { display: none; }
+.tool-row.tool-ok summary::before { content: "▸ "; }
+.tool-row.tool-ok[open] summary::before { content: "▾ "; }
+.tool-row .tool-result {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+  color: var(--text-dim);
+}
+
+.tool-row.tool-error {
+  color: var(--red);
+  background: rgba(192, 138, 138, 0.08);
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* ── Agent turn footer (Pi reference: turn-end tool summary) ──── */
+.turn-footer {
+  margin: 8px 0 12px 0;
+  padding: 4px 10px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  opacity: 0.6;
+  border-left: 2px solid var(--text-muted);
+}
+.turn-footer .turn-tool-count {
+  font-weight: 500;
+}
+
+/* ── Agent permission approval card (can_use_tool) ─────────────── */
+.approval-card {
+  margin: 8px 12px;
+  padding: 12px 14px;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+}
+
+.agent-flow .approval-card {
+  margin: 4px 0;
+}
+
+.approval-card.danger {
+  border-color: rgba(192, 138, 138, 0.5);
+  background: rgba(192, 138, 138, 0.08);
+}
+
+.approval-danger {
+  color: var(--red);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.approval-title {
+  color: var(--yellow);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.approval-title b {
+  color: var(--text);
+}
+
+.approval-input {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  max-height: 120px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  /* 命令区域必须可选择/可复制 — 覆盖 body 的 user-select: none */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.approval-btn {
+  flex: 1;
+  padding: 6px 0;
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  background: var(--surface-glass-hover);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.approval-allow {
+  border-color: rgba(157, 180, 172, 0.35);
+  color: var(--green);
+}
+
+.approval-allow:hover {
+  background: rgba(157, 180, 172, 0.15);
+}
+
+.approval-deny {
+  border-color: rgba(192, 138, 138, 0.35);
+  color: var(--red);
+}
+
+.approval-deny:hover {
+  background: rgba(192, 138, 138, 0.15);
+}
+
+.approval-note {
+  font-size: 12px;
+}
+
+.approval-note.ok { color: var(--green); }
+.approval-note.no { color: var(--red); }
+
+/* ── Consolidated permission batch card ────────────────────────── */
+/* 权限请求大框：标题(纯黄文本) + 全部允许/拒绝 + 多个固定 144px 小框。
+   大框整体不增高：命令区占小框内固定 72px，小框相对原 72px 增高 72px。 */
+.approval-batch-card {
+  display: flex;
+  flex-direction: column;
+}
+.approval-batch-card .approval-batch-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 380px;
+  overflow-y: auto;
+}
+.approval-batch-card .approval-batch-header {
+  flex-shrink: 0;
+  color: var(--yellow);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.approval-batch-card .approval-batch-count {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.approval-batch-card .approval-batch-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.approval-batch-card .approval-batch-allow-all {
+  border-color: rgba(157, 180, 172, 0.45);
+  color: var(--green);
+  font-weight: 600;
+}
+.approval-batch-card .approval-batch-deny-all {
+  border-color: rgba(192, 138, 138, 0.45);
+  color: var(--red);
+  font-weight: 600;
+}
+.approval-batch-card .approval-item {
+  height: 144px; /* 原 72px + 72px：为固定 72px 命令区腾出空间 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  padding: 6px 0;
+  margin-top: 6px;
+}
+.approval-batch-card .approval-item:first-child {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+.approval-batch-card .approval-item.answered {
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+.approval-batch-card .approval-item .approval-title {
+  flex-shrink: 0;
+  color: var(--yellow);
+  font-size: 11px;
+  margin-bottom: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.approval-batch-card .approval-item .approval-title b { color: inherit; }
+.approval-batch-card .approval-item.danger .approval-title { color: var(--red); }
+.approval-batch-card .approval-item .approval-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.approval-batch-card .approval-item .approval-actions {
+  flex-shrink: 0;
+  margin-top: 4px;
+}
+.approval-danger-inline {
+  color: var(--red);
+  margin-right: 4px;
+}
+
+/* ── Command-group rows (Trae-style merged approvals) ──────────── */
+/* Fixed-height, scrollable command region: commands stay complete
+   (never truncated), can be selected/copied, and the card stays compact. */
+.approval-batch-card .approval-cmd-box {
+  position: relative;
+  height: 72px; /* 固定命令显示高度（原 height:100% 在 72px 小框内仅剩 ~20px） */
+  min-height: 0;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin: 0;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.approval-batch-card .approval-cmd-list {
+  /* Reserve right padding so the copy button never overlaps commands */
+  padding-right: 56px;
+}
+.approval-batch-card .approval-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  border: 1px solid var(--accent-border);
+  border-radius: 4px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.approval-batch-card .approval-copy-btn:hover {
+  background: rgba(192, 160, 160, 0.22);
+}
+.approval-batch-card .approval-cmd {
+  font-family: Consolas, 'Cascadia Code', monospace;
+  font-size: 11px;
+  color: var(--text);
+  padding: 1px 0;
+  word-break: break-all;
+  white-space: pre-wrap;
+  line-height: 1.4;
+}
+.approval-cmd-sep { color: var(--text-muted); }
+.approval-cmd-merged {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 3px;
+}
+.approval-batch-card .approval-input.compact {
+  height: 72px; /* 与 approval-cmd-box 一致：固定命令显示高度 */
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px;
+  font-size: 10.5px;
+  margin: 0;
+}
+/* Custom slim scrollbars (remove default OS scrollbar) for the permission
+   command boxes — theme-matched glass/dim look. */
+.approval-batch-card .approval-cmd-box::-webkit-scrollbar,
+.approval-batch-card .approval-input.compact::-webkit-scrollbar,
+.approval-batch-card .approval-batch-body::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+.approval-batch-card .approval-cmd-box::-webkit-scrollbar-track,
+.approval-batch-card .approval-input.compact::-webkit-scrollbar-track,
+.approval-batch-card .approval-batch-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.approval-batch-card .approval-cmd-box::-webkit-scrollbar-thumb,
+.approval-batch-card .approval-input.compact::-webkit-scrollbar-thumb,
+.approval-batch-card .approval-batch-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+.approval-batch-card .approval-cmd-box::-webkit-scrollbar-thumb:hover,
+.approval-batch-card .approval-input.compact::-webkit-scrollbar-thumb:hover,
+.approval-batch-card .approval-batch-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+/* Compact the per-row action buttons */
+.approval-batch-card .approval-actions .approval-btn {
+  padding: 4px 0;
+  font-size: 11px;
+}
+
+/* ── AI agent streaming response ───────────────────────────────── */
+.ai-response {
+  padding: 14px 16px;
+  font-size: 0.88rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-response .cursor-blink::after {
+  content: '▌';
+  animation: blink 1s step-end infinite;
+  color: var(--accent);
+  font-weight: 100;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────── */
+#results-list::-webkit-scrollbar {
+  width: 4px;
+}
+#results-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+#results-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+#results-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* ── AI 对话对话框滚动条（主题一致）───────────────────────────── */
+/* WebView 默认滚动条太突兀：工具输出块(.tool-result)与聊天输入框
+   (#chat-input) 内部滚动改用与全局一致的主题细条，鼠标滚轮仍可用
+   （overflow-y: auto 保留，仅替换滚动条外观）。 */
+.tool-result,
+#chat-input {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+.tool-result::-webkit-scrollbar,
+#chat-input::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.tool-result::-webkit-scrollbar-track,
+#chat-input::-webkit-scrollbar-track {
+  background: transparent;
+}
+.tool-result::-webkit-scrollbar-thumb,
+#chat-input::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+.tool-result::-webkit-scrollbar-thumb:hover,
+#chat-input::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+/* ── AI Chat messages ─────────────────────────────────────────── */
+/* Global user-select:none is needed for the launcher chrome, but AI
+   conversation content must be selectable/copyable (point 2/17).
+   需求3：全量开启对话内容的文本选择与复制，同时声明只读（read-only）
+   禁止编辑；配合 main.ts 的 paste/cut 拦截，用户只能提取文本。 */
+.ai-response,
+#chat-log,
+.agent-flow,
+.chat-msg-user,
+.chat-msg-assistant,
+.chat-msg-system,
+.agent-text,
+.think-content,
+.think-block summary,
+.tool-row,
+.tool-result,
+.turn-footer,
+.turn-tool,
+.history-item-preview,
+.history-item-title,
+#chat-drawer,
+.chat-drawer-item,
+.chat-drawer-meta {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-user-modify: read-only;
+  user-modify: read-only;
+}
+
+.chat-msg-user {
+  position: relative;
+  background: rgba(192, 160, 160, 0.08);
+  border: 1px solid rgba(192, 160, 160, 0.15);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin: 6px 0;
+  font-size: 0.82rem;
+  color: var(--accent);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-msg-assistant {
+  position: relative;
+  padding: 8px 0;
+  font-size: 0.85rem;
+  color: var(--text);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Roll-back / Retry buttons on each user chat bubble (需求4) ──
+   回退 + 重试两按钮只在【用户提问气泡】显示（AI 回答气泡不挂）。
+   图案为印象派 SVG（ROLLBACK_SVG / RETRY_SVG：残影+点彩）。 */
+.msg-actions {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  z-index: 2;
+}
+.msg-actions button {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-msg-user:hover .msg-actions button,
+.chat-msg-assistant:hover .msg-actions button {
+  opacity: 0.85;
+}
+.msg-actions button:hover {
+  opacity: 1 !important;
+  color: var(--accent);
+  background: rgba(192, 160, 160, 0.15);
+}
+
+/* 复制按钮（agent-flow 结尾，实时对话助手全文）——同印象派主题 */
+.flow-copy {
+  align-self: flex-end;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 5px;
+  cursor: pointer;
+  opacity: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.agent-flow:hover .flow-copy {
+  opacity: 0.85;
+}
+.flow-copy:hover {
+  opacity: 1 !important;
+  color: var(--accent);
+  background: rgba(192, 160, 160, 0.15);
+}
+
+/* System message in chat log (new conversation / ready banner) */
+.chat-msg-system {
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  padding: 12px 0 4px;
+  opacity: 0.6;
+}
+
+/* ── Chat History items (drawer-style) ────────────────────────── */
+.history-item {
+  padding: 0;
+  margin: 3px 0;
+  cursor: pointer;
+}
+
+.history-item-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center; /* 标题（及计数）严格水平居中 */
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border-glass);
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.history-item-header:hover {
+  background: rgba(192, 160, 160, 0.06);
+  border-color: rgba(192, 160, 160, 0.2);
+}
+
+.history-item-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
+.history-item-info {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 72%;
+  text-align: center;
+}
+
+.history-item-title {
+  font-size: 0.82rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 2px;
+}
+
+.history-item-meta {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+
+/* Delete button on each history record (point 18/17) — visible on hover */
+.history-item-delete {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.history-item-header:hover .history-item-delete {
+  opacity: 1;
+}
+.history-item-delete:hover {
+  background: rgba(192, 138, 138, 0.15);
+  color: var(--red);
+}
+
+.history-item-preview {
+  display: none;
+  padding: 8px 12px 12px 36px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  line-height: 1.45;
+  max-height: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid var(--border-glass);
+  margin: 0 4px;
+}
+
+.history-item.open .history-item-preview {
+  display: block;
+}
+
+.history-item.open .history-item-header {
+  border-radius: 8px 8px 0 0;
+  border-bottom: none;
+}
+
+/* ── AI Chat left drawer (golden ratio ≈ 38.2%) ────────────────── */
+/* Default: off-screen, non-interactive. .hidden (display:none) is removed on first toggle. */
+#chat-drawer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 38.2%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.92);
+  backdrop-filter: blur(16px);
+  border-right: 1px solid var(--border-glass);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(-100%);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
+}
+#chat-drawer.visible {
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+/* Drawer backdrop — covers remaining 61.8% */
+#chat-drawer-backdrop {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 61.8%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 19;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s;
+}
+#chat-drawer-backdrop.visible {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+#chat-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-glass);
+  flex-shrink: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+#chat-drawer-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+#chat-drawer-close:hover {
+  background: rgba(255,255,255,0.08);
+  color: var(--text);
+}
+
+#chat-drawer-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+}
+#chat-drawer-list::-webkit-scrollbar { width: 4px; }
+#chat-drawer-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+/* ── New conversation button ──────────────────────────────────── */
+#chat-new-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 1;
+  transition: background 0.15s;
+}
+#chat-new-btn:hover {
+  background: rgba(192, 160, 160, 0.2);
+}
+
+/* ── Conversation mode toggle pill (simple Q&A / full Agent) ──── */
+#chat-mode-btn.chat-mode-pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-glass);
+  border-radius: 14px;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+#chat-mode-btn.chat-mode-pill:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+#chat-mode-btn.chat-mode-pill.simple-mode {
+  background: rgba(157, 180, 172, 0.1);
+  border-color: rgba(157, 180, 172, 0.3);
+  color: var(--green);
+}
+#chat-mode-btn.chat-mode-pill.simple-mode:hover {
+  background: rgba(157, 180, 172, 0.18);
+}
+
+/* ── AI workspace picker (chat window entry) ──────────────────── */
+.chat-workspace-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+#chat-workspace-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  font-size: 0.8rem;
+  background: var(--accent-bg);
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+#chat-workspace-btn:hover {
+  background: rgba(192, 160, 160, 0.22);
+  color: var(--accent);
+}
+#chat-workspace-btn.has-workspace {
+  background: rgba(192, 160, 160, 0.12);
+  border-color: rgba(192, 160, 160, 0.35);
+  color: var(--blue);
+}
+#chat-workspace-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(28, 26, 32, 0.92);
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(16px);
+  pointer-events: auto;
+}
+#chat-workspace-menu.hidden {
+  display: none;
+}
+.chat-workspace-path {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+#chat-workspace-menu button {
+  padding: 6px 10px;
+  font-size: 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+#chat-workspace-menu button:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+
+/* ── AI tool blacklist (chat window entry — 第19点缓存优化) ─── */
+.chat-tools-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+#chat-tools-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  font-size: 0.8rem;
+  background: var(--accent-bg);
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+#chat-tools-btn:hover {
+  background: rgba(192, 160, 160, 0.22);
+  color: var(--accent);
+}
+#chat-tools-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  width: 300px;
+  max-height: 320px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(28, 26, 32, 0.94);
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(16px);
+  pointer-events: auto;
+}
+#chat-tools-menu.hidden {
+  display: none;
+}
+.chat-tools-title {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  padding: 0 2px;
+}
+.chat-tools-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+}
+.chat-tools-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7rem;
+  color: var(--text);
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.chat-tools-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.chat-tools-item input[type="checkbox"] {
+  accent-color: var(--blue);
+  pointer-events: auto;
+}
+.chat-tools-item .chat-tools-desc {
+  color: var(--text-dim);
+  font-size: 0.62rem;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.chat-tools-item.locked {
+  color: var(--text-dim);
+}
+.chat-tools-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+#chat-tools-save {
+  padding: 5px 12px;
+  font-size: 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(192, 160, 160, 0.15);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+#chat-tools-save:hover {
+  background: rgba(192, 160, 160, 0.28);
+}
+#chat-tools-save:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.chat-tools-msg {
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+
+/* ── Agent status badge ───────────────────────────────────────── */
+.agent-status {
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-left: 6px;
+  font-weight: 500;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.agent-status.loading {
+  background: rgba(201, 184, 150, 0.15);
+  color: var(--yellow);
+}
+.agent-status.ready {
+  background: rgba(157, 180, 172, 0.12);
+  color: var(--green);
+}
+.agent-status.error {
+  background: rgba(192, 138, 138, 0.15);
+  color: var(--red);
+}
+
+/* ── Memo plugin — 2026-09 新界面（主编辑/历史子界面 + 标识对话框）── */
+.memo-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  user-select: text;
+}
+.memo-history-btn,
+.memo-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 0.72rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.memo-history-btn:hover,
+.memo-back-btn:hover {
+  background: var(--accent-bg);
+  color: var(--text);
+}
+.memo-back-btn { margin-left: 0; }
+.memo-hist-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.memo-hist-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.memo-hist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.memo-hist-item {
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.memo-hist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.memo-hist-text {
+  font-size: 0.78rem;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 6px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.memo-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.68rem;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  padding: 1px 8px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 标识编辑对话框 */
+.memo-tag-dialog {
+  margin-top: 4px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  padding: 10px;
+}
+.memo-tag-dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.memo-tag-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  font-size: 0.76rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.memo-tag-input:focus { border-color: var(--accent-border); }
+.memo-tag-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.memo-tag-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  font-size: 0.72rem;
+  border-radius: 5px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+  cursor: pointer;
+}
+.memo-tag-skip {
+  padding: 4px 12px;
+  font-size: 0.72rem;
+  border-radius: 5px;
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+/* 备忘录图片条（粘贴预览 / 已存图片 / 历史缩略图） */
+.memo-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.memo-img-cell {
+  position: relative;
+  display: inline-flex;
+}
+.memo-img-thumb {
+  width: 88px;
+  height: 88px;
+  object-fit: cover;
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+}
+.memo-img-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--border-glass);
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--red);
+  cursor: pointer;
+  padding: 0;
+}
+.memo-img-del svg { width: 10px; height: 10px; }
+
+/* ── Memo plugin (点17) ────────────────────────────────────────── */
+.memo-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.memo-saved-msg {
+  font-size: 0.75rem;
+  color: var(--green);
+}
+
+.memo-textarea {
+  width: 100%;
+  min-height: 90px;
+  resize: vertical;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  outline: none;
+}
+.memo-textarea:focus {
+  border-color: rgba(192, 160, 160, 0.5);
+}
+
+.memo-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memo-save-btn {
+  background: rgba(192, 160, 160, 0.14);
+  border: 1px solid rgba(192, 160, 160, 0.25);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.memo-save-btn:hover {
+  background: rgba(192, 160, 160, 0.24);
+}
+
+.memo-autosave-hint {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.memo-clear-btn {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: color 0.1s, border-color 0.1s;
+}
+.memo-clear-btn:hover {
+  color: var(--red);
+  border-color: rgba(192, 138, 138, 0.4);
+}
+
+.memo-list-title {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.memo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.memo-item {
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.memo-item-text {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.memo-item-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.memo-item-time {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.memo-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.memo-item-actions button {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 0.68rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1.4;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.memo-item-actions button:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+
+.memo-item-actions .memo-copy:hover {
+  color: var(--green);
+  border-color: rgba(157, 180, 172, 0.35);
+}
+.memo-item-actions .memo-edit:hover {
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+.memo-item-actions .memo-del:hover {
+  color: var(--red);
+  background: rgba(192, 138, 138, 0.12);
+  border-color: rgba(192, 138, 138, 0.4);
+}
+.memo-item-actions .memo-save-edit {
+  color: var(--green);
+  border-color: rgba(157, 180, 172, 0.3);
+}
+.memo-item-actions .memo-save-edit:hover {
+  background: rgba(157, 180, 172, 0.12);
+}
+.memo-item-actions .memo-cancel-edit:hover {
+  color: var(--yellow);
+  border-color: rgba(201, 184, 150, 0.35);
+}
+
+/* Editable textarea in edit mode */
+.memo-item-edit {
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  padding: 6px 8px;
+  outline: none;
+}
+.memo-item-edit:focus {
+  border-color: rgba(192, 160, 160, 0.6);
+}
+
+.memo-item.editing {
+  border-color: rgba(192, 160, 160, 0.4);
+  background: rgba(192, 160, 160, 0.06);
+}
+
+.memo-empty {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  opacity: 0.6;
+  text-align: center;
+  padding: 16px 0;
+}
+
+/* ── 全插件标题统一左对齐（需求1）─────────────────────────────
+   覆盖侧边栏、主内容区、悬浮面板等所有承载插件的场景，确保全平台
+   所有类型插件的标题排版一致。 */
+.settings-pane-title,
+.plugin-result-title,
+.result-item-title,
+#detached-title,
+#plugin-bar-title,
+.history-item-title,
+.approval-title,
+#chat-drawer-header,
+.chat-tools-title,
+.memo-list-title {
+  text-align: left !important;
+}
+
+/* ── 印象派按钮背景清理（用户确认：取消背景全部元素）───────────
+   所有按钮背景保持全透明（background-image:none; box-shadow:none），
+   不再叠加扫笔纹理与双光源光效；hover 仅保留各按钮原有语义色背景
+   （如 accent-bg）作反馈。印象派风格由按钮内部 icon（SVG 图案）承载。
+   A 组：工具图标按钮（默认/hover 均透明）
+   B 组：描边/半透明按钮（去掉常驻纹理层）
+   pill：胶囊切换按钮（去掉常驻纹理层）
+   C 组：圆形小按钮（保持无图案） */
+/* A 组 ─ 工具图标按钮 */
+#settings-btn,
+#chat-history-btn,
+#humanize-btn,
+#chat-drawer-close,
+#plugin-bar-exit,
+#detached-back-btn,
+#detached-vscode-btn,
+#detached-close-btn {
+  background-image: none;
+  box-shadow: none;
+}
+#settings-btn:hover,
+#chat-history-btn:hover,
+#humanize-btn:hover,
+#chat-drawer-close:hover,
+#plugin-bar-exit:hover,
+#detached-back-btn:hover,
+#detached-vscode-btn:hover,
+#detached-close-btn:hover {
+  background-image: none;
+  box-shadow: none;
+}
+
+/* B 组 ─ 描边/半透明按钮 */
+.clip-item-copy,
+.ocr-action-btn,
+.ocr-copy-btn,
+#chat-add-file-btn,
+#chat-send-btn,
+#chat-stop-btn,
+#chat-new-btn,
+#chat-tools-btn,
+#chat-workspace-btn,
+#chat-tools-save,
+#chat-workspace-menu button,
+.approval-btn,
+.approval-batch-card .approval-copy-btn,
+.memo-save-btn,
+.memo-clear-btn,
+.memo-item-actions button {
+  background-image: none;
+  box-shadow: none;
+}
+
+/* pill ─ 胶囊切换按钮 */
+#chat-mode-btn.chat-mode-pill {
+  background-image: none;
+  box-shadow: none;
+}
+
+/* C 组 ─ 圆形小按钮：恢复原样（不再叠加背景图案） */
+.file-chip-remove:hover,
+.result-item-remove:hover,
+.history-item-delete:hover,
+.msg-actions button:hover {
+  background-image: none;
+  box-shadow: none;
+}
+

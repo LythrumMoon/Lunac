@@ -1,0 +1,39 @@
+[package]
+name = "lunac"
+version = "0.9.0"
+edition = "2021"
+description = "Lunac - Native AI coding assistant with local + cloud hybrid inference"
+
+[package.metadata]
+# Tauri build metadata
+
+[dependencies]
+tauri = { version = "2.5", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+arboard = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tokio = { version = "1", features = ["sync", "macros"] }
+futures = "0.3"
+dotenvy = "0.15"
+base64 = "0.22"
+pinyin = { version = "0.11", features = ["plain"] }
+winreg = "0.52"
+windows = { version = "0.58", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage",
+    "Storage_Streams",
+    "Foundation",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

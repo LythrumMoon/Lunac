@@ -1,0 +1,18 @@
+{
+  "name": "image_pattern_analysis",
+  "description": "Analyze the visual pattern features of a local image file (jpg/png) using pure pixel statistics, fully offline: overall brightness & 4x4 brightness grid, dominant hue & main colors, brush-stroke/edge direction histogram (Sobel), texture density, highlight dot ratio, and horizontal symmetry, ending with composition suggestions. Use this when the user asks to extract the pattern/style features of a reference image (e.g. for UI button/icon design).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute path to the image file (jpg/png)"
+      }
+    },
+    "required": ["path"]
+  },
+  "handler": {
+    "type": "builtin",
+    "name": "image_pattern_analysis"
+  }
+}

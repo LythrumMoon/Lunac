@@ -1,0 +1,128 @@
+{
+  "name": "lunac",
+  "displayName": "Lunac — AI Chat & Launcher",
+  "description": "Multi-model AI chat powered by DeepSeek · OpenAI · Anthropic · Gemini · GLM · SiliconFlow · Qwen. Built-in OCR, app launcher, and tooling.",
+  "version": "0.9.0",
+  "publisher": "lunac",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "chat",
+    "deepseek",
+    "openai",
+    "claude",
+    "gemini",
+    "copilot",
+    "ocr",
+    "launcher"
+  ],
+  "activationEvents": [
+    "onUri",
+    "onView:lunac.chatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "lunac-sidebar",
+          "title": "Lunac",
+          "icon": "media/lunac-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "lunac-sidebar": [
+        {
+          "type": "webview",
+          "id": "lunac.chatView",
+          "name": "AI Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "lunac.openPanel",
+        "title": "Lunac: Open Panel",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "lunac.focusChat",
+        "title": "Lunac: Focus AI Chat",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "lunac.configureProvider",
+        "title": "Lunac: Configure AI Provider"
+      }
+    ],
+    "uriHandler": {
+      "handlerId": "lunac"
+    },
+    "configuration": {
+      "title": "Lunac",
+      "properties": {
+        "lunac.provider": {
+          "type": "string",
+          "enum": [
+            "deepseek",
+            "openai",
+            "anthropic",
+            "google",
+            "zhipu",
+            "moonshot",
+            "qwen",
+            "siliconflow",
+            "custom"
+          ],
+          "default": "deepseek",
+          "description": "AI provider for chat. Requires corresponding API key."
+        },
+        "lunac.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key. Falls back to provider-specific env vars (DEEPSEEK_API_KEY, OPENAI_API_KEY, etc.) and ANTHROPIC_API_KEY."
+        },
+        "lunac.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model name. Leave empty to use provider's default (e.g. deepseek-v4-pro, gpt-4o-mini)."
+        },
+        "lunac.apiUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Custom API base URL. Overrides the built-in endpoint. E.g. https://your-proxy.com/v1"
+        },
+        "lunac.apiFormat": {
+          "type": "string",
+          "enum": ["openai", "anthropic"],
+          "default": "openai",
+          "description": "API format for custom provider (OpenAI-compatible or Anthropic-compatible)."
+        },
+        "lunac.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to cli.exe. Leave empty for auto-discovery (release/Lunac, %USERPROFILE%/.lunac, or LUNAC_CLI_PATH)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.3.0",
+    "typescript": "^5.5.0"
+  }
+}

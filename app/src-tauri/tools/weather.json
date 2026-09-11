@@ -1,0 +1,18 @@
+{
+  "name": "get_weather",
+  "description": "Get current weather for any city using wttr.in",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "city": {
+        "type": "string",
+        "description": "City name (e.g. Beijing, London, Tokyo)"
+      }
+    },
+    "required": ["city"]
+  },
+  "handler": {
+    "type": "shell",
+    "command": "curl -s \"wttr.in/{{city}}?format=3\""
+  }
+}

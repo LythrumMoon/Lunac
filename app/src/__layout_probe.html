@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Layout Probe</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    body { background: #222; }
+    /* probe 专用：把窗口钉成插件固定高度 360 逻辑像素 */
+    #probe-win { height: 360px; }
+  </style>
+</head>
+<body>
+  <div id="probe-win">
+  <div id="app" class="plugin-active">
+    <div id="search-bar" class="plugin-locked has-results">
+      <div id="search-input-area">
+        <div id="file-chips"></div>
+        <textarea id="search-input" rows="1" disabled></textarea>
+      </div>
+      <span id="search-hint" class="hidden"></span>
+      <span id="plugin-bar-title">Restored session title · Aug 16, 14:00</span>
+      <button id="plugin-bar-exit" class="hidden" style="display:flex">✕</button>
+      <button id="settings-btn" style="display:none"></button>
+    </div>
+    <div id="results-container" class="ai-chat">
+      <div id="app-bg-image" style="background-image:none"></div>
+      <div id="results-list">
+        <div class="ai-response" id="chat-log">
+          <div class="chat-msg-user" data-idx="0">What is the meaning of life, the universe and everything? Please explain in detail.</div>
+          <div class="chat-msg-assistant" data-idx="1"><div class="agent-text"><p>42. The answer is 42.</p></div></div>
+          <div class="chat-msg-user" data-idx="2">Follow-up question: why 42?</div>
+          <div class="chat-msg-assistant" data-idx="3"><div class="agent-text"><p>Because it is.</p></div></div>
+        </div>
+      </div>
+      <div id="chat-input-bar" class="">
+        <div id="chat-file-chips"></div>
+        <div id="chat-input-row">
+          <button id="chat-add-file-btn">+</button>
+          <textarea id="chat-input" rows="1" placeholder="Ask AI..."></textarea>
+        </div>
+      </div>
+    </div>
+    <div id="status-bar"><span>Ready</span></div>
+  </div>
+  </div>
+</body>
+</html>

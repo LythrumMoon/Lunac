@@ -1,0 +1,2045 @@
+// src-tauri/src/commands.rs
+// Tauri IPC commands — CLI subprocess management and message relay.
+// Note: Simple AI chat is handled directly by chat.rs (no proxy needed).
+// cli.exe is the full Agent backend (tools, skills, prompts).
+// It is optional and started on demand via start_cli.
+
+use crate::AppState;
+use crate::proxy_server;
+use crate::cli_bridge;
+use crate::windows_ocr;
+use crate::paddle_ocr;
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use tauri::{AppHandle, Emitter, State};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StatusPayload {
+    pub state: String,
+    pub message: String,
+    /// CLI process instance id. Every cli.exe spawn gets a fresh id; the
+    /// frontend ignores "closed" events whose instance doesn't match the
+    /// currently-known one — a stale close from a stopped CLI can no longer
+    /// tear down a newly started session.
+    #[serde(default)]
+    pub instance: u32,
+}
+
+/// Returns a fresh, monotonically increasing CLI instance id.
+pub fn next_cli_instance() -> u32 {
+    static CLI_INSTANCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    CLI_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CliOutput {
+    pub line: String,
+}
+
+// ── Path helpers ──────────────────────────────────────────────────
+
+/// Returns the directory containing compiled CLI and proxy binaries.
+/// In dev mode this is the `core/` project directory.
+/// In release mode checks multiple locations (in priority order):
+///   1. exe_dir/resources/  — Tauri's built-in bundler puts resources here
+///   2. exe_dir/            — our custom NSIS installer puts cli.exe alongside lunac.exe
+///   3. ../../../../core    — dev mode fallback (navigate up from src-tauri/target/debug/)
+fn core_dir() -> std::path::PathBuf {
+    let exe_dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // Release: Tauri's bundle extraction directory
+    let resources_dir = exe_dir.join("resources");
+    if resources_dir.join("cli.exe").exists() {
+        return resources_dir;
+    }
+
+    // Release: our custom NSIS installer puts cli.exe alongside lunac.exe
+    if exe_dir.join("cli.exe").exists() {
+        return exe_dir;
+    }
+
+    // Dev mode: navigate up from src-tauri/target/{debug,release}/ to core/
+    exe_dir
+        .join("..").join("..").join("..").join("..")
+        .join("core")
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap().join("..").join("core"))
+}
+
+// ── Subprocess management ─────────────────────────────────────────
+
+// ── Windows Job Object：子进程严格绑定 lunac.exe 生命周期 ────────
+// spawn 的子进程（cli.exe / llama-server.exe）由 OS 记录父子关系，
+// 任务管理器"进程"页展开 Lunac 分组即可看到（CREATE_NO_WINDOW 只是
+// 不弹控制台，进程本身可见）。但父进程崩溃时子进程会变孤儿；
+// Job Object + KILL_ON_JOB_CLOSE 保证 lunac.exe 以任何方式退出
+// （含崩溃/taskkill）时，Windows 内核自动终止 job 内全部子进程。
+#[cfg(target_os = "windows")]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimits {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        basic: BasicLimits,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut std::ffi::c_void, name: *const u16) -> isize;
+        fn SetInformationJobObject(
+            job: isize,
+            class: u32,
+            info: *const std::ffi::c_void,
+            len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+    }
+
+    static JOB: OnceLock<isize> = OnceLock::new();
+
+    fn handle() -> isize {
+        *JOB.get_or_init(|| unsafe {
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if job != 0 {
+                let mut info = ExtendedLimits::default();
+                info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    job,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    &info as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<ExtendedLimits>() as u32,
+                );
+            }
+            job // handle 永不关闭 — 进程退出时由内核关闭并触发 KILL
+        })
+    }
+
+    /// 将子进程加入 job。失败不致命（极老系统不支持嵌套 job），仅记录日志。
+    pub fn assign(child: &std::process::Child) {
+        let job = handle();
+        if job == 0 {
+            return;
+        }
+        unsafe {
+            if AssignProcessToJobObject(job, child.as_raw_handle() as isize) == 0 {
+                eprintln!("[job] AssignProcessToJobObject failed (pid {})", child.id());
+            }
+        }
+    }
+}
+
+// ── Agent HTTP bridge (VSCode extension) ─────────────────────────
+// Same logic as start_cli but without Tauri AppHandle/State dependencies.
+// Called by agent_server.rs via POST /agent/start.
+// The desktop app can also drive Agent via Tauri IPC on the same cli.exe process.
+
+pub fn start_agent_http() -> Result<String, String> {
+    if cli_bridge::is_running() {
+        return Ok("already running".into());
+    }
+
+    let api_url = env::var("AI_API_URL")
+        .or_else(|_| env::var("DEEPSEEK_URL"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".into());
+    let api_key = env::var("AI_API_KEY")
+        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
+        .map_err(|_| "No AI_API_KEY configured".to_string())?;
+    let model = env::var("AI_MODEL")
+        .unwrap_or_else(|_| "deepseek-v4-pro".into());
+
+    proxy_server::stop();
+
+    let anth_url = env::var("AI_ANTHROPIC_URL")
+        .unwrap_or_else(|_| format!("{}/anthropic", api_url.trim_end_matches('/')));
+    env::set_var("ANTHROPIC_BASE_URL", anth_url);
+    env::set_var("ANTHROPIC_AUTH_TOKEN", &api_key);
+    env::remove_var("ANTHROPIC_API_KEY");
+    env::set_var("ANTHROPIC_MODEL", &model);
+    env::set_var("ANTHROPIC_SMALL_FAST_MODEL", &model);
+
+    let dir = core_dir();
+    let cli_exe = dir.join("cli.exe");
+    if !cli_exe.exists() {
+        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+    }
+
+    // Ripgrep vendor path
+    let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
+    if rg_dir.join("rg.exe").exists() {
+        let rg_str = rg_dir.display().to_string();
+        let old_path = env::var("PATH").unwrap_or_default();
+        if !old_path.contains(&rg_str) {
+            env::set_var("PATH", format!("{};{}", rg_str, old_path));
+        }
+        env::set_var("USE_BUILTIN_RIPGREP", "0");
+    }
+
+    let cli_path = cli_exe.to_string_lossy().to_string();
+    let mut args: Vec<String> = vec![
+        "--print".into(),
+        "--verbose".into(),
+        "--input-format".into(), "stream-json".into(),
+        "--output-format".into(), "stream-json".into(),
+        "--include-partial-messages".into(),
+        "--permission-prompt-tool".into(), "stdio".into(),
+    ];
+
+    // MCP bridge
+    {
+        let lunac_exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("lunac.exe"));
+        args.push("--mcp-server".into());
+        args.push(format!("stdio:{}", lunac_exe.display()));
+    }
+    cli_args_for_profile("project", &dir, &mut args);
+    args.push(".".into());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut child = spawn_child(&cli_path, &args_refs, &dir, &[])?;
+
+    let stdin = child.stdin.take();
+    if let Some(stdin) = stdin {
+        cli_bridge::set_stdin(stdin);
+    }
+
+    // stdout reader → broadcast to SSE subscribers
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() && trimmed.starts_with('{') {
+                        cli_bridge::broadcast_output(trimmed);
+                    }
+                }
+            }
+        });
+    }
+
+    // stderr → dev terminal only (no Tauri AppHandle available)
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if !line.trim().is_empty() {
+                        eprintln!("[cli-http] {}", line);
+                    }
+                }
+            }
+        });
+    }
+
+    cli_bridge::set_process(child);
+    Ok("Agent started".into())
+}
+
+fn spawn_child(
+    program: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    envs: &[(&str, String)],
+) -> Result<Child, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console popup
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", program, e))?;
+        job::assign(&child); // 绑定生命周期：lunac 退出 → 子进程必死
+        Ok(child)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("Failed to spawn {}: {}", program, e))
+    }
+}
+
+// ── CLI process ───────────────────────────────────────────────────
+
+/// 保守默认工具黑名单（第 19 点 — DeepSeek 缓存命中率优化）。
+/// Lunac 桌面助手用不到的实验性工具，经 `--disallowedTools` 从请求体
+/// tools schema 中剔除：既让工具数组更短（尾部每轮恒定 miss 体积变小），
+/// 又避免随 MCP 工具增减漂移。用户可在设置面板追加禁用更多工具
+/// （存入 AppState.tool_blacklist，start_cli_process 时与此合并）。
+/// 注意：多数受 feature flag 控制、默认就不在工具池中，禁入无害。
+const DEFAULT_TOOL_BLACKLIST: &[&str] = &[
+    "ToolSearch",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "SendMessage",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Config",
+    "TeamCreate",
+    "TeamDelete",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "RemoteTrigger",
+    "LSP",
+    "NotebookEdit",
+    "Brief",
+];
+
+/// Build the `--disallowedTools` args (defaults + user-custom, deduped).
+/// Empty when nothing to deny — keeps the CLI arg list minimal.
+fn tool_blacklist_args(custom: &[String]) -> Vec<String> {
+    let mut list: Vec<String> = DEFAULT_TOOL_BLACKLIST
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for name in custom {
+        let name = name.trim();
+        if !name.is_empty() && !list.iter().any(|b| b == name) {
+            list.push(name.to_string());
+        }
+    }
+    if list.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec!["--disallowedTools".to_string()];
+    args.extend(list);
+    args
+}
+
+
+/// Security profiles map to CLI permission modes + directory scoping.
+/// - "safe":  read-only, no writes anywhere (plan mode)
+/// - "project": auto-approve edits in project dir (acceptEdits + --add-dir)
+/// - "full":   bypass all permission checks (dangerous, admin only)
+fn cli_args_for_profile<'a>(
+    profile: &str,
+    cwd: &'a std::path::Path,
+    args: &'a mut Vec<String>,
+) {
+    match profile {
+        "safe" => {
+            args.push("--permission-mode".into());
+            args.push("plan".into());
+        }
+        "full" => {
+            args.push("--dangerously-skip-permissions".into());
+            // Still scope to project dir as safety net
+            args.push("--add-dir".into());
+            args.push(cwd.display().to_string());
+        }
+        _ => { // "project" (default)
+            args.push("--permission-mode".into());
+            args.push("acceptEdits".into());
+            args.push("--add-dir".into());
+            args.push(cwd.display().to_string());
+        }
+    }
+}
+
+fn start_cli_process(
+    state: &AppState,
+    app: AppHandle,
+    core_dir: &std::path::Path,
+) -> Result<(), String> {
+    if cli_bridge::is_running() {
+        return Ok(()); // already running
+    }
+
+    let profile = state.security_profile
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "project".into());
+
+    // AI workspace: the directory the agent may operate in (cwd + --add-dir).
+    // Empty = fall back to the user's home directory — the agent can reach
+    // the whole system; edits outside the home dir still trigger the
+    // ask/approval flow (warning cards) instead of silent auto-allow.
+    // When a workspace IS configured, LUNAC_WORKSPACE_LOCKED=1 is passed to
+    // the CLI so file reads/writes OUTSIDE the workspace are denied outright
+    // (instead of the default "ask" for the whole-system mode).
+    let (workdir, workspace_locked) = {
+        let ws = state.workspace.lock().map(|g| g.clone()).unwrap_or_default();
+        let ws = ws.trim().to_string();
+        if ws.is_empty() {
+            (dirs_current_user_home(), false)
+        } else {
+            (std::path::PathBuf::from(ws), true)
+        }
+    };
+
+    let cli_exe = core_dir.join("cli.exe");
+    if !cli_exe.exists() {
+        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+    }
+    let cli_path = cli_exe.to_string_lossy().to_string();
+
+    // Args for the compiled standalone CLI (no "bun run" prefix needed)
+    let mut args: Vec<String> = vec![
+        "--print".into(),
+        "--verbose".into(),
+        "--input-format".into(),
+        "stream-json".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        // Emit stream_event lines (content_block_delta etc.) for live
+        // typing in the frontend; without it only whole messages arrive.
+        "--include-partial-messages".into(),
+        // Route permission "ask" decisions to the frontend via the
+        // can_use_tool control_request protocol (approval cards in UI).
+        // Without this the CLI decides everything silently by itself.
+        "--permission-prompt-tool".into(),
+        "stdio".into(),
+    ];
+
+    // ── MCP bridge: connect cli.exe to lunac.exe's built-in MCP server.
+    // cli.exe parses --mcp-server stdio:<path> and generates a temporary
+    // --mcp-config that launches lunac.exe --mcp-server as a child process.
+    // The MCP server reads user-defined tools from <exe 根>\tools\
+    {
+        let lunac_exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("lunac.exe"));
+        args.push("--mcp-server".into());
+        args.push(format!("stdio:{}", lunac_exe.display()));
+    }
+    cli_args_for_profile(&profile, &workdir, &mut args);
+    args.push(".".into());
+
+    // ── 工具黑名单（第 19 点）：默认保守 + 用户自定义，剔除不需要的
+    // 工具以缩减请求体尾部 tools schema（缓存命中率优化）。
+    // 注意：必须放在 "."（路径参数）之后 —— commander 的 <tools...>
+    // variadic 会贪婪消费到下一个 --flag，若放在前面会把 "." 吞成工具名。
+    let blacklist = {
+        let custom = state
+            .tool_blacklist
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        tool_blacklist_args(&custom)
+    };
+    args.extend(blacklist);
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    // Workspace lock: when a workspace is configured, the CLI must deny
+    // access outside it (filesystem.ts reads this env var).
+    let mut envs: Vec<(&str, String)> = Vec::new();
+    if workspace_locked {
+        envs.push(("LUNAC_WORKSPACE_LOCKED", "1".into()));
+    }
+    // 已安装技能固定目录 → cli.exe（core 侧经 LUNAC_SKILLS_DIR 额外扫描
+    // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
+    envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
+
+    // DeepSeek 思考模式三档 → cli.exe 环境变量（点2/7）。
+    // core 侧依据 MAX_THINKING_TOKENS 决定 thinking 开关与预算
+    // （0=disabled，>0=enabled+budgetTokens）；DeepSeek 官方 Anthropic 兼容
+    // 端点只接受 enabled/disabled，故必须 CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1
+    // 阻止 core 对未知模型默认走 {type:"adaptive"}。
+    //   fast : MAX_THINKING_TOKENS=0            → 不思考
+    //   think: MAX_THINKING_TOKENS=8192         → 思考（8k budget）
+    //   deep : MAX_THINKING_TOKENS=32768        → 深度思考（32k budget）
+    let thinking_mode = state
+        .thinking_mode
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "fast".into());
+    match thinking_mode.as_str() {
+        "think" => {
+            envs.push(("MAX_THINKING_TOKENS", "8192".into()));
+            envs.push(("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "1".into()));
+        }
+        "deep" => {
+            envs.push(("MAX_THINKING_TOKENS", "32768".into()));
+            envs.push(("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "1".into()));
+        }
+        _ => {
+            envs.push(("MAX_THINKING_TOKENS", "0".into()));
+        }
+    }
+
+    let mut child = spawn_child(&cli_path, &args_refs, &workdir, &envs)?;
+
+    // Unique instance id for this cli.exe spawn — the frontend uses it to
+    // discard stale "closed" events after a stop/restart.
+    let instance = next_cli_instance();
+
+    // Extract stdin handle before moving child → store for send_message
+    let stdin = child.stdin.take();
+
+    // Relay stdout → frontend Tauri events + HTTP SSE bridge
+    // Filter: only emit lines that are valid JSON (ignore debug output)
+    if let Some(stdout) = child.stdout.take() {
+        let app_clone = app.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() && trimmed.starts_with('{') {
+                        let _ = app_clone.emit("cli-output", CliOutput { line: trimmed.clone() });
+                        // Also broadcast to HTTP SSE subscribers (VSCode extension)
+                        cli_bridge::broadcast_output(trimmed);
+                    }
+                }
+            }
+            // stdout pipe closed → CLI process exited
+            let _ = app_clone.emit("cli-status", StatusPayload {
+                state: "closed".into(),
+                message: "CLI process exited".into(),
+                instance,
+            });
+        });
+    }
+
+    // Relay stderr → frontend + dev terminal (debugging visibility)
+    if let Some(stderr) = child.stderr.take() {
+        let app_clone = app.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if !line.trim().is_empty() {
+                        eprintln!("[cli] {}", line);
+                        let _ = app_clone.emit("cli-stderr", line);
+                    }
+                }
+            }
+        });
+    }
+
+    // Store child (for kill access) and stdin (for send_message)
+    // Both in AppState (Tauri) and cli_bridge (HTTP server)
+    if let Some(stdin) = stdin {
+        cli_bridge::set_stdin(stdin);
+    }
+    cli_bridge::set_process(child);
+
+    // Signal frontend that CLI stdin is ready to receive messages.
+    // The CLI buffers stdin input while it finishes loading plugins and
+    // scanning --add-dir . Once initialized, it processes the buffered
+    // message. system/init arrives later (per-query-turn) and is used
+    // by the frontend for status display only — NOT for cliReady.
+    if let Err(e) = app.emit("cli-status", StatusPayload {
+        state: "stdout".into(),
+        message: "CLI stdin ready".into(),
+        instance,
+    }) {
+        eprintln!("[start_cli] Failed to emit stdout status: {}", e);
+    }
+
+    Ok(())
+}
+
+/// 构造 Anthropic 兼容端点。
+/// api_url 若带末尾 `/v1`（OpenAI 兼容风格的地址栏/预设），先剥离再拼
+/// `/anthropic`，避免出现 `/v1/anthropic` 双重路径；explicit 优先（AI_ANTHROPIC_URL）。
+fn anthropic_endpoint(api_url: &str, explicit: Option<&str>) -> String {
+    if let Some(a) = explicit {
+        let a = a.trim();
+        if !a.is_empty() {
+            return a.to_string();
+        }
+    }
+    let base = api_url.trim_end_matches('/');
+    let root = match base.strip_suffix("/v1") {
+        // 只剥纯末尾 /v1；host-only（http(s)://api.xxx）不会被误伤
+        Some(r) if r.contains("://") => r,
+        _ => base,
+    };
+    format!("{}/anthropic", root)
+}
+
+// ── Tauri Commands (IPC) ──────────────────────────────────────────
+
+#[tauri::command]
+pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let api_url = env::var("AI_API_URL")
+        .or_else(|_| env::var("DEEPSEEK_URL"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".into());
+    let api_key = env::var("AI_API_KEY")
+        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
+        .map_err(|_| "No AI_API_KEY configured".to_string())?;
+    let model = env::var("AI_MODEL")
+        .unwrap_or_else(|_| "deepseek-v4-pro".into());
+
+    // Agent mode: connect cli.exe DIRECTLY to the provider's native
+    // Anthropic-compatible endpoint. This gives full tool-calling
+    // support — the old proxy dropped `tools` from requests, so the
+    // model could never emit tool_use blocks.
+    // Auth MUST be Bearer via ANTHROPIC_AUTH_TOKEN; x-api-key → 401.
+    proxy_server::stop();
+    // Providers whose Anthropic endpoint is NOT base+"/anthropic"
+    // (e.g. Zhipu GLM) set AI_ANTHROPIC_URL explicitly via set_ai_config.
+    let anth_url = anthropic_endpoint(&api_url, env::var("AI_ANTHROPIC_URL").ok().as_deref());
+    env::set_var("ANTHROPIC_BASE_URL", anth_url);
+    env::set_var("ANTHROPIC_AUTH_TOKEN", &api_key);
+    env::remove_var("ANTHROPIC_API_KEY"); // avoid x-api-key overriding Bearer
+    env::set_var("ANTHROPIC_MODEL", &model);
+    env::set_var("ANTHROPIC_SMALL_FAST_MODEL", &model);
+
+    let dir = core_dir();
+    let cli_exe = dir.join("cli.exe");
+    if !cli_exe.exists() {
+        proxy_server::stop();
+        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+    }
+
+    // Ripgrep for the compiled cli.exe: the bundled path points into Bun's
+    // virtual filesystem (B:\~BUN\...) where rg.exe was never packed.
+    // Force system-PATH mode and prepend the on-disk vendor dir to PATH.
+    let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
+    if rg_dir.join("rg.exe").exists() {
+        let rg_str = rg_dir.display().to_string();
+        let old_path = env::var("PATH").unwrap_or_default();
+        if !old_path.contains(&rg_str) {
+            env::set_var("PATH", format!("{};{}", rg_str, old_path));
+        }
+        env::set_var("USE_BUILTIN_RIPGREP", "0");
+    }
+
+    // Only emit starting if CLI is not already running — avoid spurious
+    // cliReady=false with no follow-up stdout. ensure_agent_running()
+    // (called before ai-mode-changed) already handles the first spawn.
+    let already_running = cli_bridge::is_running();
+    if !already_running {
+        app.emit("cli-status", StatusPayload {
+            state: "starting".into(),
+            message: format!("Mode agent, CLI at {}", dir.display()),
+            instance: 0, // informational — not tied to a specific spawn
+        }).ok();
+    }
+
+    start_cli_process(&state, app.clone(), &dir)?;
+    Ok("CLI started".into())
+}
+
+#[tauri::command]
+pub async fn stop_cli(_state: State<'_, AppState>) -> Result<String, String> {
+    cli_bridge::kill_and_cleanup();
+    proxy_server::stop();
+    Ok("All processes stopped".into())
+}
+
+#[tauri::command]
+pub async fn send_message(_state: State<'_, AppState>, message: String) -> Result<String, String> {
+    cli_bridge::write_to_cli(&message)?;
+    Ok("Message sent".into())
+}
+
+#[tauri::command]
+pub async fn get_status(_state: State<'_, AppState>) -> Result<StatusPayload, String> {
+    let cli_running = cli_bridge::is_running();
+    let state_str = if cli_running { "ready" } else { "idle" };
+    let message = format!(
+        "CLI: {}",
+        if cli_running { "running" } else { "stopped" },
+    );
+    Ok(StatusPayload { state: state_str.into(), message, instance: 0 })
+}
+
+// ── Security profile ────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_security_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile: String,
+) -> Result<String, String> {
+    // Validate profile
+    if !["safe", "project", "full"].contains(&profile.as_str()) {
+        return Err(format!("Invalid profile: {}. Use safe/project/full.", profile));
+    }
+
+    // Update stored profile
+    {
+        let mut guard = state.security_profile.lock().map_err(|e| e.to_string())?;
+        *guard = profile.clone();
+    }
+
+    // Restart CLI with new profile (stop old, start new)
+    // cli_bridge owns the process/stdin since the agent HTTP bridge refactor;
+    // the legacy AppState fields are no longer authoritative.
+    cli_bridge::kill_and_cleanup();
+
+    let dir = core_dir();
+    start_cli_process(&state, app.clone(), &dir)?;
+
+    Ok(format!("Security profile set to: {}", profile))
+}
+
+// ── Start Menu apps ─────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AppEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default = "default_source")]
+    pub source: String,
+}
+
+/// Helper for serde(default=...)
+#[allow(dead_code)]
+fn default_source() -> String {
+    "start_menu".into()
+}
+
+#[tauri::command]
+pub fn list_start_menu_apps() -> Vec<AppEntry> {
+    crate::app_indexer::scan_all()
+        .into_iter()
+        .map(|a| AppEntry {
+            name: a.name,
+            path: a.path,
+            icon: a.icon,
+            source: a.source,
+        })
+        .collect()
+}
+
+/// Search apps by fuzzy query — returns top matches for the search bar.
+#[tauri::command]
+pub fn search_apps(query: String, limit: usize) -> Vec<AppEntry> {
+    crate::app_indexer::search_apps(&query, limit)
+        .into_iter()
+        .map(|a| AppEntry {
+            name: a.name,
+            path: a.path,
+            icon: a.icon,
+            source: a.source,
+        })
+        .collect()
+}
+
+/// Launch an app by path (.exe, .lnk, folder, or URL).
+#[tauri::command]
+pub fn launch_app(path: String) -> Result<(), String> {
+    crate::app_indexer::launch_app(&path)
+}
+
+/// Add a custom app to the registry.
+#[tauri::command]
+pub fn add_custom_app(name: String, path: String) -> Result<String, String> {
+    crate::app_indexer::add_custom_app(&name, &path)?;
+    Ok(format!("Added: {} ({})", name, path))
+}
+
+/// Remove a custom app from the registry.
+#[tauri::command]
+pub fn remove_custom_app(path: String) -> Result<String, String> {
+    crate::app_indexer::remove_custom_app(&path)?;
+    Ok(format!("Removed: {}", path))
+}
+
+/// List all registered custom apps.
+#[tauri::command]
+pub fn list_custom_apps() -> Vec<AppEntry> {
+    crate::app_indexer::list_custom_apps()
+        .into_iter()
+        .map(|a| AppEntry {
+            name: a.name,
+            path: a.path,
+            icon: a.icon,
+            source: a.source,
+        })
+        .collect()
+}
+
+/// Extract the system icon for a file path, returned as base64 PNG data URL.
+#[tauri::command]
+pub fn get_app_icon(path: String) -> Result<Option<String>, String> {
+    Ok(crate::icon_extractor::extract_icon_base64(&path))
+}
+
+// ── Query / recording / plugin / detached / chips state ──────────
+
+#[tauri::command]
+pub fn set_query_state(empty: bool) {
+    crate::hotkey::QUERY_EMPTY.store(empty, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub fn set_recording_state(recording: bool) {
+    crate::hotkey::RECORDING.store(recording, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub fn set_plugin_active(active: bool) {
+    crate::hotkey::PLUGIN_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub fn set_chips_empty(empty: bool) {
+    crate::hotkey::CHIPS_EMPTY.store(empty, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub fn set_detached(detached: bool) {
+    crate::hotkey::DETACHED.store(detached, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Update AI provider config at runtime (from the settings plugin).
+/// Values become process env vars, inherited by chat.rs (simple mode,
+/// per-request) and cli.exe (agent mode, next start_cli).
+/// `anthropic_url` overrides base+"/anthropic" for providers with a
+/// non-standard Anthropic endpoint (e.g. Zhipu GLM); empty = default rule.
+#[tauri::command]
+pub async fn set_ai_config(
+    provider: String,
+    url: String,
+    key: String,
+    model: String,
+    anthropic_url: Option<String>,
+) -> Result<String, String> {
+    if url.trim().is_empty() || model.trim().is_empty() {
+        return Err("url / model must not be empty".into());
+    }
+    if !provider.trim().is_empty() {
+        env::set_var("AI_PROVIDER", provider.trim());
+    }
+    env::set_var("AI_API_URL", url.trim());
+    env::set_var("AI_API_KEY", key.trim());
+    env::set_var("AI_MODEL", model.trim());
+    match anthropic_url.as_deref().map(str::trim) {
+        Some(a) if !a.is_empty() => env::set_var("AI_ANTHROPIC_URL", a),
+        _ => env::remove_var("AI_ANTHROPIC_URL"),
+    }
+    Ok("AI config updated".into())
+}
+
+/// Return current AI config from env vars.
+#[tauri::command]
+pub fn get_ai_config() -> serde_json::Value {
+    serde_json::json!({
+        "provider": env::var("AI_PROVIDER").unwrap_or_default(),
+        "base_url": env::var("AI_API_URL").unwrap_or_default(),
+        "model": env::var("AI_MODEL").unwrap_or_default(),
+        "api_key": env::var("AI_API_KEY").unwrap_or_default(),
+    })
+}
+
+// ── AI Workspace ──────────────────────────────────────────────────
+// Simple mode removed (2026-08-04): the app runs Agent (cli.exe) only.
+// The workspace is the directory the agent may operate in — used as the
+// CLI working directory and --add-dir scope. Empty string = user home dir
+// (whole system reachable; edits elsewhere go through ask approval).
+
+/// Set the agent workspace directory. Empty string resets to the default
+/// (user home dir). When the CLI is already running the caller should stop it
+/// (`stop_cli`) so the next start picks up the new workspace.
+#[tauri::command]
+pub fn set_workspace(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    let trimmed = path.trim();
+    let resolved = if trimmed.is_empty() {
+        String::new()
+    } else {
+        let p = std::path::Path::new(trimmed);
+        let canonical = p
+            .canonicalize()
+            .map_err(|e| format!("Workspace not found: {}", e))?;
+        if !canonical.is_dir() {
+            return Err("Workspace must be a directory".into());
+        }
+        canonical.display().to_string()
+    };
+    {
+        let mut guard = state.workspace.lock().map_err(|e| e.to_string())?;
+        *guard = resolved.clone();
+    }
+    Ok(if resolved.is_empty() {
+        "Workspace reset to default (user home)".into()
+    } else {
+        format!("Workspace set: {}", resolved)
+    })
+}
+
+#[tauri::command]
+pub fn get_workspace(state: State<'_, AppState>) -> String {
+    state.workspace.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Set the user-custom tool blacklist (第 19 点缓存优化)。
+/// Merged with DEFAULT_TOOL_BLACKLIST on the next cli.exe start.
+/// The caller should stop_cli + start_cli to apply the new list.
+#[tauri::command]
+pub fn set_tool_blacklist(
+    state: State<'_, AppState>,
+    blacklist: Vec<String>,
+) -> Result<String, String> {
+    let mut b = state
+        .tool_blacklist
+        .lock()
+        .map_err(|_| "Failed to lock AppState".to_string())?;
+    *b = blacklist;
+    Ok("Tool blacklist updated".into())
+}
+
+/// Internal: start CLI (direct provider connection). Does NOT start local model (caller decides).
+fn ensure_agent_running(state: &AppState, app: &AppHandle) -> Result<(), String> {
+    // Already running? (cli_bridge owns the process since the HTTP bridge refactor)
+    if cli_bridge::is_running() {
+        return Ok(());
+    }
+
+    let api_url = env::var("AI_API_URL")
+        .or_else(|_| env::var("DEEPSEEK_URL"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".into());
+    let api_key = env::var("AI_API_KEY")
+        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
+        .map_err(|_| "No AI_API_KEY configured".to_string())?;
+    let model = env::var("AI_MODEL")
+        .unwrap_or_else(|_| "deepseek-v4-pro".into());
+
+    // Connect cli.exe DIRECTLY to the provider's native Anthropic-compatible
+    // endpoint — identical to start_cli(). The old built-in proxy strips the
+    // `tools` array from requests, so the model can never emit tool_use blocks
+    // and falls back to raw XML tool text (`<toolcall ...>`), which renders as
+    // garbage in the agent chat bubble.
+    proxy_server::stop();
+    let anth_url = anthropic_endpoint(&api_url, env::var("AI_ANTHROPIC_URL").ok().as_deref());
+    env::set_var("ANTHROPIC_BASE_URL", anth_url);
+    // Auth MUST be Bearer via ANTHROPIC_AUTH_TOKEN; x-api-key → 401.
+    env::set_var("ANTHROPIC_AUTH_TOKEN", &api_key);
+    env::remove_var("ANTHROPIC_API_KEY"); // avoid x-api-key overriding Bearer
+    env::set_var("ANTHROPIC_MODEL", &model);
+    env::set_var("ANTHROPIC_SMALL_FAST_MODEL", &model);
+
+    let dir = core_dir();
+    let cli_exe = dir.join("cli.exe");
+    if !cli_exe.exists() {
+        proxy_server::stop();
+        return Err(format!("cli.exe not found at {}", cli_exe.display()));
+    }
+
+    // Ripgrep vendor path — same as start_cli(): the bundled path points into
+    // Bun's virtual filesystem where rg.exe was never packed. Force system-PATH
+    // mode and prepend the on-disk vendor dir to PATH.
+    let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
+    if rg_dir.join("rg.exe").exists() {
+        let rg_str = rg_dir.display().to_string();
+        let old_path = env::var("PATH").unwrap_or_default();
+        if !old_path.contains(&rg_str) {
+            env::set_var("PATH", format!("{};{}", rg_str, old_path));
+        }
+        env::set_var("USE_BUILTIN_RIPGREP", "0");
+    }
+
+    app.emit("cli-status", StatusPayload {
+        state: "starting".into(),
+        message: format!("Agent CLI at {}", dir.display()),
+        instance: 0, // informational — not tied to a specific spawn
+    }).ok();
+
+    start_cli_process(state, app.clone(), &dir)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_ai_mode(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mode: String,
+) -> Result<String, String> {
+    if mode != "agent" {
+        return Err("Only agent mode is supported (simple mode removed)".into());
+    }
+
+    let current = state.ai_mode.lock().map_err(|e| e.to_string())?.clone();
+    if current == mode {
+        return Ok("Already in agent mode".into());
+    }
+
+    {
+        let mut guard = state.ai_mode.lock().map_err(|e| e.to_string())?;
+        *guard = mode.clone();
+    }
+
+    ensure_agent_running(&state, &app)?;
+    Ok("Switched to agent mode".into())
+}
+
+#[tauri::command]
+pub async fn set_thinking_mode(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mode: String,
+    restart: bool,
+) -> Result<String, String> {
+    if !["fast", "think", "deep"].contains(&mode.as_str()) {
+        return Err(format!("Invalid thinking mode: {}. Use fast/think/deep.", mode));
+    }
+
+    {
+        let mut guard = state.thinking_mode.lock().map_err(|e| e.to_string())?;
+        *guard = mode.clone();
+    }
+
+    // 思考模式通过环境变量在 cli.exe spawn 时生效。restart=true（用户显式
+    // 切换）才重启 CLI；startup 同步只存值、不拉起 CLI（保持懒启动）。
+    if restart {
+        cli_bridge::kill_and_cleanup();
+        ensure_agent_running(&state, &app)?;
+    }
+    Ok(format!("Thinking mode set to: {}", mode))
+}
+
+// ── Hotkey configuration (from settings plugin) ──────────────────
+
+/// Update the global hotkey combo. The LL hook in hotkey.rs picks up
+/// the new key immediately (atomic swap). Persisted to disk.
+#[tauri::command]
+pub fn set_hotkey_combo(combo: String) -> Result<String, String> {
+    crate::hotkey::parse_and_set_hotkey(&combo)?;
+    Ok(format!("Hotkey set to: {}", combo))
+}
+
+/// Get the current hotkey combo string for display in settings.
+#[tauri::command]
+pub fn get_hotkey_combo() -> String {
+    crate::hotkey::get_current_hotkey_string()
+}
+
+/// Check if a file exists at the given path (used by quick-launch plugin).
+#[tauri::command]
+pub fn check_file_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+// ── Auto-start commands ──────────────────────────────────────────
+
+/// Enable or disable launch at Windows startup via the HKCU Run registry key
+/// (see auto_start.rs). Pass { enabled: true } to enable,
+/// { enabled: false } to disable.
+#[tauri::command]
+pub fn set_auto_start(enabled: bool) -> Result<String, String> {
+    if enabled {
+        crate::auto_start::enable_auto_start()?;
+        Ok("Auto-start enabled".into())
+    } else {
+        crate::auto_start::disable_auto_start()?;
+        Ok("Auto-start disabled".into())
+    }
+}
+
+/// Check whether auto-start is currently enabled.
+#[tauri::command]
+pub fn get_auto_start() -> Result<bool, String> {
+    crate::auto_start::is_auto_start_enabled()
+}
+
+// ── User tool definitions (MCP bridge) ────────────────────────────
+
+/// List user-defined tool files from <exe 根>\tools\
+#[tauri::command]
+pub fn list_tool_files() -> Result<Vec<ToolFileEntry>, String> {
+    let dir = mcp_tools_dir();
+    let mut files = Vec::new();
+
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                let content = std::fs::read_to_string(&path)
+                    .unwrap_or_default();
+                let tool: Result<crate::mcp_server::ToolDef, _> =
+                    serde_json::from_str(&content);
+                files.push(ToolFileEntry {
+                    filename: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    name: tool.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                    description: tool
+                        .as_ref()
+                        .map(|t| t.description.clone())
+                        .unwrap_or_default(),
+                    valid: tool.is_ok(),
+                });
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+/// Read a user-defined tool file
+#[tauri::command]
+pub fn read_tool_file(filename: String) -> Result<String, String> {
+    let path = mcp_tools_dir().join(&filename);
+    if !path.exists() {
+        return Err(format!("Tool file not found: {}", filename));
+    }
+    std::fs::read_to_string(&path).map_err(|e| format!("Read error: {}", e))
+}
+
+/// Save a user-defined tool file
+#[tauri::command]
+pub fn save_tool_file(filename: String, content: String) -> Result<String, String> {
+    // Basic validation: must be valid JSON with required fields
+    let _tool: crate::mcp_server::ToolDef =
+        serde_json::from_str(&content).map_err(|e| format!("Invalid tool JSON: {}", e))?;
+
+    let dir = mcp_tools_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+
+    let path = dir.join(&filename);
+    std::fs::write(&path, &content).map_err(|e| format!("Write error: {}", e))?;
+
+    Ok(format!("Tool saved: {}", filename))
+}
+
+/// Delete a user-defined tool file
+#[tauri::command]
+pub fn delete_tool_file(filename: String) -> Result<String, String> {
+    let path = mcp_tools_dir().join(&filename);
+    if !path.exists() {
+        return Err(format!("Tool file not found: {}", filename));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("Delete error: {}", e))?;
+    Ok(format!("Tool deleted: {}", filename))
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolFileEntry {
+    pub filename: String,
+    pub name: String,
+    pub description: String,
+    pub valid: bool,
+}
+
+fn mcp_tools_dir() -> std::path::PathBuf {
+    crate::storage::lunac_root_dir().join("tools")
+}
+
+// ── 已安装技能（设置「技能扩展」）──────────────────────────────
+// 固定技能目录：<exe_dir>\skills，布局 <技能名>/SKILL.md。
+// cli.exe（独立编译）通过 LUNAC_SKILLS_DIR 环境变量读取同一目录（core 补丁）；
+// lunac 前端在此列出 / 新建 / 编辑 / 删除。
+
+/// 固定技能根目录（与 MCP tools 同级，均在 exe 安装根下）。
+pub fn lunac_skills_dir() -> std::path::PathBuf {
+    crate::storage::lunac_root_dir().join("skills")
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InstalledSkill {
+    pub name: String,
+    pub description: String,
+    /// 子目录 key（目录名），读写/删除以它为标识
+    pub key: String,
+    /// skill 所在目录完整路径（前端「打开」定位用）
+    pub dir: String,
+}
+
+/// 从文本解析 SKILL.md frontmatter 的 name / description（兼容无 frontmatter）。
+fn parse_skill_md_str(content: &str) -> (String, String) {
+    let mut name = String::new();
+    let mut desc = String::new();
+    if let Some(rest) = content.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            for line in rest[..end].lines() {
+                let line = line.trim();
+                if let Some(v) = line.strip_prefix("name:") {
+                    name = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                } else if let Some(v) = line.strip_prefix("description:") {
+                    desc = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                }
+            }
+        }
+    }
+    (name, desc)
+}
+
+fn parse_skill_md(path: &std::path::Path) -> (String, String) {
+    parse_skill_md_str(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+/// 技能名 → 目录 key（小写 kebab，安全字符）。
+fn slugify_skill_key(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            last_dash = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+            out.push('-');
+        }
+    }
+    let s = out.trim_matches('-').to_string();
+    if s.is_empty() {
+        "untitled-skill".to_string()
+    } else {
+        s
+    }
+}
+
+/// 校验并解析 key 为技能目录（防目录穿越：key 只允许安全 slug）。
+fn skill_dir_for(key: &str) -> Result<std::path::PathBuf, String> {
+    let key = slugify_skill_key(key);
+    if key.is_empty() {
+        return Err("Invalid skill key".into());
+    }
+    Ok(lunac_skills_dir().join(key))
+}
+
+/// 列出固定技能目录中的已安装技能。
+#[tauri::command]
+pub fn list_installed_skills() -> Vec<InstalledSkill> {
+    let root = lunac_skills_dir();
+    let mut out = Vec::new();
+    if !root.is_dir() {
+        return out;
+    }
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let skill_md = dir.join("SKILL.md");
+            if !skill_md.exists() {
+                continue;
+            }
+            let key = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if key.is_empty() {
+                continue;
+            }
+            let (name, desc) = parse_skill_md(&skill_md);
+            out.push(InstalledSkill {
+                name: if name.is_empty() { key.clone() } else { name },
+                description: desc,
+                key,
+                dir: dir.to_string_lossy().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// 读取某个已安装技能的 SKILL.md 全文（编辑用）。
+#[tauri::command]
+pub fn read_skill_file(key: String) -> Result<String, String> {
+    let dir = skill_dir_for(&key)?;
+    let path = dir.join("SKILL.md");
+    std::fs::read_to_string(&path).map_err(|e| format!("Read error: {}", e))
+}
+
+/// 保存（覆盖更新）某个已安装技能的 SKILL.md。
+#[tauri::command]
+pub fn save_skill_file(key: String, content: String) -> Result<String, String> {
+    let dir = skill_dir_for(&key)?;
+    if !content.trim_start().starts_with("---") {
+        return Err("SKILL.md 需以 --- frontmatter 开头（含 name/description）".into());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("SKILL.md"), &content).map_err(|e| format!("Write error: {}", e))?;
+    Ok(key)
+}
+
+/// 新建 / 粘贴导入技能：内容写入 <技能目录>/<key>/SKILL.md，key 由 frontmatter.name 派生。
+#[tauri::command]
+pub fn import_skill_content(content: String) -> Result<String, String> {
+    if !content.trim_start().starts_with("---") {
+        return Err("SKILL.md 需以 --- frontmatter 开头（含 name）".into());
+    }
+    let (name, _) = parse_skill_md_str(&content);
+    if name.trim().is_empty() {
+        return Err("SKILL.md frontmatter 缺少 name".into());
+    }
+    let key = slugify_skill_key(&name);
+    let dir = skill_dir_for(&key)?;
+    if dir.exists() {
+        return Err(format!("技能“{}”已存在，可直接编辑", name));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("SKILL.md"), &content).map_err(|e| format!("Write error: {}", e))?;
+    Ok(key)
+}
+
+/// 从 raw SKILL.md URL 安装技能到固定目录。
+#[tauri::command]
+pub fn install_skill_from_url(url: String) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Client error: {}", e))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Download failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
+    }
+    let body = resp.text().map_err(|e| format!("Read error: {}", e))?;
+    if !body.trim_start().starts_with("---") {
+        return Err("该 URL 内容不是 SKILL.md（缺少 --- frontmatter）".into());
+    }
+    let (name, _) = parse_skill_md_str(&body);
+    let key = if name.trim().is_empty() {
+        let stem = url.rsplit('/').next().unwrap_or("");
+        let stem = stem.trim_end_matches(".md").trim_end_matches(".MD");
+        slugify_skill_key(stem)
+    } else {
+        slugify_skill_key(&name)
+    };
+    let dir = skill_dir_for(&key)?;
+    if dir.exists() {
+        return Err(format!("技能“{}”已存在，可直接编辑", key));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("SKILL.md"), &body).map_err(|e| format!("Write error: {}", e))?;
+    Ok(key)
+}
+
+/// 删除技能目录（递归）。
+#[tauri::command]
+pub fn delete_skill(key: String) -> Result<String, String> {
+    let dir = skill_dir_for(&key)?;
+    if !dir.exists() {
+        return Err("Skill not found".into());
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("Delete error: {}", e))?;
+    Ok(key)
+}
+
+/// Download a tool definition JSON from a URL and save to the tools directory.
+/// Returns the saved filename on success.
+#[tauri::command]
+pub fn download_tool_from_url(url: String) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Client error: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
+    }
+
+    let body = resp
+        .text()
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    // Validate as ToolDef
+    let _tool: crate::mcp_server::ToolDef =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid tool JSON: {}", e))?;
+
+    // Derive filename from tool name, fallback to URL stem
+    let filename = if let Ok(tool) = serde_json::from_str::<crate::mcp_server::ToolDef>(&body) {
+        let base = tool.name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-");
+        format!("{}.json", base)
+    } else {
+        let stem = url
+            .split('/')
+            .last()
+            .unwrap_or("tool")
+            .split('?')
+            .next()
+            .unwrap_or("tool");
+        if stem.ends_with(".json") { stem.to_string() } else { format!("{}.json", stem) }
+    };
+
+    let dir = mcp_tools_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+
+    let path = dir.join(&filename);
+    std::fs::write(&path, &body).map_err(|e| format!("Write error: {}", e))?;
+
+    Ok(filename)
+}
+
+// ── Windows OCR ──────────────────────────────────────────────────
+/// Recognize text from an image file using Windows 10/11 built-in OCR.
+#[tauri::command]
+pub fn run_ocr(path: String) -> Result<String, String> {
+    windows_ocr::recognize_image(&path)
+}
+
+// ── PaddleOCR-json ──────────────────────────────────────────────
+/// Recognize text from an image file using PaddleOCR-json (PP-OCRv4 model).
+/// Supports Chinese, English, Japanese, Korean, Cyrillic.
+/// Much higher accuracy than Windows OCR, especially for Chinese text.
+/// lang: "chs" (default, Chinese+English), "cht", "en", "japan", "korean", "cyrillic"
+#[tauri::command]
+pub fn run_paddle_ocr(path: String, lang: Option<String>) -> Result<String, String> {
+    let lang = lang.unwrap_or_else(|| "chs".into());
+    paddle_ocr::recognize_image(&path, &lang)
+}
+
+// ── Window control ──────────────────────────────────────────────
+/// Directly hide the Lunac window via ShowWindow(SW_HIDE).
+/// Bypasses Tauri's Window API to avoid any IPC queue delays.
+/// Used as a fast-path double-insurance alongside win.hide() in launchApp.
+#[tauri::command]
+pub fn hide_lunac() {
+    crate::hotkey::hide_window();
+}
+
+// ── Temp image save (for clipboard OCR) ──────────────────────────
+/// Save a base64 data URL as a temporary image file, return the path.
+/// Detects image format from the MIME type in the data URL and uses the
+/// correct file extension (png/jpg/bmp) for PaddleOCR-json compatibility.
+#[tauri::command]
+pub fn save_temp_image(data_url: String) -> Result<String, String> {
+    // Extract MIME type: data:image/<fmt>;base64,... or data:image/<fmt>,...
+    let mime = data_url
+        .split("data:")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.split(',').next())
+        .unwrap_or("image/png");
+    let ext = match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/bmp" => "bmp",
+        "image/webp" => "png",     // PaddleOCR-json does not support webp natively
+        "image/gif" => "png",       // PaddleOCR-json does not support gif natively
+        "image/tiff" | "image/tif" => "tiff",
+        _ => "png",                 // default: PNG (canvas.toDataURL always outputs PNG)
+    };
+
+    // Parse base64: strip the header part (data:image/...;base64,)
+    let b64 = data_url
+        .split(',')
+        .nth(1)
+        .ok_or("Invalid data URL format")?;
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        b64,
+    )
+    .map_err(|e| format!("Base64 decode failed: {e}"))?;
+
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join(format!("lunac_ocr_{}.{}", std::process::id(), ext));
+    std::fs::write(&tmp_path, &bytes)
+        .map_err(|e| format!("Write temp file failed: {e}"))?;
+
+    Ok(tmp_path.to_string_lossy().to_string())
+}
+
+/// Delete a temporary image file (cleanup after OCR).
+#[tauri::command]
+pub fn delete_temp_image(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    // Only delete files in the temp directory (safety guard)
+    let tmp_dir = std::env::temp_dir();
+    if p.starts_with(&tmp_dir) && p.is_file() {
+        std::fs::remove_file(p).map_err(|e| format!("Delete temp file failed: {e}"))?;
+        Ok("Deleted".into())
+    } else {
+        Ok("Skipped (not in temp)".into())
+    }
+}
+
+// ── Clipboard file paths (CF_HDROP) ────────────────────────────
+/// Read image file paths from the clipboard (CF_HDROP format).
+/// Handles the case where user copies image files from Explorer
+/// rather than image data. Returns Vec of paths ending in common
+/// image extensions. Returns empty Vec if no image files on clipboard.
+#[tauri::command]
+pub fn read_clipboard_files() -> Vec<String> {
+    read_clipboard_image_files()
+}
+
+/// Read ALL file paths from the clipboard (CF_HDROP format), not just
+/// images — used by the paste handler so AI gets the real source path
+/// instead of WebView2's `C:\fakepath\...` (点14/17).
+#[tauri::command]
+pub fn read_clipboard_file_paths() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use std::ptr;
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn OpenClipboard(hWndNewOwner: isize) -> i32;
+            fn CloseClipboard() -> i32;
+            fn GetClipboardData(uFormat: u32) -> isize;
+        }
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn DragQueryFileW(hDrop: isize, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
+        }
+
+        const CF_HDROP: u32 = 15;
+
+        let mut paths = Vec::new();
+        unsafe {
+            if OpenClipboard(0) == 0 {
+                return paths;
+            }
+            let h = GetClipboardData(CF_HDROP);
+            if h != 0 {
+                let count = DragQueryFileW(h, 0xFFFFFFFF, ptr::null_mut(), 0) as usize;
+                for i in 0..count {
+                    let len = DragQueryFileW(h, i as u32, ptr::null_mut(), 0) as usize;
+                    if len == 0 { continue; }
+                    let mut buf: Vec<u16> = vec![0; len + 1];
+                    DragQueryFileW(h, i as u32, buf.as_mut_ptr(), buf.len() as u32);
+                    if let Some(path) = OsString::from_wide(&buf[..len]).into_string().ok() {
+                        paths.push(path);
+                    }
+                }
+            }
+            CloseClipboard();
+        }
+        paths
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+
+
+#[cfg(target_os = "windows")]
+fn read_clipboard_image_files() -> Vec<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::ptr;
+
+    const IMAGE_EXTS: &[&str] = &[
+        ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif", ".ico",
+        ".PNG", ".JPG", ".JPEG", ".BMP", ".TIFF", ".TIF", ".WEBP", ".GIF", ".ICO",
+    ];
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hWndNewOwner: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(uFormat: u32) -> isize;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn DragQueryFileW(hDrop: isize, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
+    }
+
+    const CF_HDROP: u32 = 15;
+
+    let mut paths = Vec::new();
+
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return paths;
+        }
+
+        let h = GetClipboardData(CF_HDROP);
+        if h != 0 {
+            let count = DragQueryFileW(h, 0xFFFFFFFF, ptr::null_mut(), 0) as usize;
+            for i in 0..count {
+                let len = DragQueryFileW(h, i as u32, ptr::null_mut(), 0) as usize;
+                if len == 0 { continue; }
+                let mut buf: Vec<u16> = vec![0; len + 1];
+                DragQueryFileW(h, i as u32, buf.as_mut_ptr(), buf.len() as u32);
+                if let Some(path) = OsString::from_wide(&buf[..len]).into_string().ok() {
+                    if IMAGE_EXTS.iter().any(|ext| path.ends_with(ext)) {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+
+        CloseClipboard();
+    }
+
+    paths
+ }
+
+#[cfg(not(target_os = "windows"))]
+fn read_clipboard_image_files() -> Vec<String> {
+    Vec::new()
+}
+
+// ── Clipboard backup image (Raw DIB → BMP) ────────────────────
+/// 纯 Win32 FFI 剪贴板图片读取，不依赖 GDI、image crate 或外部进程。
+///
+/// ShareX 等截图工具在剪贴板上放 CF_DIB（BI_BITFIELDS 压缩）和/或
+/// CF_DIBV5，但不一定放 CF_BITMAP。CF_DIB 本质上是去掉 BMP 文件头
+/// 的完整位图数据 —— 只需前插 14 字节 BITMAPFILEHEADER 即得合法 BMP。
+///
+/// 此方案与 arboard 无冲突（不同剪贴板格式），不触发任何 clipboard lock。
+/// 成功返回临时 BMP 文件路径，失败返回空字符串。
+#[tauri::command]
+pub fn read_clipboard_backup_image() -> String {
+    #[cfg(not(target_os = "windows"))]
+    { String::new() }
+
+    #[cfg(target_os = "windows")]
+    {
+        // DIB (BMP/BI_BITFIELDS/BI_JPEG/BI_PNG) first, then registered "PNG".
+        clipboard_dib_to_bmp().or_else(clipboard_png_to_file).unwrap_or_default()
+    }
+}
+
+/// Some apps (Chrome/Edge, WeChat, QQ) place PNG data via the *registered*
+/// "PNG" clipboard format without a usable CF_DIB. Read it directly so the
+/// OCR entry still shows for those screenshots.
+#[cfg(target_os = "windows")]
+fn clipboard_png_to_file() -> Option<String> {
+    use std::path::PathBuf;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn RegisterClipboardFormatW(lpszFormat: *const u16) -> u32;
+        fn OpenClipboard(hWndNewOwner: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(uFormat: u32) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalLock(hMem: isize) -> isize;
+        fn GlobalUnlock(hMem: isize) -> i32;
+        fn GlobalSize(hMem: isize) -> usize;
+    }
+
+    struct CloseClipboardOnDrop;
+    impl Drop for CloseClipboardOnDrop {
+        fn drop(&mut self) { unsafe { CloseClipboard(); } }
+    }
+
+    unsafe {
+        const PNG_NAME: &[u16] = &[0x50, 0x4e, 0x47, 0x00]; // L"PNG"
+        let cf_png = RegisterClipboardFormatW(PNG_NAME.as_ptr());
+        if cf_png == 0 { return None; }
+        if OpenClipboard(0) == 0 { return None; }
+        let _guard = CloseClipboardOnDrop;
+
+        let h = GetClipboardData(cf_png);
+        if h == 0 { return None; }
+        let size = GlobalSize(h);
+        if size < 8 { return None; } // PNG signature is 8 bytes
+        let ptr = GlobalLock(h);
+        if ptr == 0 { return None; }
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
+        // Validate PNG signature before trusting the payload
+        if bytes.len() < 8 || bytes[0..8] != [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] {
+            GlobalUnlock(h);
+            return None;
+        }
+        let png: Vec<u8> = bytes.to_vec();
+        GlobalUnlock(h);
+
+        let fingerprint = dib_fingerprint(&png);
+        let temp_path = PathBuf::from(std::env::temp_dir()).join(format!(
+            "lunac_clip_{}.png", std::process::id()
+        ));
+        std::fs::write(&temp_path, &png).ok()?;
+        Some(format!("{}|{}", temp_path.to_string_lossy(), fingerprint))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_dib_to_bmp() -> Option<String> {
+    use std::path::PathBuf;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hWndNewOwner: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(uFormat: u32) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalLock(hMem: isize) -> isize;
+        fn GlobalUnlock(hMem: isize) -> i32;
+        fn GlobalSize(hMem: isize) -> usize;
+    }
+
+    const CF_DIB: u32 = 8;
+    const CF_DIBV5: u32 = 17;
+
+    // ── RAII guard: CloseClipboard() ALWAYS runs, even on early returns ──
+    // A leaked clipboard lock blocks every other app from copying (and, in
+    // pathological cases, stalls clipboard-owner message pumps). The unsafe
+    // block below returns early on every validation failure — the guard
+    // guarantees we never leave the clipboard open.
+    struct CloseClipboardOnDrop;
+    impl Drop for CloseClipboardOnDrop {
+        fn drop(&mut self) {
+            unsafe { CloseClipboard(); }
+        }
+    }
+
+    unsafe {
+        // 1. Open clipboard
+        if OpenClipboard(0) == 0 { return None; }
+        let _guard = CloseClipboardOnDrop;
+
+        // 2. Try CF_DIBV5 first, then CF_DIB
+        let h_dibv5 = GetClipboardData(CF_DIBV5);
+        let h_dib = GetClipboardData(CF_DIB);
+        let h_used = if h_dibv5 != 0 { h_dibv5 } else { h_dib };
+        if h_used == 0 { return None; }
+
+        // 3. Lock and validate BEFORE any bulk copy. GlobalSize returns the
+        //    allocation size of the HGLOBAL; a broken handle (or an owner that
+        //    lied about the format) must never feed an out-of-bounds read.
+        let size = GlobalSize(h_used);
+        // DIB header is at least 40 bytes (BITMAPINFOHEADER)
+        if size < 40 { return None; }
+        let ptr = GlobalLock(h_used);
+        if ptr == 0 { return None; }
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
+
+        // Header sanity check — reject obviously corrupt DIBs.
+        // biSize must be >= 40 and <= remaining buffer.
+        let bi_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let bi_compression = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let bi_bit_count = u16::from_le_bytes([bytes[14], bytes[15]]);
+        if bi_size < 40 || bi_size > size {
+            GlobalUnlock(h_used);
+            return None;
+        }
+        // Compression must be one of the values the pipeline understands.
+        // BI_RGB=0, BI_RLE8=1, BI_RLE4=2, BI_BITFIELDS=3, BI_JPEG=4, BI_PNG=5
+        if bi_compression > 5 {
+            GlobalUnlock(h_used);
+            return None;
+        }
+        // biBitCount: 1/4/8/16/24/32 are legal DIB values.
+        if !matches!(bi_bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
+            GlobalUnlock(h_used);
+            return None;
+        }
+
+        // 4. Copy the validated region to an owned Vec, then unlock.
+        let dib: Vec<u8> = bytes.to_vec();
+        GlobalUnlock(h_used);
+
+        // 4a. Compute content fingerprint for JS-side dedup
+        let fingerprint = dib_fingerprint(&dib);
+
+        // 4b. BI_JPEG (4) / BI_PNG (5): the DIB pixel payload IS a JPEG/PNG
+        //     file stream. Wrapping it in a BMP header would corrupt it —
+        //     save the raw encoded data with the right extension instead.
+        //     (Chrome/Edge and several screenshot tools place PNG/JPEG this way.)
+        if bi_compression == 4 || bi_compression == 5 {
+            let ext = if bi_compression == 4 { "jpg" } else { "png" };
+            let payload_start = bi_size as usize;
+            if payload_start >= dib.len() { return None; }
+            let payload: Vec<u8> = dib[payload_start..].to_vec();
+            let temp_path = PathBuf::from(std::env::temp_dir()).join(format!(
+                "lunac_clip_{}.{}", std::process::id(), ext
+            ));
+            std::fs::write(&temp_path, &payload).ok()?;
+            return Some(format!("{}|{}", temp_path.to_string_lossy(), fingerprint));
+        }
+
+        // 5. Calculate bfOffBits: BMP header + DIB header size (incl. masks for BI_BITFIELDS)
+        let mut dib_header_size: u32 = bi_size as u32;
+        if bi_compression == 3 { dib_header_size += 12; }
+        else if bi_bit_count <= 8 { dib_header_size += (1u32 << bi_bit_count) * 4; }
+        let pixel_offset: u32 = 14 + dib_header_size;
+        let file_size: u32 = (14 + size) as u32;
+
+        // 6. Build BMP: BITMAPFILEHEADER(14) + DIB
+        let mut bmp_data = Vec::with_capacity(file_size as usize);
+        bmp_data.extend_from_slice(b"BM");
+        bmp_data.extend_from_slice(&file_size.to_le_bytes());
+        bmp_data.extend_from_slice(&0u32.to_le_bytes());
+        bmp_data.extend_from_slice(&pixel_offset.to_le_bytes());
+        bmp_data.extend_from_slice(&dib);
+
+        // 7. Save
+        let temp_path = PathBuf::from(std::env::temp_dir()).join(format!(
+            "lunac_clip_{}.bmp", std::process::id()
+        ));
+        std::fs::write(&temp_path, &bmp_data).ok()?;
+
+        // Return path|fingerprint for JS dedup
+        Some(format!("{}|{}", temp_path.to_string_lossy(), fingerprint))
+    }
+}
+
+/// Simple FNV-1a hash of first 256 DIB bytes + total size → hex string for dedup.
+#[cfg(target_os = "windows")]
+fn dib_fingerprint(dib: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let sample = &dib[..dib.len().min(256)];
+    for &b in sample {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= dib.len() as u64;
+    format!("{:016x}", h)
+}
+
+// ── VSCode 依附 ───────────────────────────────────────────────
+/// Launch VSCode in the current or home directory.
+/// Also attempts to install the Lunac VSCode extension if the .vsix is
+/// bundled alongside the executable (release/Lunac/resources/lunac.vsix).
+/// Called from the AI detached window's "Attach to VSCode" button.
+#[tauri::command]
+pub fn open_in_vscode() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let dir = std::env::current_dir()
+            .unwrap_or_else(|_| dirs_current_user_home());
+
+        // Find the VSCode "code" executable — try multiple known paths
+        let code_path = find_vscode();
+        let code = code_path.as_deref().unwrap_or("code");
+
+        // Try to install the Lunac VSCode extension if bundled .vsix exists
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(base) = &exe_dir {
+            // Check: exe_dir/resources/  (Tauri bundle) or exe_dir/ (NSIS flat)
+            for candidates in &[
+                base.join("resources").join("lunac.vsix"),
+                base.join("lunac.vsix"),
+            ] {
+                if candidates.exists() {
+                    let _ = Command::new("cmd")
+                        .args(["/c", code, "--install-extension", &candidates.to_string_lossy()])
+                        .creation_flags(0x0800_0000)
+                        .spawn();
+                    break;
+                }
+            }
+        }
+
+        // Launch VSCode with the workspace directory
+        Command::new("cmd")
+            .args(["/c", code, "."])
+            .current_dir(&dir)
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!(
+                "VSCode not found. Install from https://code.visualstudio.com\nPath tried: {} (error: {})",
+                code, e
+            ))?;
+
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("VSCode launch not supported on this platform".into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_vscode() -> Option<String> {
+    // Priority order: PATH → system-wide → user install
+    let candidates = [
+        "code",
+        r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
+        r"C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd",
+    ];
+
+    for c in &candidates {
+        use std::os::windows::process::CommandExt;
+        if std::process::Command::new("cmd")
+            .args(["/c", "where", c])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — 探测命令不弹 cmd 窗口
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(c.to_string());
+        }
+    }
+
+    // Try LOCALAPPDATA user install
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let user_code = format!("{}\\Programs\\Microsoft VS Code\\bin\\code.cmd", local);
+        if std::path::Path::new(&user_code).exists() {
+            return Some(user_code);
+        }
+    }
+
+    None
+}
+
+/// Open a specific file in VSCode at an optional line number.
+/// Available to Agent mode tools via IPC.
+#[tauri::command]
+pub fn open_file_in_vscode(path: String, line: Option<u32>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let code = find_vscode().unwrap_or_else(|| "code".to_string());
+        let target = if let Some(l) = line {
+            format!("{}:{}", path, l)
+        } else {
+            path
+        };
+
+        Command::new("cmd")
+            .args(["/c", &code, "--goto", &target])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("Failed to open file in VSCode: {}", e))?;
+
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, line);
+        Err("Not supported on this platform".into())
+    }
+}
+
+fn dirs_current_user_home() -> std::path::PathBuf {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+// ── 系统语言检测 ──────────────────────────────────────────────
+/// Returns a BCP-47 language tag matching the Windows display language.
+/// Used by the frontend to initialize the UI language on startup.
+#[tauri::command]
+pub fn get_system_language() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetUserDefaultUILanguage() -> u16;
+        }
+        unsafe { lang_id_to_tag(GetUserDefaultUILanguage()) }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "en".into()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lang_id_to_tag(lang_id: u16) -> String {
+    match lang_id {
+        0x0804 => "zh-CN".into(),  // Chinese (Simplified, PRC)
+        0x0404 => "zh-TW".into(),  // Chinese (Traditional, Taiwan)
+        0x0c04 | 0x1404 | 0x1004 => "zh-HK".into(), // Chinese (HK/Macau/Singapore)
+        0x0409 | 0x0809 | 0x0c09 | 0x1009 | 0x1409 | 0x1809 | 0x1c09 | 0x2009 | 0x2409 | 0x2809 | 0x2c09 | 0x3009 | 0x3409 => "en".into(), // English (all variants)
+        0x0411 => "ja".into(),      // Japanese
+        0x0412 => "ko".into(),      // Korean
+        0x0407 => "de".into(),      // German
+        0x040c => "fr".into(),      // French
+        0x0410 => "it".into(),      // Italian
+        0x0c0a => "es".into(),      // Spanish
+        0x0416 => "pt-BR".into(),   // Portuguese (Brazil)
+        0x0419 => "ru".into(),      // Russian
+        0x0401 => "ar".into(),      // Arabic
+        0x041d => "sv".into(),      // Swedish
+        0x041f => "tr".into(),      // Turkish
+        0x0413 => "nl".into(),      // Dutch
+        0x0414 => "nb".into(),      // Norwegian
+        0x0415 => "pl".into(),      // Polish
+        0x0405 => "cs".into(),      // Czech
+        0x040e => "hu".into(),      // Hungarian
+        0x040b => "fi".into(),      // Finnish
+        0x0406 => "da".into(),      // Danish
+        0x0408 => "el".into(),      // Greek
+        0x040d => "he".into(),      // Hebrew
+        0x0421 => "id".into(),      // Indonesian
+        0x041a => "hr".into(),      // Croatian
+        0x0418 => "ro".into(),      // Romanian
+        0x041b => "sk".into(),      // Slovak
+        0x0424 => "sl".into(),      // Slovenian
+        0x0422 => "uk".into(),      // Ukrainian
+        0x0425 => "et".into(),      // Estonian
+        0x0426 => "lv".into(),      // Latvian
+        0x0427 => "lt".into(),      // Lithuanian
+        0x0429 => "fa".into(),      // Persian
+        0x041e => "th".into(),      // Thai
+        0x042a => "vi".into(),      // Vietnamese
+        _ => "en".into(),           // Fallback to English
+    }
+}

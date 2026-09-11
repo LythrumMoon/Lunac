@@ -1,0 +1,12 @@
+{
+  "name": "claude-code-gui",
+  "version": "1.0.0",
+  "description": "Claude Code GUI - Native Desktop Client (Tauri)",
+  "scripts": {
+    "dev": "powershell -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "build": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "tauri:dev": "powershell -ExecutionPolicy Bypass -File scripts/tauri-dev.ps1",
+    "tauri:build": "powershell -ExecutionPolicy Bypass -File scripts/tauri-build.ps1",
+    "cli": "cd core && bun run start"
+  }
+}
