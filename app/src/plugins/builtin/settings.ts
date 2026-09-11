@@ -1750,6 +1750,15 @@ export async function attachSettingsListeners(container: HTMLElement) {
     };
     const closeSkillEditor = () => { if (editorEl) editorEl.style.display = "none"; skillEditorKey = ""; };
 
+    /** 技能目录只在 agent.exe 启动时扫描一次，所以技能增删改之后必须重启它才生效
+     *  （与「工具黑名单」同一套流程：先存会话，再 stop_cli → start_cli）。
+     *  返回是否真的重启了 —— 没接到桥（旧前端）时不谎称「已生效」。 */
+    const applySkillChange = async (): Promise<boolean> => {
+      const fn = (window as any).__lunac_reload_agent;
+      if (typeof fn !== "function") return false;
+      try { await fn(); return true; } catch { return false; }
+    };
+
     const bindInstalledRowActions = () => {
       // 打开技能目录（Explorer）
       installedListEl?.querySelectorAll<HTMLElement>(".settings-skill-open").forEach(btn => {
@@ -1806,7 +1815,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
         const key = await invoke<string>("install_skill_from_url", { url });
         if (installUrlInput) installUrlInput.value = "";
         await renderInstalledSkills();
-        showOp(t("settings.skill_installed_ok", { name: key }), "var(--green)");
+        const restarted = await applySkillChange();
+        showOp(t("settings.skill_installed_ok", { name: key }) + (restarted ? t("settings.skill_applied") : ""), "var(--green)");
       } catch (e: any) { showOp(String(e), "var(--red)"); }
     };
     if (installUrlBtn) installUrlBtn.addEventListener("click", installSkillFromUrl);
@@ -1832,7 +1842,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
           }
           closeSkillEditor();
           await renderInstalledSkills();
-          showOp(t("settings.saved_ok"), "var(--green)");
+          const restarted = await applySkillChange();
+          showOp(t("settings.saved_ok") + (restarted ? t("settings.skill_applied") : ""), "var(--green)");
         } catch (e: any) { showOp(String(e), "var(--red)"); }
       });
     }

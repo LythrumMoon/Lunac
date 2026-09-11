@@ -17,10 +17,10 @@
 
 | 维度 | 旧 cli.exe | agent.exe 现在 | 缺口 |
 |---|---|---|---|
-| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 6 个 | 31 个具名工具 |
+| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 6 个内置 + `Skill`（技能）+ 动态接入的 MCP 用户工具（`mcp__*`，来自 `tools\*.json`） | 30 个具名工具 |
 | 斜杠命令 | 75+ | 0 | 全部 |
-| 命令行开关 | 123+ 个 `--flag` | 6 个（`--add-dir` / `--permission-mode` / `--permission-prompt-tool` / `--dangerously-skip-permissions` / `--disallowedTools` + 忽略其余） | ~117 个 |
-| 顶层子系统 | ~22 | 4（Agent 循环、工具执行、权限审批、上下文预算/压缩） | ~18 |
+| 命令行开关 | 123+ 个 `--flag` | 7 个（`--add-dir` / `--permission-mode` / `--permission-prompt-tool` / `--dangerously-skip-permissions` / `--disallowedTools` / `--mcp-server` + 忽略其余） | ~116 个 |
+| 顶层子系统 | ~22 | 6（Agent 循环、工具执行、权限审批、上下文预算/压缩、MCP 桥、技能） | ~16 |
 | stdout 消息类型 | 8 类 | 8 类 | 仅差 `system/api_retry`（无害） |
 | 上下文压缩 | `services/compact/` 全套 | 两级压缩 + 400 兜底（不额外调模型） | 差「调模型摘要」式变体，见 §2.1（已不再是可用性缺口） |
 
@@ -80,7 +80,7 @@
 | 子系统 | 旧 CLI 位置 | 依赖/说明 |
 |---|---|---|
 | MCP 全栈 | `core/services/mcp/`（stdio / sse / http / WebSocket 传输、tools、resources、prompts、roots、elicitation、OAuth、`.mcp.json`） | **stdio + tools 部分已完成（P3，2026-09）**：agent 侧作 client 连本机 `lunac.exe --mcp-server`、注册并调用其工具。仍缺：远程传输（sse/http/ws）、resources/prompts/roots/elicitation/OAuth、`.mcp.json` 配置（目前工具来源只有 `<exe 根>\tools\*.json`） |
-| Skills（含 inline / fork / remote 三模式） | `core/skills/`、`core/tools/SkillTool/` | = P4；`core/skills/bundled/` 里旧 CLI 自带 12+ 个内置技能 |
+| Skills（含 inline / fork / remote 三模式） | `core/skills/`、`core/tools/SkillTool/` | **inline 模式已完成（P4，2026-09）**：`LUNAC_SKILLS_DIR` 的 `<key>/SKILL.md` 列进提示词 + `Skill` 工具取正文（含 `$ARGUMENTS` 替换）。仍缺：fork（子代理执行技能）、remote（远端拉取）、技能自带脚本/资源 |
 | 插件市场 / 插件命令 | `core/plugins/`、`core/utils/plugins/` | 桌面端的「插件」面板目前只读展示 `list_tool_files`，没有下发通道 |
 | 权限 hooks（19 类事件） | `core/services/tools/toolHooks.ts`、`core/utils/hooks/`、`core/schemas/hooks.ts`、`core/hooks/useCanUseTool.tsx` | PreToolUse / PostToolUse / SessionStart / PreCompact / PermissionRequest … 供用户脚本介入 |
 | 自动权限分类器 | `core/utils/permissions/`（`bashClassifier.ts`、`yoloClassifier.ts`、`classifierDecision.ts`） | 自动判定「这条命令能不能不问」；我们现在靠前端白名单前缀 |
@@ -134,8 +134,8 @@
 | 项 | 位置 | 处理 |
 |---|---|---|
 | 工具黑名单候选列表全是旧工具名，用户**无法禁用**真实六件工具 | [main.ts L1525-1549](file:///d:/cc/claude-code-cli-master/app/src/main.ts#L1525-L1549)、Rust [DEFAULT_TOOL_BLACKLIST](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs#L323-L340) | 换成真实工具名 |
-| 「技能扩展」文案声称 agent.exe 会加载该目录，实际不读 | [settings.ts L386-446](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L386-L446)、i18n `settings.skills_*` | 随 P4 落地，或先改文案 |
-| 「插件 (MCP 工具)」面板只读展示，无下发通道 | [settings.ts L448+](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L448) | 随 P3 落地 |
+| ~~「技能扩展」文案声称 agent.exe 会加载该目录，实际不读~~ | [settings.ts L386-446](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L386-L446)、i18n `settings.skills_*` | ✅ 文案已属实（P4，2026-09）：agent.exe 启动时读该目录，增删改后前端自动重启 agent 生效 |
+| 「插件 (MCP 工具)」面板只读展示，无下发通道 | [settings.ts L448+](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L448) | ✅ 已随 P3 落地：agent.exe 现在会读 `<exe 根>\tools\*.json`（面板的安装/编辑/删除 + 重启 agent 流程已生效）；面板自身仍是只读列表 + 安装入口，编辑在 Tool Editor 插件里 |
 | 安全档位 `set_security_profile` 无前端入口 | `app/src-tauri/src/commands.rs` `set_security_profile` | 设置面板加 safe/project/full 切换 |
 
 ---
@@ -144,7 +144,7 @@
 
 1. ~~**上下文预算 + 压缩**（§2.1）——唯一「用久了必然坏掉」的缺口，属防回归性质~~ ✅ **已完成（2026-09）**
 2. ~~**P3 MCP 工具桥** —— 让「插件」面板与 `tools\*.json` 真正生效~~ ✅ **已完成（2026-09）**；resources 两件未做
-3. **P4 Skills** —— 让「技能扩展」面板生效，并修掉失实文案
+3. ~~**P4 Skills** —— 让「技能扩展」面板生效，并修掉失实文案~~ ✅ **已完成（2026-09）**；fork / remote 未做
 4. **低成本高收益**：`PowerShell` 工具、工具黑名单候选列表刷新、`WebFetch`/`WebSearch`、`AskUserQuestion`、`TodoWrite`
 5. 视需要：权限 hooks、自动权限分类器、模型输出重试、Bash AST 安全分析
 

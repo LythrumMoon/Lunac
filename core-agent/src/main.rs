@@ -38,7 +38,9 @@
 //   ✅ 上下文预算 + 压缩：按端点实测体积走瘦身/丢弃两级水位，400 超限再强制压缩重试
 //   ✅ P3 MCP 工具桥：连 `lunac.exe --mcp-server`，把 <exe 根>\tools\*.json 的用户工具
 //      以 `mcp__<名>` 接进请求体（实现见 mcp.rs）
-//   ❌ P4 skills
+//   ✅ P4 技能：`LUNAC_SKILLS_DIR`（=<exe 根>\skills）下的 <key>/SKILL.md，
+//      系统提示词列出清单，模型调 Skill 工具取正文（实现见 skills.rs）
+//   ❌ 技能 fork / remote 模式、MCP resources
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
 
@@ -54,6 +56,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 mod mcp;
+mod skills;
 mod tools;
 
 /// 单次回复的 token 上限（无思考时的基线）
@@ -202,6 +205,7 @@ fn compact_history(history: &mut Vec<Value>, force: bool) -> usize {
 }
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
+/// 技能清单（P4）在 main() 里追加到本提示词之后，见 skills::listing()。
 const SYSTEM_PROMPT: &str = "You are Lunac's built-in assistant, running inside a Windows desktop launcher. \
 Answer in the user's language and keep it concise. \
 You can inspect and modify the local machine with the provided tools: prefer Read/Glob/Grep \
@@ -596,15 +600,38 @@ fn main() {
         }
     };
 
+    // P4 技能：`LUNAC_SKILLS_DIR`（=<exe 根>\skills）下的 <key>/SKILL.md。
+    // 渐进披露 —— 系统提示词只列 key + 描述，正文由 `Skill` 工具按需加载；
+    // 读不出来就当作没有技能，不影响其它工具。
+    let skills = skills::load();
+    let skills_on = !skills.is_empty() && !cli.disallowed.iter().any(|d| d == "Skill");
+    if !skills.is_empty() {
+        eprintln!(
+            "[agent] 技能 {} 个{}: [{}]",
+            skills.len(),
+            if skills_on { "" } else { "（已被 --disallowedTools 禁用）" },
+            skills
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    let system_prompt = format!("{SYSTEM_PROMPT}{}", skills::listing(if skills_on { &skills } else { &[] }));
+
     let mut tool_defs = tools::defs(&cli.disallowed);
     let mut tool_names = tools::names(&tool_defs);
+    if skills_on {
+        tool_defs.push(skills::tool_def());
+        tool_names.push("Skill".into());
+    }
     if let Some(b) = &mcp_bridge {
         tool_defs.extend(b.defs().iter().cloned());
         tool_names.extend(tools::names(b.defs()));
     }
 
     eprintln!(
-        "[agent] P1/P2/P3 就绪 cwd={} 工具=[{}]{}{}",
+        "[agent] P1–P4 就绪 cwd={} 工具=[{}]{}{}",
         tools_ctx.cwd.display(),
         tool_names.join(","),
         if tools_ctx.read_only { " 只读模式" } else { "" },
@@ -673,6 +700,8 @@ fn main() {
                     &tool_names,
                     cli.ask_permission,
                     mcp_bridge.as_mut(),
+                    &skills,
+                    &system_prompt,
                 );
             }
             // 没被认领的 control_response（如请求已超时）在这里丢弃即可
@@ -728,13 +757,17 @@ fn needs_approval(name: &str) -> bool {
     tools::needs_approval(name) || mcp::is_mcp(name)
 }
 
-/// 分发一次工具调用：MCP 工具走桥（P3），其余走内置实现（P1）。
+/// 分发一次工具调用：技能（P4）→ MCP 桥（P3）→ 内置实现（P1）。
 fn run_tool(
     tctx: &tools::Ctx,
     mcp_bridge: Option<&mut mcp::Bridge>,
+    skill_list: &[skills::Skill],
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    if name == "Skill" {
+        return skills::run(skill_list, input).map(tools::truncate);
+    }
     if !mcp::is_mcp(name) {
         return tools::run(tctx, name, input);
     }
@@ -757,6 +790,8 @@ fn run_query(
     tool_names: &[String],
     ask_permission: bool,
     mut mcp_bridge: Option<&mut mcp::Bridge>,
+    skill_list: &[skills::Skill],
+    system_prompt: &str,
 ) {
     let started = Instant::now();
     emit_init(&cfg.model, tool_names);
@@ -826,7 +861,7 @@ fn run_query(
                 "model": cfg.model,
                 "max_tokens": max_tokens_for(plan),
                 "stream": true,
-                "system": SYSTEM_PROMPT,
+                "system": system_prompt,
                 "messages": history,
             });
             if !tool_defs.is_empty() {
@@ -1150,7 +1185,7 @@ fn run_query(
                 Some(msg) => (format!("Error: {msg}"), true),
                 None => {
                     eprintln!("[agent] 执行工具 {name}");
-                    match run_tool(tctx, mcp_bridge.as_deref_mut(), name, &run_input) {
+                    match run_tool(tctx, mcp_bridge.as_deref_mut(), skill_list, name, &run_input) {
                         Ok(s) => (s, false),
                         Err(e) => (format!("Error: {e}"), true),
                     }

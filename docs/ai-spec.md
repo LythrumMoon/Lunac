@@ -454,6 +454,7 @@ core-agent/
 ├── src/main.rs                      # 自研 agent 核心 —— stream-json 契约、工具循环、审批，见 §3.5
 ├── src/tools.rs                     # P1 内置工具：Read / Write / Edit / Bash / Glob / Grep
 ├── src/mcp.rs                       # P3 MCP 工具桥（stdio client，连 lunac.exe --mcp-server）
+├── src/skills.rs                    # P4 技能（LUNAC_SKILLS_DIR 的 <key>/SKILL.md + Skill 工具）
 ├── Cargo.toml
 └── target/release/agent.exe         # 编译产物（cargo build --release，约 2.5MB，不入库）
 
@@ -554,6 +555,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | Agent 工具权限审批（can_use_tool） | ✅ P2 已完成 — 写类工具执行前弹卡，allow/deny/interrupt 与超时撤卡均验证通过 |
 | Agent 上下文预算与压缩 | ✅ 已完成 — 按端点实测体积走瘦身/丢弃两级水位 + 400 强制压缩兜底；真实端点烟测（`LUNAC_MAX_CONTEXT_TOKENS=8000`）连跑 17 轮工具往返不中断 |
 | Agent MCP 工具桥（插件面板的 tools\*.json） | ✅ P3 已完成 — agent.exe 作 client 连 `lunac.exe --mcp-server`，用户工具以 `mcp__<名>` 进请求体；真实端点烟测通过（注册、审批卡、成功/失败两条回灌路径） |
+| Agent 技能（技能扩展面板的 `<exe 根>\skills\<key>\SKILL.md`） | ✅ P4 已完成 — agent.exe 读 `LUNAC_SKILLS_DIR`，提示词只列 `key: 描述`，模型调 `Skill` 拿到正文（`$ARGUMENTS` 已替换）；面板增删改后自动重启 agent 生效 |
 
 ## 10. 待办路线
 
@@ -564,9 +566,10 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 5. **Agent Tools 扩展** — 继续接入更多开源的硬件 AI skill/tools (LocalAI skills, OpenJarvis skills 等)
 6. ~~**P2 权限审批**~~ — ✅ 已完成：写类工具发 `can_use_tool`，前端卡片 allow/deny（含 interrupt 中断本轮），300s 超时自动撤卡；见 §3.5
 7. **安全档位可切换** — `set_security_profile` 命令已存在但前端无人调用，目前永远「项目」档；需要时在设置面板加 safe/project/full 切换入口
-8. **补齐 agent 后端能力** — 与旧 `cli.exe` 的差距（skills、WebFetch/WebSearch、PowerShell、AskUserQuestion、TodoWrite 等）按 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md) 的分级与顺序推进
+8. **补齐 agent 后端能力** — 与旧 `cli.exe` 的差距（WebFetch/WebSearch、PowerShell、AskUserQuestion、TodoWrite、MCP resources 等）按 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md) 的分级与顺序推进
 9. ~~**上下文预算与压缩**~~ — ✅ 已完成：见 §3.5「上下文预算与压缩」（backlog §2.1 第 1 项，唯一「用久了必然坏掉」的缺口）
 10. ~~**P3 MCP 工具桥**~~ — ✅ 已完成：见 §3.5「P3 已完成（MCP 工具桥）」；`ListMcpResourcesTool` / `ReadMcpResourceTool` 仍未做（server 侧缺 `resources/read`）
+11. ~~**P4 技能 SKILL.md**~~ — ✅ 已完成：见 §3.5「P4 已完成（技能 SKILL.md）」；fork / remote 两种模式未做
 
 ---
 

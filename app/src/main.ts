@@ -4368,18 +4368,23 @@ async function startAIChat(query: string, files?: string[]) {
 // Make startAIChat accessible from plugins (ai-agent.ts)
 (window as any).__lunac_start_ai_chat = startAIChat;
 (window as any).__lunac_show_chat_history = showChatHistory;
-// 工具黑名单保存流程（第19点）：按用户要求顺序 —
-// 1) localStorage 持久化用户自定义清单
-// 2) 保存当前会话历史（避免重启丢失）
-// 3) 交给 Rust 合并默认黑名单（set_tool_blacklist）
-// 4) 退出 agent.exe → 重启 agent.exe（新 --disallowedTools 生效）
-(window as any).__lunac_save_tool_blacklist = async (custom: string[]) => {
-  try { localStorage.setItem("lunac-tool-blacklist", JSON.stringify(custom)); } catch {}
+// 让 agent.exe 重新读盘：技能目录等只在启动时扫描一次，
+// 设置类改动（技能增删改 / 工具黑名单）之后都要走这一步。
+// 先存会话再 stop → start，避免重启丢掉当前对话（前端自持历史）。
+(window as any).__lunac_reload_agent = async () => {
   try { await saveCurrentSession(); } catch (e) { console.warn("[lunac] save history before restart:", e); }
-  try { await invoke("set_tool_blacklist", { blacklist: custom }); } catch (e) { console.warn("[lunac] set_tool_blacklist:", e); }
   try { await invoke("stop_cli"); } catch {}
   cliReady = false;
   try { await invoke("start_cli"); return "ok"; } catch (e) { return "error: " + String(e); }
+};
+// 工具黑名单保存流程（第19点）：按用户要求顺序 —
+// 1) localStorage 持久化用户自定义清单
+// 2) 交给 Rust 合并默认黑名单（set_tool_blacklist）
+// 3) 重启 agent.exe（新 --disallowedTools 生效，重启前先存会话）
+(window as any).__lunac_save_tool_blacklist = async (custom: string[]) => {
+  try { localStorage.setItem("lunac-tool-blacklist", JSON.stringify(custom)); } catch {}
+  try { await invoke("set_tool_blacklist", { blacklist: custom }); } catch (e) { console.warn("[lunac] set_tool_blacklist:", e); }
+  return (window as any).__lunac_reload_agent();
 };
 // Open tool editor plugin from settings panel
 (window as any).__lunac_execute_tool_editor = async () => {

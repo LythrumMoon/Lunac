@@ -2121,6 +2121,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "새로 만들기 / 붙여넣기",
     "en": "New / Paste",
   },
+  "settings.skill_applied": {
+    "zh-CN": "（agent 已重启，立即生效）",
+    "zh-TW": "（agent 已重啟，立即生效）",
+    "ja": "（agent を再起動しました。すぐに反映されます）",
+    "ko": "（agent를 재시작했습니다. 즉시 반영됩니다）",
+    "en": " (agent restarted — active now)",
+  },
   "settings.skill_installed_ok": {
     "zh-CN": "已安装：{name}",
     "zh-TW": "已安裝：{name}",
