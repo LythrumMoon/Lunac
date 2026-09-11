@@ -1,4 +1,4 @@
-# scripts/dev.ps1 — 开发模式；缺 agent.exe 时先用 cargo 编译 core-agent
+﻿# scripts/dev.ps1 — 开发模式；缺 agent.exe 时先用 cargo 编译 core-agent
 . "$PSScriptRoot\_env.ps1"
 
 $projectRoot = "$PSScriptRoot\.."

@@ -165,7 +165,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 - **对话模式**：应用始终运行 Agent 进程（`ai_mode` 恒为 "agent"；`set_ai_mode` 拒绝其他值），但提供**对话级模式切换**：
   - **Agent 模式**（默认）：完整工具链 + skills + 权限审批
   - **简单问答模式**：复用同一 agent.exe，发送消息时注入"直接回答、勿用工具/skills"软约束提示词（`buildSimpleChatHint`），替代已删除的 chat.rs 简单模式；前端按钮 `#chat-mode-btn` 切换，localStorage `lunac-chat-mode` 持久化
-- **权限审批**：agent 发 `can_use_tool` control_request，前端展示审批卡片并**阻塞等待**用户允许/拒绝（agent 天然暂停）
+- **权限审批**：前端审批卡片（`showPermissionCard` + 白/黑名单）已就绪，等 P2 在 agent 侧发 `can_use_tool` control_request 接通；在此之前工具按 §3.5 的**静态策略**执行（`plan` 档只读、工作区越界拒绝）
 - **工作区**：`AppState.workspace` 决定 agent.exe 的 cwd 与 `--add-dir`；为空回退用户主目录（整个系统可访问，敏感操作走 ask 弹卡）
 
 ### 3.3 技术实现 (`agent.exe` 直连)
@@ -181,7 +181,8 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 功能 | 文件 | 说明 |
 |------|------|------|
 | Agent 对话 | `main.ts` → `startAgentChat` → `start_cli` → `send_message` | cli-output 事件流式渲染 |
-| 权限审批 | `main.ts` `showPermissionCard` | 多请求合并为单批处理卡片，pending 期间状态栏显示"对话已暂停" |
+| 权限审批 | `main.ts` `showPermissionCard` | 多请求合并为单批处理卡片，pending 期间状态栏显示"对话已暂停"（待 P2 接通 agent 侧的 `can_use_tool`） |
+| 工具卡片 | `main.ts` `agentNewBlock("tool")` / `agentToolArgsDelta` / `agentToolResult` | `content_block_start(tool_use)` + `input_json_delta` 流式展开参数，`tool_result` 内联成功/失败（P1 起真正生效） |
 | 工作区设置 | `main.ts` AI 对话输入栏 `#chat-workspace-btn`（唯一入口） | 选择目录/重置 → `invoke("set_workspace")` + 重启 CLI；默认=用户主目录（整个系统可访问） |
 | 简单问答切换 | `main.ts` `#chat-mode-btn` + `buildSimpleChatHint` | 软约束"勿用工具/skills"，状态栏显示当前模式 |
 | Token 仪表盘 | `main.ts` `updateTokenDashboard` | 完整计费口径：Hit=缓存读取，Miss=普通输入+缓存写入，Total=四类 token 之和 |
@@ -202,11 +203,35 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 面 | 内容 |
 |---|---|
 | env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED` |
-| 启动参数 | `--print` / `--input-format stream-json` / `--output-format stream-json` / `--include-partial-messages` / `--permission-prompt-tool stdio` / `--mcp-server stdio:<path>` / `--add-dir <ws>`；P0 一律接受并忽略（不因此报错退出） |
-| stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response",…}` 为审批回包 |
-| stdout | 每行一条 JSON：`system/init` → `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，仅无增量时前端兜底）→ `result`（`subtype` / `is_error` / `usage`） |
+| 启动参数 | `--add-dir <dir>`（可重复，工作区外追加可访问目录）/ `--permission-mode plan`（只读）/ `--dangerously-skip-permissions`（忽略工作区锁）/ `--disallowedTools <name…>`（这些工具不进请求体）；其余（`--print` / `--verbose` / `--input-format stream-json` / `--include-partial-messages` / `--mcp-server stdio:<path>` …）一律接受并忽略 |
+| stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response",…}` 为审批回包（P2 起使用） |
+| stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
 
-**P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮自动回滚 history，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
+**P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮按 `history.truncate(base)` 整体回滚，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
+
+**P1 已完成（2026-09，内置工具循环）**：六件工具实现在 [core-agent/src/tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)，主循环按「请求 → 流式收块 → 有 `tool_use` 就执行并以 `tool_result` 回灌 → 再请求」往返，直到模型不再调工具（上限 `MAX_TOOL_ROUNDS=16`，到顶后再给一次「只用文本收口」的机会）。
+
+| 工具 | 入参 | 行为 |
+|---|---|---|
+| `Read` | `file_path` / `offset` / `limit` | 带 1-based 行号输出；单次 ≤2000 行、文件 ≤2MB |
+| `Write` | `file_path` / `content` | 自动建父目录，整文件覆盖 |
+| `Edit` | `file_path` / `old_string` / `new_string` / `replace_all` | 精确串替换；找不到、或多处匹配且未开 `replace_all` 时按错误返回 |
+| `Bash` | `command` / `timeout` | `cmd /C` 执行（带 `CREATE_NO_WINDOW`，GUI 宿主下不闪黑框）；默认 120s、上限 600s，超时 kill；stdout+stderr 合并回传 |
+| `Glob` | `pattern` / `path` | `**` 递归、`*` 不跨目录；≤200 条 |
+| `Grep` | `pattern` / `path` / `glob` / `ignore_case` | Rust 正则逐行匹配，输出 `路径:行号:内容`；跳过 `.git`/`node_modules`/`target` 等重目录与二进制文件；≤200 条 |
+
+**工具权限策略（P1 静态裁决 —— P2 审批卡片落地前的过渡）**
+
+| 条件 | 效果 |
+|---|---|
+| `--permission-mode plan`（前端「安全」档） | 只读：`Write`/`Edit`/`Bash` 一律以 `is_error=true` 拒绝；`Read`/`Glob`/`Grep` 可用 |
+| 默认 `acceptEdits`（前端「项目」档） | 六件工具全开 |
+| `LUNAC_WORKSPACE_LOCKED=1`（配置了工作区时 src-tauri 注入） | 文件类工具路径先做词法规范化（消 `..`），越出工作区（cwd / `--add-dir`）即拒绝 —— 含 `Read` 的越界读取 |
+| `--dangerously-skip-permissions`（前端「完全」档） | 忽略工作区锁 |
+
+⚠️ **当前默认档位是「项目」，且前端没有切换入口**（`set_security_profile` 命令存在但无人调用），因此 `Bash` 目前是**无审批直接执行**，直到 P2 的 `can_use_tool` 卡片接通。
+
+**工具错误不中断整轮**：工具返回 Err 时转成 `is_error=true` 的 `tool_result` 交回模型自行纠正；只有 HTTP / 流错误才终止本轮并回滚 history。写回上下文的 assistant 消息会**剔除 thinking 块**（端点要求 thinking 带 `signature`，回灌会 400），发给前端的整包仍保留 thinking。
 
 **思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、原生 Messages 端点的新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
 
@@ -218,9 +243,9 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 **400 降级链**（仅当错误正文含 `thinking`/`adaptive`/`budget_tokens` 才触发，避免把「模型名不存在」这类无关 400 也白重试）：`enabled+budget → adaptive → 不带字段`；fast 档为 `disabled → 不带字段`（**不退到 adaptive**，否则等于反过来把思考打开）。降级结果缓存在进程内，后续轮次不再试错，并往 stderr 打一行说明。
 
-**P1–P4 待做**：P1 内置工具（read/write/edit/bash/glob/grep）+ `tool_use`/`tool_result` 循环；P2 `can_use_tool` 权限审批（发 `control_request` 并阻塞等 stdin `control_response`）；P3 MCP 工具桥（作 client 连 `lunac.exe --mcp-server`，读 `<exe 根>\tools\*.json`）；P4 skills / 系统提示词 / 工作区锁（`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`）。
+**P2–P4 待做**：P2 `can_use_tool` 权限审批（发 `control_request` 并阻塞等 stdin `control_response`，接上前端既有的审批卡片与白/黑名单；落地后 `Bash`/`Write`/`Edit` 改为逐次询问）；P3 MCP 工具桥（作 client 连 `lunac.exe --mcp-server`，读 `<exe 根>\tools\*.json`）；P4 skills / 系统提示词（`LUNAC_SKILLS_DIR`）。
 
-**构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 1.5MB。打包链路：`bundle.resources` 把它平铺成 `resources\agent.exe`，NSIS 由 `release\lunac-installer.nsi` 装到安装根；`build-release.ps1` 的 **[4/9]** 步必须在 Rust 构建之前跑，否则 resources 缺文件会打包失败。
+**构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路：`bundle.resources` 把它平铺成 `resources\agent.exe`，NSIS 由 `release\lunac-installer.nsi` 装到安装根；`build-release.ps1` 的 **[4/9]** 步必须在 Rust 构建之前跑，否则 resources 缺文件会打包失败。
 
 ### 3.6 数学公式渲染
 
@@ -400,9 +425,10 @@ app/
 └── package.json
 
 core-agent/
-├── src/main.rs                      # 自研 agent 核心 —— lunac 的 agent 后端，见 §3.5
+├── src/main.rs                      # 自研 agent 核心 —— stream-json 契约、工具循环，见 §3.5
+├── src/tools.rs                     # P1 内置工具：Read / Write / Edit / Bash / Glob / Grep
 ├── Cargo.toml
-└── target/release/agent.exe          # 编译产物（cargo build --release，约 1.5MB，不入库）
+└── target/release/agent.exe         # 编译产物（cargo build --release，约 2.5MB，不入库）
 
 scripts/
 ├── _env.ps1                         # 公共环境准备（把 cargo / mingw64\bin 追加进 PATH，供其它脚本 dot-source）
@@ -497,6 +523,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | 计算器/编码/JSON 插件 | ❌ 已移除 — 2026-07-22 删除，功能由 AI Agent 替代 |
 | OCR 文字识别插件 | ✅ 新增 `ocr.ts` — PaddleOCR-json 离线 OCR（多语言） |
 | 硬件 AI Agent Tools | ✅ 新增 `tools/system_info.json` — Agent 模式 MCP Tools |
+| Agent 内置工具（Read/Write/Edit/Bash/Glob/Grep） | ✅ P1 已完成 — 真实端点烟测通过（多轮工具往返、工作区越界拒绝、`plan` 档只读） |
 
 ## 10. 待办路线
 
@@ -505,6 +532,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 3. ~~**接入 Start Menu 实时搜索**~~ — ✅ 已完成
 4. ~~**热键可配置**~~ — ✅ 已完成：settings 面板自定义 Alt+key 组合热键
 5. **Agent Tools 扩展** — 继续接入更多开源的硬件 AI skill/tools (LocalAI skills, OpenJarvis skills 等)
+6. **P2 权限审批** — 把 `can_use_tool` control_request 接到前端既有审批卡片与白/黑名单；在此之前 `Bash` 是无审批执行的（见 §3.5）
 
 ---
 
@@ -531,6 +559,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 11. **自定义文件启动（快速启动 / Custom Launch）**：持久注册表为 `<exe 根>\ModuleData\custom\app_registry.json`（业务数据同根统一管理；旧 exe 同目录 / LOCALAPPDATA 文件首读自动迁移）。面板打开即列出**全部已注册项**（可启动 / 逐条删除 / 「添加启动项」），重启不丢失、数据不再“消失”；删除 = 注销注册表 + 摘除对应气泡。拖入/粘贴路径进搜索栏即自动注册；入口词多语言/拼音覆盖（launch/open/启动/qidong/dakai/自定义/快速启动…，中文由 pluginRegistry 自动生成拼音索引）。
 12. **卸载清理**：NSIS `installerHooks`（[nsis-hooks.nsh](file:///d:/cc/claude-code-cli-master/app/src-tauri/nsis-hooks.nsh)）`NSIS_HOOK_POSTUNINSTALL` 做**双清理**：① 递归删除 exe 安装根内的运行时数据子目录（ModuleData / temp / skills / tools / config / paddle-ocr）；② 删除旧版本遗留的 `%LOCALAPPDATA%\Lunac(-dev)`，实现干净卸载。
 13. **OCR 引擎按需下载**：PaddleOCR-json 引擎不随发行包分发，落到 `<exe 根>\paddle-ocr`（与数据根一致）。前端两条入口复用 `ocr.ts` 导出的 `installOcrEngine()`（监听 `ocr-engine-progress`/`ready`/`error`）：① OCR 面板执行识别前先 `ocr_engine_status()`，缺失则在状态行内联「下载并安装」按钮；② 设置 · 常规面板常驻「OCR 引擎」行（状态 + 下载/重试）。**安装必须原子化**：下载 → 解压到 `temp\paddle-ocr-staging` → 校验 `PaddleOCR-json.exe` + `models/config_chinese.txt` → 才删除并 `rename` 到目标目录，任一环节失败清理半成品，避免 `paddle_ocr_dir()` 定位到残缺目录导致 OCR 永久失败且无从诊断。
+14. **Agent 内置工具（P1，2026-09）**：六件工具全部在 `core-agent/src/tools.rs`，工具名必须保持 **PascalCase**（前端 `main.ts` 对 `"Bash"` 有专门的命令展示与危险命令分类分支），新增/改名要同步 §3.5 的契约表。权限目前是**静态裁决**：`--permission-mode plan` 只读、`LUNAC_WORKSPACE_LOCKED=1` 拦越界；**P2 审批卡片接通前，这两道闸门不得移除或放宽**。工具报错必须以 `is_error=true` 的 `tool_result` 回给模型（不中断整轮），只有 HTTP/流错误才回滚 history。
 
 ## 12. Agent Plan 模式规范
 

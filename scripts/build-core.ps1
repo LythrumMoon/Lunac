@@ -1,4 +1,4 @@
-# scripts/build-core.ps1 — 编译自研 agent 后端（core-agent → agent.exe）
+﻿# scripts/build-core.ps1 — 编译自研 agent 后端（core-agent → agent.exe）
 # 产物：core-agent\target\release\agent.exe，由 src-tauri 的 core_dir() 查找。
 . "$PSScriptRoot\_env.ps1"
 

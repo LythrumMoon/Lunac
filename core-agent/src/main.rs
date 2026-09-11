@@ -1,5 +1,5 @@
 // core-agent/src/main.rs
-// Lunac 自研 agent 核心 —— P0：纯文本流式对话闭环
+// Lunac 自研 agent 核心 —— P1：内置工具循环（Read/Write/Edit/Bash/Glob/Grep）
 //
 // 本程序是 lunac 桌面端的唯一 agent 后端：遵守既有 stream-json 契约
 // （见 docs/ai-spec.md §3、app/src/main.ts 对 `cli-output` 的逐行解析），
@@ -10,40 +10,55 @@
 //          LUNAC_AGENT_TOKEN     （鉴权必须走 Bearer；用 x-api-key 会被
 //                                 兼容端点判 401）
 //          LUNAC_AGENT_MODEL
+//   args   --add-dir <dir>（可重复）工作区外追加目录
+//          --permission-mode plan → 只读
+//          --dangerously-skip-permissions → 忽略工作区锁
+//          --disallowedTools <name…>      → 这些工具不进请求体
+//          其余 CLI 风格参数接受并忽略
 //   stdin  每行一条 JSON
 //            {"type":"user","session_id":"","message":{"role":"user",
 //             "content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}
 //   stdout 每行一条 JSON（非 JSON 行会被前端忽略）
-//            {"type":"system","subtype":"init",…}
+//            {"type":"system","subtype":"init","tools":[…]}
 //            {"type":"stream_event","event":{…content_block_delta…}}
-//            {"type":"assistant","message":{"content":[{"type":"text",…}]}}
+//            {"type":"assistant","message":{"content":[…]}}   ← 含 tool_use
+//            {"type":"user","message":{"content":[{tool_result}]}}
 //            {"type":"result","subtype":"success","usage":{…}}
 //
-// P0 范围与边界
-//   ✅ 多轮上下文（进程内 history）、SSE 增量打字、用量上报、错误回传
-//   ✅ 思考档位跨模型自适应（MAX_THINKING_TOKENS → thinking 形态 + 400 降级）
-//   ❌ 工具调用 / 权限审批（can_use_tool）/ MCP 工具桥 / skills —— P1–P4
+// 已实现范围
+//   ✅ P0 多轮上下文、SSE 增量打字、用量上报、错误回传
+//   ✅ P0 思考档位跨模型自适应（MAX_THINKING_TOKENS → thinking 形态 + 400 降级）
+//   ✅ P1 内置工具 + tool_use/tool_result 往返循环（工具实现见 tools.rs）
+//   ❌ P2 权限审批（can_use_tool）/ P3 MCP 工具桥 / P4 skills
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+mod tools;
+
 /// 单次回复的 token 上限（无思考时的基线）
 const BASE_MAX_TOKENS: u32 = 8192;
 /// 请求总超时（含流式读取整段响应）
 const REQUEST_TIMEOUT_SECS: u64 = 1800;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// 一轮用户提问内最多允许的「模型→工具→模型」往返次数
+const MAX_TOOL_ROUNDS: usize = 16;
 
-/// P0 无工具，明确告知模型别假装有工具，避免它凭空描述读文件/跑命令
+/// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
 const SYSTEM_PROMPT: &str = "You are Lunac's built-in assistant, running inside a Windows desktop launcher. \
 Answer in the user's language and keep it concise. \
-You currently have NO tools available — do not claim to read files, run commands, or browse the web.";
+You can inspect and modify the local machine with the provided tools: prefer Read/Glob/Grep \
+before editing, make the smallest change that solves the problem, and say what you changed. \
+Relative paths resolve against your working directory.";
+
 
 // ── 思考档位：跨模型自适应 ───────────────────────────────────────
 //
@@ -176,29 +191,98 @@ fn emit_stream_event(event: Value) {
 }
 
 /// system/init —— 前端据此把 agentState 从 starting 推进到 idle。
-/// 真实 CLI 每轮查询都会发一次，这里保持一致。
-fn emit_init(model: &str) {
+/// 真实 CLI 每轮查询都会发一次，这里保持一致；`tools` 上报本轮可用工具名。
+fn emit_init(model: &str, tool_names: &[String]) {
     emit(json!({
         "type": "system",
         "subtype": "init",
         "session_id": "",
         "model": model,
-        "tools": [],
+        "tools": tool_names,
     }));
+}
+
+// ── 启动参数 ─────────────────────────────────────────────────────
+//
+// src-tauri 传的是上游 CLI 风格命令行，这里只挑对 P1 有意义的几个：
+//   --add-dir <dir>                工作区之外追加可访问目录（可重复）
+//   --permission-mode <mode>       plan = 只读；acceptEdits/其他 = 可写
+//   --dangerously-skip-permissions 忽略工作区锁（full 档）
+//   --disallowedTools <name…>      variadic：这些工具不进请求体
+// 其余（--print / --verbose / --input-format …）一律接受并忽略。
+#[derive(Default)]
+struct CliArgs {
+    add_dirs: Vec<PathBuf>,
+    permission_mode: String,
+    skip_permissions: bool,
+    disallowed: Vec<String>,
+}
+
+impl CliArgs {
+    fn parse(args: &[String]) -> Self {
+        let mut out = CliArgs::default();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--add-dir" => {
+                    if let Some(v) = args.get(i + 1) {
+                        out.add_dirs.push(PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--permission-mode" => {
+                    if let Some(v) = args.get(i + 1) {
+                        out.permission_mode = v.clone();
+                        i += 1;
+                    }
+                }
+                "--dangerously-skip-permissions" => out.skip_permissions = true,
+                "--disallowedTools" => {
+                    // variadic：吃到下一个 --flag 为止（与上游 commander 语义一致）
+                    let mut j = i + 1;
+                    while j < args.len() && !args[j].starts_with("--") {
+                        out.disallowed.push(args[j].clone());
+                        j += 1;
+                    }
+                    i = j.saturating_sub(1);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 // ── 入口 ─────────────────────────────────────────────────────────
 
 fn main() {
-    // src-tauri 传入的 CLI 风格参数一律接受并忽略（P0 无工具/无 MCP）。
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-v") {
-        println!("agent 0.1.0 (lunac self-developed agent core, P0)");
+        println!("agent 0.2.0 (lunac self-developed agent core, P1)");
         return;
     }
     if args.iter().any(|a| a == "--mcp-server") {
-        eprintln!("[agent] P0: --mcp-server 已接受但未实现（MCP 工具桥为 P3）");
+        eprintln!("[agent] --mcp-server 已接受但未实现（MCP 工具桥为 P3）");
     }
+
+    let cli = CliArgs::parse(&args);
+    let tools_ctx = tools::Ctx {
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        add_dirs: cli.add_dirs.clone(),
+        read_only: cli.permission_mode == "plan",
+        locked: std::env::var("LUNAC_WORKSPACE_LOCKED").ok().as_deref() == Some("1")
+            && !cli.skip_permissions,
+    };
+    let tool_defs = tools::defs(&cli.disallowed);
+    let tool_names = tools::names(&tool_defs);
+
+    eprintln!(
+        "[agent] P1 就绪 cwd={} 工具=[{}]{}",
+        tools_ctx.cwd.display(),
+        tool_names.join(","),
+        if tools_ctx.read_only { " 只读模式" } else { "" }
+    );
 
     let cfg = match Cfg::from_env() {
         Ok(c) => c,
@@ -249,9 +333,9 @@ fn main() {
                 if prompt.trim().is_empty() {
                     continue;
                 }
-                run_query(&cfg, &mut history, &prompt);
+                run_query(&cfg, &mut history, &prompt, &tools_ctx, &tool_defs, &tool_names);
             }
-            // P0 不产生 can_use_tool，收到审批回包直接忽略
+            // P1 不产生 can_use_tool，收到审批回包直接忽略
             Some("control_response") => {}
             other => eprintln!("[agent] 忽略输入类型: {other:?}"),
         }
@@ -278,192 +362,388 @@ fn extract_user_text(msg: &Value) -> String {
     }
 }
 
-// ── 单轮查询 ─────────────────────────────────────────────────────
+// ── 单轮查询（含工具循环）────────────────────────────────────────
+//
+// 一轮 =「请求 → 流式解析 → 若有 tool_use 就执行并回灌 tool_result → 再请求」，
+// 直到模型不再调用工具（或达到 MAX_TOOL_ROUNDS）为止，最后发一条 result。
+// 失败时把 history 回滚到本轮开始前，避免半截对话污染后续上下文。
 
-fn run_query(cfg: &Cfg, history: &mut Vec<Value>, prompt: &str) {
-    emit_init(&cfg.model);
+#[derive(Default)]
+struct Block {
+    kind: String,
+    id: String,
+    name: String,
+    /// text / thinking 的累积内容
+    text: String,
+    /// tool_use 的 input_json_delta 累积
+    json: String,
+    /// 端点直接在 content_block_start 里给全量 input 时用它
+    input: Value,
+}
+
+fn run_query(
+    cfg: &Cfg,
+    history: &mut Vec<Value>,
+    prompt: &str,
+    tctx: &tools::Ctx,
+    tool_defs: &[Value],
+    tool_names: &[String],
+) {
     let started = Instant::now();
+    emit_init(&cfg.model, tool_names);
 
+    // 回滚锚点：本轮压入的所有消息（user / assistant / tool_result）都在其后
+    let base = history.len();
     history.push(json!({
         "role": "user",
         "content": [{ "type": "text", "text": prompt }],
     }));
 
-    // 发送（思考形态可降级重试）：只有「与 thinking 相关的 400」才沿降级链
-    // 前进一次，并把可用的形态写回 cfg 缓存，后续轮次不再试错。
-    let resp = loop {
-        let plan = cfg.thinking.get();
-        let mut body = json!({
-            "model": cfg.model,
-            "max_tokens": max_tokens_for(plan),
-            "stream": true,
-            "system": SYSTEM_PROMPT,
-            "messages": history,
-        });
-        if let Some(t) = plan.to_json() {
-            body["thinking"] = t;
-        }
-
-        let sent = cfg
-            .client
-            .post(&cfg.endpoint)
-            .header("authorization", format!("Bearer {}", cfg.token))
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send();
-
-        let r = match sent {
-            Ok(r) => r,
-            Err(e) => return finish_error(history, &format!("请求失败: {e}"), started),
-        };
-        if r.status().is_success() {
-            break r;
-        }
-
-        let status = r.status();
-        let detail = r.text().unwrap_or_default();
-        if status == 400 && thinking_related_error(&detail) {
-            if let Some(next) = plan.next() {
-                eprintln!("[agent] 端点不接受 thinking={plan:?} → 降级为 {next:?}");
-                cfg.thinking.set(next);
-                continue;
-            }
-        }
-        let detail: String = detail.trim().chars().take(800).collect();
-        return finish_error(history, &format!("HTTP {status}: {detail}"), started);
-    };
-
-    let mut acc = String::new();
+    // 整轮累计用量（跨多次往返；前端按累计值做差，故不能只报最后一次）
     let mut in_tokens: u64 = 0;
     let mut out_tokens: u64 = 0;
     let mut cache_read: u64 = 0;
     let mut cache_create: u64 = 0;
-    let mut api_error: Option<String> = None;
+    let mut final_text = String::new();
+    let mut turns = 0usize;
+    let mut rounds = 0usize;
+    let mut hint_sent = false;
 
-    // SSE：只关心 `data:` 载荷；`event:`/空行/注释行一律跳过
-    let reader = BufReader::new(resp);
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let Some(data) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let Ok(ev) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        let index = || ev.get("index").and_then(Value::as_u64).unwrap_or(0);
+    loop {
+        turns += 1;
 
-        match ev.get("type").and_then(Value::as_str).unwrap_or("") {
-            "message_start" => {
-                let u = &ev["message"]["usage"];
-                in_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                cache_read = u
-                    .get("cache_read_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                cache_create = u
-                    .get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+        // 发送（思考形态可降级重试）：只有「与 thinking 相关的 400」才沿降级链
+        // 前进一次，并把可用的形态写回 cfg 缓存，后续轮次不再试错。
+        let resp = loop {
+            let plan = cfg.thinking.get();
+            let mut body = json!({
+                "model": cfg.model,
+                "max_tokens": max_tokens_for(plan),
+                "stream": true,
+                "system": SYSTEM_PROMPT,
+                "messages": history,
+            });
+            if !tool_defs.is_empty() {
+                body["tools"] = json!(tool_defs);
             }
-            "content_block_start" => {
-                let ty = ev
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("text");
-                if ty == "thinking" {
-                    emit_stream_event(json!({
-                        "type": "content_block_start",
-                        "index": index(),
-                        "content_block": { "type": "thinking" },
-                    }));
-                } else if ty == "text" {
-                    emit_stream_event(json!({
-                        "type": "content_block_start",
-                        "index": index(),
-                        "content_block": { "type": "text", "text": "" },
-                    }));
+            if let Some(t) = plan.to_json() {
+                body["thinking"] = t;
+            }
+
+            let sent = cfg
+                .client
+                .post(&cfg.endpoint)
+                .header("authorization", format!("Bearer {}", cfg.token))
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send();
+
+            let r = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    return finish_error(
+                        history,
+                        base,
+                        &format!("请求失败: {e}"),
+                        started,
+                        turns,
+                    )
+                }
+            };
+            if r.status().is_success() {
+                break r;
+            }
+
+            let status = r.status();
+            let detail = r.text().unwrap_or_default();
+            if status == 400 && thinking_related_error(&detail) {
+                if let Some(next) = plan.next() {
+                    eprintln!("[agent] 端点不接受 thinking={plan:?} → 降级为 {next:?}");
+                    cfg.thinking.set(next);
+                    continue;
                 }
             }
-            "content_block_delta" => {
-                let delta = &ev["delta"];
-                match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                    "text_delta" => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                        acc.push_str(text);
-                        emit_stream_event(json!({
-                            "type": "content_block_delta",
-                            "index": index(),
-                            "delta": { "type": "text_delta", "text": text },
-                        }));
-                    }
-                    "thinking_delta" => {
-                        let thinking = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        emit_stream_event(json!({
-                            "type": "content_block_delta",
-                            "index": index(),
-                            "delta": { "type": "thinking_delta", "thinking": thinking },
-                        }));
-                    }
-                    // P0 不产生工具调用，input_json_delta 忽略
-                    _ => {}
+            let detail: String = detail.trim().chars().take(800).collect();
+            return finish_error(history, base, &format!("HTTP {status}: {detail}"), started, turns);
+        };
+
+        // ── 流式解析：把每个 content block 收齐 ──────────────────
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut api_error: Option<String> = None;
+
+        // SSE：只关心 `data:` 载荷；`event:`/空行/注释行一律跳过
+        let reader = BufReader::new(resp);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(ev) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let idx = || ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+            match ev.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message_start" => {
+                    let u = &ev["message"]["usage"];
+                    in_tokens += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    cache_read += u
+                        .get("cache_read_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    cache_create += u
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                 }
-            }
-            "content_block_stop" => {
-                emit_stream_event(json!({ "type": "content_block_stop", "index": index() }));
-            }
-            "message_delta" => {
-                if let Some(n) = ev["usage"].get("output_tokens").and_then(Value::as_u64) {
-                    out_tokens = n;
-                }
-            }
-            "message_stop" => {
-                emit_stream_event(json!({ "type": "message_stop" }));
-            }
-            "error" => {
-                api_error = Some(
-                    ev.pointer("/error/message")
+                "content_block_start" => {
+                    let cb = &ev["content_block"];
+                    let ty = cb
+                        .get("type")
                         .and_then(Value::as_str)
-                        .unwrap_or("未知流错误")
-                        .to_string(),
-                );
+                        .unwrap_or("text")
+                        .to_string();
+                    let i = idx();
+                    if blocks.len() <= i {
+                        blocks.resize_with(i + 1, Block::default);
+                    }
+                    let mut blk = Block {
+                        kind: ty.clone(),
+                        ..Block::default()
+                    };
+                    match ty.as_str() {
+                        "thinking" => emit_stream_event(json!({
+                            "type": "content_block_start",
+                            "index": i,
+                            "content_block": { "type": "thinking" },
+                        })),
+                        "tool_use" => {
+                            blk.id = cb
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            blk.name = cb
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            blk.input = cb.get("input").cloned().unwrap_or(Value::Null);
+                            emit_stream_event(json!({
+                                "type": "content_block_start",
+                                "index": i,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": blk.id,
+                                    "name": blk.name,
+                                },
+                            }));
+                        }
+                        _ => emit_stream_event(json!({
+                            "type": "content_block_start",
+                            "index": i,
+                            "content_block": { "type": "text", "text": "" },
+                        })),
+                    }
+                    blocks[i] = blk;
+                }
+                "content_block_delta" => {
+                    let delta = &ev["delta"];
+                    let i = idx();
+                    if blocks.len() <= i {
+                        blocks.resize_with(i + 1, Block::default);
+                    }
+                    match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "text_delta" => {
+                            let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                            if blocks[i].kind.is_empty() {
+                                blocks[i].kind = "text".into();
+                            }
+                            blocks[i].text.push_str(text);
+                            emit_stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": i,
+                                "delta": { "type": "text_delta", "text": text },
+                            }));
+                        }
+                        "thinking_delta" => {
+                            let thinking = delta
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if blocks[i].kind.is_empty() {
+                                blocks[i].kind = "thinking".into();
+                            }
+                            blocks[i].text.push_str(thinking);
+                            emit_stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": i,
+                                "delta": { "type": "thinking_delta", "thinking": thinking },
+                            }));
+                        }
+                        "input_json_delta" => {
+                            let partial = delta
+                                .get("partial_json")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if blocks[i].kind.is_empty() {
+                                blocks[i].kind = "tool_use".into();
+                            }
+                            blocks[i].json.push_str(partial);
+                            emit_stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": i,
+                                "delta": { "type": "input_json_delta", "partial_json": partial },
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                "content_block_stop" => {
+                    emit_stream_event(json!({ "type": "content_block_stop", "index": idx() }));
+                }
+                "message_delta" => {
+                    if let Some(n) = ev["usage"].get("output_tokens").and_then(Value::as_u64) {
+                        out_tokens += n;
+                    }
+                }
+                "message_stop" => {
+                    emit_stream_event(json!({ "type": "message_stop" }));
+                }
+                "error" => {
+                    api_error = Some(
+                        ev.pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("未知流错误")
+                            .to_string(),
+                    );
+                }
+                _ => {}
             }
-            _ => {}
+        }
+
+        if let Some(err) = api_error {
+            return finish_error(history, base, &err, started, turns);
+        }
+
+        // ── 组装本轮块 ──────────────────────────────────────────
+        // display = 发给前端展示（含 thinking）；hist = 写回上下文
+        // （不含 thinking —— 端点要求 thinking 块带 signature，回灌会 400）
+        let mut display: Vec<Value> = Vec::new();
+        let mut hist: Vec<Value> = Vec::new();
+        let mut calls: Vec<(String, String, Value)> = Vec::new();
+
+        for b in &blocks {
+            match b.kind.as_str() {
+                "thinking" if !b.text.is_empty() => {
+                    display.push(json!({ "type": "thinking", "thinking": b.text }));
+                }
+                "text" if !b.text.is_empty() => {
+                    final_text = b.text.clone();
+                    let blk = json!({ "type": "text", "text": b.text });
+                    display.push(blk.clone());
+                    hist.push(blk);
+                }
+                "tool_use" => {
+                    // 优先用 input_json_delta 累积出来的完整 JSON —— 兼容端点
+                    // （如 DeepSeek 的 Anthropic 层）会在 content_block_start
+                    // 里先塞一个占位 `"input": {}`，只看它会拿到空参数。
+                    let input = if !b.json.trim().is_empty() {
+                        match serde_json::from_str::<Value>(&b.json) {
+                            Ok(v) if v.is_object() => v,
+                            Ok(_) => json!({}),
+                            Err(e) => {
+                                eprintln!("[agent] tool_use input 不是合法 JSON（{e}）");
+                                json!({})
+                            }
+                        }
+                    } else if b.input.is_object() {
+                        b.input.clone()
+                    } else {
+                        json!({})
+                    };
+                    let blk = json!({
+                        "type": "tool_use",
+                        "id": b.id,
+                        "name": b.name,
+                        "input": input,
+                    });
+                    display.push(blk.clone());
+                    hist.push(blk);
+                    calls.push((b.id.clone(), b.name.clone(), input));
+                }
+                _ => {}
+            }
+        }
+
+        // assistant 整包：前端在没有任何增量时拿它兜底，同时作为后续轮次的上下文
+        emit(json!({
+            "type": "assistant",
+            "message": { "role": "assistant", "content": display },
+        }));
+        if !hist.is_empty() {
+            history.push(json!({ "role": "assistant", "content": hist }));
+        }
+
+        // 没有工具调用 ⇒ 本轮结束
+        if calls.is_empty() {
+            break;
+        }
+
+        // ── 执行工具 → 回灌 tool_result ─────────────────────────
+        // 工具报错不中断整轮：转成 is_error=true 的 tool_result，模型可自行纠正。
+        let mut results: Vec<Value> = Vec::new();
+        for (id, name, input) in &calls {
+            eprintln!("[agent] 执行工具 {name}");
+            let (text, is_error) = match tools::run(tctx, name, input) {
+                Ok(s) => (s, false),
+                Err(e) => (format!("Error: {e}"), true),
+            };
+            let mut blk = json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": text,
+            });
+            if is_error {
+                blk["is_error"] = json!(true);
+            }
+            results.push(blk);
+        }
+        let tool_msg = json!({ "role": "user", "content": results });
+        emit(json!({ "type": "user", "message": tool_msg.clone() }));
+        history.push(tool_msg);
+
+        rounds += 1;
+        if rounds >= MAX_TOOL_ROUNDS {
+            if hint_sent {
+                eprintln!("[agent] 工具轮次达上限，提前收尾");
+                break;
+            }
+            // 给模型一次「收口」的机会：只出文本，不再调工具
+            hint_sent = true;
+            history.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "Tool budget exhausted. Stop calling tools and give the user your final answer now.",
+                }],
+            }));
         }
     }
-
-    if let Some(err) = api_error {
-        return finish_error(history, &err, started);
-    }
-
-    // assistant 整包：前端只在「本轮没有任何增量」时用它兜底，不会重复渲染
-    emit(json!({
-        "type": "assistant",
-        "message": {
-            "role": "assistant",
-            "content": [{ "type": "text", "text": acc }],
-        },
-    }));
-    history.push(json!({
-        "role": "assistant",
-        "content": [{ "type": "text", "text": acc }],
-    }));
 
     emit(json!({
         "type": "result",
         "subtype": "success",
         "is_error": false,
         "duration_ms": started.elapsed().as_millis() as u64,
-        "num_turns": 1,
-        "result": acc,
+        "num_turns": turns,
+        "result": final_text,
         "session_id": "",
         "total_cost_usd": 0.0,
         "usage": {
@@ -475,23 +755,23 @@ fn run_query(cfg: &Cfg, history: &mut Vec<Value>, prompt: &str) {
     }));
 }
 
-/// 出错时收尾：把刚压入的 user 消息弹出，避免失败轮污染后续上下文。
-fn finish_error(history: &mut Vec<Value>, msg: &str, started: Instant) {
+/// 出错时收尾：把本轮压入的所有消息（user / assistant / tool_result）
+/// 全部丢弃，避免半截对话污染后续上下文。
+fn finish_error(
+    history: &mut Vec<Value>,
+    base: usize,
+    msg: &str,
+    started: Instant,
+    turns: usize,
+) {
     eprintln!("[agent] {msg}");
-    let last_is_user = history
-        .last()
-        .and_then(|m| m.get("role"))
-        .and_then(Value::as_str)
-        == Some("user");
-    if last_is_user {
-        history.pop();
-    }
+    history.truncate(base);
     emit(json!({
         "type": "result",
         "subtype": "error_during_execution",
         "is_error": true,
         "duration_ms": started.elapsed().as_millis() as u64,
-        "num_turns": 0,
+        "num_turns": turns,
         "result": msg,
         "session_id": "",
         "total_cost_usd": 0.0,

@@ -1,4 +1,4 @@
-# scripts/verify-git.ps1
+﻿# scripts/verify-git.ps1
 # 「新克隆自检」—— 把本仓库克隆到新机器后先跑这个，一次列清缺什么。
 #
 # 用法:  powershell -ExecutionPolicy Bypass -File scripts\verify-git.ps1
@@ -71,7 +71,7 @@ if (Test-Path $agent) {
 } else {
   Warn "agent.exe 未编译 —— AI 对话将报 'agent.exe not found'"
   Note "修复: powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1"
-  Note "（等价于 cd core-agent ; cargo build --release；首次约需数分钟，产物约 1.5MB）"
+  Note "（等价于 cd core-agent ; cargo build --release；首次约需数分钟，产物约 2.5MB）"
 }
 
 # ── 4. AI 配置 ──────────────────────────────────────────────────

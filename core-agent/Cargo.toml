@@ -12,6 +12,9 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
+# P1 内置工具：Glob 的模式匹配、Grep 的正则
+glob = "0.3"
+regex = "1"
 
 [profile.release]
 opt-level = "z"
