@@ -21,6 +21,8 @@ ui/dist/
 app/src-tauri/target/
 app/src-tauri/target-e2e/
 app/src-tauri/gen/
+# 自研 agent 核心（core-agent）的编译产物
+core-agent/target/
 # 随附的 cli.exe（Claude Code CLI 编译产物，不随本仓库分发）
 app/src-tauri/binaries/
 # VS Code 扩展的编译输出（源在 vscode-extension/src/）

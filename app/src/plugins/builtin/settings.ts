@@ -196,7 +196,9 @@ const PROVIDER_PRESETS: Record<string, ModelPreset> = {
 
 const MODEL_SUGGESTIONS: Record<string, string[]> = {
   "openai":     ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"],
-  "deepseek":   ["deepseek-v4-pro", "deepseek-v4-flash"],
+  // DeepSeek 官方 Anthropic 兼容端点只认 "deepseek-flash" / "deepseek-v4-pro"
+  // （实测传 "deepseek-v4.1-flash" 或 "v4-flash" 之外的臆造名会 400）
+  "deepseek":   ["deepseek-v4-pro", "deepseek-flash"],
   "anthropic":  ["claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-haiku-4-5-20251001"],
   "google":     ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"],
   "zhipu":      ["glm-5", "glm-4.7", "glm-4.5-air", "glm-4.5-flash"],

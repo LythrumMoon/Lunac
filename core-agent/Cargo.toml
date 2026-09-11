@@ -1,0 +1,20 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+description = "Lunac self-developed agent core — drop-in for the Claude Code CLI stream-json contract"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

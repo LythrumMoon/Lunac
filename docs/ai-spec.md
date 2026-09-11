@@ -186,6 +186,35 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 简单问答切换 | `main.ts` `#chat-mode-btn` + `buildSimpleChatHint` | 软约束"勿用工具/skills"，状态栏显示当前模式 |
 | Token 仪表盘 | `main.ts` `updateTokenDashboard` | 完整计费口径：Hit=缓存读取，Miss=普通输入+缓存写入，Total=四类 token 之和 |
 
+### 3.5 自研 agent 核心 `core-agent/`（P0，2026-09）
+
+`core/cli.exe` 是 Anthropic 的 Claude Code CLI 编译产物，版权不可分发。**架构与 stream-json 协议本身不受版权保护**，故自研 [core-agent](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 以**同一契约**实现同类 agent 循环，作为 drop-in 替代——src-tauri 与前端本来就不关心二进制是谁，因此**零改动**。
+
+**契约（即前端/[main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts#L2924-L3073) 的既有约定）**
+
+| 面 | 内容 |
+|---|---|
+| env | `ANTHROPIC_BASE_URL`（已是完整 anthropic 端点，请求拼 `/v1/messages`）、`ANTHROPIC_AUTH_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`ANTHROPIC_MODEL` |
+| 启动参数 | 兼容 cli.exe 的 `--print` / `--input-format stream-json` / `--output-format stream-json` / `--include-partial-messages` / `--permission-prompt-tool stdio` / `--mcp-server stdio:<path>` / `--add-dir <ws>`；P0 一律接受并忽略（不因此报错退出） |
+| stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response",…}` 为审批回包 |
+| stdout | 每行一条 JSON：`system/init` → `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，仅无增量时前端兜底）→ `result`（`subtype` / `is_error` / `usage`） |
+
+**P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮自动回滚 history，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
+
+**思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、Anthropic 新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
+
+| 输入 | 首选形态 | `max_tokens` |
+|---|---|---|
+| `MAX_THINKING_TOKENS=0` | `{"type":"disabled"}` | 8192 基线 |
+| `MAX_THINKING_TOKENS=n>0` | `{"type":"enabled","budget_tokens":n}` | `max(n+4096, 8192)` —— Anthropic 要求 `budget_tokens < max_tokens`，deep 档 32768 配 8192 会被判非法 |
+| 未设置 | 完全不发该字段 | 8192 基线 |
+
+**400 降级链**（仅当错误正文含 `thinking`/`adaptive`/`budget_tokens` 才触发，避免把「模型名不存在」这类无关 400 也白重试）：`enabled+budget → adaptive → 不带字段`；fast 档为 `disabled → 不带字段`（**不退到 adaptive**，否则等于反过来把思考打开）。降级结果缓存在进程内，后续轮次不再试错，并往 stderr 打一行说明。
+
+**P1–P4 待做**：P1 内置工具（read/write/edit/bash/glob/grep）+ `tool_use`/`tool_result` 循环；P2 `can_use_tool` 权限审批（发 `control_request` 并阻塞等 stdin `control_response`）；P3 MCP 工具桥（作 client 连 `lunac.exe --mcp-server`，读 `<exe 根>\tools\*.json`）；P4 skills / 系统提示词 / 工作区锁（`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`）。
+
+**构建与切换**：`cd core-agent; cargo build --release` → `core-agent/target/release/agent.exe`（约 1.5MB，对比 `cli.exe` 121MB）。接线时只需让 `start_cli_process` 的 `cli_exe` 指向 `core\agent.exe`。
+
 ### 3.6 数学公式渲染
 
 Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
@@ -364,8 +393,12 @@ app/
 └── package.json
 
 core/
-├── cli.exe                          # 编译后的 Claude Code CLI (121MB)
+├── cli.exe                          # 编译后的 Claude Code CLI (121MB，Anthropic 版权，不入库)
 └── ...                              # 数百个 TypeScript 源文件 (休眠)
+
+core-agent/
+├── src/main.rs                      # 自研 agent 核心（P0，drop-in 替代 cli.exe，见 §3.5）
+└── Cargo.toml
 
 scripts/
 ├── tauri-dev.ps1                    # 开发启动脚本
@@ -462,6 +495,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
    - 供应商 = 大节点：模型下拉只含**当前供应商**的预设模型 + 该供应商已保存的自定义模型；切换供应商时回落其默认模型，不把上一家模型带入。
    - 自定义模型确认 = 在**当前供应商模型列表内新增一项**，预设全部保留；内联编辑器只“追加编辑行”，禁止覆盖 dropdown 整体 innerHTML。
    - 接口地址默认**不带 /v1**；cli.exe 组 Anthropic 端点时先剥离末尾 /v1 再拼 /anthropic。
+   - 模型建议名必须与供应商**实际可用名**一致：DeepSeek 的 Anthropic 兼容端点只认 `deepseek-v4-pro` / `deepseek-flash`（实测臆造名如 `deepseek-v4.1-flash` 会直接 400 并回报支持列表）—— MODEL_SUGGESTIONS 已按此修正。
 3. **设置 · 技能扩展**：固定目录 `<exe 根>\skills`（布局 `<技能key>/SKILL.md`）；lunac 负责 raw SKILL.md URL 安装 / 新建粘贴 / 编辑 / 删除；cli.exe 经 `LUNAC_SKILLS_DIR` 读取该目录，与编译内置技能互不影响；key 由 frontmatter.name 安全 slug 派生。
 4. **搜索性能**：Start Menu 扫描 Rust 侧带 30s TTL 缓存（增删自定义应用主动失效，并同时删除落盘文件防复活）。**三级策略（stale-while-revalidate）**：① TTL 内直接返回；② 过期则**立即返回旧数据 + 后台重建**（搜索路径永不因目录扫描阻塞）；③ 无任何缓存才同步扫一次。扫描结果**落盘到 `<exe 根>\temp\app-index-cache.json`**（含版本号 + 保存时间戳，>7 天视为不可信丢弃），**启动时优先从该文件预热**（跨重启秒出，不再等首次扫描），**热键唤出 / 托盘显示时若缓存过期则后台刷新**（方案A，热键路径非阻塞）。前端输入 60ms 去抖并丢弃过期输入，**内容检测（latest-wins）**：`search_apps` 晚回包时校验键入序号（`_searchSeq`），过期或期间已进插件态直接丢弃、不触碰 UI——快速键入只显示最终结果，杜绝旧结果覆盖/一次键入多次渲染闪烁；结果渲染不保留入场 / 开合动画。**窗口高度**：搜索路径懒测量（双 rAF 后实测），`setSize` 串行化（latest-wins，在途期间只记最新期望高度，完成后补发一次），杜绝快速键入时逐键 setSize IPC 风暴 / onResized 回环。
    - **窗口高度「滑动」动画（正式，2026-09）**：非插件/搜索态高度变化默认逐帧滑动（rail 模式——每步等上一 setSize 经 onResized 落地再走下一步），默认参数定稿 `rigidity 0.22`（每帧逼近比例，大=刚性/跟手，小=柔滑拖尾）/ `maxStep 14`（单步最大位移 px）/ `stepHz 120`（步频上限）/ `suppressMs 400`（唤出/启动抑制期）；DevTools Console `__lunac_resize_anim`（含 `enabled=false` 即回退原直设路径）可实时调节，`__lunac_resize_anim_stats` 记录步数/耗时。首次高度落位直设防启动滑屏；插件态离散跳变不走动画。**唤出抑制**：热键/托盘唤出（`lunac-window-shown`）后 `suppressMs` 内的高度变化一律直设并在期内顺延（内容分批到达：剪贴板探测 → 加泡泡 → 重跑搜索 → 实测），保证窗口**瞬时完整展开**——否则会看到结果区被物理窗口裁剪、逐帧“撑开”（WebView2 无法渲染超出窗口的内容）。
