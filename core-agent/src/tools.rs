@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch
+// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch / AskUserQuestion
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -181,6 +181,50 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["url"]
             }
         }),
+        json!({
+            "name": "AskUserQuestion",
+            "description": "Ask the user 1-4 multiple-choice questions and wait for the answer. \
+                Use it when you are genuinely blocked on a decision only the user can make \
+                (ambiguous requirement, a choice between approaches). Do not use it to ask for \
+                permission or to confirm an action — just say it in plain text.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": { "type": "string", "description": "The complete question to ask" },
+                                "header": { "type": "string", "description": "Very short label, at most 12 characters" },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string", "description": "Concise choice text, 1-5 words" },
+                                            "description": { "type": "string", "description": "What this choice means" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "multiSelect": { "type": "boolean", "description": "Allow picking more than one option (default false)" }
+                            },
+                            "required": ["question", "header", "options"]
+                        }
+                    },
+                    "answers": {
+                        "type": "object",
+                        "description": "Filled in by Lunac when the user answers — never set this yourself"
+                    }
+                },
+                "required": ["questions"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -207,13 +251,25 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 /// 写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）一律先问 —— 前端会自行处理
 /// 「白名单 / 内置安全前缀自动放行」与「危险命令只给手动确认」，所以 agent
 /// 侧不做二次判断，问就完了。
+/// `AskUserQuestion` 也必须问：**交互本身就是它的功能**（答案经审批卡的
+/// `updatedInput` 回传，不问就拿不到答案）。
 ///
-/// `plan` 档不在此判断：那四件写类工具会被 tools::run 直接拒绝，压根到不了审批。
+/// `plan` 档下的例外见 [`gated_in_read_only`]。
 pub fn needs_approval(name: &str) -> bool {
     matches!(
         name,
-        "Write" | "Edit" | "Bash" | "PowerShell" | "WebFetch"
+        "Write" | "Edit" | "Bash" | "PowerShell" | "WebFetch" | "AskUserQuestion"
     )
+}
+
+/// 只读（plan）档下**仍需**审批的工具。
+///
+/// 只读档对写类工具免于询问，是因为它们会被 `run()` 直接拒绝（问了白问）。
+/// 下面这两件在只读档是**放行**的，且都必须经过前端交互：
+///   · `WebFetch` —— 唯一的外部数据出口（`Read` 到的文件内容能拼进 URL 带出）
+///   · `AskUserQuestion` —— 交互就是它的功能；不问等于拿不到答案
+pub fn gated_in_read_only(name: &str) -> bool {
+    matches!(name, "WebFetch" | "AskUserQuestion")
 }
 
 // ── 分发 ─────────────────────────────────────────────────────────
@@ -230,6 +286,7 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "Glob" => glob(ctx, input),
         "Grep" => grep(ctx, input),
         "WebFetch" => webfetch(input),
+        "AskUserQuestion" => ask_user_question(input),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -884,6 +941,66 @@ fn entity_value(ent: &str) -> Option<String> {
         _ => return None,
     };
     Some(c.to_string())
+}
+
+/// 单选答案是字符串，多选是字符串数组，统一成可读文本
+fn answer_text(a: &Value) -> String {
+    match a {
+        Value::Array(items) => items
+            .iter()
+            .map(|x| match x.as_str() {
+                Some(s) => s.to_string(),
+                None => x.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+// ── AskUserQuestion ──────────────────────────────────────────────
+
+/// 选项由模型给，**答案由前端经审批卡的 `updatedInput` 塞回来**（见 ai-spec
+/// §3.5 的 `can_use_tool` 协议：非空 `updatedInput` 覆盖原参数）。本工具自己
+/// 只做一件事：把 `answers` 排成模型好读的一段文本当 tool_result。
+///
+/// 没有 `answers` 就**报错**而不是假装用户答了 —— 那说明这条调用没经过交互
+/// 通道（没传 `--permission-prompt-tool stdio`，或用户点了卡片的「全部允许」
+/// 但没选）。报错能让模型改用文本提问，编一个假答案则会污染后续推理。
+fn ask_user_question(input: &Value) -> Result<String, String> {
+    let Some(answers) = input.get("answers").and_then(Value::as_object) else {
+        return Err(
+            "No answer was collected — the interactive channel is unavailable. \
+             Ask the user in plain text instead."
+                .into(),
+        );
+    };
+    if answers.is_empty() {
+        return Err("No answer was collected — the user submitted nothing.".into());
+    }
+
+    // 先按模型给的题目顺序输出（`answers` 的键就是题目原文），
+    // 再把没对上题的答案补在后面，免得前端改了题面时答案凭空消失
+    let mut out = String::from("User has answered your questions:");
+    let mut done: Vec<&str> = Vec::new();
+    if let Some(list) = input.get("questions").and_then(Value::as_array) {
+        for q in list {
+            let Some(text) = q.get("question").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(a) = answers.get(text) {
+                out.push_str(&format!("\n\"{text}\" = \"{}\"", answer_text(a)));
+                done.push(text);
+            }
+        }
+    }
+    for (q, a) in answers {
+        if !done.contains(&q.as_str()) {
+            out.push_str(&format!("\n\"{q}\" = \"{}\"", answer_text(a)));
+        }
+    }
+    Ok(out)
 }
 
 /// 递归收集文本文件（跳过 SKIP_DIRS，深度与数量封顶）

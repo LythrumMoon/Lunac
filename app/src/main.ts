@@ -1531,6 +1531,7 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "Glob" },
   { name: "Grep" },
   { name: "WebFetch" },
+  { name: "AskUserQuestion" },
   { name: "Skill" },
 ];
 
@@ -2615,15 +2616,27 @@ function classifyRequest(toolName: string, input: unknown): {
     return { auto: false, danger: null, bashCmd };
   }
 
+  // AskUserQuestion 必须由人来选：即使工具名进了白名单也不能自动放行 ——
+  // 自动放行 = 回一个空 updatedInput，模型拿不到任何答案（agent 会报
+  // "No answer was collected"）。
+  if (toolName === "AskUserQuestion") return { auto: false, danger: null, bashCmd: null };
+
   const wl = getUserWhitelist();
   return { auto: wl.tools.includes(toolName), danger: null, bashCmd: null };
 }
 
-function respondPermission(requestId: string, allow: boolean, toolUseId?: string) {
+function respondPermission(
+  requestId: string,
+  allow: boolean,
+  toolUseId?: string,
+  updatedInput?: Record<string, unknown>,
+) {
   // allow with empty updatedInput = "run with the original input"
   // (explicitly supported: CLI treats {} as use-original)
+  // 非空 updatedInput = 覆盖原参数 —— AskUserQuestion 靠它把用户选中的答案带回 agent
+  // （agent 侧只有「非空对象才覆盖」，所以答案必须挂在对象里，不能是空 {}）。
   const inner = allow
-    ? { behavior: "allow", updatedInput: {}, toolUseID: toolUseId }
+    ? { behavior: "allow", updatedInput: updatedInput ?? {}, toolUseID: toolUseId }
     : { behavior: "deny", message: "User denied this action in Lunac", interrupt: false, toolUseID: toolUseId };
   const msg = JSON.stringify({
     type: "control_response",
@@ -2659,6 +2672,10 @@ interface CmdGroupItem extends HTMLElement {
   _groupInput?: unknown;
   _isCmdGroup: boolean;
   _finish: (allow: boolean, always?: boolean) => void;
+  /** AskUserQuestion 专用：把当前选中的选项组装成 updatedInput 交给 agent */
+  _buildUpdatedInput?: () => Record<string, unknown>;
+  /** AskUserQuestion 专用：解决后的提示文案（普通行走 t("agent.approved") 那套） */
+  _resolveNote?: (allow: boolean) => string;
 }
 
 /** Find the last open command-group row for a tool (merge target). */
@@ -2671,6 +2688,88 @@ function findLastBashGroup(toolName: string): CmdGroupItem | null {
     }
   }
   return last;
+}
+
+/** AskUserQuestion 的选项界面：单选用互斥高亮、多选可叠加；选中结果写进
+ *  item._buildUpdatedInput，由 finish() 经 `updatedInput` 回传给 agent
+ *  （agent 侧只把 answers 排成 tool_result，见 core-agent/src/tools.rs）。 */
+function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupItem) {
+  const inp = (input ?? {}) as Record<string, unknown>;
+  const questions = Array.isArray(inp.questions)
+    ? (inp.questions as Array<Record<string, unknown>>)
+    : [];
+  // 题目原文 → 已选中的 label 列表（answers 的键就是题目原文）
+  const picked = new Map<string, string[]>();
+
+  for (const q of questions) {
+    const qText = String(q.question ?? "");
+    const multi = q.multiSelect === true;
+    const list = Array.isArray(q.options) ? (q.options as Array<Record<string, unknown>>) : [];
+    picked.set(qText, []);
+
+    const wrap = document.createElement("div");
+    wrap.className = "approval-ask-q";
+    const head = document.createElement("div");
+    head.className = "approval-ask-head";
+    if (q.header) {
+      const chip = document.createElement("span");
+      chip.className = "approval-ask-chip";
+      chip.textContent = String(q.header);
+      head.appendChild(chip);
+    }
+    head.appendChild(document.createTextNode(qText));
+    wrap.appendChild(head);
+
+    const opts = document.createElement("div");
+    opts.className = "approval-ask-opts";
+    for (const o of list) {
+      const label = String(o.label ?? "");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "approval-ask-opt";
+      const lab = document.createElement("span");
+      lab.className = "approval-ask-opt-label";
+      lab.textContent = label;
+      btn.appendChild(lab);
+      if (o.description) {
+        const desc = document.createElement("span");
+        desc.className = "approval-ask-opt-desc";
+        desc.textContent = String(o.description);
+        btn.appendChild(desc);
+      }
+      btn.addEventListener("click", () => {
+        const cur = picked.get(qText) ?? [];
+        picked.set(
+          qText,
+          multi
+            ? cur.includes(label)
+              ? cur.filter((x) => x !== label)
+              : [...cur, label]
+            : [label],
+        );
+        const now = picked.get(qText) ?? [];
+        opts.querySelectorAll(".approval-ask-opt").forEach((el) => {
+          const l = el.querySelector(".approval-ask-opt-label")?.textContent ?? "";
+          el.classList.toggle("picked", now.includes(l));
+        });
+      });
+      opts.appendChild(btn);
+    }
+    wrap.appendChild(opts);
+    host.appendChild(wrap);
+  }
+
+  item._buildUpdatedInput = () => {
+    const answers: Record<string, string | string[]> = {};
+    for (const [qText, labels] of picked) {
+      if (!labels.length) continue; // 没选的题不带答案，agent 会看到「漏答」
+      const multi = questions.find((x) => String(x.question ?? "") === qText)?.multiSelect === true;
+      answers[qText] = multi ? labels : labels[0];
+    }
+    // 必须带上 questions：agent 只认「非空对象」为覆盖，空对象 = 用原参数
+    return { ...inp, answers };
+  };
+  item._resolveNote = (allow) => (allow ? "已提交答案" : "已拒绝提问");
 }
 
 /** Re-render a command group's body (command list + merge count). */
@@ -2824,16 +2923,23 @@ function showPermissionCard(
   const alwaysBtn = cls.danger
     ? ""
     : `<button class="approval-btn approval-always">始终允许</button>`;
+  // AskUserQuestion 的「允许」其实是「提交答案」，且不能白名单化
+  // （白名单化 = 以后自动回空 updatedInput = 模型永远拿不到答案）
+  const isAsk = toolName === "AskUserQuestion";
   item.innerHTML = `
     <div class="approval-title">${dangerHtml}<b>${esc(toolName)}</b></div>
     <div class="approval-body"></div>
     <div class="approval-actions">
-      <button class="approval-btn approval-allow">允许</button>
-      ${alwaysBtn}
+      <button class="approval-btn approval-allow">${isAsk ? "提交" : "允许"}</button>
+      ${isAsk ? "" : alwaysBtn}
       <button class="approval-btn approval-deny">拒绝</button>
     </div>`;
   body.appendChild(item);
-  renderCmdGroupBody(item);
+  if (isAsk) {
+    renderAskQuestions(item.querySelector(".approval-body")!, input, item);
+  } else {
+    renderCmdGroupBody(item);
+  }
   agentScroll();
 
   const finish = (allow: boolean, always = false) => {
@@ -2850,21 +2956,25 @@ function showPermissionCard(
       saveUserWhitelist(wl);
     }
     ids.forEach((rid, i) => {
-      respondPermission(rid, allow, item._groupToolUseIds[i] || undefined);
+      // AskUserQuestion：用户选中的选项要随 allow 一起带回去（覆盖原参数）
+      const updated = allow ? item._buildUpdatedInput?.() : undefined;
+      respondPermission(rid, allow, item._groupToolUseIds[i] || undefined, updated);
       pendingPermissionCards.delete(rid);
     });
     item.querySelector(".approval-actions")?.remove();
     const note = document.createElement("div");
     note.className = `approval-note ${allow ? "ok" : "no"}`;
-    note.textContent = allow
-      ? always
-        ? t("agent.approved_whitelist")
+    note.textContent = item._resolveNote
+      ? item._resolveNote(allow)
+      : allow
+        ? always
+          ? t("agent.approved_whitelist")
+          : ids.length > 1
+            ? t("agent.cmd_allowed", { count: String(ids.length) })
+            : t("agent.approved")
         : ids.length > 1
-          ? t("agent.cmd_allowed", { count: String(ids.length) })
-          : t("agent.approved")
-      : ids.length > 1
-        ? t("agent.cmd_denied", { count: String(ids.length) })
-        : t("agent.denied");
+          ? t("agent.cmd_denied", { count: String(ids.length) })
+          : t("agent.denied");
     item.appendChild(note);
     item.classList.add("answered");
     // Slide the resolved row out, then finalize the batch card

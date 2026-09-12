@@ -638,8 +638,8 @@ fn main() {
         if !cli.ask_permission {
             ""
         } else if tools_ctx.read_only {
-            // 只读档只有 WebFetch 需要审批（写类工具直接被拒，不必问）
-            " 网络读取需审批"
+            // 只读档只有 WebFetch / AskUserQuestion 需要审批（写类工具直接被拒）
+            " 网络与提问需审批"
         } else {
             " 写操作需审批"
         }
@@ -758,9 +758,9 @@ struct Block {
 }
 
 /// 需要审批的工具：内置写类四件（Write/Edit/Bash/PowerShell）+ WebFetch
-/// （唯一会把数据发往外部）+ 全部 MCP 工具 —— 后者的 handler 能跑 shell /
-/// 发 HTTP，且定义来自用户 JSON，agent 侧无权替用户判断安全性，
-/// 一律交前端卡片决定。
+/// （唯一会把数据发往外部）+ AskUserQuestion（交互本身就是它的功能）
+/// + 全部 MCP 工具 —— 后者的 handler 能跑 shell / 发 HTTP，且定义来自
+/// 用户 JSON，agent 侧无权替用户判断安全性，一律交前端卡片决定。
 fn needs_approval(name: &str) -> bool {
     tools::needs_approval(name) || mcp::is_mcp(name)
 }
@@ -1166,14 +1166,13 @@ fn run_query(
         // 工具报错不中断整轮：转成 is_error=true 的 tool_result，模型可自行纠正。
         //
         // plan（只读）档的豁免只对写类工具有效 —— 它们会被 tools::run 直接拒绝，
-        // 问了也是白问。但 WebFetch 在只读档是**放行**的，而它是唯一会把数据
-        // 发往外部的内置工具（Read 到的文件内容可以拼进 URL），所以它不享受
-        // 这个豁免：只读档下同样要过审批。
+        // 问了也是白问。放行的那两件（WebFetch / AskUserQuestion）必须照问：
+        // 前者是唯一的外部数据出口，后者的答案只能从卡片上取（见 gated_in_read_only）。
         let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
             let ask = ask_permission
                 && needs_approval(name)
-                && (!tctx.read_only || name == "WebFetch");
+                && (!tctx.read_only || tools::gated_in_read_only(name));
             if ask {
                 pendings.push(Some(open_approval(name, id, input)));
             } else {
