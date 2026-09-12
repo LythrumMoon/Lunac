@@ -319,6 +319,8 @@ fn main() {
             storage::load_chat_sessions,
             storage::save_clipboard_history,
             storage::load_clipboard_history,
+            storage::append_usage_log,
+            storage::read_usage_log,
             storage::memo_save_entries,
             storage::memo_load_entries,
             storage::memo_save_image,

@@ -646,9 +646,17 @@ interface ChatDoneInfo {
   cache_creation_input_tokens?: number;
 }
 
-// ── Cumulative token tracking (reset per conversation) ───────────
-let sessionTokens = { hit: 0, miss: 0, total: 0 };
-let lastAgentTokens = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 }; // CLI reports cumulative totals
+// ── 用量统计（口径：本地用量日志的「今日累计」）──────────────────
+// agent.exe 的 result.usage 是**每次提问的绝对值**（一次提问内所有工具往返
+// 在本轮内累加），不是会话累计 —— 所以这里不做差，直接累加。
+// 面板数值 = 今日本地日志（ModuleData\usage\usage-YYYY-MM-DD.jsonl）的合计，
+// 与供应商平台的按天统计同口径，可逐条对账。
+let usageTotals = { hit: 0, miss: 0, total: 0 };
+let usageSeeded = false;
+/** 已经实时累加过的提问数 —— 播种回包晚于实时回包时用它判弃 */
+let usageLiveTurns = 0;
+/** 当前 agent 的模型名（来自 system/init，写进用量日志便于区分供应商/模型） */
+let agentModel = "";
 
 // ── Chat conversation mode ────────────────────────────────────────
 // DeepSeek 思考模式三档（点2/7），替换旧的 simple/agent 切换：
@@ -1732,23 +1740,23 @@ function fmtTokens(n: number): string {
  *  Total = input + cache_creation + cache_read + output (all billed tokens)
  *  NOTE: Anthropic's usage.input_tokens does NOT include cache tokens, so
  *  "miss" must add cache_creation instead of subtracting cache_read. */
-function updateTokenDashboard(info?: ChatDoneInfo) {
-  if (info) {
-    const cacheHit = info.cache_read_input_tokens || 0;
-    const cacheCreate = info.cache_creation_input_tokens || 0;
-    const cacheMiss = info.input_tokens + cacheCreate;
-    const total = cacheMiss + cacheHit + info.output_tokens;
-    sessionTokens.hit += cacheHit;
-    sessionTokens.miss += cacheMiss;
-    sessionTokens.total += total;
-  }
+function addUsageToTotals(info: ChatDoneInfo) {
+  const hit = info.cache_read_input_tokens || 0;
+  // DeepSeek 走自动缓存，实测 cache_creation 恒为 0；这里保留加法是为了兼容
+  // 会显式建缓存的端点（Anthropic 原生）。
+  const miss = info.input_tokens + (info.cache_creation_input_tokens || 0);
+  usageTotals.hit += hit;
+  usageTotals.miss += miss;
+  usageTotals.total += miss + hit + info.output_tokens;
+}
 
-  const { hit, miss, total } = sessionTokens;
+function updateTokenDashboard() {
+  const { hit, miss, total } = usageTotals;
   const inputTokens = hit + miss;
   const hitPct = inputTokens > 0 ? Math.round((hit / inputTokens) * 100) : 0;
 
   tokenDashboard.innerHTML =
-    `<span class="tk-bar" title="${t("token.cache_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), total: fmtTokens(total) })}">` +
+    `<span class="tk-bar" title="${t("token.scope_today")} · ${t("token.cache_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), total: fmtTokens(total) })}">` +
       `<span class="tk-bar-fill tk-bar-hit" style="width:${hitPct}%"></span>` +
       `<span class="tk-bar-fill tk-bar-miss" style="width:${100 - hitPct}%"></span>` +
     `</span>` +
@@ -1756,18 +1764,64 @@ function updateTokenDashboard(info?: ChatDoneInfo) {
     `<span class="tk-total" title="${t("token.detail_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), out: fmtTokens(total - inputTokens), total: fmtTokens(total) })}">${fmtTokens(total)}</span>`;
 }
 
+/** `YYYY-MM-DD`（本地时区）—— 用量日志的文件名分片键 */
+function localDateKey(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 把一次提问的用量追加进本地日志（只追加，失败不影响对话） */
+function appendUsageLog(info: ChatDoneInfo) {
+  const now = new Date();
+  void invoke("append_usage_log", {
+    date: localDateKey(now),
+    record: {
+      ts: now.getTime(),
+      model: agentModel,
+      input: info.input_tokens,
+      output: info.output_tokens,
+      cacheRead: info.cache_read_input_tokens ?? 0,
+      cacheCreate: info.cache_creation_input_tokens ?? 0,
+    },
+  }).catch(() => {});
+}
+
+/** 面板数值的唯一来源 = 今日日志。首次显示时播种一次，之后每次提问累加。 */
+async function seedUsageTotals() {
+  if (usageSeeded) return;
+  usageSeeded = true;
+  const turnsAtStart = usageLiveTurns;
+  try {
+    const records = await invoke<Array<{
+      input: number; output: number; cacheRead: number; cacheCreate: number;
+    }>>("read_usage_log", { date: localDateKey(new Date()) });
+    // 播种是异步的：期间若有提问回包，直接放弃覆盖（那次的数已经实时累加过）
+    if (usageLiveTurns !== turnsAtStart) return;
+    usageTotals = { hit: 0, miss: 0, total: 0 };
+    for (const r of records) {
+      addUsageToTotals({
+        stop_reason: "end_turn",
+        input_tokens: r.input || 0,
+        output_tokens: r.output || 0,
+        cache_read_input_tokens: r.cacheRead || 0,
+        cache_creation_input_tokens: r.cacheCreate || 0,
+      });
+    }
+    updateTokenDashboard();
+  } catch {
+    // 读不到日志就按 0 起步，下一次提问照样累加
+  }
+}
+
 function showTokenDashboard(show: boolean) {
   if (show) {
-    sessionTokens = { hit: 0, miss: 0, total: 0 };
-    lastAgentTokens = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
     tokenDashboard.classList.remove("hidden");
     tokenDashboard.classList.add("visible");
-    updateTokenDashboard(); // render "0% · 0"
+    updateTokenDashboard();
+    void seedUsageTotals();
   } else {
     tokenDashboard.classList.remove("visible");
     tokenDashboard.classList.add("hidden");
-    sessionTokens = { hit: 0, miss: 0, total: 0 };
-    lastAgentTokens = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
   }
 }
 
@@ -2326,6 +2380,7 @@ interface CliEventLine {
   };
   message?: { content?: Array<{ type: string; text?: string; name?: string; thinking?: string; input?: unknown; content?: unknown; is_error?: boolean }> };
   usage?: { input_tokens: number; output_tokens: number };
+  model?: string;
 }
 
 // ── Agent state machine (Pi reference: turn lifecycle) ────────────
@@ -4341,35 +4396,15 @@ async function startAgentChat(query: string) {
     setStreamingUI(false);
     agentTransition("done");
     statusText.textContent = t("agent.done", { count: String(turn.toolCalls.length) });
-    // CLI reports cumulative totals → compute per-turn deltas. If the new
-    // cumulative value is SMALLER than the last saved one (CLI was restarted
-    // or state got out of sync), take it as absolute (fresh cumulative start).
+    // result.usage 是**本次提问的绝对值**（agent.exe 每次提问重置计数），不是
+    // 会话累计 —— 旧 cli.exe 才是累计值。先前这里按累计做差，会把「前缀没变」
+    // 的那几轮命中缓存算成 0（两轮 cache_read 相同 → 差值 0），导致本地命中率
+    // 系统性低于供应商平台、无法对账。
     if (info) {
-      const fresh =
-        info.input_tokens < lastAgentTokens.input ||
-        info.output_tokens < lastAgentTokens.output;
-      const delta: ChatDoneInfo = fresh
-        ? {
-            stop_reason: "end_turn",
-            input_tokens: info.input_tokens,
-            output_tokens: info.output_tokens,
-            cache_read_input_tokens: info.cache_read_input_tokens ?? 0,
-            cache_creation_input_tokens: info.cache_creation_input_tokens ?? 0,
-          }
-        : {
-            stop_reason: "end_turn",
-            input_tokens: Math.max(0, info.input_tokens - lastAgentTokens.input),
-            output_tokens: Math.max(0, info.output_tokens - lastAgentTokens.output),
-            cache_read_input_tokens: Math.max(0, (info.cache_read_input_tokens ?? 0) - lastAgentTokens.cacheRead),
-            cache_creation_input_tokens: Math.max(0, (info.cache_creation_input_tokens ?? 0) - lastAgentTokens.cacheCreate),
-          };
-      lastAgentTokens = {
-        input: info.input_tokens,
-        output: info.output_tokens,
-        cacheRead: info.cache_read_input_tokens ?? 0,
-        cacheCreate: info.cache_creation_input_tokens ?? 0,
-      };
-      updateTokenDashboard(delta);
+      usageLiveTurns++;
+      addUsageToTotals(info);
+      updateTokenDashboard();
+      appendUsageLog(info);
     }
     cliTextCallback = null;
     cliDoneCallback = null;

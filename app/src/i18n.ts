@@ -1902,6 +1902,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "파일 첨부",
     "en": "Attach files",
   },
+  "token.scope_today": {
+    "zh-CN": "今日累计（本机用量日志）",
+    "zh-TW": "今日累計（本機用量日誌）",
+    "ja": "本日累計（ローカル使用ログ）",
+    "ko": "오늘 누적(로컬 사용 로그)",
+    "en": "Today's total (local usage log)",
+  },
   "token.cache_tooltip": {
     "zh-CN": "{hit} 缓存命中 · {miss} 新生成 · {total} 总计",
     "zh-TW": "{hit} 快取命中 · {miss} 新產生 · {total} 總計",

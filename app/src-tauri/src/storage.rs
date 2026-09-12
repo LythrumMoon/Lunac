@@ -12,6 +12,7 @@
 // migrate_legacy_localappdata() 整体搬移后删除。
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
@@ -214,6 +215,77 @@ pub fn load_clipboard_history() -> Result<Vec<ClipEntry>, String> {
     }
 }
 
+// ── 用量日志（ModuleData\usage\usage-YYYY-MM-DD.jsonl，与平台对账用）────
+//
+// 每次用户提问一行。**口径**：一行 = 一次提问的合计（含提问内所有工具往返），
+// 而供应商平台按「每次 API 请求」记行 —— 一次带工具的提问在平台上就是多行，
+// 对账时把同一时间窗的平台各行相加。
+//
+// 只追加不重写：文件天然按天分片、可被任何工具解析（jq/脚本），且不必担心
+// 并发写坏。文件名用**本地日期**（由前端传入）：Rust 侧没有 chrono，不为一句
+// 时区换算引入新依赖。
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UsageRecord {
+    /// 本地时钟的 epoch 毫秒（前端 Date.now()）
+    pub ts: u64,
+    /// 产生这条记录的模型名（来自 agent 的 system/init）
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    #[serde(rename = "cacheCreate")]
+    pub cache_create: u64,
+}
+
+fn usage_dir() -> PathBuf {
+    module_data_dir().join("usage")
+}
+
+/// 只接受严格的 `YYYY-MM-DD` —— 文件名来自前端，必须挡住路径拼串
+fn usage_log_path(date: &str) -> Result<PathBuf, String> {
+    let b = date.as_bytes();
+    let ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() });
+    if !ok {
+        return Err(format!("invalid date: {date}"));
+    }
+    Ok(usage_dir().join(format!("usage-{date}.jsonl")))
+}
+
+#[tauri::command]
+pub fn append_usage_log(date: String, record: UsageRecord) -> Result<(), String> {
+    let path = usage_log_path(&date)?;
+    fs::create_dir_all(usage_dir()).map_err(|e| e.to_string())?;
+    let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "{line}").map_err(|e| e.to_string())
+}
+
+/// 读取某天的全部记录；文件不存在返回空表。单行损坏只跳过该行（半个写入
+/// 的文件不该让整个面板失效）。
+#[tauri::command]
+pub fn read_usage_log(date: String) -> Result<Vec<UsageRecord>, String> {
+    let path = usage_log_path(&date)?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<UsageRecord>(l).ok())
+        .collect())
+}
+
 // ── 备忘录（ModuleData\memo\memo.json）──────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -291,4 +363,61 @@ pub fn memo_save_image(id: String, index: usize, data_url: String) -> Result<Str
     let file = dir.join(format!("{}.{}", index, ext));
     fs::write(&file, &bytes).map_err(|e| format!("Write memo image failed: {e}"))?;
     Ok(file.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(cache_read: u64) -> UsageRecord {
+        UsageRecord {
+            ts: 1_700_000_000_000,
+            model: "deepseek-flash".into(),
+            input: 212,
+            output: 3,
+            cache_read,
+            cache_create: 0,
+        }
+    }
+
+    /// 文件名来自前端 —— 必须挡住跨目录拼串与非 `YYYY-MM-DD` 形态
+    #[test]
+    fn usage_log_path_only_accepts_iso_date() {
+        for bad in ["", "2026-9-1", "2026/09/12", "../2026-09-12", "2026-09-12x", "2026-09-1"] {
+            assert!(usage_log_path(bad).is_err(), "should reject `{bad}`");
+        }
+        assert!(usage_log_path("2026-09-12").is_ok());
+        assert!(usage_log_path("1970-01-01").is_ok());
+    }
+
+    /// 字段名是前端 `read_usage_log` 的消费契约（cacheRead/cacheCreate 驼峰）
+    #[test]
+    fn usage_record_json_shape() {
+        let line = serde_json::to_string(&rec(1536)).unwrap();
+        assert_eq!(
+            line,
+            r#"{"ts":1700000000000,"model":"deepseek-flash","input":212,"output":3,"cacheRead":1536,"cacheCreate":0}"#
+        );
+    }
+
+    #[test]
+    fn usage_log_append_read_and_tolerate_broken_line() {
+        let date = "1970-01-01"; // 固定的远古日期，不与真实用量混在一起
+        let path = usage_log_path(date).unwrap();
+        let _ = fs::remove_file(&path);
+
+        append_usage_log(date.into(), rec(1536)).unwrap();
+        append_usage_log(date.into(), rec(7000)).unwrap();
+        let got = read_usage_log(date.into()).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].cache_read, 7000);
+
+        // 半截写入不该让整个面板失效
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{{\"ts\":1,").unwrap();
+        assert_eq!(read_usage_log(date.into()).unwrap().len(), 2);
+
+        let _ = fs::remove_file(&path);
+        assert!(read_usage_log("1970-01-02".into()).unwrap().is_empty());
+    }
 }

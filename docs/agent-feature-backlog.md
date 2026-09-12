@@ -122,7 +122,7 @@
 
 ## 4. 已核对：以下不是缺口
 
-- **前端依赖的 stdout 契约**：`system/init`、`stream_event`（4 种 delta）、`assistant`、`user/tool_result`、`control_request`、`result`（含 4 个 token 字段）—— agent.exe **全部已提供**，token 面板数据源正常。
+- **前端依赖的 stdout 契约**：`system/init`（含 `model`，用量日志的元数据来源）、`stream_event`（4 种 delta）、`assistant`、`user/tool_result`、`control_request`、`result`（含 4 个 token 字段，**每次提问的绝对值**）—— agent.exe **全部已提供**，token 面板数据源正常；对账口径见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「用量与对账」。
 - **工具名硬编码**：前端特判的 `Bash`（及 `PowerShell`）命名一致；十件内置工具名字与旧 CLI 完全同名同义。
 - **`--disallowedTools` 链路**：Rust → agent.exe → 请求体过滤已通，UI 黑名单候选列表已换成真实工具名（见 §5）。
 - **思考档位跨模型自适应**：旧 CLI 没有对应机制（它绑定自家模型），我们反而是超集。
