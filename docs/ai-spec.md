@@ -202,7 +202,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 面 | 内容 |
 |---|---|
-| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_KEY`（WebSearch 主源 Tavily 的 key；缺省则只用 DuckDuckGo 兜底源） |
+| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_PROVIDER` + `LUNAC_SEARCH_KEY`（WebSearch 主源的服务商与密钥，服务商可选 bocha / tavily / exa / firecrawl；缺任一项则只用无 key 的 Bing / 百度兜底源） |
 | 启动参数 | `--add-dir <dir>`（可重复，工作区外追加可访问目录）/ `--permission-mode plan`（只读）/ `--dangerously-skip-permissions`（忽略工作区锁）/ `--permission-prompt-tool stdio`（写类工具先审批）/ `--disallowedTools <name…>`（这些工具不进请求体）/ `--mcp-server stdio:<exe 路径>`（拉起该 exe 的 MCP server 并接入其工具，P3）；其余（`--print` / `--verbose` / `--input-format stream-json` / `--include-partial-messages` …）一律接受并忽略 |
 | stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"\|"deny",…}}}` 为审批回包（P2，由 stdin 线程按 request_id 直接投递给等待中的工具调用） |
 | stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
@@ -220,7 +220,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | `PowerShell` | `command` / `timeout` | `-NoProfile -NonInteractive -Command` 执行（无用户 profile、不卡交互式输入），超时与结果口径同 `Bash`（共用 `run_shell`）；命令前置 `$OutputEncoding` / `[Console]::OutputEncoding` 双 UTF-8 兜底 —— PS 5.1 重定向到管道时按控制台 ANSI 码页（中文 Windows = GBK）输出，不切 UTF-8 会把中文变成替换字符 |
 | `Glob` | `pattern` / `path` | `**` 递归、`*` 不跨目录；≤200 条 |
 | `Grep` | `pattern` / `path` / `glob` / `ignore_case` | Rust 正则逐行匹配，输出 `路径:行号:内容`；跳过 `.git`/`node_modules`/`target` 等重目录与二进制文件；≤200 条 |
-| `WebSearch` | `query` / `count`（1–10，默认 5） | 联网检索。**主源 Tavily**（`POST https://api.tavily.com/search`，`Authorization: Bearer $LUNAC_SEARCH_KEY`），**兜底源 DuckDuckGo HTML 抓取**（`POST https://html.duckduckgo.com/html/`，无官方 API 可用；两次抓取间强制 ≥1.1s，拿到 202 视为限流）。主源失败/0 结果/未配 key 时自动回落，回落结果尾部附 `[fallback] <原因>`；两源都失败则整条报错（原因写进 `is_error=true` 的 `tool_result`，模型可自行改方案）。返回 `Query / Source / 编号列表（标题 + URL + 摘要）`；UA 标识 `Lunac/<版本>`。为什么不是 Bing：微软已于 2025-08-11 退役全部 Bing Search API（老 key 410 Gone、不再接受新注册），官方替代品是绑定 Azure 的 AI 平台产品而非 SERP API |
+| `WebSearch` | `query` / `count`（1–10，默认 5） | 联网检索。**主源 = 可配置的搜索 API**（`LUNAC_SEARCH_PROVIDER` 选 bocha / tavily / exa / firecrawl，配 `LUNAC_SEARCH_KEY`），**兜底 = Bing RSS → Bing HTML → 百度 HTML 抓取**（无 key；两次抓取间强制 ≥1.1s，202/429 视为限流）。主源失败/0 结果/未配齐服务商与 key 时自动回落，回落结果尾部附 `[fallback] <原因>`；三级兜底全失败则整条报错（原因写进 `is_error=true` 的 `tool_result`，模型可自行改方案）。返回 `Query / Source / 编号列表（标题 + URL + 摘要）`；主源用 UA `Lunac/<版本>`，抓取类兜底源用浏览器 UA（Bing / 百度对非浏览器 UA 只给降级空壳）。为什么不用 DuckDuckGo：本机实测 `html.duckduckgo.com` 与 lite 版均 15s 超时（国内不可达），「不配 key 也能搜」会变成空话；为什么不是 Bing Search API：微软已于 2025-08-11 退役全部 Bing Search API（老 key 410 Gone、不再接受新注册），官方替代品是绑定 Azure 的 AI 平台产品而非 SERP API |
 | `WebFetch` | `url` / `prompt`（提示性） | 抓取 URL 并把 HTML 转成纯文本（去 script/style/注释、块级标签当换行、剥标签、解高频实体，无 DOM 依赖）；`reqwest` 60s 超时、≤10 次重定向、≤10MB 响应、UA 标识为 `Lunac/<版本>`；返回 `URL / Status / 正文`。**不做二次模型摘要**（正文直接回给主模型，省一次往返、不绑死供应商小模型，故 `prompt` 只作提示）；**不做域名预检**（旧 CLI 依赖 `api.anthropic.com/api/web/domain_info`，我们没有该服务，安全性交审批与前端白名单）。`Read` 到的文件内容可拼进 URL，故它会把数据发往外部 |
 | `AskUserQuestion` | `questions`（1–4 题，每题 2–4 选项）/ `answers`（**由前端填**） | 结构化提问：选项给用户点选。**工具自身只做格式化** —— 答案由前端经审批卡的 `updatedInput` 回传（`{...input, answers}`），工具把它排成 `User has answered your questions: "题" = "答"`。收不到 `answers` 就**报错而非编答案**（模型会改用文本提问）—— 见下「结构化提问」一节 |
 | `TodoWrite` | `todos`（数组，项含 `content` / `status`(`pending`\|`in_progress`\|`completed`) / `activeForm`，三项必填） | 待办清单：模型**每次都发完整清单**（整体替换语义）。工具**不维护状态、不落盘、不碰本机** —— 清单的唯一真相是模型最近一条 `tool_use` 入参，进程重启 / 多会话并行都不会串味；`todo_write()` 只回一段确认 + 清单快照（状态回显成规范名，防止模型用别的词造成漂移）。**免审批**（`needs_approval` 不含它）。前端拿流式入参画面板（见下「待办面板」） |
@@ -264,16 +264,19 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 **工具错误不中断整轮**：工具返回 Err 时转成 `is_error=true` 的 `tool_result` 交回模型自行纠正；只有 HTTP / 流错误才终止本轮并回滚 history。写回上下文的 assistant 消息会**剔除 thinking 块**（端点要求 thinking 带 `signature`，回灌会 400），发给前端的整包仍保留 thinking。
 
-**联网检索（WebSearch，2026-09）**：主源 Tavily + 兜底源 DuckDuckGo HTML 抓取，key 走**设置 · AI · 搜索 API 密钥**。
+**联网检索（WebSearch，2026-09）**：主源是**可配置的搜索 API**（设置 · AI · 搜索服务商 + 搜索 API 密钥），兜底是**免 key 的结果页抓取**（Bing RSS → Bing HTML → 百度 HTML）。
 
 | 项 | 约定 |
 |---|---|
-| 选型原因 | Bing Search API 已于 2025-08-11 全部退役（老 key 返 410 Gone、不再接受新注册），官方替代「Grounding with Bing Search」是绑定 Azure 项目的 AI 平台产品，不是 SERP API；DuckDuckGo **没有官方搜索 API**（`api.duckduckgo.com` 只返维基摘要，不返网页结果），所以兜底只能抓 `html.duckduckgo.com/html/` |
-| key 存放 | `src-tauri` 的 `AI_SEARCH_KEY`（`set_ai_config` 写入、`get_ai_config` 回读），注入 agent.exe 的 `LUNAC_SEARCH_KEY`（`configure_agent_env` + `start_cli_process` 两条路径都要给）；**空串 = 删除**，前端每次都回传输入框当前值。前端另存 localStorage `lunac-ai-config.search_key` —— 进程重启后 env 会丢，不还原就每次开机都退化成兜底源 |
-| 回落语义 | 未配 key / 主源报错 / 主源 0 结果 → 走 DDG，结果尾部附 `[fallback] <原因>`；两源都失败 → 整条 `Err`（进 `is_error=true` 的 `tool_result`），**不编造结果** |
-| DDG 限流 | 进程内 `OnceLock<Mutex<Instant>>` 强制两次抓取间隔 ≥1.1s；HTTP 202 视为软封并显式报限流；解析为空时用 `result__a` / `no-results` 区分「真无结果」与「页面改版」（后者报错，避免静默返回空） |
+| 选型原因 | 兜底源必须**免 key 且国内可达**：原选的 DuckDuckGo 实测在本机（国内）15s 超时（`html.duckduckgo.com` 与 lite 版都连不上），等于「不配 key 也能搜」是假的；Bing（`www` / `cn` 均 200，<600ms）与百度（200，1.5s）均通。抓取之所以是「结果页」而不是 API：**Bing Search API 已于 2025-08-11 全部退役**（老 key 返 410 Gone、不再接受新注册），官方替代「Grounding with Bing Search」是绑定 Azure 项目的 AI 平台产品、不是 SERP API；DuckDuckGo / 百度同样没有公开免费的 SERP API |
+| 主源服务商 | `bocha`（博查，`api.bochaai.com/v1/web-search`，国内直连、中文结果最好，注册只需微信扫码）/ `tavily`（`api.tavily.com/search`，`Authorization: Bearer`）/ `exa`（`api.exa.ai/search`，`x-api-key`）/ `firecrawl`（`api.firecrawl.dev/v2/search`）。四家只差 endpoint / 鉴权头 / 响应字段名，共用一个 `post_json()` + `json_hits()`。**不做「猜服务商」**：服务商没选或名字不认识就退回兜底源并说明原因 —— 猜错等于把密钥发给无关的第三方服务器 |
+| key 存放 | `src-tauri` 的 `AI_SEARCH_PROVIDER` / `AI_SEARCH_KEY`（`set_ai_config` 写入、`get_ai_config` 回读），注入 agent.exe 的 `LUNAC_SEARCH_PROVIDER` / `LUNAC_SEARCH_KEY`（`configure_agent_env` + `start_cli_process` 两条路径都要给）；**空串 = 删除**，前端每次都回传输入框当前值。前端另存 localStorage `lunac-ai-config.search_provider` / `.search_key` —— 进程重启后 env 会丢，不还原就每次开机都退化成兜底源 |
+| 回落语义 | 未选服务商 / 未配 key / 服务商名未知 / 主源报错 / 主源 0 结果 → 走抓取兜底，结果尾部附 `[fallback] <原因>`；兜底三家按 **Bing RSS → Bing HTML → 百度** 顺序试，全失败则整条 `Err`（进 `is_error=true` 的 `tool_result`，原因含三家各自的报错），**不编造结果** |
+| 抓取限流 | 进程内 `OnceLock<Mutex<Instant>>` 强制两次抓取间隔 ≥1.1s；HTTP 202 / 429 视为限流并显式报错（区分「被限流」与「没结果」）；响应里连结果容器（`<item>` / `b_algo` / `result c-container`）都没有时**报错**而不是返回空列表 —— 不把「改版/被反爬」说成「没搜到」 |
+| 解析要点 | Bing RSS 是首选（干净 XML、`<link>` 就是真实 URL、无跳转壳），先切 `<item>` 块再在块内取字段（通道级同名标签会串）；Bing HTML 取 `<h2><a href>` + 就近 2KB 内的 `b_caption` 摘要；百度取 `class="result c-container"` 容器的 `mu="真实URL"`（**不必跟 `baidu.com/link?url=` 的 302**）+ 块内 `<h3>` 标题，摘要字段不稳定故留空 |
+| 抓取 UA | 主源一律用 `Lunac/<版本>`；**抓取类兜底源用浏览器 UA + `Accept-Language: zh-CN`** —— Bing / 百度对非浏览器 UA 只返回降级空壳（实测数据即用浏览器 UA 取得），这是抓取结果页的必要条件，不代表身份伪装 |
 | 审批 | 在 `needs_approval` 与 `gated_in_read_only` 里（查询词是外部出口），**plan 档同样弹审批**；前端工具黑名单候选名单同步补 `WebSearch` |
-| 不新增依赖 | HTML 解析用既有 `regex` + `serde_json`，DDG 跳转壳（`uddg=`）自带百分号解码（按字节索引，不切 `&str`） |
+| 不新增依赖 | 解析全部用既有 `regex` + `serde_json`（`head_chars()` 按 UTF-8 边界截断，避免中文页面切片 panic） |
 
 **思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、原生 Messages 端点的新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
 
@@ -612,7 +615,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | 计算器/编码/JSON 插件 | ❌ 已移除 — 2026-07-22 删除，功能由 AI Agent 替代 |
 | OCR 文字识别插件 | ✅ 新增 `ocr.ts` — PaddleOCR-json 离线 OCR（多语言） |
 | 硬件 AI Agent Tools | ✅ 新增 `tools/system_info.json` — Agent 模式 MCP Tools |
-| Agent 内置工具（Read/Write/Edit/Bash/PowerShell/Glob/Grep/WebSearch/WebFetch/AskUserQuestion/TodoWrite） | ✅ P1 已完成 — 真实端点烟测通过（多轮工具往返、工作区越界拒绝、`plan` 档只读；`PowerShell` 中文输出与 `--disallowedTools` 裁剪均验证）。`WebFetch` 已完成（2026-09）：HTML→纯文本抓取，非只读档与**只读档都走审批**，真实文档页（doc.rust-lang.org）烟测通过。`AskUserQuestion` 已完成（2026-09）：选项卡片 + `updatedInput` 回答案，答题/未答/拒绝/plan 四条路径烟测通过。`TodoWrite` 已完成（2026-09）：待办面板、免审批、成功回执不重复渲染。`WebSearch` 已完成（2026-09）：三条路径真实端点烟测通过 —— ①无 key 直接走 DDG 兜底；②无效 key 时 Tavily 真返 401 并回落兜底（证明端点/请求形状与错误透传都对）；③`plan` 档照常弹审批、拒绝后写回 `tool_result`。⚠️ **兜底源 DuckDuckGo 的真实抓取未在本机验证**（沙箱访问不到 `html.duckduckgo.com`，Tavily 域名可达），`parse_ddg()` 的正则需在有外网的环境下补一次真机验证；Tavily **成功**路径也需一个真实 key 才能复验（本次只验到 401 分支） |
+| Agent 内置工具（Read/Write/Edit/Bash/PowerShell/Glob/Grep/WebSearch/WebFetch/AskUserQuestion/TodoWrite） | ✅ P1 已完成 — 真实端点烟测通过（多轮工具往返、工作区越界拒绝、`plan` 档只读；`PowerShell` 中文输出与 `--disallowedTools` 裁剪均验证）。`WebFetch` 已完成（2026-09）：HTML→纯文本抓取，非只读档与**只读档都走审批**，真实文档页（doc.rust-lang.org）烟测通过。`AskUserQuestion` 已完成（2026-09）：选项卡片 + `updatedInput` 回答案，答题/未答/拒绝/plan 四条路径烟测通过。`TodoWrite` 已完成（2026-09）：待办面板、免审批、成功回执不重复渲染。`WebSearch` 已完成（2026-09，**同日重构**）：主源改为可配置多后端（博查 / Tavily / Exa / Firecrawl，设置面板下拉），兜底源由国内不可达的 DuckDuckGo 换成 **Bing RSS → Bing HTML → 百度**。真实端点烟测（`deepseek-flash`）两条 PASS：①未选服务商/未配 key → 直接走 Bing RSS 兜底并回真实中文结果（结果尾部含 `[fallback] 未选择搜索服务商…`）；②`provider=tavily` + 无效 key → Tavily 真返 401 并把响应正文带回 `[fallback]`，随后 Bing 兜底成功。三个解析器另用真实抓取页面离线验证：Bing RSS 10 条 / Bing HTML 10 条（带摘要）/ 百度 9 条（`mu` 取到真实 URL）。⚠️ **Exa / Firecrawl / 博查的「成功」路径尚无真实 key 复验**（本次只验到请求形状 + 错误透传 + 回落）；抓取类兜底源在对方改版后需重跑一次验证 |
 | Agent 工具权限审批（can_use_tool） | ✅ P2 已完成 — 写类工具执行前弹卡，allow/deny/interrupt 与超时撤卡均验证通过 |
 | Agent 上下文预算与压缩 | ✅ 已完成 — 按端点实测体积走瘦身/丢弃两级水位 + 400 强制压缩兜底；真实端点烟测（`LUNAC_MAX_CONTEXT_TOKENS=8000`）连跑 17 轮工具往返不中断 |
 | Agent MCP 工具桥（插件面板的 tools\*.json） | ✅ P3 已完成 — agent.exe 作 client 连 `lunac.exe --mcp-server`，用户工具以 `mcp__<名>` 进请求体；真实端点烟测通过（注册、审批卡、成功/失败两条回灌路径） |
@@ -627,7 +630,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 5. **Agent Tools 扩展** — 继续接入更多开源的硬件 AI skill/tools (LocalAI skills, OpenJarvis skills 等)
 6. ~~**P2 权限审批**~~ — ✅ 已完成：写类工具发 `can_use_tool`，前端卡片 allow/deny（含 interrupt 中断本轮），300s 超时自动撤卡；见 §3.5
 7. **安全档位可切换** — `set_security_profile` 命令已存在但前端无人调用，目前永远「项目」档；需要时在设置面板加 safe/project/full 切换入口
-8. **补齐 agent 后端能力** — 与旧 `cli.exe` 的差距按 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md) 的分级与顺序推进，**§6-4「低成本高收益」已全部落地**（PowerShell / 工具黑名单 / WebFetch / AskUserQuestion / TodoWrite）。剩余：**`WebSearch` 不能照搬** —— 旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（结果经 `server_tool_use` / `web_search_tool_result` 流式回传），自研侧要做得另接第三方搜索 API（需 key 或自建抓取）；MCP `resources` 未做（server 侧缺 `resources/read`）
+8. **补齐 agent 后端能力** — 与旧 `cli.exe` 的差距按 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md) 的分级与顺序推进，**§6-4「低成本高收益」已全部落地**（PowerShell / 工具黑名单 / WebFetch / AskUserQuestion / TodoWrite / WebSearch）。剩余：MCP `resources` 未做（server 侧缺 `resources/read`）
 9. ~~**上下文预算与压缩**~~ — ✅ 已完成：见 §3.5「上下文预算与压缩」（backlog §2.1 第 1 项，唯一「用久了必然坏掉」的缺口）
 10. ~~**P3 MCP 工具桥**~~ — ✅ 已完成：见 §3.5「P3 已完成（MCP 工具桥）」；`ListMcpResourcesTool` / `ReadMcpResourceTool` 仍未做（server 侧缺 `resources/read`）
 11. ~~**P4 技能 SKILL.md**~~ — ✅ 已完成：见 §3.5「P4 已完成（技能 SKILL.md）」；fork / remote 两种模式未做
@@ -636,7 +639,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 14. ~~**`AskUserQuestion` 工具**~~ — ✅ 已完成（2026-09）：选项卡片 + 复用 `can_use_tool` 的 `updatedInput` 回答案（不新增协议）；工具的「始终允许」被刻意禁用、白名单也不放行它；plan 档可用且照常审批；见 §3.5「结构化提问」
 15. ~~**`TodoWrite` 工具**~~ — ✅ 已完成（2026-09）：工具不持有状态（清单唯一真相 = 模型最近一条 `tool_use`），前端拿流式入参就地重绘 `.todo-panel`；免审批、成功回执不重复渲染；见 §3.5「待办面板」
 16. ~~**用量口径修正 + 本地用量日志**~~ — ✅ 已完成（2026-09）：前端不再对 `result.usage` 做差（自研 agent 报的是每次提问的绝对值，做差会把未变化的前缀算成 0 命中）；每次提问落一行 `<exe根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`，token 仪表盘改为「今日累计」，可与供应商平台按天对账；见 §3.5「用量与对账」与 §11 规则 19
-17. ~~**`WebSearch` 工具**~~ — ✅ 已完成（2026-09）：主源 **Tavily**（key 走设置 · AI · 搜索 API 密钥 → `AI_SEARCH_KEY` → `LUNAC_SEARCH_KEY`）+ 兜底源 **DuckDuckGo HTML 抓取**（≥1.1s 节流、202 视为限流），两源都失败就如实报错、不编造；plan 档照常审批；Bing/DuckDuckGo 官方 API 均不可用（Bing 已退役、DDG 无官方 API），选型与回落语义见 §3.5「联网检索」；烟测见 §9
+17. ~~**`WebSearch` 工具**~~ — ✅ 已完成（2026-09，**同日重构为多后端**）：主源 = 设置 · AI 的「搜索服务商 + 搜索 API 密钥」（`AI_SEARCH_PROVIDER`/`AI_SEARCH_KEY` → `LUNAC_SEARCH_PROVIDER`/`LUNAC_SEARCH_KEY`，可选 bocha / tavily / exa / firecrawl），兜底 = **Bing RSS → Bing HTML → 百度 HTML 抓取**（≥1.1s 节流、202/429 视为限流），三级全失败就如实报错、不编造；plan 档照常审批。换掉原 DuckDuckGo 兜底的原因：本机实测国内连不上（15s 超时），而 Bing / 百度可达 —— 「不配 key 也能搜」必须是真的；Bing Search API 已于 2025-08-11 退役、DDG 无官方 API，故兜底只能抓结果页。选型、回落语义与解析要点见 §3.5「联网检索」；烟测见 §9
 
 ---
 

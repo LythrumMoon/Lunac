@@ -461,8 +461,15 @@ fn start_cli_process(
     // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
     // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
     envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
-    // WebSearch 主源 key（Tavily）→ agent.exe（core-agent 经 LUNAC_SEARCH_KEY
-    // 读取）；未配置时 agent 直接走 DuckDuckGo 兜底源。
+    // WebSearch 主源（服务商 + key）→ agent.exe（core-agent 经
+    // LUNAC_SEARCH_PROVIDER / LUNAC_SEARCH_KEY 读取）；未配置时 agent
+    // 直接走无 key 的 Bing / 百度兜底源。
+    if let Ok(p) = env::var("AI_SEARCH_PROVIDER") {
+        let p = p.trim();
+        if !p.is_empty() {
+            envs.push(("LUNAC_SEARCH_PROVIDER", p.to_lowercase()));
+        }
+    }
     if let Ok(k) = env::var("AI_SEARCH_KEY") {
         let k = k.trim();
         if !k.is_empty() {
@@ -575,14 +582,18 @@ fn ai_credentials() -> Result<(String, String, String), String> {
     Ok((api_url, api_key, model))
 }
 
-/// 把凭据注入自研 agent 后端（core-agent）读取的三个环境变量。
+/// 把凭据注入自研 agent 后端（core-agent）读取的环境变量。
 /// 鉴权必须走 `authorization: Bearer`；用 `x-api-key` 会被兼容端点判 401。
-/// 另注入 WebSearch 工具的搜索源 key（空 = 只走无 key 的 DuckDuckGo 兜底）。
+/// 另注入 WebSearch 主源的「服务商 + key」（空 = 只走无 key 的 Bing/百度兜底）。
 fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
     let agent_url = agent_endpoint(api_url, env::var("AI_AGENT_URL").ok().as_deref());
     env::set_var("LUNAC_AGENT_BASE_URL", agent_url);
     env::set_var("LUNAC_AGENT_TOKEN", api_key);
     env::set_var("LUNAC_AGENT_MODEL", model);
+    match env::var("AI_SEARCH_PROVIDER") {
+        Ok(p) if !p.trim().is_empty() => env::set_var("LUNAC_SEARCH_PROVIDER", p.trim().to_lowercase()),
+        _ => env::remove_var("LUNAC_SEARCH_PROVIDER"),
+    }
     match env::var("AI_SEARCH_KEY") {
         Ok(k) if !k.trim().is_empty() => env::set_var("LUNAC_SEARCH_KEY", k.trim()),
         _ => env::remove_var("LUNAC_SEARCH_KEY"),
@@ -834,6 +845,7 @@ pub async fn set_ai_config(
     key: String,
     model: String,
     agent_url: Option<String>,
+    search_provider: Option<String>,
     search_key: Option<String>,
 ) -> Result<String, String> {
     if url.trim().is_empty() || model.trim().is_empty() {
@@ -849,8 +861,12 @@ pub async fn set_ai_config(
         Some(a) if !a.is_empty() => env::set_var("AI_AGENT_URL", a),
         _ => env::remove_var("AI_AGENT_URL"),
     }
-    // WebSearch 的搜索源 key（Tavily）。前端每次都回传当前输入框的值，
-    // 所以空串 = 用户清掉了 key，按删除处理（否则会一直用旧 key）。
+    // WebSearch 主源的服务商与 key。前端每次都回传当前输入框的值，
+    // 所以空串 = 用户清掉了，按删除处理（否则会一直用旧值）。
+    match search_provider.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => env::set_var("AI_SEARCH_PROVIDER", p.to_lowercase()),
+        _ => env::remove_var("AI_SEARCH_PROVIDER"),
+    }
     match search_key.as_deref().map(str::trim) {
         Some(k) if !k.is_empty() => env::set_var("AI_SEARCH_KEY", k),
         _ => env::remove_var("AI_SEARCH_KEY"),
@@ -867,6 +883,7 @@ pub fn get_ai_config() -> serde_json::Value {
         "model": env::var("AI_MODEL").unwrap_or_default(),
         "api_key": env::var("AI_API_KEY").unwrap_or_default(),
         "agent_url": env::var("AI_AGENT_URL").unwrap_or_default(),
+        "search_provider": env::var("AI_SEARCH_PROVIDER").unwrap_or_default(),
         "search_key": env::var("AI_SEARCH_KEY").unwrap_or_default(),
     })
 }

@@ -49,16 +49,27 @@ const FETCH_USER_AGENT: &str = concat!("Lunac/", env!("CARGO_PKG_VERSION"));
 
 // ── WebSearch ────────────────────────────────────────────────────
 //
-// 主源 Tavily（官方 key），兜底 DuckDuckGo HTML 抓取（无 key）。
-// api.duckduckgo.com 只返回维基摘要、不返回网页结果。
+// 两级：主源 = 可配置的搜索 API（需 key），兜底 = 抓 Bing / 百度结果页（无需 key）。
+//
+// 为什么兜底不用 DuckDuckGo：实测本机（国内）连不上 html.duckduckgo.com（15s 超时，
+// lite 版同样超时），「不配 key 也能搜」会变成空话；Bing（www / cn 均可达）与百度均通。
+const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/web-search";
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
-const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
-/// DDG 抓取的最小间隔（秒）—— 官方未公开限流值，社区经验 1 req/s 是安全上限，
-const DDG_MIN_INTERVAL_SECS: f64 = 1.1;
+const EXA_ENDPOINT: &str = "https://api.exa.ai/search";
+const FIRECRAWL_ENDPOINT: &str = "https://api.firecrawl.dev/v2/search";
+const BING_SEARCH_ENDPOINT: &str = "https://www.bing.com/search";
+const BAIDU_SEARCH_ENDPOINT: &str = "https://www.baidu.com/s";
+/// 抓取类兜底源的最小间隔（秒）—— 官方未公开限流值，社区经验 1 req/s 是安全上限
+const SCRAPE_MIN_INTERVAL_SECS: f64 = 1.1;
 const SEARCH_TIMEOUT_SECS: u64 = 20;
 const SEARCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SEARCH_DEFAULT_COUNT: usize = 5;
 const SEARCH_MAX_COUNT: usize = 10;
+/// 单条摘要的字符上限 —— Exa 的 `text` 会带回整页正文，不截断一条就能吃光预算
+const SEARCH_SNIPPET_CHARS: usize = 400;
+/// 抓取类兜底源的 UA：Bing / 百度只对浏览器 UA 返回正常结果页（非浏览器 UA 给降级空壳）
+const SCRAPE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// 目录遍历时跳过的常见重目录（避免 Glob/Grep 卡在依赖上）
 const SKIP_DIRS: [&str; 13] = [
@@ -780,9 +791,42 @@ struct SearchHit {
     snippet: String,
 }
 
+/// 主源服务商（`LUNAC_SEARCH_PROVIDER`，小写比较）。
+///
+/// **不做「猜服务商」**：key 只发给用户明确选中的那一家 —— 猜错等于把密钥递给无关的
+/// 第三方服务器。未选 / 未知一律退回兜底源，并如实说明原因。
+#[derive(Clone, Copy)]
+enum SearchProvider {
+    Bocha,
+    Tavily,
+    Exa,
+    Firecrawl,
+}
+
+impl SearchProvider {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "bocha" => Some(Self::Bocha),
+            "tavily" => Some(Self::Tavily),
+            "exa" => Some(Self::Exa),
+            "firecrawl" => Some(Self::Firecrawl),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bocha => "bocha",
+            Self::Tavily => "tavily",
+            Self::Exa => "exa",
+            Self::Firecrawl => "firecrawl",
+        }
+    }
+}
+
 /// 网页搜索。**主源 + 兜底**，两级都不调用模型：
-///   ① Tavily（`LUNAC_SEARCH_KEY` 存在时）—— 官方 API，结构化 JSON
-///   ② DuckDuckGo HTML 抓取 —— 无 key，仅在上游失败/无 key 时走（见 `ddg_search`）
+///   ① 主源 —— `LUNAC_SEARCH_PROVIDER` 选定的搜索 API（需 `LUNAC_SEARCH_KEY`）
+///   ② 兜底 —— Bing RSS → Bing HTML → 百度 HTML（无 key，见 `scraped_search`）
 ///
 /// 两级的失败原因会一并回给模型（`[fallback] …`），否则「为什么结果这么差」
 /// 在对话里无从诊断。`plan`（只读）档允许调用（网络只读），但**照常审批** ——
@@ -797,34 +841,194 @@ fn web_search(input: &Value) -> Result<String, String> {
         None => SEARCH_DEFAULT_COUNT,
     };
 
+    let provider = std::env::var("LUNAC_SEARCH_PROVIDER").unwrap_or_default();
+    let provider = provider.trim().to_ascii_lowercase();
     let key = std::env::var("LUNAC_SEARCH_KEY").unwrap_or_default();
     let key = key.trim().to_string();
     let mut notes: Vec<String> = Vec::new();
 
-    // ① 主源：Tavily（仅在配置了 key 时尝试）
-    if key.is_empty() {
-        notes.push("未配置搜索 API key（设置 · AI · 搜索 API Key），已直接走兜底源".into());
+    // ① 主源：只有「服务商 + key」都配齐才发请求
+    if provider.is_empty() {
+        notes.push("未选择搜索服务商（设置 · AI · 搜索服务商），已直接走兜底源".into());
+    } else if key.is_empty() {
+        notes.push("未配置搜索 API 密钥（设置 · AI · 搜索 API 密钥），已直接走兜底源".into());
     } else {
-        match tavily_search(&query, count, &key) {
-            Ok(hits) if !hits.is_empty() => return Ok(format_hits(&query, "tavily", &hits)),
-            Ok(_) => notes.push("Tavily 返回 0 条结果".into()),
-            Err(e) => notes.push(format!("Tavily 失败：{e}")),
+        match SearchProvider::parse(&provider) {
+            None => notes.push(format!(
+                "未知的搜索服务商 `{provider}`（可选 bocha / tavily / exa / firecrawl）"
+            )),
+            Some(sp) => match provider_search(sp, &query, count, &key) {
+                Ok(hits) if !hits.is_empty() => return Ok(format_hits(&query, sp.name(), &hits)),
+                Ok(_) => notes.push(format!("{} 返回 0 条结果", sp.name())),
+                Err(e) => notes.push(format!("{} 失败：{e}", sp.name())),
+            },
         }
     }
 
-    // ② 兜底：DuckDuckGo HTML
-    match ddg_search(&query, count) {
-        Ok(hits) if !hits.is_empty() => {
-            let mut out = format_hits(&query, "duckduckgo (html, 兜底)", &hits);
+    // ② 兜底：抓 Bing / 百度结果页
+    match scraped_search(&query, count) {
+        Ok((source, hits)) => {
+            let mut out = format_hits(&query, source, &hits);
             out.push_str(&format!("\n\n[fallback] {}", notes.join("；")));
             Ok(out)
         }
-        Ok(_) => Err(format!("WebSearch 无结果（{}）", notes.join("；"))),
         Err(e) => {
-            notes.push(format!("DuckDuckGo 失败：{e}"));
+            notes.push(e);
             Err(format!("WebSearch failed: {}", notes.join("；")))
         }
     }
+}
+
+/// 主源分发：四家只差 endpoint / 鉴权头 / 响应字段名
+fn provider_search(
+    sp: SearchProvider,
+    query: &str,
+    count: usize,
+    key: &str,
+) -> Result<Vec<SearchHit>, String> {
+    match sp {
+        SearchProvider::Bocha => bocha_search(query, count, key),
+        SearchProvider::Tavily => tavily_search(query, count, key),
+        SearchProvider::Exa => exa_search(query, count, key),
+        SearchProvider::Firecrawl => firecrawl_search(query, count, key),
+    }
+}
+
+/// 主源共用的 POST + JSON。非 2xx 把正文前 200 字符带回 —— 401（key 无效）、
+/// 429（超额度）、402（欠费）的原因都在正文里，否则模型只看到一句「HTTP 401」。
+fn post_json(
+    endpoint: &str,
+    auth_header: &str,
+    auth_value: &str,
+    body: &Value,
+) -> Result<Value, String> {
+    let client = http_client(SEARCH_TIMEOUT_SECS)?;
+    let resp = client
+        .post(endpoint)
+        .header(auth_header, auth_value)
+        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
+        .json(body)
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status();
+    let (text, _) = read_body_capped(resp, SEARCH_MAX_BYTES)?;
+    if !status.is_success() {
+        let brief: String = text.trim().chars().take(200).collect();
+        return Err(format!("HTTP {status} {brief}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))
+}
+
+/// 一条 JSON 结果 → `SearchHit`。标题/摘要各家字段名不一，按给定顺序取第一个存在的；
+/// URL 缺失或不是 http(s) 的条目直接丢弃（给模型的链接必须能点开）。
+fn json_hit(v: &Value, title_key: &str, url_key: &str, snippet_keys: &[&str]) -> Option<SearchHit> {
+    let url = v.get(url_key).and_then(Value::as_str)?.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let text_at = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| v.get(*k).and_then(Value::as_str))
+            .map(inline_text)
+            .unwrap_or_default()
+    };
+    Some(SearchHit {
+        title: text_at(&[title_key]),
+        url: url.to_string(),
+        snippet: truncate_chars(&text_at(snippet_keys), SEARCH_SNIPPET_CHARS),
+    })
+}
+
+fn json_hits(
+    items: Option<&Vec<Value>>,
+    title_key: &str,
+    url_key: &str,
+    snippet_keys: &[&str],
+) -> Vec<SearchHit> {
+    items
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| json_hit(r, title_key, url_key, snippet_keys))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 博查 Web Search：`POST /v1/web-search` + `Authorization: Bearer BOCHA-…`。
+/// 国内直连、中文结果最好；`summary:true` 让每条结果多带一段较长的摘要。
+/// 响应兼容 Bing Search API 的形状 `webPages.value[]`，外面包了一层 `data`。
+fn bocha_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
+    let v = post_json(
+        BOCHA_ENDPOINT,
+        reqwest::header::AUTHORIZATION.as_str(),
+        &format!("Bearer {key}"),
+        &json!({ "query": query, "summary": true, "freshness": "noLimit", "count": count }),
+    )?;
+    let items = v
+        .pointer("/data/webPages/value")
+        .or_else(|| v.pointer("/webPages/value"))
+        .and_then(Value::as_array);
+    Ok(json_hits(items, "name", "url", &["summary", "snippet"]))
+}
+
+/// Tavily Search：`POST /search` + `Authorization: Bearer tvly-…`。
+/// 只取 `results[].title/url/content`；`include_answer`/`include_raw_content`
+/// 一律关掉 —— 摘要是另一个模型生成的，我们不替主模型做判断，且按 token 计费。
+fn tavily_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
+    let v = post_json(
+        TAVILY_ENDPOINT,
+        reqwest::header::AUTHORIZATION.as_str(),
+        &format!("Bearer {key}"),
+        &json!({
+            "query": query,
+            "max_results": count,
+            "search_depth": "basic",
+            "include_answer": false,
+            "include_raw_content": false,
+            "include_images": false,
+        }),
+    )?;
+    Ok(json_hits(
+        v.get("results").and_then(Value::as_array),
+        "title",
+        "url",
+        &["content"],
+    ))
+}
+
+/// Exa Search：`POST /search` + `x-api-key`。`text:true` 会带回整页正文，
+/// 摘要必须按 `SEARCH_SNIPPET_CHARS` 截断。
+fn exa_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
+    let v = post_json(
+        EXA_ENDPOINT,
+        "x-api-key",
+        key,
+        &json!({ "query": query, "numResults": count, "text": true }),
+    )?;
+    Ok(json_hits(
+        v.get("results").and_then(Value::as_array),
+        "title",
+        "url",
+        &["text", "summary"],
+    ))
+}
+
+/// Firecrawl Search：`POST /v2/search` + `Authorization: Bearer fc-…`，
+/// 结果在 `data.web[]`，`description` 即默认的 Highlights 摘要。
+fn firecrawl_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
+    let v = post_json(
+        FIRECRAWL_ENDPOINT,
+        reqwest::header::AUTHORIZATION.as_str(),
+        &format!("Bearer {key}"),
+        &json!({ "query": query, "limit": count }),
+    )?;
+    Ok(json_hits(
+        v.pointer("/data/web").and_then(Value::as_array),
+        "title",
+        "url",
+        &["description"],
+    ))
 }
 
 /// 统一的 HTTP 客户端（超时由调用方给；重定向上限与 WebFetch 一致）
@@ -852,195 +1056,254 @@ fn read_body_capped(
     Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
 }
 
-/// Tavily Search（官方 API）：`POST /search` + `Authorization: Bearer tvly-…`。
-/// 只取 `results[].title/url/content`；`include_answer`/`include_raw_content`
-/// 一律关掉 —— 摘要是另一个模型生成的，我们不替主模型做判断，且按 token 计费。
-fn tavily_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
-    let client = http_client(SEARCH_TIMEOUT_SECS)?;
-    let resp = client
-        .post(TAVILY_ENDPOINT)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
-        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
-        .json(&json!({
-            "query": query,
-            "max_results": count,
-            "search_depth": "basic",
-            "include_answer": false,
-            "include_raw_content": false,
-            "include_images": false,
-        }))
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    let status = resp.status();
-    let (body, _) = read_body_capped(resp, SEARCH_MAX_BYTES)?;
-    if !status.is_success() {
-        // 401=key 无效、429=超额度、432/433=额度相关 —— 正文里带原因，截一小段回给模型
-        let brief: String = body.trim().chars().take(200).collect();
-        return Err(format!("HTTP {status} {brief}"));
-    }
-    let v: Value = serde_json::from_str(&body).map_err(|e| format!("bad json: {e}"))?;
-    Ok(parse_tavily(&v))
-}
-
-fn parse_tavily(v: &Value) -> Vec<SearchHit> {
-    v.get("results")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| {
-                    let url = r.get("url").and_then(Value::as_str)?.trim();
-                    if url.is_empty() {
-                        return None;
-                    }
-                    Some(SearchHit {
-                        title: inline_text(r.get("title").and_then(Value::as_str).unwrap_or("")),
-                        url: url.to_string(),
-                        snippet: inline_text(r.get("content").and_then(Value::as_str).unwrap_or("")),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// DuckDuckGo 兜底：抓 `html.duckduckgo.com/html/`（免 vqd 握手，单次请求拿整页）。
+/// 无 key 兜底：Bing RSS → Bing HTML → 百度 HTML，成功时返回 (来源标识, 结果)。
 ///
-/// 这是**抓取不是 API**，风险已在文档里写明：DDG 改版即失效、ToS 禁止抓取、
-/// 结果本身也「largely sourced from Bing」。所以：
-///   · 只在主源不可用/失败时调用
-///   · 进程内强制 ≥ `DDG_MIN_INTERVAL_SECS` 间隔（202 是软封，宁可慢）
-///   · 解析不出结果就**报错**，绝不返回空列表冒充「没有结果」
-fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
-    throttle_ddg();
+/// 三家都是**抓结果页而不是 API**（Bing / 百度都没有公开免费的 SERP API），所以：
+///   · 只在上游不可用或失败时调用
+///   · 进程内强制 ≥ `SCRAPE_MIN_INTERVAL_SECS` 间隔
+///   · 解析不出结果就如实报错 —— 绝不返回空列表冒充「没有结果」
+/// 三家都失败时把各自原因拼成一条 Err，便于诊断是哪家挂了。
+fn scraped_search(query: &str, count: usize) -> Result<(&'static str, Vec<SearchHit>), String> {
+    let mut errs: Vec<String> = Vec::new();
 
+    match bing_rss_search(query, count) {
+        Ok(hits) if !hits.is_empty() => return Ok(("bing rss (兜底)", hits)),
+        Ok(_) => errs.push("Bing RSS 返回 0 条结果".into()),
+        Err(e) => errs.push(format!("Bing RSS 失败：{e}")),
+    }
+    match bing_html_search(query, count) {
+        Ok(hits) if !hits.is_empty() => return Ok(("bing html (兜底)", hits)),
+        Ok(_) => errs.push("Bing HTML 返回 0 条结果".into()),
+        Err(e) => errs.push(format!("Bing HTML 失败：{e}")),
+    }
+    match baidu_search(query, count) {
+        Ok(hits) if !hits.is_empty() => return Ok(("baidu html (兜底)", hits)),
+        Ok(_) => errs.push("百度返回 0 条结果".into()),
+        Err(e) => errs.push(format!("百度失败：{e}")),
+    }
+
+    Err(errs.join("；"))
+}
+
+/// GET 一个结果页并按上限读回（抓取类兜底源共用）。浏览器 UA + `Accept-Language`
+/// 是必须的 —— Bing / 百度对非浏览器 UA 会返回降级空壳。
+fn scrape_get(url: &str, params: &[(&str, &str)]) -> Result<String, String> {
     let client = http_client(SEARCH_TIMEOUT_SECS)?;
     let resp = client
-        .post(DDG_HTML_ENDPOINT)
-        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
-        .form(&[("q", query)])
+        .get(url)
+        .header(reqwest::header::USER_AGENT, SCRAPE_USER_AGENT)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .query(params)
         .send()
         .map_err(|e| e.to_string())?;
 
     let status = resp.status();
     let (body, _) = read_body_capped(resp, SEARCH_MAX_BYTES)?;
-    if status.as_u16() == 202 {
-        return Err("HTTP 202（DuckDuckGo 限流，稍后重试）".into());
+    // 202 / 429 是「被限流」而不是「没结果」—— 显式区分，模型才知道该稍后重试
+    if status.as_u16() == 202 || status.as_u16() == 429 {
+        return Err(format!("HTTP {status}（被限流，稍后重试）"));
     }
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
-
-    let hits = parse_ddg(&body, count);
-    if hits.is_empty() {
-        // 页面还在但没有结果 → 可能是该查询确实无结果，也可能是结构变了。
-        // 用「有没有结果容器」区分，避免把改版说成「没搜到」。
-        if body.contains("result__a") || body.contains("no-results") {
-            return Ok(Vec::new());
-        }
-        return Err("页面结构无法识别（DuckDuckGo 可能已改版）".into());
-    }
-    Ok(hits)
+    Ok(body)
 }
 
-/// 进程内 DDG 节流（多轮工具调用串行，所以一把锁即可）
-fn throttle_ddg() {
-    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
-    let m = LAST.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
-    if let Ok(mut last) = m.lock() {
-        let elapsed = last.elapsed().as_secs_f64();
-        if elapsed < DDG_MIN_INTERVAL_SECS {
-            thread::sleep(Duration::from_secs_f64(DDG_MIN_INTERVAL_SECS - elapsed));
-        }
-        *last = Instant::now();
+/// 兜底①：Bing 的 RSS 输出（`?q=…&format=rss`）。
+///
+/// 比抓 HTML 稳得多：干净 XML、`<link>` 直接就是真实 URL（没有跳转壳）、字段固定。
+fn bing_rss_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
+    throttle_scrape();
+    let body = scrape_get(BING_SEARCH_ENDPOINT, &[("q", query), ("format", "rss")])?;
+    if !body.contains("<item") {
+        return Err("响应里没有 <item>（疑似改版或被反爬）".into());
     }
+    Ok(parse_bing_rss(&body, count))
 }
 
-/// 从 DDG 的 HTML 里抠结果。Rust 正则没有反向引用，所以「取整个 <a …> 标签、
-/// 再在属性里找 href」分两步做 —— 属性顺序在页面里不保证。
-fn parse_ddg(html: &str, count: usize) -> Vec<SearchHit> {
-    let Ok(anchor) = regex::Regex::new(r#"(?s)<a\s+([^>]*result__a[^>]*)>(.*?)</a>"#) else {
+/// 从 RSS 的 `<item>` 里抠结果。通道级的 `<title>/<link>/<description>` 长得一模一样，
+/// 所以必须先切出 item 块、再在块内取字段。
+fn parse_bing_rss(xml: &str, count: usize) -> Vec<SearchHit> {
+    let Ok(item_re) = regex::Regex::new(r"(?s)<item\s*>(.*?)</item>") else {
         return Vec::new();
     };
-    let Ok(href_re) = regex::Regex::new(r#"href="([^"]+)""#) else {
+    let Ok(title_re) = regex::Regex::new(r"(?s)<title>(.*?)</title>") else {
         return Vec::new();
     };
-    // 同一条结果里 a 与 snippet 是相邻的兄弟节点，按出现顺序配对最省事
-    let snippets: Vec<String> = regex::Regex::new(r#"(?s)<a\s+[^>]*result__snippet[^>]*>(.*?)</a>"#)
-        .ok()
-        .map(|re| {
-            re.captures_iter(html)
-                .map(|c| inline_text(c.get(1).map(|m| m.as_str()).unwrap_or("")))
-                .collect()
+    let Ok(link_re) = regex::Regex::new(r"(?s)<link>(.*?)</link>") else {
+        return Vec::new();
+    };
+    let Ok(desc_re) = regex::Regex::new(r"(?s)<description>(.*?)</description>") else {
+        return Vec::new();
+    };
+    let field = |re: &regex::Regex, s: &str| -> String {
+        re.captures(s)
+            .and_then(|c| c.get(1))
+            .map(|m| xml_text(m.as_str()))
+            .unwrap_or_default()
+    };
+
+    item_re
+        .captures_iter(xml)
+        .take(count)
+        .filter_map(|c| {
+            let item = c.get(1).map(|m| m.as_str()).unwrap_or("");
+            let url = field(&link_re, item);
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return None;
+            }
+            Some(SearchHit {
+                title: inline_text(&field(&title_re, item)),
+                url,
+                snippet: inline_text(&field(&desc_re, item)),
+            })
         })
-        .unwrap_or_default();
+        .collect()
+}
+
+/// XML 文本节点：剥掉 `<![CDATA[ … ]]>` 外壳（Bing 偶有）再 trim
+fn xml_text(s: &str) -> String {
+    let s = s.trim();
+    s.strip_prefix("<![CDATA[")
+        .and_then(|x| x.strip_suffix("]]>"))
+        .unwrap_or(s)
+        .trim()
+        .to_string()
+}
+
+/// 兜底②：Bing 的 HTML 结果页（RSS 被关掉或改版时的后备）。
+/// 结构是 `<li class="b_algo">` 里 `<h2><a href="…">标题</a></h2>` + `b_caption` 的 `<p>` 摘要。
+fn bing_html_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
+    throttle_scrape();
+    let body = scrape_get(BING_SEARCH_ENDPOINT, &[("q", query)])?;
+    if !body.contains("b_algo") {
+        return Err("响应里没有 b_algo（疑似改版或被反爬）".into());
+    }
+    Ok(parse_bing_html(&body, count))
+}
+
+fn parse_bing_html(html: &str, count: usize) -> Vec<SearchHit> {
+    let Ok(anchor) =
+        regex::Regex::new(r#"(?s)<h2[^>]*>\s*<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
+    else {
+        return Vec::new();
+    };
+    let Ok(caption) = regex::Regex::new(r#"(?s)b_caption[^>]*>\s*<p[^>]*>(.*?)</p>"#) else {
+        return Vec::new();
+    };
 
     anchor
         .captures_iter(html)
         .take(count)
         .filter_map(|c| {
-            let attrs = c.get(1).map(|m| m.as_str()).unwrap_or("");
-            let href = href_re.captures(attrs)?.get(1)?.as_str();
-            let url = ddg_real_url(href)?;
+            let url = decode_entities(c.get(1)?.as_str()).trim().to_string();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return None;
+            }
+            // 摘要在锚点之后的兄弟节点里，就近找（不整页搜，避免配到别的结果上）
+            let after = &html[c.get(0)?.end()..];
+            let snippet = caption
+                .captures(head_chars(after, 2048))
+                .and_then(|m| m.get(1))
+                .map(|m| inline_text(m.as_str()))
+                .unwrap_or_default();
             Some(SearchHit {
-                title: inline_text(c.get(2).map(|m| m.as_str()).unwrap_or("")),
+                title: inline_text(c.get(2)?.as_str()),
                 url,
-                snippet: String::new(),
+                snippet,
             })
-        })
-        .enumerate()
-        .map(|(i, mut h)| {
-            h.snippet = snippets.get(i).cloned().unwrap_or_default();
-            h
         })
         .collect()
 }
 
-/// DDG 的链接是跳转壳：`//duckduckgo.com/l/?uddg=<percent-encoded>&rut=…`，
-/// 取 `uddg` 并解码；不是跳转壳时按原样使用（补 `https:`）。
-fn ddg_real_url(href: &str) -> Option<String> {
-    let href = href.trim();
-    if href.is_empty() || href.starts_with("javascript:") {
-        return None;
+/// 兜底③：百度 HTML。作为最后一道 —— 中文长尾查询命中率好，但页面脏得多：
+/// 结果块是 `<div class="result c-container" … mu="真实 URL" …>`（`mu` 就是目标地址，
+/// 不必去跟 `baidu.com/link?url=` 的 302），标题在 `<h3>` 里；摘要字段不稳定
+/// （实测 `c-abstract` 命中 0），所以**只给标题与 URL，不编摘要**。
+fn baidu_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
+    throttle_scrape();
+    let body = scrape_get(BAIDU_SEARCH_ENDPOINT, &[("wd", query), ("rn", "10")])?;
+    if !body.contains("result c-container") {
+        return Err("响应里没有 result c-container（疑似改版或被反爬）".into());
     }
-    if let Some(i) = href.find("uddg=") {
-        let rest = &href[i + 5..];
-        let end = rest.find('&').unwrap_or(rest.len());
-        let decoded = percent_decode(&rest[..end]);
-        if decoded.starts_with("http://") || decoded.starts_with("https://") {
-            return Some(decoded);
-        }
-        return None;
-    }
-    if let Some(rest) = href.strip_prefix("//") {
-        return Some(format!("https://{rest}"));
-    }
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return Some(href.to_string());
-    }
-    None
+    Ok(parse_baidu(&body, count))
 }
 
-/// 百分号解码。**不把 `+` 当空格** —— URL 的 path/query 里 `+` 是合法字符，
-/// 误转会改坏链接。按字节判断（不切片 `&str`：非法转义会被切在 UTF-8 边界上）
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hi = (b[i + 1] as char).to_digit(16);
-            let lo = (b[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
+fn parse_baidu(html: &str, count: usize) -> Vec<SearchHit> {
+    let Ok(block) = regex::Regex::new(r#"class="result c-container"#) else {
+        return Vec::new();
+    };
+    let Ok(mu) = regex::Regex::new(r#"mu="([^"]+)""#) else {
+        return Vec::new();
+    };
+    let Ok(h3) = regex::Regex::new(r"(?s)<h3[^>]*>(.*?)</h3>") else {
+        return Vec::new();
+    };
+
+    // 每块的有效范围 = 本块起点 → 下一块起点（末块到页尾）
+    let starts: Vec<usize> = block.find_iter(html).map(|m| m.start()).collect();
+    starts
+        .iter()
+        .take(count)
+        .filter_map(|&start| {
+            let rest = &html[start..];
+            let end = starts
+                .iter()
+                .find(|&&s| s > start)
+                .map(|&s| s - start)
+                .unwrap_or(rest.len());
+            let area = head_chars(rest, end);
+            // `mu` 是容器自身的属性，紧跟在 class 之后（实测在首 300 字符内）
+            let url = mu
+                .captures(head_chars(area, 600))
+                .and_then(|c| c.get(1))
+                .map(|m| decode_entities(m.as_str()))
+                .unwrap_or_default();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return None;
             }
+            Some(SearchHit {
+                title: h3.captures(area)
+                    .and_then(|c| c.get(1))
+                    .map(|m| inline_text(m.as_str()))
+                    .unwrap_or_default(),
+                url,
+                snippet: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// 进程内抓取节流（多轮工具调用串行，所以一把锁即可）—— 兜底是「蹭」别人的结果页，
+/// 宁可慢也不能把对方惹毛。
+fn throttle_scrape() {
+    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let m = LAST.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    if let Ok(mut last) = m.lock() {
+        let elapsed = last.elapsed().as_secs_f64();
+        if elapsed < SCRAPE_MIN_INTERVAL_SECS {
+            thread::sleep(Duration::from_secs_f64(SCRAPE_MIN_INTERVAL_SECS - elapsed));
         }
-        out.push(b[i]);
-        i += 1;
+        *last = Instant::now();
     }
-    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 取前 n 个字符（按 UTF-8 边界切 —— 结果页里全是中文，按字节切会 panic）
+fn head_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// 按字符（不是字节）截断并加省略号
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// 行内文本（标题/摘要）：剥标签 + 解实体 + 把连续空白压成一个空格

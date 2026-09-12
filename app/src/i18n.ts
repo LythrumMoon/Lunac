@@ -1180,6 +1180,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "API 키",
     "en": "API Key",
   },
+  "settings.search_provider": {
+    "zh-CN": "搜索服务商",
+    "zh-TW": "搜尋服務商",
+    "ja": "検索プロバイダー",
+    "ko": "검색 공급자",
+    "en": "Search Provider",
+  },
+  "settings.search_provider_none": {
+    "zh-CN": "不使用（仅内置兜底）",
+    "zh-TW": "不使用（僅內建備援）",
+    "ja": "使用しない（内蔵フォールバックのみ）",
+    "ko": "사용 안 함 (내장 대체 검색만)",
+    "en": "None (built-in fallback only)",
+  },
   "settings.search_key": {
     "zh-CN": "搜索 API 密钥",
     "zh-TW": "搜尋 API 金鑰",
@@ -1188,11 +1202,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Search API Key",
   },
   "settings.search_key_hint": {
-    "zh-CN": "Tavily 密钥（可留空，留空时自动使用 DuckDuckGo 兜底搜索）",
-    "zh-TW": "Tavily 金鑰（可留空，留空時自動使用 DuckDuckGo 備援搜尋）",
-    "ja": "Tavily キー（空欄可、空欄時は DuckDuckGo に自動フォールバック）",
-    "ko": "Tavily 키 (비워 두면 DuckDuckGo 대체 검색 사용)",
-    "en": "Tavily key (optional; falls back to DuckDuckGo when empty)",
+    "zh-CN": "所选服务商的密钥（可留空，留空时使用内置的 Bing / 百度兜底搜索）",
+    "zh-TW": "所選服務商的金鑰（可留空，留空時使用內建的 Bing / 百度備援搜尋）",
+    "ja": "選択したプロバイダーのキー（空欄可、空欄時は内蔵の Bing / Baidu にフォールバック）",
+    "ko": "선택한 공급자의 키 (비워 두면 내장 Bing / Baidu 대체 검색 사용)",
+    "en": "Key for the selected provider (optional; falls back to built-in Bing / Baidu when empty)",
   },
   "settings.workspace": {
     "zh-CN": "工作区",

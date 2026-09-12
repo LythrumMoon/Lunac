@@ -1214,8 +1214,9 @@ function forceResetPluginUI() {
         key: cfg.key || "",
         model: cfg.model,
         agent_url: cfg.agent_url || null,
-        // WebSearch 主源 key（Tavily）：进程重启后 env 会丢，必须从 localStorage
-        // 复原，否则每次开机都退化成 DuckDuckGo 兜底源。
+        // WebSearch 主源（服务商 + key）：进程重启后 env 会丢，必须从 localStorage
+        // 复原，否则每次开机都退化成免 key 的 Bing / 百度兜底源。
+        search_provider: cfg.search_provider || null,
         search_key: cfg.search_key || null,
       }).catch(() => {});
     }

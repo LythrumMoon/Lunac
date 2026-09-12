@@ -220,7 +220,7 @@ function inferProviderForModel(model: string, fallback: string): string {
   return fallback;
 }
 
-function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchKey: string): string {
+function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -295,6 +295,17 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
     modelOptions.push({ value: "__custom__", label: t("settings.custom_model"), selected: false });
     const modelSelectHtml = renderCustomSelect("settings-model", modelOptions, true);
 
+  // WebSearch 主源服务商（值为 agent 读的 LUNAC_SEARCH_PROVIDER；空 = 只用免 key 兜底源）。
+  // 品牌名不翻译；「不使用」走 i18n。
+  const searchProvSelectHtml = renderCustomSelect("settings-search-provider",
+    [
+      { value: "", label: t("settings.search_provider_none") },
+      { value: "bocha", label: "博查 Bocha" },
+      { value: "tavily", label: "Tavily" },
+      { value: "exa", label: "Exa" },
+      { value: "firecrawl", label: "Firecrawl" },
+    ].map(o => ({ ...o, selected: o.value === searchProvider })));
+
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.ai_model")}</div>
@@ -313,6 +324,10 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
       <div class="settings-row">
         <span class="settings-label">${t("settings.api_key")}</span>
         <input type="password" id="settings-apikey" class="settings-input" autocomplete="off" value="${esc(apiKey)}" placeholder="${masked || 'sk-...'}">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.search_provider")}</span>
+        ${searchProvSelectHtml}
       </div>
       <div class="settings-row">
         <span class="settings-label">${t("settings.search_key")}</span>
@@ -1224,6 +1239,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
   // 否则二次切换仍操作已被移除的旧节点（parentElement 为 null → 模型下拉卡死不更新）。
   let modelDD = container.querySelector("#settings-model") as HTMLElement | null;
   const searchEngineDD = container.querySelector("#settings-search-engine") as HTMLElement | null;
+  const searchProviderDD = container.querySelector("#settings-search-provider") as HTMLElement | null;
   const baseUrlInput = container.querySelector("#settings-baseurl") as HTMLInputElement | null;
   const apiKeyInput = container.querySelector("#settings-apikey") as HTMLInputElement | null;
 
@@ -1422,6 +1438,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
     });
   }
 
+  // Search provider dropdown（WebSearch 主源；值由「保存」按钮统一读取持久化）
+  if (searchProviderDD) {
+    setupCustomDropdown(searchProviderDD, () => {});
+  }
+
   // Model dropdown init + inline edit. 供应商切换会用新节点 replaceWith 重建，
   // 每个新节点都必须重新绑定（下拉逻辑 + 双击标签编辑自定义模型）。
   const setupModelDropdown = (dd: HTMLElement) => {
@@ -1541,8 +1562,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
       const model = modelOpt?.getAttribute("data-value") || "";
       const baseUrl = (container.querySelector("#settings-baseurl") as HTMLInputElement)?.value || "";
       const apiKey = (container.querySelector("#settings-apikey") as HTMLInputElement)?.value || "";
-      // WebSearch 主源（Tavily）密钥。每次回传当前输入框值，空串 = 清除
-      // （后端按删除处理，回落到 DuckDuckGo 兜底源）。
+      // WebSearch 主源（服务商 + 密钥）。每次回传当前值，空串 = 清除
+      // （后端按删除处理，agent 回落到免 key 的 Bing / 百度兜底源）。
+      const searchProvider = container.querySelector("#settings-search-provider .custom-select-option.selected")?.getAttribute("data-value") || "";
       const searchKey = (container.querySelector("#settings-searchkey") as HTMLInputElement)?.value || "";
       // Preserve existing agent_url if set (don't overwrite with empty)
       let agentUrl = "";
@@ -1556,12 +1578,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
         key: apiKey,
         model,
         agent_url: agentUrl,
+        search_provider: searchProvider,
         search_key: searchKey,
       });
       // Persist to localStorage so config survives restart
       try {
         localStorage.setItem("lunac-ai-config", JSON.stringify({
-          provider, url: baseUrl, key: apiKey, model, agent_url: agentUrl, search_key: searchKey,
+          provider, url: baseUrl, key: apiKey, model, agent_url: agentUrl,
+          search_provider: searchProvider, search_key: searchKey,
         }));
       } catch {}
     } catch (e) {
@@ -2032,6 +2056,7 @@ export const settingsPlugin: Plugin = {
     let baseUrl = "";
     let model = "";
     let apiKey = "";
+    let searchProvider = "";
     let searchKey = "";
 
     try {
@@ -2045,11 +2070,12 @@ export const settingsPlugin: Plugin = {
     try { autoStart = await invoke<boolean>("get_auto_start"); } catch {}
 
     try {
-      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_key: string }>("get_ai_config");
+      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_provider: string; search_key: string }>("get_ai_config");
       provider = aiCfg.provider || "";
       baseUrl = aiCfg.base_url || "";
       model = aiCfg.model || "";
       apiKey = aiCfg.api_key || "";
+      searchProvider = aiCfg.search_provider || "";
       searchKey = aiCfg.search_key || "";
     } catch {}
 
@@ -2060,7 +2086,7 @@ export const settingsPlugin: Plugin = {
     if (!model && preset) model = preset.default_model;
 
     const generalPane = buildGeneralPane(hotkey, autoStart);
-    const aiPane = buildAIPane(provider, baseUrl, model, apiKey, searchKey);
+    const aiPane = buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey);
     const pluginsPane = await buildPluginsPane();
     const searchPane = await buildSearchPane();
     const skillsPane = await buildSkillsPane();
