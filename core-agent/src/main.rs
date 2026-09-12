@@ -761,6 +761,7 @@ struct Block {
 /// （唯一会把数据发往外部）+ AskUserQuestion（交互本身就是它的功能）
 /// + 全部 MCP 工具 —— 后者的 handler 能跑 shell / 发 HTTP，且定义来自
 /// 用户 JSON，agent 侧无权替用户判断安全性，一律交前端卡片决定。
+/// `TodoWrite` 不在其中：它只改前端那块待办面板，不碰本机任何东西。
 fn needs_approval(name: &str) -> bool {
     tools::needs_approval(name) || mcp::is_mcp(name)
 }

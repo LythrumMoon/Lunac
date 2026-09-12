@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch / AskUserQuestion
+// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch / AskUserQuestion / TodoWrite
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -66,7 +66,7 @@ pub struct Ctx {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 八个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 十个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -225,6 +225,31 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["questions"]
             }
         }),
+        json!({
+            "name": "TodoWrite",
+            "description": "Create or update the task list shown to the user. Send the COMPLETE \
+                list every time — it replaces the previous one. Keep at most one entry \
+                in_progress, and flip an entry to completed the moment it is done. Use it for \
+                multi-step work so the user can follow along; skip it for a single trivial step.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string", "description": "Imperative form, e.g. \"Run the tests\"" },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
+                                "activeForm": { "type": "string", "description": "Present continuous form, e.g. \"Running the tests\"" }
+                            },
+                            "required": ["content", "status", "activeForm"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -253,6 +278,7 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 /// 侧不做二次判断，问就完了。
 /// `AskUserQuestion` 也必须问：**交互本身就是它的功能**（答案经审批卡的
 /// `updatedInput` 回传，不问就拿不到答案）。
+/// `TodoWrite` **不问**：它只改前端那块待办面板，不碰本机任何东西。
 ///
 /// `plan` 档下的例外见 [`gated_in_read_only`]。
 pub fn needs_approval(name: &str) -> bool {
@@ -287,6 +313,7 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "Grep" => grep(ctx, input),
         "WebFetch" => webfetch(input),
         "AskUserQuestion" => ask_user_question(input),
+        "TodoWrite" => todo_write(input),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -1001,6 +1028,35 @@ fn ask_user_question(input: &Value) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+// ── TodoWrite ────────────────────────────────────────────────────
+
+/// `TodoWrite` 不改本机、不落盘、也不需要审批：模型每次都发**完整**清单，
+/// 前端直接拿 `tool_use` 里的参数画那块待办面板（见 main.ts `renderTodoPanel`）。
+/// 这里只回一段确认文本 + 清单快照，让模型在后续轮次里能重新读到进度 —— 工具
+/// 自己**不维护状态**（清单的唯一真相就是模型最近一条 `tool_use`），所以进程
+/// 重启、多会话并行都不会串味。
+fn todo_write(input: &Value) -> Result<String, String> {
+    let Some(list) = input.get("todos").and_then(Value::as_array) else {
+        return Err("missing required parameter \"todos\"".into());
+    };
+
+    let mut out = String::from(
+        "Todos have been modified successfully. Keep the list up to date — at most one entry \
+         in_progress, and flip an entry to completed as soon as it is done.",
+    );
+    for (i, todo) in list.iter().enumerate() {
+        let content = todo.get("content").and_then(Value::as_str).unwrap_or("");
+        // 状态回显成规范名（模型可能给别的词，别把它原样带回去造成漂移）
+        let status = match todo.get("status").and_then(Value::as_str) {
+            Some("completed") => "completed",
+            Some("in_progress") => "in_progress",
+            _ => "pending",
+        };
+        out.push_str(&format!("\n{}. [{}] {}", i + 1, status, content));
+    }
+    Ok(truncate(out))
 }
 
 /// 递归收集文本文件（跳过 SKIP_DIRS，深度与数量封顶）

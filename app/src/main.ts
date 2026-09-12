@@ -1532,6 +1532,7 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "Grep" },
   { name: "WebFetch" },
   { name: "AskUserQuestion" },
+  { name: "TodoWrite" },
   { name: "Skill" },
 ];
 
@@ -2323,7 +2324,7 @@ interface CliEventLine {
     delta?: { type: string; text?: string; thinking?: string; partial_json?: string };
     content_block?: { type: string; name?: string };
   };
-  message?: { content?: Array<{ type: string; text?: string; name?: string; thinking?: string; content?: unknown; is_error?: boolean }> };
+  message?: { content?: Array<{ type: string; text?: string; name?: string; thinking?: string; input?: unknown; content?: unknown; is_error?: boolean }> };
   usage?: { input_tokens: number; output_tokens: number };
 }
 
@@ -2419,13 +2420,18 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string) {
     v.thinkChars = 0;
     v.current = det.querySelector(".think-content");
   } else if (kind === "tool") {
-    const row = document.createElement("div");
-    row.className = "tool-row";
-    row.innerHTML = `<span class="tool-name">🔧 ${esc(toolName || t("chat.badge_tool"))}</span> <span class="tool-args"></span>`;
-    v.flow.appendChild(row);
-    v.current = row.querySelector(".tool-args");
     v.curToolName = toolName || "";
     v.curToolArgs = "";
+    if (v.curToolName === "TodoWrite") {
+      // 待办清单单独画成一块面板（见 renderTodoPanel），不占普通工具行
+      v.current = null;
+    } else {
+      const row = document.createElement("div");
+      row.className = "tool-row";
+      row.innerHTML = `<span class="tool-name">🔧 ${esc(toolName || t("chat.badge_tool"))}</span> <span class="tool-args"></span>`;
+      v.flow.appendChild(row);
+      v.current = row.querySelector(".tool-args");
+    }
   } else {
     const p = document.createElement("div");
     p.className = "agent-text";
@@ -2453,8 +2459,15 @@ function agentAppend(kind: "thinking" | "text", s: string) {
 
 function agentToolArgsDelta(s: string) {
   const v = agentView;
-  if (!v || v.currentKind !== "tool" || !v.current || !s) return;
+  if (!v || v.currentKind !== "tool" || !s) return;
   v.curToolArgs += s;
+  if (v.curToolName === "TodoWrite") {
+    // 入参是流式 JSON：分片不完整时解析失败，等下一个分片（末片必定完整）
+    const todos = parseTodoArgs(v.curToolArgs);
+    if (todos) renderTodoPanel(todos);
+    return;
+  }
+  if (!v.current) return;
   // Show a readable summary instead of raw JSON (Trae-style): the command
   // text for Bash/PowerShell, key=value fields for other tools.
   let display = v.curToolArgs;
@@ -2477,6 +2490,47 @@ function agentToolArgsDelta(s: string) {
     // partial JSON while streaming — keep raw accumulation
   }
   v.current.textContent = display.length > 200 ? display.slice(0, 200) + "…" : display;
+}
+
+/** 从 TodoWrite 的 tool_use 入参里取 todos（非数组 = 还没拿到完整清单）。 */
+function todosFromInput(input: unknown): unknown[] | null {
+  const todos = (input as { todos?: unknown } | null)?.todos;
+  return Array.isArray(todos) ? todos : null;
+}
+
+/** 流式入参是 JSON 的合法前缀，只有完整那一片才解析得出来。 */
+function parseTodoArgs(raw: string): unknown[] | null {
+  try {
+    return todosFromInput(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/** 画 TodoWrite 的待办面板：模型每轮发**完整**清单，这里就地重绘同一块面板，
+ *  所以同一轮里多次 TodoWrite 只留最后一份状态，不会堆成一摞。 */
+function renderTodoPanel(todos: unknown[]) {
+  const v = agentView;
+  if (!v) return;
+  let panel = v.flow.querySelector<HTMLElement>(".todo-panel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.className = "todo-panel";
+    panel.innerHTML = `<div class="todo-head">📋 <span class="todo-title"></span></div><ul class="todo-list"></ul>`;
+    v.flow.appendChild(panel);
+  }
+  const title = panel.querySelector(".todo-title");
+  if (title) title.textContent = t("agent.todo_title");
+  const ul = panel.querySelector(".todo-list");
+  if (!ul) return;
+  ul.innerHTML = todos.map((raw) => {
+    const o = (raw ?? {}) as { content?: unknown; status?: unknown };
+    const text = typeof o.content === "string" ? o.content : "";
+    const status = o.status === "completed" || o.status === "in_progress" ? o.status : "pending";
+    const mark = status === "completed" ? "✔" : status === "in_progress" ? "◐" : "○";
+    return `<li class="todo-item todo-${status}"><span class="todo-mark">${mark}</span><span class="todo-text">${esc(text)}</span></li>`;
+  }).join("");
+  agentScroll();
 }
 
 function agentCloseBlock() {
@@ -3107,6 +3161,12 @@ listen<{ line: string }>("cli-output", (event) => {
           agentCloseBlock();
         } else if (block.type === "tool_use") {
           statusText.textContent = `Agent tool: ${block.name || "..."}`;
+          // TodoWrite 优先用整包入参画面板：端点可能直接在 content_block_start
+          // 里给全量 input（此时不会有 input_json_delta），流式分片路径拿不到
+          if (block.name === "TodoWrite") {
+            const todos = todosFromInput(block.input);
+            if (todos) renderTodoPanel(todos);
+          }
           if (!cliSawStreamDelta) {
             agentNewBlock("tool", block.name);
             agentCloseBlock();
@@ -3118,10 +3178,14 @@ listen<{ line: string }>("cli-output", (event) => {
     else if (data.type === "user" && data.message?.content) {
       for (const block of data.message.content) {
         if (block.type === "tool_result") {
-          agentToolResult(!!block.is_error, block.content);
           // Update turn tool call status (Pi: structured tool lifecycle)
           const tc = agentTurn?.toolCalls;
           const lastTool = tc && tc[tc.length - 1];
+          // TodoWrite 的成功回执就是那块面板本身 —— 再贴一条「✓ 完成」只会把
+          // 整份清单原样重复一遍；失败仍照常显示。
+          if (!(lastTool?.name === "TodoWrite" && !block.is_error)) {
+            agentToolResult(!!block.is_error, block.content);
+          }
           if (lastTool && lastTool.status === "running") {
             lastTool.status = block.is_error ? "error" : "success";
             lastTool.result = extractToolResultText(block.content).slice(0, 200);

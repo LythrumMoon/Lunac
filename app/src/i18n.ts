@@ -1779,6 +1779,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "생각하는 중…",
     "en": "Thinking…",
   },
+  "agent.todo_title": {
+    "zh-CN": "待办清单",
+    "zh-TW": "待辦清單",
+    "ja": "タスクリスト",
+    "ko": "할 일 목록",
+    "en": "Task list",
+  },
   "agent.please_wait": {
     "zh-CN": "请稍候...",
     "zh-TW": "請稍候...",
