@@ -2,7 +2,7 @@
 
 > **用途**：把「旧 cli.exe 有、自研 agent.exe 没有」的能力集中登记为待实现项，并说明每一项对 Lunac（Windows 桌面启动器 + AI 对话）的实际价值，避免重复考古 `core/`。
 >
-> **状态基线**：agent.exe 目前 = P0 多轮循环/流式/用量 + P1 十件内置工具 + P2 权限审批 + P3 MCP 工具桥 + P4 技能 + 上下文预算/压缩，见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。
+> **状态基线**：agent.exe 目前 = P0 多轮循环/流式/用量 + P1 十一件内置工具 + P2 权限审批 + P3 MCP 工具桥 + P4 技能 + 上下文预算/压缩，见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。
 >
 > **核对口径**（本文的「全集」从这三个真源枚举，不是靠目录名猜的）：
 > 1. 工具：[core/tools.ts](file:///d:/cc/claude-code-cli-master/core/tools.ts) `getAllBaseTools()` —— 旧 CLI 自己标注的「ALL tools 的唯一真源」
@@ -17,7 +17,7 @@
 
 | 维度 | 旧 cli.exe | agent.exe 现在 | 缺口 |
 |---|---|---|---|
-| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 10 个内置 + `Skill`（技能）+ 动态接入的 MCP 用户工具（`mcp__*`，来自 `tools\*.json`） | 26 个具名工具 |
+| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 11 个内置 + `Skill`（技能）+ 动态接入的 MCP 用户工具（`mcp__*`，来自 `tools\*.json`） | 25 个具名工具 |
 | 斜杠命令 | 75+ | 0 | 全部 |
 | 命令行开关 | 123+ 个 `--flag` | 7 个（`--add-dir` / `--permission-mode` / `--permission-prompt-tool` / `--dangerously-skip-permissions` / `--disallowedTools` / `--mcp-server` + 忽略其余） | ~116 个 |
 | 顶层子系统 | ~22 | 6（Agent 循环、工具执行、权限审批、上下文预算/压缩、MCP 桥、技能） | ~16 |
@@ -33,7 +33,7 @@
 | 工具 | 旧 CLI 位置 | 价值 | 说明 |
 |---|---|---|---|
 | ~~`PowerShell`~~ | `core/tools/PowerShellTool/` | **高** | ✅ **已完成（2026-09）**：`-NoProfile -NonInteractive -Command` + 双 UTF-8 编码兜底（中文输出不再变乱码），与 `Bash` 共用 `run_shell`；`plan` 档拒绝、非 plan 档先审批，真机烟测通过 |
-| `WebSearch` | `core/tools/WebSearchTool/` | **高** | ⛔ **不能照搬（2026-09 核查）**：旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（`WebSearchTool.ts:76-84`），结果经 `server_tool_use` / `web_search_tool_result` 流式回传，全仓无任何本地搜索源。自研要做得另接第三方搜索 API（需用户配 key）或自建抓取 —— 属新依赖，需先定方案 |
+| ~~`WebSearch`~~ | `core/tools/WebSearchTool/` | **高** | ✅ **已完成（2026-09）**：旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（`WebSearchTool.ts:76-84`），全仓无本地搜索源，**不能照搬**。自研方案：主源 **Tavily**（key 走设置面板 → `AI_SEARCH_KEY` → `LUNAC_SEARCH_KEY`）+ 兜底源 **DuckDuckGo HTML 抓取**（≥1.1s 节流、202 视为限流），主源失败/未配 key 自动回落并附 `[fallback] <原因>`，两源都失败就如实报错不编造。**Bing Search API 已于 2025-08-11 退役**（老 key 410 Gone、不再接受新注册），**DuckDuckGo 无官方搜索 API**（`api.duckduckgo.com` 只返维基摘要），故不存在「bing 首选 + ddg api 兜底」这条路。关键：`WebSearch` 进 `needs_approval` 与 `gated_in_read_only`（查询词是外部出口，plan 档也弹审批）。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「联网检索」 |
 | ~~`WebFetch`~~ | `core/tools/WebFetchTool/` | **高** | ✅ **已完成（2026-09）**：HTML→纯文本抓取（无 DOM 依赖）、60s 超时 / ≤10MB / UA 标识 Lunac；**未照搬两处服务端依赖** —— 域名预检 `api.anthropic.com/api/web/domain_info` 与 Haiku 二次摘要。只读档同样走审批（唯一外部数据出口），烟测见 [ai-spec.md §9](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md) |
 | ~~`AskUserQuestion`~~ | `core/tools/AskUserQuestionTool/` | **高** | ✅ **已完成（2026-09）**：**答案复用 `can_use_tool` 的 `updatedInput` 回传**（旧 CLI 也是这条通道，不新增协议）；前端 `renderAskQuestions()` 渲染选项、`classifyRequest()` 对它恒定 `auto:false`；收不到答案时工具报错而非编造。plan 档可用且照常审批。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「结构化提问」 |
 | ~~`TodoWrite`~~ | `core/tools/TodoWriteTool/` | **中高** | ✅ **已完成（2026-09）**：长任务的进度可见性；工具**不持有状态**（清单唯一真相 = 模型最近一条 `tool_use`），前端拿流式入参就地重绘 `.todo-panel`；**免审批**、成功回执不重复渲染。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「待办面板」 |
@@ -123,7 +123,7 @@
 ## 4. 已核对：以下不是缺口
 
 - **前端依赖的 stdout 契约**：`system/init`（含 `model`，用量日志的元数据来源）、`stream_event`（4 种 delta）、`assistant`、`user/tool_result`、`control_request`、`result`（含 4 个 token 字段，**每次提问的绝对值**）—— agent.exe **全部已提供**，token 面板数据源正常；对账口径见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「用量与对账」。
-- **工具名硬编码**：前端特判的 `Bash`（及 `PowerShell`）命名一致；十件内置工具名字与旧 CLI 完全同名同义。
+- **工具名硬编码**：前端特判的 `Bash`（及 `PowerShell`）命名一致；十一件内置工具名字与旧 CLI 完全同名同义。
 - **`--disallowedTools` 链路**：Rust → agent.exe → 请求体过滤已通，UI 黑名单候选列表已换成真实工具名（见 §5）。
 - **思考档位跨模型自适应**：旧 CLI 没有对应机制（它绑定自家模型），我们反而是超集。
 
@@ -145,7 +145,7 @@
 1. ~~**上下文预算 + 压缩**（§2.1）——唯一「用久了必然坏掉」的缺口，属防回归性质~~ ✅ **已完成（2026-09）**
 2. ~~**P3 MCP 工具桥** —— 让「插件」面板与 `tools\*.json` 真正生效~~ ✅ **已完成（2026-09）**；resources 两件未做
 3. ~~**P4 Skills** —— 让「技能扩展」面板生效，并修掉失实文案~~ ✅ **已完成（2026-09）**；fork / remote 未做
-4. ~~**低成本高收益**~~ ✅ **已全部完成（2026-09）**：~~`PowerShell` 工具~~、~~工具黑名单候选列表刷新~~（同步提升前缀缓存命中）、~~`WebFetch`~~、~~`AskUserQuestion`~~、~~`TodoWrite`~~。**唯一未做的是 `WebSearch`**（⛔ 需先定搜索源方案，见 §1.1）
+4. ~~**低成本高收益**~~ ✅ **已全部完成（2026-09）**：~~`PowerShell` 工具~~、~~工具黑名单候选列表刷新~~（同步提升前缀缓存命中）、~~`WebFetch`~~、~~`AskUserQuestion`~~、~~`TodoWrite`~~、~~`WebSearch`~~（Tavily 主源 + DuckDuckGo HTML 兜底，见 §1.1）。§1.1 组 A 中仅剩 `ListMcpResourcesTool` / `ReadMcpResourceTool`（MCP resources，需先扩 `mcp_server.rs`）
 5. 视需要：权限 hooks、自动权限分类器、模型输出重试、Bash AST 安全分析
 6. ~~**前缀缓存命中率优化**（第 19 点）~~ ✅ **已完成（2026-09）**：MCP 工具数组按名排序、技能清单按 `key` 排序、工具黑名单不再内置空转旧名 —— 不变量见 [ai-spec.md §11 规则 18](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)
 

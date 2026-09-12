@@ -202,14 +202,14 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 面 | 内容 |
 |---|---|
-| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED` |
+| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_KEY`（WebSearch 主源 Tavily 的 key；缺省则只用 DuckDuckGo 兜底源） |
 | 启动参数 | `--add-dir <dir>`（可重复，工作区外追加可访问目录）/ `--permission-mode plan`（只读）/ `--dangerously-skip-permissions`（忽略工作区锁）/ `--permission-prompt-tool stdio`（写类工具先审批）/ `--disallowedTools <name…>`（这些工具不进请求体）/ `--mcp-server stdio:<exe 路径>`（拉起该 exe 的 MCP server 并接入其工具，P3）；其余（`--print` / `--verbose` / `--input-format stream-json` / `--include-partial-messages` …）一律接受并忽略 |
 | stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"\|"deny",…}}}` 为审批回包（P2，由 stdin 线程按 request_id 直接投递给等待中的工具调用） |
 | stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
 
 **P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮按 `history.truncate(base)` 整体回滚，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
 
-**P1 已完成（2026-09，内置工具循环）**：十件工具实现在 [core-agent/src/tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)，主循环按「请求 → 流式收块 → 有 `tool_use` 就执行并以 `tool_result` 回灌 → 再请求」往返，直到模型不再调工具（上限 `MAX_TOOL_ROUNDS=16`，到顶后再给一次「只用文本收口」的机会）。
+**P1 已完成（2026-09，内置工具循环）**：十一件工具实现在 [core-agent/src/tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)，主循环按「请求 → 流式收块 → 有 `tool_use` 就执行并以 `tool_result` 回灌 → 再请求」往返，直到模型不再调工具（上限 `MAX_TOOL_ROUNDS=16`，到顶后再给一次「只用文本收口」的机会）。
 
 | 工具 | 入参 | 行为 |
 |---|---|---|
@@ -220,7 +220,8 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | `PowerShell` | `command` / `timeout` | `-NoProfile -NonInteractive -Command` 执行（无用户 profile、不卡交互式输入），超时与结果口径同 `Bash`（共用 `run_shell`）；命令前置 `$OutputEncoding` / `[Console]::OutputEncoding` 双 UTF-8 兜底 —— PS 5.1 重定向到管道时按控制台 ANSI 码页（中文 Windows = GBK）输出，不切 UTF-8 会把中文变成替换字符 |
 | `Glob` | `pattern` / `path` | `**` 递归、`*` 不跨目录；≤200 条 |
 | `Grep` | `pattern` / `path` / `glob` / `ignore_case` | Rust 正则逐行匹配，输出 `路径:行号:内容`；跳过 `.git`/`node_modules`/`target` 等重目录与二进制文件；≤200 条 |
-| `WebFetch` | `url` / `prompt`（提示性） | 抓取 URL 并把 HTML 转成纯文本（去 script/style/注释、块级标签当换行、剥标签、解高频实体，无 DOM 依赖）；`reqwest` 60s 超时、≤10 次重定向、≤10MB 响应、UA 标识为 `Lunac/<版本>`；返回 `URL / Status / 正文`。**不做二次模型摘要**（正文直接回给主模型，省一次往返、不绑死供应商小模型，故 `prompt` 只作提示）；**不做域名预检**（旧 CLI 依赖 `api.anthropic.com/api/web/domain_info`，我们没有该服务，安全性交审批与前端白名单）。`Read` 到的文件内容可拼进 URL，故它是唯一会把数据发往外部的内置工具 |
+| `WebSearch` | `query` / `count`（1–10，默认 5） | 联网检索。**主源 Tavily**（`POST https://api.tavily.com/search`，`Authorization: Bearer $LUNAC_SEARCH_KEY`），**兜底源 DuckDuckGo HTML 抓取**（`POST https://html.duckduckgo.com/html/`，无官方 API 可用；两次抓取间强制 ≥1.1s，拿到 202 视为限流）。主源失败/0 结果/未配 key 时自动回落，回落结果尾部附 `[fallback] <原因>`；两源都失败则整条报错（原因写进 `is_error=true` 的 `tool_result`，模型可自行改方案）。返回 `Query / Source / 编号列表（标题 + URL + 摘要）`；UA 标识 `Lunac/<版本>`。为什么不是 Bing：微软已于 2025-08-11 退役全部 Bing Search API（老 key 410 Gone、不再接受新注册），官方替代品是绑定 Azure 的 AI 平台产品而非 SERP API |
+| `WebFetch` | `url` / `prompt`（提示性） | 抓取 URL 并把 HTML 转成纯文本（去 script/style/注释、块级标签当换行、剥标签、解高频实体，无 DOM 依赖）；`reqwest` 60s 超时、≤10 次重定向、≤10MB 响应、UA 标识为 `Lunac/<版本>`；返回 `URL / Status / 正文`。**不做二次模型摘要**（正文直接回给主模型，省一次往返、不绑死供应商小模型，故 `prompt` 只作提示）；**不做域名预检**（旧 CLI 依赖 `api.anthropic.com/api/web/domain_info`，我们没有该服务，安全性交审批与前端白名单）。`Read` 到的文件内容可拼进 URL，故它会把数据发往外部 |
 | `AskUserQuestion` | `questions`（1–4 题，每题 2–4 选项）/ `answers`（**由前端填**） | 结构化提问：选项给用户点选。**工具自身只做格式化** —— 答案由前端经审批卡的 `updatedInput` 回传（`{...input, answers}`），工具把它排成 `User has answered your questions: "题" = "答"`。收不到 `answers` 就**报错而非编答案**（模型会改用文本提问）—— 见下「结构化提问」一节 |
 | `TodoWrite` | `todos`（数组，项含 `content` / `status`(`pending`\|`in_progress`\|`completed`) / `activeForm`，三项必填） | 待办清单：模型**每次都发完整清单**（整体替换语义）。工具**不维护状态、不落盘、不碰本机** —— 清单的唯一真相是模型最近一条 `tool_use` 入参，进程重启 / 多会话并行都不会串味；`todo_write()` 只回一段确认 + 清单快照（状态回显成规范名，防止模型用别的词造成漂移）。**免审批**（`needs_approval` 不含它）。前端拿流式入参画面板（见下「待办面板」） |
 
@@ -228,9 +229,9 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 条件 | 效果 |
 |---|---|
-| `--permission-mode plan`（前端「安全」档） | 只读：`Write`/`Edit`/`Bash`/`PowerShell` 一律以 `is_error=true` 拒绝（不弹审批）；`Read`/`Glob`/`Grep`/`WebFetch` 可用，`AskUserQuestion` 也可用，`TodoWrite` 照常可用（它只改前端面板） |
-| `--permission-prompt-tool stdio` 且非 plan 档 | `Write`/`Edit`/`Bash`/`PowerShell`/`WebFetch`/`AskUserQuestion` 执行前先发 `can_use_tool` 请前端审批；前端自行判定「内置安全前缀 / 白名单自动放行」还是「弹卡片」（危险命令永远只给手动确认）。没有这个开关就不问，避免对着无人应答的通道干等。`TodoWrite` **永远不在此列**（不碰本机，问了纯属打扰） |
-| `WebFetch` / `AskUserQuestion` 在 plan（只读）档 | **照常审批**（`tools::gated_in_read_only`）—— 只读档对写类工具的「不必问」豁免不适用于它们：写类工具在只读档会被直接拒绝（问了白问），而这两件在只读档是放行的。`WebFetch` 能把 `Read` 到的文件内容拼进 URL 带出本机（唯一外部数据出口）；`AskUserQuestion` 的答案只能从卡片上取（不问就拿不到答案） |
+| `--permission-mode plan`（前端「安全」档） | 只读：`Write`/`Edit`/`Bash`/`PowerShell` 一律以 `is_error=true` 拒绝（不弹审批）；`Read`/`Glob`/`Grep`/`WebSearch`/`WebFetch` 可用，`AskUserQuestion` 也可用，`TodoWrite` 照常可用（它只改前端面板） |
+| `--permission-prompt-tool stdio` 且非 plan 档 | `Write`/`Edit`/`Bash`/`PowerShell`/`WebSearch`/`WebFetch`/`AskUserQuestion` 执行前先发 `can_use_tool` 请前端审批；前端自行判定「内置安全前缀 / 白名单自动放行」还是「弹卡片」（危险命令永远只给手动确认）。没有这个开关就不问，避免对着无人应答的通道干等。`TodoWrite` **永远不在此列**（不碰本机，问了纯属打扰） |
+| `WebSearch` / `WebFetch` / `AskUserQuestion` 在 plan（只读）档 | **照常审批**（`tools::gated_in_read_only`）—— 只读档对写类工具的「不必问」豁免不适用于它们：写类工具在只读档会被直接拒绝（问了白问），而这三件在只读档是放行的。`WebSearch` 会把查询词发往外部搜索源；`WebFetch` 能把 `Read` 到的文件内容拼进 URL 带出本机；`AskUserQuestion` 的答案只能从卡片上取（不问就拿不到答案） |
 | `LUNAC_WORKSPACE_LOCKED=1`（配置了工作区时 src-tauri 注入） | 文件类工具路径先做词法规范化（消 `..`），越出工作区（cwd / `--add-dir`）即拒绝 —— 含 `Read` 的越界读取。**审批通过也不放行**（这是硬边界） |
 | MCP 工具（P3，见下） | 非 plan 档下**一律先发 `can_use_tool`**（handler 能跑 shell / 发 HTTP，且定义来自用户 JSON，agent 侧无权替用户判断）；plan 档压根不接入，模型看不到这些工具 |
 | `--dangerously-skip-permissions`（前端「完全」档） | 忽略工作区锁 |
@@ -262,6 +263,17 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 前端 UI | `app/src/main.ts` `renderTodoPanel()` + `styles.css` `.todo-panel` / `.todo-item`；工具黑名单候选名单同步补 `TodoWrite` |
 
 **工具错误不中断整轮**：工具返回 Err 时转成 `is_error=true` 的 `tool_result` 交回模型自行纠正；只有 HTTP / 流错误才终止本轮并回滚 history。写回上下文的 assistant 消息会**剔除 thinking 块**（端点要求 thinking 带 `signature`，回灌会 400），发给前端的整包仍保留 thinking。
+
+**联网检索（WebSearch，2026-09）**：主源 Tavily + 兜底源 DuckDuckGo HTML 抓取，key 走**设置 · AI · 搜索 API 密钥**。
+
+| 项 | 约定 |
+|---|---|
+| 选型原因 | Bing Search API 已于 2025-08-11 全部退役（老 key 返 410 Gone、不再接受新注册），官方替代「Grounding with Bing Search」是绑定 Azure 项目的 AI 平台产品，不是 SERP API；DuckDuckGo **没有官方搜索 API**（`api.duckduckgo.com` 只返维基摘要，不返网页结果），所以兜底只能抓 `html.duckduckgo.com/html/` |
+| key 存放 | `src-tauri` 的 `AI_SEARCH_KEY`（`set_ai_config` 写入、`get_ai_config` 回读），注入 agent.exe 的 `LUNAC_SEARCH_KEY`（`configure_agent_env` + `start_cli_process` 两条路径都要给）；**空串 = 删除**，前端每次都回传输入框当前值。前端另存 localStorage `lunac-ai-config.search_key` —— 进程重启后 env 会丢，不还原就每次开机都退化成兜底源 |
+| 回落语义 | 未配 key / 主源报错 / 主源 0 结果 → 走 DDG，结果尾部附 `[fallback] <原因>`；两源都失败 → 整条 `Err`（进 `is_error=true` 的 `tool_result`），**不编造结果** |
+| DDG 限流 | 进程内 `OnceLock<Mutex<Instant>>` 强制两次抓取间隔 ≥1.1s；HTTP 202 视为软封并显式报限流；解析为空时用 `result__a` / `no-results` 区分「真无结果」与「页面改版」（后者报错，避免静默返回空） |
+| 审批 | 在 `needs_approval` 与 `gated_in_read_only` 里（查询词是外部出口），**plan 档同样弹审批**；前端工具黑名单候选名单同步补 `WebSearch` |
+| 不新增依赖 | HTML 解析用既有 `regex` + `serde_json`，DDG 跳转壳（`uddg=`）自带百分号解码（按字节索引，不切 `&str`） |
 
 **思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、原生 Messages 端点的新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
 
@@ -305,7 +317,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 审批 | MCP 工具一律先发 `can_use_tool`（见上表）；deny → `is_error=true` 的 `tool_result` |
 | 顺序 | `tools/list` 的返回顺序不保证稳定，接入时**按工具名排序后再入请求体** —— tools 数组属于请求前缀，顺序一变端点侧的前缀缓存整段失效 |
 | 错误 | 上游 `isError=true`、进程退出、超时都转成 `is_error=true` 的 `tool_result`，不中断整轮；结果按内置工具同一上限（30000 字符）截断 |
-| 容错 | spawn/握手失败只往 stderr 记一行并继续 —— 十件内置工具必须照常可用；MCP server 的 stderr 直接并入 agent stderr（上游会转发到前端/终端），stdout 独占给 JSON-RPC |
+| 容错 | spawn/握手失败只往 stderr 记一行并继续 —— 十一件内置工具必须照常可用；MCP server 的 stderr 直接并入 agent stderr（上游会转发到前端/终端），stdout 独占给 JSON-RPC |
 | 生命周期 | agent.exe 退出时 kill 子进程（`Drop for Bridge`）；新增/改动 `tools\*.json` 后需重启 agent.exe 才生效（与工具黑名单同一套重启流程） |
 
 **P4 已完成（2026-09，技能 SKILL.md）**：实现在 [core-agent/src/skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)。agent.exe 启动时扫 `LUNAC_SKILLS_DIR`（= `<exe 根>\skills`，见 §11 规则 3）下的 `<key>/SKILL.md`，采用**渐进披露**：系统提示词里只列 `key: 描述`（描述 ≤250 字符、清单总预算 8000 字符），模型需要时调内置 `Skill` 工具取回正文（`$ARGUMENTS` 已按调用参数替换）。要点：
@@ -501,7 +513,7 @@ app/
 
 core-agent/
 ├── src/main.rs                      # 自研 agent 核心 —— stream-json 契约、工具循环、审批，见 §3.5
-├── src/tools.rs                     # P1 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch / AskUserQuestion / TodoWrite
+├── src/tools.rs                     # P1 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
 ├── src/mcp.rs                       # P3 MCP 工具桥（stdio client，连 lunac.exe --mcp-server）
 ├── src/skills.rs                    # P4 技能（LUNAC_SKILLS_DIR 的 <key>/SKILL.md + Skill 工具）
 ├── Cargo.toml
@@ -600,7 +612,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | 计算器/编码/JSON 插件 | ❌ 已移除 — 2026-07-22 删除，功能由 AI Agent 替代 |
 | OCR 文字识别插件 | ✅ 新增 `ocr.ts` — PaddleOCR-json 离线 OCR（多语言） |
 | 硬件 AI Agent Tools | ✅ 新增 `tools/system_info.json` — Agent 模式 MCP Tools |
-| Agent 内置工具（Read/Write/Edit/Bash/PowerShell/Glob/Grep/WebFetch/AskUserQuestion） | ✅ P1 已完成 — 真实端点烟测通过（多轮工具往返、工作区越界拒绝、`plan` 档只读；`PowerShell` 中文输出与 `--disallowedTools` 裁剪均验证）。`WebFetch` 已完成（2026-09）：HTML→纯文本抓取，非只读档与**只读档都走审批**，真实文档页（doc.rust-lang.org）烟测通过。`AskUserQuestion` 已完成（2026-09）：选项卡片 + `updatedInput` 回答案，答题/未答/拒绝/plan 四条路径烟测通过 |
+| Agent 内置工具（Read/Write/Edit/Bash/PowerShell/Glob/Grep/WebSearch/WebFetch/AskUserQuestion/TodoWrite） | ✅ P1 已完成 — 真实端点烟测通过（多轮工具往返、工作区越界拒绝、`plan` 档只读；`PowerShell` 中文输出与 `--disallowedTools` 裁剪均验证）。`WebFetch` 已完成（2026-09）：HTML→纯文本抓取，非只读档与**只读档都走审批**，真实文档页（doc.rust-lang.org）烟测通过。`AskUserQuestion` 已完成（2026-09）：选项卡片 + `updatedInput` 回答案，答题/未答/拒绝/plan 四条路径烟测通过。`TodoWrite` 已完成（2026-09）：待办面板、免审批、成功回执不重复渲染。`WebSearch` 已完成（2026-09）：三条路径真实端点烟测通过 —— ①无 key 直接走 DDG 兜底；②无效 key 时 Tavily 真返 401 并回落兜底（证明端点/请求形状与错误透传都对）；③`plan` 档照常弹审批、拒绝后写回 `tool_result`。⚠️ **兜底源 DuckDuckGo 的真实抓取未在本机验证**（沙箱访问不到 `html.duckduckgo.com`，Tavily 域名可达），`parse_ddg()` 的正则需在有外网的环境下补一次真机验证；Tavily **成功**路径也需一个真实 key 才能复验（本次只验到 401 分支） |
 | Agent 工具权限审批（can_use_tool） | ✅ P2 已完成 — 写类工具执行前弹卡，allow/deny/interrupt 与超时撤卡均验证通过 |
 | Agent 上下文预算与压缩 | ✅ 已完成 — 按端点实测体积走瘦身/丢弃两级水位 + 400 强制压缩兜底；真实端点烟测（`LUNAC_MAX_CONTEXT_TOKENS=8000`）连跑 17 轮工具往返不中断 |
 | Agent MCP 工具桥（插件面板的 tools\*.json） | ✅ P3 已完成 — agent.exe 作 client 连 `lunac.exe --mcp-server`，用户工具以 `mcp__<名>` 进请求体；真实端点烟测通过（注册、审批卡、成功/失败两条回灌路径） |
@@ -624,6 +636,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 14. ~~**`AskUserQuestion` 工具**~~ — ✅ 已完成（2026-09）：选项卡片 + 复用 `can_use_tool` 的 `updatedInput` 回答案（不新增协议）；工具的「始终允许」被刻意禁用、白名单也不放行它；plan 档可用且照常审批；见 §3.5「结构化提问」
 15. ~~**`TodoWrite` 工具**~~ — ✅ 已完成（2026-09）：工具不持有状态（清单唯一真相 = 模型最近一条 `tool_use`），前端拿流式入参就地重绘 `.todo-panel`；免审批、成功回执不重复渲染；见 §3.5「待办面板」
 16. ~~**用量口径修正 + 本地用量日志**~~ — ✅ 已完成（2026-09）：前端不再对 `result.usage` 做差（自研 agent 报的是每次提问的绝对值，做差会把未变化的前缀算成 0 命中）；每次提问落一行 `<exe根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`，token 仪表盘改为「今日累计」，可与供应商平台按天对账；见 §3.5「用量与对账」与 §11 规则 19
+17. ~~**`WebSearch` 工具**~~ — ✅ 已完成（2026-09）：主源 **Tavily**（key 走设置 · AI · 搜索 API 密钥 → `AI_SEARCH_KEY` → `LUNAC_SEARCH_KEY`）+ 兜底源 **DuckDuckGo HTML 抓取**（≥1.1s 节流、202 视为限流），两源都失败就如实报错、不编造；plan 档照常审批；Bing/DuckDuckGo 官方 API 均不可用（Bing 已退役、DDG 无官方 API），选型与回落语义见 §3.5「联网检索」；烟测见 §9
 
 ---
 
@@ -650,11 +663,11 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 11. **自定义文件启动（快速启动 / Custom Launch）**：持久注册表为 `<exe 根>\ModuleData\custom\app_registry.json`（业务数据同根统一管理；旧 exe 同目录 / LOCALAPPDATA 文件首读自动迁移）。面板打开即列出**全部已注册项**（可启动 / 逐条删除 / 「添加启动项」），重启不丢失、数据不再“消失”；删除 = 注销注册表 + 摘除对应气泡。拖入/粘贴路径进搜索栏即自动注册；入口词多语言/拼音覆盖（launch/open/启动/qidong/dakai/自定义/快速启动…，中文由 pluginRegistry 自动生成拼音索引）。
 12. **卸载清理**：NSIS `installerHooks`（[nsis-hooks.nsh](file:///d:/cc/claude-code-cli-master/app/src-tauri/nsis-hooks.nsh)）`NSIS_HOOK_POSTUNINSTALL` 做**双清理**：① 递归删除 exe 安装根内的运行时数据子目录（ModuleData / temp / skills / tools / config / paddle-ocr）；② 删除旧版本遗留的 `%LOCALAPPDATA%\Lunac(-dev)`，实现干净卸载。
 13. **OCR 引擎按需下载**：PaddleOCR-json 引擎不随发行包分发，落到 `<exe 根>\paddle-ocr`（与数据根一致）。前端两条入口复用 `ocr.ts` 导出的 `installOcrEngine()`（监听 `ocr-engine-progress`/`ready`/`error`）：① OCR 面板执行识别前先 `ocr_engine_status()`，缺失则在状态行内联「下载并安装」按钮；② 设置 · 常规面板常驻「OCR 引擎」行（状态 + 下载/重试）。**安装必须原子化**：下载 → 解压到 `temp\paddle-ocr-staging` → 校验 `PaddleOCR-json.exe` + `models/config_chinese.txt` → 才删除并 `rename` 到目标目录，任一环节失败清理半成品，避免 `paddle_ocr_dir()` 定位到残缺目录导致 OCR 永久失败且无从诊断。
-14. **Agent 内置工具与审批（P1/P2，2026-09）**：十件工具全部在 `core-agent/src/tools.rs`，工具名必须保持 **PascalCase**（前端 `main.ts` 对 `"Bash"` / `"PowerShell"` 有专门的命令展示与危险命令分类分支），新增/改名要同步 §3.5 的契约表。写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）**必须先发 `can_use_tool` 等前端回包**，agent 侧不做二次判断（白名单与危险命令分类归前端 `classifyRequest()`）；`plan` 档直接拒绝、`LUNAC_WORKSPACE_LOCKED=1` 拦越界 —— 这两道闸门与审批是**与**关系，任何一道都不得为了「少点一次同意」而放宽。**`WebFetch` 与 `AskUserQuestion` 同样必须先审批，且是「`plan` 档不解禁」的例外**（`tools::gated_in_read_only`）：只读档对写类工具免于询问，是因为那些工具反正会被拒（问了白问）；这两件在只读档**放行** —— `WebFetch` 能把 `Read` 到的文件内容拼进 URL 带出本机，`AskUserQuestion` 的答案只能从卡片上取。**`TodoWrite` 是唯一的常驻免审批工具**（不碰本机、只改前端面板），它的免审批不构成先例：判断新工具是否免问，看的是「执行会不会改变本机或把数据带出」。工具报错必须以 `is_error=true` 的 `tool_result` 回给模型（不中断整轮），只有 HTTP/流错误才回滚 history。
+14. **Agent 内置工具与审批（P1/P2，2026-09）**：十一件工具全部在 `core-agent/src/tools.rs`，工具名必须保持 **PascalCase**（前端 `main.ts` 对 `"Bash"` / `"PowerShell"` 有专门的命令展示与危险命令分类分支），新增/改名要同步 §3.5 的契约表。写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）**必须先发 `can_use_tool` 等前端回包**，agent 侧不做二次判断（白名单与危险命令分类归前端 `classifyRequest()`）；`plan` 档直接拒绝、`LUNAC_WORKSPACE_LOCKED=1` 拦越界 —— 这两道闸门与审批是**与**关系，任何一道都不得为了「少点一次同意」而放宽。**`WebSearch`、`WebFetch` 与 `AskUserQuestion` 同样必须先审批，且是「`plan` 档不解禁」的例外**（`tools::gated_in_read_only`）：只读档对写类工具免于询问，是因为那些工具反正会被拒（问了白问）；这三件在只读档**放行** —— `WebSearch` 会把查询词发往外部搜索源，`WebFetch` 能把 `Read` 到的文件内容拼进 URL 带出本机，`AskUserQuestion` 的答案只能从卡片上取。**`TodoWrite` 是唯一的常驻免审批工具**（不碰本机、只改前端面板），它的免审批不构成先例：判断新工具是否免问，看的是「执行会不会改变本机或把数据带出」。工具报错必须以 `is_error=true` 的 `tool_result` 回给模型（不中断整轮），只有 HTTP/流错误才回滚 history。
 15. **Agent 上下文压缩不变量（2026-09）**：历史一律以 **user 文本消息**开头（不是 `tool_result`），`tool_use` 与对应 `tool_result` 不得被拆散（丢弃点要跳过 `tool_result` 开头的位置）。任何改动 `compact_history()` 的代码都必须同步修正调用方的回滚锚点 `base`（`base -= dropped`），并在压缩后往 `system/context_compacted` 事件里报出计数 —— 这三条是「压缩后仍能继续对话」的充分条件，改动后请用 `LUNAC_MAX_CONTEXT_TOKENS=8000` 的真实端点烟测复验。
 16. **测试一律用 flash 模型（2026-09）**：任何真实端点测试（工具往返、权限审批、上下文压缩、MCP 桥等）把 `AI_MODEL` / `LUNAC_AGENT_MODEL` 指向 **`deepseek-flash`**，**不要用 `deepseek-v4-pro`** —— 测试只验证链路、契约与结构，flash 足够且更快更省；只有当问题与回答质量本身相关、或需要复现线上行为时才用 pro。
-17. **MCP 工具命名与审批（P3，2026-09）**：接进请求体的用户工具名一律 `mcp__<原名>`，**前缀与清洗规则（非法字符换 `_`、超长截断、重名加 `_2`）不得随意改动** —— 前端审批卡的「始终允许」按完整工具名记 localStorage 白名单，改名等于让用户的白名单失效。MCP 工具**必须**先发 `can_use_tool`（handler 能跑 shell / 发 HTTP），且 plan（只读）档不接入；桥的失败（spawn/握手/超时）只记 stderr，**绝不允许影响十件内置工具的可用性**。
-18. **前缀缓存不变量（第 19 点，2026-09）**：DeepSeek 等端点的自动前缀缓存按「最长公共前缀」命中，**请求体里任何靠前内容逐字节抖动都会让整段缓存失效**。已定稿的稳定化措施，改动时不得回退：① `history` 一律以 user 文本消息开头；② 压缩丢弃点左移 `base` 锚点而不是改历史首条；③ 系统提示词固定、技能清单按 `key` 排序；④ 内置工具名 PascalCase 稳定、MCP 工具数组**按名排序**后再入请求体；⑤ 工具黑名单只裁剪真实存在的工具名（`core-agent` 的内置十件 + `Skill`），`src-tauri` 侧**不再内置旧 CLI 时代的默认名单** —— 那批名字对自研 agent 全是空转项，且按名精确比较会误伤同名 MCP 工具。判断「改了会不会掉缓存」的方法：把两次请求体开头做 diff，出现任何顺序变化即为回归。
+17. **MCP 工具命名与审批（P3，2026-09）**：接进请求体的用户工具名一律 `mcp__<原名>`，**前缀与清洗规则（非法字符换 `_`、超长截断、重名加 `_2`）不得随意改动** —— 前端审批卡的「始终允许」按完整工具名记 localStorage 白名单，改名等于让用户的白名单失效。MCP 工具**必须**先发 `can_use_tool`（handler 能跑 shell / 发 HTTP），且 plan（只读）档不接入；桥的失败（spawn/握手/超时）只记 stderr，**绝不允许影响十一件内置工具的可用性**。
+18. **前缀缓存不变量（第 19 点，2026-09）**：DeepSeek 等端点的自动前缀缓存按「最长公共前缀」命中，**请求体里任何靠前内容逐字节抖动都会让整段缓存失效**。已定稿的稳定化措施，改动时不得回退：① `history` 一律以 user 文本消息开头；② 压缩丢弃点左移 `base` 锚点而不是改历史首条；③ 系统提示词固定、技能清单按 `key` 排序；④ 内置工具名 PascalCase 稳定、MCP 工具数组**按名排序**后再入请求体；⑤ 工具黑名单只裁剪真实存在的工具名（`core-agent` 的内置十一件 + `Skill`），`src-tauri` 侧**不再内置旧 CLI 时代的默认名单** —— 那批名字对自研 agent 全是空转项，且按名精确比较会误伤同名 MCP 工具。判断「改了会不会掉缓存」的方法：把两次请求体开头做 diff，出现任何顺序变化即为回归。
 19. **用量口径不变量（2026-09）**：`result.usage` 是**每次提问的绝对值**（agent.exe 每次提问把四个计数器清零再累加本轮的工具往返），**永不改成会话累计** —— 累积是前端/面板的事，agent 侧一旦改成累计，回滚（失败轮 `history.truncate(base)`）就会让计数与上下文不一致。前端**禁止对 `result.usage` 做差**（旧 cli.exe 才是累计值，这条是历史包袱）；面板数值一律 = 本地日志 `ModuleData\usage\usage-YYYY-MM-DD.jsonl` 的今日合计。日志字段名 `cacheRead` / `cacheCreate`（驼峰）是 `read_usage_log` 的消费契约，改名前端读的是 undefined 会静默算成 0。详见 §3.5「用量与对账」。
 
 ## 12. Agent Plan 模式规范

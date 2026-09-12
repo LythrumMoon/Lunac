@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch / AskUserQuestion / TodoWrite
+// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -18,6 +18,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,19 @@ const MAX_URL_CHARS: usize = 2000;
 /// WebFetch 的 UA —— 明确标识自己是 Lunac，不冒充其它客户端
 const FETCH_USER_AGENT: &str = concat!("Lunac/", env!("CARGO_PKG_VERSION"));
 
+// ── WebSearch ────────────────────────────────────────────────────
+//
+// 主源 Tavily（官方 key），兜底 DuckDuckGo HTML 抓取（无 key）。
+// api.duckduckgo.com 只返回维基摘要、不返回网页结果。
+const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
+const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+/// DDG 抓取的最小间隔（秒）—— 官方未公开限流值，社区经验 1 req/s 是安全上限，
+const DDG_MIN_INTERVAL_SECS: f64 = 1.1;
+const SEARCH_TIMEOUT_SECS: u64 = 20;
+const SEARCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SEARCH_DEFAULT_COUNT: usize = 5;
+const SEARCH_MAX_COUNT: usize = 10;
+
 /// 目录遍历时跳过的常见重目录（避免 Glob/Grep 卡在依赖上）
 const SKIP_DIRS: [&str; 13] = [
     ".git", "node_modules", "target", "dist", "out", ".next", ".nuxt", ".venv", "venv",
@@ -66,7 +80,7 @@ pub struct Ctx {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 十个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 十一个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -164,6 +178,21 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                     "ignore_case": { "type": "boolean" }
                 },
                 "required": ["pattern"]
+            }
+        }),
+        json!({
+            "name": "WebSearch",
+            "description": "Search the web and get ranked results (title, URL, snippet). Use \
+                this to find pages when you do not know the URL, then WebFetch the promising \
+                ones for the full text. Returns a small JSON-free text list; results may be \
+                stale or wrong, so cite the URLs you actually used.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "count": { "type": "integer", "description": format!("Number of results, 1-{SEARCH_MAX_COUNT} (default {SEARCH_DEFAULT_COUNT})") }
+                },
+                "required": ["query"]
             }
         }),
         json!({
@@ -284,18 +313,25 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 pub fn needs_approval(name: &str) -> bool {
     matches!(
         name,
-        "Write" | "Edit" | "Bash" | "PowerShell" | "WebFetch" | "AskUserQuestion"
+        "Write"
+            | "Edit"
+            | "Bash"
+            | "PowerShell"
+            | "WebSearch"
+            | "WebFetch"
+            | "AskUserQuestion"
     )
 }
 
 /// 只读（plan）档下**仍需**审批的工具。
 ///
 /// 只读档对写类工具免于询问，是因为它们会被 `run()` 直接拒绝（问了白问）。
-/// 下面这两件在只读档是**放行**的，且都必须经过前端交互：
+/// 下面这三件在只读档是**放行**的，且都必须经过前端交互：
+///   · `WebSearch` —— 会把查询词发往外部搜索源
 ///   · `WebFetch` —— 唯一的外部数据出口（`Read` 到的文件内容能拼进 URL 带出）
 ///   · `AskUserQuestion` —— 交互就是它的功能；不问等于拿不到答案
 pub fn gated_in_read_only(name: &str) -> bool {
-    matches!(name, "WebFetch" | "AskUserQuestion")
+    matches!(name, "WebSearch" | "WebFetch" | "AskUserQuestion")
 }
 
 // ── 分发 ─────────────────────────────────────────────────────────
@@ -311,6 +347,7 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "PowerShell" => powershell(ctx, input),
         "Glob" => glob(ctx, input),
         "Grep" => grep(ctx, input),
+        "WebSearch" => web_search(input),
         "WebFetch" => webfetch(input),
         "AskUserQuestion" => ask_user_question(input),
         "TodoWrite" => todo_write(input),
@@ -734,6 +771,297 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
     Ok(truncate(hits.join("\n")))
 }
 
+// ── WebSearch ────────────────────────────────────────────────────
+
+/// 一条搜索结果
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// 网页搜索。**主源 + 兜底**，两级都不调用模型：
+///   ① Tavily（`LUNAC_SEARCH_KEY` 存在时）—— 官方 API，结构化 JSON
+///   ② DuckDuckGo HTML 抓取 —— 无 key，仅在上游失败/无 key 时走（见 `ddg_search`）
+///
+/// 两级的失败原因会一并回给模型（`[fallback] …`），否则「为什么结果这么差」
+/// 在对话里无从诊断。`plan`（只读）档允许调用（网络只读），但**照常审批** ——
+/// 查询串是外部数据出口，见 `gated_in_read_only`。
+fn web_search(input: &Value) -> Result<String, String> {
+    let query = str_arg(input, "query")?.trim().to_string();
+    if query.is_empty() {
+        return Err("query is empty".into());
+    }
+    let count = match input.get("count").and_then(Value::as_u64) {
+        Some(n) => (n as usize).clamp(1, SEARCH_MAX_COUNT),
+        None => SEARCH_DEFAULT_COUNT,
+    };
+
+    let key = std::env::var("LUNAC_SEARCH_KEY").unwrap_or_default();
+    let key = key.trim().to_string();
+    let mut notes: Vec<String> = Vec::new();
+
+    // ① 主源：Tavily（仅在配置了 key 时尝试）
+    if key.is_empty() {
+        notes.push("未配置搜索 API key（设置 · AI · 搜索 API Key），已直接走兜底源".into());
+    } else {
+        match tavily_search(&query, count, &key) {
+            Ok(hits) if !hits.is_empty() => return Ok(format_hits(&query, "tavily", &hits)),
+            Ok(_) => notes.push("Tavily 返回 0 条结果".into()),
+            Err(e) => notes.push(format!("Tavily 失败：{e}")),
+        }
+    }
+
+    // ② 兜底：DuckDuckGo HTML
+    match ddg_search(&query, count) {
+        Ok(hits) if !hits.is_empty() => {
+            let mut out = format_hits(&query, "duckduckgo (html, 兜底)", &hits);
+            out.push_str(&format!("\n\n[fallback] {}", notes.join("；")));
+            Ok(out)
+        }
+        Ok(_) => Err(format!("WebSearch 无结果（{}）", notes.join("；"))),
+        Err(e) => {
+            notes.push(format!("DuckDuckGo 失败：{e}"));
+            Err(format!("WebSearch failed: {}", notes.join("；")))
+        }
+    }
+}
+
+/// 统一的 HTTP 客户端（超时由调用方给；重定向上限与 WebFetch 一致）
+fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::limited(FETCH_MAX_REDIRECTS))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))
+}
+
+/// 读取响应体并封顶（多读 1 字节判断是否被截断），返回 (文本, 是否截断)
+fn read_body_capped(
+    resp: reqwest::blocking::Response,
+    cap: u64,
+) -> Result<(String, bool), String> {
+    let mut buf = Vec::new();
+    resp.take(cap + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read response body: {e}"))?;
+    let truncated = buf.len() as u64 > cap;
+    if truncated {
+        buf.truncate(cap as usize);
+    }
+    Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
+}
+
+/// Tavily Search（官方 API）：`POST /search` + `Authorization: Bearer tvly-…`。
+/// 只取 `results[].title/url/content`；`include_answer`/`include_raw_content`
+/// 一律关掉 —— 摘要是另一个模型生成的，我们不替主模型做判断，且按 token 计费。
+fn tavily_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
+    let client = http_client(SEARCH_TIMEOUT_SECS)?;
+    let resp = client
+        .post(TAVILY_ENDPOINT)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
+        .json(&json!({
+            "query": query,
+            "max_results": count,
+            "search_depth": "basic",
+            "include_answer": false,
+            "include_raw_content": false,
+            "include_images": false,
+        }))
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status();
+    let (body, _) = read_body_capped(resp, SEARCH_MAX_BYTES)?;
+    if !status.is_success() {
+        // 401=key 无效、429=超额度、432/433=额度相关 —— 正文里带原因，截一小段回给模型
+        let brief: String = body.trim().chars().take(200).collect();
+        return Err(format!("HTTP {status} {brief}"));
+    }
+    let v: Value = serde_json::from_str(&body).map_err(|e| format!("bad json: {e}"))?;
+    Ok(parse_tavily(&v))
+}
+
+fn parse_tavily(v: &Value) -> Vec<SearchHit> {
+    v.get("results")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let url = r.get("url").and_then(Value::as_str)?.trim();
+                    if url.is_empty() {
+                        return None;
+                    }
+                    Some(SearchHit {
+                        title: inline_text(r.get("title").and_then(Value::as_str).unwrap_or("")),
+                        url: url.to_string(),
+                        snippet: inline_text(r.get("content").and_then(Value::as_str).unwrap_or("")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// DuckDuckGo 兜底：抓 `html.duckduckgo.com/html/`（免 vqd 握手，单次请求拿整页）。
+///
+/// 这是**抓取不是 API**，风险已在文档里写明：DDG 改版即失效、ToS 禁止抓取、
+/// 结果本身也「largely sourced from Bing」。所以：
+///   · 只在主源不可用/失败时调用
+///   · 进程内强制 ≥ `DDG_MIN_INTERVAL_SECS` 间隔（202 是软封，宁可慢）
+///   · 解析不出结果就**报错**，绝不返回空列表冒充「没有结果」
+fn ddg_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
+    throttle_ddg();
+
+    let client = http_client(SEARCH_TIMEOUT_SECS)?;
+    let resp = client
+        .post(DDG_HTML_ENDPOINT)
+        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
+        .form(&[("q", query)])
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status();
+    let (body, _) = read_body_capped(resp, SEARCH_MAX_BYTES)?;
+    if status.as_u16() == 202 {
+        return Err("HTTP 202（DuckDuckGo 限流，稍后重试）".into());
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+
+    let hits = parse_ddg(&body, count);
+    if hits.is_empty() {
+        // 页面还在但没有结果 → 可能是该查询确实无结果，也可能是结构变了。
+        // 用「有没有结果容器」区分，避免把改版说成「没搜到」。
+        if body.contains("result__a") || body.contains("no-results") {
+            return Ok(Vec::new());
+        }
+        return Err("页面结构无法识别（DuckDuckGo 可能已改版）".into());
+    }
+    Ok(hits)
+}
+
+/// 进程内 DDG 节流（多轮工具调用串行，所以一把锁即可）
+fn throttle_ddg() {
+    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let m = LAST.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    if let Ok(mut last) = m.lock() {
+        let elapsed = last.elapsed().as_secs_f64();
+        if elapsed < DDG_MIN_INTERVAL_SECS {
+            thread::sleep(Duration::from_secs_f64(DDG_MIN_INTERVAL_SECS - elapsed));
+        }
+        *last = Instant::now();
+    }
+}
+
+/// 从 DDG 的 HTML 里抠结果。Rust 正则没有反向引用，所以「取整个 <a …> 标签、
+/// 再在属性里找 href」分两步做 —— 属性顺序在页面里不保证。
+fn parse_ddg(html: &str, count: usize) -> Vec<SearchHit> {
+    let Ok(anchor) = regex::Regex::new(r#"(?s)<a\s+([^>]*result__a[^>]*)>(.*?)</a>"#) else {
+        return Vec::new();
+    };
+    let Ok(href_re) = regex::Regex::new(r#"href="([^"]+)""#) else {
+        return Vec::new();
+    };
+    // 同一条结果里 a 与 snippet 是相邻的兄弟节点，按出现顺序配对最省事
+    let snippets: Vec<String> = regex::Regex::new(r#"(?s)<a\s+[^>]*result__snippet[^>]*>(.*?)</a>"#)
+        .ok()
+        .map(|re| {
+            re.captures_iter(html)
+                .map(|c| inline_text(c.get(1).map(|m| m.as_str()).unwrap_or("")))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    anchor
+        .captures_iter(html)
+        .take(count)
+        .filter_map(|c| {
+            let attrs = c.get(1).map(|m| m.as_str()).unwrap_or("");
+            let href = href_re.captures(attrs)?.get(1)?.as_str();
+            let url = ddg_real_url(href)?;
+            Some(SearchHit {
+                title: inline_text(c.get(2).map(|m| m.as_str()).unwrap_or("")),
+                url,
+                snippet: String::new(),
+            })
+        })
+        .enumerate()
+        .map(|(i, mut h)| {
+            h.snippet = snippets.get(i).cloned().unwrap_or_default();
+            h
+        })
+        .collect()
+}
+
+/// DDG 的链接是跳转壳：`//duckduckgo.com/l/?uddg=<percent-encoded>&rut=…`，
+/// 取 `uddg` 并解码；不是跳转壳时按原样使用（补 `https:`）。
+fn ddg_real_url(href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with("javascript:") {
+        return None;
+    }
+    if let Some(i) = href.find("uddg=") {
+        let rest = &href[i + 5..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        let decoded = percent_decode(&rest[..end]);
+        if decoded.starts_with("http://") || decoded.starts_with("https://") {
+            return Some(decoded);
+        }
+        return None;
+    }
+    if let Some(rest) = href.strip_prefix("//") {
+        return Some(format!("https://{rest}"));
+    }
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    None
+}
+
+/// 百分号解码。**不把 `+` 当空格** —— URL 的 path/query 里 `+` 是合法字符，
+/// 误转会改坏链接。按字节判断（不切片 `&str`：非法转义会被切在 UTF-8 边界上）
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 行内文本（标题/摘要）：剥标签 + 解实体 + 把连续空白压成一个空格
+fn inline_text(s: &str) -> String {
+    let text = if s.contains('<') { html_to_text(s) } else { decode_entities(s) };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_hits(query: &str, source: &str, hits: &[SearchHit]) -> String {
+    let mut out = format!("Query: {query}\nSource: {source}\n");
+    for (i, h) in hits.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}", i + 1, h.title));
+        out.push_str(&format!("\n   {}", h.url));
+        if !h.snippet.is_empty() {
+            out.push_str(&format!("\n   {}", h.snippet));
+        }
+        out.push('\n');
+    }
+    truncate(out)
+}
+
 // ── WebFetch ─────────────────────────────────────────────────────
 
 /// 抓一个 URL，把页面正文转成纯文本回给模型。
@@ -750,11 +1078,7 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
 fn webfetch(input: &Value) -> Result<String, String> {
     let url = normalize_url(&str_arg(input, "url")?)?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(FETCH_MAX_REDIRECTS))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
+    let client = http_client(FETCH_TIMEOUT_SECS)?;
 
     let resp = client
         .get(&url)
@@ -774,21 +1098,12 @@ fn webfetch(input: &Value) -> Result<String, String> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // 多读 1 字节用于判断「被截断」，避免把超大响应整个读进内存
-    let mut buf = Vec::new();
-    resp.take(FETCH_MAX_BYTES + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read response body: {e}"))?;
-    let oversized = buf.len() as u64 > FETCH_MAX_BYTES;
-    if oversized {
-        buf.truncate(FETCH_MAX_BYTES as usize);
-    }
+    let (body, oversized) = read_body_capped(resp, FETCH_MAX_BYTES)?;
 
     if !status.is_success() {
         return Err(format!("WebFetch {url} → HTTP {status}"));
     }
 
-    let body = String::from_utf8_lossy(&buf).into_owned();
     let text = if ctype.contains("html") || looks_like_html(&body) {
         html_to_text(&body)
     } else {

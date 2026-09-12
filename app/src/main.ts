@@ -1214,6 +1214,9 @@ function forceResetPluginUI() {
         key: cfg.key || "",
         model: cfg.model,
         agent_url: cfg.agent_url || null,
+        // WebSearch 主源 key（Tavily）：进程重启后 env 会丢，必须从 localStorage
+        // 复原，否则每次开机都退化成 DuckDuckGo 兜底源。
+        search_key: cfg.search_key || null,
       }).catch(() => {});
     }
   } catch { /* keep .env defaults */ }
@@ -1538,6 +1541,7 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "PowerShell" },
   { name: "Glob" },
   { name: "Grep" },
+  { name: "WebSearch" },
   { name: "WebFetch" },
   { name: "AskUserQuestion" },
   { name: "TodoWrite" },

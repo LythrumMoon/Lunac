@@ -220,7 +220,7 @@ function inferProviderForModel(model: string, fallback: string): string {
   return fallback;
 }
 
-function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string): string {
+function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchKey: string): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -313,6 +313,10 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
       <div class="settings-row">
         <span class="settings-label">${t("settings.api_key")}</span>
         <input type="password" id="settings-apikey" class="settings-input" autocomplete="off" value="${esc(apiKey)}" placeholder="${masked || 'sk-...'}">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.search_key")}</span>
+        <input type="password" id="settings-searchkey" class="settings-input" autocomplete="off" value="${esc(searchKey)}" placeholder="${esc(t("settings.search_key_hint"))}" title="${esc(t("settings.search_key_hint"))}">
       </div>
       <div class="settings-row" style="justify-content: flex-end;">
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
@@ -1537,6 +1541,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
       const model = modelOpt?.getAttribute("data-value") || "";
       const baseUrl = (container.querySelector("#settings-baseurl") as HTMLInputElement)?.value || "";
       const apiKey = (container.querySelector("#settings-apikey") as HTMLInputElement)?.value || "";
+      // WebSearch 主源（Tavily）密钥。每次回传当前输入框值，空串 = 清除
+      // （后端按删除处理，回落到 DuckDuckGo 兜底源）。
+      const searchKey = (container.querySelector("#settings-searchkey") as HTMLInputElement)?.value || "";
       // Preserve existing agent_url if set (don't overwrite with empty)
       let agentUrl = "";
       try {
@@ -1549,11 +1556,12 @@ export async function attachSettingsListeners(container: HTMLElement) {
         key: apiKey,
         model,
         agent_url: agentUrl,
+        search_key: searchKey,
       });
       // Persist to localStorage so config survives restart
       try {
         localStorage.setItem("lunac-ai-config", JSON.stringify({
-          provider, url: baseUrl, key: apiKey, model, agent_url: agentUrl,
+          provider, url: baseUrl, key: apiKey, model, agent_url: agentUrl, search_key: searchKey,
         }));
       } catch {}
     } catch (e) {
@@ -2024,6 +2032,7 @@ export const settingsPlugin: Plugin = {
     let baseUrl = "";
     let model = "";
     let apiKey = "";
+    let searchKey = "";
 
     try {
       hotkey = await invoke<string>("get_hotkey_combo");
@@ -2036,11 +2045,12 @@ export const settingsPlugin: Plugin = {
     try { autoStart = await invoke<boolean>("get_auto_start"); } catch {}
 
     try {
-      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string }>("get_ai_config");
+      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_key: string }>("get_ai_config");
       provider = aiCfg.provider || "";
       baseUrl = aiCfg.base_url || "";
       model = aiCfg.model || "";
       apiKey = aiCfg.api_key || "";
+      searchKey = aiCfg.search_key || "";
     } catch {}
 
     // 未配置供应商（环境缺 AI_PROVIDER）：用模型名反推；仍无则回退 openai
@@ -2050,7 +2060,7 @@ export const settingsPlugin: Plugin = {
     if (!model && preset) model = preset.default_model;
 
     const generalPane = buildGeneralPane(hotkey, autoStart);
-    const aiPane = buildAIPane(provider, baseUrl, model, apiKey);
+    const aiPane = buildAIPane(provider, baseUrl, model, apiKey, searchKey);
     const pluginsPane = await buildPluginsPane();
     const searchPane = await buildSearchPane();
     const skillsPane = await buildSkillsPane();

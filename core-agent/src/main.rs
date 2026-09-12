@@ -638,7 +638,8 @@ fn main() {
         if !cli.ask_permission {
             ""
         } else if tools_ctx.read_only {
-            // 只读档只有 WebFetch / AskUserQuestion 需要审批（写类工具直接被拒）
+            // 只读档只有 WebSearch / WebFetch / AskUserQuestion 需要审批
+            // （写类工具直接被拒）
             " 网络与提问需审批"
         } else {
             " 写操作需审批"
@@ -757,8 +758,8 @@ struct Block {
     input: Value,
 }
 
-/// 需要审批的工具：内置写类四件（Write/Edit/Bash/PowerShell）+ WebFetch
-/// （唯一会把数据发往外部）+ AskUserQuestion（交互本身就是它的功能）
+/// 需要审批的工具：内置写类四件（Write/Edit/Bash/PowerShell）+ WebSearch /
+/// WebFetch（会把数据发往外部）+ AskUserQuestion（交互本身就是它的功能）
 /// + 全部 MCP 工具 —— 后者的 handler 能跑 shell / 发 HTTP，且定义来自
 /// 用户 JSON，agent 侧无权替用户判断安全性，一律交前端卡片决定。
 /// `TodoWrite` 不在其中：它只改前端那块待办面板，不碰本机任何东西。
@@ -1167,8 +1168,9 @@ fn run_query(
         // 工具报错不中断整轮：转成 is_error=true 的 tool_result，模型可自行纠正。
         //
         // plan（只读）档的豁免只对写类工具有效 —— 它们会被 tools::run 直接拒绝，
-        // 问了也是白问。放行的那两件（WebFetch / AskUserQuestion）必须照问：
-        // 前者是唯一的外部数据出口，后者的答案只能从卡片上取（见 gated_in_read_only）。
+        // 问了也是白问。放行的那三件（WebSearch / WebFetch / AskUserQuestion）
+        // 必须照问：搜索查询词与抓取的目标 URL 都是外部出口，后者的答案只能
+        // 从卡片上取（见 gated_in_read_only）。
         let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
             let ask = ask_permission

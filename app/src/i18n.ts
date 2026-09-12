@@ -1180,6 +1180,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "API 키",
     "en": "API Key",
   },
+  "settings.search_key": {
+    "zh-CN": "搜索 API 密钥",
+    "zh-TW": "搜尋 API 金鑰",
+    "ja": "検索 API キー",
+    "ko": "검색 API 키",
+    "en": "Search API Key",
+  },
+  "settings.search_key_hint": {
+    "zh-CN": "Tavily 密钥（可留空，留空时自动使用 DuckDuckGo 兜底搜索）",
+    "zh-TW": "Tavily 金鑰（可留空，留空時自動使用 DuckDuckGo 備援搜尋）",
+    "ja": "Tavily キー（空欄可、空欄時は DuckDuckGo に自動フォールバック）",
+    "ko": "Tavily 키 (비워 두면 DuckDuckGo 대체 검색 사용)",
+    "en": "Tavily key (optional; falls back to DuckDuckGo when empty)",
+  },
   "settings.workspace": {
     "zh-CN": "工作区",
     "zh-TW": "工作區",
