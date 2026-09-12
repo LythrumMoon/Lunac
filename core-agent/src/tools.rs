@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep
+// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebFetch
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -38,6 +38,13 @@ const BASH_TIMEOUT_MS: u64 = 120_000;
 const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
 /// Glob 递归深度上限
 const MAX_DEPTH: usize = 12;
+/// WebFetch：单次抓取的响应体积上限、超时、重定向上限、URL 长度上限
+const FETCH_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const FETCH_TIMEOUT_SECS: u64 = 60;
+const FETCH_MAX_REDIRECTS: usize = 10;
+const MAX_URL_CHARS: usize = 2000;
+/// WebFetch 的 UA —— 明确标识自己是 Lunac，不冒充其它客户端
+const FETCH_USER_AGENT: &str = concat!("Lunac/", env!("CARGO_PKG_VERSION"));
 
 /// 目录遍历时跳过的常见重目录（避免 Glob/Grep 卡在依赖上）
 const SKIP_DIRS: [&str; 13] = [
@@ -59,7 +66,7 @@ pub struct Ctx {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 六个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 八个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -159,6 +166,21 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["pattern"]
             }
         }),
+        json!({
+            "name": "WebFetch",
+            "description": "Fetch a URL and return its readable text (HTML is converted to \
+                plain text, script/style/comments removed). Use this to read documentation or \
+                a web page. Only single documents can be fetched — the page is returned in \
+                full, so you can answer any question about it yourself.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Absolute http(s) URL to fetch" },
+                    "prompt": { "type": "string", "description": "What you want to learn from the page (advisory only — the full text is returned regardless)" }
+                },
+                "required": ["url"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -179,14 +201,19 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 
 /// 是否需要先过用户审批（P2 的 `can_use_tool`）。
 ///
-/// 只读三件不需要（工作区锁已是硬边界）；写类三件 + PowerShell 一律先问 ——
-/// 前端 `classifyRequest()` 会自行处理「白名单 / 内置安全前缀自动放行」与
-/// 「危险命令只给手动确认」，所以 agent 侧不做二次判断，问就完了。
-/// 返回真实改动前用户应看到提示的调用也在此列（含 Bash / PowerShell 的只读命令）。
+/// 只读四件（`Read`/`Glob`/`Grep`/`WebFetch`）里的前三件不需要 —— 工作区锁
+/// 已是硬边界；`WebFetch` 不算，它是**唯一会把数据发往外部**的内置工具，
+/// 由前端 `classifyRequest()` 决定「白名单自动放行」还是「弹卡片」。
+/// 写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）一律先问 —— 前端会自行处理
+/// 「白名单 / 内置安全前缀自动放行」与「危险命令只给手动确认」，所以 agent
+/// 侧不做二次判断，问就完了。
 ///
-/// `plan` 档不在此判断：那几件工具会被 tools::run 直接拒绝，压根到不了审批。
+/// `plan` 档不在此判断：那四件写类工具会被 tools::run 直接拒绝，压根到不了审批。
 pub fn needs_approval(name: &str) -> bool {
-    matches!(name, "Write" | "Edit" | "Bash" | "PowerShell")
+    matches!(
+        name,
+        "Write" | "Edit" | "Bash" | "PowerShell" | "WebFetch"
+    )
 }
 
 // ── 分发 ─────────────────────────────────────────────────────────
@@ -202,6 +229,7 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "PowerShell" => powershell(ctx, input),
         "Glob" => glob(ctx, input),
         "Grep" => grep(ctx, input),
+        "WebFetch" => webfetch(input),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -620,6 +648,242 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
         return Ok(format!("No matches for {pattern}"));
     }
     Ok(truncate(hits.join("\n")))
+}
+
+// ── WebFetch ─────────────────────────────────────────────────────
+
+/// 抓一个 URL，把页面正文转成纯文本回给模型。
+///
+/// 与旧 CLI 的两点差异（都是有意为之）：
+///   · **不做二次模型摘要** —— 旧实现把 markdown 交给 Haiku 按 `prompt` 提炼。
+///     我们直接把正文回给主模型（它本来就能读），省一次往返，也不绑死某个
+///     供应商的小模型；`prompt` 因此只是提示性的，不影响返回值。
+///   · **不做域名预检** —— 旧实现请求 `api.anthropic.com/api/web/domain_info`
+///     拿 `can_fetch`，我们没有那个服务。安全性交给审批（见 `needs_approval`）
+///     与前端白名单，agent 侧不假装自己能判断域名安不安全。
+///
+/// `plan`（只读）档**允许**调用：它是网络只读，不改本机任何东西。
+fn webfetch(input: &Value) -> Result<String, String> {
+    let url = normalize_url(&str_arg(input, "url")?)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::limited(FETCH_MAX_REDIRECTS))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html, text/plain, text/markdown, application/json;q=0.9, */*;q=0.8",
+        )
+        .send()
+        .map_err(|e| format!("WebFetch failed: {e}"))?;
+
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // 多读 1 字节用于判断「被截断」，避免把超大响应整个读进内存
+    let mut buf = Vec::new();
+    resp.take(FETCH_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read response body: {e}"))?;
+    let oversized = buf.len() as u64 > FETCH_MAX_BYTES;
+    if oversized {
+        buf.truncate(FETCH_MAX_BYTES as usize);
+    }
+
+    if !status.is_success() {
+        return Err(format!("WebFetch {url} → HTTP {status}"));
+    }
+
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    let text = if ctype.contains("html") || looks_like_html(&body) {
+        html_to_text(&body)
+    } else {
+        body.trim().to_string()
+    };
+    if text.is_empty() {
+        return Err(format!(
+            "WebFetch {url} → empty body (content-type: {})",
+            if ctype.is_empty() { "unknown" } else { &ctype }
+        ));
+    }
+
+    let mut out = format!("URL: {url}\nStatus: {status}\n\n{text}");
+    if oversized {
+        out.push_str(&format!(
+            "\n\n… (body truncated at {FETCH_MAX_BYTES} bytes)"
+        ));
+    }
+    Ok(truncate(out))
+}
+
+/// URL 规范化：去空白、`http` 升级为 `https`（与旧 CLI 一致，避免明文抓取）、
+/// 长度封顶。不解析 host —— 拦截交给审批，这里只把明显不合法的挡掉。
+fn normalize_url(raw: &str) -> Result<String, String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err("url is empty".into());
+    }
+    if url.chars().count() > MAX_URL_CHARS {
+        return Err(format!("url is longer than {MAX_URL_CHARS} characters"));
+    }
+    let url = match url.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
+    };
+    if !url.starts_with("https://") {
+        return Err(format!("only http/https URLs are supported: {url}"));
+    }
+    Ok(url)
+}
+
+/// 响应体前若干字符里出现 html 特征 —— 有些站点不返回正确的 content-type
+fn looks_like_html(body: &str) -> bool {
+    let head: String = body.chars().take(512).collect::<String>().to_ascii_lowercase();
+    head.contains("<!doctype html")
+        || head.contains("<html")
+        || head.contains("<head")
+        || head.contains("<body")
+}
+
+/// HTML → 纯文本。不引入 DOM / turndown 依赖：去掉脚本样式与注释、把块级
+/// 标签当换行、剥掉其余标签、解实体 —— 够读文档，不追求渲染级还原。
+fn html_to_text(html: &str) -> String {
+    // 注意：Rust 正则**不支持反向引用**，所以开闭标签只能各自列一遍
+    let Ok(drop) = regex::Regex::new(
+        r"(?is)<(?:script|style|noscript|svg|template)\b[^>]*>.*?</(?:script|style|noscript|svg|template)\s*>",
+    ) else {
+        return html.trim().to_string();
+    };
+    let Ok(comment) = regex::Regex::new(r"(?s)<!--.*?-->") else {
+        return html.trim().to_string();
+    };
+    let Ok(block) = regex::Regex::new(
+        r"(?i)<(?:br|hr|/p|/div|/li|/tr|/h[1-6]|/section|/article|/pre|/blockquote|/table)\b[^>]*>",
+    ) else {
+        return html.trim().to_string();
+    };
+    let Ok(tag) = regex::Regex::new(r"(?s)<[^>]*>") else {
+        return html.trim().to_string();
+    };
+
+    let stripped = drop.replace_all(html, " ");
+    let stripped = comment.replace_all(&stripped, " ");
+    let stripped = block.replace_all(&stripped, "\n");
+    let stripped = tag.replace_all(&stripped, "");
+    collapse_lines(&decode_entities(&stripped))
+}
+
+/// 逐行 trim、空行折叠为一个、去掉首尾空行 —— HTML 剥完会剩大量空白
+fn collapse_lines(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut pending_blank = false;
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            pending_blank = !out.is_empty();
+            continue;
+        }
+        if pending_blank {
+            out.push("");
+            pending_blank = false;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// HTML 实体解码。只覆盖正文高频实体与数字实体，未知实体保持原样 ——
+/// 全表（2000+ 项）不值得为「读文档」这个场景引入。
+fn decode_entities(s: &str) -> String {
+    let Ok(re) =
+        regex::Regex::new(r"&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});")
+    else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    for m in re.find_iter(s) {
+        out.push_str(&s[last..m.start()]);
+        match entity_value(m.as_str()) {
+            Some(v) => out.push_str(&v),
+            None => out.push_str(m.as_str()),
+        }
+        last = m.end();
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// `&amp;` 形态的实体 → 实际字符；无法识别返回 None（调用方保留原样）
+fn entity_value(ent: &str) -> Option<String> {
+    let body = ent.strip_prefix('&')?.strip_suffix(';')?;
+    if let Some(num) = body.strip_prefix('#') {
+        let code = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        return char::from_u32(code).map(String::from);
+    }
+    let c = match body {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" | "QUOT" => '"',
+        "apos" => '\'',
+        "nbsp" | "ensp" | "emsp" | "thinsp" => ' ',
+        "shy" => return Some(String::new()),
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "hellip" => '…',
+        "mdash" => '—',
+        "ndash" => '–',
+        "minus" => '−',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "laquo" => '«',
+        "raquo" => '»',
+        "bull" => '•',
+        "middot" => '·',
+        "dagger" => '†',
+        "sect" => '§',
+        "para" => '¶',
+        "deg" => '°',
+        "plusmn" => '±',
+        "times" => '×',
+        "divide" => '÷',
+        "frac12" => '½',
+        "permil" => '‰',
+        "euro" => '€',
+        "pound" => '£',
+        "yen" => '¥',
+        "cent" => '¢',
+        "ge" => '≥',
+        "le" => '≤',
+        "ne" => '≠',
+        "asymp" => '≈',
+        "infin" => '∞',
+        "larr" => '←',
+        "uarr" => '↑',
+        "rarr" => '→',
+        "darr" => '↓',
+        "check" => '✓',
+        "star" => '★',
+        _ => return None,
+    };
+    Some(c.to_string())
 }
 
 /// 递归收集文本文件（跳过 SKIP_DIRS，深度与数量封顶）

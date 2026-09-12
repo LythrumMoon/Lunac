@@ -635,7 +635,14 @@ fn main() {
         tools_ctx.cwd.display(),
         tool_names.join(","),
         if tools_ctx.read_only { " 只读模式" } else { "" },
-        if cli.ask_permission && !tools_ctx.read_only { " 写操作需审批" } else { "" }
+        if !cli.ask_permission {
+            ""
+        } else if tools_ctx.read_only {
+            // 只读档只有 WebFetch 需要审批（写类工具直接被拒，不必问）
+            " 网络读取需审批"
+        } else {
+            " 写操作需审批"
+        }
     );
 
     let cfg = match Cfg::from_env() {
@@ -750,9 +757,10 @@ struct Block {
     input: Value,
 }
 
-/// 需要审批的工具：内置可写四件（Write/Edit/Bash/PowerShell）+ 全部 MCP 工具 ——
-/// 后者的 handler 能跑 shell / 发 HTTP，且定义来自用户 JSON，agent 侧
-/// 无权替用户判断安全性，一律交前端卡片决定。
+/// 需要审批的工具：内置写类四件（Write/Edit/Bash/PowerShell）+ WebFetch
+/// （唯一会把数据发往外部）+ 全部 MCP 工具 —— 后者的 handler 能跑 shell /
+/// 发 HTTP，且定义来自用户 JSON，agent 侧无权替用户判断安全性，
+/// 一律交前端卡片决定。
 fn needs_approval(name: &str) -> bool {
     tools::needs_approval(name) || mcp::is_mcp(name)
 }
@@ -1156,10 +1164,17 @@ fn run_query(
         // 写类工具先请用户审批（P2）：一批先全部发出，前端才能把连续 Bash
         // 合并成一行（findLastBashGroup）一次决定；随后按顺序阻塞等回包。
         // 工具报错不中断整轮：转成 is_error=true 的 tool_result，模型可自行纠正。
-        let gate = ask_permission && !tctx.read_only;
+        //
+        // plan（只读）档的豁免只对写类工具有效 —— 它们会被 tools::run 直接拒绝，
+        // 问了也是白问。但 WebFetch 在只读档是**放行**的，而它是唯一会把数据
+        // 发往外部的内置工具（Read 到的文件内容可以拼进 URL），所以它不享受
+        // 这个豁免：只读档下同样要过审批。
         let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
-            if gate && needs_approval(name) {
+            let ask = ask_permission
+                && needs_approval(name)
+                && (!tctx.read_only || name == "WebFetch");
+            if ask {
                 pendings.push(Some(open_approval(name, id, input)));
             } else {
                 pendings.push(None);

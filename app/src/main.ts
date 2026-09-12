@@ -1530,6 +1530,7 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "PowerShell" },
   { name: "Glob" },
   { name: "Grep" },
+  { name: "WebFetch" },
   { name: "Skill" },
 ];
 

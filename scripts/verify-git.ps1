@@ -1,4 +1,4 @@
-﻿# scripts/verify-git.ps1
+﻿﻿# scripts/verify-git.ps1
 # 「新克隆自检」—— 把本仓库克隆到新机器后先跑这个，一次列清缺什么。
 #
 # 用法:  powershell -ExecutionPolicy Bypass -File scripts\verify-git.ps1

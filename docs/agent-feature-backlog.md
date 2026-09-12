@@ -2,7 +2,7 @@
 
 > **用途**：把「旧 cli.exe 有、自研 agent.exe 没有」的能力集中登记为待实现项，并说明每一项对 Lunac（Windows 桌面启动器 + AI 对话）的实际价值，避免重复考古 `core/`。
 >
-> **状态基线**：agent.exe 目前 = P0 多轮循环/流式/用量 + P1 七件内置工具 + P2 权限审批 + P3 MCP 工具桥 + P4 技能 + 上下文预算/压缩，见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。
+> **状态基线**：agent.exe 目前 = P0 多轮循环/流式/用量 + P1 八件内置工具 + P2 权限审批 + P3 MCP 工具桥 + P4 技能 + 上下文预算/压缩，见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。
 >
 > **核对口径**（本文的「全集」从这三个真源枚举，不是靠目录名猜的）：
 > 1. 工具：[core/tools.ts](file:///d:/cc/claude-code-cli-master/core/tools.ts) `getAllBaseTools()` —— 旧 CLI 自己标注的「ALL tools 的唯一真源」
@@ -17,7 +17,7 @@
 
 | 维度 | 旧 cli.exe | agent.exe 现在 | 缺口 |
 |---|---|---|---|
-| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 7 个内置 + `Skill`（技能）+ 动态接入的 MCP 用户工具（`mcp__*`，来自 `tools\*.json`） | 29 个具名工具 |
+| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 8 个内置 + `Skill`（技能）+ 动态接入的 MCP 用户工具（`mcp__*`，来自 `tools\*.json`） | 28 个具名工具 |
 | 斜杠命令 | 75+ | 0 | 全部 |
 | 命令行开关 | 123+ 个 `--flag` | 7 个（`--add-dir` / `--permission-mode` / `--permission-prompt-tool` / `--dangerously-skip-permissions` / `--disallowedTools` / `--mcp-server` + 忽略其余） | ~116 个 |
 | 顶层子系统 | ~22 | 6（Agent 循环、工具执行、权限审批、上下文预算/压缩、MCP 桥、技能） | ~16 |
@@ -33,8 +33,8 @@
 | 工具 | 旧 CLI 位置 | 价值 | 说明 |
 |---|---|---|---|
 | ~~`PowerShell`~~ | `core/tools/PowerShellTool/` | **高** | ✅ **已完成（2026-09）**：`-NoProfile -NonInteractive -Command` + 双 UTF-8 编码兜底（中文输出不再变乱码），与 `Bash` 共用 `run_shell`；`plan` 档拒绝、非 plan 档先审批，真机烟测通过 |
-| `WebSearch` | `core/tools/WebSearchTool/` | **高** | 无联网检索；前端搜索栏已有「Web 搜索」入口，但 Agent 侧搜不了 |
-| `WebFetch` | `core/tools/WebFetchTool/` | **高** | 抓取指定 URL 正文（含域名预批准 `preapproved.ts`），是「让它读文档」的前提 |
+| `WebSearch` | `core/tools/WebSearchTool/` | **高** | ⛔ **不能照搬（2026-09 核查）**：旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（`WebSearchTool.ts:76-84`），结果经 `server_tool_use` / `web_search_tool_result` 流式回传，全仓无任何本地搜索源。自研要做得另接第三方搜索 API（需用户配 key）或自建抓取 —— 属新依赖，需先定方案 |
+| ~~`WebFetch`~~ | `core/tools/WebFetchTool/` | **高** | ✅ **已完成（2026-09）**：HTML→纯文本抓取（无 DOM 依赖）、60s 超时 / ≤10MB / UA 标识 Lunac；**未照搬两处服务端依赖** —— 域名预检 `api.anthropic.com/api/web/domain_info` 与 Haiku 二次摘要。只读档同样走审批（唯一外部数据出口），烟测见 [ai-spec.md §9](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md) |
 | `AskUserQuestion` | `core/tools/AskUserQuestionTool/` | **高** | 结构化提问（多选项）—— 现在只能靠模型在文本里问，用户没法点选 |
 | `TodoWrite` | `core/tools/TodoWriteTool/` | **中高** | 长任务的进度可见性；旧 CLI 用它支撑多步任务，不需要任务框架也能用 |
 | `Skill` | `core/tools/SkillTool/` | **中高** | P4 计划内；设置面板已有「技能扩展」且 UI 文案声称 agent.exe 会加载 —— 目前不读，属明显缺口 |
@@ -123,7 +123,7 @@
 ## 4. 已核对：以下不是缺口
 
 - **前端依赖的 stdout 契约**：`system/init`、`stream_event`（4 种 delta）、`assistant`、`user/tool_result`、`control_request`、`result`（含 4 个 token 字段）—— agent.exe **全部已提供**，token 面板数据源正常。
-- **工具名硬编码**：前端特判的 `Bash`（及 `PowerShell`）命名一致；七件内置工具名字与旧 CLI 完全同名同义。
+- **工具名硬编码**：前端特判的 `Bash`（及 `PowerShell`）命名一致；八件内置工具名字与旧 CLI 完全同名同义。
 - **`--disallowedTools` 链路**：Rust → agent.exe → 请求体过滤已通，UI 黑名单候选列表已换成真实工具名（见 §5）。
 - **思考档位跨模型自适应**：旧 CLI 没有对应机制（它绑定自家模型），我们反而是超集。
 
@@ -133,7 +133,7 @@
 
 | 项 | 位置 | 处理 |
 |---|---|---|
-| ~~工具黑名单候选列表全是旧工具名，用户**无法禁用**真实内置工具~~ | [main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts) `TOOL_BLACKLIST_CANDIDATES` | ✅ 已修（2026-09，第 19 点缓存优化）：候选换成真实八件（内置七件 + `Skill`），Rust 侧删掉对自研 agent 全为空转的 `DEFAULT_TOOL_BLACKLIST` —— 勾选即真正从请求体 `tools` 裁掉，缩短前缀、提升缓存命中 |
+| ~~工具黑名单候选列表全是旧工具名，用户**无法禁用**真实内置工具~~ | [main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts) `TOOL_BLACKLIST_CANDIDATES` | ✅ 已修（2026-09，第 19 点缓存优化）：候选换成真实内置工具名（含 `Skill`），Rust 侧删掉对自研 agent 全为空转的 `DEFAULT_TOOL_BLACKLIST` —— 勾选即真正从请求体 `tools` 裁掉，缩短前缀、提升缓存命中 |
 | ~~「技能扩展」文案声称 agent.exe 会加载该目录，实际不读~~ | [settings.ts L386-446](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L386-L446)、i18n `settings.skills_*` | ✅ 文案已属实（P4，2026-09）：agent.exe 启动时读该目录，增删改后前端自动重启 agent 生效 |
 | 「插件 (MCP 工具)」面板只读展示，无下发通道 | [settings.ts L448+](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L448) | ✅ 已随 P3 落地：agent.exe 现在会读 `<exe 根>\tools\*.json`（面板的安装/编辑/删除 + 重启 agent 流程已生效）；面板自身仍是只读列表 + 安装入口，编辑在 Tool Editor 插件里 |
 | 安全档位 `set_security_profile` 无前端入口 | `app/src-tauri/src/commands.rs` `set_security_profile` | 设置面板加 safe/project/full 切换 |
@@ -145,7 +145,7 @@
 1. ~~**上下文预算 + 压缩**（§2.1）——唯一「用久了必然坏掉」的缺口，属防回归性质~~ ✅ **已完成（2026-09）**
 2. ~~**P3 MCP 工具桥** —— 让「插件」面板与 `tools\*.json` 真正生效~~ ✅ **已完成（2026-09）**；resources 两件未做
 3. ~~**P4 Skills** —— 让「技能扩展」面板生效，并修掉失实文案~~ ✅ **已完成（2026-09）**；fork / remote 未做
-4. **低成本高收益**：~~`PowerShell` 工具~~ ✅（2026-09）、~~工具黑名单候选列表刷新~~ ✅（2026-09，同步提升前缀缓存命中）；剩余 `WebFetch`/`WebSearch`、`AskUserQuestion`、`TodoWrite`
+4. **低成本高收益**：~~`PowerShell` 工具~~ ✅（2026-09）、~~工具黑名单候选列表刷新~~ ✅（2026-09，同步提升前缀缓存命中）、~~`WebFetch`~~ ✅（2026-09）；剩余 `WebSearch`（⛔ 需先定搜索源方案，见 §1.1）、`AskUserQuestion`、`TodoWrite`
 5. 视需要：权限 hooks、自动权限分类器、模型输出重试、Bash AST 安全分析
 6. ~~**前缀缓存命中率优化**（第 19 点）~~ ✅ **已完成（2026-09）**：MCP 工具数组按名排序、技能清单按 `key` 排序、工具黑名单不再内置空转旧名 —— 不变量见 [ai-spec.md §11 规则 18](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)
 
