@@ -1,0 +1,18 @@
+{
+  "name": "file_sha256",
+  "description": "Compute the SHA-256 hash of a local file. Useful to verify downloads or detect whether two files are identical. Read-only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute path of the file to hash"
+      }
+    },
+    "required": ["path"]
+  },
+  "handler": {
+    "type": "shell",
+    "command": "powershell -NoProfile -NonInteractive -Command \"(Get-FileHash -Algorithm SHA256 -LiteralPath '{{path}}').Hash\""
+  }
+}

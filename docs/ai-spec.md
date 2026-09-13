@@ -202,7 +202,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 面 | 内容 |
 |---|---|
-| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_PROVIDER` + `LUNAC_SEARCH_KEY`（WebSearch 主源的服务商与密钥，服务商可选 bocha / tavily / exa / firecrawl；缺任一项则只用无 key 的 Bing / 百度兜底源） |
+| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_PROVIDER` + `LUNAC_SEARCH_KEY`（WebSearch 主源的服务商与密钥，服务商可选 bocha / tavily / exa / firecrawl；缺任一项则只用无 key 的 Bing / 百度兜底源）、`LUNAC_LOG_DIR`（宿主注入的日志目录 = `<exe 根>\temp\logs`）、`LUNAC_LOG`（`off` = 关闭落盘日志）、`LUNAC_LOG_LEVEL`（`error\|warn\|info\|debug`，默认 `info`；见 §11 规则 20） |
 | 启动参数 | `--add-dir <dir>`（可重复，工作区外追加可访问目录）/ `--permission-mode plan`（只读）/ `--dangerously-skip-permissions`（忽略工作区锁）/ `--permission-prompt-tool stdio`（写类工具先审批）/ `--disallowedTools <name…>`（这些工具不进请求体）/ `--mcp-server stdio:<exe 路径>`（拉起该 exe 的 MCP server 并接入其工具，P3）；其余（`--print` / `--verbose` / `--input-format stream-json` / `--include-partial-messages` …）一律接受并忽略 |
 | stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"\|"deny",…}}}` 为审批回包（P2，由 stdin 线程按 request_id 直接投递给等待中的工具调用） |
 | stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
@@ -238,7 +238,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 **P2 审批实现要点**：一批工具**先全部发请求、再逐个等回包**（前端才能把连续 Bash 合并成一行一次性决定，见 `findLastBashGroup`）；`updatedInput` 为非空对象时覆盖原参数，空对象表示按原参数执行；`behavior=deny` 转成 `is_error=true` 的 `tool_result` 交回模型（模型可改方案），回包带 `interrupt=true` 则本轮就此结束；等待上限 300s，超时按拒绝处理并回一条 `control_cancel_request` 让前端撤掉卡片。回包由 stdin 线程按 `request_id` 直接投递给等待中的调用，不进主消息队列。
 
-⚠️ **档位仍不可切换**（`set_security_profile` 命令存在但前端无人调用），默认始终是「项目」档 —— 写操作「每次都要点一次同意」，但不再有静默执行。
+✅ **档位已可切换（2026-09）**：两个入口共用 `set_security_profile`（`restart=true` 才重启 agent）——① 设置 · AI 面板的**安全档位**下拉（只读 / 项目 / 完全，边界 = 允不允许）；② AI 输入栏的**运行方式**胶囊（手动 / 白名单 / 自动，频率 = 问不问，「自动」档映射 `full`）。两者关系、自动档二次确认与常驻警示、越界卡片的三个动作见 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md) §4，规则见 §11 规则 21。
 
 **结构化提问（AskUserQuestion，2026-09）**：模型发 `AskUserQuestion{questions:[…]}` → agent 发 `can_use_tool` → 前端把选项渲染成按钮 → 用户点选后**经 `updatedInput` 回答案**，agent 用它覆盖原参数并执行工具（答案不带 `interrupt`，一轮照常继续）。
 
@@ -292,9 +292,11 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 档 | 触发 | 动作 |
 |---|---|---|
-| 瘦身 | 实测 > 预算 × 0.70 | 把较旧轮次里超 2000 字符的 `tool_result.content` 就地换成 `[elided: N chars dropped to save context]`（文件内容/Grep 结果是体积大头，价值递减），尾部 8 条不动 |
-| 丢弃 | 实测 > 预算 × 0.90 | 强制模式下除瘦身外，再从最老处整条丢弃、只留尾部 8 条；**始终保留开头那条用户提问**（任务目标），且丢弃后首条不得是 `tool_result`（必须紧跟对应 `tool_use`），否则补一条 `TRIMMED_MARKER` 文本消息 |
+| 瘦身 | 实测 > 预算 × 0.85 **且**距上次压缩已再长 ≥ 预算 × 0.15（滞回） | 把较旧轮次里超 2000 字符的 `tool_result.content` 就地换成 `[elided: N chars dropped to save context]`（文件内容/Grep 结果是体积大头，价值递减），尾部 8 条不动。**只瘦身、永不丢整条消息** —— 在这个水位上丢消息等于白废一次缓存 |
+| 丢弃 | 实测 > 预算 × 0.95 | 从最老处整条丢弃、只留尾部 8 条（**仅当没有可瘦身的大块**时；体积在对话本身才丢）；**始终保留开头那条用户提问**（任务目标），且丢弃后首条不得是 `tool_result`（必须紧跟对应 `tool_use`），否则补一条 `TRIMMED_MARKER` 文本消息 |
 | 400 兜底 | 端点回报的 400 正文含 `context`/`too long`/`input length` | 强制压缩一次后重试（每轮至多一次），兜住估算误差 |
+
+**水位为什么定得高 + 为什么要滞回（2026-09）**：每次压缩都会改写请求前缀，端点侧 KV 缓存随之整段作废。原先 0.70 水位 + 无滞回，会让**每轮都有一两条旧消息跨过保留尾部被瘦身** → 前缀每轮都变、缓存每轮归零，实测是缓存命中率偏低的最大来源。现在：水位抬到 0.85/0.95、瘦身档加滞回（一次压缩后要再长 15% 预算才允许动第二次），并把「只瘦身档也能直接丢消息」这条去掉。丢弃档不受滞回约束 —— 到了 0.95 不压就可能 400，安全优先。见 §11 规则 23。
 
 压缩发生时往 stderr 与 stdout 各报一次（stdout 为 `system/context_compacted`，含 `elided` / `dropped` 计数）。**压缩会左移 `history`，调用方的失败回滚锚点 `base` 必须同步减去 `dropped`**，否则回滚会误删保留段。单条用户输入超 100000 字符先截断（防一次粘贴顶爆窗口）。
 
@@ -306,7 +308,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 粒度差 | 平台**按每次 API 请求**记一行，本地**按每次提问**记一行 —— 一次带工具的提问在平台上就是多行（system prompt + tools 前缀每次重发），对账时把同一时间窗的平台各行相加 |
 | 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, input, output, cacheRead, cacheCreate}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init` |
 | 读写命令 | [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs) `append_usage_log(date, record)` / `read_usage_log(date)`；`date` 只接受严格 `YYYY-MM-DD`（文件名来自前端，必须挡路径拼串）；读取时单行损坏只跳过该行 |
-| 面板数值 | token 仪表盘 = 今日日志的合计（首次显示时播种一次，之后每次提问累加），因此重启、切会话都不再清零，与平台按天统计同口径 |
+| 面板数值 | token 仪表盘 = 今日日志的合计（首次显示时播种一次，之后每次提问累加），因此重启、切会话都不再清零，与平台按天统计同口径。今日发生过压缩时，命中率的 tooltip 会追加一句「压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
 | 计算口径 | Hit = `cacheRead`；Miss = `input + cacheCreate`（Anthropic 的 `input_tokens` **不含**缓存两项，故不能拿它减 `cache_read`）；Total = Miss + Hit + `output` |
 
 **P3 已完成（2026-09，MCP 工具桥）**：实现在 [core-agent/src/mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)。src-tauri 在 spawn 时把 lunac.exe 自己的路径交过来（`--mcp-server stdio:<路径>`），agent **作 client** 把该 exe 以 `--mcp-server` 拉起 —— 那个进程会拦截该参数、进 stdio MCP server 模式（实现在 [mcp_server.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/mcp_server.rs)），读 `<exe 根>\tools\*.json` 的用户自定义工具（handler 有 `shell` / `http` / `builtin` 三种）。
@@ -368,6 +370,7 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
 - 每行按钮紧凑（`padding: 4px 0`），danger 命令不提供"始终允许"。
 
 **B. 工具调用过程展示（对话流内）**
+> 2026-09 升级：工具行升级为**命令卡片**（状态 / 退出码 / 耗时 / 折叠输出 / 复制）、思考块规范化（省略 + 惰性渲染）、回合自动折叠，详见 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md) §3。以下各条仍是底线要求。
 - 工具参数实时显示**可读摘要**而非原始 JSON：Bash/PowerShell 显示 `command` 文本；其他工具显示 `key=value` 摘要（≤200 字符截断）。
 - 工具结果成功时折叠为一行 `✓ 完成: <120字符摘要>`，点击 `<details>` 展开完整输出（≤600 字符）；失败显示 `✗` + 错误原因；⚠ 安全告警保留黄色高亮。
 - 思考过程默认折叠为 `▸ 思考中…`，展开查看完整内容。
@@ -503,6 +506,7 @@ app/
 │   │   ├── main.rs                  # Tauri 入口 — 窗口/托盘/子进程
 │   │   ├── hotkey.rs                # 原生 Win32 热键
 │   │   ├── commands.rs              # IPC 命令
+│   │   ├── log.rs                   # 落盘日志（宿主侧：启动/退出、agent stderr、前端 JS 错误，见 §11 规则 20）
 │   │   └── mcp_server.rs            # MCP stdio 服务器 (Agent Tools 执行引擎)
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
@@ -519,6 +523,7 @@ core-agent/
 ├── src/tools.rs                     # P1 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
 ├── src/mcp.rs                       # P3 MCP 工具桥（stdio client，连 lunac.exe --mcp-server）
 ├── src/skills.rs                    # P4 技能（LUNAC_SKILLS_DIR 的 <key>/SKILL.md + Skill 工具）
+├── src/log.rs                       # 落盘日志（agent 侧：工具调用与错误、stderr、panic，见 §11 规则 20）
 ├── Cargo.toml
 └── target/release/agent.exe         # 编译产物（cargo build --release，约 2.5MB，不入库）
 
@@ -533,7 +538,7 @@ scripts/
 ```
 
 > 所有 ps1 脚本必须用 `$PSScriptRoot` / `Split-Path -Parent $PSScriptRoot` 推导仓库根，**禁止硬编码本机绝对路径**；统一包管理器为 `npm`。
-> **ps1 含中文必须以 UTF-8 with BOM 保存** —— Windows PowerShell 5.1 对无 BOM 文件按 ANSI(GBK) 解码，中文字符会把紧随其后的引号/换行吞进双字节，导致「字符串缺少终止符」等解析错误（`download-paddle-ocr.ps1`、`build-release.ps1` 曾因此无法运行）。
+> **含中文的 `.ps1` 与 `.nsi` 必须以 UTF-8 with BOM 保存** —— Windows PowerShell 5.1 与 makensis 对无 BOM 文件按 ANSI(GBK) 解码，中文字符会把紧随其后的引号/换行吞进双字节：ps1 报「字符串缺少终止符」，NSI 报 `Bad text encoding: <file>:<line>`（行号指向**首个非 ASCII 行**，不是真正出问题的那一行，极易误判）。已知触发源：`download-paddle-ocr.ps1` / `build-release.ps1`（PS 侧），以及**用会丢 BOM 的编辑器/批量替换工具改 `scripts\lunac-installer.nsi`**（实测：一次文本替换就把 BOM 抹掉，makensis 立刻在第 14 行中文注释处报 `Bad text encoding`，整个打包链路直接断掉）。`build-release.ps1` 第 ⑨ 步每次都会用 `UTF8Encoding($true)` 重写 NSI，所以**从仓库新鲜克隆的 NSI 有没有 BOM 取决于最后一次提交** —— 提交前请确认首三字节是 `EF BB BF`。
 
 ## 7. 开发命令
 
@@ -569,7 +574,7 @@ powershell -ExecutionPolicy Bypass -File build-release.ps1        # 版本号取
 powershell -ExecutionPolicy Bypass -File build-release.ps1 0.9.1  # 或显式指定
 ```
 
-脚本九步：① 预检 cargo / makensis ② kill 运行中的 lunac.exe / agent.exe ③ `npm run build`（前端）④ `cargo build --release`（core-agent → agent.exe，**必须早于第 5 步**）⑤ `cargo build --release`（src-tauri → lunac.exe）⑥ **清空并重建暂存目录** `release\Lunac\` + 拷 `lunac.exe` / `agent.exe` / `WebView2Loader.dll` ⑦ 打包 VSCode 扩展 → `lunac.vsix` ⑧ 预置 PaddleOCR-json（本地 `paddle-ocr/` 优先，缺失则从 GitHub 下载 .7z）⑨ 改写 NSI 版本号 → **先删同名旧产物**（makensis 覆盖已存在文件时只会含糊地报 `Can't open output file`，实测于旧包刚生成、杀软仍在扫描它时）→ makensis → `release\Lunac-<版本>-Setup.exe`。
+脚本九步：① 预检 cargo / makensis ② kill 运行中的 lunac.exe / agent.exe ③ `npm run build`（前端）④ `cargo build --release`（core-agent → agent.exe，**必须早于第 5 步**）⑤ `cargo build --release`（src-tauri → lunac.exe）⑥ **清空并重建暂存目录** `release\Lunac\` + 拷 `lunac.exe` / `agent.exe` / `WebView2Loader.dll` + **拷 `agent-templates\{skills,tools}` → 暂存目录同名子目录**（README + `*.example` 模板，装完用户可照抄，见 §11 规则 24）⑦ 打包 VSCode 扩展 → `lunac.vsix` ⑧ 预置 PaddleOCR-json（本地 `paddle-ocr/` 优先，缺失则从 GitHub 下载 .7z）⑨ 改写 NSI 版本号 → **先删同名旧产物**（makensis 覆盖已存在文件时只会含糊地报 `Can't open output file`，实测于旧包刚生成、杀软仍在扫描它时）→ makensis → `release\Lunac-<版本>-Setup.exe`。
 
 **NSI 脚本位置**：`scripts\lunac-installer.nsi`（**已入库**）。此前它放在 `release\` 内，而 `release\` 整体被 gitignore → 换个克隆就 `NSI script not found`，打包链路不可复现。脚本首部用 `!cd ${__FILEDIR__}\..\release` 锚定源文件目录：makensis 解析 `File` / `OutFile` 的相对路径用的是**脚本所在目录**而非调用方 CWD（实测从仓库根调用同样正确），因此 `File "Lunac\..."` 恒定解析到 `release\Lunac\`、Setup.exe 恒落在 `release\`，与 `Push-Location` 无关。
 
@@ -640,7 +645,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 4. ~~**热键可配置**~~ — ✅ 已完成：settings 面板自定义 Alt+key 组合热键
 5. **Agent Tools 扩展** — 继续接入更多开源的硬件 AI skill/tools (LocalAI skills, OpenJarvis skills 等)
 6. ~~**P2 权限审批**~~ — ✅ 已完成：写类工具发 `can_use_tool`，前端卡片 allow/deny（含 interrupt 中断本轮），300s 超时自动撤卡；见 §3.5
-7. **安全档位可切换** — `set_security_profile` 命令已存在但前端无人调用，目前永远「项目」档；需要时在设置面板加 safe/project/full 切换入口
+7. ~~**安全档位可切换**~~ — ✅ 已完成（2026-09）：设置 · AI 面板加「安全档位」下拉（只读 / 项目 / 完全）+ 输入栏「运行方式」胶囊（手动 / 白名单 / 自动），`set_security_profile` 接线完成；见 §3.5 与 §11 规则 21
 8. **补齐 agent 后端能力** — 与旧 `cli.exe` 的差距按 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md) 的分级与顺序推进，**§6-4「低成本高收益」已全部落地**（PowerShell / 工具黑名单 / WebFetch / AskUserQuestion / TodoWrite / WebSearch）。剩余：MCP `resources` 未做（server 侧缺 `resources/read`）
 9. ~~**上下文预算与压缩**~~ — ✅ 已完成：见 §3.5「上下文预算与压缩」（backlog §2.1 第 1 项，唯一「用久了必然坏掉」的缺口）
 10. ~~**P3 MCP 工具桥**~~ — ✅ 已完成：见 §3.5「P3 已完成（MCP 工具桥）」；`ListMcpResourcesTool` / `ReadMcpResourceTool` 仍未做（server 侧缺 `resources/read`）
@@ -683,6 +688,34 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 17. **MCP 工具命名与审批（P3，2026-09）**：接进请求体的用户工具名一律 `mcp__<原名>`，**前缀与清洗规则（非法字符换 `_`、超长截断、重名加 `_2`）不得随意改动** —— 前端审批卡的「始终允许」按完整工具名记 localStorage 白名单，改名等于让用户的白名单失效。MCP 工具**必须**先发 `can_use_tool`（handler 能跑 shell / 发 HTTP），且 plan（只读）档不接入；桥的失败（spawn/握手/超时）只记 stderr，**绝不允许影响十一件内置工具的可用性**。
 18. **前缀缓存不变量（第 19 点，2026-09）**：DeepSeek 等端点的自动前缀缓存按「最长公共前缀」命中，**请求体里任何靠前内容逐字节抖动都会让整段缓存失效**。已定稿的稳定化措施，改动时不得回退：① `history` 一律以 user 文本消息开头；② 压缩丢弃点左移 `base` 锚点而不是改历史首条；③ 系统提示词固定、技能清单按 `key` 排序；④ 内置工具名 PascalCase 稳定、MCP 工具数组**按名排序**后再入请求体；⑤ 工具黑名单只裁剪真实存在的工具名（`core-agent` 的内置十一件 + `Skill`），`src-tauri` 侧**不再内置旧 CLI 时代的默认名单** —— 那批名字对自研 agent 全是空转项，且按名精确比较会误伤同名 MCP 工具。判断「改了会不会掉缓存」的方法：把两次请求体开头做 diff，出现任何顺序变化即为回归。
 19. **用量口径不变量（2026-09）**：`result.usage` 是**每次提问的绝对值**（agent.exe 每次提问把四个计数器清零再累加本轮的工具往返），**永不改成会话累计** —— 累积是前端/面板的事，agent 侧一旦改成累计，回滚（失败轮 `history.truncate(base)`）就会让计数与上下文不一致。前端**禁止对 `result.usage` 做差**（旧 cli.exe 才是累计值，这条是历史包袱）；面板数值一律 = 本地日志 `ModuleData\usage\usage-YYYY-MM-DD.jsonl` 的今日合计。日志字段名 `cacheRead` / `cacheCreate`（驼峰）是 `read_usage_log` 的消费契约，改名前端读的是 undefined 会静默算成 0。详见 §3.5「用量与对账」。
+20. **落盘日志（2026-09）**：release 是 GUI 子系统、没有控制台，`eprintln!` 线上全部丢失，前端也没有 DevTools —— 出问题原本**没有任何东西可查**。现在两个进程各自落盘到 **`<exe 根>\temp\logs\`**（`agent-YYYY-MM-DD.log` / `lunac-YYYY-MM-DD.log`，日期为 **UTC**、跨天自动换文件，启动时清理 7 天前的 `*.log`）：
+    - **agent 侧**（[core-agent/src/log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs)）：启动/退出、`ready`（工具清单 / 审批档 / 技能与 MCP 数量）、`cfg`（端点与模型，token 只记 set/empty）、**每次工具调用**（`run_tool` 是唯一入口：名称 + 参数摘要 + 成功或 `FAILED` 文案 + 耗时，覆盖内置 / Skill / MCP 三类）、`run_shell` 的**退出码 / 是否超时 / 输出规模 / stderr 原文**、panic。
+    - **宿主侧**（[app/src-tauri/src/log.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/log.rs)）：启动与退出、`stop_cli`、**agent 的每一行 stderr 原样落盘**（agent 自身没机会写日志时的兜底）、以及前端经 `log_frontend` 命令上报的未捕获 JS 错误（`window.onerror` / `unhandledrejection`，前端按内容去重后上报）。
+    - **开关**：`LUNAC_LOG=off` 关闭；`LUNAC_LOG_LEVEL=error|warn|info|debug`（默认 `info`，`debug` 才记工具输出全文）。`LUNAC_LOG_DIR` 由宿主注入给 agent，保证两个进程写同一目录；agent 独立运行（烟测）时回退 `<agent.exe 目录>\temp\logs`。
+    - **不引依赖**：不用 `log` / `env_logger` / `chrono`，UTC 时间戳是手写换算（`civil_from_days`）—— 所以日志时间是 UTC，与本地时间差 8 小时，属已知取舍。
+    - **脱敏是硬要求**：任何进日志的字符串都要过 `mask_secrets()`（`sk-` 裸 key、`Bearer <token>`、`api_key` / `search_key` / `token` 等键值对）—— 日志会被用户贴出来求助，凭据不能跟着出门。
+    - **禁止写 stdout**：agent 的 stdout 是 stream-json 协议流（宿主只转发以 `{` 开头的行），日志只能走文件，否则会污染协议。
+21. **AI 对话面板（参照 Trae 侧栏，2026-09）**：UI/交互的唯一规范是 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md)；本节只固化**不可回退的硬约束**：
+    - **视窗不动**：窗口宽度、毛玻璃形态、`#search-bar → #results-container → #status-bar` 纵向结构、AI 态离散高度（360 / 600 / 520）全部不变；改造只发生在 `#results-list` 内部与输入栏内部控件，**不得**新增 `setSize` 或把插件态拉进高度滑动动画（与规则 4 一致）。
+    - **不许自称「沙箱」**：Lunac 没有 OS 级隔离（无 `sandbox-exec` / 无 AppContainer），只有**策略级**边界（审批 + 工作区锁 + 危险命令黑名单 + 白名单）。UI 与文档统一叫「**命令运行方式**」（问不问）与「**安全档位 / 文件边界**」（允不允许）——把策略级边界包装成隔离沙箱会让用户在 `full` 档产生「反正有沙箱兜底」的误判。
+    - **两道闸门不得因「自动」而消失**：运行方式三档（手动 / 白名单 / 自动）只改**询问频率**；`CMD_BLACKLIST` 命中的危险命令**任何档位都强制人工确认**（含自动档），且永不提供「加入白名单」（与规则 14 的「与关系」一致）。自动档必须二次确认 + 常驻警示，但**提示必须出现在切换点就地**（⋯ 菜单里运行方式按钮旁的简述换红字警示，同时给该按钮与 `#chat-more-btn` 加 `.run-mode-auto`）——**不做**输入栏顶部的全宽警示条，二次确认也内联在同一位置。
+    - **单一 IPC 下发点**：运行方式与安全档位两个入口都走 `main.ts` 的 `setSecurityProfile()` → `set_security_profile`（`restart=true` 切换即重启 agent；启动同步用 `restart=false` 保持懒启动）。设置面板只广播 `lunac-security-profile-changed` 事件，禁止再造第二个 invoke 点（否则一次切换会重启两遍 agent）。
+    - **展示信息从现有字段推导**：退出码 / 超时来自 `tool_result` 文本解析（`exit code: N` / `(timed out after N ms`），耗时 = `tool_use_id` 配对的前端时间戳，越界拒绝识别 `Access denied: … is outside the workspace`，用户拒绝识别 `User denied this action`。**不得**先私自给 `stream-json` 加字段（要走 §3.5 契约表登记流程）。
+    - **折叠与省略**：思考块折叠态**不保留正文 DOM**（展开时惰性填充），超 4000 字只渲染首 2000 + 末 500；回合默认折叠门槛 = 工具调用 ≥2 或过程块 ≥3，开关 `lunac-agent-autofold`（默认 `1`，设置 · AI 面板）。折叠只做局部类名切换，不重排已完成块、不逐帧测量（code-rules §4.2/§4.3）。
+    - **文案与图标**：新增文案一律进 `i18n.ts` 五语言 DICT（`agent.*` / `settings.*`），禁止硬编码中文；承担状态语义的图标必须按 [icon-style.md](file:///d:/cc/claude-code-cli-master/docs/icon-style.md) 用内联线性 SVG（emoji 只允许纯装饰）。
+22. **系统提示词环境块（2026-09）**：agent 的系统提示词 = `SYSTEM_PROMPT`（身份 / 风格 / 工具使用） + `env_block(cwd)` + `skills::listing()`，三段拼接，见 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `env_block()`。环境块必须写明：宿主是 **Lunac**（不是任何其它 agent 框架的一部分）、**工作目录的绝对路径**、**Lunac 自己的技能目录**（`LUNAC_SKILLS_DIR`），并**显式禁止用磁盘上的文件反推宿主**。
+    - **为什么必须写**（真实案例）：默认工作区是用户主目录，而用户主目录里可能躺着**别的 agent 框架**的目录（实测：`~/.hermes/skills`）。模型回答「我自己的 skills 在哪」时只能从文件系统反推 —— Glob 到那些目录后，它把宿主认成了那个框架，整个思考过程都锁死在那里（只是「你是 Lunac 的助手」这一句并不够）。
+    - **不得回退**：这段话是身份纠偏的唯一来源，删掉就会退回「模型自己猜宿主」。内容在一次会话内必须**逐字节不变**（cwd 与技能目录在 agent 进程生命周期内都是常量），否则违反规则 18 的前缀缓存不变量。
+23. **缓存命中率的解释口径（2026-09）**：命中率**有自然下限**，不能拿 100% 当目标 —— 每轮新增的 user 提问 / assistant 输出 / `tool_result` 都是新内容，天然不被上一轮缓存覆盖，命中上限 ≈ 上一轮长度 ÷ 本轮长度；工具往返多、`tool_result` 大时必然偏低。**因此必须把「自然未命中」与「断裂失效」分开统计**，只有后者才是回归。
+    - **全链路审计结论**：`system`（含 `env_block`）、`tools`（按名排序）、`history` 的四个追加点都是 append-only 且进程内恒定，**不是**命中率低的来源。
+    - **断裂源按影响排序**（都在 `compact_history()` 及其调用点，[core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)）：① `drop`（>95% 水位才丢中段）> ② `elide`（>85% 水位 + 滞回）> ③ 首条插入 `TRIMMED_MARKER` > ④ 失败回滚 `history.truncate(base)` 与压缩叠加。任何改动这四处的代码都要意识到「这是在主动放弃整段前缀缓存」。
+    - **已实施的减损措施（不得回退）**：水位从 0.70/0.90 抬到 **0.85/0.95**；瘦身档加**滞回**（`Cfg.last_compact`：一次压缩后要再长 ≥ 预算 ×0.15 才允许动第二次）；`Compact` 三档化，**瘦身档永不丢整条消息**（原先「无可瘦身内容就直接丢」会让 0.85 水位也丢整段，等于白废一次缓存）。丢弃档不受滞回约束 —— 到 0.95 不压就可能 400，安全优先。
+    - **思考模式不直接进前缀**：thinking 只进 `display`、**不进 history**（回灌会 400）；其 400 降级只改 `thinking` 形态与 `max_tokens` 两个生成参数（`Thinking` / `max_tokens_for`），是否掉缓存取决于端点侧 hash 口径（本仓库无法自证）。但**切档会重启 agent ⇒ history 清空 ⇒ 缓存必然重建**，这是「切档后命中率骤降」的合理解释，属预期行为。
+    - **归因方法**：本地 `ModuleData\usage\usage-YYYY-MM-DD.jsonl` 的今日合计给出命中/未命中（口径见 §3.5「用量与对账」，Hit = `cacheRead`，Miss = `input + cacheCreate`）；把 `system/context_compacted` 的 `elided`/`dropped` 计数按时间对齐上去，即可区分「自然未命中」与「压缩断裂」。对账时注意粒度差：平台**按每次 API 请求**记一行，本地**按每次提问**记一行。
+24. **Agent 能力定位与本地扩展目录（2026-09）**：
+    - **定位**：Lunac 的 agent 目标是**一个可以完全类比于完整 agent 类应用**的能力体。**不得**以「宿主是桌面启动器」为由把某项能力判定为「用不上」—— 缺口只做**优先级排序**，不做**价值否定**（旧文档把多代理协作等写成「与 Lunac 无关」是错的，已改）。
+    - **文档分工**：[agent-implementation.md](./agent-implementation.md) = 实现全景（已实现能力矩阵 / 工具清单全表 / 本地 `skills\` 与 `tools\` 扩展格式）；[agent-feature-backlog.md](./agent-feature-backlog.md) = 待办与实施顺序。两者不互相搬运重复内容。
+    - **发布包必须预置 `skills\` 与 `tools\` 模板**：源文件在仓库 `agent-templates/`，由 [build-release.ps1](file:///d:/cc/claude-code-cli-master/build-release.ps1) 拷进暂存目录、由 [lunac-installer.nsi](file:///d:/cc/claude-code-cli-master/scripts/lunac-installer.nsi) 打进 `$INSTDIR\skills` / `$INSTDIR\tools`。模板**必须是不可加载的形态**（`README.md` + `*.example` 后缀）—— `skills\` 下任何含 `SKILL.md` 的子目录都会被列进系统提示词、`tools\` 下任何 `.json` 都会被当工具加载并进入请求体前缀；放真实文件会污染模型的工具清单并破坏前缀缓存不变量（规则 18）。
 
 ## 12. Agent Plan 模式规范
 

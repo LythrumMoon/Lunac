@@ -262,6 +262,7 @@ pub fn start_agent_http() -> Result<String, String> {
             for line in reader.lines() {
                 if let Ok(line) = line {
                     if !line.trim().is_empty() {
+                        crate::log::warn(format!("[agent stderr] {line}"));
                         eprintln!("[cli-http] {}", line);
                     }
                 }
@@ -461,6 +462,10 @@ fn start_cli_process(
     // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
     // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
     envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
+    // 日志目录 → agent.exe：与宿主写同一份目录（<exe 根>\temp\logs），排障只需
+    // 看一个地方。agent 没拿到该变量时会自行回退到 <agent.exe 目录>\temp\logs
+    // （见 core-agent/src/log.rs）。
+    envs.push(("LUNAC_LOG_DIR", crate::log::log_dir().to_string_lossy().to_string()));
     // WebSearch 主源（服务商 + key）→ agent.exe（core-agent 经
     // LUNAC_SEARCH_PROVIDER / LUNAC_SEARCH_KEY 读取）；未配置时 agent
     // 直接走无 key 的 Bing / 百度兜底源。
@@ -496,6 +501,11 @@ fn start_cli_process(
         _ => envs.push(("MAX_THINKING_TOKENS", "0".into())),
     }
 
+    crate::log::info(format!(
+        "agent spawn: workdir={} args=[{}]",
+        workdir.display(),
+        args.join(" ")
+    ));
     let mut child = spawn_child(&agent_path, &args_refs, &workdir, &envs)?;
 
     // Unique instance id for this agent spawn — the frontend uses it to
@@ -538,6 +548,8 @@ fn start_cli_process(
             for line in reader.lines() {
                 if let Ok(line) = line {
                     if !line.trim().is_empty() {
+                        // release 是 GUI 子系统、没有控制台，eprintln 线上看不到 —— 必须落盘
+                        crate::log::warn(format!("[agent stderr] {line}"));
                         eprintln!("[cli] {}", line);
                         let _ = app_clone.emit("cli-stderr", line);
                     }
@@ -669,6 +681,7 @@ pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<Str
 
 #[tauri::command]
 pub async fn stop_cli(_state: State<'_, AppState>) -> Result<String, String> {
+    crate::log::info("stop_cli: killing agent + proxy");
     cli_bridge::kill_and_cleanup();
     proxy_server::stop();
     Ok("All processes stopped".into())
@@ -698,6 +711,7 @@ pub async fn set_security_profile(
     app: AppHandle,
     state: State<'_, AppState>,
     profile: String,
+    restart: bool,
 ) -> Result<String, String> {
     // Validate profile
     if !["safe", "project", "full"].contains(&profile.as_str()) {
@@ -710,13 +724,14 @@ pub async fn set_security_profile(
         *guard = profile.clone();
     }
 
-    // Restart CLI with new profile (stop old, start new)
-    // cli_bridge owns the process/stdin since the agent HTTP bridge refactor;
-    // the legacy AppState fields are no longer authoritative.
-    cli_bridge::kill_and_cleanup();
-
-    let dir = core_dir();
-    start_cli_process(&state, app.clone(), &dir)?;
+    // 档位通过命令行参数在 agent.exe spawn 时生效，所以切换必须重启 agent。
+    // restart=false（startup 同步）只存值、不拉起 CLI —— 与 set_thinking_mode
+    // 同一套约定，保持懒启动。
+    if restart {
+        crate::log::info(format!("security profile → {profile}, restarting agent"));
+        cli_bridge::kill_and_cleanup();
+        ensure_agent_running(&state, &app)?;
+    }
 
     Ok(format!("Security profile set to: {}", profile))
 }
@@ -1498,6 +1513,19 @@ pub fn ocr_engine_install(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn hide_lunac() {
     crate::hotkey::hide_window();
+}
+
+// ── 前端日志（window.onerror / unhandledrejection）───────────────
+/// 前端把未捕获的 JS 错误转发到这里落盘。前端在 release 下同样没有控制台，
+/// DevTools 平时也不会开 —— 不落盘就等于「用户看到报错、我们什么都查不到」。
+/// 只收错误与警告：这是错误通道，不是通用日志通道（避免刷屏与体积失控）。
+#[tauri::command]
+pub fn log_frontend(level: String, message: String) {
+    let msg = crate::log::mask_secrets(&message);
+    match level.as_str() {
+        "warn" => crate::log::warn(format!("[frontend] {msg}")),
+        _ => crate::log::error(format!("[frontend] {msg}")),
+    }
 }
 
 // ── Temp image save (for clipboard OCR) ──────────────────────────

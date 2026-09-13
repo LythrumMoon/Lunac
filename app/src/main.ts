@@ -11,6 +11,29 @@ import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
 import { initI18n, loadSavedLanguage, t, pluginName } from "./i18n.js";
 
+// ── 全局错误上报 ─────────────────────────────────────────────────
+// release 下前端没有控制台、用户平时也不会开 DevTools，未捕获的错误必须送到
+// Rust 侧落盘（<exe 根>\temp\logs\lunac-YYYY-MM-DD.log），否则「用户看到报错、
+// 我们什么都查不到」。同一错误去重，避免一个每帧都抛的错误把日志刷爆。
+const _reportedFrontendErrors = new Set<string>();
+function reportFrontendError(level: "error" | "warn", message: string): void {
+  const text = message.slice(0, 4000);
+  const key = `${level}:${text}`.slice(0, 400);
+  if (_reportedFrontendErrors.has(key)) return;
+  _reportedFrontendErrors.add(key);
+  invoke("log_frontend", { level, message: text }).catch(() => {});
+}
+window.addEventListener("error", (e) => {
+  const where = e.filename ? ` @ ${e.filename}:${e.lineno}:${e.colno}` : "";
+  reportFrontendError("error", `${e.message}${where}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const reason = (e as PromiseRejectionEvent).reason;
+  const detail =
+    reason instanceof Error ? `${reason.name}: ${reason.message}\n${reason.stack ?? ""}` : String(reason);
+  reportFrontendError("error", `unhandled rejection: ${detail}`);
+});
+
 // ── App entry from Rust backend ──────────────────────────────────
 interface AppEntry {
   name: string;
@@ -68,14 +91,17 @@ const drawerParent = chatDrawer.parentElement!;
 /** Sibling before which to re-insert drawer (results-list) */
 const drawerSibling = resultsList;
 const chatNewBtn = el("chat-new-btn");
-const chatModeBtn = el("chat-mode-btn");
-const chatWorkspaceBtn = el("chat-workspace-btn");
-const chatWorkspaceMenu = el("chat-workspace-menu");
+const chatMoreBtn = el("chat-more-btn");
+const chatMoreMenu = el("chat-more-menu");
+const chatMoreThinkIc = el("chat-more-think-ic");
+const chatMoreThinkLabel = el("chat-more-think-label");
+const chatMoreWorkspaceLabel = el("chat-more-workspace-label");
+const chatModeSeg = el("chat-mode-seg");
+const chatRunmodeBtn = el("chat-runmode-btn");
+const chatRunmodeHint = el("chat-runmode-hint");
 const chatWorkspacePath = el("chat-workspace-path");
 const chatWorkspaceSelect = el("chat-workspace-select");
 const chatWorkspaceReset = el("chat-workspace-reset");
-const chatToolsBtn = el("chat-tools-btn");
-const chatToolsMenu = el("chat-tools-menu");
 const chatToolsTitle = el("chat-tools-title");
 const chatToolsList = el("chat-tools-list");
 const chatToolsSave = el("chat-tools-save");
@@ -651,12 +677,16 @@ interface ChatDoneInfo {
 // 在本轮内累加），不是会话累计 —— 所以这里不做差，直接累加。
 // 面板数值 = 今日本地日志（ModuleData\usage\usage-YYYY-MM-DD.jsonl）的合计，
 // 与供应商平台的按天统计同口径，可逐条对账。
-let usageTotals = { hit: 0, miss: 0, total: 0 };
+let usageTotals = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
 let usageSeeded = false;
 /** 已经实时累加过的提问数 —— 播种回包晚于实时回包时用它判弃 */
 let usageLiveTurns = 0;
 /** 当前 agent 的模型名（来自 system/init，写进用量日志便于区分供应商/模型） */
 let agentModel = "";
+/** 本次提问内 agent 报告的历史压缩次数（提问结束写进用量日志）。
+ *  压缩会改写请求前缀 → 端点侧缓存作废，是命中率的**断裂型**失效来源；
+ *  必须与「新内容天生没被上一轮缓存覆盖」的自然未命中分开看（ai-spec §11 规则 23）。 */
+let liveCompaction = { elided: 0, dropped: 0 };
 
 // ── Chat conversation mode ────────────────────────────────────────
 // DeepSeek 思考模式三档（点2/7），替换旧的 simple/agent 切换：
@@ -680,13 +710,37 @@ const THINKING_LABEL: Record<ThinkingMode, string> = {
   deep: "chat.mode_deep",
 };
 
-/** Render the chat-mode toggle button (label + active state). */
-function renderChatModeBtn() {
-  if (!chatModeBtn) return;
-  chatModeBtn.textContent = t(THINKING_LABEL[chatMode]);
-  chatModeBtn.setAttribute("title", t("chat.mode_tooltip_" + chatMode));
-  chatModeBtn.classList.toggle("simple-mode", chatMode === "fast");
-  chatModeBtn.classList.toggle("deep-mode", chatMode === "deep");
+/** 思考档位分段（「更多」菜单里的三档：快速 / 思考 / 深度）。 */
+function renderChatModeSeg() {
+  if (!chatModeSeg) return;
+  chatModeSeg.querySelectorAll<HTMLButtonElement>("button[data-mode]").forEach((b) => {
+    const m = b.dataset.mode as ThinkingMode;
+    b.textContent = t(THINKING_LABEL[m]);
+    b.title = t("chat.mode_tooltip_" + m);
+    b.classList.toggle("active", m === chatMode);
+  });
+}
+
+/** 「更多」菜单的静态文案与行图标（语言切换时也要重刷）。 */
+function renderMoreMenuLabels() {
+  if (chatMoreBtn) {
+    chatMoreBtn.title = t("chat.more_btn");
+    chatMoreBtn.setAttribute("aria-label", t("chat.more_btn"));
+  }
+  // 思考行复用思考块的 SVG 常量，不重复造路径（icon-style.md §4 检查清单）
+  if (chatMoreThinkIc) chatMoreThinkIc.innerHTML = THINK_SVG;
+  if (chatMoreThinkLabel) chatMoreThinkLabel.textContent = t("chat.more_thinking");
+  if (chatMoreWorkspaceLabel) chatMoreWorkspaceLabel.textContent = t("settings.workspace");
+  renderWorkspaceMenuLabels();
+  renderToolsBlacklistLabels();
+}
+
+/** 打开菜单时把各行的动态状态刷新一遍。 */
+function renderMoreMenu() {
+  renderMoreMenuLabels();
+  renderChatModeSeg();
+  renderRunModeUI();
+  refreshWorkspaceUI();
 }
 
 /** Persistent conversation-mode label used in the status bar. */
@@ -1450,14 +1504,182 @@ async function newConversation(skipCliRestart = false) {
 }
 chatNewBtn.addEventListener("click", () => newConversation());
 
-// Toggle DeepSeek thinking mode: fast → think → deep → fast.
-chatModeBtn.addEventListener("click", () => {
-  chatMode = chatMode === "fast" ? "think" : chatMode === "think" ? "deep" : "fast";
+// 思考档位：三档分段（原为循环胶囊，2026-09 收进「更多」菜单）
+function setThinkingMode(mode: ThinkingMode) {
+  chatMode = mode;
   try { localStorage.setItem("lunac-chat-mode", chatMode); } catch {}
-  renderChatModeBtn();
+  renderChatModeSeg();
   invoke("set_thinking_mode", { mode: chatMode, restart: true }).catch((e) => console.warn("set_thinking_mode", e));
   if (statusText) statusText.textContent = t("status.ai", { mode: currentModeLabel() });
+}
+chatModeSeg?.querySelectorAll<HTMLButtonElement>("button[data-mode]").forEach((b) => {
+  b.addEventListener("click", (e) => {
+    e.stopPropagation(); // 别让「更多」菜单的 outside-click 把它关掉
+    const m = b.dataset.mode as ThinkingMode;
+    if (m !== chatMode) setThinkingMode(m);
+  });
 });
+
+// ── 命令运行方式（Trae「沙箱」的 Lunac 等价物，见 docs/agent-ui-spec.md §4）──
+// 三档**只决定「问不问」**，不动文件边界：工作区锁、安全档位、危险命令拦截都不受
+// 这里影响（规范里明确不把策略级边界称作「沙箱」）。
+// 默认 allowlist = 与既有行为完全一致（内置安全前缀 + 用户白名单自动放行）。
+type AgentRunMode = "manual" | "allowlist" | "auto";
+
+const RUN_MODE_KEY = "lunac-agent-run-mode";
+const RUN_MODE_ORDER: AgentRunMode[] = ["manual", "allowlist", "auto"];
+
+function getRunMode(): AgentRunMode {
+  const v = localStorage.getItem(RUN_MODE_KEY);
+  return v === "manual" || v === "auto" ? v : "allowlist";
+}
+
+/** 运行方式按钮：图标 + 三格档位点阵（不写档位名）+ 右侧一句功能简述。
+ *  自动档是高风险状态：点阵与 ⋯ 按钮都转红，简述换成常驻警示（不再单独占一条全宽横幅）。 */
+function renderRunModeUI() {
+  if (!chatRunmodeBtn) return;
+  const mode = getRunMode();
+  const level = RUN_MODE_ORDER.indexOf(mode) + 1; // 1=手动 2=白名单 3=自动
+  const label = `${t("agent.run_mode")}：${t(`agent.run_mode_${mode}`)} — ${t(`agent.run_mode_${mode}_hint`)}`;
+  chatRunmodeBtn.setAttribute("title", label);
+  chatRunmodeBtn.setAttribute("aria-label", label);
+  chatRunmodeBtn.dataset.mode = mode;
+  chatRunmodeBtn.classList.toggle("run-mode-auto", mode === "auto");
+  chatRunmodeBtn.querySelectorAll<HTMLElement>(".rm-dots i").forEach((dot, i) => {
+    dot.classList.toggle("on", i < level);
+  });
+
+  // 功能简述：自动档用警示文案（红字）
+  if (chatRunmodeHint && !runModeConfirmEl?.isConnected) {
+    chatRunmodeHint.textContent =
+      mode === "auto" ? t("agent.run_mode_auto_warning") : t(`agent.run_mode_${mode}_hint`);
+    chatRunmodeHint.classList.toggle("warn", mode === "auto");
+  }
+  // 菜单收起时也要能看出「自动运行开着」
+  chatMoreBtn?.classList.toggle("run-mode-auto", mode === "auto");
+}
+
+function setRunMode(mode: AgentRunMode) {
+  writeRunMode(mode);
+  renderRunModeUI();
+  applyRunModeProfile(mode, true);
+}
+
+/** 只写 localStorage、不碰后端（设置面板改安全档位时用它同步胶囊显示）。 */
+function writeRunMode(mode: AgentRunMode) {
+  try {
+    localStorage.setItem(RUN_MODE_KEY, mode);
+  } catch {
+    /* 存不了就只在本次会话生效 */
+  }
+}
+
+// 档位 → 安全档位：手动/白名单都落在 project（两者的差别只在前端「问不问」），
+// 自动档落在 full（--dangerously-skip-permissions）。见 agent-ui-spec §4.2。
+const RUN_MODE_PROFILE: Record<AgentRunMode, SecurityProfile> = {
+  manual: "project",
+  allowlist: "project",
+  auto: "full",
+};
+
+/**
+ * 安全档位（文件边界）—— 与运行方式正交：运行方式决定「问不问」，
+ * 档位决定「允不允许」（agent-ui-spec §4.4）。两个入口（输入栏胶囊 /
+ * 设置面板下拉）共用这一个下发点，避免重复 invoke。
+ */
+type SecurityProfile = "safe" | "project" | "full";
+const PROFILE_KEY = "lunac-security-profile";
+
+function getSavedProfile(): SecurityProfile {
+  const v = localStorage.getItem(PROFILE_KEY);
+  return v === "safe" || v === "full" ? v : "project";
+}
+
+/** 已经下发给后端的档位。相同就不重复下发（避免白重启一次 agent）。 */
+let appliedSecurityProfile: SecurityProfile = getSavedProfile();
+
+function setSecurityProfile(profile: SecurityProfile, restart: boolean) {
+  appliedSecurityProfile = profile;
+  try {
+    localStorage.setItem(PROFILE_KEY, profile);
+  } catch {
+    /* 存不了就只在本次会话生效 */
+  }
+  invoke("set_security_profile", { profile, restart }).catch((e) =>
+    console.warn("set_security_profile", e),
+  );
+}
+
+/** 把运行方式映射出的档位下发后端。restart=false 仅用于启动同步（保持懒启动）。 */
+function applyRunModeProfile(mode: AgentRunMode, restart: boolean) {
+  const profile = RUN_MODE_PROFILE[mode];
+  if (profile === appliedSecurityProfile) return;
+  setSecurityProfile(profile, restart);
+}
+
+// 设置面板改了安全档位 → 同步胶囊显示（只读档下「自动运行」的说法不成立，
+// 收回到最保守的「手动」；这是收紧方向，不会悄悄放松询问）。
+window.addEventListener("lunac-security-profile-changed", (e) => {
+  const profile = (e as CustomEvent).detail?.profile as SecurityProfile | undefined;
+  if (profile !== "safe" && profile !== "project" && profile !== "full") return;
+  setSecurityProfile(profile, true);
+  if (profile === "safe") writeRunMode("manual");
+  renderRunModeUI();
+});
+
+let runModeConfirmEl: HTMLElement | null = null;
+
+/** 切到「自动」档必须二次确认：这是会显著放松询问的开关。
+ *  确认条就出现在运行方式按钮旁边（原来的全宽横幅已去掉，用户要求就地提示）。 */
+function askRunModeAutoConfirm() {
+  if (runModeConfirmEl?.isConnected) return;
+  const host = chatRunmodeHint;
+  if (!host) return;
+  host.textContent = "";
+  host.classList.remove("warn");
+  const box = document.createElement("span");
+  box.className = "run-mode-confirm";
+  const msg = document.createElement("span");
+  msg.className = "run-mode-confirm-msg";
+  msg.textContent = t("agent.run_mode_auto_confirm");
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "run-mode-confirm-ok";
+  ok.textContent = t("agent.run_mode_confirm_ok");
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "run-mode-confirm-cancel";
+  cancel.textContent = t("agent.run_mode_confirm_cancel");
+  const close = () => {
+    box.remove();
+    runModeConfirmEl = null;
+    renderRunModeUI(); // 把功能简述写回来
+  };
+  ok.addEventListener("click", (e) => {
+    e.stopPropagation();
+    close();
+    setRunMode("auto");
+  });
+  cancel.addEventListener("click", (e) => {
+    e.stopPropagation();
+    close();
+  });
+  box.append(msg, ok, cancel);
+  host.appendChild(box);
+  runModeConfirmEl = box;
+}
+
+// 三档循环（点一下进一档）：手动 → 白名单 → 自动 → 手动
+chatRunmodeBtn.addEventListener("click", (e) => {
+  e.stopPropagation(); // 别让「更多」菜单的 outside-click 把它关掉
+  const next = RUN_MODE_ORDER[(RUN_MODE_ORDER.indexOf(getRunMode()) + 1) % RUN_MODE_ORDER.length];
+  if (next === "auto") askRunModeAutoConfirm();
+  else setRunMode(next);
+});
+renderRunModeUI();
+// 启动同步：把上次的安全档位下发给后端（后端内存态每次启动都回到 project）。
+// restart=false → 只存值、不拉起 agent，保持懒启动。
+invoke("set_security_profile", { profile: appliedSecurityProfile, restart: false }).catch(() => {});
 
 // ── AI workspace (chat window entry — the ONLY workspace UI) ─────
 // Default (empty) workspace = user home dir → whole system reachable,
@@ -1467,10 +1689,7 @@ function refreshWorkspaceUI() {
   if (!chatWorkspacePath) return;
   chatWorkspacePath.textContent = currentWorkspace || t("settings.workspace_default");
   chatWorkspacePath.setAttribute("title", currentWorkspace || "");
-  if (chatWorkspaceBtn) {
-    chatWorkspaceBtn.classList.toggle("has-workspace", !!currentWorkspace);
-    chatWorkspaceBtn.setAttribute("title", currentWorkspace || t("settings.workspace_default"));
-  }
+  chatWorkspacePath.classList.toggle("has-workspace", !!currentWorkspace);
 }
 async function applyWorkspace(path: string): Promise<boolean> {
   try {
@@ -1492,11 +1711,6 @@ async function applyWorkspace(path: string): Promise<boolean> {
     return false;
   }
 }
-chatWorkspaceBtn?.addEventListener("click", (e) => {
-  e.stopPropagation();
-  // Toggle the workspace picker menu (select folder / reset)
-  chatWorkspaceMenu?.classList.toggle("hidden");
-});
 chatWorkspaceSelect?.addEventListener("click", async () => {
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1506,23 +1720,12 @@ chatWorkspaceSelect?.addEventListener("click", async () => {
       if (!ok) statusText.textContent = t("settings.workspace_fail");
     }
   } catch {}
-  closeWorkspaceMenu();
 });
 chatWorkspaceReset?.addEventListener("click", async () => {
   const ok = await applyWorkspace("");
   if (!ok) statusText.textContent = t("settings.workspace_fail");
-  closeWorkspaceMenu();
 });
-function closeWorkspaceMenu() {
-  chatWorkspaceMenu?.classList.add("hidden");
-}
-document.addEventListener("click", (e) => {
-  const wrap = chatWorkspaceBtn?.parentElement;
-  if (wrap && !wrap.contains(e.target as Node)) {
-    closeWorkspaceMenu();
-  }
-});
-// Keep the menu's button labels in sync with the current language
+// Keep the row labels in sync with the current language
 function renderWorkspaceMenuLabels() {
   if (chatWorkspaceSelect) chatWorkspaceSelect.textContent = t("settings.workspace_select");
   if (chatWorkspaceReset) chatWorkspaceReset.textContent = t("settings.workspace_reset");
@@ -1560,29 +1763,42 @@ function loadCustomBlacklist(): string[] {
   return [];
 }
 
+/** 已禁用（从请求体 tools 里剔除）的工具名。菜单打开时装载一次，之后由
+ *  行内 ×/✓ 切换维护，点「保存」才写回 localStorage 并重启 agent。 */
+let toolsOffSet = new Set<string>();
+
+function loadToolsBlacklistSel() {
+  toolsOffSet = new Set(loadCustomBlacklist());
+}
+
 function renderToolsBlacklist() {
   if (!chatToolsList || !chatToolsTitle) return;
   chatToolsTitle.textContent = t("chat.tools_title");
-  const custom = new Set(loadCustomBlacklist());
-  chatToolsList.innerHTML = TOOL_BLACKLIST_CANDIDATES.map(tool => `
-    <label class="chat-tools-item${tool.locked ? " locked" : ""}" title="${esc(tool.name)}">
-      <input type="checkbox" data-tool="${esc(tool.name)}" ${tool.locked ? "checked disabled" : custom.has(tool.name) ? "checked" : ""}>
-      <span>${esc(tool.name)}</span>
+  chatToolsList.innerHTML = TOOL_BLACKLIST_CANDIDATES.map(tool => {
+    const off = tool.locked || toolsOffSet.has(tool.name);
+    return `
+    <div class="chat-tools-item${off ? " off" : ""}${tool.locked ? " locked" : ""}">
+      <button type="button" class="chat-tools-toggle" data-tool="${esc(tool.name)}"${tool.locked ? " disabled" : ""}
+              title="${esc(off ? t("chat.tools_enable") : t("chat.tools_disable"))}"
+              aria-label="${esc(off ? t("chat.tools_enable") : t("chat.tools_disable"))}">${off ? X_SVG : CHECK_SVG}</button>
+      <span class="chat-tools-name">${esc(tool.name)}</span>
       ${tool.locked ? `<span class="chat-tools-desc">${esc(t("chat.tools_locked"))}</span>` : ""}
-    </label>
-  `).join("");
+    </div>`;
+  }).join("");
 }
-chatToolsBtn?.addEventListener("click", (e) => {
+// 行内的 ×/✓ 切换（icon-style.md §3 的「取消 ✕」「保存 ✓」，加一点残影/高光）
+const CHECK_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/><circle cx="19.6" cy="5.4" r=".9" opacity=".28"/></svg>`;
+const X_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/><circle cx="19.6" cy="5.4" r=".9" opacity=".28"/></svg>`;
+// 点一下切一格：× = 已禁用（红），✓ = 启用（暗）
+chatToolsList?.addEventListener("click", (e) => {
+  const btn = (e.target as HTMLElement).closest(".chat-tools-toggle") as HTMLButtonElement | null;
+  if (!btn || btn.disabled) return;
   e.stopPropagation();
-  const willOpen = chatToolsMenu?.classList.contains("hidden") ?? false;
-  chatToolsMenu?.classList.toggle("hidden");
-  if (willOpen) renderToolsBlacklist();
-});
-document.addEventListener("click", (e) => {
-  const wrap = chatToolsBtn?.parentElement;
-  if (wrap && !wrap.contains(e.target as Node)) {
-    chatToolsMenu?.classList.add("hidden");
-  }
+  const name = btn.getAttribute("data-tool") || "";
+  if (!name) return;
+  if (toolsOffSet.has(name)) toolsOffSet.delete(name);
+  else toolsOffSet.add(name);
+  renderToolsBlacklist();
 });
 // 保存流程（用户需求顺序）：点击保存 → 按钮原位切换提醒 → 保存历史 →
 // 退出 agent.exe → 重启 agent.exe 应用新黑名单（具体在 __lunac_save_tool_blacklist）
@@ -1609,8 +1825,30 @@ chatToolsSave?.addEventListener("click", async () => {
 });
 function renderToolsBlacklistLabels() {
   if (chatToolsSave) chatToolsSave.textContent = t("chat.tools_save");
-  if (chatToolsBtn) chatToolsBtn.setAttribute("title", t("chat.tools_btn"));
 }
+
+// ── 「更多」菜单开关（思考 / 运行方式 / 工作区 / 工具黑名单四行）─────
+function closeMoreMenu() {
+  chatMoreMenu?.classList.add("hidden");
+  chatMoreBtn?.classList.remove("open");
+}
+chatMoreBtn?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const willOpen = chatMoreMenu?.classList.contains("hidden") ?? false;
+  if (willOpen) {
+    renderMoreMenu();      // 打开时刷新各行状态（含工作区路径）
+    loadToolsBlacklistSel();
+    renderToolsBlacklist();
+    chatMoreMenu?.classList.remove("hidden");
+    chatMoreBtn?.classList.add("open");
+  } else {
+    closeMoreMenu();
+  }
+});
+document.addEventListener("click", (e) => {
+  const wrap = chatMoreBtn?.parentElement;
+  if (wrap && !wrap.contains(e.target as Node)) closeMoreMenu();
+});
 
 // ── Drawer: open / close with slide animation ───────────────────
 let drawerVisible = false;
@@ -1756,17 +1994,21 @@ function addUsageToTotals(info: ChatDoneInfo) {
 }
 
 function updateTokenDashboard() {
-  const { hit, miss, total } = usageTotals;
+  const { hit, miss, total, elided, dropped } = usageTotals;
   const inputTokens = hit + miss;
   const hitPct = inputTokens > 0 ? Math.round((hit / inputTokens) * 100) : 0;
+  // 今天发生过压缩才追加这段说明 —— 它解释「命中率为什么掉了」。
+  const compactNote = elided + dropped > 0
+    ? ` · ${t("token.compact_note", { elided: String(elided), dropped: String(dropped) })}`
+    : "";
 
   tokenDashboard.innerHTML =
-    `<span class="tk-bar" title="${t("token.scope_today")} · ${t("token.cache_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), total: fmtTokens(total) })}">` +
+    `<span class="tk-bar" title="${t("token.scope_today")} · ${t("token.cache_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), total: fmtTokens(total) })}${compactNote}">` +
       `<span class="tk-bar-fill tk-bar-hit" style="width:${hitPct}%"></span>` +
       `<span class="tk-bar-fill tk-bar-miss" style="width:${100 - hitPct}%"></span>` +
     `</span>` +
     `<span class="tk-pct">${hitPct}%</span>` +
-    `<span class="tk-total" title="${t("token.detail_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), out: fmtTokens(total - inputTokens), total: fmtTokens(total) })}">${fmtTokens(total)}</span>`;
+    `<span class="tk-total" title="${t("token.detail_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), out: fmtTokens(total - inputTokens), total: fmtTokens(total) })}${compactNote}">${fmtTokens(total)}</span>`;
 }
 
 /** `YYYY-MM-DD`（本地时区）—— 用量日志的文件名分片键 */
@@ -1787,6 +2029,9 @@ function appendUsageLog(info: ChatDoneInfo) {
       output: info.output_tokens,
       cacheRead: info.cache_read_input_tokens ?? 0,
       cacheCreate: info.cache_creation_input_tokens ?? 0,
+      // 压缩次数随用量一起落盘：日后对账时可用它解释命中率的断裂
+      elided: liveCompaction.elided,
+      dropped: liveCompaction.dropped,
     },
   }).catch(() => {});
 }
@@ -1799,10 +2044,11 @@ async function seedUsageTotals() {
   try {
     const records = await invoke<Array<{
       input: number; output: number; cacheRead: number; cacheCreate: number;
+      elided?: number; dropped?: number;
     }>>("read_usage_log", { date: localDateKey(new Date()) });
     // 播种是异步的：期间若有提问回包，直接放弃覆盖（那次的数已经实时累加过）
     if (usageLiveTurns !== turnsAtStart) return;
-    usageTotals = { hit: 0, miss: 0, total: 0 };
+    usageTotals = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
     for (const r of records) {
       addUsageToTotals({
         stop_reason: "end_turn",
@@ -1811,6 +2057,8 @@ async function seedUsageTotals() {
         cache_read_input_tokens: r.cacheRead || 0,
         cache_creation_input_tokens: r.cacheCreate || 0,
       });
+      usageTotals.elided += r.elided || 0;
+      usageTotals.dropped += r.dropped || 0;
     }
     updateTokenDashboard();
   } catch {
@@ -2372,6 +2620,9 @@ interface CliEventLine {
   error_status?: number;
   result?: string;
   request_id?: string;
+  /** system/context_compacted 的压缩计数（见 usageTotals / ai-spec §11 规则 23） */
+  elided?: number;
+  dropped?: number;
   request?: {
     subtype?: string;
     tool_name?: string;
@@ -2381,9 +2632,22 @@ interface CliEventLine {
   event?: {
     type: string;
     delta?: { type: string; text?: string; thinking?: string; partial_json?: string };
-    content_block?: { type: string; name?: string };
+    content_block?: { type: string; id?: string; name?: string; input?: unknown };
   };
-  message?: { content?: Array<{ type: string; text?: string; name?: string; thinking?: string; input?: unknown; content?: unknown; is_error?: boolean }> };
+  message?: {
+    content?: Array<{
+      type: string;
+      id?: string;
+      text?: string;
+      name?: string;
+      thinking?: string;
+      input?: unknown;
+      content?: unknown;
+      /** tool_result 与它对应的 tool_use 配对用（core-agent 一定会带，见 main.rs） */
+      tool_use_id?: string;
+      is_error?: boolean;
+    }>;
+  };
   usage?: { input_tokens: number; output_tokens: number };
   model?: string;
 }
@@ -2448,6 +2712,17 @@ let agentTurn: AgentTurn | null = null;
 // The agent output is a SEQUENCE of blocks (thinking / text / tool use /
 // approval cards) rendered in arrival order — not one big text blob with
 // cards stuck at the bottom.
+/** 一张命令执行卡片的状态（按 tool_use_id 与 tool_result 配对）。 */
+interface AgentToolCard {
+  el: HTMLDetailsElement;
+  name: string;
+  /** 命令原文（Bash/PowerShell）或 k=v 参数摘要 */
+  cmd: string;
+  /** 起始时间：入参开始流式时记；经过审批的卡片会在「批准」时重置（不把用户犹豫算进耗时） */
+  startAt: number;
+  done: boolean;
+}
+
 interface AgentView {
   turn: AgentTurn;                       // turn this view belongs to
   flow: HTMLElement;                    // ordered block container
@@ -2456,16 +2731,89 @@ interface AgentView {
   curDetails: HTMLDetailsElement | null;
   curToolName: string;                  // current tool for readable arg display
   curToolArgs: string;                  // accumulated input_json_delta
+  curToolId: string;                    // tool_use id of the current card
   thinkChars: number;
   textAll: string;                      // concatenated text blocks (history)
+  /** tool_use_id → 卡片；用于把 tool_result 的结果填回同一张卡 */
+  toolCards: Map<string, AgentToolCard>;
+  /** 最近一张未完成的卡片（端点未给 tool_use_id 时的兜底配对） */
+  openCard: AgentToolCard | null;
+  /** 思考正文，折叠时从 DOM 摘下来，展开时再填回（避免长思考常驻 DOM） */
+  thinkText: string;
 }
 let agentView: AgentView | null = null;
+
+/** 从一张卡片里取「耗时」的展示串（<1s 用 ms，否则用 s，保留一位小数）。 */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
 
 function agentScroll() {
   autoScrollIfNearBottom();
 }
 
-function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string) {
+// ── AI 对话：思考块 + 命令卡片（2026-09，参照 Trae 侧栏，见 docs/agent-ui-spec.md）──
+//
+// 图标严格按 docs/icon-style.md：24 栅格、fill:none、stroke:currentColor、
+// stroke-width 2.2、圆头圆角；点彩圆点 r≈0.9 + opacity .28 作为「高光」装饰。
+
+/** 思考：气泡 + 底座 + 点彩高光 */
+const THINK_SVG = `<svg class="ai-ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2a6 6 0 0 1 3.4 10.9c-.3.2-.5.6-.5 1v1.3H9.1v-1.3c0-.4-.2-.8-.5-1A6 6 0 0 1 12 3.2Z"/><path d="M10 19.6h4"/><circle cx="19.8" cy="5.2" r=".9" opacity=".28"/></svg>`;
+
+/** 终端：>_ 形状 + 点彩高光（命令执行） */
+const TERM_SVG = `<svg class="ai-ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7.5 9 12l-4 4.5"/><path d="M12.5 17H19"/><circle cx="19.8" cy="5.2" r=".9" opacity=".28"/></svg>`;
+
+/** 思考正文超过该长度时：折叠态不常驻 DOM、展开态只渲染首尾（agent-ui-spec §3.2） */
+const THINK_INLINE_MAX = 4000;
+const THINK_HEAD_CHARS = 2000;
+const THINK_TAIL_CHARS = 500;
+
+function setThinkLabel(det: HTMLDetailsElement, state: "running" | "done", chars: number) {
+  const label = det.querySelector<HTMLElement>(".think-label");
+  if (!label) return;
+  const key = state === "running" ? "agent.thinking_running" : "agent.thinking_done";
+  label.textContent = t(key, { n: String(chars) });
+}
+
+/** 展开时把正文填回；超长只给首尾两段（避免一次塞进上万字拖慢整个对话流）。 */
+function fillThinkContent(det: HTMLDetailsElement, box: HTMLElement) {
+  const text = det.dataset.thinkText || "";
+  if (!text) return;
+  if (text.length <= THINK_INLINE_MAX) {
+    box.textContent = text;
+    return;
+  }
+  box.textContent =
+    text.slice(0, THINK_HEAD_CHARS) +
+    `\n… (${text.length - THINK_HEAD_CHARS - THINK_TAIL_CHARS} chars omitted) …\n` +
+    text.slice(-THINK_TAIL_CHARS);
+}
+
+/** 建一张命令执行卡片：头部（工具名 + 命令 + 状态）+ 折叠体（元信息 / 输出 / 操作）。 */
+function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
+  const el = document.createElement("details");
+  el.className = "tool-card running";
+  if (id) el.dataset.toolId = id;
+  el.innerHTML =
+    `<summary class="tool-card-head">` +
+    `<span class="tool-ic">${TERM_SVG}</span>` +
+    `<span class="tool-name">${esc(name || t("chat.badge_tool"))}</span>` +
+    `<span class="tool-cmd"></span>` +
+    `<span class="tool-state">${esc(t("agent.tool_running"))}</span>` +
+    `</summary>` +
+    `<div class="tool-body">` +
+    `<div class="tool-meta"></div>` +
+    `<pre class="tool-out"></pre>` +
+    `<div class="tool-actions"></div>` +
+    `</div>`;
+  v.flow.appendChild(el);
+  const card: AgentToolCard = { el, name, cmd: "", startAt: performance.now(), done: false };
+  if (id) v.toolCards.set(id, card);
+  return card;
+}
+
+function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, toolId?: string) {
   const v = agentView;
   if (!v) return;
   agentCloseBlock();
@@ -2474,23 +2822,38 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string) {
   if (kind === "thinking") {
     const det = document.createElement("details");
     det.className = "think-block";
-    det.innerHTML = `<summary>💭 ${t("agent.thinking_toggle")}</summary><div class="think-content"></div>`;
+    det.open = true; // 进行中展开，让用户看得到「在思考」
+    det.innerHTML =
+      `<summary><span class="think-ic">${THINK_SVG}</span><span class="think-label"></span></summary>` +
+      `<div class="think-content"></div>`;
     v.flow.appendChild(det);
     v.curDetails = det;
     v.thinkChars = 0;
+    v.thinkText = "";
     v.current = det.querySelector(".think-content");
+    setThinkLabel(det, "running", 0);
+    // 结束后的折叠态不保留正文节点；展开时再按需填回（见 fillThinkContent）
+    det.addEventListener("toggle", () => {
+      const box = det.querySelector<HTMLElement>(".think-content");
+      if (!box) return;
+      if (det.open) {
+        if (!box.textContent) fillThinkContent(det, box);
+      } else if (det.dataset.done === "1") {
+        box.textContent = "";
+      }
+    });
   } else if (kind === "tool") {
     v.curToolName = toolName || "";
     v.curToolArgs = "";
+    v.curToolId = toolId || "";
     if (v.curToolName === "TodoWrite") {
-      // 待办清单单独画成一块面板（见 renderTodoPanel），不占普通工具行
+      // 待办清单单独画成一块面板（见 renderTodoPanel），不占命令卡片
       v.current = null;
+      v.openCard = null;
     } else {
-      const row = document.createElement("div");
-      row.className = "tool-row";
-      row.innerHTML = `<span class="tool-name">🔧 ${esc(toolName || t("chat.badge_tool"))}</span> <span class="tool-args"></span>`;
-      v.flow.appendChild(row);
-      v.current = row.querySelector(".tool-args");
+      const card = createToolCard(v, v.curToolName, v.curToolId);
+      v.current = card.el.querySelector(".tool-cmd");
+      v.openCard = card;
     }
   } else {
     const p = document.createElement("div");
@@ -2508,13 +2871,44 @@ function agentAppend(kind: "thinking" | "text", s: string) {
   if (v.currentKind !== kind || !v.current) agentNewBlock(kind);
   if (kind === "thinking") {
     v.thinkChars += s.length;
-    const sum = v.curDetails?.querySelector("summary");
-    if (sum) sum.textContent = `💭 思考中… (${v.thinkChars} 字)`;
+    v.thinkText += s;
+    if (v.curDetails) setThinkLabel(v.curDetails, "running", v.thinkChars);
   } else {
     v.textAll += s;
   }
   v.current!.textContent = (v.current!.textContent || "") + s;
   agentScroll();
+}
+
+/** 把工具入参 JSON 变成一行可读摘要：Bash/PowerShell 给命令原文，其余给 k=v。
+ *  （Trae 风格：卡片上直接看到命令，而不是一坨原始 JSON） */
+function toolArgsDisplay(name: string, raw: string): string {
+  try {
+    const obj = JSON.parse(raw);
+    if (typeof obj === "object" && obj !== null && !Array.isArray(obj)) {
+      if (name === "Bash" || name === "PowerShell") {
+        return typeof (obj as any).command === "string" ? ((obj as any).command as string) : raw;
+      }
+      return Object.entries(obj)
+        .map(([k, val]) =>
+          `${k}=${typeof val === "string" ? (val as string) : JSON.stringify(val)}`
+        )
+        .join("  ");
+    }
+  } catch {
+    // 流式分片不是完整 JSON —— 先用原文顶上（末片一定是完整的）
+  }
+  return raw;
+}
+
+/** 把入参摘要写进当前卡片：流式分片路径与整包回落路径共用。 */
+function agentToolInput(name: string, rawJson: string) {
+  const card = agentView?.openCard;
+  if (!card) return;
+  const display = toolArgsDisplay(name, rawJson);
+  card.cmd = display;
+  const el = card.el.querySelector<HTMLElement>(".tool-cmd");
+  if (el) el.textContent = display.length > 200 ? display.slice(0, 200) + "…" : display;
 }
 
 function agentToolArgsDelta(s: string) {
@@ -2527,29 +2921,7 @@ function agentToolArgsDelta(s: string) {
     if (todos) renderTodoPanel(todos);
     return;
   }
-  if (!v.current) return;
-  // Show a readable summary instead of raw JSON (Trae-style): the command
-  // text for Bash/PowerShell, key=value fields for other tools.
-  let display = v.curToolArgs;
-  try {
-    const obj = JSON.parse(v.curToolArgs);
-    if (typeof obj === "object" && obj !== null && !Array.isArray(obj)) {
-      if (v.curToolName === "Bash" || v.curToolName === "PowerShell") {
-        display = typeof (obj as any).command === "string"
-          ? ((obj as any).command as string)
-          : v.curToolArgs;
-      } else {
-        display = Object.entries(obj)
-          .map(([k, val]) =>
-            `${k}=${typeof val === "string" ? (val as string) : JSON.stringify(val)}`
-          )
-          .join("  ");
-      }
-    }
-  } catch {
-    // partial JSON while streaming — keep raw accumulation
-  }
-  v.current.textContent = display.length > 200 ? display.slice(0, 200) + "…" : display;
+  agentToolInput(v.curToolName, v.curToolArgs);
 }
 
 /** 从 TodoWrite 的 tool_use 入参里取 todos（非数组 = 还没拿到完整清单）。 */
@@ -2597,10 +2969,13 @@ function agentCloseBlock() {
   const v = agentView;
   if (!v) return;
   if (v.currentKind === "thinking" && v.curDetails) {
-    // Collapse finished thinking into a small expandable header (Hermes-style)
-    const sum = v.curDetails.querySelector("summary");
-    if (sum) sum.textContent = `💭 思考过程 (${v.thinkChars} 字)`;
-    v.curDetails.open = false;
+    // 收起的思考只留一行；正文转存到 dataset，展开时按需填回（agent-ui-spec §3.2）。
+    // 必须先落 dataset.done 再收起：toggle 回调据此决定是否清空正文节点。
+    const det = v.curDetails;
+    det.dataset.done = "1";
+    det.dataset.thinkText = v.thinkText;
+    setThinkLabel(det, "done", v.thinkChars);
+    det.open = false;
     v.curDetails = null;
   }
   if (v.currentKind === "text") {
@@ -2626,30 +3001,256 @@ function extractToolResultText(c: unknown): string {
   return "";
 }
 
+/** core-agent 的 run_shell 把退出码与超时写进了结果文本（协议未变），这里做轻量解析；
+ *  解析不到就只显示耗时 —— 降级为不显示，绝不抛错、不打断裂渲染。 */
+function parseShellOutcome(txt: string): { exitCode: number | null; timedOut: boolean } {
+  const timedOut = /\(timed out after \d+ ms/i.test(txt);
+  const m = txt.match(/(?:^|\n)exit code:\s*(\d+)/);
+  return { exitCode: m ? Number(m[1]) : null, timedOut };
+}
+
+async function copyToClipboard(s: string) {
+  try {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(s);
+  } catch {
+    /* 剪贴板不可用就静默失败：不打断对话流 */
+  }
+}
+
+function toolActionButton(label: string, text: string): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "tool-action";
+  b.innerHTML = `${COPY_SVG}<span>${esc(label)}</span>`;
+  b.addEventListener("click", (e) => {
+    // 卡片体在 <details> 里：不阻止冒泡会被当成点标题而开合
+    e.preventDefault();
+    e.stopPropagation();
+    copyToClipboard(text);
+    const sp = b.querySelector("span");
+    if (sp) {
+      sp.textContent = t("agent.copied");
+      setTimeout(() => {
+        sp.textContent = label;
+      }, 1200);
+    }
+  });
+  return b;
+}
+
+/** 越界（工作区锁）拒绝文案：core-agent 的 guard() 固定输出
+ *  `Access denied: <path> is outside the workspace (<cwd>)`（tools.rs）。 */
+function parseBoundaryDenial(txt: string): string | null {
+  const m = txt.match(/Access denied:\s*(.+?)\s+is outside the workspace/i);
+  return m ? m[1] : null;
+}
+
+/** 危险命令标签 —— 与审批卡共用同一份黑名单；命中即不给「加入白名单」。 */
+function dangerLabelOf(cmd: string): string | null {
+  for (const b of CMD_BLACKLIST) {
+    if (b.re.test(cmd)) return b.label;
+  }
+  return null;
+}
+
+/** 把命令首词加进用户白名单（与审批卡「始终允许」同一份数据）。 */
+function allowlistCommand(cmd: string) {
+  const prefix = cmd.trim().split(/\s+/)[0];
+  if (!prefix) return;
+  const wl = getUserWhitelist();
+  if (!wl.bash.includes(prefix)) wl.bash.push(prefix);
+  saveUserWhitelist(wl);
+}
+
+function refusalButton(label: string, cls: string, onClick: () => void): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = `tool-refusal-btn ${cls}`;
+  b.textContent = label;
+  b.addEventListener("click", (e) => {
+    // 卡片体在 <details> 里：不阻止冒泡会被当成点标题而开合
+    e.preventDefault();
+    e.stopPropagation();
+    onClick();
+  });
+  return b;
+}
+
+/** 越界 / 被拒时的用户选项（agent-ui-spec §4.3）：
+ *  跳过（= 收起，默认）/ 改到工作区内重试（只回填路径，不自动放宽边界）/
+ *  加入命令白名单（仅命令类，且危险命令永不提供）。 */
+function appendRefusalActions(card: AgentToolCard, txt: string, isError: boolean) {
+  if (!isError) return;
+  const body = card.el.querySelector<HTMLElement>(".tool-body");
+  if (!body) return;
+  const denied = /User denied this action/i.test(txt);
+  const outside = parseBoundaryDenial(txt);
+  if (!denied && !outside) return;
+
+  const isShell = card.name === "Bash" || card.name === "PowerShell";
+  const danger = isShell ? dangerLabelOf(card.cmd || txt) : null;
+
+  const box = document.createElement("div");
+  box.className = "tool-refusal";
+  const msg = document.createElement("div");
+  msg.className = "tool-refusal-msg";
+  if (danger) {
+    // 危险命令被拦：给可读原因（复用黑名单标签），且不出白名单按钮
+    msg.textContent = t("agent.boundary_reason", { reason: danger });
+  } else if (outside) {
+    msg.textContent = `${t("agent.boundary_blocked")} — ${t("agent.boundary_reason", { reason: outside })}`;
+  } else {
+    msg.textContent = t("agent.boundary_reason", { reason: t("agent.denied") });
+  }
+
+  const btns = document.createElement("div");
+  btns.className = "tool-refusal-actions";
+  btns.appendChild(refusalButton(t("agent.boundary_skip"), "tool-refusal-skip", () => {
+    card.el.open = false;
+  }));
+  if (outside) {
+    btns.appendChild(refusalButton(t("agent.boundary_retry_in_workspace"), "tool-refusal-retry", () => {
+      chatInput.value = outside;
+      autoResizeChatTextarea();
+      chatInput.focus();
+    }));
+  }
+  if (denied && isShell && !danger && card.cmd.trim()) {
+    btns.appendChild(refusalButton(t("agent.boundary_add_allowlist"), "tool-refusal-allow", () => {
+      allowlistCommand(card.cmd);
+      box.remove();
+    }));
+  }
+
+  box.append(msg, btns);
+  body.appendChild(box);
+}
+
+/** 把一次 tool_result 填回它对应的卡片：状态 / 退出码 / 耗时 / 输出 / 复制操作。 */
+function fillToolCard(card: AgentToolCard, txt: string, isError: boolean) {
+  const el = card.el;
+  const { exitCode, timedOut } = parseShellOutcome(txt);
+  const isShell = card.name === "Bash" || card.name === "PowerShell";
+  const firstLine = txt.split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 80);
+
+  el.classList.remove("running");
+  const stateEl = el.querySelector<HTMLElement>(".tool-state");
+  if (isError) {
+    el.classList.add("failed");
+    el.open = true; // 失败直接摊开，别让用户再点一次
+    if (stateEl) stateEl.textContent = t("agent.tool_failed", { txt: firstLine || "unknown error" });
+  } else if (timedOut) {
+    el.classList.add("timeout");
+    if (stateEl) stateEl.textContent = t("agent.tool_timeout");
+  } else if (isShell && exitCode !== null && exitCode !== 0) {
+    // 工具本身没失败，是命令返回非零 —— 用黄色，不标红
+    el.classList.add("exit-nonzero");
+    if (stateEl) stateEl.textContent = t("agent.tool_exit_nonzero", { code: String(exitCode) });
+  } else {
+    el.classList.add("ok");
+    if (stateEl) stateEl.textContent = t("agent.tool_ok");
+  }
+
+  // 元信息：退出码（命令类才有）+ 耗时（审批等待已在批准那一刻剔除）
+  const metaEl = el.querySelector<HTMLElement>(".tool-meta");
+  if (metaEl) {
+    const parts: string[] = [];
+    if (isShell && exitCode !== null) {
+      parts.push(t("agent.tool_exit_code", { code: String(exitCode) }));
+    }
+    parts.push(t("agent.tool_elapsed", { dur: formatDuration(performance.now() - card.startAt) }));
+    metaEl.textContent = "";
+    for (const p of parts) {
+      const s = document.createElement("span");
+      s.className = "tool-meta-item";
+      s.textContent = p;
+      metaEl.appendChild(s);
+    }
+  }
+
+  const outEl = el.querySelector<HTMLElement>(".tool-out");
+  if (outEl) {
+    if (txt) {
+      outEl.textContent = txt.length > 600 ? txt.slice(0, 600) : txt;
+      outEl.dataset.full = txt;
+    } else {
+      outEl.remove();
+    }
+  }
+
+  const actions = el.querySelector<HTMLElement>(".tool-actions");
+  if (actions) {
+    if (isShell && card.cmd.trim()) {
+      actions.appendChild(toolActionButton(t("agent.tool_copy_cmd"), card.cmd));
+    }
+    if (txt) actions.appendChild(toolActionButton(t("agent.tool_copy_output"), txt));
+    if (txt.length > 600) {
+      const all = document.createElement("button");
+      all.type = "button";
+      all.className = "tool-action";
+      all.textContent = t("agent.tool_show_all");
+      all.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const box = el.querySelector<HTMLElement>(".tool-out");
+        if (box) box.textContent = box.dataset.full || box.textContent;
+        all.remove();
+      });
+      actions.appendChild(all);
+    }
+    if (!actions.childElementCount) actions.remove();
+  }
+
+  // 越界 / 被拒：补一行用户可选的后续动作（§4.3）
+  appendRefusalActions(card, txt, isError);
+}
+
 /** Render a tool execution outcome inline — otherwise a failed tool looks
  *  like a silent hang (only the tool row appears, then nothing). */
-function agentToolResult(isError: boolean, content: unknown) {
-  const host = agentView?.flow ?? resultsList;
+function agentToolResult(isError: boolean, content: unknown, toolUseId?: string) {
+  const v = agentView;
+  const host = v?.flow ?? resultsList;
   const txt = extractToolResultText(content).trim();
 
+  // 优先填回它自己的卡片（tool_use_id 配对；端点未给 id 时退到最近一张未完成的卡）
+  const card = (toolUseId ? v?.toolCards.get(toolUseId) : undefined) ?? v?.openCard ?? null;
+  if (card && !card.done) {
+    card.done = true;
+    if (v?.openCard === card) v.openCard = null;
+    fillToolCard(card, txt, isError);
+    if (isError) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= 3) {
+        const warn = document.createElement("div");
+        warn.className = "tool-row tool-warn";
+        warn.innerHTML = `<strong>${t("agent.warn_tool_failures")}</strong>`;
+        host.appendChild(warn);
+        consecutiveFailures = 0; // Reset after warning to avoid spam
+      }
+    } else {
+      consecutiveFailures = 0; // 修好了就复位
+    }
+    agentScroll();
+    return;
+  }
+
+  // 兜底：没有卡片可配对（旧协议/异常顺序）时沿用一行式渲染
   if (isError) {
     const row = document.createElement("div");
     row.className = "tool-row tool-error";
     row.textContent = `${t("agent.tool_failed", { txt: txt.slice(0, 200).replace(/\s+/g, " ") || "unknown error" })}`;
-    // Track consecutive failures for 3-fix-failure warning
     consecutiveFailures++;
     if (consecutiveFailures >= 3) {
       const warn = document.createElement("div");
       warn.className = "tool-row tool-warn";
       warn.innerHTML = `<strong>${t("agent.warn_tool_failures")}</strong>`;
       host.appendChild(warn);
-      consecutiveFailures = 0; // Reset after warning to avoid spam
+      consecutiveFailures = 0;
     }
     host.appendChild(row);
   } else {
-    // Reset counter on success — the fix chain resolved
     consecutiveFailures = 0;
-    // Collapsible result (Trae-style): one-line summary, full output on click
     const det = document.createElement("details");
     det.className = "tool-row tool-ok";
     const oneLine = txt.replace(/\s+/g, " ").trim();
@@ -2719,8 +3320,13 @@ function classifyRequest(toolName: string, input: unknown): {
 
   if (bashCmd) {
     for (const b of CMD_BLACKLIST) {
+      // 危险命令任何档位都要人工确认（含「自动」档）
       if (b.re.test(bashCmd)) return { auto: false, danger: b.label, bashCmd };
     }
+    const mode = getRunMode();
+    if (mode === "auto") return { auto: true, danger: null, bashCmd };
+    // 手动档：连内置安全前缀也照问不误
+    if (mode === "manual") return { auto: false, danger: null, bashCmd };
     const cmd = bashCmd.trim();
     const wl = getUserWhitelist();
     const hit = (p: string) => cmd === p || cmd.startsWith(p + " ");
@@ -2735,6 +3341,10 @@ function classifyRequest(toolName: string, input: unknown): {
   // "No answer was collected"）。
   if (toolName === "AskUserQuestion") return { auto: false, danger: null, bashCmd: null };
 
+  // 非命令类工具同样受运行方式约束（写类四件走这里）
+  const mode = getRunMode();
+  if (mode === "auto") return { auto: true, danger: null, bashCmd: null };
+  if (mode === "manual") return { auto: false, danger: null, bashCmd: null };
   const wl = getUserWhitelist();
   return { auto: wl.tools.includes(toolName), danger: null, bashCmd: null };
 }
@@ -2745,6 +3355,11 @@ function respondPermission(
   toolUseId?: string,
   updatedInput?: Record<string, unknown>,
 ) {
+  // 批准那一刻重新计时：用户在审批卡上犹豫的时间不该算进卡片的「耗时」
+  if (allow && toolUseId) {
+    const card = agentView?.toolCards.get(toolUseId);
+    if (card) card.startAt = performance.now();
+  }
   // allow with empty updatedInput = "run with the original input"
   // (explicitly supported: CLI treats {} as use-original)
   // 非空 updatedInput = 覆盖原参数 —— AskUserQuestion 靠它把用户选中的答案带回 agent
@@ -3148,7 +3763,7 @@ listen<{ line: string }>("cli-output", (event) => {
         } else if (cb?.type === "tool_use") {
           // Track tool call in turn (Pi: structured tool lifecycle)
           agentTurn?.toolCalls.push({ name: cb.name || "unknown", status: "running" });
-          agentNewBlock("tool", cb.name);
+          agentNewBlock("tool", cb.name, cb.id);
           statusText.textContent = t("agent.tool", { tool: cb.name || "..." });
         } else {
           agentNewBlock("text");
@@ -3187,6 +3802,16 @@ listen<{ line: string }>("cli-output", (event) => {
     // API retry — surface silent backoff loops (e.g. auth/network failures)
     else if (data.type === "system" && data.subtype === "api_retry") {
     statusText.textContent = t("agent.retry", { attempt: String(data.attempt ?? "?"), max: String(data.max_retries ?? "?") });
+    }
+    // Context compaction — agent trimmed history to fit the window.
+    // 每次压缩都会改写请求前缀、作废端点侧缓存，所以既提示也计数：
+    // 计数随用量落盘，用来区分「压缩断裂」与「自然未命中」（ai-spec §11 规则 23）。
+    else if (data.type === "system" && data.subtype === "context_compacted") {
+      const elided = Number(data.elided ?? 0) || 0;
+      const dropped = Number(data.dropped ?? 0) || 0;
+      liveCompaction.elided += elided;
+      liveCompaction.dropped += dropped;
+      statusText.textContent = t("agent.compacted", { elided: String(elided), dropped: String(dropped) });
     }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {
@@ -3228,7 +3853,10 @@ listen<{ line: string }>("cli-output", (event) => {
             if (todos) renderTodoPanel(todos);
           }
           if (!cliSawStreamDelta) {
-            agentNewBlock("tool", block.name);
+            agentNewBlock("tool", block.name, block.id);
+            if (block.input !== undefined) {
+              agentToolInput(block.name || "", JSON.stringify(block.input));
+            }
             agentCloseBlock();
           }
         }
@@ -3244,7 +3872,7 @@ listen<{ line: string }>("cli-output", (event) => {
           // TodoWrite 的成功回执就是那块面板本身 —— 再贴一条「✓ 完成」只会把
           // 整份清单原样重复一遍；失败仍照常显示。
           if (!(lastTool?.name === "TodoWrite" && !block.is_error)) {
-            agentToolResult(!!block.is_error, block.content);
+            agentToolResult(!!block.is_error, block.content, block.tool_use_id);
           }
           if (lastTool && lastTool.status === "running") {
             lastTool.status = block.is_error ? "error" : "success";
@@ -3342,7 +3970,46 @@ let lastCliStderr = "";
 listen<string>("cli-stderr", (event) => {
   lastCliStderr = event.payload;
   console.warn("[cli-stderr]", event.payload);
+  appendRuntimeNote(event.payload);
 });
+
+// ── 回合折叠与运行端输出（见 docs/agent-ui-spec.md §3.4 / §3.5）──────
+/** 本轮开始时间，用于回合汇总里的「耗时」。 */
+let turnStartAt = 0;
+
+const runtimeNoteBuffer: string[] = [];
+let runtimeNoteEl: HTMLDetailsElement | null = null;
+
+/** 回合完成后是否自动折叠过程（设置面板可关，默认开）。 */
+function agentAutoFold(): boolean {
+  return localStorage.getItem("lunac-agent-autofold") !== "0";
+}
+
+/** 回合开始时重置运行端输出的累积（每轮一条提示块）。 */
+function resetRuntimeNote() {
+  runtimeNoteBuffer.length = 0;
+  runtimeNoteEl = null;
+}
+
+/** agent.exe 的 stderr：以前只进 console（release 没有控制台 → 用户什么都看不到）。
+ *  现在折成一条系统提示块 —— 与落盘日志互补：日志是事后取证，这条是当场可见。 */
+function appendRuntimeNote(line: string) {
+  if (!line.trim()) return;
+  const host = agentView?.flow ?? resultsList;
+  runtimeNoteBuffer.push(line);
+  if (!runtimeNoteEl || !runtimeNoteEl.isConnected) {
+    const det = document.createElement("details");
+    det.className = "sys-note sys-note-error";
+    det.innerHTML = `<summary></summary><pre class="sys-note-body"></pre>`;
+    host.appendChild(det);
+    runtimeNoteEl = det;
+  }
+  const sum = runtimeNoteEl.querySelector("summary");
+  if (sum) sum.textContent = t("agent.runtime_output", { n: String(runtimeNoteBuffer.length) });
+  const body = runtimeNoteEl.querySelector<HTMLElement>(".sys-note-body");
+  if (body) body.textContent = runtimeNoteBuffer.join("\n");
+  agentScroll();
+}
 
 function clearSearch(status: string) {
   searchInput.value = "";
@@ -4339,6 +5006,9 @@ async function startAgentChat(query: string) {
   applyWindowSize();
 
   cliSawStreamDelta = false; // new query — reset double-render guard
+  turnStartAt = performance.now();
+  resetRuntimeNote();
+
   agentView = {
     turn,
     flow: flowEl,
@@ -4347,8 +5017,12 @@ async function startAgentChat(query: string) {
     curDetails: null,
     curToolName: "",
     curToolArgs: "",
+    curToolId: "",
     thinkChars: 0,
     textAll: "",
+    toolCards: new Map<string, AgentToolCard>(),
+    openCard: null,
+    thinkText: "",
   };
 
   cliDoneCallback = (info?: ChatDoneInfo) => {
@@ -4384,16 +5058,43 @@ async function startAgentChat(query: string) {
     chatHistory = pruneContext(chatHistory);
 
     // Turn footer: tool summary (Pi: turn_end reporting)
-    if (turn.toolCalls.length > 0) {
-      const successCount = turn.toolCalls.filter(t => t.status === "success").length;
-      const errorCount = turn.toolCalls.filter(t => t.status === "error").length;
+    // 回合汇总 + 「展开过程」（参照 Trae 的对话流节点自动折叠，见 agent-ui-spec §3.5）
+    {
+      const errorCount = turn.toolCalls.filter((c) => c.status === "error").length;
+      const dur = formatDuration(performance.now() - turnStartAt);
       const footer = doc("div");
       footer.className = "turn-footer";
-      footer.innerHTML = `<span class="turn-tool-count">${
-        errorCount > 0
-          ? t("agent.tool_summary", { count: String(turn.toolCalls.length), ok: String(successCount), failed: String(errorCount) })
-          : t("agent.tool_summary_ok", { count: String(turn.toolCalls.length), ok: String(successCount) })
-      }</span>`;
+      const label = doc("span");
+      label.className = "turn-tool-count";
+      label.textContent =
+        turn.toolCalls.length > 0
+          ? t("agent.turn_summary", {
+              tools: String(turn.toolCalls.length),
+              fails: String(errorCount),
+              dur,
+            })
+          : t("agent.turn_elapsed", { dur });
+      footer.appendChild(label);
+
+      // 只有这一轮真的产生了「过程」才给折叠按钮
+      const processEls = flowEl.querySelectorAll(
+        ".think-block, .tool-card, .tool-row, .todo-panel, .sys-note",
+      );
+      if (processEls.length > 0) {
+        const foldBtn = doc("button");
+        foldBtn.className = "turn-fold";
+        foldBtn.setAttribute("type", "button");
+        const setFolded = (folded: boolean) => {
+          flowEl.classList.toggle("flow-folded", folded);
+          foldBtn.textContent = folded ? t("agent.turn_expand") : t("agent.turn_collapse");
+        };
+        foldBtn.addEventListener("click", () => {
+          setFolded(!flowEl.classList.contains("flow-folded"));
+        });
+        footer.appendChild(foldBtn);
+        // 默认折叠门槛（agent-ui-spec §3.5）：工具调用 ≥2 或过程块 ≥3
+        setFolded(agentAutoFold() && (turn.toolCalls.length >= 2 || processEls.length >= 3));
+      }
       flowEl.appendChild(footer);
     }
 
@@ -4408,6 +5109,9 @@ async function startAgentChat(query: string) {
     if (info) {
       usageLiveTurns++;
       addUsageToTotals(info);
+      // 压缩计数归入「今日合计」，面板据此解释命中率
+      usageTotals.elided += liveCompaction.elided;
+      usageTotals.dropped += liveCompaction.dropped;
       updateTokenDashboard();
       appendUsageLog(info);
     }
@@ -4440,6 +5144,9 @@ async function startAgentChat(query: string) {
   // the hint is a send-time wrapper only and must not leak into saved
   // sessions / restored conversations (ai-spec §3.4).
   chatHistory.push({ role: "user", content: finalQuery });
+
+  // 新提问开始：本轮压缩计数归零（一次提问内 agent 可能报多次压缩）
+  liveCompaction = { elided: 0, dropped: 0 };
 
   try {
     // Send NDJSON message to CLI (must include session_id and parent_tool_use_id)
@@ -4616,9 +5323,9 @@ function applyI18nToStaticUI() {
   setTitle("detached-back-btn", "tooltip.restore");
   setTitle("detached-vscode-btn", "tooltip.vscode");
   setTitle("detached-close-btn", "tooltip.close_plugin");
-  renderChatModeBtn();
-  renderWorkspaceMenuLabels();
-  renderToolsBlacklistLabels();
+  renderMoreMenuLabels();
+  renderChatModeSeg();
+  renderRunModeUI();
   refreshWorkspaceUI();
 
   // Drawer header (static text in index.html)

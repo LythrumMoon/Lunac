@@ -205,6 +205,22 @@ if (Test-Path "$AppDir\cli.exe") {
   throw "暂存目录里出现 cli.exe —— 上游 CLI 禁止随安装包分发（见 .gitignore / ai-spec §8.3）"
 }
 
+# ── 技能 / 工具模板（agent-templates\ → skills\ + tools\）─────────────
+# 装完就有的两个目录，用户照着 README 与 .example 抄自己的技能/工具。
+# 刻意只放「不可加载」的形态：
+#   · skills\ 下任何含 SKILL.md 的子目录都会被列进系统提示词
+#   · tools\  下任何 .json 都会被当工具加载
+# 所以模板一律用 .example 后缀，避免污染模型的工具清单与提示词。
+$TplDir = "$Root\agent-templates"
+foreach ($sub in @("skills", "tools")) {
+  $src = Join-Path $TplDir $sub
+  if (-not (Test-Path $src)) {
+    throw "agent-templates\$sub not found: $src"
+  }
+  Copy-Item $src -Destination "$AppDir\$sub" -Recurse -Force
+  Write-Host "  $sub\ (README + .example templates)" -ForegroundColor DarkGray
+}
+
 $totalMb = [math]::Round($TotalBinSize / 1MB, 1)
 Write-Host "  Total : $totalMb MB" -ForegroundColor Green
 Write-Host ""

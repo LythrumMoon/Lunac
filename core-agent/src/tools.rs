@@ -366,6 +366,15 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
     }
 }
 
+/// 工具参数摘要：单行、截断、**脱敏** —— 供日志使用。
+/// 参数里可能带 API key（WebSearch）或整段文件内容（Write），不脱敏就等于
+/// 把凭据写进日志文件，用户一贴出来就泄漏了。
+pub fn summarize_args(input: &Value) -> String {
+    let raw = input.to_string();
+    let masked = crate::log::mask_secrets(&raw);
+    crate::log::truncate_chars(&masked, 400).replace('\r', " ").replace('\n', " ")
+}
+
 // ── 路径解析与越界拦截 ───────────────────────────────────────────
 
 fn str_arg(input: &Value, key: &str) -> Result<String, String> {
@@ -591,6 +600,7 @@ fn timeout_arg(input: &Value) -> u64 {
 
 /// 起进程 → 读干输出 → 超时 kill → 拼结果文本。
 fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, String> {
+    let prog = cmd.get_program().to_string_lossy().to_string();
     cmd.current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -602,7 +612,15 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
         cmd.creation_flags(0x0800_0000);
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // spawn 失败（解释器不存在 / 被拦）是最需要事后取证的一类错误
+            let msg = format!("spawn failed: {e}");
+            crate::log::warn(format!("shell[{prog}] {msg}"));
+            return Err(msg);
+        }
+    };
     let out_pipe: Option<ChildStdout> = child.stdout.take();
     let err_pipe = child.stderr.take();
     // 必须并发读干管道，否则子进程写满缓冲区后会卡死
@@ -652,6 +670,21 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
     if out.trim().is_empty() {
         out = "(no output)".into();
     }
+
+    // shell 类工具的事后取证：退出码 / 是否超时 / 输出规模 / stderr 原文
+    // （命令行本身由 main.rs 的 run_tool 在调用前后记录，这里补执行结果）
+    let code = status.and_then(|s| s.code());
+    crate::log::info(format!(
+        "shell[{prog}] exit={} timeout={} stdout={}B stderr={}B",
+        code.map_or_else(|| "-".into(), |c| c.to_string()),
+        timed_out,
+        stdout.len(),
+        stderr.len()
+    ));
+    if !stderr.trim().is_empty() {
+        crate::log::warn(format!("shell[{prog}] stderr:\n{stderr}"));
+    }
+
     Ok(truncate(out))
 }
 

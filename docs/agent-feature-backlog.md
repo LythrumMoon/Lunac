@@ -9,7 +9,11 @@
 > 2. 斜杠命令：[core/commands.ts](file:///d:/cc/claude-code-cli-master/core/commands.ts) `COMMANDS` 数组
 > 3. 子系统：`core/` 顶层目录结构 + 各子系统入口文件
 >
-> **最后核对时间**：2026-09-11
+> **本文只回答「还差什么、先做什么」**；已实现能力的全景、工具清单全表、以及本地 `skills\` / `tools\` 的扩展格式，见 [agent-implementation.md](./agent-implementation.md)。
+>
+> **定位前提（2026-09-13 修正）**：Lunac 的 AI agent 目标是**一个可以完全类比于完整 agent 类应用**的能力体，不因「宿主是桌面启动器」而降级。因此下列分组只是**优先级**，不是**价值否定** —— 旧版把多代理协作等写成「与 Lunac 无关」是错的，已改。
+>
+> **最后核对时间**：2026-09-11（§0 差距总览）、2026-09-13（定位修正）
 
 ---
 
@@ -23,6 +27,8 @@
 | 顶层子系统 | ~22 | 6（Agent 循环、工具执行、权限审批、上下文预算/压缩、MCP 桥、技能） | ~16 |
 | stdout 消息类型 | 8 类 | 8 类 | 仅差 `system/api_retry`（无害） |
 | 上下文压缩 | `services/compact/` 全套 | 两级压缩 + 400 兜底（不额外调模型） | 差「调模型摘要」式变体，见 §2.1（已不再是可用性缺口） |
+
+> **怎么读这张表**：缺口数 = **能力差距**，不是「用不上」。目标是让 Lunac 的 agent 成为一个可以完全类比于完整 agent 类应用的能力体（见 [agent-implementation.md](./agent-implementation.md) §1）；本文剩下要做的只是**排序**，不是**筛掉**。
 
 ---
 
@@ -56,11 +62,13 @@
 | `Config`（ant-only） | 改 CLI 自身设置 |
 | `SendUserMessage` / `Brief`、`SendUserFile`、`PushNotification` | 面向远端/移动端的推送通道 |
 
-### 1.3 组 C —— 明确不做（旧 CLI 的协作/企业能力，与 Lunac 无关）
+### 1.3 组 C —— 需要前置能力 / 绑定旧 CLI 形态（按完整 agent 路线图排后，**不是不做**）
 
-`TeamCreate` / `TeamDelete` / `SendMessage` / `ListPeers`（多代理团队，`core/utils/swarm/`、`core/utils/teammate*.ts`）、`RemoteTrigger`、`Monitor`、`VerifyPlanExecution`、`Workflow`、`SubscribePR` / `SuggestBackgroundPR`、`WebBrowser`（浏览器控制）、`TerminalCapture`、`OverflowTest` / `CtxInspect` / `Snip` / `Sleep`（调试与实验）、`REPL`（ant 专用 VM 工具）、`TestingPermission`（测试用）。
+`TeamCreate` / `TeamDelete` / `SendMessage` / `ListPeers`（多代理协作，`core/utils/swarm/`、`core/utils/teammate*.ts`）、`RemoteTrigger`、`Monitor`、`VerifyPlanExecution`、`Workflow`、`SubscribePR` / `SuggestBackgroundPR`、`WebBrowser`（浏览器控制）、`TerminalCapture`、`OverflowTest` / `CtxInspect` / `Snip` / `Sleep`（调试与实验）、`REPL`（ant 专用 VM 工具）、`TestingPermission`（测试用）。
 
-> 这些在 `getAllBaseTools()` 里大多已被显式置为 `null` 停用，属旧 CLI 自己的历史包袱。
+> **读法**：多代理协作（`TeamCreate` / `SendMessage` / `ListPeers`）是「完整 agent 类应用」的正当能力，**前置是子代理框架（`Agent`）** —— 框架落地后应重估，不再按「无关」处理。
+> 其余各项绑定的分别是：旧 CLI 的 Ink TUI 形态、ant 内部构建、IDE 常驻上下文、远端推送通道、或调试开关。它们不是「没价值」，而是**当前没有对应形态的宿主**；随能力补齐逐项重估。
+> 这些在 `getAllBaseTools()` 里大多已被显式置为 `null` 停用，属旧 CLI 自己的历史包袱 —— 照搬前先确认它在新宿主下还有意义。
 
 ---
 
@@ -89,20 +97,20 @@
 | 图片 / PDF / 附件多模态输入 | `core/utils/attachments.ts`、`imagePaste.ts`、`pdf.ts`、`FileReadTool/imageProcessor.ts`、`xlsxReader.ts` | 前端只把附件**路径**拼进文本让 agent 自己读；真正的图片内容块未实现 |
 | 输出样式 / statusline | `core/outputStyles/`、`core/constants/outputStyles.ts` | CLI 的终端样式体系，Lunac 用 WebView 替代 |
 
-### 2.3 组 C —— 明确不做（CLI 形态的产物）
+### 2.3 组 C —— 绑定旧 CLI 形态（排后，按需重估）
 
-| 子系统 | 位置 | 为什么不做 |
+| 子系统 | 位置 | 为什么排后 / 何时重估 |
 |---|---|---|
-| Ink TUI 全套 | `core/ink/`、`core/components/`、`core/screens/REPL.tsx` | CLI 自己的终端渲染器，已被 WebView 取代 |
-| 75+ 斜杠命令 | `core/commands/` | 多数是 CLI 会话内操作（`/theme` `/vim` `/statusline` `/login` `/upgrade` `/doctor` …），桌面端另有 UI |
-| Vim 模式 / 语音 / buddy / chrome | `core/vim/`、`core/voice/`、`core/buddy/`、`core/commands/chrome` | 与 Lunac 交互形态无关 |
-| 桥接 / 远程控制 / teleport | `core/bridge/`、`core/utils/teleport.tsx`、`core/commands/bridge` | 面向 Claude 云端会话接管 |
-| 遥测 / 成本统计 | `core/utils/telemetry/`、`cost-tracker.ts`、`core/services/analytics/` | 旧 CLI 的运营与计费上报；前端连 `total_cost_usd` 都不读 |
+| Ink TUI 全套 | `core/ink/`、`core/components/`、`core/screens/REPL.tsx` | CLI 自己的终端渲染器，已被 WebView 取代；若要重估，先看它的**交互模式**（如 REPL 的批量工具调用）是否有价值，而不是照搬渲染层 |
+| 75+ 斜杠命令 | `core/commands/` | 多数是 CLI 会话内操作（`/theme` `/vim` `/statusline` `/login` `/upgrade` `/doctor` …），桌面端另有 UI。**逐项评估**：与能力相关的（如 `/compact`、`/rewind`、memory 类）值得单列出来看，不要因为挂在这个目录下就一并丢弃 |
+| Vim 模式 / 语音 / buddy / chrome | `core/vim/`、`core/voice/`、`core/buddy/`、`core/commands/chrome` | 当前交互形态没有对应入口 |
+| 桥接 / 远程控制 / teleport | `core/bridge/`、`core/utils/teleport.tsx`、`core/commands/bridge` | 面向 Claude 云端会话接管；若将来做「远端会话接管」再重估 |
+| 遥测 / 成本统计 | `core/utils/telemetry/`、`cost-tracker.ts`、`core/services/analytics/` | 旧 CLI 的运营与计费上报。**成本统计值得重估**：Lunac 已有按天用量日志（ai-spec §3.5），可在此基础上做本地成本面板，不必照搬上报链路 |
 | OAuth / 账号 / 订阅额度 | `core/services/oauth/`、`core/utils/auth.ts`、`commands/login`、`extraUsage` | Lunac 用自己的 API Key 直连供应商 |
 | 自动更新 / 安装器 | `core/utils/autoUpdater.ts` | 由 NSIS 安装包负责 |
-| 代理 / 证书 / mTLS / bedrock / aws | `core/proxy/`、`core/upstreamproxy/`、`core/utils/{proxy,mtls,caCerts,aws,bedrock}.ts` | 企业网关场景 |
+| 代理 / 证书 / mTLS / bedrock / aws | `core/proxy/`、`core/upstreamproxy/`、`core/utils/{proxy,mtls,caCerts,aws,bedrock}.ts` | 企业网关场景；用户提需求再评估 |
 | IDE 集成（VSCode / JetBrains / Desktop） | `core/utils/ide.ts`、`jetbrains.ts`、`claudeDesktop.ts` | Lunac 已有自己的 VSCode 扩展（`vscode-extension/`） |
-| 其余 utils 级实现细节 | `core/utils/`（约 200 文件：`ripgrep.ts`、`glob.ts`、`fileRead.ts`、`bashParser.ts` …） | 我们已用 6 个工具 + glob/regex crate 覆盖同等能力，只是实现更薄 |
+| 其余 utils 级实现细节 | `core/utils/`（约 200 文件：`ripgrep.ts`、`glob.ts`、`fileRead.ts`、`bashParser.ts` …） | 我们已用 11 个内置工具 + glob/regex crate 覆盖同等能力，只是实现更薄；其中 `bashParser.ts` 已单列进 §2.1（安全短板） |
 
 ---
 
@@ -136,7 +144,7 @@
 | ~~工具黑名单候选列表全是旧工具名，用户**无法禁用**真实内置工具~~ | [main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts) `TOOL_BLACKLIST_CANDIDATES` | ✅ 已修（2026-09，第 19 点缓存优化）：候选换成真实内置工具名（含 `Skill`），Rust 侧删掉对自研 agent 全为空转的 `DEFAULT_TOOL_BLACKLIST` —— 勾选即真正从请求体 `tools` 裁掉，缩短前缀、提升缓存命中 |
 | ~~「技能扩展」文案声称 agent.exe 会加载该目录，实际不读~~ | [settings.ts L386-446](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L386-L446)、i18n `settings.skills_*` | ✅ 文案已属实（P4，2026-09）：agent.exe 启动时读该目录，增删改后前端自动重启 agent 生效 |
 | 「插件 (MCP 工具)」面板只读展示，无下发通道 | [settings.ts L448+](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L448) | ✅ 已随 P3 落地：agent.exe 现在会读 `<exe 根>\tools\*.json`（面板的安装/编辑/删除 + 重启 agent 流程已生效）；面板自身仍是只读列表 + 安装入口，编辑在 Tool Editor 插件里 |
-| 安全档位 `set_security_profile` 无前端入口 | `app/src-tauri/src/commands.rs` `set_security_profile` | 设置面板加 safe/project/full 切换 |
+| ~~安全档位 `set_security_profile` 无前端入口~~ | `app/src-tauri/src/commands.rs` `set_security_profile` | ✅ 已落地（2026-09）：设置面板「AI」分区有只读/项目/完全下拉，经 `lunac-security-profile-changed` → `main.ts` `setSecurityProfile()` 单一 IPC 下发（与运行方式共用，避免重启两遍） |
 
 ---
 

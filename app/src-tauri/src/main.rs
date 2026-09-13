@@ -16,6 +16,7 @@ mod windows_ocr;
 mod paddle_ocr;
 mod cli_bridge;
 mod agent_server;
+mod log;
 
 use commands::{
     start_cli, stop_cli, send_message, get_status,
@@ -120,6 +121,16 @@ fn main() {
     // 并删除（幂等，见 storage.rs）。必须在 WebView2 初始化前完成，否则旧 profile
     // 与新的 WEBVIEW2_USER_DATA_FOLDER 会割裂。
     crate::storage::migrate_legacy_localappdata();
+
+    // 落盘日志：<exe 根>\temp\logs\lunac-YYYY-MM-DD.log。release 是 GUI 子系统、
+    // 没有控制台，eprintln 线上拿不到；这里是宿主的启动/退出、agent 启停与
+    // agent stderr 的唯一留存点。放在 dotenv 之后，好让 .env 里的 LUNAC_LOG* 生效。
+    log::init("lunac");
+    log::info(format!(
+        "args={:?} background={is_background} root={}",
+        std::env::args().skip(1).collect::<Vec<_>>(),
+        crate::storage::lunac_root_dir().display()
+    ));
 
     if std::env::var("WEBVIEW2_USER_DATA_FOLDER").is_err() {
         // 缓存统一放 <exe_dir>\temp\（2026-09 修订）：不再写入 LOCALAPPDATA / exe 目录以外
@@ -266,6 +277,7 @@ fn main() {
                 }
                 // Real cleanup on tray "Quit" → app.exit(0)
                 WindowEvent::Destroyed => {
+                    log::info("window destroyed → app exit");
                     let state = window.state::<AppState>();
 
                     // Process/stdin live in cli_bridge since the agent HTTP
@@ -345,6 +357,7 @@ fn main() {
             ocr_engine_status,
             ocr_engine_install,
             hide_lunac,
+            commands::log_frontend,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

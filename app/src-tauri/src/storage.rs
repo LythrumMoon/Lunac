@@ -237,6 +237,14 @@ pub struct UsageRecord {
     pub cache_read: u64,
     #[serde(rename = "cacheCreate")]
     pub cache_create: u64,
+    /// 本次提问内 agent 报告的历史压缩次数（瘦身 tool_result / 丢弃旧消息）。
+    /// 压缩会改写请求前缀 → 端点侧缓存作废，是命中率的**断裂型**失效来源，
+    /// 与「新内容天生没被上一轮缓存覆盖」的自然未命中分开统计用。
+    /// 旧记录没有这两个字段，读时按 0（`serde(default)`）。
+    #[serde(default)]
+    pub elided: u64,
+    #[serde(default)]
+    pub dropped: u64,
 }
 
 fn usage_dir() -> PathBuf {

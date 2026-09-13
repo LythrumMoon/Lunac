@@ -306,6 +306,26 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
       { value: "firecrawl", label: "Firecrawl" },
     ].map(o => ({ ...o, selected: o.value === searchProvider })));
 
+  // 安全档位（文件边界）：与「运行方式」（问不问）正交，这里是「允不允许」。
+  // 真实下发在 main.ts（单一 invoke 点），本面板只广播选择，见 agent-ui-spec §4.4。
+  let securityProfile = "project";
+  try {
+    const p = localStorage.getItem("lunac-security-profile");
+    if (p === "safe" || p === "full") securityProfile = p;
+  } catch {}
+  const profileSelectHtml = renderCustomSelect("settings-security-profile",
+    [
+      { value: "safe", label: t("settings.security_profile_ro") },
+      { value: "project", label: t("settings.security_profile_project") },
+      { value: "full", label: t("settings.security_profile_full") },
+    ].map(o => ({ ...o, selected: o.value === securityProfile })));
+
+  // 回合结束自动折叠（main.ts 每次都现读，故这里只写 localStorage、不广播）
+  let autofoldOn = true;
+  try {
+    autofoldOn = localStorage.getItem("lunac-agent-autofold") !== "0";
+  } catch {}
+
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.ai_model")}</div>
@@ -333,6 +353,19 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
         <span class="settings-label">${t("settings.search_key")}</span>
         <input type="password" id="settings-searchkey" class="settings-input" autocomplete="off" value="${esc(searchKey)}" placeholder="${esc(t("settings.search_key_hint"))}" title="${esc(t("settings.search_key_hint"))}">
       </div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.security_profile")}</span>
+        ${profileSelectHtml}
+      </div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.security_profile_hint")}</div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.agent_autofold")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="settings-autofold" ${autofoldOn ? "checked" : ""}>
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.agent_autofold_hint")}</div>
       <div class="settings-row" style="justify-content: flex-end;">
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
         <span id="settings-save-msg" class="settings-save-msg"></span>
@@ -1616,6 +1649,29 @@ export async function attachSettingsListeners(container: HTMLElement) {
   // Search engine dropdown
   if (searchEngineDD) {
     setupCustomDropdown(searchEngineDD, () => {}); // onChange is no-op, save button handles persistence
+  }
+
+  // ── AI 安全档位（文件边界）─────────────────────────────────────
+  // 单独一个下拉，不跟 provider/model 那条保存链路混：切换立即生效（会重启 agent）。
+  const profileDD = container.querySelector("#settings-security-profile") as HTMLElement | null;
+  if (profileDD) {
+    setupCustomDropdown(profileDD, (value) => {
+      // 由 main.ts 统一 invoke set_security_profile 并同步输入栏胶囊显示；
+      // 这里只广播，避免两个 invoke 点各自重启一次 agent。
+      window.dispatchEvent(new CustomEvent("lunac-security-profile-changed", {
+        detail: { profile: value },
+      }));
+    });
+  }
+
+  // ── 回合自动折叠开关 ──────────────────────────────────────────
+  const autofoldCheck = container.querySelector("#settings-autofold") as HTMLInputElement | null;
+  if (autofoldCheck) {
+    autofoldCheck.addEventListener("change", () => {
+      try {
+        localStorage.setItem("lunac-agent-autofold", autofoldCheck.checked ? "1" : "0");
+      } catch { /* 存不了就只在本次会话生效 */ }
+    });
   }
 
   // ── Language selector ─────────────────────────────────────────

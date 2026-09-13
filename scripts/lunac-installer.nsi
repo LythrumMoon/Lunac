@@ -87,6 +87,14 @@ Section "Install"
   File "Lunac\agent.exe"
   File "Lunac\WebView2Loader.dll"
 
+  ; 技能 / 工具目录：README + .example 模板，供用户照抄（见 agent-templates\）。
+  ; 只装模板不装可加载文件 —— *.json 与 SKILL.md 会被 agent 当成真实工具/技能。
+  SetOutPath "$INSTDIR\skills"
+  File /r "Lunac\skills\*"
+  SetOutPath "$INSTDIR\tools"
+  File /r "Lunac\tools\*"
+  SetOutPath "$INSTDIR"
+
   ; VSCode extension -- optional, auto-installed by the "Attach to VSCode" button
   ; if present alongside lunac.exe
   !if /FileExists "Lunac\lunac.vsix"

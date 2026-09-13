@@ -167,45 +167,91 @@
             <circle cx="17.5" cy="18" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
           </svg>
         </button>
-          <button id="chat-mode-btn" class="chat-mode-pill" title="Switch thinking mode" aria-label="Thinking mode">思考</button>
-          <div class="chat-workspace-wrap">
-            <button id="chat-workspace-btn" title="AI workspace" aria-label="AI workspace">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <textarea id="chat-input" rows="1" placeholder="Type a message..." autocomplete="off" spellcheck="false"></textarea>
+          <!-- 「更多」菜单：思考档位 / 命令运行方式 / 工作区 / 工具黑名单
+               四个控件收在一个 ⋯ 里（图标参数见 docs/icon-style.md §1–§2）。 -->
+          <div class="chat-more-wrap">
+            <button id="chat-more-btn" title="More" aria-label="More">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                 <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                  <line x1="5" y1="12" x2="5.01" y2="12"/>
+                  <line x1="12" y1="12" x2="12.01" y2="12"/>
+                  <line x1="19" y1="12" x2="19.01" y2="12"/>
                 </g>
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                <circle cx="7" cy="6" r="1" fill="currentColor" stroke="none"/>
-                <circle cx="17" cy="16.5" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+                <line x1="5" y1="12" x2="5.01" y2="12"/>
+                <line x1="12" y1="12" x2="12.01" y2="12"/>
+                <line x1="19" y1="12" x2="19.01" y2="12"/>
+                <circle cx="16.4" cy="6.2" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
               </svg>
             </button>
-            <div id="chat-workspace-menu" class="hidden">
-              <div id="chat-workspace-path" class="chat-workspace-path" title=""></div>
-              <button id="chat-workspace-select" type="button"></button>
-              <button id="chat-workspace-reset" type="button"></button>
-            </div>
-          </div>
-          <div class="chat-tools-wrap">
-            <button id="chat-tools-btn" title="Tool blacklist" aria-label="Tool blacklist">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
-                  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
-                </g>
-                <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
-                <circle cx="8" cy="8" r="1" fill="currentColor" stroke="none"/>
-                <circle cx="16.5" cy="16.5" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
-              </svg>
-            </button>
-            <div id="chat-tools-menu" class="hidden">
-              <div id="chat-tools-title" class="chat-tools-title"></div>
-              <div id="chat-tools-list" class="chat-tools-list"></div>
-              <div class="chat-tools-actions">
-                <button id="chat-tools-save" type="button"></button>
-                <span id="chat-tools-msg" class="chat-tools-msg"></span>
+            <div id="chat-more-menu" class="hidden">
+              <!-- 思考档位：三档分段（图标由 main.ts 用既有 THINK_SVG 填入，不再造路径） -->
+              <div class="chat-more-row">
+                <span class="chat-more-ic" id="chat-more-think-ic"></span>
+                <span class="chat-more-label" id="chat-more-think-label"></span>
+                <div class="chat-more-seg" id="chat-mode-seg">
+                  <button type="button" data-mode="fast"></button>
+                  <button type="button" data-mode="think"></button>
+                  <button type="button" data-mode="deep"></button>
+                </div>
+              </div>
+              <!-- 命令运行方式：图标 + 档位点阵（不写档位名）+ 一句功能简述 -->
+              <div class="chat-more-row">
+                <button id="chat-runmode-btn" type="button">
+                  <span class="rm-ic">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+                        <path d="M12 3l7 3v5.5c0 4.6-3 8-7 9.5-4-1.5-7-4.9-7-9.5V6z"/>
+                      </g>
+                      <path d="M12 3l7 3v5.5c0 4.6-3 8-7 9.5-4-1.5-7-4.9-7-9.5V6z"/>
+                      <circle cx="9.2" cy="8.8" r="1" fill="currentColor" stroke="none"/>
+                      <circle cx="15.4" cy="14.8" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+                    </svg>
+                  </span>
+                  <span class="rm-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                </button>
+                <span class="chat-more-hint" id="chat-runmode-hint"></span>
+              </div>
+              <!-- 工作区：原独立弹窗的内容，扁平化成一行（无嵌套弹窗） -->
+              <div class="chat-more-row chat-more-block">
+                <span class="chat-more-ic">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                    </g>
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                    <circle cx="7" cy="6" r="1" fill="currentColor" stroke="none"/>
+                    <circle cx="17" cy="16.5" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+                  </svg>
+                </span>
+                <span class="chat-more-label" id="chat-more-workspace-label"></span>
+                <div id="chat-workspace-path" class="chat-workspace-path" title=""></div>
+                <div class="chat-more-actions">
+                  <button id="chat-workspace-select" type="button"></button>
+                  <button id="chat-workspace-reset" type="button"></button>
+                </div>
+              </div>
+              <!-- 工具黑名单：勾选后重启 agent 生效（第19点前缀缓存优化） -->
+              <div class="chat-more-row chat-more-block">
+                <span class="chat-more-ic">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+                      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                    </g>
+                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                    <circle cx="8" cy="8" r="1" fill="currentColor" stroke="none"/>
+                    <circle cx="16.5" cy="16.5" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+                  </svg>
+                </span>
+                <span class="chat-more-label chat-tools-title" id="chat-tools-title"></span>
+                <div id="chat-tools-list" class="chat-tools-list"></div>
+                <div class="chat-tools-actions">
+                  <button id="chat-tools-save" type="button"></button>
+                  <span id="chat-tools-msg" class="chat-tools-msg"></span>
+                </div>
               </div>
             </div>
           </div>
-          <textarea id="chat-input" rows="1" placeholder="Type a message..." autocomplete="off" spellcheck="false"></textarea>
           <button id="chat-history-btn" title="Chat History" aria-label="History">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">

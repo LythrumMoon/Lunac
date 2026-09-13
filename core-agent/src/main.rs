@@ -55,6 +55,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+mod log;
 mod mcp;
 mod skills;
 mod tools;
@@ -85,8 +86,16 @@ const MAX_CONTEXT_ENV: &str = "LUNAC_MAX_CONTEXT_TOKENS";
 const DEFAULT_MAX_CONTEXT_TOKENS: u64 = 128_000;
 const MIN_CONTEXT_TOKENS: u64 = 8_000;
 /// 超过预算的该比例 → 先瘦身；超过更高水位 → 直接丢弃
-const ELIDE_RATIO: f64 = 0.70;
-const DROP_RATIO: f64 = 0.90;
+///
+/// 水位定得高是刻意的：**每次压缩都会改变请求前缀，端点侧的 KV 缓存整段作废**。
+/// 压缩发生得越少，长会话的命中率越高 —— 详情见 docs/ai-spec.md §11 规则 23。
+const ELIDE_RATIO: f64 = 0.85;
+const DROP_RATIO: f64 = 0.95;
+/// 距上次压缩之后至少要再长「预算 × 该比例」才允许第二次动历史（滞回）。
+///
+/// 没有这道闸，每轮都会有一两条旧消息跨过保留尾部被瘦身 → 前缀每轮都变、
+/// 缓存每轮归零（实测是命中率的最大来源）。有它之后压缩变成「成批、间隔足够远」。
+const COMPACT_MIN_GROWTH: f64 = 0.15;
 /// 压缩时始终保留最近的消息条数
 const COMPACT_KEEP_TAIL: usize = 8;
 /// tool_result 内容超过该字符数才算「值得瘦身的大块」
@@ -123,10 +132,21 @@ fn context_related_error(detail: &str) -> bool {
     d.contains("context") || d.contains("too long") || d.contains("input length")
 }
 
+/// 压缩强度。三档对应三个调用场景，区别只在「允不允许丢整条消息」。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Compact {
+    /// 只瘦身：把旧的大块 `tool_result` 换成占位串。挤不出来就原样返回 ——
+    /// 宁可等到达丢弃水位，也不在这个水位上改历史结构（那等于白丢一次缓存）。
+    Elide,
+    /// 水位到顶：先瘦身；确实挤不出来（体积在对话本身）才整条丢弃。
+    Drop,
+    /// 400 兜底：直接丢弃 —— 已被端点判超限，没时间再试一轮。
+    Force,
+}
+
 /// 压缩历史。返回「被丢弃的消息条数」，调用方据此修正失败回滚锚点。
-///
-/// `force = true` 跳过水位判断直接丢弃（用于 400 兜底 / 硬水位）。
-fn compact_history(history: &mut Vec<Value>, force: bool) -> usize {
+fn compact_history(history: &mut Vec<Value>, mode: Compact) -> usize {
+    let force = mode == Compact::Force;
     // ① 瘦身：只动尾部以外的消息，正在用的最近几轮保持原样。
     //    强制模式下连尾部也瘦（只留最近 2 条）—— 否则尾部若塞了多个超大
     //    tool_result，光靠「丢弃更老的消息」根本压不下来。
@@ -152,10 +172,17 @@ fn compact_history(history: &mut Vec<Value>, force: bool) -> usize {
         }
     }
 
-    // ② 丢弃：强制模式，或压根没有可瘦身的东西（说明体积在对话本身）。
+    // ② 丢弃：强制模式，或「已到丢弃水位却挤不出来」（说明体积在对话本身）。
+    //    只瘦身档永不丢弃 —— 在 0.85 水位上丢整条消息会把缓存一次性废掉，
+    //    而按 0.95 水位多等一会儿完全来得及。
     //    始终保留开头那条用户提问 —— 它是任务目标，丢了模型就不知道要干什么。
+    let can_drop = match mode {
+        Compact::Elide => false,
+        Compact::Drop => elided == 0,
+        Compact::Force => true,
+    };
     let mut dropped = 0usize;
-    if force || elided == 0 {
+    if can_drop {
         let head = if history
             .first()
             .map(|m| {
@@ -211,6 +238,38 @@ Answer in the user's language and keep it concise. \
 You can inspect and modify the local machine with the provided tools: prefer Read/Glob/Grep \
 before editing, make the smallest change that solves the problem, and say what you changed. \
 Relative paths resolve against your working directory.";
+
+/// 环境说明（接在 SYSTEM_PROMPT 之后）。
+///
+/// 为什么需要它：只说「你是 Lunac 的助手」不够 —— 模型在答「我自己的 skills 在哪」这类
+/// 问题时只能从文件系统反推，一旦工作区（默认是用户主目录）里躺着**别的 agent 框架**的
+/// 目录（`~/.hermes/skills` 之类），它就会把那个框架当成宿主，整个思考过程都锁死在
+/// 「我在 hermes 里」上。这里明确给出：宿主是谁、工作目录的绝对路径、**Lunac 自己的
+/// 技能目录在哪**，并显式禁止「用磁盘上的文件反推宿主」。
+///
+/// 稳定性要求（ai-spec §11 规则 18）：内容必须在一次会话内逐字节不变，否则前缀缓存失效
+/// —— cwd 与技能目录在 agent 进程生命周期内都是常量，满足该条件。
+fn env_block(cwd: &std::path::Path) -> String {
+    let skills_dir = std::env::var("LUNAC_SKILLS_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(not configured)".into());
+    format!(
+        "\n\nEnvironment:\n\
+         - Host: Lunac, a Windows desktop launcher. You are Lunac's built-in agent — not a \
+         component of any other agent framework, and not running inside one.\n\
+         - Working directory (absolute): {}\n\
+         - Lunac's own skills live in: {} — each skill is a folder containing SKILL.md. When the \
+         user says \"my skills\", \"我自己的 skills\" or similar, they mean the skills of this app \
+         (the ones listed below, if any) or this directory.\n\
+         - Other files on disk are ordinary files. If the workspace happens to contain another \
+         agent/tool framework's repository, config or skills, do not treat it as Lunac's setup \
+         and do not answer as if you were that product.",
+        cwd.display(),
+        skills_dir
+    )
+}
 
 
 // ── 思考档位：跨模型自适应 ───────────────────────────────────────
@@ -300,6 +359,9 @@ struct Cfg {
     /// 上一轮请求实测的上下文体积（token）。跨轮保留：新的一轮要在发请求
     /// 之前先按它判断水位，否则第一发就可能超限。
     last_input: Cell<u64>,
+    /// 上次压缩时的实测体积 —— 滞回基准（见 `COMPACT_MIN_GROWTH`）。
+    /// 0 表示本进程还没压缩过。
+    last_compact: Cell<u64>,
 }
 
 impl Cfg {
@@ -330,6 +392,7 @@ impl Cfg {
             model,
             thinking: Cell::new(Thinking::from_env()),
             last_input: Cell::new(0),
+            last_compact: Cell::new(0),
         })
     }
 }
@@ -564,6 +627,9 @@ fn main() {
         println!("agent 0.2.0 (lunac self-developed agent core, P1)");
         return;
     }
+    // 落盘日志（<exe 根>\temp\logs\agent-YYYY-MM-DD.log）。release 是 GUI 子系统、
+    // 没有控制台，下面所有 eprintln 线上都拿不到 —— 出问题只能靠这个文件回溯。
+    log::init("agent");
     let cli = CliArgs::parse(&args);
     let tools_ctx = tools::Ctx {
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -617,7 +683,11 @@ fn main() {
                 .join(",")
         );
     }
-    let system_prompt = format!("{SYSTEM_PROMPT}{}", skills::listing(if skills_on { &skills } else { &[] }));
+    let system_prompt = format!(
+        "{SYSTEM_PROMPT}{}{}",
+        env_block(&tools_ctx.cwd),
+        skills::listing(if skills_on { &skills } else { &[] })
+    );
 
     let mut tool_defs = tools::defs(&cli.disallowed);
     let mut tool_names = tools::names(&tool_defs);
@@ -661,6 +731,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    log::info(format!(
+        "cfg: endpoint={} model={} token={}",
+        log::mask_secrets(&cfg.endpoint),
+        cfg.model,
+        if cfg.token.is_empty() { "(empty)" } else { "(set)" }
+    ));
 
     // stdin 读取线程 → 查询线程（mpsc 解耦）。
     // 解耦的意义：查询线程在等审批回包时会阻塞，stdin 必须另有线程持续 drain，
@@ -718,6 +795,7 @@ fn main() {
         }
     }
     eprintln!("[agent] stdin closed, exiting");
+    log::info("=== agent exit (stdin closed) ===");
 }
 
 /// 从上游消息里取出纯文本。content 既可能是 block 数组，也可能是裸字符串。
@@ -768,7 +846,36 @@ fn needs_approval(name: &str) -> bool {
 }
 
 /// 分发一次工具调用：技能（P4）→ MCP 桥（P3）→ 内置实现（P1）。
+///
+/// 三类工具都从这里过，所以**日志也打在这里**：名称 + 参数摘要（脱敏）+ 结果或
+/// 错误 + 耗时。线上出问题（例如某个 PowerShell 调用报错）时，这是唯一能事后
+/// 还原「模型到底让工具干了什么、工具回给它什么」的地方。
 fn run_tool(
+    tctx: &tools::Ctx,
+    mcp_bridge: Option<&mut mcp::Bridge>,
+    skill_list: &[skills::Skill],
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let args = tools::summarize_args(input);
+    let result = dispatch_tool(tctx, mcp_bridge, skill_list, name, input);
+    let ms = started.elapsed().as_millis();
+
+    match &result {
+        Ok(out) => {
+            log::info(format!(
+                "tool {name} ok ({ms}ms, out {} chars) args={args}",
+                out.chars().count()
+            ));
+            log::debug(format!("tool {name} output:\n{out}"));
+        }
+        Err(e) => log::warn(format!("tool {name} FAILED ({ms}ms) args={args} :: {e}")),
+    }
+    result
+}
+
+fn dispatch_tool(
     tctx: &tools::Ctx,
     mcp_bridge: Option<&mut mcp::Bridge>,
     skill_list: &[skills::Skill],
@@ -845,18 +952,26 @@ fn run_query(
 
         // ── 上下文水位检查（发请求之前）─────────────────────────
         // 用上一轮实测的输入体积作基准（比按字符估算准），过了 ELIDE 水位
-        // 先瘦身、过了 DROP 水位直接丢弃。
+        // 先瘦身、过了 DROP 水位才允许丢弃。
+        //
+        // 滞回（`last_compact`）：瘦身档必须间隔足够远才允许再动历史 ——
+        // 否则每轮都有旧消息跨过保留尾部被瘦身，前缀每轮都变、缓存每轮归零。
+        // 丢弃档（0.95）不受滞回约束：到了那个水位不压就可能 400，安全性优先。
         let measured = cfg.last_input.get();
         if measured > 0 {
             let ratio = measured as f64 / budget as f64;
+            let grew_enough =
+                measured > cfg.last_compact.get() + (budget as f64 * COMPACT_MIN_GROWTH) as u64;
             if ratio > DROP_RATIO {
-                let dropped = compact_history(history, true);
+                let dropped = compact_history(history, Compact::Drop);
                 base = base.saturating_sub(dropped);
                 cfg.last_input.set(0);
-            } else if ratio > ELIDE_RATIO {
-                let dropped = compact_history(history, false);
+                cfg.last_compact.set(measured);
+            } else if ratio > ELIDE_RATIO && grew_enough {
+                let dropped = compact_history(history, Compact::Elide);
                 base = base.saturating_sub(dropped);
                 cfg.last_input.set(0);
+                cfg.last_compact.set(measured);
             }
         }
 
@@ -919,8 +1034,9 @@ fn run_query(
             // 上下文超限 → 强制压缩后再试一次（水位估算失准时靠这条兜底）
             if status == 400 && !compacted_for_retry && context_related_error(&detail) {
                 compacted_for_retry = true;
-                let dropped = compact_history(history, true);
+                let dropped = compact_history(history, Compact::Force);
                 base = base.saturating_sub(dropped);
+                cfg.last_compact.set(cfg.last_input.get());
                 cfg.last_input.set(0);
                 eprintln!("[agent] 端点回报上下文超限 → 压缩 {dropped} 条后重试");
                 continue;

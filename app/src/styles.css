@@ -1228,6 +1228,9 @@ html, body {
 }
 
 .think-block summary {
+  display: flex;
+  align-items: center;
+  gap: 2px;
   cursor: pointer;
   color: var(--text-dim);
   font-size: 11px;
@@ -1317,14 +1320,224 @@ html, body {
   word-break: break-word;
 }
 
+/* ── AI 命令执行卡片（参照 Trae 侧栏，见 docs/agent-ui-spec.md §3.3）──
+   只用既有主题变量（--surface-glass / --border-glass / --text-dim / 语义色），
+   不新增配色；图标为内联线性 SVG（docs/icon-style.md §1）。 */
+.ai-ic {
+  vertical-align: -1px;
+  margin-right: 4px;
+  flex: none;
+}
+
+.tool-card {
+  margin: 3px 0;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+}
+
+.tool-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tool-card-head::-webkit-details-marker { display: none; }
+.tool-card-head::before { content: "▸"; font-size: 9px; opacity: 0.55; }
+.tool-card[open] > .tool-card-head::before { content: "▾"; }
+
+.tool-card .tool-name {
+  flex: none;
+  color: var(--blue);
+  font-weight: 500;
+}
+
+.tool-card .tool-cmd {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.tool-card .tool-state {
+  flex: none;
+  font-size: 11px;
+  opacity: 0.9;
+}
+
+.tool-card.running .tool-state { color: var(--accent); }
+.tool-card.ok .tool-state { color: var(--green); }
+.tool-card.exit-nonzero .tool-state,
+.tool-card.timeout .tool-state { color: var(--yellow); }
+.tool-card.failed .tool-state { color: var(--red); }
+.tool-card.failed { background: rgba(192, 138, 138, 0.08); }
+
+.tool-body {
+  padding: 0 8px 6px 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.tool-meta {
+  display: flex;
+  gap: 10px;
+  padding-top: 4px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.tool-out {
+  margin: 4px 0 0 0;
+  padding: 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+  color: var(--text-dim);
+}
+
+.tool-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.tool-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.tool-action:hover {
+  color: var(--text);
+  background: var(--surface-glass-hover);
+}
+
+/* ── 越界 / 被拒的后续动作（agent-ui-spec §4.3）────────────────────
+   工作区锁或用户拒绝之后给出的三个选项：跳过 / 改到工作区内重试 /
+   加入命令白名单（危险命令永不出现）。用 --yellow 描边表示「被挡住」。 */
+.tool-refusal {
+  margin-top: 6px;
+  padding: 5px 7px;
+  border-left: 2px solid var(--yellow);
+  background: rgba(201, 184, 150, 0.07);
+  border-radius: 4px;
+}
+.tool-refusal-msg {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--yellow);
+  word-break: break-word;
+}
+.tool-refusal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+.tool-refusal-btn {
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.tool-refusal-btn:hover {
+  color: var(--text);
+  background: var(--surface-glass-hover);
+}
+.tool-refusal-btn.tool-refusal-allow {
+  color: var(--green);
+  border-color: rgba(157, 180, 172, 0.3);
+}
+.tool-refusal-btn.tool-refusal-allow:hover {
+  background: rgba(157, 180, 172, 0.18);
+}
+
+/* ── 系统提示块（运行端输出，见 agent-ui-spec §3.4）─────────────────
+   以前 agent.exe 的 stderr 只进 console（release 没有控制台 → 用户看不到），
+   现在折成一条可展开的提示行：日志负责事后取证，这行负责当场可见。 */
+.sys-note {
+  margin: 4px 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-glass);
+  font-size: 11px;
+}
+.sys-note > summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  list-style: none;
+  user-select: none;
+}
+.sys-note > summary::-webkit-details-marker { display: none; }
+.sys-note > summary:hover { color: var(--text); }
+.sys-note-error > summary { color: var(--red); opacity: 0.85; }
+.sys-note-body {
+  margin: 4px 0 0 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+  color: var(--text-dim);
+}
+
+/* 回合折叠（Trae 的对话流节点自动折叠）：只留用户消息 + 正文 + 汇总行 */
+.agent-flow.flow-folded .think-block,
+.agent-flow.flow-folded .tool-card,
+.agent-flow.flow-folded .tool-row,
+.agent-flow.flow-folded .todo-panel,
+.agent-flow.flow-folded .sys-note {
+  display: none;
+}
+
 /* ── Agent turn footer (Pi reference: turn-end tool summary) ──── */
 .turn-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin: 8px 0 12px 0;
   padding: 4px 10px;
   font-size: 0.68rem;
   color: var(--text-dim);
   opacity: 0.6;
   border-left: 2px solid var(--text-muted);
+}
+
+.turn-fold {
+  padding: 1px 6px;
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.turn-fold:hover {
+  color: var(--text);
+  background: var(--surface-glass-hover);
 }
 .turn-footer .turn-tool-count {
   font-weight: 500;
@@ -2052,51 +2265,20 @@ html, body {
   background: rgba(192, 160, 160, 0.2);
 }
 
-/* ── Conversation mode toggle pill (simple Q&A / full Agent) ──── */
-#chat-mode-btn.chat-mode-pill {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 28px;
-  padding: 0 10px;
-  font-size: 0.66rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--border-glass);
-  border-radius: 14px;
-  color: var(--text-dim);
-  cursor: pointer;
-  flex-shrink: 0;
-  white-space: nowrap;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-#chat-mode-btn.chat-mode-pill:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: var(--text);
-}
-#chat-mode-btn.chat-mode-pill.simple-mode {
-  background: rgba(157, 180, 172, 0.1);
-  border-color: rgba(157, 180, 172, 0.3);
-  color: var(--green);
-}
-#chat-mode-btn.chat-mode-pill.simple-mode:hover {
-  background: rgba(157, 180, 172, 0.18);
-}
-
-/* ── AI workspace picker (chat window entry) ──────────────────── */
-.chat-workspace-wrap {
+/* ── 「更多」菜单：思考 / 运行方式 / 工作区 / 工具黑名单（2026-09）──
+   原先是输入栏里并排的四个控件（两个文字胶囊 + 两个图标弹窗），现在收进
+   一个 ⋯ 按钮并移到输入框之后（agent-ui-spec §5.3；图标风格见 icon-style.md）。 */
+.chat-more-wrap {
   position: relative;
   flex-shrink: 0;
 }
-#chat-workspace-btn {
+#chat-more-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 28px;
   height: 28px;
-  font-size: 0.8rem;
-  background: var(--accent-bg);
+  background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--border-glass);
   border-radius: 8px;
   color: var(--text-dim);
@@ -2104,93 +2286,20 @@ html, body {
   flex-shrink: 0;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-#chat-workspace-btn:hover {
-  background: rgba(192, 160, 160, 0.22);
-  color: var(--accent);
-}
-#chat-workspace-btn.has-workspace {
-  background: rgba(192, 160, 160, 0.12);
-  border-color: rgba(192, 160, 160, 0.35);
-  color: var(--blue);
-}
-#chat-workspace-menu {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 0;
-  z-index: 60;
-  min-width: 220px;
-  max-width: 320px;
-  padding: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  background: rgba(28, 26, 32, 0.92);
-  border: 1px solid var(--border-glass);
-  border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(16px);
-  pointer-events: auto;
-}
-#chat-workspace-menu.hidden {
-  display: none;
-}
-.chat-workspace-path {
-  font-size: 0.68rem;
-  color: var(--text-dim);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--border-glass);
-  border-radius: 6px;
-  padding: 5px 8px;
-}
-#chat-workspace-menu button {
-  padding: 6px 10px;
-  font-size: 0.7rem;
-  border-radius: 6px;
-  border: 1px solid var(--border-glass);
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text);
-  cursor: pointer;
-  transition: background 0.1s, color 0.1s;
-}
-#chat-workspace-menu button:hover {
+#chat-more-btn:hover,
+#chat-more-btn.open {
   background: rgba(255, 255, 255, 0.12);
   color: var(--text);
 }
-
-/* ── AI tool blacklist (chat window entry — 第19点缓存优化) ─── */
-.chat-tools-wrap {
-  position: relative;
-  flex-shrink: 0;
-}
-#chat-tools-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  font-size: 0.8rem;
-  background: var(--accent-bg);
-  border: 1px solid var(--border-glass);
-  border-radius: 8px;
-  color: var(--text-dim);
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-#chat-tools-btn:hover {
-  background: rgba(192, 160, 160, 0.22);
-  color: var(--accent);
-}
-#chat-tools-menu {
+#chat-more-menu {
   position: absolute;
   bottom: calc(100% + 6px);
-  left: 0;
+  right: 0;
   z-index: 60;
-  width: 300px;
-  max-height: 320px;
+  width: 288px;
+  max-height: min(320px, 60vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 8px;
   display: flex;
   flex-direction: column;
@@ -2202,11 +2311,206 @@ html, body {
   backdrop-filter: blur(16px);
   pointer-events: auto;
 }
-#chat-tools-menu.hidden {
+#chat-more-menu.hidden {
   display: none;
 }
+
+.chat-more-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 2px;
+}
+.chat-more-row + .chat-more-row {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.chat-more-ic {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.chat-more-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+/* 工作区 / 工具黑名单两行内容多，单独占满宽度换行排布 */
+.chat-more-block {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+.chat-more-block .chat-workspace-path,
+.chat-more-block .chat-tools-list,
+.chat-more-block .chat-tools-actions {
+  flex-basis: 100%;
+}
+.chat-more-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.chat-more-actions button {
+  padding: 4px 8px;
+  font-size: 0.68rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  cursor: pointer;
+}
+.chat-more-actions button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* 思考档位：三档分段（快速 / 思考 / 深度） */
+.chat-more-seg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  flex-shrink: 0;
+}
+.chat-more-seg button {
+  padding: 3px 8px;
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.chat-more-seg button:hover {
+  color: var(--text);
+}
+.chat-more-seg button.active {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+/* 运行方式：图标 + 三格档位点阵（不写文字，语义走 title / aria-label） */
+#chat-runmode-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px 3px 5px;
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+#chat-runmode-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+.rm-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+.rm-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+}
+.rm-dots i.on {
+  background: var(--green);
+}
+/* 手动 = 中性、白名单 = 绿、自动 = 红（与审批/危险的语义色一致） */
+#chat-runmode-btn[data-mode="manual"] .rm-dots i.on {
+  background: var(--text-dim);
+}
+#chat-runmode-btn.run-mode-auto {
+  color: var(--red);
+  border-color: rgba(192, 138, 138, 0.35);
+}
+#chat-runmode-btn.run-mode-auto .rm-dots i.on {
+  background: var(--red);
+}
+
+/* 运行方式右侧的功能简述（自动档转红，即「常驻警示」就地显示在按钮旁） */
+.chat-more-hint {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.64rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+.chat-more-hint.warn {
+  color: var(--red);
+}
+/* 菜单收起时，⋯ 按钮本身也标红提醒「自动运行开着」 */
+#chat-more-btn.run-mode-auto {
+  color: var(--red);
+  border-color: rgba(192, 138, 138, 0.35);
+}
+
+/* 切换自动档的二次确认（就地长在运行方式按钮旁，不用原生 confirm） */
+.run-mode-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.run-mode-confirm-msg {
+  flex-basis: 100%;
+  font-size: 0.64rem;
+  line-height: 1.4;
+  color: var(--text);
+}
+.run-mode-confirm-ok,
+.run-mode-confirm-cancel {
+  padding: 2px 8px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.run-mode-confirm-ok {
+  color: var(--red);
+  background: rgba(192, 138, 138, 0.12);
+  border: 1px solid rgba(192, 138, 138, 0.35);
+}
+.run-mode-confirm-ok:hover {
+  background: rgba(192, 138, 138, 0.22);
+}
+.run-mode-confirm-cancel {
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+}
+.run-mode-confirm-cancel:hover {
+  color: var(--text);
+  background: var(--surface-glass-hover);
+}
+
+/* ── 工作区行（AI 对话界面 →「更多」菜单内）────────────────────── */
+.chat-workspace-path {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.chat-workspace-path.has-workspace {
+  color: var(--blue);
+  border-color: rgba(148, 144, 180, 0.35);
+}
+
+/* ── 工具黑名单行（AI 对话界面 →「更多」菜单内 — 第19点缓存优化）── */
 .chat-tools-title {
-  font-size: 0.72rem;
+  font-size: 0.7rem;
   color: var(--text-dim);
   padding: 0 2px;
 }
@@ -2225,15 +2529,38 @@ html, body {
   color: var(--text);
   padding: 3px 6px;
   border-radius: 6px;
-  cursor: pointer;
   user-select: none;
 }
 .chat-tools-item:hover {
   background: rgba(255, 255, 255, 0.06);
 }
-.chat-tools-item input[type="checkbox"] {
-  accent-color: var(--blue);
-  pointer-events: auto;
+/* 行首 ×/✓ 切换按钮：× = 已禁用（红），✓ = 启用（暗） */
+.chat-tools-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.chat-tools-toggle:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+.chat-tools-item.off .chat-tools-toggle {
+  color: var(--red);
+  border-color: rgba(192, 138, 138, 0.35);
+  background: rgba(192, 138, 138, 0.1);
+}
+.chat-tools-item.off .chat-tools-name {
+  color: var(--text-muted);
+  text-decoration: line-through;
 }
 .chat-tools-item .chat-tools-desc {
   color: var(--text-dim);
@@ -2727,10 +3054,11 @@ html, body {
 #chat-send-btn,
 #chat-stop-btn,
 #chat-new-btn,
-#chat-tools-btn,
-#chat-workspace-btn,
+#chat-more-btn,
+#chat-runmode-btn,
+.chat-more-seg button,
+.chat-more-actions button,
 #chat-tools-save,
-#chat-workspace-menu button,
 .approval-btn,
 .approval-batch-card .approval-copy-btn,
 .memo-save-btn,
@@ -2741,7 +3069,7 @@ html, body {
 }
 
 /* pill ─ 胶囊切换按钮 */
-#chat-mode-btn.chat-mode-pill {
+.chat-more-seg {
   background-image: none;
   box-shadow: none;
 }
