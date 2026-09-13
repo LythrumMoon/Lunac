@@ -169,6 +169,15 @@ Write-Host "[6/9] Copying binaries to release/Lunac/..." -ForegroundColor Yellow
 
 $ReleaseDir = "$Root\release"
 $AppDir     = "$ReleaseDir\Lunac"
+
+# 干净暂存：每次构建都从空目录开始。
+# 否则上一版的遗留文件会被静默打进新包 —— 历史上 `cli.exe`（上游 Claude Code CLI
+# 的 bun 编译产物，.gitignore 明确禁止再分发）就是这么一路跟进每个安装包的，
+# 而 NSI 只打 agent.exe 之后它就成了「打不上也删不掉」的僵尸文件。
+if (Test-Path $AppDir) {
+  Remove-Item -Recurse -Force $AppDir
+  Write-Host "  Cleared stale staging dir (fresh build)" -ForegroundColor DarkGray
+}
 New-Item -ItemType Directory $AppDir -Force | Out-Null
 
 $Binaries = @{
@@ -189,6 +198,13 @@ foreach ($name in $Binaries.Keys) {
   $sizeMb = [math]::Round($size / 1MB, 1)
   Write-Host "  $name  $sizeMb MB" -ForegroundColor DarkGray
 }
+
+# 打包前防空转：暂存目录里绝不能有上游 cli.exe。
+# （NSI 的 File 指令会在编译期拦住「文件不存在」，但拦不住「多打了不该打的文件」。）
+if (Test-Path "$AppDir\cli.exe") {
+  throw "暂存目录里出现 cli.exe —— 上游 CLI 禁止随安装包分发（见 .gitignore / ai-spec §8.3）"
+}
+
 $totalMb = [math]::Round($TotalBinSize / 1MB, 1)
 Write-Host "  Total : $totalMb MB" -ForegroundColor Green
 Write-Host ""
@@ -282,10 +298,9 @@ Write-Host ""
 Write-Host "[8/9] PaddleOCR-json (offline OCR)..." -ForegroundColor Yellow
 $PaddleDir = "$AppDir\paddle-ocr"
 
-# 解压 .7z：优先 7z.exe，其次系统自带 bsdtar（Windows 10 1803+）。
-# PowerShell 的 Expand-Archive 不支持 7z，而 PaddleOCR-json 的 Windows 资产是 .7z。
-function Expand-SevenZip {
-  param([string]$Archive, [string]$Destination)
+# 定位 7z.exe：优先 Program Files 两处，其次 PATH。找不到返回 $null
+# （步骤 8 解 .7z 与步骤 9 校验包内容都用它）。
+function Find-SevenZip {
   $candidates = @(
     "$env:ProgramFiles\7-Zip\7z.exe",
     "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
@@ -295,6 +310,14 @@ function Expand-SevenZip {
     $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
     if ($cmd) { $exe = $cmd.Source }
   }
+  return $exe
+}
+
+# 解压 .7z：优先 7z.exe，其次系统自带 bsdtar（Windows 10 1803+）。
+# PowerShell 的 Expand-Archive 不支持 7z，而 PaddleOCR-json 的 Windows 资产是 .7z。
+function Expand-SevenZip {
+  param([string]$Archive, [string]$Destination)
+  $exe = Find-SevenZip
   if ($exe) {
     & $exe x $Archive "-o$Destination" -y | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "7z exited with code $LASTEXITCODE" }
@@ -439,6 +462,25 @@ if (-not (Test-Path $SetupPath)) {
   } else {
     throw "Setup.exe not produced in $ReleaseDir — check makensis output above for errors"
   }
+}
+
+# ── 包内容校验：必须含 agent.exe、不得含 cli.exe ─────────────────────
+# NSIS 的文件表是 LZMA 压缩的，直接扫 Setup.exe 字节不可靠，所以用 7z 列包内清单。
+# 没装 7z 就跳过并提示（编译期的 File 指令已经能拦住「文件不存在」，
+# 这里防的是「打了不该打的东西」）。
+$SevenZip = Find-SevenZip
+if ($SevenZip) {
+  # 7z 在非 TTY 下可能按宽度折断长文件名，先压掉所有空白再匹配
+  $packed = ((& $SevenZip l $SetupPath 2>&1) -join "`n") -replace '\s+', ''
+  if ($packed -match 'cli\.exe') {
+    throw "安装包里出现了 cli.exe（上游 CLI，禁止再分发）：$SetupPath"
+  }
+  if ($packed -notmatch 'agent\.exe') {
+    throw "安装包里没有 agent.exe（自研 AI 后端）—— 装完 AI 起不来：$SetupPath"
+  }
+  Write-Host "  包内容 OK：含 agent.exe，无 cli.exe" -ForegroundColor Green
+} else {
+  Write-Host "  [SKIP] 未找到 7z.exe，跳过包内容校验" -ForegroundColor Yellow
 }
 
 # ═══════════════════════════════════════════════════════════════════

@@ -335,7 +335,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 **与旧 cli.exe 的完整差距清单、价值评级与实施顺序见 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md)。**
 
-**构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路：`bundle.resources` 把它平铺成 `resources\agent.exe`，NSIS 由 `release\lunac-installer.nsi` 装到安装根；`build-release.ps1` 的 **[4/9]** 步必须在 Rust 构建之前跑，否则 resources 缺文件会打包失败。
+**构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
 ### 3.6 数学公式渲染
 
@@ -562,13 +562,21 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173
 
 ### 8.2 打包流程
 
-仅在用户明确说"打包"或"生成安装包"时执行：
+仅在用户明确说"打包"或"生成安装包"时执行。一条命令搞定：
 
-1. `powershell -File scripts\build-core.ps1` — 编译自研后端 `core-agent` → `agent.exe`（必须在第 2 步前，`bundle.resources` 会引用它）
-2. `cd app && cargo build --release` — Rust 编译
-3. `npm run build` — 前端编译
-4. 复制 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` → `release/Lunac/`
-5. NSIS 编译 → `release/Lunac-0.x.0-Setup.exe`
+```
+powershell -ExecutionPolicy Bypass -File build-release.ps1        # 版本号取自 app/package.json
+powershell -ExecutionPolicy Bypass -File build-release.ps1 0.9.1  # 或显式指定
+```
+
+脚本九步：① 预检 cargo / makensis ② kill 运行中的 lunac.exe / agent.exe ③ `npm run build`（前端）④ `cargo build --release`（core-agent → agent.exe，**必须早于第 5 步**）⑤ `cargo build --release`（src-tauri → lunac.exe）⑥ **清空并重建暂存目录** `release\Lunac\` + 拷 `lunac.exe` / `agent.exe` / `WebView2Loader.dll` ⑦ 打包 VSCode 扩展 → `lunac.vsix` ⑧ 预置 PaddleOCR-json（本地 `paddle-ocr/` 优先，缺失则从 GitHub 下载 .7z）⑨ 改写 NSI 版本号 → makensis → `release\Lunac-<版本>-Setup.exe`。
+
+**产物不变量（两条都已在脚本里做成硬校验，违反即中止）**：
+
+1. **必须含 `agent.exe`** —— 自研 AI 后端，`core_dir()` 只在安装根找它；少了它装完 AI 直接 `agent.exe not found`。
+2. **不得含 `cli.exe`** —— 上游 Claude Code CLI 的 bun 编译产物（121MB），Anthropic 版权、**禁止再分发**（见 §8.3 红线）。**2026-09-13 之前的全部安装包（0.4.0–0.9.0）都含它**：NSI 里写的是 `File "Lunac\cli.exe"`，而暂存目录从不清理，那份僵尸文件就这么一路跟进每个包；且 2026-09-11 自研 agent 接线（`c5b6a10`）之后，新 `lunac.exe` 只认 `agent.exe`，于是脚本产出的包「既打不进 agent.exe、又删不掉 cli.exe」→ 装完 AI 不可用。
+
+校验方式：打包前查暂存目录有无 `cli.exe`（`Test-Path`）；打包后用 7z 列包内清单（NSIS 文件表是 LZMA 压缩的，直接扫字节不可靠），命中 `cli.exe` 或缺 `agent.exe` 即 `throw`；没装 7z 则跳过并提示。
 
 **日常修改不打包** — 仅编译验证即可。
 
@@ -581,6 +589,7 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173
 1. **`core/` 绝不入库** —— `core/` 是上游 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。**自研 `core-agent/` 已上线，构建与运行都不再依赖它**，该目录仅作历史参考保留在本地（已 gitignore）。
 2. **`.env` 绝不入库** —— `core/.env` 与 `app/src-tauri/.env`（`AI_API_KEY` 等）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
 3. **大二进制不入库** —— GitHub 单文件硬上限 100MB、仓库 >1GB 告警。以下均已 gitignore：`core/`、`core-agent/target`、`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
+4. **上游 `cli.exe` 绝不进安装包** —— `release\Lunac\cli.exe` 是上游 Claude Code CLI 的 bun 编译产物（121MB，VersionInfo：Product=Bun / Company=Oven），与第 1 条同源：**只允许留在本机作历史参考，不得随任何发行包分发**。已发布的 **0.4.0–0.9.0 安装包全都含它**（NSI 曾写 `File "Lunac\cli.exe"`），公开仓库前必须重新打包替换掉这些资产；`build-release.ps1` 已加打包前后双校验（见 §8.2）。
 
 **README 对外页面纪律**：不出现上游 CLI / `cli.exe` 相关说明，不设「快速开始」栏目（构建与自检步骤仅在 `docs/` 与本规范内维护）。
 
