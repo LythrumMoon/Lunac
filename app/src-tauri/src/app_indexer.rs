@@ -1,41 +1,37 @@
 // app_indexer.rs — System application scanner for Lunac
 //
-// Scans Start Menu, Desktop, Program Files, and PATH for executables
-// and shortcuts. Supports custom app registration from JSON registry.
+// Scans Start Menu (and the custom app registry) for launchable entries.
+//
+// 应用列表的存储（2026-09 修订）：**落盘文件是唯一真相**
+//   <exe 根>\temp\app-index-cache.json
+// 搜索路径只读这个文件 —— 不做目录扫描、不写盘、也不持有任何进程内状态，
+// 所以任何动作（窗口唤出/隐藏、切进插件、增删自定义启动项）都不会让搜索卡住。
+// 全量扫描只发生在「后台刷新」路径上，扫完原子写回文件。
 
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Start Menu / 自定义应用的扫描结果缓存。
-/// search_apps 每次击键都会调用 scan_all()；目录遍历 + pinyin 建索引很慢，
-/// 不加缓存是“快速打字顿卡”的主要来源。TTL 内直接返回缓存，新增/删除自定义
-/// 应用时调用 invalidate_scan_cache() 主动失效。
-struct ScanCache {
-    at: Instant,
-    apps: Vec<AppEntry>,
-}
-static SCAN_CACHE: Mutex<Option<ScanCache>> = Mutex::new(None);
-const SCAN_CACHE_TTL: Duration = Duration::from_secs(30);
-/// 落盘缓存版本号；结构不兼容时直接丢弃旧文件。
+/// 落盘文件版本号；结构不兼容时直接丢弃（等后台重扫重建）。
 const SCAN_CACHE_VERSION: u32 = 1;
-/// 落盘缓存最大可用年龄，超过视为不可信（等重新扫描）。
-const DISK_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// 后台重建进行中标记，避免并发重复扫描。
+/// 后台重扫的最小间隔：热键唤出时若文件比这个更旧，就异步重扫一次。
+/// 它只决定「何时刷新」，与「搜索读什么」无关 —— 搜索永远只读文件。
+const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// 后台重建进行中标记，避免并发重复扫描 / 同时写同一个文件。
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 
-/// 落盘缓存文件：<exe 根>\temp\app-index-cache.json（缓存类数据，随卸载一并清除）。
+/// 列表文件：<exe 根>\temp\app-index-cache.json（纯缓存，可随时重建，随卸载一并清除）。
 fn scan_cache_path() -> PathBuf {
     crate::storage::lunac_root_dir()
         .join("temp")
         .join("app-index-cache.json")
 }
 
-/// 落盘结构（内存缓存 → 文件）。
+/// 落盘结构。`saved_ms` 只用来判断「结果有多旧、该不该后台重扫」。
 #[derive(Serialize, Deserialize)]
 struct PersistedScanCache {
     version: u32,
@@ -50,13 +46,67 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 使扫描缓存失效（自定义应用增删后调用）：同时清内存与磁盘，
-/// 防止重建前退出导致下次启动复活旧列表。
-pub fn invalidate_scan_cache() {
-    if let Ok(mut cache) = SCAN_CACHE.lock() {
-        *cache = None;
+/// 读列表文件；缺失 / 损坏 / 版本不符一律 None（等同「还没有列表」）。
+fn read_cache() -> Option<PersistedScanCache> {
+    let text = fs::read_to_string(scan_cache_path()).ok()?;
+    let payload: PersistedScanCache = serde_json::from_str(&text).ok()?;
+    if payload.version != SCAN_CACHE_VERSION {
+        return None;
     }
-    let _ = fs::remove_file(scan_cache_path());
+    Some(payload)
+}
+
+/// 当前应用列表 —— 搜索与列表命令的**唯一入口**。
+/// **永不阻塞**：只读文件，不扫描、不写盘、无进程内状态可失效。
+pub fn apps() -> Vec<AppEntry> {
+    read_cache().map(|p| p.apps).unwrap_or_default()
+}
+
+/// 原子写：先写同目录临时文件再 rename 覆盖。
+/// 搜索路径随时可能在读这个文件，直接 `fs::write`（截断+写入）会让读方
+/// 看到半截 JSON —— 表现为「结果突然空了」。失败一律静默（列表丢了只是下次重扫）。
+fn write_cache(apps: &[AppEntry]) {
+    let path = scan_cache_path();
+    let Some(dir) = path.parent() else { return };
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let payload = PersistedScanCache {
+        version: SCAN_CACHE_VERSION,
+        saved_ms: now_ms(),
+        apps: apps.to_vec(),
+    };
+    let Ok(json) = serde_json::to_string(&payload) else { return };
+    let tmp = dir.join("app-index-cache.json.tmp");
+    if fs::write(&tmp, json).is_err() {
+        return;
+    }
+    let _ = fs::rename(&tmp, &path);
+}
+
+/// 扫描结果比 `REFRESH_MIN_INTERVAL` 更旧（或压根没有文件）才后台重扫。
+/// 供启动与 Alt+Space 唤出路径调用，自身不阻塞。
+pub fn refresh_if_stale() {
+    let fresh = read_cache()
+        .map(|p| now_ms().saturating_sub(p.saved_ms) < REFRESH_MIN_INTERVAL.as_millis() as u64)
+        .unwrap_or(false);
+    if !fresh {
+        refresh_in_background();
+    }
+}
+
+/// 后台全量重扫并写回文件（去重：已有任务在跑则忽略）。非阻塞。
+pub fn refresh_in_background() {
+    if REFRESHING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(|| {
+        write_cache(&scan_all_uncached());
+        REFRESHING.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Check if a string contains any Chinese character
@@ -114,9 +164,9 @@ pub struct AppRegistry {
 
 // ── Registry path ─────────────────────────────────────────────────
 //
-// 2026-09 存储目录重构：业务数据统一放 %LOCALAPPDATA%\Lunac\ModuleData\
-// （与 storage.rs 的 history/memo 同一根）。自定义启动项存
-// ModuleData\custom\app_registry.json，旧版本曾放在 exe 同目录，首读自动迁移。
+// 自定义启动项属**业务数据**（不是缓存，丢了就是用户资产丢失），存
+// <exe 根>\ModuleData\custom\app_registry.json —— 与 storage.rs 的
+// history/memo 同一根，随卸载一并清除；旧版本曾放在 exe 同目录，首读自动迁移。
 
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -192,7 +242,7 @@ pub fn add_custom_app(name: &str, path: &str) -> Result<(), String> {
         source: "custom".into(),
     });
     save_registry(&reg);
-    invalidate_scan_cache();
+    sync_custom_apps();
     Ok(())
 }
 
@@ -204,8 +254,19 @@ pub fn remove_custom_app(path: &str) -> Result<(), String> {
         return Err("App not found in registry".into());
     }
     save_registry(&reg);
-    invalidate_scan_cache();
+    sync_custom_apps();
     Ok(())
+}
+
+/// 自定义启动项增删后，**就地**把列表文件改成新内容：系统项沿用文件里的现状，
+/// custom 项按注册表现算 —— 不重扫 Start Menu、更不删文件。
+///
+/// 旧实现在这里把整个列表文件删掉，下一次搜索因为无文件可读而退化成全量同步
+/// 扫描，正是「加完自定义启动项后第一次搜索卡一下」的来源。改成就地重写后，
+/// 新增的启动项**立刻**可被搜到，且搜索路径依然只是读一次文件。
+fn sync_custom_apps() {
+    let system: Vec<AppEntry> = apps().into_iter().filter(|a| a.source != "custom").collect();
+    write_cache(&merge_apps(system, custom_apps()));
 }
 
 pub fn list_custom_apps() -> Vec<AppEntry> {
@@ -244,158 +305,52 @@ fn walk_lnk(dir: &Path, apps: &mut Vec<AppEntry>, source: &str, depth: u32) {
     }
 }
 
-/// Full scan: only Start Menu paths + custom registry.
-///
-/// 三级策略（2026-09）：
-///   ① 内存缓存新鲜（TTL 内）→ 直接返回，零 IO；
-///   ② 内存缓存过期 → 立即返回旧数据 + **后台重建**（stale-while-revalidate），
-///      搜索路径永不因目录扫描阻塞；
-///   ③ 无任何缓存（首启且无落盘）→ 同步扫一次。
-/// 每次重建都把结果落盘到 <exe 根>\temp\app-index-cache.json，供下次启动预热。
-pub fn scan_all() -> Vec<AppEntry> {
-    let stale: Option<Vec<AppEntry>> = match SCAN_CACHE.lock() {
-        Ok(cache) => match cache.as_ref() {
-            Some(c) if c.at.elapsed() < SCAN_CACHE_TTL => return c.apps.clone(),
-            Some(c) => Some(c.apps.clone()),
-            None => None,
-        },
-        Err(_) => None,
-    };
-
-    if let Some(apps) = stale {
-        // 过期但有旧数据：先把旧结果交给用户，后台换成新的
-        refresh_scan_cache_in_background();
-        return apps;
-    }
-
-    // 无缓存：同步扫描 + 落盘（仅首启且无落盘缓存时发生一次）
-    let apps = scan_all_uncached();
-    store_and_persist(&apps);
-    apps
-}
-
-/// 写入内存缓存并落盘。
-fn store_and_persist(apps: &[AppEntry]) {
-    if let Ok(mut cache) = SCAN_CACHE.lock() {
-        *cache = Some(ScanCache {
-            at: Instant::now(),
-            apps: apps.to_vec(),
-        });
-    }
-    persist_scan_cache(apps);
-}
-
-/// 落盘（best-effort，失败静默 —— 缓存丢失只影响下次启动速度）。
-fn persist_scan_cache(apps: &[AppEntry]) {
-    let path = scan_cache_path();
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let payload = PersistedScanCache {
-        version: SCAN_CACHE_VERSION,
-        saved_ms: now_ms(),
-        apps: apps.to_vec(),
-    };
-    if let Ok(json) = serde_json::to_string(&payload) {
-        let _ = fs::write(&path, json);
-    }
-}
-
-/// 无条件重扫并落盘（后台线程调用）。
-fn rebuild_scan_cache() {
-    let apps = scan_all_uncached();
-    store_and_persist(&apps);
-}
-
-/// 后台重建（去重：已有重建在跑则忽略）。非阻塞，可在热键唤出路径安全调用。
-pub fn refresh_scan_cache_in_background() {
-    if REFRESHING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-    std::thread::spawn(|| {
-        rebuild_scan_cache();
-        REFRESHING.store(false, Ordering::SeqCst);
-    });
-}
-
-/// 缓存过期（或缺失）才后台重建 —— 供 Alt+Space 唤出 / 启动时调用。
-pub fn refresh_scan_cache_if_stale() {
-    let stale = match SCAN_CACHE.lock() {
-        Ok(c) => c
-            .as_ref()
-            .map(|c| c.at.elapsed() >= SCAN_CACHE_TTL)
-            .unwrap_or(true),
-        Err(_) => true,
-    };
-    if stale {
-        refresh_scan_cache_in_background();
-    }
-}
-
-/// 启动时从落盘缓存预热内存；返回是否成功载入。
-/// 文件缺失 / 版本不符 / 超过 DISK_CACHE_MAX_AGE 一律忽略（改走重扫）。
-pub fn warm_cache_from_disk() -> bool {
-    let text = match fs::read_to_string(scan_cache_path()) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let payload: PersistedScanCache = match serde_json::from_str(&text) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if payload.version != SCAN_CACHE_VERSION {
-        return false;
-    }
-    let age = Duration::from_millis(now_ms().saturating_sub(payload.saved_ms));
-    if age > DISK_CACHE_MAX_AGE {
-        return false;
-    }
-    // at 回推为「文件保存时刻」，让 TTL 延续落盘时间而非启动时刻：
-    // 落盘越久 → 载入后越容易被判为过期 → 触发后台重建。
-    let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-    if let Ok(mut cache) = SCAN_CACHE.lock() {
-        *cache = Some(ScanCache {
-            at,
-            apps: payload.apps,
-        });
-    }
-    true
-}
-
+/// 全量扫描：Start Menu 的 .lnk + 注册表里仍然存在的自定义启动项。
+/// **只在后台刷新路径上调用**（`refresh_in_background` / `sync_custom_apps`），
+/// 搜索路径走 `apps()` 读文件，永远不会进到这里。
 fn scan_all_uncached() -> Vec<AppEntry> {
-    let mut apps: Vec<AppEntry> = Vec::new();
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let programdata = std::env::var("ProgramData").unwrap_or_default();
 
-    // 1. Start Menu .lnk files (both user and all-users)
-    // Locked to system Start Menu paths for consistency and user expectation
-    let start_menu_paths = [
+    // Start Menu .lnk（用户级 + 全局级）。锁定系统 Start Menu 路径，
+    // 与用户预期一致（不扫桌面/Program Files 这类噪声很大的位置）。
+    let mut system: Vec<AppEntry> = Vec::new();
+    for p in [
         PathBuf::from(&appdata).join(r"Microsoft\Windows\Start Menu\Programs"),
         PathBuf::from(&programdata).join(r"Microsoft\Windows\Start Menu\Programs"),
-    ];
-    for p in &start_menu_paths {
-        walk_lnk(p, &mut apps, "start_menu", 0);
+    ] {
+        walk_lnk(&p, &mut system, "start_menu", 0);
     }
 
-    // 2. Custom apps from registry (user-added paths, any format)
-    let reg = load_registry();
-    for a in &reg.apps {
-        if Path::new(&a.path).exists() {
-            apps.push(a.clone());
-        }
-    }
+    merge_apps(system, custom_apps())
+}
 
-    // Deduplicate by name (case-insensitive)
+/// 注册表里**路径仍然存在**的自定义启动项（已删除的条目直接忽略）
+fn custom_apps() -> Vec<AppEntry> {
+    load_registry()
+        .apps
+        .into_iter()
+        .filter(|a| Path::new(&a.path).exists())
+        .collect()
+}
+
+/// 合并系统项与自定义项：按来源优先级 + 名称排序，同名（忽略大小写）只保留
+/// 优先级更高的那条 —— 即系统项优先，用户给同名应用加的自定义项被吞掉。
+///
+/// 注意**不能用 `dedup_by`**：排序键里含来源优先级，同名条目不一定相邻
+/// （中间会插进别的低优先级条目），`dedup_by` 只处理相邻重复，会漏掉跨来源的
+/// 重名 → 搜索结果里出现两个同名条目。这里用「全表 seen 集合」去重。
+fn merge_apps(mut system: Vec<AppEntry>, custom: Vec<AppEntry>) -> Vec<AppEntry> {
+    let mut apps = Vec::with_capacity(system.len() + custom.len());
+    apps.append(&mut system);
+    apps.extend(custom);
     apps.sort_by(|a, b| {
         source_priority(&a.source)
             .cmp(&source_priority(&b.source))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    apps.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
-
+    let mut seen = HashSet::new();
+    apps.retain(|a| seen.insert(a.name.to_lowercase()));
     apps
 }
 
@@ -411,12 +366,14 @@ fn source_priority(source: &str) -> u8 {
 /// Search apps by fuzzy-matching the query against app names.
 /// Only returns executables (.exe, .lnk) — no folders.
 /// Custom apps are exceptions (user explicitly added them).
+///
+/// 只读列表文件（`apps()`）—— 每次击键调用也不会扫描目录、不会写盘。
 pub fn search_apps(query: &str, limit: usize) -> Vec<AppEntry> {
     if query.trim().is_empty() {
         return Vec::new();
     }
 
-    let all = scan_all();
+    let all = apps();
     let q = query.to_lowercase();
     let mut scored: Vec<(AppEntry, i32)> = all
         .into_iter()
@@ -547,6 +504,15 @@ pub fn launch_app(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// 下面几个测试都读写同一份列表 / 注册表文件（`cargo test` 默认并行跑测试），
+    /// 用一把锁串起来，免得互相把对方刚写进去的内容覆盖掉。
+    static FILE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_files() -> MutexGuard<'static, ()> {
+        FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_search_empty() {
@@ -555,11 +521,51 @@ mod tests {
 
     #[test]
     fn test_registry_roundtrip() {
+        let _g = lock_files();
         let _ = add_custom_app("TestApp", "C:\\Windows\\notepad.exe");
         let apps = list_custom_apps();
         assert!(apps.iter().any(|a| a.name == "TestApp"));
         let _ = remove_custom_app("C:\\Windows\\notepad.exe");
         let apps2 = list_custom_apps();
         assert!(!apps2.iter().any(|a| a.name == "TestApp"));
+    }
+
+    fn mk(name: &str, source: &str) -> AppEntry {
+        AppEntry {
+            name: name.into(),
+            path: format!("{name}.lnk"),
+            icon: None,
+            source: source.into(),
+        }
+    }
+
+    /// 「文件是唯一真相」：写进去就能读出来，且读的是文件而不是进程内状态。
+    #[test]
+    fn test_cache_file_is_the_only_source() {
+        let _g = lock_files();
+        let mut list = apps();
+        list.push(mk("LunacSmokeApp", "custom"));
+        write_cache(&list);
+        assert!(apps().iter().any(|a| a.name == "LunacSmokeApp"));
+
+        // 清掉本次写入的条目，别把测试数据留在列表文件里
+        let cleaned: Vec<AppEntry> = apps()
+            .into_iter()
+            .filter(|a| a.name != "LunacSmokeApp")
+            .collect();
+        write_cache(&cleaned);
+        assert!(!apps().iter().any(|a| a.name == "LunacSmokeApp"));
+    }
+
+    /// 合并规则：系统项优先、同名去重时保留系统项、自定义项不被丢掉。
+    #[test]
+    fn test_merge_apps_priority_and_dedup() {
+        let merged = merge_apps(
+            vec![mk("WeChat", "start_menu")],
+            vec![mk("wechat", "custom"), mk("MyTool", "custom")],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|a| a.name == "WeChat" && a.source == "start_menu"));
+        assert!(merged.iter().any(|a| a.name == "MyTool"));
     }
 }

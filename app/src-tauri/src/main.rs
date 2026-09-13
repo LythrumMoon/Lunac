@@ -232,22 +232,14 @@ fn main() {
                 });
             }
 
-            // Start Menu / 自定义启动项 扫描缓存：优先从落盘缓存预热
-            // （<exe 根>\temp\app-index-cache.json，跨重启秒出，不必等首次扫描）；
-            // 文件缺失/过旧才真正重扫。之后由热键唤出路径按需后台刷新。
-            {
-                let warmed = crate::app_indexer::warm_cache_from_disk();
-                std::thread::spawn(move || {
-                    // 略延迟，避免与开机瞬间的磁盘/杀软 IO 高峰抢时间
-                    std::thread::sleep(std::time::Duration::from_millis(600));
-                    if warmed {
-                        // 已载入落盘缓存：仅在过期时后台重建
-                        crate::app_indexer::refresh_scan_cache_if_stale();
-                    } else {
-                        crate::app_indexer::scan_all();
-                    }
-                });
-            }
+            // 应用列表（Start Menu + 自定义启动项）：<exe 根>\temp\app-index-cache.json
+            // 是唯一真相，搜索路径只读它；这里只在启动后做一次**后台**刷新
+            // （文件不存在或比刷新间隔更旧时才真扫），不阻塞启动、不阻塞搜索。
+            std::thread::spawn(|| {
+                // 略延迟，避免与开机瞬间的磁盘/杀软 IO 高峰抢时间
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                crate::app_indexer::refresh_if_stale();
+            });
 
             // Start Agent HTTP bridge for VSCode extension (127.0.0.1:8789)
             if let Err(e) = agent_server::start() {

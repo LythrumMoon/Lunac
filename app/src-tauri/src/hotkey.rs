@@ -648,9 +648,10 @@ fn toggle_window() {
             }
             force_foreground(hwnd);
 
-            // 方案A：唤出时若扫描缓存已过期 → 后台重建（非阻塞）。
-            // 用户随后搜索即命中新缓存，避免闲置超 TTL 后首次搜索同步重扫卡顿。
-            crate::app_indexer::refresh_scan_cache_if_stale();
+            // 唤出时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）。
+            // 搜索路径只读文件、永不扫描，所以这一步只影响「列表有多新」，
+            // 不会让搜索等待。
+            crate::app_indexer::refresh_if_stale();
 
             // Update toggle tick AFTER force_foreground completes, so the
             // foreground guard cooldown doesn't start until the window is
@@ -721,8 +722,8 @@ pub fn show_and_focus() {
             ShowWindow(hwnd, SW_SHOW);
         }
         force_foreground(hwnd);
-        // 方案A：显示时若扫描缓存已过期 → 后台重建（非阻塞）
-        crate::app_indexer::refresh_scan_cache_if_stale();
+        // 显示时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）
+        crate::app_indexer::refresh_if_stale();
     }
 }
 

@@ -741,7 +741,7 @@ fn default_source() -> String {
 
 #[tauri::command]
 pub fn list_start_menu_apps() -> Vec<AppEntry> {
-    crate::app_indexer::scan_all()
+    crate::app_indexer::apps()
         .into_iter()
         .map(|a| AppEntry {
             name: a.name,
@@ -753,7 +753,11 @@ pub fn list_start_menu_apps() -> Vec<AppEntry> {
 }
 
 /// Search apps by fuzzy query — returns top matches for the search bar.
-#[tauri::command]
+///
+/// `(async)` = 抛到工作线程执行：Tauri 的**同步**命令跑在主线程上，而本命令
+/// 每次击键都会被调用一次，一旦主线程被拖住就是「搜索卡住」（窗口唤出/隐藏
+/// 期间尤其明显）。放到工作线程后，无论什么动作都不会阻塞界面。
+#[tauri::command(async)]
 pub fn search_apps(query: String, limit: usize) -> Vec<AppEntry> {
     crate::app_indexer::search_apps(&query, limit)
         .into_iter()
