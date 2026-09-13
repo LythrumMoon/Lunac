@@ -407,7 +407,11 @@ Write-Host ""
 
 Write-Host "[9/9] Running makensis..." -ForegroundColor Yellow
 
-$NsiFile = "$ReleaseDir\lunac-installer.nsi"
+# NSI 位于 scripts\（已入库；release\ 整体被 gitignore，放那儿换个克隆就跑不了）。
+# NSI 内部用 `!cd ${__FILEDIR__}\..\release` 自己锚定了源文件目录 —— makensis 解析
+# File / OutFile 的相对路径时用的是**脚本所在目录**，不是调用方 CWD，所以路径解析
+# 与这里的 Push-Location 无关（保留它只是双保险）。实测：从仓库根调用也能正确解析。
+$NsiFile = "$Root\scripts\lunac-installer.nsi"
 if (-not (Test-Path $NsiFile)) {
   throw "NSI script not found: $NsiFile"
 }
@@ -464,7 +468,7 @@ if (-not (Test-Path $SetupPath)) {
   }
 }
 
-# ── 包内容校验：必须含 agent.exe、不得含 cli.exe ─────────────────────
+# ── 包内容校验：必须含 agent.exe─────────────────────
 # NSIS 的文件表是 LZMA 压缩的，直接扫 Setup.exe 字节不可靠，所以用 7z 列包内清单。
 # 没装 7z 就跳过并提示（编译期的 File 指令已经能拦住「文件不存在」，
 # 这里防的是「打了不该打的东西」）。

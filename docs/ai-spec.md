@@ -571,6 +571,8 @@ powershell -ExecutionPolicy Bypass -File build-release.ps1 0.9.1  # 或显式指
 
 脚本九步：① 预检 cargo / makensis ② kill 运行中的 lunac.exe / agent.exe ③ `npm run build`（前端）④ `cargo build --release`（core-agent → agent.exe，**必须早于第 5 步**）⑤ `cargo build --release`（src-tauri → lunac.exe）⑥ **清空并重建暂存目录** `release\Lunac\` + 拷 `lunac.exe` / `agent.exe` / `WebView2Loader.dll` ⑦ 打包 VSCode 扩展 → `lunac.vsix` ⑧ 预置 PaddleOCR-json（本地 `paddle-ocr/` 优先，缺失则从 GitHub 下载 .7z）⑨ 改写 NSI 版本号 → makensis → `release\Lunac-<版本>-Setup.exe`。
 
+**NSI 脚本位置**：`scripts\lunac-installer.nsi`（**已入库**）。此前它放在 `release\` 内，而 `release\` 整体被 gitignore → 换个克隆就 `NSI script not found`，打包链路不可复现。脚本首部用 `!cd ${__FILEDIR__}\..\release` 锚定源文件目录：makensis 解析 `File` / `OutFile` 的相对路径用的是**脚本所在目录**而非调用方 CWD（实测从仓库根调用同样正确），因此 `File "Lunac\..."` 恒定解析到 `release\Lunac\`、Setup.exe 恒落在 `release\`，与 `Push-Location` 无关。
+
 **产物不变量（两条都已在脚本里做成硬校验，违反即中止）**：
 
 1. **必须含 `agent.exe`** —— 自研 AI 后端，`core_dir()` 只在安装根找它；少了它装完 AI 直接 `agent.exe not found`。
