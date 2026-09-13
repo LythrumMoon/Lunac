@@ -435,6 +435,19 @@ if (-not (Test-Path $Makensis)) {
   throw "makensis not found（NSIS 未安装或不在默认路径；已尝试 Program Files / x86 与 PATH）"
 }
 
+# 覆盖同名旧产物前先删干净：makensis 打不开已存在的输出文件时只会含糊地报
+# "Can't open output file"（实测：上一版包刚生成、杀软还在实时扫描它那会儿）。
+# 删不掉就说明确实被占用，这里直接给出可读的原因，省得对着 makensis 的报错猜。
+$SetupPath = "$ReleaseDir\Lunac-$Version-Setup.exe"
+if (Test-Path $SetupPath) {
+  try {
+    Remove-Item $SetupPath -Force -ErrorAction Stop
+    Write-Host "  Removed previous $Version installer" -ForegroundColor DarkGray
+  } catch {
+    throw "无法删除上一版安装包（疑似被杀软或其他进程占用），请关闭后重试：$SetupPath`n$($_.Exception.Message)"
+  }
+}
+
 Push-Location $ReleaseDir
 try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -454,7 +467,6 @@ if (Test-Path $StalePath) {
   Write-Host "  Removed stale: $StalePath" -ForegroundColor DarkGray
 }
 
-$SetupPath = "$ReleaseDir\Lunac-$Version-Setup.exe"
 if (-not (Test-Path $SetupPath)) {
   # Try glob (exclude broken literal-variable filenames)
   $matches = Get-ChildItem $ReleaseDir "Lunac-*-Setup.exe" |
@@ -468,7 +480,7 @@ if (-not (Test-Path $SetupPath)) {
   }
 }
 
-# ── 包内容校验：必须含 agent.exe─────────────────────
+# ── 包内容校验：必须含 agent.exe、不得含 cli.exe ─────────────────────
 # NSIS 的文件表是 LZMA 压缩的，直接扫 Setup.exe 字节不可靠，所以用 7z 列包内清单。
 # 没装 7z 就跳过并提示（编译期的 File 指令已经能拦住「文件不存在」，
 # 这里防的是「打了不该打的东西」）。
