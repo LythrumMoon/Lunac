@@ -18,7 +18,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "0.9.1"
+!define PRODUCT_VERSION "0.9.0"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
 RequestExecutionLevel user

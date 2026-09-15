@@ -1,4 +1,4 @@
-﻿﻿# scripts/verify-git.ps1
+﻿# scripts/verify-git.ps1
 # 「新克隆自检」—— 把本仓库克隆到新机器后先跑这个，一次列清缺什么。
 #
 # 用法:  powershell -ExecutionPolicy Bypass -File scripts\verify-git.ps1
@@ -87,7 +87,7 @@ if (Test-Path $envFile) {
   if ([regex]::IsMatch($text, '(?m)^\s*AI_MODEL\s*=\s*\S+')) {
     Ok "AI_MODEL 已设置"
   } else {
-    Warn "未设置 AI_MODEL（将回退默认 deepseek-v4-pro）"
+    Warn "未设置 AI_MODEL（将回退默认 deepseek-flash）"
   }
 } else {
   Bad "app\src-tauri\.env 缺失"

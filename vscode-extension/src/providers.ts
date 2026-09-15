@@ -14,7 +14,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   deepseek: {
     name: "deepseek",
     defaultUrl: "https://api.deepseek.com",
-    defaultModel: "deepseek-v4-pro",
+    defaultModel: "deepseek-flash",
     format: "openai",
     keyEnv: "DEEPSEEK_API_KEY",
   },

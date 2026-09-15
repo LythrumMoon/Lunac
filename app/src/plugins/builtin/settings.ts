@@ -184,7 +184,7 @@ async function buildSearchPane(): Promise<string> {
 interface ModelPreset { name: string; default_model: string; default_url: string; }
 const PROVIDER_PRESETS: Record<string, ModelPreset> = {
   "openai":       { name: "OpenAI",         default_model: "gpt-5.5",            default_url: "https://api.openai.com" },
-  "deepseek":     { name: "DeepSeek",       default_model: "deepseek-v4-pro",    default_url: "https://api.deepseek.com" },
+  "deepseek":     { name: "DeepSeek",       default_model: "deepseek-flash",     default_url: "https://api.deepseek.com" },
   "anthropic":    { name: "Anthropic",      default_model: "claude-sonnet-5",    default_url: "https://api.anthropic.com" },
   "google":       { name: "Google Gemini",  default_model: "gemini-3.6-flash",   default_url: "https://generativelanguage.googleapis.com/v1beta/openai" },
   "zhipu":        { name: "Zhipu GLM",      default_model: "glm-5",              default_url: "https://open.bigmodel.cn/api/paas/v4" },
@@ -196,9 +196,11 @@ const PROVIDER_PRESETS: Record<string, ModelPreset> = {
 
 const MODEL_SUGGESTIONS: Record<string, string[]> = {
   "openai":     ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"],
-  // DeepSeek 官方 Anthropic 兼容端点只认 "deepseek-flash" / "deepseek-v4-pro"
-  // （实测传 "deepseek-v4.1-flash" 或 "v4-flash" 之外的臆造名会 400）
-  "deepseek":   ["deepseek-v4-pro", "deepseek-flash"],
+  // DeepSeek 官方 Anthropic 兼容端点实测可用名（2026-09-15 用真实 key 逐个打到 200）：
+  // "deepseek-v4-pro" / "deepseek-flash" / "deepseek-v4-flash"。
+  // **三个都要列** —— 少列一个，用户存过的那个名字就会被面板当成未知模型、
+  // 在切供应商时被静默改写成预设默认值（真实事故：存 deepseek-v4-flash → 变 v4-pro）。
+  "deepseek":   ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"],
   "anthropic":  ["claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-haiku-4-5-20251001"],
   "google":     ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"],
   "zhipu":      ["glm-5", "glm-4.7", "glm-4.5-air", "glm-4.5-flash"],
@@ -218,6 +220,23 @@ function inferProviderForModel(model: string, fallback: string): string {
     if (k !== "custom" && p.default_model === model) return k;
   }
   return fallback;
+}
+
+/** 该模型名是否属于**别的**供应商（只有这种情况才允许在切供应商时回落默认值）。
+ *
+ * 反过来说：认不出来的名字（用户手输的自定义名、或清单里暂时漏列的名字）**必须原样保留** ——
+ * 早先的实现是「不在候选清单里就回落预设默认值」，于是「存 `deepseek-v4-flash` →
+ * 切一次供应商 → 变成 `deepseek-v4-pro` → 保存落盘」这条静默改写路径真实发生过。
+ * 判断标准只看「是不是别的供应商的名字」，与当前供应商的清单是否完整无关。 */
+function belongsToOtherProvider(model: string, provider: string): boolean {
+  if (!model) return false;
+  for (const [k, list] of Object.entries(MODEL_SUGGESTIONS)) {
+    if (k !== "custom" && k !== provider && list.includes(model)) return true;
+  }
+  for (const [k, p] of Object.entries(PROVIDER_PRESETS)) {
+    if (k !== "custom" && k !== provider && p.default_model === model) return true;
+  }
+  return false;
 }
 
 function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): string {
@@ -633,15 +652,16 @@ export async function attachSettingsListeners(container: HTMLElement) {
         overflow: hidden;
         padding: 4px 0;
       }
-      /* Allow native <select> dropdowns to overflow the content area and layout */
+      /* 打开下拉时放开**设置面板自身**对下拉框的裁剪。
+         只放开这两个容器（它们不是滚动容器）；下拉框在滚动容器的可视区内
+         翻转 + 限高（见 positionDropdown），所以不需要动滚动容器。
+         **绝不要**给 #results-list / #results-container 加这个类 —— 那是滚动
+         容器（styles.css 里 overflow-y:auto），改成 visible 会让它不再是滚动
+         容器、scrollTop 归零，整页瞬间跳回顶部（下拉框跳顶事故的根因）。 */
       .settings-layout.sel-open {
         overflow: visible;
       }
       .settings-content.sel-open {
-        overflow: visible;
-      }
-      #results-list.sel-open,
-      #results-container.sel-open {
         overflow: visible;
       }
 
@@ -679,6 +699,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
         display: flex;
         gap: 6px;
         flex-shrink: 0;
+      }
+      /* 设置项下方的一行小字说明（如自启机制）—— 不占开关位，左对齐 */
+      .settings-hint {
+        padding: 0 0 6px;
+        font-size: 0.68rem;
+        line-height: 1.45;
+        color: var(--text-dim);
+        opacity: 0.85;
       }
       .settings-label {
         font-size: 0.76rem;
@@ -936,17 +964,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
         display: none;
         margin-top: 0;
         box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-        /* Show a thin scrollbar so users can tell long option lists scroll
-           (previously hidden — "dropdown can't scroll" reports) */
-        scrollbar-width: thin; /* Firefox */
-        scrollbar-color: rgba(255,255,255,0.25) transparent;
-        -ms-overflow-style: auto; /* IE/Edge */
-      }
-      .custom-select-dropdown::-webkit-scrollbar { width: 6px; }
-      .custom-select-dropdown::-webkit-scrollbar-track { background: transparent; }
-      .custom-select-dropdown::-webkit-scrollbar-thumb {
-        background: rgba(255,255,255,0.2);
-        border-radius: 3px;
+        /* 滚动条外观走全局统一细条（styles.css 的「统一细滚动条」一节）。
+           这里**不要**再写 scrollbar-width / scrollbar-color —— 在 Chromium
+           (WebView2) 里它们会让 ::-webkit-scrollbar 整段失效、退回系统默认样式。 */
       }
       .custom-select.open .custom-select-dropdown { display: block; }
       .custom-select-option {
@@ -1195,6 +1215,10 @@ export async function attachSettingsListeners(container: HTMLElement) {
   if (autoStartCheck) {
     autoStartCheck.addEventListener("change", async () => {
       try {
+        // 开启 = 后端一次做完：先写 Run 键（保证开关一定生效），再自动弹一次管理员
+        // 确认补建「登录时计划任务」（开机后早约 60 秒可用）。取消确认不是错误 ——
+        // 仍然是「已开启，只是慢」。关闭 = 计划任务若存在，同样要管理员确认才删得掉。
+        // 机制细节只进落盘日志，不在 UI 暴露（见 ai-spec §11 规则 1）。
         await invoke("set_auto_start", { enabled: autoStartCheck.checked });
       } catch {
         // Revert checkbox on failure to keep UI consistent
@@ -1292,8 +1316,12 @@ export async function attachSettingsListeners(container: HTMLElement) {
      * here — #results-container has `backdrop-filter`, which per spec makes it
      * the containing block for fixed descendants, so a viewport-coordinate top
      * lands ~searchbar-height BELOW the trigger (需求2 复测: 52px gap). Absolute
-     * is immune to that offset. Height is still capped to fit the window, and
-     * ancestors get overflow:visible via .sel-open so nothing is clipped.
+     * is immune to that offset.
+     *
+     * 可用空间按**滚动容器（`#results-list`）的可视区**计算，不再按窗口算：
+     * 裁剪下拉框的是那一层（它 `overflow-y: auto`），按窗口算会在容器底部
+     * 明明放不下时仍然朝下展开 → 被裁掉半截；而放宽它的 overflow 会让整页
+     * 跳回顶部（见 setDropdownOverflow 的注释），所以只能在可视区内翻转 + 限高。
      */
     function positionDropdown() {
       const dropEl = dd.querySelector(".custom-select-dropdown") as HTMLElement | null;
@@ -1304,10 +1332,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
       // 目标高度：约 4 行可见（紧凑，不把面板撑满窗口），
       // 更多项（如自定义模型）通过列表内部滚动条拉动查看。
       const TARGET_H = 120;
-      const VH = window.innerHeight;
-      const spaceBelow = VH - trigRect.bottom - MARGIN;
-      const spaceAbove = trigRect.top - MARGIN;
-      // 下方放得下就朝下展开；下方不够（如内嵌小窗底部）则翻到上方；
+      // 边界 = 滚动容器的可视区（找不到时退回窗口）
+      const scroller = dd.closest("#results-list") as HTMLElement | null;
+      const box = scroller?.getBoundingClientRect();
+      const boundTop = Math.max(box ? box.top : 0, 0);
+      const boundBottom = Math.min(box ? box.bottom : window.innerHeight, window.innerHeight);
+      const spaceBelow = boundBottom - trigRect.bottom - MARGIN;
+      const spaceAbove = trigRect.top - boundTop - MARGIN;
+      // 下方放得下就朝下展开；下方不够（如面板底部）则翻到上方；
       // 高度固定 TARGET_H，极小窗口下保底 60px，始终可内部滚动。
       const openUp = spaceBelow < TARGET_H && spaceAbove > spaceBelow;
       const sideSpace = openUp ? spaceAbove : spaceBelow;
@@ -1526,9 +1558,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
   }
 
   /** Rebuild the model selector when provider changes (custom dropdown).
-   *  切换供应商时不把上一供应商的模型名带过来 —— 旧模型仅当属于新供应商的
-   *  预设或已保存自定义模型时才保留，否则回落到该供应商的默认模型，
-   *  不再出现跨供应商模型被标成“(自定义)”并占据选中位的问题。 */
+   *  切换供应商时不把上一供应商的模型名带过来（旧模型属于别的供应商 → 回落本供应商
+   *  默认模型）；但不认识的名字一律**原样保留**并标成「(自定义)」，绝不静默改写
+   *  （判据见 `belongsToOtherProvider`）。 */
   function reloadModelSelector(provider: string, oldModel: string) {
     const row = modelDD?.parentElement;
     if (!row || !modelDD) return;
@@ -1540,7 +1572,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
       const map = JSON.parse(localStorage.getItem("lunac-custom-models") || "{}");
       savedCustoms = ((map && map[provider]) || []).filter((m: string) => m && !suggestions.includes(m));
     } catch {}
-    const selected = (oldModel && (suggestions.includes(oldModel) || savedCustoms.includes(oldModel)))
+    const selected = (oldModel && !belongsToOtherProvider(oldModel, provider))
       ? oldModel
       : (preset?.default_model || "");
     // Filter out built-in models the user deleted (persisted hidden-list)
@@ -1614,13 +1646,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
         search_provider: searchProvider,
         search_key: searchKey,
       });
-      // Persist to localStorage so config survives restart
-      try {
-        localStorage.setItem("lunac-ai-config", JSON.stringify({
-          provider, url: baseUrl, key: apiKey, model, agent_url: agentUrl,
-          search_provider: searchProvider, search_key: searchKey,
-        }));
-      } catch {}
+      // 落盘由后端完成（<exe 根>\config\ai.json，唯一真相源）。
+      // 这里**不要**再写 localStorage —— 旧的 localStorage 回灌会在启动时覆盖
+      // .env，导致「改了 key 不生效」（2026-09-15 实测踩到，见 ai-spec §11 规则 2）。
     } catch (e) {
       console.warn("[lunac] saveAIConfig failed:", e);
     }
@@ -1974,22 +2002,25 @@ export async function attachSettingsListeners(container: HTMLElement) {
 
 // ── Plugin definition ────────────────────────────────────────────
 
-/** Allow a custom-select dropdown to overflow its parent (open = true). */
+/** 放开**设置面板自身**对下拉框的裁剪（打开下拉时用，关闭时还原）。
+ *
+ *  只动 `.settings-layout` / `.settings-content` 这两个纯裁剪容器 ——
+ *  **绝不能碰 `#results-list` / `#results-container`**：前者是真正的滚动容器
+ *  （`styles.css` 里 `overflow-y: auto`），把它改成 `visible` 会让它不再是滚动
+ *  容器、`scrollTop` 被浏览器归零，整个设置页瞬间跳回顶部 —— 这正是「AI 分页
+ *  里一点『搜索服务商』下拉，页面就被拉到最顶端」的根因。
+ *
+ *  下拉框改为在滚动容器的**可视区内**翻转 + 限高（见 positionDropdown），
+ *  因此不再需要、也不允许去放宽滚动容器的裁剪。 */
 function setDropdownOverflow(container: HTMLElement, v: boolean) {
   const layout = container.closest(".settings-layout");
   const content = container.closest(".settings-content");
-  const list = container.closest("#results-list");
-  const results = container.closest("#results-container");
   if (v) {
     layout?.classList.add("sel-open");
     content?.classList.add("sel-open");
-    list?.classList.add("sel-open");
-    results?.classList.add("sel-open");
   } else {
     layout?.classList.remove("sel-open");
     content?.classList.remove("sel-open");
-    list?.classList.remove("sel-open");
-    results?.classList.remove("sel-open");
   }
 }
 
@@ -2123,7 +2154,11 @@ export const settingsPlugin: Plugin = {
       (window as any).__lunac_refresh_hotkey_hint?.(hotkey);
     } catch {}
 
-    try { autoStart = await invoke<boolean>("get_auto_start"); } catch {}
+    try {
+      // 只取开关状态；实际生效机制（task / run）由后端写进落盘日志，不进 UI
+      const info = await invoke<{ enabled: boolean }>("get_auto_start_info");
+      autoStart = info.enabled;
+    } catch {}
 
     try {
       const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_provider: string; search_key: string }>("get_ai_config");

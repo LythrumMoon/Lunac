@@ -81,7 +81,7 @@
           <circle cx="14.5" cy="15.5" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
         </svg>
       </button>
-      <span id="detached-title">Plugin</span>
+      <span id="detached-title" data-tauri-drag-region>Plugin</span>
       <button id="detached-vscode-btn" class="hidden" title="Open in VSCode" aria-label="Open in VSCode">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
@@ -106,6 +106,44 @@
           <circle cx="16.6" cy="16.6" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
         </svg>
       </button>
+    </div>
+
+    <!-- 详细搜索大界面（双击搜索栏进入；见 docs/ai-spec.md §2.1.2）
+         结构与简洁搜索完全平行：顶部输入行 → 分类/类型筛选 → 结果区 → 底部提示。
+         Tab 与类型胶囊由 main.ts 渲染（文案走 i18n），这里只留容器。 -->
+    <div id="detail-panel" class="hidden">
+      <div id="detail-head" data-tauri-drag-region>
+        <button id="detail-back-btn" title="Back" aria-label="Back">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+              <polyline points="15 18 9 12 15 6"/>
+            </g>
+            <polyline points="15 18 9 12 15 6"/>
+            <circle cx="9.2" cy="10.6" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="14.5" cy="15.5" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+          </svg>
+        </button>
+        <input id="detail-input" type="text" spellcheck="false" autocomplete="off" />
+        <span id="detail-count"></span>
+        <button id="detail-refresh-btn" title="Rebuild file index" aria-label="Rebuild file index">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+              <path d="M21 12a9 9 0 1 1-2.6-6.4"/><polyline points="21 3 21 9 15 9"/>
+            </g>
+            <path d="M21 12a9 9 0 1 1-2.6-6.4"/><polyline points="21 3 21 9 15 9"/>
+            <circle cx="9.4" cy="14.6" r="0.9" fill="currentColor" stroke="none" opacity="0.5"/>
+          </svg>
+        </button>
+      </div>
+      <div id="detail-filters">
+        <div id="detail-tabs"></div>
+        <div id="detail-kinds"></div>
+      </div>
+      <div id="detail-results"></div>
+      <div id="detail-foot">
+        <span id="detail-hint"></span>
+        <span id="detail-index"></span>
+      </div>
     </div>
 
     <!-- Results / Chat area -->
@@ -168,7 +206,7 @@
           </svg>
         </button>
           <textarea id="chat-input" rows="1" placeholder="Type a message..." autocomplete="off" spellcheck="false"></textarea>
-          <!-- 「更多」菜单：思考档位 / 命令运行方式 / 工作区 / 工具黑名单
+          <!-- 「更多」菜单：思考开关 / 命令运行方式 / 工作区 / 工具黑名单
                四个控件收在一个 ⋯ 里（图标参数见 docs/icon-style.md §1–§2）。 -->
           <div class="chat-more-wrap">
             <button id="chat-more-btn" title="More" aria-label="More">
@@ -185,14 +223,13 @@
               </svg>
             </button>
             <div id="chat-more-menu" class="hidden">
-              <!-- 思考档位：三档分段（图标由 main.ts 用既有 THINK_SVG 填入，不再造路径） -->
+              <!-- 思考开关：两档分段（开 / 关，图标由 main.ts 用既有 THINK_SVG 填入，不再造路径） -->
               <div class="chat-more-row">
                 <span class="chat-more-ic" id="chat-more-think-ic"></span>
                 <span class="chat-more-label" id="chat-more-think-label"></span>
                 <div class="chat-more-seg" id="chat-mode-seg">
-                  <button type="button" data-mode="fast"></button>
-                  <button type="button" data-mode="think"></button>
-                  <button type="button" data-mode="deep"></button>
+                  <button type="button" data-mode="on"></button>
+                  <button type="button" data-mode="off"></button>
                 </div>
               </div>
               <!-- 命令运行方式：图标 + 档位点阵（不写档位名）+ 一句功能简述 -->

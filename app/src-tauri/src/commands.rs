@@ -482,24 +482,20 @@ fn start_cli_process(
         }
     }
 
-    // 思考档位 → agent.exe 环境变量。
-    // core-agent 依据 MAX_THINKING_TOKENS 决定 thinking 形态与预算
-    // （0=disabled，>0=enabled+budgetTokens），并对不接受该字段的供应商
-    // 自动走 400 降级链（见 docs/ai-spec.md §3.5），无需再注入
-    // Claude 专有的 adaptive 抑制变量。
-    //   fast : MAX_THINKING_TOKENS=0            → 不思考
-    //   think: MAX_THINKING_TOKENS=8192         → 思考（8k budget）
-    //   deep : MAX_THINKING_TOKENS=32768        → 深度思考（32k budget）
+    // 思考开关 → agent.exe 环境变量（只有开 / 关两档，见 docs/ai-spec.md §3.5）。
+    // core-agent 依据 LUNAC_THINKING 决定 thinking 形态（off = disabled，其余 = 开），
+    // 并对不接受该字段的端点自动走 400 降级链，无需宿主再干预。
+    // **不再传「思考预算」** —— 实测端点不 enforce budget_tokens，传数字只会造成
+    // 「三档真的不一样」的错觉（2026-09-15 收敛两档）。
     let thinking_mode = state
         .thinking_mode
         .lock()
         .map(|g| g.clone())
-        .unwrap_or_else(|_| "fast".into());
-    match thinking_mode.as_str() {
-        "think" => envs.push(("MAX_THINKING_TOKENS", "8192".into())),
-        "deep" => envs.push(("MAX_THINKING_TOKENS", "32768".into())),
-        _ => envs.push(("MAX_THINKING_TOKENS", "0".into())),
-    }
+        .unwrap_or_else(|_| "on".into());
+    envs.push((
+        "LUNAC_THINKING",
+        if thinking_mode == "off" { "off" } else { "on" }.into(),
+    ));
 
     crate::log::info(format!(
         "agent spawn: workdir={} args=[{}]",
@@ -590,7 +586,10 @@ fn ai_credentials() -> Result<(String, String, String), String> {
     let api_key = env::var("AI_API_KEY")
         .or_else(|_| env::var("DEEPSEEK_API_KEY"))
         .map_err(|_| "No AI_API_KEY configured".to_string())?;
-    let model = env::var("AI_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
+    // 兜底模型：仅在 `AI_MODEL` 完全没配（既无 config\ai.json 也无 .env）时生效。
+    // 取 flash 而不是 pro：这类「什么都没配」的场景基本只剩测试与首次冒烟，
+    // 按 ai-spec §11 规则 16 一律用 flash（更快更省，只验链路）。
+    let model = env::var("AI_MODEL").unwrap_or_else(|_| "deepseek-flash".into());
     Ok((api_url, api_key, model))
 }
 
@@ -599,6 +598,12 @@ fn ai_credentials() -> Result<(String, String, String), String> {
 /// 另注入 WebSearch 主源的「服务商 + key」（空 = 只走无 key 的 Bing/百度兜底）。
 fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
     let agent_url = agent_endpoint(api_url, env::var("AI_AGENT_URL").ok().as_deref());
+    // 记一行「这次喂给 agent 的是哪把 key」（末 4 位 + 端点 + 模型）：
+    // 与 `AI 配置来源=…` 那行对照，「改了 key 仍 401」不用再翻 WebView2 的 leveldb。
+    crate::log::info(crate::log::mask_secrets(&format!(
+        "agent 凭据: endpoint={agent_url} model={model} key_tail={}",
+        crate::log::key_tail(api_key),
+    )));
     env::set_var("LUNAC_AGENT_BASE_URL", agent_url);
     env::set_var("LUNAC_AGENT_TOKEN", api_key);
     env::set_var("LUNAC_AGENT_MODEL", model);
@@ -609,6 +614,72 @@ fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
     match env::var("AI_SEARCH_KEY") {
         Ok(k) if !k.trim().is_empty() => env::set_var("LUNAC_SEARCH_KEY", k.trim()),
         _ => env::remove_var("LUNAC_SEARCH_KEY"),
+    }
+}
+
+/// 把一份 AI 配置**原样**注入进程环境变量（`ai.json` 存在时它说了算）。
+///
+/// 空串语义（与设置面板一致）：`provider` / `agent_url` / WebSearch 两项空 = 清掉变量。
+/// `key` 空也**不回落 `.env`** —— 否则「文件是唯一真相源」又变成两份各执一词，
+/// 正是 2026-09-15 那次 401 的成因（详见 storage.rs 顶部的注释）。
+fn apply_ai_config(cfg: &crate::storage::AiConfig) {
+    if cfg.provider.trim().is_empty() {
+        env::remove_var("AI_PROVIDER");
+    } else {
+        env::set_var("AI_PROVIDER", cfg.provider.trim());
+    }
+    env::set_var("AI_API_URL", cfg.url.trim());
+    env::set_var("AI_API_KEY", cfg.key.trim());
+    env::set_var("AI_MODEL", cfg.model.trim());
+    if cfg.agent_url.trim().is_empty() {
+        env::remove_var("AI_AGENT_URL");
+    } else {
+        env::set_var("AI_AGENT_URL", cfg.agent_url.trim());
+    }
+    if cfg.search_provider.trim().is_empty() {
+        env::remove_var("AI_SEARCH_PROVIDER");
+    } else {
+        env::set_var("AI_SEARCH_PROVIDER", cfg.search_provider.trim().to_lowercase());
+    }
+    if cfg.search_key.trim().is_empty() {
+        env::remove_var("AI_SEARCH_KEY");
+    } else {
+        env::set_var("AI_SEARCH_KEY", cfg.search_key.trim());
+    }
+    if cfg.key.trim().is_empty() {
+        crate::log::warn("AI key 为空 ⇒ 对话必然 401，请在设置面板填入 key");
+    }
+}
+
+/// 启动时应用设置面板保存的 AI 配置（`<exe 根>\config\ai.json`）。
+///
+/// **AI 凭据的唯一真相源**：没有该文件时才用 `.env`（及其缺省值）。
+/// 这里取代了旧的前端 localStorage 回灌 —— 那条路会在启动时把 localStorage 里的旧值
+/// **覆盖**进 env，于是用户改了 `.env` 完全不生效（2026-09-15 的 401 即此），
+/// 而且生效的是哪一份无从判断。两条路都记一行日志（含 key 末 4 位与来源）。
+pub fn apply_saved_ai_config() {
+    match crate::storage::load_ai_config() {
+        Some(cfg) => {
+            apply_ai_config(&cfg);
+            crate::log::info(crate::log::mask_secrets(&format!(
+                "AI 配置来源=config\\ai.json provider={} url={} model={} key_tail={}",
+                cfg.provider,
+                cfg.url,
+                cfg.model,
+                crate::log::key_tail(&cfg.key),
+            )));
+        }
+        None => {
+            let key = env::var("AI_API_KEY")
+                .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+                .unwrap_or_default();
+            crate::log::info(crate::log::mask_secrets(&format!(
+                "AI 配置来源=.env（无 config\\ai.json）url={} model={} key_tail={}",
+                env::var("AI_API_URL").unwrap_or_else(|_| "(默认)".into()),
+                env::var("AI_MODEL").unwrap_or_else(|_| "(默认)".into()),
+                crate::log::key_tail(&key),
+            )));
+        }
     }
 }
 
@@ -791,6 +862,47 @@ pub fn launch_app(path: String) -> Result<(), String> {
     crate::app_indexer::launch_app(&path)
 }
 
+// ── 详细搜索（双击搜索栏进入的大界面，见 docs/ai-spec.md §2.1.2）──
+
+/// 文件搜索：**只读内存索引，永不同步扫盘**（与 search_apps 同纪律 —— 一搜就卡
+/// 的根源就是在搜索路径上扫目录）。索引未就绪时返回空数组，前端看
+/// `file_index_status` 决定显示「正在建立索引」。
+/// `(async)` 同理：搜索每次击键都会调，必须抛到工作线程。
+#[tauri::command(async)]
+pub fn search_files(query: String, kind: Option<String>, limit: usize) -> Vec<crate::file_indexer::FileHit> {
+    crate::file_indexer::search(&query, kind.as_deref(), limit)
+}
+
+/// 索引状态：条数 / 是否在扫 / 落盘时间 / 是否被上限截断 / 扫了哪些根。
+#[tauri::command]
+pub fn file_index_status() -> crate::file_indexer::IndexStatus {
+    crate::file_indexer::status()
+}
+
+/// 强制重建文件索引（后台线程，立即返回）。
+#[tauri::command]
+pub fn refresh_file_index() {
+    crate::file_indexer::refresh_in_background();
+}
+
+/// 系统设置页 + 系统动作目录（几十条，前端一次拉走本地过滤）。
+#[tauri::command]
+pub fn system_catalog() -> Vec<crate::system_catalog::CatalogItem> {
+    crate::system_catalog::all()
+}
+
+/// 打开一个 Windows 设置页（只接受 `ms-settings:` 前缀）。
+#[tauri::command]
+pub fn open_setting(target: String) -> Result<(), String> {
+    crate::system_catalog::open_setting(&target)
+}
+
+/// 执行一个系统动作（只认 `system_catalog()` 里的动作 id）。
+#[tauri::command]
+pub fn run_system_action(id: String) -> Result<(), String> {
+    crate::system_catalog::run_action(&id)
+}
+
 /// Add a custom app to the registry.
 #[tauri::command]
 pub fn add_custom_app(name: String, path: String) -> Result<String, String> {
@@ -838,8 +950,15 @@ pub fn set_recording_state(recording: bool) {
 }
 
 #[tauri::command]
-pub fn set_plugin_active(active: bool) {
-    crate::hotkey::PLUGIN_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+pub fn set_ui_mode(mode: String) {
+    // 认不出的值（含 "main" 与拼错的）一律归 Main：Main 至少还有「query/chips 空
+    // ⇒ 隐藏」的兜底，比误留在「大界面层」（Esc 永远只 emit clear、永远隐藏不掉）安全。
+    let m = match mode.as_str() {
+        "plugin" => crate::hotkey::UI_MODE_PLUGIN,
+        "detail" => crate::hotkey::UI_MODE_DETAIL,
+        _ => crate::hotkey::UI_MODE_MAIN,
+    };
+    crate::hotkey::UI_MODE.store(m, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -853,10 +972,10 @@ pub fn set_detached(detached: bool) {
 }
 
 /// Update AI provider config at runtime (from the settings plugin).
-/// Values become process env vars, inherited by chat.rs (simple mode,
-/// per-request) and agent.exe (agent mode, next start_cli).
-/// `agent_url` overrides base+"/anthropic" for providers with a
-/// non-standard route (e.g. Zhipu GLM); empty = default rule.
+///
+/// **唯一真相源**是 `<exe 根>\config\ai.json`（写盘 + 注入进程 env，见 storage.rs）。
+/// env 随即被 `configure_agent_env` 读走传给 agent.exe；`.env` 只在没有该文件时生效。
+/// `agent_url` 覆盖 base+"/anthropic"，供非标准路由的供应商使用（如智谱 GLM）；空 = 默认规则。
 #[tauri::command]
 pub async fn set_ai_config(
     provider: String,
@@ -870,26 +989,28 @@ pub async fn set_ai_config(
     if url.trim().is_empty() || model.trim().is_empty() {
         return Err("url / model must not be empty".into());
     }
-    if !provider.trim().is_empty() {
-        env::set_var("AI_PROVIDER", provider.trim());
-    }
-    env::set_var("AI_API_URL", url.trim());
-    env::set_var("AI_API_KEY", key.trim());
-    env::set_var("AI_MODEL", model.trim());
-    match agent_url.as_deref().map(str::trim) {
-        Some(a) if !a.is_empty() => env::set_var("AI_AGENT_URL", a),
-        _ => env::remove_var("AI_AGENT_URL"),
-    }
-    // WebSearch 主源的服务商与 key。前端每次都回传当前输入框的值，
-    // 所以空串 = 用户清掉了，按删除处理（否则会一直用旧值）。
-    match search_provider.as_deref().map(str::trim) {
-        Some(p) if !p.is_empty() => env::set_var("AI_SEARCH_PROVIDER", p.to_lowercase()),
-        _ => env::remove_var("AI_SEARCH_PROVIDER"),
-    }
-    match search_key.as_deref().map(str::trim) {
-        Some(k) if !k.is_empty() => env::set_var("AI_SEARCH_KEY", k),
-        _ => env::remove_var("AI_SEARCH_KEY"),
-    }
+    let cfg = crate::storage::AiConfig {
+        provider: provider.trim().to_string(),
+        url: url.trim().to_string(),
+        key: key.trim().to_string(),
+        model: model.trim().to_string(),
+        agent_url: agent_url.unwrap_or_default().trim().to_string(),
+        // WebSearch 主源：前端每次都回传输入框当前值，空串 = 用户清掉了（按删除处理，
+        // 否则会一直用旧值）。
+        search_provider: search_provider.unwrap_or_default().trim().to_lowercase(),
+        search_key: search_key.unwrap_or_default().trim().to_string(),
+    };
+    // 先落盘再注入 env。落盘失败必须如实报错 —— 否则会重演「面板像是保存成功、
+    // 重启后又变回旧值」这种最难查的问题。
+    crate::storage::save_ai_config(&cfg)?;
+    apply_ai_config(&cfg);
+    crate::log::info(crate::log::mask_secrets(&format!(
+        "AI 配置已保存（设置面板 → config\\ai.json）provider={} url={} model={} key_tail={}",
+        cfg.provider,
+        cfg.url,
+        cfg.model,
+        crate::log::key_tail(&cfg.key),
+    )));
     Ok("AI config updated".into())
 }
 
@@ -1036,8 +1157,8 @@ pub async fn set_thinking_mode(
     mode: String,
     restart: bool,
 ) -> Result<String, String> {
-    if !["fast", "think", "deep"].contains(&mode.as_str()) {
-        return Err(format!("Invalid thinking mode: {}. Use fast/think/deep.", mode));
+    if !["on", "off"].contains(&mode.as_str()) {
+        return Err(format!("Invalid thinking mode: {}. Use on/off.", mode));
     }
 
     {
@@ -1045,7 +1166,7 @@ pub async fn set_thinking_mode(
         *guard = mode.clone();
     }
 
-    // 思考模式通过环境变量在 agent.exe spawn 时生效。restart=true（用户显式
+    // 思考开关通过环境变量在 agent.exe spawn 时生效。restart=true（用户显式
     // 切换）才重启 CLI；startup 同步只存值、不拉起 CLI（保持懒启动）。
     if restart {
         cli_bridge::kill_and_cleanup();
@@ -1092,10 +1213,14 @@ pub fn set_auto_start(enabled: bool) -> Result<String, String> {
     }
 }
 
-/// Check whether auto-start is currently enabled.
+/// 读取自启状态与**实际生效机制**（`task` / `run` / `both` / `none`）。
+///
+/// UI 只用 `enabled` 拨开关 —— 机制名是纯实现术语，不做展示（见 ai-spec §11 规则 1）。
+/// `mechanism` 保留给落盘日志：计划任务与 HKCU Run 的触发时间实测差约 60 秒，
+/// 「开机后要等很久」这类反馈只能靠它判断实际走的是哪条（见 ai-spec §9.1 难点 2）。
 #[tauri::command]
-pub fn get_auto_start() -> Result<bool, String> {
-    crate::auto_start::is_auto_start_enabled()
+pub fn get_auto_start_info() -> Result<crate::auto_start::AutoStartInfo, String> {
+    crate::auto_start::auto_start_info()
 }
 
 // ── User tool definitions (MCP bridge) ────────────────────────────

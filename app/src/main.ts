@@ -9,7 +9,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
-import { initI18n, loadSavedLanguage, t, pluginName } from "./i18n.js";
+import { initI18n, loadSavedLanguage, t, pluginName, lang } from "./i18n.js";
 
 // ── 全局错误上报 ─────────────────────────────────────────────────
 // release 下前端没有控制台、用户平时也不会开 DevTools，未捕获的错误必须送到
@@ -132,6 +132,12 @@ let requestedHeight = -1;          // 最近一次已下发的高度（-1=未下
 let pendingHeight: number | null = null;
 let sizeInFlight = false;
 
+// 详细搜索大界面（双击搜索栏进入）—— 这两个必须声明在这里：applyWindowSize()
+// 在模块初始化阶段就会被调用，声明晚于它 = TDZ 直接抛。其余详情态状态在文件末尾
+// 那一整段里（见「详细搜索大界面」章节）。
+const DETAIL_HEIGHT = 640;   // 固定高度档（设计 px × zoom = DIPs）
+let detailOpen = false;      // 是否处于详细搜索大界面
+
 // ── 窗口高度「滑动」动画（正式）── 结果区随界面高度变化平滑过渡 ─────
 // 非插件态下高度变化不再一次 setSize 到位，而是逐帧逼近（rail 模式：每步等
 // 上一个 setSize 经 onResized 落地后才走下一步，天然兼容现有防回环守卫）。
@@ -219,8 +225,8 @@ function scheduleSearchResize() {
  *  本次完成后若与已发高度不同再补发一次 —— 杜绝快速键入时 setSize IPC 排队堆积。 */
 function requestWindowHeight(h: number) {
   // 动画在途且仍处搜索态：只更新动画目标（latest-wins），由动画逐帧收敛。
-  // 插件态请求不允许被动画劫持 —— 插件是离散跳变，应走下方直设路径。
-  if (animActive && !pluginActive) {
+  // 插件态/详细搜索态请求不允许被动画劫持 —— 它们是离散跳变，应走下方直设路径。
+  if (animActive && !pluginActive && !detailOpen) {
     if (performance.now() < animSuppressUntil) {
       stopResizeAnim(); // 唤出抑制期内：停掉旧动画，改走直设瞬时落位
     } else {
@@ -233,7 +239,7 @@ function requestWindowHeight(h: number) {
   if (Math.abs(h - currentWindowHeight) < 3) { requestedHeight = h; return; }
   // 实验：搜索/空态启用「结果区随窗口大小滑动」→ 逐帧步进 setSize。
   // bootHeightSettled=false 期间（首次高度落位）直设，防启动时窗口滑屏。
-  if (bootHeightSettled && RESIZE_ANIM_CFG.enabled && !pluginActive) {
+  if (bootHeightSettled && RESIZE_ANIM_CFG.enabled && !pluginActive && !detailOpen) {
     if (performance.now() < animSuppressUntil) {
       // 唤出/复位抑制期内：直设落位，并把抑制期顺延（内容可能分几批到达：
       // 剪贴板探测 → 加泡泡 → 重跑搜索 → 实测高度，每批都会触发一次）。
@@ -299,8 +305,8 @@ function animateWindowHeight(h: number) {
       if (!sizeInFlight) void flushWindowHeight();
       return;
     }
-    // 进入插件态 → 停帧；插件高度由插件流程（applyWindowSize）直设
-    if (pluginActive) { stopResizeAnim(); return; }
+    // 进入插件态/详细搜索态 → 停帧；它们的高度由各自流程（applyWindowSize）直设
+    if (pluginActive || detailOpen) { stopResizeAnim(); return; }
     const now = performance.now();
     if (animAwaitingLand) {
       // 上一 setSize 未落地（onResized 未回）→ 等下一帧；超时兜底防卡死
@@ -346,13 +352,14 @@ function animateWindowHeight(h: number) {
 /** Apply window size based on current UI state.
  *  插件模式：固定高度（detached 600 / embedded 360 / OCR detached 520），
  *    设计 px × zoom = DIPs（插件面板按设计宽度 800 的 CSS px 排版）。
+ *  详细搜索大界面：固定高度 DETAIL_HEIGHT（640），同一套设计 px × zoom 算法。
  *  搜索/结果/空态：实测内容高度（measurePanelHeight，已含 zoom），
  *    彻底取代 heightMap 预测，保证窗口与结果区渲染区域严格一致。
  *  宽度保持用户当前宽度（lastWindowWidth）。
  *  setSize 统一走 requestWindowHeight 串行化；搜索路径可改用 scheduleSearchResize
  *  懒化测量，避免快速键入时“同任务强制 layout + IPC 风暴”。 */
 function applyWindowSize() {
-  // 插件/分离模式 #app 撑满窗口（CSS height:100%）；搜索模式内容驱动（height:auto）
+  // 插件/分离/详细搜索模式 #app 撑满窗口（CSS height:100%）；搜索模式内容驱动（height:auto）
   document.getElementById("app")!.classList.toggle("plugin-active", pluginActive);
 
   let h: number;
@@ -363,6 +370,9 @@ function applyWindowSize() {
     } else {
       h = Math.round((detached ? 600 : 360) * currentZoom);
     }
+  } else if (detailOpen) {
+    // 详细搜索大界面：离散高度档，不进高度滑动动画（见下方 requestWindowHeight）
+    h = Math.round(DETAIL_HEIGHT * currentZoom);
   } else {
     h = measurePanelHeight();
   }
@@ -664,23 +674,33 @@ let chatHistory: Array<{ role: string; content: string }> = [];
 let isStreaming = false;
 let pendingMessages: string[] = [];  // queued while streaming
 let userScrolledUp = false;         // true when user has scrolled away from bottom
+/** 单次 API 请求的用量明细（对账粒度，见 ai-spec §3.5「用量与对账」）。
+ *  平台上「一次带工具的提问」就是多行，本地按提问只落一行 —— 这个数组把粒度补齐，
+ *  才能逐行对齐。旧 agent 不报该字段 → 空数组。 */
+interface ChatDoneRequestUsage {
+  in: number;
+  read: number;
+  create: number;
+  out: number;
+}
 interface ChatDoneInfo {
   stop_reason: string;
   input_tokens: number;
   output_tokens: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+  requests?: ChatDoneRequestUsage[];
 }
 
-// ── 用量统计（口径：本地用量日志的「今日累计」）──────────────────
+// ── 用量统计（口径：**当前这次对话**）────────────────────────────
 // agent.exe 的 result.usage 是**每次提问的绝对值**（一次提问内所有工具往返
 // 在本轮内累加），不是会话累计 —— 所以这里不做差，直接累加。
-// 面板数值 = 今日本地日志（ModuleData\usage\usage-YYYY-MM-DD.jsonl）的合计，
-// 与供应商平台的按天统计同口径，可逐条对账。
+// 表盘（命中率 / 总 token）只统计当前对话，新建或切换会话即归零；
+// 按天累计另有一份落盘日志，见下面 usageTotals 的注释。
+/** 表盘数值 = **当前这次对话**（新建会话 / 切到别的会话即归零）。
+ *  注意与落盘口径的区别：`ModuleData\usage\usage-YYYY-MM-DD.jsonl` 仍按天累加，
+ *  那是留给「与供应商平台对账」的，两者不要混为一谈（ai-spec §3.5）。 */
 let usageTotals = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
-let usageSeeded = false;
-/** 已经实时累加过的提问数 —— 播种回包晚于实时回包时用它判弃 */
-let usageLiveTurns = 0;
 /** 当前 agent 的模型名（来自 system/init，写进用量日志便于区分供应商/模型） */
 let agentModel = "";
 /** 本次提问内 agent 报告的历史压缩次数（提问结束写进用量日志）。
@@ -689,28 +709,36 @@ let agentModel = "";
 let liveCompaction = { elided: 0, dropped: 0 };
 
 // ── Chat conversation mode ────────────────────────────────────────
-// DeepSeek 思考模式三档（点2/7），替换旧的 simple/agent 切换：
-//   "fast"  = 不思考（MAX_THINKING_TOKENS=0，直接回答）
-//   "think" = 思考（8k 思考预算）
-//   "deep"  = 深度思考（32k 思考预算）
-// 三档共用同一 agent.exe 完整工具链，仅思考深度不同；由 Rust 端
-// set_thinking_mode → start_cli_process 写入环境变量。
-type ThinkingMode = "fast" | "think" | "deep";
-let chatMode: ThinkingMode = "think";
+// 思考开关（2026-09-15：原 fast/think/deep 三档收敛为两档）：
+//   "off" = 不思考（thinking.type=disabled，直接回答）
+//   "on"  = 思考（先推理再回答）
+// 为什么不是「思考力度」：实测该端点没有这个旋钮 —— budget_tokens 不被
+// enforce（给 1 与给 32768 思考量一样）、effort 字段被静默忽略，三档在
+// 端点上本就退化成两态。两档共用同一 agent.exe 完整工具链，仅思考开关
+// 不同；由 Rust 端 set_thinking_mode → start_cli_process 写入环境变量。
+type ThinkingMode = "on" | "off";
+let chatMode: ThinkingMode = "on";
 try {
   const saved = localStorage.getItem("lunac-chat-mode");
-  if (saved === "fast" || saved === "think" || saved === "deep") chatMode = saved;
-  else if (saved === "simple") chatMode = "fast"; // 迁移旧 simple → fast
-  else if (saved === "agent") chatMode = "think"; // 迁移旧 agent → think
+  if (saved === "on" || saved === "off") chatMode = saved;
+  // 旧值迁移：fast/simple = 原「不思考」档 → off；think/deep/agent = 原「思考」档 → on
+  else if (saved === "fast" || saved === "simple") chatMode = "off";
+  else if (saved === "think" || saved === "deep" || saved === "agent") chatMode = "on";
 } catch { /* keep default */ }
 
+/** 分段按钮上的短标签（开 / 关）。 */
 const THINKING_LABEL: Record<ThinkingMode, string> = {
-  fast: "chat.mode_fast",
-  think: "chat.mode_think",
-  deep: "chat.mode_deep",
+  on: "chat.mode_on",
+  off: "chat.mode_off",
 };
 
-/** 思考档位分段（「更多」菜单里的三档：快速 / 思考 / 深度）。 */
+/** 状态栏与系统提示里的完整说法（「思考开」），避免出现「AI · 开」这种半句话。 */
+const THINKING_STATUS_LABEL: Record<ThinkingMode, string> = {
+  on: "chat.status_on",
+  off: "chat.status_off",
+};
+
+/** 思考开关分段（「更多」菜单里的两档：开 / 关）。 */
 function renderChatModeSeg() {
   if (!chatModeSeg) return;
   chatModeSeg.querySelectorAll<HTMLButtonElement>("button[data-mode]").forEach((b) => {
@@ -745,7 +773,7 @@ function renderMoreMenu() {
 
 /** Persistent conversation-mode label used in the status bar. */
 function currentModeLabel(): string {
-  return t(THINKING_LABEL[chatMode]);
+  return t(THINKING_STATUS_LABEL[chatMode]);
 }
 
 // ── Agent (CLI) callbacks ─────────────────────────────────────
@@ -779,12 +807,45 @@ resultsList.addEventListener("scroll", () => {
   userScrolledUp = dist > SCROLL_THRESHOLD;
 });
 
-// ── AI Chat history (localStorage) ──────────────────────────────
+// ── AI Chat history (file-based via Rust IPC) ───────────────────
+/** 本次对话的 token 用量（**表盘口径**）。
+ *  随会话一起落盘 → 历史回顾时读回来还原表盘（2026-09 起，
+ *  不再「切到历史会话就归零」）。 */
+interface SessionUsage {
+  hit: number;
+  miss: number;
+  total: number;
+  elided: number;
+  dropped: number;
+}
+
+/** 过程快照里的一步：一条思考 / 一次工具调用（含结果）。 */
+interface SessionStep {
+  kind: "thinking" | "tool" | "text";
+  /** 工具名（kind=tool 时） */
+  name?: string;
+  /** 命令原文 / 参数摘要 / 文本片段（已截断） */
+  detail?: string;
+  /** 工具输出（已截断，kind=tool 时） */
+  result?: string;
+  isError?: boolean;
+}
+
+/** 一个回合的过程快照 —— 历史回顾时按回合渲染成可折叠的「过程」块。 */
+interface SessionProcess {
+  turn: number;
+  items: SessionStep[];
+}
+
 interface ChatSession {
   id: string;
   title: string;           // first user message, truncated
   messages: Array<{ role: string; content: string }>;
   createdAt: number;       // Date.now()
+  /** token 用量（表盘口径）；旧记录没有该字段 */
+  usage?: SessionUsage;
+  /** 过程快照（按回合分组）；旧记录没有该字段 */
+  steps?: SessionProcess[];
 }
 
 // ── Session persistence — file-based via Rust IPC ─────────────────
@@ -793,6 +854,11 @@ interface ChatSession {
 
 const MAX_SESSIONS = 50;
 let currentSessionId: string | null = null;  // reuse across saves to avoid duplicates
+
+/** 本对话的**过程快照**（每回合一组：思考 / 工具调用 + 结果）。
+ *  随会话一起落盘，历史回顾时渲染成可折叠的「过程」块。
+ *  只在**回合结束**时采集一次（见 recordTurnSteps），不参与流式渲染。 */
+let sessionSteps: SessionProcess[] = [];
 
 /** Serialize saveCurrentSession calls (point 4/17). The function is invoked
  *  from several places concurrently (cliDoneCallback fire-and-forget +
@@ -863,7 +929,12 @@ async function deleteChatSession(id: string): Promise<ChatSession[]> {
  *  each other's load-modify-save cycles. Takes an explicit snapshot because
  *  callers clear chatHistory right after invoking save (e.g. ensureChatLog
  *  resets the log while the queued write is still pending). */
-async function persistCurrentSessionInner(snapshotChat: Array<{ role: string; content: string }>, snapshotId: string | null) {
+async function persistCurrentSessionInner(
+  snapshotChat: Array<{ role: string; content: string }>,
+  snapshotId: string | null,
+  snapshotUsage: SessionUsage,
+  snapshotSteps: SessionProcess[],
+) {
   // Keep any conversation with at least one real user message. Previously
   // this required 1 user + 1 assistant, so conversations where the CLI
   // errored / was closed mid-stream silently never reached history.
@@ -893,6 +964,10 @@ async function persistCurrentSessionInner(snapshotChat: Array<{ role: string; co
     title,
     messages: pruned,
     createdAt: idx >= 0 ? sessions[idx].createdAt : updatedAt,
+    // 表盘数值与过程快照一并落盘：历史回顾时读回来还原表盘 / 展示「查看过程」。
+    // 旧记录没有这两个字段，读取端按可选处理（前端 `?.`，Rust 侧 `#[serde(default)]`）。
+    usage: snapshotUsage,
+    steps: snapshotSteps,
   };
   if (idx >= 0) {
     sessions[idx] = session; // update in place
@@ -908,7 +983,14 @@ function saveCurrentSession() {
   // so reading globals inside the queue would silently drop the old chat.
   const snapshot = chatHistory.map(m => ({ ...m }));
   const snapshotId = currentSessionId;
-  return queueSessionSave(() => persistCurrentSessionInner(snapshot, snapshotId));
+  const snapshotUsage: SessionUsage = { ...usageTotals };
+  const snapshotSteps = sessionSteps.map(g => ({
+    turn: g.turn,
+    items: g.items.map(i => ({ ...i })),
+  }));
+  return queueSessionSave(() =>
+    persistCurrentSessionInner(snapshot, snapshotId, snapshotUsage, snapshotSteps),
+  );
 }
 
 function restoreSession(session: ChatSession) {
@@ -916,6 +998,19 @@ function restoreSession(session: ChatSession) {
   // after restore — otherwise the next save generates a brand-new id and
   // the original record is never updated (duplicate history, point 4/17).
   currentSessionId = session.id;
+  // 表盘口径 = 当前对话，且**从会话记录里读回来**（表盘数值随会话落盘，见
+  // SessionUsage）—— 历史回顾时能看到当时那次对话的命中率/总量/压缩次数。
+  // 旧记录没有 usage 字段 → 归零。
+  usageTotals = session.usage
+    ? { ...session.usage }
+    : { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
+  liveCompaction = { elided: 0, dropped: 0 };
+  updateTokenDashboard();
+  // 过程快照一并恢复，供「查看过程」
+  sessionSteps = (session.steps ?? []).map(g => ({
+    turn: g.turn,
+    items: g.items.map(i => ({ ...i })),
+  }));
   // Cancel any active streaming before restoring
   if (isStreaming) {
     streamId++;
@@ -942,7 +1037,7 @@ function restoreSession(session: ChatSession) {
   // Ensure chat UI buttons are in the correct state
   setStreamingUI(false);
   humanizeBtn.style.display = "none";
-  invoke("set_plugin_active", { active: true }).catch(() => {});
+  invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
 
   resultsContainer.classList.remove("hidden");
   searchBar.classList.add("has-results");
@@ -951,6 +1046,8 @@ function restoreSession(session: ChatSession) {
   // conversation can continue seamlessly after restore. Every message gets a
   // roll-back button (需求4).
   renderChatLogHtml();
+  // 过程快照：每个回合的过程块插到该回合的助手气泡之后（可折叠）
+  renderHistoryProcess(session);
   statusText.textContent = t("status.history_restored");
   applyWindowSize();
   // Focus chat input so user can continue conversation immediately
@@ -985,6 +1082,116 @@ function renderChatLogHtml() {
     if (container) renderLatex(container as HTMLElement);
   }, 20);
   applyWindowSize();
+}
+
+// ── 过程快照：采集（回合结束）与回放（历史回顾）────────────────
+//
+// 会话记录原本只有 `{role, content}` 气泡，agent 的思考与工具调用从不落盘 →
+// 历史回顾时**看不到当时的执行过程**。这里在回合结束时把过程块按 DOM 顺序抽成
+// 可序列化的步骤，随会话存盘；恢复历史时再渲染成可折叠的「过程」块。
+// 只存**摘要**（命令 / 参数 / 输出各截断），避免历史文件被长输出撑爆。
+
+/** 单条步骤文本上限 */
+const STEP_MAX = 2000;
+/** 单回合最多保留的步骤数（超长回合只留前 N 步，防文件膨胀） */
+const STEPS_PER_TURN_MAX = 60;
+
+function clipStep(s: string, n = STEP_MAX): string {
+  const v = (s || "").trim();
+  return v.length > n ? v.slice(0, n) + "…" : v;
+}
+
+/** 把本轮的过程块按 DOM 顺序抽成步骤（回合结束时调用一次）。 */
+function recordTurnSteps(flowEl: HTMLElement) {
+  const items: SessionStep[] = [];
+  flowEl
+    .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card, .todo-panel")
+    .forEach(el => {
+      if (items.length >= STEPS_PER_TURN_MAX) return;
+      if (el.classList.contains("think-block")) {
+        const text = clipStep(el.dataset.thinkText || el.textContent || "");
+        if (text) items.push({ kind: "thinking", detail: text });
+      } else if (el.classList.contains("agent-text")) {
+        const text = clipStep(el.textContent || "");
+        if (text) items.push({ kind: "text", detail: text });
+      } else if (el.classList.contains("tool-card")) {
+        items.push({
+          kind: "tool",
+          name: el.querySelector(".tool-name")?.textContent?.trim() || "",
+          detail: clipStep(el.querySelector(".tool-cmd")?.textContent || ""),
+          result: clipStep(el.querySelector(".tool-out")?.textContent || ""),
+          isError: el.classList.contains("failed"),
+        });
+      } else {
+        // TodoWrite 面板：把清单文本压成一行留痕
+        const text = clipStep((el.textContent || "").replace(/\s+/g, " "));
+        if (text) items.push({ kind: "text", detail: text });
+      }
+    });
+  if (items.length) sessionSteps.push({ turn: sessionSteps.length + 1, items });
+}
+
+/** 历史「过程」块里的一步 → HTML（复用实时对话的类名，样式免费）。 */
+function historyStepHtml(s: SessionStep): string {
+  if (s.kind === "thinking") {
+    const text = s.detail || "";
+    return (
+      `<details class="think-block"><summary><span class="think-ic">${THINK_SVG}</span>` +
+      `<span class="think-label">${esc(t("agent.thinking_done", { n: String(text.length) }))}</span></summary>` +
+      `<div class="think-content">${esc(text)}</div></details>`
+    );
+  }
+  if (s.kind === "text") {
+    return `<div class="agent-text">${esc(s.detail || "")}</div>`;
+  }
+  const firstLine = (s.result || "").split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 60);
+  const state = s.isError
+    ? t("agent.tool_failed", { txt: firstLine || "error" })
+    : t("agent.tool_ok");
+  return (
+    `<details class="tool-card ${s.isError ? "failed" : "ok"}">` +
+    `<summary class="tool-card-head"><span class="tool-ic">${TERM_SVG}</span>` +
+    `<span class="tool-name">${esc(s.name || t("chat.badge_tool"))}</span>` +
+    `<span class="tool-cmd">${esc(s.detail || "")}</span>` +
+    `<span class="tool-state">${esc(state)}</span></summary>` +
+    (s.result ? `<div class="tool-body"><pre class="tool-out">${esc(s.result)}</pre></div>` : "") +
+    `</details>`
+  );
+}
+
+/** 历史回顾：把每个回合的过程快照渲染成可折叠的「过程」块，
+ *  插到该回合的助手气泡之后（回合 N ↔ 第 N 条助手消息）。 */
+function renderHistoryProcess(session: ChatSession) {
+  const groups = (session.steps ?? []).filter(g => g.items && g.items.length > 0);
+  if (!groups.length) return;
+  const log = document.getElementById("chat-log");
+  if (!log) return;
+  const assistants = Array.from(log.querySelectorAll<HTMLElement>(".chat-msg-assistant"));
+  groups.forEach((g, i) => {
+    const flow = document.createElement("div");
+    flow.className = "agent-flow history-process flow-folded";
+    flow.innerHTML = g.items.map(historyStepHtml).join("");
+    const footer = document.createElement("div");
+    footer.className = "turn-footer";
+    const label = document.createElement("span");
+    label.className = "turn-tool-count";
+    label.textContent = t("agent.process_steps", { n: String(g.items.length) });
+    footer.appendChild(label);
+    const btn = document.createElement("button");
+    btn.className = "turn-fold";
+    btn.setAttribute("type", "button");
+    const setFolded = (folded: boolean) => {
+      flow.classList.toggle("flow-folded", folded);
+      btn.textContent = folded ? t("agent.turn_expand") : t("agent.turn_collapse");
+    };
+    btn.addEventListener("click", () => setFolded(!flow.classList.contains("flow-folded")));
+    footer.appendChild(btn);
+    flow.appendChild(footer);
+    setFolded(true);
+    const host = assistants[i];
+    if (host) host.insertAdjacentElement("afterend", flow);
+    else log.appendChild(flow);
+  });
 }
 
 /** 复制气泡原文到剪贴板（含 [Attached files] 前缀时只复制用户提问原文）。 */
@@ -1138,7 +1345,7 @@ async function showChatHistory() {
   activePluginId = "ai-agent";
   setPluginBar(t("chat.ai_entry"));
   searchInput.disabled = true;
-  invoke("set_plugin_active", { active: true }).catch(() => {});
+  invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
   const sessions = await loadSessions();
   resultsContainer.classList.remove("hidden");
   searchBar.classList.add("has-results");
@@ -1256,25 +1463,34 @@ function forceResetPluginUI() {
   // 预热备忘录标识检索索引（供搜索栏“标识直达编辑”使用）
   import("./plugins/builtin/memo").then(m => m.refreshMemoIndex()).catch(() => {});
 
-  // Restore user AI provider config (settings plugin) — overrides .env defaults
+  // AI 供应商配置不再由前端恢复：唯一真相源是 <exe 根>\config\ai.json，
+  // 由 Rust 侧 main() 在启动时读回并注入环境变量（见 commands::apply_saved_ai_config）。
+  // 以前这里会用 localStorage["lunac-ai-config"] 回灌 set_ai_config，它会在启动时
+  // 把 localStorage 里的旧值**覆盖**掉用户刚改的 .env —— 表现为「key 改了不生效、
+  // 一直 401」，且无从判断生效的是哪一份（2026-09-15 实测踩到）。
+  //
+  // 一次性迁移：老版本只有 localStorage 一份，升级后不能让它静默丢配置。
+  // **只在后端完全没有 key 时才回填**（绝不覆盖 .env / ai.json），回填后立刻删掉旧键，
+  // 于是它再也不可能参与后续启动。
   try {
     const raw = localStorage.getItem("lunac-ai-config");
-    if (!raw) return;
-    const cfg = JSON.parse(raw);
-    if (cfg?.url && cfg?.model) {
-      invoke("set_ai_config", {
-        provider: cfg.provider || "deepseek",
-        url: cfg.url,
-        key: cfg.key || "",
-        model: cfg.model,
-        agent_url: cfg.agent_url || null,
-        // WebSearch 主源（服务商 + key）：进程重启后 env 会丢，必须从 localStorage
-        // 复原，否则每次开机都退化成免 key 的 Bing / 百度兜底源。
-        search_provider: cfg.search_provider || null,
-        search_key: cfg.search_key || null,
-      }).catch(() => {});
+    if (raw) {
+      const old = JSON.parse(raw);
+      const cur = await invoke<{ api_key?: string }>("get_ai_config");
+      if (!cur?.api_key && old?.url && old?.model && old?.key) {
+        await invoke("set_ai_config", {
+          provider: old.provider || "deepseek",
+          url: old.url,
+          key: old.key,
+          model: old.model,
+          agent_url: old.agent_url || null,
+          search_provider: old.search_provider || null,
+          search_key: old.search_key || null,
+        });
+      }
+      localStorage.removeItem("lunac-ai-config");
     }
-  } catch { /* keep .env defaults */ }
+  } catch { /* 迁移失败不影响启动：配置仍可在设置面板重填 */ }
 
   // Restore AI workspace — scopes the agent to a folder; empty = whole system
   try {
@@ -1299,7 +1515,7 @@ function forceResetPluginUI() {
     }
   } catch { /* no blacklist saved */ }
 
-  // Sync DeepSeek thinking mode (fast/think/deep) to Rust on startup.
+  // Sync thinking switch (on/off) to Rust on startup.
   // restart=false → 只存值，不拉起 agent.exe（保持懒启动）。
   invoke("set_thinking_mode", { mode: chatMode, restart: false }).catch(() => {});
 })();
@@ -1313,6 +1529,9 @@ let dragging = false; // true during any drag operation — prevents auto-hide
 // Drag handler factory — generic mouse-move threshold drag
 function makeDragHandle(el: HTMLElement) {
   el.addEventListener("mousedown", (e) => {
+    // 只认左键：右键是上下文菜单（搜索栏的四项菜单），中键是粘贴等，
+    // 都不该启动窗口拖动 —— 否则右键后手一抖就把窗口拖走了。
+    if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     // Don't drag on buttons or interactive elements
     if (target.tagName === "BUTTON" || target.closest("button") || target.closest("input")) {
@@ -1346,6 +1565,14 @@ function makeDragHandle(el: HTMLElement) {
 // Search bar (non-input area)
 makeDragHandle(searchBar);
 
+// Detached（大界面）顶栏。**必须显式绑定**：Tauri 的 `data-tauri-drag-region` 是
+// 「裸属性」语义 —— 只有事件目标**就是**带属性的那个元素才触发（tauri drag.js
+// 的 `el === composedPath[0]`），点在子元素上无效；而顶栏中间被 `#detached-title`
+// （flex:1）占满，靠属性只能拖到 12px 内边距/间隙 ⇒ 表现为「有时候拖不动」。
+// JS 拖动对子元素同样生效，且 factory 内已跳过 button ⇒ 顶栏三个按钮照常可点。
+// 与 `#search-bar` 一致：属性 + JS 两条通道都留，属性管「按下即拖」，JS 管「移动阈值」。
+makeDragHandle(detachedHeader);
+
 // Window drag is intentionally LIMITED to the title-bar areas only
 // (search bar / plugin title bar / detached header — all carry
 // `data-tauri-drag-region` + makeDragHandle). The results/chat body must
@@ -1354,37 +1581,49 @@ makeDragHandle(searchBar);
 // — that's why AI chat text couldn't be selected (需求3). Body text stays
 // fully selectable; move the window from the title bar instead.
 
-// Search input — uTools-style: disable pointer events during drag
-searchInput.addEventListener("mousedown", (e) => {
-  const startX = e.clientX;
-  const startY = e.clientY;
-  let dragged = false;
+// 输入框拖动 —— uTools 风格：3px 阈值后才发起拖动，拖动期间关掉输入框的
+// pointer-events（避免拖动过程中选中文本），结束后恢复并回焦。
+// 简洁搜索框与详细搜索大界面的输入框用的是同一套手感，故抽成工厂。
+function makeInputDragHandle(input: HTMLTextAreaElement | HTMLInputElement) {
+  // 转成 HTMLElement 再挂监听：联合类型的 addEventListener 会退化成 Event 重载，
+  // 拿不到 MouseEvent 的 clientX/clientY（编译期报错）。
+  (input as HTMLElement).addEventListener("mousedown", (e) => {
+    // 只认左键：右键要在输入框上弹上下文菜单（全选/复制/剪切/粘贴），
+    // 若右键也能启动拖动，菜单一弹出窗口就跟着跑了。
+    if (e.button !== 0) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let dragged = false;
 
-  const onMove = (ev: MouseEvent) => {
-    if (!dragged && (Math.abs(ev.clientX - startX) > 3 || Math.abs(ev.clientY - startY) > 3)) {
-      dragged = true;
-      dragging = true;
-      // Disable input interaction during drag (uTools-style cursor switch)
-      searchInput.style.pointerEvents = "none";
-      win.startDragging();
-    }
-  };
-  const onUp = () => {
-    document.removeEventListener("mousemove", onMove);
-    document.removeEventListener("mouseup", onUp);
-    if (dragged) {
-      // Restore after drag ends
-      setTimeout(() => {
-        searchInput.style.pointerEvents = "";
-        dragging = false;
-        // Re-focus if needed
-        if (isVisible && !pluginActive) searchInput.focus();
-      }, 200);
-    }
-  };
-  document.addEventListener("mousemove", onMove);
-  document.addEventListener("mouseup", onUp);
-});
+    const onMove = (ev: MouseEvent) => {
+      if (!dragged && (Math.abs(ev.clientX - startX) > 3 || Math.abs(ev.clientY - startY) > 3)) {
+        dragged = true;
+        dragging = true;
+        // Disable input interaction during drag (uTools-style cursor switch)
+        input.style.pointerEvents = "none";
+        win.startDragging();
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (dragged) {
+        // Restore after drag ends
+        setTimeout(() => {
+          input.style.pointerEvents = "";
+          dragging = false;
+          // Re-focus if needed
+          if (isVisible && !pluginActive) input.focus();
+        }, 200);
+      }
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+// Search input — uTools-style: disable pointer events during drag
+makeInputDragHandle(searchInput);
 
 // ── Plugin bar lock — search bar transforms to plugin title + exit ─
 function setPluginBar(title: string | null) {
@@ -1472,6 +1711,11 @@ async function newConversation(skipCliRestart = false) {
   agentView = null;
   agentTurn = null;
   pendingMessages = [];
+  // 表盘口径 = 当前这次对话，新对话即归零（按天日志不受影响，对账照旧）
+  resetUsageTotals();
+  liveCompaction = { elided: 0, dropped: 0 };
+  // 新对话 → 过程快照也重新开始（旧会话的已随它自己的记录落盘）
+  sessionSteps = [];
 
   // Restart CLI to clear accumulated conversation context.
   // Without this, the CLI retains all previous messages in its
@@ -1492,7 +1736,7 @@ async function newConversation(skipCliRestart = false) {
   activePluginId = "ai-agent";
   isChatHistoryView = false;
   setPluginBar(t("chat.ai_entry"));
-  invoke("set_plugin_active", { active: true }).catch(() => {});
+  invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
   resultsContainer.classList.remove("hidden");
   searchBar.classList.add("has-results");
   resultsList.innerHTML = `<div class="ai-response" id="chat-log"><div class="chat-msg-system">${t("chat.new_conversation_msg", { mode: currentModeLabel() })}</div></div>`;
@@ -1504,7 +1748,7 @@ async function newConversation(skipCliRestart = false) {
 }
 chatNewBtn.addEventListener("click", () => newConversation());
 
-// 思考档位：三档分段（原为循环胶囊，2026-09 收进「更多」菜单）
+// 思考开关：两档分段（原为循环胶囊与三档分段，2026-09 收进「更多」菜单）
 function setThinkingMode(mode: ThinkingMode) {
   chatMode = mode;
   try { localStorage.setItem("lunac-chat-mode", chatMode); } catch {}
@@ -2032,38 +2276,17 @@ function appendUsageLog(info: ChatDoneInfo) {
       // 压缩次数随用量一起落盘：日后对账时可用它解释命中率的断裂
       elided: liveCompaction.elided,
       dropped: liveCompaction.dropped,
+      // 每次 API 请求一行（对账粒度，与平台用量页逐行对齐）；旧 agent 缺该字段 → 不写
+      requests: info.requests ?? [],
     },
   }).catch(() => {});
 }
 
-/** 面板数值的唯一来源 = 今日日志。首次显示时播种一次，之后每次提问累加。 */
-async function seedUsageTotals() {
-  if (usageSeeded) return;
-  usageSeeded = true;
-  const turnsAtStart = usageLiveTurns;
-  try {
-    const records = await invoke<Array<{
-      input: number; output: number; cacheRead: number; cacheCreate: number;
-      elided?: number; dropped?: number;
-    }>>("read_usage_log", { date: localDateKey(new Date()) });
-    // 播种是异步的：期间若有提问回包，直接放弃覆盖（那次的数已经实时累加过）
-    if (usageLiveTurns !== turnsAtStart) return;
-    usageTotals = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
-    for (const r of records) {
-      addUsageToTotals({
-        stop_reason: "end_turn",
-        input_tokens: r.input || 0,
-        output_tokens: r.output || 0,
-        cache_read_input_tokens: r.cacheRead || 0,
-        cache_creation_input_tokens: r.cacheCreate || 0,
-      });
-      usageTotals.elided += r.elided || 0;
-      usageTotals.dropped += r.dropped || 0;
-    }
-    updateTokenDashboard();
-  } catch {
-    // 读不到日志就按 0 起步，下一次提问照样累加
-  }
+/** 表盘归零 —— 新建会话 / 切换到别的会话时调用。
+ *  表盘口径是「当前这次对话」，所以换对话必须清零；按天日志不受影响（对账照旧）。 */
+function resetUsageTotals() {
+  usageTotals = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
+  updateTokenDashboard();
 }
 
 function showTokenDashboard(show: boolean) {
@@ -2071,7 +2294,6 @@ function showTokenDashboard(show: boolean) {
     tokenDashboard.classList.remove("hidden");
     tokenDashboard.classList.add("visible");
     updateTokenDashboard();
-    void seedUsageTotals();
   } else {
     tokenDashboard.classList.remove("visible");
     tokenDashboard.classList.add("hidden");
@@ -2439,11 +2661,19 @@ document.addEventListener("contextmenu", (e) => {
 // 前端仅通过 listen 事件响应，不做 JS keydown 后备
 // （后备会导致 JS 先清空→Rust 后判空→直接隐藏的双击问题）。
 
-/** 统一的 Esc 逐级清除逻辑（抽屉 → 泡泡 → 文本 → 退出/隐藏） */
+/** 统一的 Esc 逐级清除逻辑（抽屉 → 详情大界面 → 插件 → 泡泡 → 文本 → 退出/隐藏） */
 function handleEscClear() {
   // Drawer visible → close it first, don't touch plugin state
   if (drawerVisible) {
     toggleDrawer(false);
+    return;
+  }
+  // 详细搜索大界面：Esc 的第一件事是退回简洁搜索（把查询词带回去），**不是清词**、
+  // 更不是隐藏窗口。Rust 侧靠 UI_MODE=detail 把这一下 Esc 交给我们（见 hotkey.rs
+  // 的 Esc 分支）—— 那里已经不再按「query/chips 是否空」判断，因为详情态的
+  // 查询词在自己的输入框里、简洁搜索栏本来就是空的，按内容判空会直接隐藏窗口。
+  if (detailOpen) {
+    exitDetail();
     return;
   }
   if (pluginActive) {
@@ -2566,8 +2796,8 @@ async function closePluginView() {
   currentSessionId = null;
   // Clean up drawer if still present
   closeDrawer();
-  // Await Rust state sync — prevents race: next ESC sees correct PLUGIN_ACTIVE=false
-  await invoke("set_plugin_active", { active: false }).catch(() => {});
+  // Await Rust state sync — prevents race: next ESC sees correct UI_MODE=main
+  await invoke("set_ui_mode", { mode: "main" }).catch(() => {});
   // Stop CLI (free resources on exit)
   invoke("stop_cli").catch(() => {});
   cliReady = false;
@@ -2628,6 +2858,13 @@ interface CliEventLine {
     tool_name?: string;
     input?: Record<string, unknown>;
     tool_use_id?: string;
+    /** 命令类工具（Bash / PowerShell）的**执行侧**静态安全分析，由 agent 附上 ——
+     *  见 docs/ai-spec.md §3.5「命令静态安全分析」。
+     *  · `dangerous` 非空 → 任何档位都必须人工确认，且不给「始终允许」
+     *  · `opaque`    非空 → 含无法静态判定的成分（变量 / 编码执行 / 间接执行器），
+     *                      **不得自动放行**（fail-closed）
+     *  缺字段时回落到本文件自己的正则（兼容旧 agent 与非命令类工具）。 */
+    analysis?: { dangerous?: string[]; opaque?: string[] };
   };
   event?: {
     type: string;
@@ -3274,6 +3511,34 @@ const BUILTIN_SAFE_PREFIXES = [
   "node -v", "npm -v", "python --version", "Get-ChildItem", "Get-Content",
 ];
 
+/** 不可白名单化的命令前缀（解释器 / 启动器 / 动态执行）。
+ *
+ *  白名单是**前缀匹配**（`cmd === p || cmd.startsWith(p + " ")`），一旦把
+ *  `powershell` 放进去，以后**任何** `powershell …` 都会被自动放行 —— 等于把
+ *  任意代码执行权交出去（`powershell -Command <任意脚本>` 与刚才那条毫无关系）。
+ *  同理 `cmd` / `bash` / `python` / `node` / `npx` / `iex` … 因此这些前缀
+ *  一律不提供「始终允许」（旧 CLI 在 auto 模式下也是直接剥离这类规则）。
+ *
+ *  注意：这不影响「危险命令不给白名单」那条 —— 那是按命令**内容**判定，
+ *  这里按命令**词**判定，两者是「与」的关系。 */
+const NON_WHITELISTABLE_PREFIXES = new Set([
+  "cmd", "powershell", "pwsh", "bash", "sh", "zsh", "fish", "wsl",
+  "python", "python3", "node", "npx", "npm", "yarn", "pnpm", "bun", "deno",
+  "ruby", "perl", "php", "lua", "env", "sudo", "doas", "runas", "su",
+  "iex", "invoke-expression", "start", "start-process",
+  "wscript", "cscript", "mshta", "rundll32", "regsvr32", "certutil",
+]);
+
+/** 命令类请求的首个词（小写、去 .exe），用于判断能否白名单化 */
+function cmdPrefix(bashCmd: string): string {
+  return (bashCmd.trim().split(/\s+/)[0] || "").toLowerCase().replace(/\.exe$/, "");
+}
+
+function canWhitelistCmd(bashCmd: string): boolean {
+  const p = cmdPrefix(bashCmd);
+  return p !== "" && !NON_WHITELISTABLE_PREFIXES.has(p);
+}
+
 // Hard blacklist — destructive patterns; NEVER auto-approved, no
 // "always allow" offered, card shows a danger warning.
 const CMD_BLACKLIST: { re: RegExp; label: string }[] = [
@@ -3307,46 +3572,73 @@ function saveUserWhitelist(wl: ApproveWhitelist) {
   localStorage.setItem("lunac-approve-whitelist", JSON.stringify(wl));
 }
 
+interface RequestClass {
+  auto: boolean;
+  danger: string | null;
+  opaque: string | null;
+  bashCmd: string | null;
+}
+
 /** Classify a permission request: auto-allow (safe/whitelisted), danger
- *  (blacklisted — manual only), or normal (3-button card). */
-function classifyRequest(toolName: string, input: unknown): {
-  auto: boolean; danger: string | null; bashCmd: string | null;
-} {
+ *  (blacklisted — manual only), opaque (不可静态判定 — 不自动放行), or normal. */
+function classifyRequest(
+  toolName: string,
+  input: unknown,
+  analysis?: { dangerous?: string[]; opaque?: string[] },
+): RequestClass {
   const inp = input as Record<string, unknown> | undefined;
   const bashCmd =
     (toolName === "Bash" || toolName === "PowerShell") && typeof inp?.command === "string"
       ? (inp.command as string)
       : null;
 
+  // ① **agent 的执行侧静态分析优先于本地正则**。本地正则只看命令原文，挡不住
+  //    引号拼接（`r""m`）/ 包装器（`cmd /c …`）/ 变量（`%TMP%\x.bat`）/ 串联后半段
+  //    （`echo hi & shutdown /r`）；判定实现在 core-agent/src/bash_safety.rs。
+  const agentDanger = (analysis?.dangerous ?? []).filter(Boolean);
+  const agentOpaque = (analysis?.opaque ?? []).filter(Boolean);
+  if (agentDanger.length) {
+    // 危险命令任何档位都要人工确认（含「自动」档），且不给「始终允许」
+    return { auto: false, danger: agentDanger.join("、"), opaque: null, bashCmd };
+  }
+  // ② 含无法静态判定的成分（变量 / 编码执行 / 间接执行器）→ **不得自动放行**。
+  //    fail-closed 是刻意的：判不出来就当「要人看」，绝不当「安全」。
+  if (agentOpaque.length) {
+    return { auto: false, danger: null, opaque: agentOpaque.join("、"), bashCmd };
+  }
+
   if (bashCmd) {
     for (const b of CMD_BLACKLIST) {
       // 危险命令任何档位都要人工确认（含「自动」档）
-      if (b.re.test(bashCmd)) return { auto: false, danger: b.label, bashCmd };
+      if (b.re.test(bashCmd)) return { auto: false, danger: b.label, opaque: null, bashCmd };
     }
     const mode = getRunMode();
-    if (mode === "auto") return { auto: true, danger: null, bashCmd };
+    if (mode === "auto") return { auto: true, danger: null, opaque: null, bashCmd };
     // 手动档：连内置安全前缀也照问不误
-    if (mode === "manual") return { auto: false, danger: null, bashCmd };
+    if (mode === "manual") return { auto: false, danger: null, opaque: null, bashCmd };
     const cmd = bashCmd.trim();
     const wl = getUserWhitelist();
     const hit = (p: string) => cmd === p || cmd.startsWith(p + " ");
-    if (BUILTIN_SAFE_PREFIXES.some(hit) || wl.bash.some(hit)) {
-      return { auto: true, danger: null, bashCmd };
+    // 解释器前缀即便在用户白名单里也不放行 —— 否则「允许过一次
+    // `powershell -Command A`」会变成「以后任何 `powershell …` 都自动放行」。
+    const userHit = canWhitelistCmd(cmd) && wl.bash.some(hit);
+    if (BUILTIN_SAFE_PREFIXES.some(hit) || userHit) {
+      return { auto: true, danger: null, opaque: null, bashCmd };
     }
-    return { auto: false, danger: null, bashCmd };
+    return { auto: false, danger: null, opaque: null, bashCmd };
   }
 
   // AskUserQuestion 必须由人来选：即使工具名进了白名单也不能自动放行 ——
   // 自动放行 = 回一个空 updatedInput，模型拿不到任何答案（agent 会报
   // "No answer was collected"）。
-  if (toolName === "AskUserQuestion") return { auto: false, danger: null, bashCmd: null };
+  if (toolName === "AskUserQuestion") return { auto: false, danger: null, opaque: null, bashCmd: null };
 
   // 非命令类工具同样受运行方式约束（写类四件走这里）
   const mode = getRunMode();
-  if (mode === "auto") return { auto: true, danger: null, bashCmd: null };
-  if (mode === "manual") return { auto: false, danger: null, bashCmd: null };
+  if (mode === "auto") return { auto: true, danger: null, opaque: null, bashCmd: null };
+  if (mode === "manual") return { auto: false, danger: null, opaque: null, bashCmd: null };
   const wl = getUserWhitelist();
-  return { auto: wl.tools.includes(toolName), danger: null, bashCmd: null };
+  return { auto: wl.tools.includes(toolName), danger: null, opaque: null, bashCmd: null };
 }
 
 function respondPermission(
@@ -3380,24 +3672,33 @@ function respondPermission(
 // all of them. The merge is approval/presentation only: the CLI still
 // runs each command individually, so execution semantics are never
 // altered (a failed `&&` short-circuit, per-command output, etc.).
-const MAX_CMD_GROUP = 8;
+const MAX_CMD_GROUP = 20;
 
-/** A command may join a merge group only if it is a simple single command —
- *  shell separators/pipes/redirects/backgrounding/newlines would change
- *  meaning, so those stay as their own approval row. */
+/** 连续的命令类审批请求能否并进同一行。
+ *
+ *  合并**只影响审批展示**：每条命令仍由 agent 各自执行，`&&` 的短路、各自的
+ *  退出码与输出都不受影响 —— 所以「含 `&&` / `|` / 重定向 / 换行 的复杂命令」
+ *  同样可以合组。2026-09 起不再按算子排除：旧规则会让复杂任务里**同类请求一行
+ *  一条地堆满卡片**（用户反馈的「同类型权限请求反复出现」正是这个）。
+ *  只留一个宽松的长度上限，避免单条超长命令把一行撑爆。 */
 function isMergeableCommand(cmd: string): boolean {
   if (!cmd) return false;
-  if (cmd.length > 200) return false;
-  if (/[|;&<>`\n]/.test(cmd)) return false;
-  return true;
+  return cmd.length <= 2000;
 }
 
 interface CmdGroupItem extends HTMLElement {
   _groupIds: string[];
   _groupCmds: string[];
   _groupToolUseIds: string[];
-  _groupToolName: string;
+  /** 组内出现过的命令类工具名（Bash / PowerShell，去重） */
+  _groupToolNames: string[];
   _groupDanger: boolean;
+  /** 组内命中的危险标签（去重）—— 标题 tooltip 用 */
+  _groupDangerLabels: string[];
+  /** 组内出现过「无法静态判定」的命令（变量 / 编码执行…）→ 不留「始终允许」 */
+  _groupOpaque?: boolean;
+  /** 组内的不透明原因（去重）—— 标题 tooltip 用 */
+  _groupOpaqueLabels: string[];
   _groupInput?: unknown;
   _isCmdGroup: boolean;
   _finish: (allow: boolean, always?: boolean) => void;
@@ -3407,16 +3708,35 @@ interface CmdGroupItem extends HTMLElement {
   _resolveNote?: (allow: boolean) => string;
 }
 
-/** Find the last open command-group row for a tool (merge target). */
-function findLastBashGroup(toolName: string): CmdGroupItem | null {
+/** Find the last open command-group row (merge target).
+ *
+ *  命令类工具（`Bash` / `PowerShell`）视作**同一族** —— 用户要求「短时间内不同类型的
+ *  命令也合并进同一次权限运行」，所以这里不再按工具名区分：只要上一行还是**未被应答**
+ *  的命令组，新命令就并进去（跨轮是并不了的：下一轮的命令要等上一轮的执行结果才产生）。 */
+function findLastCmdGroup(): CmdGroupItem | null {
   let last: CmdGroupItem | null = null;
   for (const [, item] of pendingPermissionCards) {
     const it = item as CmdGroupItem;
-    if (it._isCmdGroup && it._groupToolName === toolName && !it.classList.contains("answered")) {
+    if (it._isCmdGroup && !it.classList.contains("answered")) {
       last = it;
     }
   }
   return last;
+}
+
+/** 行标题：合并后工具名可能不止一个（`Bash + PowerShell`），危险 / 不透明标记也可能
+ *  来自后来合并进来的那条命令，所以每次合并都重画一次。 */
+function renderGroupTitle(item: CmdGroupItem) {
+  const el = item.querySelector(".approval-title");
+  if (!el) return;
+  const dangerHtml = item._groupDanger
+    ? `<span class="approval-danger-inline" title="${esc(t("agent.static_danger", { labels: item._groupDangerLabels.join("、") }))}">⛔</span>`
+    : "";
+  // 无法静态判定 → 也给一个标记，说明「为什么这条要人看」
+  const opaqueHtml = item._groupOpaque
+    ? `<span class="approval-warn-inline" title="${esc(t("agent.static_opaque", { reasons: item._groupOpaqueLabels.join("、") }))}">⚠</span>`
+    : "";
+  el.innerHTML = `${dangerHtml}${opaqueHtml}<b>${esc(item._groupToolNames.join(" + "))}</b>`;
 }
 
 /** AskUserQuestion 的选项界面：单选用互斥高亮、多选可叠加；选中结果写进
@@ -3501,8 +3821,31 @@ function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupIte
   item._resolveNote = (allow) => (allow ? "已提交答案" : "已拒绝提问");
 }
 
+/** 权限卡里命令文本的**显示**归一化（纯排版，不改实际执行的命令）。
+ *
+ *  模型经常把命令写成「首行空白 + 后续行统一缩进」的多行串，而 `.approval-cmd`
+ *  是 `white-space: pre-wrap` —— 于是卡片里第一行是空的、整段看着不贴顶，还平白带着
+ *  一层缩进（用户反馈「悬浮在命令行中间、内容没置顶」，要求删掉无效空白/缩进）。
+ *  做法：统一换行符 → 去掉首尾空行 → 去掉各非空行的**公共缩进**。
+ *  保留换行，多行脚本仍然分行可读。 */
+function normalizeCmdForDisplay(cmd: string): string {
+  const lines = cmd.replace(/\r\n?/g, "\n").split("\n");
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  if (!lines.length) return cmd.trim();
+  const indents = lines.filter(l => l.trim()).map(l => l.match(/^[ \t]*/)![0].length);
+  const common = Math.min(...indents);
+  if (common <= 0) return lines.join("\n");
+  return lines.map(l => (l.trim() ? l.slice(common) : "")).join("\n");
+}
+
 /** Re-render a command group's body (command list + merge count). */
 function renderCmdGroupBody(item: CmdGroupItem) {
+  // 危险 / 判不出来的命令不留「始终允许」—— 合并进来的**后续**命令可能才是危险的那条，
+  // 而按钮是在第一条命令时就画好的，所以在这里兜一次（每次合并都会走到）。
+  if (item._groupDanger || item._groupOpaque) {
+    item.querySelector(".approval-always")?.remove();
+  }
   const bodyEl = item.querySelector(".approval-body") as HTMLElement | null;
   if (!bodyEl) return;
   if (item._isCmdGroup) {
@@ -3510,28 +3853,21 @@ function renderCmdGroupBody(item: CmdGroupItem) {
     const html = cmds
       .map((c, i) => {
         const sep = i > 0 ? `<span class="approval-cmd-sep">└ </span>` : "";
-        return `<div class="approval-cmd" title="${esc(c)}">${sep}<span class="approval-cmd-text">${esc(c)}</span></div>`;
+        const shown = normalizeCmdForDisplay(c);
+        return `<div class="approval-cmd" title="${esc(shown)}">${sep}<span class="approval-cmd-text">${esc(shown)}</span></div>`;
       })
       .join("");
     const count = cmds.length > 1
       ? `<div class="approval-cmd-merged">${t("agent.cmd_merged", { count: String(cmds.length) })}</div>`
       : "";
+    // 命令区**不带**复制按钮（2026-09）：按钮固定在右上角，短命令与它之间会留出
+    // 一大片空距（.approval-cmd-list 还得为它预留 56px 右边距）。命令文本本身可选
+    // 可复制（.approval-cmd-box 有 user-select: text），功能不丢。
     bodyEl.innerHTML = `
       <div class="approval-cmd-box">
-        <button class="approval-copy-btn" title="${esc(t("agent.copy_cmd"))}">${esc(t("agent.copy_cmd"))}</button>
         <div class="approval-cmd-list">${html}</div>
         ${count}
       </div>`;
-    // Copy button: copies the full (merged) command text, shows feedback
-    const copyBtn = bodyEl.querySelector(".approval-copy-btn");
-    copyBtn?.addEventListener("click", () => {
-      navigator.clipboard.writeText(cmds.join("\n")).catch(() => {});
-      const label = copyBtn as HTMLElement;
-      label.textContent = t("agent.copied");
-      setTimeout(() => {
-        label.textContent = t("agent.copy_cmd");
-      }, 1200);
-    });
   } else {
     let preview = "";
     try {
@@ -3569,10 +3905,11 @@ function showPermissionCard(
   toolName: string,
   input: unknown,
   toolUseId?: string,
+  analysis?: { dangerous?: string[]; opaque?: string[] },
 ) {
   pendingPermissionCards.get(requestId)?.remove();
   const host = agentView?.flow ?? resultsList; // inline, in arrival order
-  const cls = classifyRequest(toolName, input);
+  const cls = classifyRequest(toolName, input, analysis);
 
   // Whitelisted / built-in safe → auto-approve, show a one-line notice
   if (cls.auto) {
@@ -3617,15 +3954,25 @@ function showPermissionCard(
   }
   const body = permissionBatchCard.querySelector(".approval-batch-body")!;
 
-  // ── Continuous-command merge: fold a simple follow-up command into the
-  // last open Bash/PowerShell approval row instead of a new one ─────────
+  // ── Continuous-command merge: fold a follow-up command into the last open
+  // Bash/PowerShell approval row instead of a new one ───────────────────
   if (cls.bashCmd && !cls.auto && isMergeableCommand(cls.bashCmd)) {
-    const last = findLastBashGroup(toolName);
+    const last = findLastCmdGroup();
     if (last && last._groupIds.length < MAX_CMD_GROUP) {
       last._groupIds.push(requestId);
       last._groupCmds.push(cls.bashCmd);
       last._groupToolUseIds.push(toolUseId ?? "");
+      if (!last._groupToolNames.includes(toolName)) last._groupToolNames.push(toolName);
       last._groupDanger = last._groupDanger || !!cls.danger;
+      if (cls.danger && !last._groupDangerLabels.includes(cls.danger)) {
+        last._groupDangerLabels.push(cls.danger);
+      }
+      last._groupOpaque = last._groupOpaque || !!cls.opaque;
+      if (cls.opaque && !last._groupOpaqueLabels.includes(cls.opaque)) {
+        last._groupOpaqueLabels.push(cls.opaque);
+      }
+      if (cls.danger) last.classList.add("danger");
+      renderGroupTitle(last);
       renderCmdGroupBody(last);
       pendingPermissionCards.set(requestId, last);
       updatePermissionHeader();
@@ -3640,29 +3987,32 @@ function showPermissionCard(
   item._groupIds = [requestId];
   item._groupCmds = cls.bashCmd ? [cls.bashCmd] : [];
   item._groupToolUseIds = [toolUseId ?? ""];
-  item._groupToolName = toolName;
+  item._groupToolNames = [toolName];
   item._groupDanger = !!cls.danger;
+  item._groupDangerLabels = cls.danger ? [cls.danger] : [];
+  item._groupOpaque = !!cls.opaque;
+  item._groupOpaqueLabels = cls.opaque ? [cls.opaque] : [];
   item._groupInput = input;
   item._isCmdGroup = cls.bashCmd !== null;
 
-  const dangerHtml = cls.danger
-    ? `<span class="approval-danger-inline" title="⛔ 危险操作（${esc(cls.danger)}）— 不可加入白名单，请谨慎确认">⛔</span>`
-    : "";
-  // Blacklisted commands never get an "always allow" button
-  const alwaysBtn = cls.danger
-    ? ""
-    : `<button class="approval-btn approval-always">始终允许</button>`;
+  // 危险命令永不提供「始终允许」；解释器前缀、以及「判不出来」的命令同样不给 ——
+  // 白名单是**前缀匹配**，放进去等于把「以后任何 `powershell …` / `del …`」全自动放行。
+  const alwaysBtn =
+    cls.danger || cls.opaque || (cls.bashCmd !== null && !canWhitelistCmd(cls.bashCmd))
+      ? ""
+      : `<button class="approval-btn approval-always">始终允许</button>`;
   // AskUserQuestion 的「允许」其实是「提交答案」，且不能白名单化
   // （白名单化 = 以后自动回空 updatedInput = 模型永远拿不到答案）
   const isAsk = toolName === "AskUserQuestion";
   item.innerHTML = `
-    <div class="approval-title">${dangerHtml}<b>${esc(toolName)}</b></div>
+    <div class="approval-title"></div>
     <div class="approval-body"></div>
     <div class="approval-actions">
       <button class="approval-btn approval-allow">${isAsk ? "提交" : "允许"}</button>
       ${isAsk ? "" : alwaysBtn}
       <button class="approval-btn approval-deny">拒绝</button>
     </div>`;
+  renderGroupTitle(item);
   body.appendChild(item);
   if (isAsk) {
     renderAskQuestions(item.querySelector(".approval-body")!, input, item);
@@ -3674,11 +4024,16 @@ function showPermissionCard(
   const finish = (allow: boolean, always = false) => {
     const ids = item._groupIds;
     // Always-allow whitelists the first command's prefix or the tool name
-    if (always && !item._groupDanger) {
+    if (always && !item._groupDanger && !item._groupOpaque) {
       const wl = getUserWhitelist();
       if (item._isCmdGroup && item._groupCmds.length) {
-        const prefix = item._groupCmds[0].trim().split(/\s+/)[0];
-        if (prefix && !wl.bash.includes(prefix)) wl.bash.push(prefix);
+        // 组内**每一条**命令的命令词都进白名单（旧实现只记第一条 → 组里第二条
+        // 以后的同类命令下次还要再问一遍，就是「允许过还要再问」）。
+        // 解释器/启动器前缀仍然排除（见 canWhitelistCmd）。
+        for (const c of item._groupCmds) {
+          const prefix = cmdPrefix(c);
+          if (prefix && canWhitelistCmd(prefix) && !wl.bash.includes(prefix)) wl.bash.push(prefix);
+        }
       } else if (!wl.tools.includes(toolName)) {
         wl.tools.push(toolName);
       }
@@ -3821,6 +4176,7 @@ listen<{ line: string }>("cli-output", (event) => {
         data.request.tool_name || "unknown tool",
         data.request.input,
         data.request.tool_use_id,
+        data.request.analysis,
       );
     }
     // CLI cancelled a pending request (hook decided first / query aborted)
@@ -3893,6 +4249,7 @@ listen<{ line: string }>("cli-output", (event) => {
             output_tokens: (u.output_tokens as number) ?? 0,
             cache_read_input_tokens: (u.cache_read_input_tokens as number) ?? 0,
             cache_creation_input_tokens: (u.cache_creation_input_tokens as number) ?? 0,
+            requests: Array.isArray(u.requests) ? (u.requests as ChatDoneRequestUsage[]) : [],
           }
         : undefined;
       // Finalize turn (Pi: turn_end)
@@ -4565,7 +4922,7 @@ async function executePlugin(plugin: Plugin) {
   pluginActive = true;
   activePluginId = plugin.id;
   setPluginBar(pluginName(plugin.id));
-  invoke("set_plugin_active", { active: true }).catch(() => {});
+  invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
 
   // Allow native select dropdowns to overflow the container (no clipping)
   resultsContainer.classList.add("plugin-open");
@@ -4954,7 +5311,7 @@ async function startAgentChat(query: string) {
     activePluginId = "ai-agent";
     isChatHistoryView = false;
     setPluginBar(t("chat.ai_entry"));
-    invoke("set_plugin_active", { active: true }).catch(() => {});
+    invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
     applyWindowSize();
     try {
       await invoke("start_cli");
@@ -4990,7 +5347,7 @@ async function startAgentChat(query: string) {
   activePluginId = "ai-agent";
   isChatHistoryView = false;
   setPluginBar(t("chat.ai_entry"));
-  invoke("set_plugin_active", { active: true }).catch(() => {});
+  invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
 
   // Show streaming UI — wrap this turn in a .agent-turn container
   resultsContainer.classList.remove("hidden");
@@ -5076,6 +5433,9 @@ async function startAgentChat(query: string) {
           : t("agent.turn_elapsed", { dur });
       footer.appendChild(label);
 
+      // 过程快照：把本轮的过程块抽成可持久化的步骤（历史回顾时展示「查看过程」）
+      recordTurnSteps(flowEl);
+
       // 只有这一轮真的产生了「过程」才给折叠按钮
       const processEls = flowEl.querySelectorAll(
         ".think-block, .tool-card, .tool-row, .todo-panel, .sys-note",
@@ -5107,9 +5467,8 @@ async function startAgentChat(query: string) {
     // 的那几轮命中缓存算成 0（两轮 cache_read 相同 → 差值 0），导致本地命中率
     // 系统性低于供应商平台、无法对账。
     if (info) {
-      usageLiveTurns++;
       addUsageToTotals(info);
-      // 压缩计数归入「今日合计」，面板据此解释命中率
+      // 压缩计数一并计入表盘（本对话口径），面板据此解释命中率
       usageTotals.elided += liveCompaction.elided;
       usageTotals.dropped += liveCompaction.dropped;
       updateTokenDashboard();
@@ -5224,7 +5583,7 @@ async function startAIChat(query: string, files?: string[]) {
     activePluginId = "ai-agent";
     isChatHistoryView = false;
     setPluginBar(t("chat.ai_entry"));
-    invoke("set_plugin_active", { active: true }).catch(() => {});
+    invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
     resultsContainer.classList.remove("hidden");
     searchBar.classList.add("has-results");
     resultsList.innerHTML = `<div class="ai-response" id="chat-log"><div class="chat-msg-system">${t("chat.ai_chat_ready", { mode: currentModeLabel() })}</div></div>`;
@@ -5454,11 +5813,20 @@ contextMenuEl.id = "context-menu";
 contextMenuEl.className = "hidden";
 document.body.appendChild(contextMenuEl);
 
-function showContextMenu(x: number, y: number, items: Array<{ label: string; action: () => void; danger?: boolean }>) {
+/** 自定义右键菜单的一项。`disabled` 用于「无选区 → 复制/剪切置灰」这类按状态
+ *  变化的项（置灰项仍渲染，只是点不动 —— 直接隐藏会让菜单忽长忽短）。 */
+interface CtxMenuItem {
+  label: string;
+  action: () => void;
+  danger?: boolean;
+  disabled?: boolean;
+}
+
+function showContextMenu(x: number, y: number, items: CtxMenuItem[]) {
   // 互斥：打开结果菜单前先移除 ws 引擎菜单，避免两菜单同帧同时显示
   document.getElementById("ws-context-menu")?.remove();
   contextMenuEl.innerHTML = items.map(item =>
-    `<div class="context-menu-item${item.danger ? " danger" : ""}">${esc(item.label)}</div>`
+    `<div class="context-menu-item${item.danger ? " danger" : ""}${item.disabled ? " disabled" : ""}">${esc(item.label)}</div>`
   ).join("");
 
   // CSS zoom 缩放 <html> 后，position:fixed 的元素也会被等比放大，而事件
@@ -5472,6 +5840,7 @@ function showContextMenu(x: number, y: number, items: Array<{ label: string; act
   const menuItems = contextMenuEl.querySelectorAll(".context-menu-item");
   menuItems.forEach((el, i) => {
     el.addEventListener("click", () => {
+      if (items[i]?.disabled) return;   // 置灰项保持菜单打开，不做任何事
       items[i]?.action();
       hideContextMenu();
     });
@@ -5492,6 +5861,82 @@ function hideContextMenu() {
 }
 
 document.addEventListener("click", () => hideContextMenu());
+
+// ── 搜索栏右键菜单：全选 / 复制 / 剪切 / 粘贴 ──────────────────────
+// 全仓右键菜单已在文件顶部统一 preventDefault（WebView2 默认菜单里的
+// 「后退/重新加载/检查元素」对桌面工具毫无意义），所以搜索栏原本是「右键没反应」。
+// 这里补一个搜索引擎式的四项菜单。要点：
+//   ① 复制 / 剪切 依赖选区，无选区时置灰（不隐藏，避免菜单忽长忽短）；
+//   ② 粘贴走 Tauri 剪贴板插件（capabilities 已授 `clipboard-manager:allow-read-text`），
+//      不用 `navigator.clipboard` —— WebView2 下它另需权限、且未聚焦时直接 reject；
+//   ③ 任何改动值的操作都必须补发 `input` 事件：简洁搜索栏靠它同步 Rust 空白态
+//      （Esc 判据）与重跑搜索，详细搜索栏靠它重跑查询，漏发 = 界面与状态脱节。
+
+/** 简洁搜索栏是 textarea、详细搜索栏是 input，两者选区 API 相同，用联合类型接收。 */
+type SearchBox = HTMLInputElement | HTMLTextAreaElement;
+
+/** 用 text 替换输入框当前选区，光标落在插入内容之后，并补发 input 事件。 */
+function replaceInputSelection(el: SearchBox, text: string) {
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.value = el.value.slice(0, start) + text + el.value.slice(end);
+  const caret = start + text.length;
+  el.setSelectionRange(caret, caret);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/** 给一个搜索输入框挂上「全选 / 复制 / 剪切 / 粘贴」右键菜单。 */
+function attachSearchContextMenu(el: SearchBox) {
+  // 转成 HTMLElement 再挂监听：联合类型的 addEventListener 会退化成 Event 重载，
+  // 拿不到 MouseEvent 的 clientX/clientY（与 makeInputDragHandle 同一个坑）。
+  (el as HTMLElement).addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();   // 别冒泡到结果区/全局菜单
+    el.focus();
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    const hasSelection = end > start;
+    const selected = hasSelection ? el.value.slice(start, end) : "";
+
+    showContextMenu(e.clientX, e.clientY, [
+      {
+        label: t("ctxmenu.select_all"),
+        action: () => el.select(),
+      },
+      {
+        label: t("ctxmenu.copy"),
+        disabled: !hasSelection,
+        action: () => {
+          // 动态 import 与结果区菜单保持同一写法（插件不在启动路径上）
+          import("@tauri-apps/plugin-clipboard-manager")
+            .then(({ writeText }) => writeText(selected))
+            .catch(() => {});
+        },
+      },
+      {
+        label: t("ctxmenu.cut"),
+        disabled: !hasSelection,
+        action: () => {
+          import("@tauri-apps/plugin-clipboard-manager")
+            .then(({ writeText }) => writeText(selected))
+            .catch(() => {});
+          replaceInputSelection(el, "");
+        },
+      },
+      {
+        label: t("ctxmenu.paste"),
+        action: () => {
+          import("@tauri-apps/plugin-clipboard-manager")
+            .then(({ readText }) => readText())
+            .then(text => { if (text) replaceInputSelection(el, text); })
+            .catch(() => {});
+        },
+      },
+    ]);
+  });
+}
+
+attachSearchContextMenu(searchInput);
 
 resultsContainer.addEventListener("contextmenu", (e) => {
   e.preventDefault();   // 阻止 WebView2 默认右键菜单（与全局互补）
@@ -5803,11 +6248,6 @@ function processClipboardText(text: string) {
     }
   }
 
-  // 状态栏预览
-  const first = parts[0].trim();
-  const preview = first.length > 50 ? first.slice(0, 50) + "…" : first;
-  statusHint.textContent = `📋 ${preview.replace(/\n/g, " ")}`;
-
   // 触发搜索：文本填搜索栏，路径已有泡泡框
   // Skip auto-fill if the search bar already contains the same text
   if (!pluginActive) {
@@ -5887,8 +6327,572 @@ function triggerJSClipboardRead() {
 // 同时进入「抑制滑动」期：唤出瞬间窗口应完整展开，而不是被结果区逐帧撑开。
 win.listen("lunac-window-shown", () => {
   suppressResizeAnimBriefly();
+  // 大界面不跨「隐藏 → 唤出」存活：唤出（热键 / 双击图标）一律回到简洁搜索 ——
+  // 否则用户下次唤出面对的是上次留下的大界面，还占着 640 的固定高度。
+  if (detailOpen) exitDetailSilently();
   triggerJSClipboardRead();
 });
 
 // Also try reading clipboard on initial startup
 setTimeout(triggerJSClipboardRead, 800);
+
+// ══════════════════════════════════════════════════════════════════
+// 详细搜索大界面（双击搜索栏进入）
+// 规范：docs/ai-spec.md §2.1.2。四条设计约束：
+//   ① **简洁搜索的任何行为都不改**：进大界面只是叠一层视图；退出时把查询词带回
+//      搜索栏并重跑一次简洁搜索，结果区照旧。
+//   ② 数据源四个：应用索引（`search_apps`）/ 文件索引（`search_files`）/
+//      Windows 设置页与系统动作（`system_catalog`）/ 插件命令（pluginRegistry）。
+//   ③ 序号（seq）latest-wins，与简洁搜索同一纪律：快速键入丢弃过期回包。
+//   ④ 窗口高度固定档 `DETAIL_HEIGHT × zoom`，且**不进高度滑动动画** —— 与插件态
+//      同策略（离散切换），滑动只属于搜索/结果态（见 ai-spec §3.2 视窗规则）。
+// ══════════════════════════════════════════════════════════════════
+
+/** 文件索引条目（Rust `file_indexer::FileEntry`） */
+interface DetailFile {
+  name: string;
+  path: string;
+  kind: string;
+  ext: string;
+  modified: number;
+  size: number;
+}
+
+/** 系统设置页 / 系统动作条目（Rust `system_catalog::CatalogItem`） */
+interface DetailCatalogItem {
+  id: string;
+  kind: string;
+  icon: string;
+  title_zh: string;
+  title_en: string;
+  target: string;
+  danger: boolean;
+  keywords: string[];
+}
+
+interface DetailIndexStatus {
+  count: number;
+  scanning: boolean;
+  saved_ms: number;
+  truncated: boolean;
+  roots: string[];
+}
+
+type DetailCat = "all" | "apps" | "files" | "settings" | "actions" | "commands";
+type DetailRowCat = Exclude<DetailCat, "all"> | "web";
+
+interface DetailRow {
+  cat: DetailRowCat;
+  app?: AppEntry;
+  file?: DetailFile;
+  item?: DetailCatalogItem;
+  plugin?: Plugin;
+  query?: string;
+}
+
+const DETAIL_CATS: DetailCat[] = ["all", "apps", "files", "settings", "actions", "commands"];
+/// 文件类型筛选（"" = 全部类型；值必须与 Rust `kind_for` 的分类一一对应）
+const DETAIL_KINDS = ["", "folder", "document", "image", "video", "audio", "archive", "program", "other"];
+/// 文件结果条数上限（其余分类体量都很小，不需要上限）
+const DETAIL_FILE_LIMIT = 40;
+/// 结果区分组顺序（Tab「全部」时按这个顺序分组显示）
+const DETAIL_GROUPS: Array<{ cat: DetailRowCat; key: string }> = [
+  { cat: "apps", key: "detail.group_apps" },
+  { cat: "files", key: "detail.group_files" },
+  { cat: "settings", key: "detail.group_settings" },
+  { cat: "actions", key: "detail.group_actions" },
+  { cat: "commands", key: "detail.group_commands" },
+  { cat: "web", key: "detail.group_web" },
+];
+
+const detailPanel = el("detail-panel");
+const detailInput = el("detail-input") as HTMLInputElement;
+const detailTabs = el("detail-tabs");
+const detailKinds = el("detail-kinds");
+const detailResults = el("detail-results");
+const detailCount = el("detail-count");
+const detailHint = el("detail-hint");
+const detailIndexEl = el("detail-index");
+const detailBackBtn = el("detail-back-btn");
+const detailRefreshBtn = el("detail-refresh-btn");
+
+let detailSeq = 0;            // latest-wins 序号
+let detailCat: DetailCat = "all";
+let detailKind = "";          // 文件类型筛选
+let detailAllRows: DetailRow[] = [];  // 本次查询的全部结果（未按分类筛）
+let detailRows: DetailRow[] = [];     // 当前可见（已按分类筛）—— 键盘导航就按它走
+let detailSel = 0;
+let detailCatalog: DetailCatalogItem[] = [];
+let detailStatus: DetailIndexStatus = { count: 0, scanning: false, saved_ms: 0, truncated: false, roots: [] };
+let detailEntryQuery = "";    // 进大界面时简洁搜索里的查询词（退出时若未输入则还原）
+let detailArmed = "";         // 危险动作二次确认中的 id
+let detailArmedTimer: ReturnType<typeof setTimeout> | null = null;
+let detailStatusTimer: ReturnType<typeof setInterval> | null = null;
+let detailIconToken = 0;      // 图标异步回填的失效令牌（重渲染后旧回包作废）
+
+/** 目录条目的显示名：系统语言是中文就用中文名，其余语言用英文名。
+ *  为什么不给五种语言：Windows 设置页的名字是 OS 自己的资源，我们拿不到官方译名。 */
+function detailCatalogTitle(it: DetailCatalogItem): string {
+  return lang.startsWith("zh") ? it.title_zh : it.title_en;
+}
+
+function detailKindLabel(kind: string): string {
+  return t(kind ? `detail.kind_${kind}` : "detail.kind_all");
+}
+
+/** 目录（设置页 + 系统动作）本地匹配：几十条数据，不必走后端。 */
+function matchDetailCatalog(q: string): DetailCatalogItem[] {
+  if (!q) return [];
+  const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return [];
+  const scored: Array<{ it: DetailCatalogItem; score: number }> = [];
+  for (const it of detailCatalog) {
+    const zh = it.title_zh.toLowerCase();
+    const en = it.title_en.toLowerCase();
+    const hay = [it.id.toLowerCase(), zh, en, ...it.keywords.map(k => k.toLowerCase())];
+    let total = 0;
+    let all = true;
+    for (const tk of tokens) {
+      const hit = hay.find(h => h.includes(tk));
+      if (!hit) {
+        all = false;
+        break;
+      }
+      total += hit === zh || hit === en ? 100 : hit.startsWith(tk) ? 60 : 30;
+    }
+    if (all) scored.push({ it, score: total });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 8).map(s => s.it);
+}
+
+async function ensureDetailCatalog() {
+  if (detailCatalog.length) return;
+  try {
+    detailCatalog = await invoke<DetailCatalogItem[]>("system_catalog");
+  } catch {
+    detailCatalog = [];
+  }
+  if (detailOpen) void runDetailSearch();
+}
+
+// ── 进入 / 退出 ──────────────────────────────────────────────────
+
+function enterDetail() {
+  if (detailOpen || pluginActive) return;
+  detailOpen = true;
+  detailEntryQuery = searchInput.value;
+  detailInput.value = detailEntryQuery;
+  detailInput.placeholder = t("detail.placeholder");
+  detailHint.textContent = t("detail.hint_keys");
+  detailPanel.classList.remove("hidden");
+  document.getElementById("app")!.classList.add("detail-mode");
+  // 告诉 Rust「当前在详细搜索这一层」——否则它按「query/chips 空」判空，
+  // 一下 Esc 就把整个窗口隐藏了（2026-09-15 修的 bug，见 hotkey.rs 的 UI_MODE）。
+  invoke("set_ui_mode", { mode: "detail" }).catch(() => {});
+  detailCat = "all";
+  detailSel = 0;
+  renderDetailFilters();
+  applyWindowSize();
+  startDetailStatusPolling();
+  void ensureDetailCatalog();
+  void refreshDetailStatus();
+  void runDetailSearch();
+  detailInput.focus();
+  detailInput.select();
+}
+
+/** 退出大界面但**不**重跑简洁搜索 —— 用于「立刻要隐藏窗口 / 交给插件接管」的路径。 */
+function exitDetailSilently() {
+  if (!detailOpen) return;
+  detailOpen = false;
+  stopDetailStatusPolling();
+  clearDetailArmed();
+  document.getElementById("app")!.classList.remove("detail-mode");
+  detailPanel.classList.add("hidden");
+  applyWindowSize();
+  // 同步 Rust 的界面层（Esc 的隐藏判据）。exitDetail() 也走这里，故一处即可。
+  invoke("set_ui_mode", { mode: "main" }).catch(() => {});
+}
+
+/** 退出大界面并回到简洁搜索（返回按钮 / 唤出窗口时走这条）。 */
+function exitDetail() {
+  if (!detailOpen) return;
+  const q = detailInput.value.trim() ? detailInput.value : detailEntryQuery;
+  exitDetailSilently();
+  searchInput.value = q;
+  autoResizeTextarea();
+  if (!pluginActive) {
+    searchInput.focus();
+    searchInput.dispatchEvent(new Event("input", { bubbles: true })); // 重跑简洁搜索
+  }
+}
+
+// ── 查询 ─────────────────────────────────────────────────────────
+
+async function runDetailSearch() {
+  if (!detailOpen) return;
+  const seq = ++detailSeq;
+  const q = detailInput.value.trim();
+  const [apps, files] = await Promise.all([
+    invoke<AppEntry[]>("search_apps", { query: q, limit: 6 }).catch(() => [] as AppEntry[]),
+    invoke<DetailFile[]>("search_files", { query: q, kind: detailKind || null, limit: DETAIL_FILE_LIMIT })
+      .catch(() => [] as DetailFile[]),
+  ]);
+  if (seq !== detailSeq || !detailOpen) return; // 过期回包直接丢（latest-wins）
+  const rows: DetailRow[] = [];
+  for (const a of apps) rows.push({ cat: "apps", app: a });
+  for (const f of files) rows.push({ cat: "files", file: f });
+  for (const it of matchDetailCatalog(q)) {
+    rows.push({ cat: it.kind === "setting" ? "settings" : "actions", item: it });
+  }
+  for (const p of pluginRegistry.search(q).slice(0, 6)) rows.push({ cat: "commands", plugin: p });
+  if (q) rows.push({ cat: "web", query: q });
+  detailAllRows = rows;
+  if (detailSel >= rows.length) detailSel = 0;
+  renderDetail();
+}
+
+// ── 渲染 ─────────────────────────────────────────────────────────
+
+function renderDetailFilters() {
+  detailTabs.replaceChildren(
+    ...DETAIL_CATS.map(c => {
+      const chip = doc("div");
+      chip.className = `detail-chip${c === detailCat ? " active" : ""}`;
+      chip.textContent = t(`detail.tab_${c}`);
+      chip.addEventListener("click", () => setDetailCat(c));
+      return chip;
+    })
+  );
+  detailKinds.replaceChildren(
+    ...DETAIL_KINDS.map(k => {
+      const chip = doc("div");
+      chip.className = `detail-chip${k === detailKind ? " active" : ""}`;
+      chip.textContent = detailKindLabel(k);
+      chip.addEventListener("click", () => {
+        if (detailKind === k) return;
+        detailKind = k;
+        renderDetailFilters();
+        void runDetailSearch();
+      });
+      return chip;
+    })
+  );
+}
+
+/** 切分类只筛已有结果，不重新查询（数据在 detailAllRows 里，切 Tab 要瞬时）。 */
+function setDetailCat(cat: DetailCat) {
+  detailCat = cat;
+  detailSel = 0;
+  renderDetailFilters();
+  renderDetail();
+}
+
+function renderDetail() {
+  detailIconToken++;
+  const token = detailIconToken;
+  detailRows = detailCat === "all" ? detailAllRows.slice() : detailAllRows.filter(r => r.cat === detailCat);
+  if (detailSel >= detailRows.length) detailSel = Math.max(0, detailRows.length - 1);
+
+  const frag = document.createDocumentFragment();
+  if (!detailRows.length) {
+    const empty = doc("div");
+    empty.className = "detail-group-title";
+    empty.textContent = t("detail.no_results", { q: detailInput.value.trim() });
+    frag.appendChild(empty);
+  }
+  let lastCat: DetailRowCat | null = null;
+  detailRows.forEach((row, i) => {
+    if (row.cat !== lastCat) {
+      lastCat = row.cat;
+      const group = DETAIL_GROUPS.find(g => g.cat === row.cat);
+      const title = doc("div");
+      title.className = "detail-group-title";
+      title.textContent = group ? t(group.key) : "";
+      frag.appendChild(title);
+    }
+    frag.appendChild(buildDetailItem(row, i, token));
+  });
+  detailResults.replaceChildren(frag);
+  detailCount.textContent = detailRows.length ? String(detailRows.length) : "";
+  renderDetailStatus();
+  scrollDetailSelectionIntoView();
+}
+
+/** 父目录（结果条目的副行文案；根目录时原样回显盘符）。 */
+function parentDir(path: string): string {
+  const cut = path.replace(/[\\/][^\\/]*$/, "");
+  return cut && cut !== path ? cut : path;
+}
+
+function buildDetailItem(row: DetailRow, idx: number, token: number): HTMLElement {
+  const item = doc("div");
+  const armed = !!row.item?.danger && detailArmed === row.item.id;
+  item.className = `result-item${idx === detailSel ? " selected" : ""}${armed ? " danger-armed" : ""}`;
+  item.dataset.idx = String(idx);
+
+  let iconHtml = "";   // SVG 图标（插件）直接内联；文本占位走 esc()
+  let iconText = "";
+  let title = "";
+  let desc = "";
+  let badge = "";
+
+  switch (row.cat) {
+    case "apps": {
+      const app = row.app!;
+      const ext = (app.path.match(/\.([a-zA-Z0-9]+)$/)?.[1] || "").toLowerCase();
+      const isFolder = !ext || ext === "lnk";
+      iconText = isFolder ? "📁" : ext.length <= 3 ? ext : ext.slice(0, 3);
+      title = app.name;
+      desc = t("chat.launch_app");
+      badge = isFolder ? (ext === "lnk" ? t("chat.badge_shortcut") : t("chat.badge_folder")) : ext;
+      break;
+    }
+    case "files": {
+      const f = row.file!;
+      const isFolder = f.kind === "folder";
+      iconText = isFolder ? "📁" : f.ext.length <= 4 ? f.ext : f.ext.slice(0, 4);
+      title = f.name;
+      desc = parentDir(f.path);
+      badge = isFolder ? t("chat.badge_folder") : f.ext;
+      break;
+    }
+    case "settings": {
+      const it = row.item!;
+      iconText = it.icon;
+      title = detailCatalogTitle(it);
+      desc = it.target;
+      badge = t("detail.badge_setting");
+      break;
+    }
+    case "actions": {
+      const it = row.item!;
+      iconText = it.icon;
+      title = armed ? t("detail.confirm_danger", { title: detailCatalogTitle(it) }) : detailCatalogTitle(it);
+      desc = it.keywords.slice(0, 3).join(" · ");
+      badge = t("detail.badge_action");
+      break;
+    }
+    case "commands": {
+      const p = row.plugin!;
+      iconHtml = pluginIconSvg(p.id);
+      title = p.name;
+      desc = p.description;
+      badge = p.badge || t("detail.badge_command");
+      break;
+    }
+    case "web": {
+      iconHtml = pluginIconSvg("web-search");
+      title = t("plugin.web-search");
+      desc = `"${(row.query || "").slice(0, 40)}"`;
+      badge = t("chat.badge_web");
+      break;
+    }
+  }
+
+  item.innerHTML = `
+    <div class="result-item-icon">${iconHtml || esc(iconText)}</div>
+    <div class="result-item-content">
+      <div class="result-item-title${armed ? " detail-danger" : ""}">${esc(title)}</div>
+      ${desc ? `<div class="result-item-desc">${esc(desc)}</div>` : ""}
+    </div>
+    <span class="result-item-badge">${esc(badge)}</span>
+  `;
+  item.addEventListener("click", () => {
+    detailSel = idx;
+    void activateDetailRow(row);
+  });
+  item.addEventListener("mousemove", () => {
+    if (detailSel !== idx) {
+      detailSel = idx;
+      markDetailSelection();
+    }
+  });
+  // 应用 / 文件用系统图标替换占位文本（异步；重渲染后靠 token 作废旧回包）
+  if (row.cat === "apps") applyDetailPathIcon(item, row.app!.path, token);
+  else if (row.cat === "files") applyDetailPathIcon(item, row.file!.path, token);
+  return item;
+}
+
+function applyDetailPathIcon(item: HTMLElement, path: string, token: number) {
+  invoke<string | null>("get_app_icon", { path })
+    .then(dataUrl => {
+      if (!dataUrl || token !== detailIconToken) return;
+      const iconEl = item.querySelector(".result-item-icon") as HTMLElement | null;
+      if (iconEl) iconEl.innerHTML = `<img src="${dataUrl}" class="result-item-icon-img" alt="">`;
+    })
+    .catch(() => {});
+}
+
+function markDetailSelection() {
+  detailResults.querySelectorAll<HTMLElement>(".result-item").forEach(it => {
+    it.classList.toggle("selected", Number(it.dataset.idx) === detailSel);
+  });
+  scrollDetailSelectionIntoView();
+}
+
+function scrollDetailSelectionIntoView() {
+  detailResults
+    .querySelector<HTMLElement>(`.result-item[data-idx="${detailSel}"]`)
+    ?.scrollIntoView({ block: "nearest" });
+}
+
+// ── 执行 ─────────────────────────────────────────────────────────
+
+async function activateDetailRow(row: DetailRow) {
+  switch (row.cat) {
+    case "apps":
+    case "files":
+      // launchApp 自带「隐藏窗口 + 记录使用频次」；先还原视图，下次唤出回到简洁搜索
+      exitDetailSilently();
+      launchApp(row.app ? row.app.path : row.file!.path);
+      return;
+    case "settings":
+      exitDetailSilently();
+      invoke("open_setting", { target: row.item!.target }).catch(e => console.warn("[lunac] open_setting:", e));
+      return;
+    case "actions": {
+      const it = row.item!;
+      // 危险动作（关机 / 重启）二次确认：3 秒内再按一次才真执行
+      if (it.danger && detailArmed !== it.id) {
+        clearDetailArmed();
+        detailArmed = it.id;
+        detailArmedTimer = setTimeout(() => {
+          detailArmed = "";
+          detailArmedTimer = null;
+          if (detailOpen) renderDetail();
+        }, 3000);
+        renderDetail();
+        return;
+      }
+      clearDetailArmed();
+      exitDetailSilently();
+      invoke("run_system_action", { id: it.id }).catch(e => console.warn("[lunac] run_system_action:", e));
+      return;
+    }
+    case "commands": {
+      const plugin = row.plugin!;
+      if (_execGuard) return;
+      exitDetailSilently();
+      await executePlugin(plugin);
+      return;
+    }
+    case "web": {
+      const wsPlugin = pluginRegistry.getAll().find(p => p.id === "web-search");
+      exitDetailSilently();
+      if (wsPlugin) void wsPlugin.execute(row.query || "");
+      return;
+    }
+  }
+}
+
+function clearDetailArmed() {
+  detailArmed = "";
+  if (detailArmedTimer) {
+    clearTimeout(detailArmedTimer);
+    detailArmedTimer = null;
+  }
+}
+
+// ── 索引状态 ─────────────────────────────────────────────────────
+
+function renderDetailStatus() {
+  if (detailStatus.scanning || !detailStatus.count) {
+    detailIndexEl.textContent = t("detail.indexing");
+    return;
+  }
+  detailIndexEl.textContent = detailStatus.truncated
+    ? t("detail.index_truncated", { n: String(detailStatus.count) })
+    : t("detail.indexed", { n: String(detailStatus.count) });
+}
+
+async function refreshDetailStatus() {
+  let next: DetailIndexStatus;
+  try {
+    next = await invoke<DetailIndexStatus>("file_index_status");
+  } catch {
+    return;
+  }
+  if (!detailOpen) return;
+  const wasScanning = detailStatus.scanning || !detailStatus.count;
+  detailStatus = next;
+  renderDetailStatus();
+  // 索引刚从「扫描中/空」变成就绪 → 补一次查询（首进大界面时索引常常还没载入）。
+  // 注意不要用 `!detailSeq` 之类当守卫：enterDetail() 里那次 runDetailSearch()
+  // 已经把序号推进到 1，加了这个条件这条分支就变成永不触发的死代码 ——
+  // 表现为「首次进大界面时文件结果区一直是空的」。过渡只发生一次，
+  // 且 rerun 后 detailStatus 已更新为 scanning=false，不会自激。
+  if (wasScanning && !next.scanning && next.count > 0) void runDetailSearch();
+}
+
+function startDetailStatusPolling() {
+  if (detailStatusTimer) return;
+  detailStatusTimer = setInterval(() => void refreshDetailStatus(), 2000);
+}
+
+function stopDetailStatusPolling() {
+  if (detailStatusTimer) {
+    clearInterval(detailStatusTimer);
+    detailStatusTimer = null;
+  }
+}
+
+// ── 事件绑定 ─────────────────────────────────────────────────────
+
+// 双击搜索栏 → 详细搜索大界面。插件锁定态的双击另走 setDetached（见上方既有监听），
+// 这里在 pluginActive / detached / 已经在详情态时直接返回，两条路径互不干扰。
+searchBar.addEventListener("dblclick", (e) => {
+  const target = e.target as HTMLElement;
+  if (target.closest("button")) return;         // 设置按钮等
+  if (pluginActive || detached || detailOpen) return;
+  e.preventDefault();
+  enterDetail();
+});
+
+detailInput.addEventListener("input", () => void runDetailSearch());
+
+// 输入框也能拖窗（与简洁搜索框同一套手感）—— 顶栏大部分面积被输入框占据，
+// 不给它拖动通道的话，大界面就只剩 12px 内边距能拖了（这正是「拖不动」的成因）。
+makeInputDragHandle(detailInput);
+
+// 详细搜索输入框与简洁搜索栏共用同一套右键菜单（全选/复制/剪切/粘贴）
+attachSearchContextMenu(detailInput);
+
+detailInput.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    if (!detailRows.length) return;
+    const delta = e.key === "ArrowDown" ? 1 : detailRows.length - 1;
+    detailSel = (detailSel + delta) % detailRows.length;
+    markDetailSelection();
+    return;
+  }
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const i = DETAIL_CATS.indexOf(detailCat);
+    const delta = e.shiftKey ? DETAIL_CATS.length - 1 : 1;
+    setDetailCat(DETAIL_CATS[(i + delta) % DETAIL_CATS.length]);
+    return;
+  }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const row = detailRows[detailSel];
+    if (row) {
+      void activateDetailRow(row);
+    } else if (detailInput.value.trim()) {
+      // 当前分类下没有结果 → 回车直接走网页搜索（与 Win+S 的兜底一致）
+      void activateDetailRow({ cat: "web", query: detailInput.value.trim() });
+    }
+  }
+});
+
+detailBackBtn.addEventListener("click", () => exitDetail());
+
+detailRefreshBtn.addEventListener("click", () => {
+  invoke("refresh_file_index").catch(() => {});
+  detailStatus = { ...detailStatus, scanning: true };
+  renderDetailStatus();
+  startDetailStatusPolling();
+});
+

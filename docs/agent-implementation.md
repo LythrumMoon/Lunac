@@ -28,7 +28,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | 通信 | stdin/stdout 上的 **stream-json**（NDJSON），契约见 [ai-spec.md](./ai-spec.md) §3.5；agent 的 stdout **只走协议**，日志一律落盘 |
 | 数据根 | **便携模式**：一律 `<exe 根>`（`current_exe()` 所在目录），实现 dev/release 物理隔离与卸载彻底化 |
 | 关键路径 | `skills\`（技能）、`tools\`（用户工具定义）、`ModuleData\`（用量日志等）、`temp\logs\`（落盘日志） |
-| 环境注入 | 端点 / token / 模型 / 思考档位 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent |
+| 环境注入 | 端点 / token / 模型 / 思考开关 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent |
 | 源码 | [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)（主循环）、[tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)、[skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)、[mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)、[log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs) |
 
 ---
@@ -38,10 +38,14 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | 阶段 | 能力 | 关键实现 |
 |---|---|---|
 | **P0** | 多轮上下文、SSE 增量打字、用量上报（input / output / cacheRead / cacheCreate）、错误回传（失败轮整体回滚历史） | `run_query` 主循环；用量口径见 ai-spec §3.5「用量与对账」 |
-| **P0** | 思考档位跨模型自适应 | `MAX_THINKING_TOKENS` → `Thinking` 形态；400 沿降级链 `enabled+budget → adaptive → 不带字段` 重试一次并缓存结果 |
+| **P0** | 思考开关跨模型自适应 | `LUNAC_THINKING`（`off` / 其余=开）→ `Thinking` 形态；400 沿降级链 `enabled+budget → adaptive → 不带字段` 重试一次并缓存结果。**只有开 / 关两档** —— 端点无思考力度旋钮（预算不被 enforce、`effort` 被静默忽略），见 ai-spec §3.5 |
 | **P1** | 内置工具 + `tool_use` / `tool_result` 往返循环 | 11 件内置工具，见 §4.1 |
+| **可用性** | 瞬时失败重试：网络抖动 / 429 / 5xx（含 529）退避重试，**请求级**（不产生重复内容），并补发 `system/api_retry` | `retryable_status` / `retry_delay_ms` / `emit_api_retry`；见 ai-spec §3.5「瞬时失败重试」与 §11 规则 25 |
+| **安全** | 命令静态安全分析（Bash / PowerShell）：子命令拆分 + 引号/转义归一 + 包装器递归 + Windows 危险规则集 + **fail-closed** 不透明判定，结果随 `can_use_tool` 的 `analysis` 上报 | `bash_safety::analyze`（自研，单测 8 例）；见 ai-spec §3.5「命令静态安全分析」与 §11 规则 26 |
 | **P2** | 权限审批：写类工具发 `can_use_tool` → 阻塞等前端回包（超时按拒绝） | 与工作区锁是**与**关系（ai-spec §11 规则 14） |
 | **P2** | 上下文预算 + 两级压缩 + 400 兜底 | 水位 0.85 / 0.95 + 滞回；只瘦身 / 丢弃 / 强制三档，见 ai-spec §3.5 与 §11 规则 23 |
+| **上下文** | 单条工具输出预算：超 12000 字符落盘全文、只内联「头 8000 + 尾 2000 + 路径」，模型用 Read / Grep 取回全文 | `tools::apply_budget`（唯一出口，`run_tool` 调用）；落盘 `temp\tool-outputs`（7 天清理）并并入 `Ctx.add_dirs`；见 ai-spec §3.5「单条工具输出预算」与 §11 规则 27 |
+| **执行** | 只读工具并行：一轮里**连续的**只读调用合成一批并发（上限 4），写类/命令/MCP 串行 | `tools::parallel_safe` + `plan_tool_batches`；结果按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序；见 ai-spec §3.5「只读工具并行」与 §11 规则 28 |
 | **P3** | MCP 工具桥 | 把 `<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 接进请求体 |
 | **P4** | 技能（渐进披露） | `LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`；提示词只列 `key: 描述`，模型调 `Skill` 取正文 |
 | **UI** | AI 对话面板（思考省略 / 命令卡片 / 回合折叠 / 运行方式三档 / 用量面板） | 规范见 [agent-ui-spec.md](./agent-ui-spec.md) |
@@ -139,8 +143,6 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 | 优先级 | 子系统 | 现状与差距 |
 |---|---|---|
-| **高** | 模型输出重试 | 只有「thinking 参数 400 降级」；网络抖动 / 5xx / 429 一律直接失败。前端已有 `system/api_retry` 解析分支，agent 侧未发该事件 |
-| **高** | Bash 静态安全分析 | 危险命令判定**全在前端正则黑名单**，可被引号 / 变量 / 管道绕过；旧 CLI 在 agent 侧做 AST 级判定（`bashParser` / `bashSecurity` / `sedValidation` / `readOnlyValidation`） |
 | **中高** | 写文件前安全扫描 | 旧 CLI 写入前扫凭据与危险模式（`core/security/scanContent()`），现在没有 |
 | **中高** | 多代理 / 子代理框架 | 见 §4.2 组 A、B —— 这是「完整 agent 类应用」的核心缺口 |
 | **中高** | MCP 全栈 | 已通：stdio + tools。缺：远程传输（sse / http / ws）、resources / prompts / roots / elicitation / OAuth、`.mcp.json` |
@@ -157,7 +159,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 | 项 | 现状 | 影响 |
 |---|---|---|
-| `system/api_retry` | 未发（前端有解析分支） | 无重试可上报；与「模型输出重试」绑定 |
+| `system/api_retry` | **已发**（2026-09，瞬时失败退避重试时补发 `attempt` / `max_retries` / `error_status` / `delay_ms`） | 无 |
 | `system/task_started` / `task_progress` | 未发（前端有解析与文案） | 子代理进度文案永不出现；与子代理框架绑定 |
 | 命令行开关 | 只解析 6 个（`--add-dir` / `--permission-mode` / `--permission-prompt-tool` / `--dangerously-skip-permissions` / `--disallowedTools` / `--mcp-server`） | 其余 ~116 个被忽略；多数绑定 CLI 形态，按需再评估 |
 | 斜杠命令 | 0 / 75+ | 多数是 CLI 会话内操作（`/theme` `/vim` `/statusline` …），桌面端另有 UI —— **按需逐项评估**，不整体照搬 |
@@ -166,10 +168,11 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 ## 7. 实施顺序（当前判断）
 
-1. **模型输出重试** —— 唯一「网络一抖就整轮失败」的可用性缺口，且前端解析分支已就绪。
-2. **Bash 静态安全分析** —— 现有正则黑名单是安全边界上的已知短板。
-3. **子代理框架（`Agent`）** —— 解锁 `TaskOutput` / `TaskStop` / 多代理协作一整组能力，是「完整 agent 类应用」的关键一步。
-4. MCP `resources` 两件（需先扩 `mcp_server.rs`）、写文件前安全扫描、权限 hooks、多模态输入。
-5. 其余按 §4.2 / §6 逐项评估。
+> ✅ 已完成：**模型输出重试**（2026-09，见 §3「可用性」行）、**Bash 静态安全分析**（2026-09，见 §3「安全」行，实现在 `core-agent/src/bash_safety.rs`）。以下为**剩余**实施顺序：
+
+1. **子代理框架（`Agent`）** —— 解锁 `TaskOutput` / `TaskStop` / 多代理协作一整组能力，是「完整 agent 类应用」的关键一步。
+2. MCP `resources` 两件（需先扩 `mcp_server.rs`）。
+3. 写文件前安全扫描、权限 hooks（19 类事件）、自动权限分类器、多模态输入。
+4. 其余按 §4.2 / §6 逐项评估。
 
 > 具体排期与勾选状态以 [agent-feature-backlog.md](./agent-feature-backlog.md) 为准；本节的顺序是在 2026-09-13 的判断。

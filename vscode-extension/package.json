@@ -93,7 +93,7 @@
         "lunac.model": {
           "type": "string",
           "default": "",
-          "description": "Model name. Leave empty to use provider's default (e.g. deepseek-v4-pro, gpt-4o-mini)."
+          "description": "Model name. Leave empty to use provider's default (e.g. deepseek-flash, gpt-4o-mini)."
         },
         "lunac.apiUrl": {
           "type": "string",

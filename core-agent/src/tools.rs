@@ -18,14 +18,25 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
-/// 单次工具结果回传给模型的字符上限（超出截断，避免撑爆上下文）
-const MAX_RESULT_CHARS: usize = 30_000;
+/// 单条工具输出的**内联预算**（字符）：超过就把全文落盘、只内联「头 + 尾 + 路径」。
+/// 旧实现是硬截断，超出部分对模型永久消失 —— 见 `apply_budget`。
+const SPILL_THRESHOLD: usize = 12_000;
+/// 预览保留的头部字符数
+const INLINE_HEAD_CHARS: usize = 8_000;
+/// 预览保留的尾部字符数（构建/报错的结论通常压在末尾，尾部比中部值钱）
+const INLINE_TAIL_CHARS: usize = 2_000;
+/// 落盘输出的保留天数（与落盘日志同口径）
+const KEEP_DAYS: u64 = 7;
+/// 落盘正文的字节上限 —— **必须低于 Read / Grep 的 `MAX_TEXT_BYTES`(2MB) 文件门槛**，
+/// 否则模型拿不回自己落盘的文件（那两个工具遇到超大文件是直接拒绝/跳过）。
+const MAX_SPILL_BYTES: usize = 1_500_000;
 /// Read 一次最多返回的行数
 const MAX_READ_LINES: usize = 2000;
 /// Glob / Grep 的结果条数上限
@@ -81,7 +92,7 @@ const SKIP_DIRS: [&str; 13] = [
 pub struct Ctx {
     /// 进程工作目录 —— src-tauri 用它传「AI 工作区」
     pub cwd: PathBuf,
-    /// `--add-dir` 追加的可访问目录
+    /// 可访问目录：`--add-dir` 追加的 + 工具输出落盘目录（见 `prepare_output_dir`）
     pub add_dirs: Vec<PathBuf>,
     /// `--permission-mode plan` → 只读
     pub read_only: bool,
@@ -345,6 +356,27 @@ pub fn gated_in_read_only(name: &str) -> bool {
     matches!(name, "WebSearch" | "WebFetch" | "AskUserQuestion")
 }
 
+/// 该工具是否**只读且互不干扰** —— 可以与其他只读工具**并行**执行（见 main.rs
+/// 的 `plan_tool_batches`）。
+///
+/// 判据是「不碰本机可写状态、不依赖与别的调用的先后」：
+///   · `Read` / `Glob` / `Grep` —— 纯读本地
+///   · `WebSearch` / `WebFetch` —— 纯网络读取（慢的就是它们；无副作用）
+///   · `Skill` —— 只读 `SKILL.md` 正文
+///   · `TodoWrite` —— 只回一段待办清单文本，不碰本机
+///
+/// 以下**一律串行**，别往这里加：
+///   · `Write` / `Edit` / `Bash` / `PowerShell` —— 有副作用，且「写文件 → 读该文件」
+///     的相对顺序必须保持（并行批绝不允许跨越它们，见 `plan_tool_batches`）
+///   · MCP 工具 —— 副作用未知，且共用一条 stdio JSON-RPC 通道
+///   · `AskUserQuestion` —— 要等人回答，并发弹问没有意义
+pub fn parallel_safe(name: &str) -> bool {
+    matches!(
+        name,
+        "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "Skill" | "TodoWrite"
+    )
+}
+
 // ── 分发 ─────────────────────────────────────────────────────────
 
 /// 执行一个工具调用。Err 会成为 is_error=true 的 tool_result
@@ -475,7 +507,7 @@ fn read(ctx: &Ctx, input: &Value) -> Result<String, String> {
     if out.is_empty() {
         out = format!("(empty file: {} lines total)", lines.len());
     }
-    Ok(truncate(out))
+    Ok(out)
 }
 
 // ── Write ────────────────────────────────────────────────────────
@@ -685,7 +717,7 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
         crate::log::warn(format!("shell[{prog}] stderr:\n{stderr}"));
     }
 
-    Ok(truncate(out))
+    Ok(out)
 }
 
 /// 把管道读干（超上限后继续读但丢弃，防止子进程阻塞）
@@ -748,7 +780,7 @@ fn glob(ctx: &Ctx, input: &Value) -> Result<String, String> {
         return Ok(format!("No files matched {pattern}"));
     }
     hits.sort();
-    Ok(truncate(hits.join("\n")))
+    Ok(hits.join("\n"))
 }
 
 // ── Grep ─────────────────────────────────────────────────────────
@@ -812,7 +844,7 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
     if hits.is_empty() {
         return Ok(format!("No matches for {pattern}"));
     }
-    Ok(truncate(hits.join("\n")))
+    Ok(hits.join("\n"))
 }
 
 // ── WebSearch ────────────────────────────────────────────────────
@@ -1355,7 +1387,7 @@ fn format_hits(query: &str, source: &str, hits: &[SearchHit]) -> String {
         }
         out.push('\n');
     }
-    truncate(out)
+    out
 }
 
 // ── WebFetch ─────────────────────────────────────────────────────
@@ -1418,7 +1450,7 @@ fn webfetch(input: &Value) -> Result<String, String> {
             "\n\n… (body truncated at {FETCH_MAX_BYTES} bytes)"
         ));
     }
-    Ok(truncate(out))
+    Ok(out)
 }
 
 /// URL 规范化：去空白、`http` 升级为 `https`（与旧 CLI 一致，避免明文抓取）、
@@ -1667,7 +1699,7 @@ fn todo_write(input: &Value) -> Result<String, String> {
         };
         out.push_str(&format!("\n{}. [{}] {}", i + 1, status, content));
     }
-    Ok(truncate(out))
+    Ok(out)
 }
 
 /// 递归收集文本文件（跳过 SKIP_DIRS，深度与数量封顶）
@@ -1717,11 +1749,251 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|&b| b == 0)
 }
 
-/// 单条工具结果上限（MCP 桥的结果也走这里，见 main.rs `run_tool`）
-pub fn truncate(mut s: String) -> String {
-    if s.chars().count() > MAX_RESULT_CHARS {
-        let cut: String = s.chars().take(MAX_RESULT_CHARS).collect();
-        s = format!("{cut}\n… (truncated at {MAX_RESULT_CHARS} chars)");
+/// 单条工具结果的**预算出口**（唯一出口，由 main.rs `run_tool` 调用 —— 只有那里
+/// 同时知道工具名与完整输出）。
+///
+/// 超过 `SPILL_THRESHOLD` 字符时把**全文**落到 `output_dir()`，上下文里只内联
+/// 「头 + 尾 + 行数 + 路径」；模型要全文就自己 `Read`（带 `offset`/`limit`）或
+/// `Grep` 那个文件。旧实现是硬截断：超出部分对模型**永久消失**（只有
+/// `LUNAC_LOG_LEVEL=debug` 能在日志里翻到），长构建日志/整页抓取经常因此表现成
+/// 「像是什么都没输出」。
+///
+/// 落盘失败（磁盘满 / 无权限）时仍按内联预算收口，只把末尾说明换成「已丢弃」——
+/// 宁可让模型知道内容不全，也不能把十几万字符塞进上下文。
+pub fn apply_budget(name: &str, body: String) -> String {
+    let total = body.chars().count();
+    if total <= SPILL_THRESHOLD {
+        return body;
     }
-    s
+    let lines = body.lines().count().max(1);
+    let (write_body, cut) = capped_body(&body);
+    let note = match spill(name, write_body) {
+        Some(path) => {
+            // 落盘是「模型看不到全文」这件事的关键线索，必须留痕（只记路径与体积，不记内容）
+            crate::log::info(format!(
+                "tool {name} 输出超预算（{total} 字符 / {lines} 行，{}）→ {}",
+                if cut { "按 1.5MB 上限截断" } else { "全文已落盘" },
+                path.display()
+            ));
+            let path = path.display();
+            if cut {
+                format!(
+                    "[output saved to {path} — only the first {} chars (file cap); use Read or Grep on it]",
+                    write_body.chars().count()
+                )
+            } else {
+                format!("[full output saved to {path} — use Read (with offset/limit) or Grep on it]")
+            }
+        }
+        None => "[全文落盘失败，超出部分已丢弃]".to_string(),
+    };
+    preview(&body, total, lines, &note)
+}
+
+/// 落盘正文按字节封顶（切在字符边界上）。返回 (正文, 是否被砍)。
+fn capped_body(body: &str) -> (&str, bool) {
+    if body.len() <= MAX_SPILL_BYTES {
+        return (body, false);
+    }
+    let mut end = MAX_SPILL_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&body[..end], true)
+}
+
+/// 预览文本（纯函数，便于单测）：头 `INLINE_HEAD_CHARS` + 省略提示 + 尾 `INLINE_TAIL_CHARS` + 说明。
+fn preview(body: &str, total: usize, lines: usize, note: &str) -> String {
+    let head: String = body.chars().take(INLINE_HEAD_CHARS).collect();
+    let tail: String = body
+        .chars()
+        .skip(total.saturating_sub(INLINE_TAIL_CHARS))
+        .collect();
+    let omitted = total.saturating_sub(INLINE_HEAD_CHARS + INLINE_TAIL_CHARS);
+    format!("{head}\n\n… [{omitted} chars omitted — {total} chars / {lines} lines in total]\n\n{tail}\n\n{note}")
+}
+
+/// 落盘目录：`<exe 根>\temp\tool-outputs`。
+///
+/// 不新增环境变量 —— `log::log_dir()` 已经实现了「宿主注入 `LUNAC_LOG_DIR`，
+/// 否则回退 `<agent.exe 目录>\temp\logs`」，取它的父目录即可同时覆盖两种情况。
+pub fn output_dir() -> PathBuf {
+    crate::log::log_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tool-outputs")
+}
+
+/// 启动时调用：建目录、清 7 天前的落盘输出，返回目录路径 —— main.rs 要把它
+/// 塞进 `Ctx.add_dirs`，否则工作区锁（默认 project 档）会让模型读不到自己的全量输出。
+pub fn prepare_output_dir() -> PathBuf {
+    let dir = output_dir();
+    match fs::create_dir_all(&dir) {
+        Ok(()) => purge_old(&dir),
+        Err(e) => crate::log::warn(format!(
+            "tool-outputs: 建目录失败 {}: {e}",
+            dir.display()
+        )),
+    }
+    dir
+}
+
+/// 清理超过 `KEEP_DAYS` 的落盘输出（与落盘日志同口径，按修改时间）。失败一律忽略。
+fn purge_old(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(KEEP_DAYS * 86_400))
+    else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// 落盘文件的进程内序号：只读工具并行后会**同一毫秒落多个文件**，毫秒精度不够用。
+static SPILL_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// 全文写盘，返回路径；文件名 `{毫秒}-{序号}-{工具名}.txt`。
+fn spill(name: &str, body: &str) -> Option<PathBuf> {
+    let dir = output_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        crate::log::warn(format!("tool-outputs: 建目录失败 {}: {e}", dir.display()));
+        return None;
+    }
+    let millis = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{millis}-{seq}-{}.txt", safe_name(name)));
+    match fs::write(&path, body) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            crate::log::warn(format!("tool-outputs: 写 {} 失败: {e}", path.display()));
+            None
+        }
+    }
+}
+
+/// 工具名 → 文件名安全片段（MCP 工具名形如 `mcp__x`，仍统一过滤）
+fn safe_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 没超预算的结果必须**逐字节原样**回给模型（不许多出任何说明文字、不许碰磁盘）
+    #[test]
+    fn under_budget_is_untouched() {
+        let s = "ok".repeat(1_000); // 2000 字符 < 12k
+        assert_eq!(apply_budget("Bash", s.clone()), s);
+    }
+
+    /// 超预算：头尾都留、省略量算得对、多字节字符不许切在半路（切错会 panic）
+    #[test]
+    fn preview_keeps_head_and_tail_on_char_boundaries() {
+        let body: String = "中文😀".chars().cycle().take(20_000).collect();
+        let total = body.chars().count();
+        let out = preview(&body, total, 42, "[note]");
+
+        let head: String = body.chars().take(INLINE_HEAD_CHARS).collect();
+        let tail: String = body.chars().skip(total - INLINE_TAIL_CHARS).collect();
+        let omitted = total - INLINE_HEAD_CHARS - INLINE_TAIL_CHARS;
+
+        assert!(out.starts_with(&head), "必须保留头部");
+        assert!(out.ends_with("[note]"), "说明必须在最末");
+        assert!(out.contains(&tail), "必须保留尾部");
+        assert!(out.contains(&format!(
+            "{omitted} chars omitted — {total} chars / 42 lines in total"
+        )));
+        // 内联体积必须真受控：头 + 尾 + 说明（说明约 150 字符）
+        assert!(out.chars().count() < SPILL_THRESHOLD, "内联不该超过预算");
+    }
+
+    /// 工具名可能带 MCP 前缀/奇怪字符，文件名片段只允许字母数字与 - _
+    #[test]
+    fn spill_file_name_is_sanitized() {
+        assert_eq!(safe_name("mcp__my-tool"), "mcp__my-tool");
+        assert_eq!(safe_name("Bash"), "Bash");
+        assert_eq!(safe_name("a/b:c*d"), "a_b_c_d");
+    }
+
+    /// 并行白名单：只读的可以并行；写类 / 命令 / MCP / 交互一律串行
+    #[test]
+    fn only_read_only_tools_may_run_in_parallel() {
+        for n in ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"] {
+            assert!(parallel_safe(n), "{n} 应可并行");
+        }
+        for n in [
+            "Write",
+            "Edit",
+            "Bash",
+            "PowerShell",
+            "AskUserQuestion",
+            "mcp__fetch", // MCP 工具名带前缀，副作用未知且共用一条通道
+            "Unknown",
+        ] {
+            assert!(!parallel_safe(n), "{n} 不该并行");
+        }
+    }
+
+    /// 落盘正文必须留在 Read / Grep 能打开的体积内，且切在字符边界上
+    #[test]
+    fn spill_body_is_byte_capped_on_a_char_boundary() {
+        let small = "x".repeat(1_000);
+        assert_eq!(capped_body(&small), (small.as_str(), false));
+
+        // 多字节字符铺满：砍点必然落在字符中间，必须回退到边界（否则 panic）
+        let big: String = "中".repeat(MAX_SPILL_BYTES); // 3 字节/字 → 远超上限
+        let (cut, was_cut) = capped_body(&big);
+        assert!(was_cut);
+        assert!(cut.len() <= MAX_SPILL_BYTES);
+        assert!(cut.len() > MAX_SPILL_BYTES - 4, "只该回退几个字节，不该砍多");
+        assert!(big.starts_with(cut));
+    }
+
+    /// 真落盘一次（唯一的碰盘测试）：文件写在 output_dir() 下、内容与全文逐字一致、
+    /// 预览里给出的路径就是它 —— 也就是模型拿来 Read/Grep 的那条路径。
+    #[test]
+    fn spill_writes_the_full_body_into_the_output_dir() {
+        let body: String = "行\n".repeat(SPILL_THRESHOLD); // 远超内联预算
+        let out = apply_budget("Bash", body.clone());
+        let dir = output_dir();
+
+        let path = fs::read_dir(&dir)
+            .expect("落盘目录应已在写入前创建")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension().and_then(|e| e.to_str()) == Some("txt")
+                    && fs::read_to_string(p).map(|t| t == body).unwrap_or(false)
+            })
+            .expect("找不到刚落的文件，或文件内容与全文不一致");
+
+        assert!(out.contains(&path.display().to_string()), "预览必须附落盘路径");
+        assert!(out.ends_with("]"), "说明必须在最末");
+        let _ = fs::remove_file(&path);
+    }
 }

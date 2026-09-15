@@ -32,7 +32,7 @@
 //
 // 已实现范围
 //   ✅ P0 多轮上下文、SSE 增量打字、用量上报、错误回传
-//   ✅ P0 思考档位跨模型自适应（MAX_THINKING_TOKENS → thinking 形态 + 400 降级）
+//   ✅ P0 思考开关（开/关 → thinking 形态 + 400 降级）
 //   ✅ P1 内置工具 + tool_use/tool_result 往返循环（工具实现见 tools.rs）
 //   ✅ P2 权限审批：写类工具发 can_use_tool → 阻塞等 control_response（超时按拒绝）
 //   ✅ 上下文预算 + 压缩：按端点实测体积走瘦身/丢弃两级水位，400 超限再强制压缩重试
@@ -51,10 +51,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+mod bash_safety;
 mod log;
 mod mcp;
 mod skills;
@@ -67,8 +68,27 @@ const REQUEST_TIMEOUT_SECS: u64 = 1800;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// 一轮用户提问内最多允许的「模型→工具→模型」往返次数
 const MAX_TOOL_ROUNDS: usize = 16;
+/// 同一批只读工具的最大并发数。本地读取是毫秒级，4 够用；再加高只会先撞上
+/// 端点/搜索源的限流与磁盘争用（见 `plan_tool_batches`）。
+const TOOL_PARALLELISM: usize = 4;
 /// 审批等待上限：超时按拒绝处理，并通知前端撤掉卡片（避免 UI 丢了以后永久挂住）
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+// ── 瞬时失败重试（2026-09）───────────────────────────────────────
+//
+// 这**不是**「重新生成回答」，而是**请求级**重试：只在**还没读到响应体之前**
+// 退避重试，所以永远不会产生重复内容。覆盖范围刻意收窄到「重试有意义」的两类：
+//   · 网络层：连接失败 / 连接重置 / 超时（reqwest 的 builder 错误除外）
+//   · 429 限流、5xx 服务端故障（含 529「过载」）
+// 下面这些**不**走这里，各有专门分支：
+//   · 400 + thinking 相关 → 沿思考降级链换形态再试（已存在）
+//   · 400 + 上下文超限   → 强制压缩后再试（已存在）
+//   · 其余 4xx           → 重试也不会变（鉴权 / 参数错），直接报错
+const MAX_API_RETRIES: usize = 3;
+/// 首次退避 1s，之后 2s / 4s（指数增长）
+const RETRY_BASE_MS: u64 = 1_000;
+/// 退避上限（也用来夹住端点给的 `Retry-After`，免得界面长时间无响应）
+const RETRY_MAX_MS: u64 = 30_000;
 
 // ── 上下文预算 ───────────────────────────────────────────────────
 //
@@ -100,6 +120,16 @@ const COMPACT_MIN_GROWTH: f64 = 0.15;
 const COMPACT_KEEP_TAIL: usize = 8;
 /// tool_result 内容超过该字符数才算「值得瘦身的大块」
 const ELIDE_TOOL_RESULT_CHARS: usize = 2_000;
+/// 瘦身档的「值不值得」闸门：**可省体积至少要占当前上下文这么大比例**，否则宁可不压。
+///
+/// 为什么需要：瘦身是**就地改写较早的消息**，端点侧从被改的那条起就再也匹配不上
+/// 已落盘的缓存前缀单元（DS 的命中要求「完整匹配缓存前缀单元」）—— 省一点点却让
+/// 后面整段失效是**净亏**。旧实现只要水位过 0.85 就压，于是长会话里频繁出现
+/// 「省了 2% 体积、废掉 60% 前缀」。**只加在瘦身档**（可选档）；丢弃档与 400
+/// 兜底档是安全刚需，照旧无条件压（见 ai-spec §11 规则 23）。
+const ELIDE_MIN_SAVINGS_RATIO: f64 = 0.05;
+/// 估算字符→token 的经验系数（不引 tokenizer；同 Hermes 的估算口径）
+const CHARS_PER_TOKEN: f64 = 4.0;
 /// 单条用户输入上限（防一次粘贴把整个窗口顶爆）
 const MAX_USER_CHARS: usize = 100_000;
 /// 历史被丢弃后插在开头的提示（保证历史以 user 文本消息开头）
@@ -144,31 +174,69 @@ enum Compact {
     Force,
 }
 
-/// 压缩历史。返回「被丢弃的消息条数」，调用方据此修正失败回滚锚点。
-fn compact_history(history: &mut Vec<Value>, mode: Compact) -> usize {
+/// 压缩结果：改了前缀的条数（瘦身）与丢掉的条数。
+/// 调用方据此决定**是否推进滞回时钟** —— 「扫了一圈但决定不动」不算压缩过。
+struct CompactOutcome {
+    elided: usize,
+    dropped: usize,
+}
+
+/// 压缩历史。`measured_tokens` = 上一轮实测的上下文体积（0 = 未知），
+/// 只喂给瘦身档的「值不值得」闸门（见 ELIDE_MIN_SAVINGS_RATIO）。
+fn compact_history(
+    history: &mut Vec<Value>,
+    mode: Compact,
+    measured_tokens: u64,
+) -> CompactOutcome {
     let force = mode == Compact::Force;
     // ① 瘦身：只动尾部以外的消息，正在用的最近几轮保持原样。
     //    强制模式下连尾部也瘦（只留最近 2 条）—— 否则尾部若塞了多个超大
     //    tool_result，光靠「丢弃更老的消息」根本压不下来。
     let elide_keep = if force { 2 } else { COMPACT_KEEP_TAIL };
     let tail_start = history.len().saturating_sub(elide_keep);
-    let mut elided = 0usize;
-    for msg in history.iter_mut().take(tail_start) {
-        let Some(blocks) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+
+    // 先**只统计**能省多少，再决定动不动手（原因见 ELIDE_MIN_SAVINGS_RATIO）。
+    let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+    for (mi, msg) in history.iter().enumerate().take(tail_start) {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
         };
-        for block in blocks.iter_mut() {
+        for (bi, block) in blocks.iter().enumerate() {
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }
             if let Some(Value::String(s)) = block.get("content") {
                 let n = s.chars().count();
                 if n > ELIDE_TOOL_RESULT_CHARS {
-                    block["content"] =
-                        json!(format!("[elided: {n} chars dropped to save context]"));
-                    elided += 1;
+                    candidates.push((mi, bi, n));
                 }
             }
+        }
+    }
+    let savable: usize = candidates.iter().map(|(_, _, n)| *n).sum();
+    let needed = (measured_tokens as f64 * ELIDE_MIN_SAVINGS_RATIO * CHARS_PER_TOKEN) as usize;
+    let skip_elide = mode == Compact::Elide && savable < needed;
+
+    let mut elided = 0usize;
+    let mut elided_chars = 0usize;
+    if skip_elide {
+        eprintln!(
+            "[agent] 跳过瘦身：可省 {savable} 字 < 阈值 {needed} 字（上下文≈{measured_tokens} tokens）\
+             —— 省下的体积不够抵偿前缀失效，等长够了再压"
+        );
+    } else {
+        for (mi, bi, n) in &candidates {
+            let Some(block) = history
+                .get_mut(*mi)
+                .and_then(|m| m.get_mut("content"))
+                .and_then(Value::as_array_mut)
+                .and_then(|a| a.get_mut(*bi))
+            else {
+                continue;
+            };
+            block["content"] = json!(format!("[elided: {n} chars dropped to save context]"));
+            elided += 1;
+            elided_chars += n;
         }
     }
 
@@ -220,7 +288,9 @@ fn compact_history(history: &mut Vec<Value>, mode: Compact) -> usize {
     }
 
     if elided > 0 || dropped > 0 {
-        eprintln!("[agent] 上下文压缩：瘦身 {elided} 个 tool_result，丢弃 {dropped} 条旧消息");
+        eprintln!(
+            "[agent] 上下文压缩：瘦身 {elided} 个 tool_result（省 {elided_chars} 字），丢弃 {dropped} 条旧消息"
+        );
         emit(json!({
             "type": "system",
             "subtype": "context_compacted",
@@ -228,7 +298,7 @@ fn compact_history(history: &mut Vec<Value>, mode: Compact) -> usize {
             "dropped": dropped,
         }));
     }
-    dropped
+    CompactOutcome { elided, dropped }
 }
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
@@ -272,10 +342,16 @@ fn env_block(cwd: &std::path::Path) -> String {
 }
 
 
-// ── 思考档位：跨模型自适应 ───────────────────────────────────────
+// ── 思考开关：跨模型自适应 ───────────────────────────────────────
 //
-// lunac 的思考档位由 src-tauri 经 `MAX_THINKING_TOKENS` 传入
-// （0=fast 不思考 / 8192=think / 32768=deep）。
+// lunac 的思考只有**开 / 关**两档（2026-09-15 由 fast/think/deep 收敛而来），
+// 由 src-tauri 经 `LUNAC_THINKING` 在 spawn 时传入（`off` = 关，其余 = 开）。
+//
+// 为什么不再做「思考力度」档位：实测本端点**没有力度旋钮** ——
+//   · `budget_tokens` 给 1 / 1024 / 32768，思考量完全一样（预算不被 enforce）
+//   · `output_config.effort` / `reasoning_effort` 被当未知字段静默忽略
+//   · 不发 `thinking` 字段时端点默认就在思考
+// 三档在端点上本就退化成两态，UI 也就不该假装有三档。
 //
 // 但各供应商的兼容端点对 `thinking` 字段的接受度不一样：
 //   · DeepSeek   —— 只认 enabled / disabled，传 adaptive 会 400
@@ -286,28 +362,36 @@ fn env_block(cwd: &std::path::Path) -> String {
 // 相关的 400」就沿降级链自动重试一次，并把最终可用的形态缓存在进程内，
 // 后续轮次不再试错。
 
+/// 开档随请求附带的思考预算。端点不 enforce 它时该值无意义（实测如此）；
+/// 但真会 enforce 的端点要一个合法值，取 8192 是因为它还满足
+/// `budget_tokens < max_tokens`（见 `max_tokens_for`）。
+const THINKING_BUDGET: u32 = 8192;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Thinking {
-    /// `{"type":"disabled"}` —— fast 档
+    /// `{"type":"disabled"}` —— 关档
     Disabled,
-    /// `{"type":"enabled","budget_tokens":n}` —— think/deep 档
+    /// `{"type":"enabled","budget_tokens":THINKING_BUDGET}` —— 开档首选形态
     Budget(u32),
-    /// `{"type":"adaptive"}` —— 原生 Messages 端点的新模型
+    /// `{"type":"adaptive"}` —— 原生 Messages 端点的新模型（降级链第二站）
     Adaptive,
-    /// 完全不发该字段，交由端点默认（未设置 env 时即是此态）
+    /// 完全不发该字段，交由端点默认（降级链终点）
     Omit,
+}
+
+/// 纯函数形态（`from_env` 只负责取值），便于单测。
+/// 只有明确的「关」才算关，其余（含未设置 / 值不认识）一律当开 ——
+/// 与前端默认档一致，也让「注入漏了」退化成可用，而不是静默把思考关掉。
+fn thinking_from(value: Option<&str>) -> Thinking {
+    match value.map(str::trim) {
+        Some("off") | Some("0") | Some("false") => Thinking::Disabled,
+        _ => Thinking::Budget(THINKING_BUDGET),
+    }
 }
 
 impl Thinking {
     fn from_env() -> Self {
-        match std::env::var("MAX_THINKING_TOKENS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-        {
-            Some(0) => Thinking::Disabled,
-            Some(n) => Thinking::Budget(n),
-            None => Thinking::Omit,
-        }
+        thinking_from(std::env::var("LUNAC_THINKING").ok().as_deref())
     }
 
     fn to_json(self) -> Option<Value> {
@@ -330,8 +414,8 @@ impl Thinking {
     }
 }
 
-/// 端点要求 `budget_tokens < max_tokens`，故思考档必须抬高 max_tokens，
-/// 否则 deep 档（32768）配 8192 会被判参数非法。
+/// 端点要求 `budget_tokens < max_tokens`，故开档必须抬高 max_tokens，
+/// 否则 8192 的预算配 8192 的上限会被判参数非法。
 fn max_tokens_for(plan: Thinking) -> u32 {
     match plan {
         Thinking::Budget(n) => (n + 4096).max(BASE_MAX_TOKENS),
@@ -344,6 +428,45 @@ fn max_tokens_for(plan: Thinking) -> u32 {
 fn thinking_related_error(detail: &str) -> bool {
     let d = detail.to_ascii_lowercase();
     d.contains("thinking") || d.contains("adaptive") || d.contains("budget_tokens")
+}
+
+/// 哪些 HTTP 状态值得退避重试：429 限流、5xx 服务端故障（含 529「过载」）。
+/// **4xx 不在此列** —— 除了上面两个专门分支，其余 4xx 重试也不会变。
+fn retryable_status(code: u16) -> bool {
+    code == 429 || code == 529 || (500..=599).contains(&code)
+}
+
+/// 退避时长（毫秒）：优先采用端点给的 `Retry-After`，否则 1s → 2s → 4s… 并加抖动。
+/// 抖动是防止多个副本同时重试形成尖峰；取系统时间的亚秒位，不引 rand（见 §11 规则 20）。
+fn retry_delay_ms(attempt: usize, retry_after_secs: Option<u64>) -> u64 {
+    if let Some(secs) = retry_after_secs {
+        return secs.saturating_mul(1000).min(RETRY_MAX_MS);
+    }
+    let shift = attempt.saturating_sub(1).min(5) as u32;
+    let base = RETRY_BASE_MS.saturating_mul(1u64 << shift);
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % 250)
+        .unwrap_or(0);
+    (base + jitter).min(RETRY_MAX_MS)
+}
+
+/// 上报一次「瞬时失败 → 退避重试」：前端据此显示状态文案（`system/api_retry`），
+/// 同时写进 agent 自己的落盘日志。**进日志的文本必须过 `mask_secrets`**（规则 20）。
+fn emit_api_retry(attempt: usize, status: Option<u16>, delay_ms: u64, reason: &str) {
+    emit(json!({
+        "type": "system",
+        "subtype": "api_retry",
+        "attempt": attempt,
+        "max_retries": MAX_API_RETRIES,
+        "error_status": status,
+        "delay_ms": delay_ms,
+    }));
+    log::warn(format!(
+        "api retry {attempt}/{MAX_API_RETRIES} after {delay_ms}ms (status={}): {}",
+        status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+        log::mask_secrets(reason)
+    ));
 }
 
 
@@ -491,15 +614,35 @@ fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
         reg.insert(request_id.clone(), tx);
     }
     eprintln!("[agent] 等待审批 {tool_name}");
+    let mut request = json!({
+        "subtype": "can_use_tool",
+        "tool_name": tool_name,
+        "input": input,
+        "tool_use_id": tool_use_id,
+    });
+    // 命令类工具附上**执行侧**的静态安全分析（见 bash_safety.rs）：
+    // 前端只拿到命令字符串，正则挡不住引号拼接 / 包装器 / 变量 / 串联的后半段。
+    // 这里只**上报判定**、不代替前端决策 —— 前端仍是「自动放行 / 弹审批」的唯一决策点。
+    if matches!(tool_name, "Bash" | "PowerShell") {
+        if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+            let report = bash_safety::analyze(cmd);
+            if !report.is_clean() {
+                log::warn(format!(
+                    "静态安全分析 {tool_name}: dangerous=[{}] opaque=[{}]",
+                    report.dangerous.join("、"),
+                    report.opaque.join("、"),
+                ));
+            }
+            request["analysis"] = json!({
+                "dangerous": report.dangerous,
+                "opaque": report.opaque,
+            });
+        }
+    }
     emit(json!({
         "type": "control_request",
         "request_id": request_id,
-        "request": {
-            "subtype": "can_use_tool",
-            "tool_name": tool_name,
-            "input": input,
-            "tool_use_id": tool_use_id,
-        },
+        "request": request,
     }));
     Pending { request_id, rx }
 }
@@ -631,9 +774,15 @@ fn main() {
     // 没有控制台，下面所有 eprintln 线上都拿不到 —— 出问题只能靠这个文件回溯。
     log::init("agent");
     let cli = CliArgs::parse(&args);
+    // 落盘目录（<exe 根>\temp\tool-outputs）必须进可访问范围：单条工具输出超预算时
+    // 全文落在那里，模型要自己 Read/Grep 取回 —— 工作区锁会拦工作区外的路径。
+    let output_dir = tools::prepare_output_dir();
+    log::info(format!("工具输出落盘目录: {}", output_dir.display()));
+    let mut add_dirs = cli.add_dirs.clone();
+    add_dirs.push(output_dir);
     let tools_ctx = tools::Ctx {
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        add_dirs: cli.add_dirs.clone(),
+        add_dirs,
         read_only: cli.permission_mode == "plan",
         locked: std::env::var("LUNAC_WORKSPACE_LOCKED").ok().as_deref() == Some("1")
             && !cli.skip_permissions,
@@ -698,6 +847,27 @@ fn main() {
     if let Some(b) = &mcp_bridge {
         tool_defs.extend(b.defs().iter().cloned());
         tool_names.extend(tools::names(b.defs()));
+    }
+
+    // ── 固定前缀体积自检 ───────────────────────────────────────────
+    // 每轮请求都要重发的常量只有三块：system（身份 + 环境块 + 技能清单）、
+    // tools（内置 + Skill + MCP/用户工具）。**前缀缓存优化前必须先知道这三块各有多大**
+    // ——否则改了也不知道省在哪（字符数 ÷ 4 ≈ token，与 Hermes 的估算口径一致）。
+    {
+        let sys_chars = system_prompt.chars().count();
+        let tools_chars: usize = tool_defs
+            .iter()
+            .filter_map(|d| serde_json::to_string(d).ok())
+            .map(|s| s.chars().count())
+            .sum();
+        let ctx = max_context_tokens();
+        let total_tokens = (sys_chars + tools_chars) as f64 / CHARS_PER_TOKEN;
+        log::info(format!(
+            "固定前缀 system={sys_chars}字 tools={}个/{tools_chars}字 合计≈{} tokens（budget={ctx}，占 {:.1}%）",
+            tool_defs.len(),
+            total_tokens.round() as u64,
+            total_tokens / ctx as f64 * 100.0,
+        ));
     }
 
     eprintln!(
@@ -859,7 +1029,10 @@ fn run_tool(
 ) -> Result<String, String> {
     let started = Instant::now();
     let args = tools::summarize_args(input);
-    let result = dispatch_tool(tctx, mcp_bridge, skill_list, name, input);
+    // 单条工具输出预算的唯一出口：超预算落盘全文、只内联头尾（见 tools::apply_budget）。
+    // 必须在这里做 —— 只有这一层同时拿到工具名与未经裁剪的完整输出。
+    let result = dispatch_tool(tctx, mcp_bridge, skill_list, name, input)
+        .map(|out| tools::apply_budget(name, out));
     let ms = started.elapsed().as_millis();
 
     match &result {
@@ -882,8 +1055,10 @@ fn dispatch_tool(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    // 结果**不在这里**截断 —— 单条输出预算统一由 run_tool 的
+    // `tools::apply_budget` 收口（那里才知道工具名，超长要落盘）。
     if name == "Skill" {
-        return skills::run(skill_list, input).map(tools::truncate);
+        return skills::run(skill_list, input);
     }
     if !mcp::is_mcp(name) {
         return tools::run(tctx, name, input);
@@ -895,7 +1070,62 @@ fn dispatch_tool(
     let Some(bridge) = mcp_bridge else {
         return Err(format!("MCP bridge is not connected, cannot call {name}"));
     };
-    bridge.call(name, input).map(tools::truncate)
+    bridge.call(name, input)
+}
+
+/// 组装回灌给模型的 `tool_result` 块。顺序必须与 `tool_use` 原顺序一致
+/// （并行只改变执行时机，不改变回灌顺序）。
+fn tool_result_block(id: &str, text: String, is_error: bool) -> Value {
+    let mut blk = json!({ "type": "tool_result", "tool_use_id": id, "content": text });
+    if is_error {
+        blk["is_error"] = json!(true);
+    }
+    blk
+}
+
+/// 执行单条工具调用 → (回灌文本, 是否错误)。
+/// `denied` 非空 = 用户在审批卡上拒绝，直接回错误文本、不执行。
+fn run_one_tool(
+    tctx: &tools::Ctx,
+    mcp_bridge: Option<&mut mcp::Bridge>,
+    skill_list: &[skills::Skill],
+    name: &str,
+    run_input: &Value,
+    denied: Option<&str>,
+) -> (String, bool) {
+    if let Some(msg) = denied {
+        return (format!("Error: {msg}"), true);
+    }
+    eprintln!("[agent] 执行工具 {name}");
+    match run_tool(tctx, mcp_bridge, skill_list, name, run_input) {
+        Ok(s) => (s, false),
+        Err(e) => (format!("Error: {e}"), true),
+    }
+}
+
+/// 把一轮的工具调用切成执行批：**连续的**只读调用合成一批（批内并行，见
+/// `tools::parallel_safe`），其余各自成批（串行）。返回 `(是否并行, 下标区间)`，
+/// 区间按原顺序无缝覆盖全部调用。
+///
+/// **为什么必须是「连续」段**：只读批绝不允许跨越写类调用 —— 否则
+/// 「写 A → 读 A」会被重排成「读 A（旧内容）→ 写 A」，错得无声无息。
+/// 单元素的只读段不标并行：省一次线程 spawn，行为与串行完全一致。
+fn plan_tool_batches(calls: &[(String, String, Value)]) -> Vec<(bool, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < calls.len() {
+        if tools::parallel_safe(&calls[i].1) {
+            let start = i;
+            while i < calls.len() && tools::parallel_safe(&calls[i].1) {
+                i += 1;
+            }
+            out.push((i - start > 1, start..i));
+        } else {
+            out.push((false, i..i + 1));
+            i += 1;
+        }
+    }
+    out
 }
 
 fn run_query(
@@ -942,6 +1172,14 @@ fn run_query(
     let mut out_tokens: u64 = 0;
     let mut cache_read: u64 = 0;
     let mut cache_create: u64 = 0;
+    // 每次 API 请求的用量明细（**对账粒度**）：平台上「一次带工具的提问」就是**多行**，
+    // 而本地按提问只落一行 → 命中率无法逐行对齐（见 ai-spec §11 规则 23 的粒度差提醒）。
+    // 这里把每次请求的 in/read/create/out 也带上，前端写进 usage-*.jsonl。
+    let mut req_log: Vec<Value> = Vec::new();
+    let mut cur_in: u64 = 0;
+    let mut cur_read: u64 = 0;
+    let mut cur_create: u64 = 0;
+    let mut cur_out: u64 = 0;
     let mut final_text = String::new();
     let mut turns = 0usize;
     let mut rounds = 0usize;
@@ -963,23 +1201,29 @@ fn run_query(
             let grew_enough =
                 measured > cfg.last_compact.get() + (budget as f64 * COMPACT_MIN_GROWTH) as u64;
             if ratio > DROP_RATIO {
-                let dropped = compact_history(history, Compact::Drop);
-                base = base.saturating_sub(dropped);
+                let out = compact_history(history, Compact::Drop, measured);
+                base = base.saturating_sub(out.dropped);
                 cfg.last_input.set(0);
                 cfg.last_compact.set(measured);
             } else if ratio > ELIDE_RATIO && grew_enough {
-                let dropped = compact_history(history, Compact::Elide);
-                base = base.saturating_sub(dropped);
+                let out = compact_history(history, Compact::Elide, measured);
+                base = base.saturating_sub(out.dropped);
                 cfg.last_input.set(0);
-                cfg.last_compact.set(measured);
+                // 闸门判定「不值得」时什么都没改 —— 那时**不推进滞回时钟**，
+                // 否则会白等一个 15% 增长窗口才重新评估（压缩次数统计也不会被污染）。
+                if out.elided > 0 {
+                    cfg.last_compact.set(measured);
+                }
             }
         }
 
         // 兜底：本轮内被 400 判为上下文超限时，强制压缩后再试一次
         let mut compacted_for_retry = false;
+        // 本轮已用掉的「瞬时失败重试」次数（每轮重置；见 MAX_API_RETRIES）
+        let mut transient_attempt = 0usize;
 
-        // 发送（思考形态可降级重试）：只有「与 thinking 相关的 400」才沿降级链
-        // 前进一次，并把可用的形态写回 cfg 缓存，后续轮次不再试错。
+        // 发送（思考形态可降级重试 / 瞬时失败退避重试）：只有「与 thinking 相关的
+        // 400」才沿降级链前进一次，并把可用形态写回 cfg 缓存，后续轮次不再试错。
         let resp = loop {
             let plan = cfg.thinking.get();
             let mut body = json!({
@@ -1009,6 +1253,15 @@ fn run_query(
             let r = match sent {
                 Ok(r) => r,
                 Err(e) => {
+                    // 网络层瞬时故障（连接失败 / 重置 / 超时）→ 退避重试。
+                    // builder 类错误（URL 非法、TLS 配置错）重试也不会成功，直接失败。
+                    if !e.is_builder() && transient_attempt < MAX_API_RETRIES {
+                        transient_attempt += 1;
+                        let delay = retry_delay_ms(transient_attempt, None);
+                        emit_api_retry(transient_attempt, None, delay, &e.to_string());
+                        thread::sleep(Duration::from_millis(delay));
+                        continue;
+                    }
                     return finish_error(
                         history,
                         base,
@@ -1023,6 +1276,12 @@ fn run_query(
             }
 
             let status = r.status();
+            // `Retry-After`（秒）由端点给出时优先采用；非数字形态（HTTP-date）忽略
+            let retry_after = r
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
             let detail = r.text().unwrap_or_default();
             if status == 400 && thinking_related_error(&detail) {
                 if let Some(next) = plan.next() {
@@ -1034,11 +1293,20 @@ fn run_query(
             // 上下文超限 → 强制压缩后再试一次（水位估算失准时靠这条兜底）
             if status == 400 && !compacted_for_retry && context_related_error(&detail) {
                 compacted_for_retry = true;
-                let dropped = compact_history(history, Compact::Force);
-                base = base.saturating_sub(dropped);
+                let out = compact_history(history, Compact::Force, cfg.last_input.get());
+                base = base.saturating_sub(out.dropped);
                 cfg.last_compact.set(cfg.last_input.get());
                 cfg.last_input.set(0);
-                eprintln!("[agent] 端点回报上下文超限 → 压缩 {dropped} 条后重试");
+                eprintln!("[agent] 端点回报上下文超限 → 压缩 {} 条后重试", out.dropped);
+                continue;
+            }
+            // 429 / 5xx：端点侧瞬时故障 → 退避重试（尊重 Retry-After）
+            if retryable_status(status.as_u16()) && transient_attempt < MAX_API_RETRIES {
+                transient_attempt += 1;
+                let delay = retry_delay_ms(transient_attempt, retry_after);
+                let brief: String = detail.trim().chars().take(200).collect();
+                emit_api_retry(transient_attempt, Some(status.as_u16()), delay, &brief);
+                thread::sleep(Duration::from_millis(delay));
                 continue;
             }
             let detail: String = detail.trim().chars().take(800).collect();
@@ -1052,7 +1320,15 @@ fn run_query(
         // SSE：只关心 `data:` 载荷；`event:`/空行/注释行一律跳过
         let reader = BufReader::new(resp);
         for line in reader.lines() {
-            let Ok(line) = line else { break };
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    // 读流出错（连接被掐断 / 超时）。这里**不能**退避重试 —— 前面已经
+                    // 把部分内容流给前端了，重来会产生重复文本。至少留一条可查的日志。
+                    log::warn(format!("SSE 流中断，本轮回复可能不完整: {e}"));
+                    break;
+                }
+            };
             let Some(data) = line.trim().strip_prefix("data:") else {
                 continue;
             };
@@ -1083,6 +1359,11 @@ fn run_query(
                     in_tokens += req_in;
                     cache_read += req_read;
                     cache_create += req_create;
+                    // 本次请求的明细（message_stop 时整条推入 req_log）
+                    cur_in = req_in;
+                    cur_read = req_read;
+                    cur_create = req_create;
+                    cur_out = 0;
                 }
                 "content_block_start" => {
                     let cb = &ev["content_block"];
@@ -1193,9 +1474,19 @@ fn run_query(
                 "message_delta" => {
                     if let Some(n) = ev["usage"].get("output_tokens").and_then(Value::as_u64) {
                         out_tokens += n;
+                        // Anthropic 的 message_delta.output_tokens 是**本条消息的累计值**，
+                        // 所以这里是赋值不是累加（同一条消息可能来多次 delta）。
+                        cur_out = n;
                     }
                 }
                 "message_stop" => {
+                    // 一次 API 请求 = 一条对账明细（与平台用量页逐行对齐）
+                    req_log.push(json!({
+                        "in": cur_in,
+                        "read": cur_read,
+                        "create": cur_create,
+                        "out": cur_out,
+                    }));
                     emit_stream_event(json!({ "type": "message_stop" }));
                 }
                 "error" => {
@@ -1299,9 +1590,12 @@ fn run_query(
             }
         }
 
-        let mut results: Vec<Value> = Vec::new();
+        // 先把审批**按原顺序**全部解完（审批是阻塞等用户，且顺序不能乱：前端按
+        // 「未应答行」合并同一批命令，乱序会打乱卡片与合并结果）。
         let mut interrupted = false;
-        for ((id, name, input), pending) in calls.iter().zip(pendings.into_iter()) {
+        let mut run_inputs: Vec<Value> = Vec::with_capacity(calls.len());
+        let mut denieds: Vec<Option<String>> = Vec::with_capacity(calls.len());
+        for ((_id, _name, input), pending) in calls.iter().zip(pendings.into_iter()) {
             let mut run_input = input.clone();
             let mut denied: Option<String> = None;
             if let Some(p) = pending {
@@ -1313,27 +1607,87 @@ fn run_query(
                     }
                 }
             }
-
-            let (text, is_error) = match denied {
-                Some(msg) => (format!("Error: {msg}"), true),
-                None => {
-                    eprintln!("[agent] 执行工具 {name}");
-                    match run_tool(tctx, mcp_bridge.as_deref_mut(), skill_list, name, &run_input) {
-                        Ok(s) => (s, false),
-                        Err(e) => (format!("Error: {e}"), true),
-                    }
-                }
-            };
-            let mut blk = json!({
-                "type": "tool_result",
-                "tool_use_id": id,
-                "content": text,
-            });
-            if is_error {
-                blk["is_error"] = json!(true);
-            }
-            results.push(blk);
+            run_inputs.push(run_input);
+            denieds.push(denied);
         }
+
+        // 按批执行：**连续的**只读调用并行（上限 TOOL_PARALLELISM），其余串行。
+        // 结果一律按下标回填 ⇒ 回灌顺序恒等于 tool_use 的原顺序。
+        let mut slots: Vec<Option<(String, bool)>> = vec![None; calls.len()];
+        for (parallel, range) in plan_tool_batches(&calls) {
+            if !parallel {
+                let i = range.start;
+                slots[i] = Some(run_one_tool(
+                    tctx,
+                    mcp_bridge.as_deref_mut(),
+                    skill_list,
+                    &calls[i].1,
+                    &run_inputs[i],
+                    denieds[i].as_deref(),
+                ));
+                continue;
+            }
+            // 只读批里只可能出现内置工具（白名单见 tools::parallel_safe）⇒ 不需要
+            // MCP 桥，也就绕开了 `&mut Bridge` 无法跨线程共享的问题。
+            // 并发上限靠**分块 + 块内 join** 实现，不引信号量。
+            // 先把三个只读切片取成 `&`（引用是 Copy，`move` 闭包拷进去的是引用
+            // 本身，不会把 `calls` 整个移走 —— 后面还要用它组装回灌结果）。
+            let (calls_ref, inputs_ref, denieds_ref) = (&calls, &run_inputs, &denieds);
+            log::info(format!(
+                "只读工具并行批 {} 条（并发上限 {TOOL_PARALLELISM}）: {}",
+                range.len(),
+                range
+                    .clone()
+                    .map(|i| calls[i].1.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            let mut start = range.start;
+            while start < range.end {
+                let end = (start + TOOL_PARALLELISM).min(range.end);
+                let done: Vec<(usize, String, bool)> = thread::scope(|s| {
+                    let handles: Vec<_> = (start..end)
+                        .map(|i| {
+                            (
+                                i,
+                                s.spawn(move || {
+                                    let (text, is_error) = run_one_tool(
+                                        tctx,
+                                        None,
+                                        skill_list,
+                                        &calls_ref[i].1,
+                                        &inputs_ref[i],
+                                        denieds_ref[i].as_deref(),
+                                    );
+                                    (i, text, is_error)
+                                }),
+                            )
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(i, h)| {
+                            h.join()
+                                .unwrap_or_else(|_| (i, "Error: tool worker panicked".into(), true))
+                        })
+                        .collect()
+                });
+                for (i, text, is_error) in done {
+                    slots[i] = Some((text, is_error));
+                }
+                start = end;
+            }
+        }
+
+        let results: Vec<Value> = calls
+            .iter()
+            .zip(slots)
+            .map(|((id, _name, _input), slot)| {
+                let (text, is_error) =
+                    slot.unwrap_or_else(|| ("Error: tool was not executed".into(), true));
+                tool_result_block(id, text, is_error)
+            })
+            .collect();
         let tool_msg = json!({ "role": "user", "content": results });
         emit(json!({ "type": "user", "message": tool_msg.clone() }));
         history.push(tool_msg);
@@ -1376,6 +1730,9 @@ fn run_query(
             "output_tokens": out_tokens,
             "cache_read_input_tokens": cache_read,
             "cache_creation_input_tokens": cache_create,
+            // 每次 API 请求一行（顺序 = 请求顺序）。前端写进本地用量日志，
+            // 与 DeepSeek 平台用量页按请求对账；旧消费者忽略即可。
+            "requests": req_log,
         },
     }));
 }
@@ -1401,4 +1758,150 @@ fn finish_error(
         "session_id": "",
         "total_cost_usd": 0.0,
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一段历史：开头是用户提问，中间塞一条大 tool_result，尾部留 COMPACT_KEEP_TAIL 条。
+    fn history_with_big_tool_result(chars: usize) -> (Vec<Value>, Value) {
+        let big = json!("x".repeat(chars));
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"user","content":[{"type":"tool_result","content":big.clone()}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL {
+            history.push(json!({"role":"user","content":[{"type":"text","text":format!("t{i}")}]}));
+        }
+        (history, big)
+    }
+
+    /// 瘦身档的「值不值得」闸门：省得不够多就不许动历史（动了会让其后整段前缀失效）
+    #[test]
+    fn elide_is_skipped_when_savings_are_too_small() {
+        let (mut history, big) = history_with_big_tool_result(3_000);
+        // 上下文 10 万 token → 阈值 = 100000 × 0.05 × 4 = 20000 字 ≫ 可省 3000 字
+        let out = compact_history(&mut history, Compact::Elide, 100_000);
+        assert_eq!(out.elided, 0, "省得不够多时不该瘦身");
+        assert_eq!(history[1]["content"][0]["content"], big, "历史必须原样保留");
+
+        // 上下文小到阈值（1000 token → 200 字）以下 → 允许瘦身
+        let out = compact_history(&mut history, Compact::Elide, 1_000);
+        assert_eq!(out.elided, 1);
+        assert_ne!(history[1]["content"][0]["content"], big);
+    }
+
+    /// 丢弃档 / 400 兜底档是安全刚需 —— 不受上面那道闸门约束
+    #[test]
+    fn drop_mode_ignores_the_savings_gate() {
+        let (mut history, big) = history_with_big_tool_result(3_000);
+        let out = compact_history(&mut history, Compact::Drop, 100_000);
+        assert_eq!(out.elided, 1);
+        assert_eq!(out.dropped, 0, "砍得动 tool_result 时不必丢整条消息");
+        assert_ne!(history[1]["content"][0]["content"], big);
+
+        let (mut history, _) = history_with_big_tool_result(3_000);
+        let out = compact_history(&mut history, Compact::Force, 100_000);
+        assert_eq!(out.elided, 1);
+    }
+
+    #[test]
+    fn retries_only_transient_statuses() {
+        // 限流与服务端故障才重试（529 是部分兼容端点表示「过载」的写法）
+        for code in [429u16, 500, 502, 503, 504, 529, 599] {
+            assert!(retryable_status(code), "{code} 应当重试");
+        }
+        // 4xx（除 429）重试也不会变：鉴权/参数错、以及专门分支处理的 400
+        for code in [400u16, 401, 403, 404, 422, 499] {
+            assert!(!retryable_status(code), "{code} 不该重试");
+        }
+    }
+
+    #[test]
+    fn backoff_grows_and_honours_retry_after() {
+        // 指数增长 + 抖动（0..250ms）
+        let first = retry_delay_ms(1, None);
+        let second = retry_delay_ms(2, None);
+        assert!((1_000..1_250).contains(&first), "首次退避应≈1s，实得 {first}");
+        assert!((2_000..2_250).contains(&second), "第二次应≈2s，实得 {second}");
+
+        // 端点给的 Retry-After 优先，且被上限夹住
+        assert_eq!(retry_delay_ms(1, Some(7)), 7_000);
+        assert_eq!(retry_delay_ms(1, Some(9_999)), RETRY_MAX_MS);
+
+        // 很大的 attempt 不会溢出、也不会超过上限
+        assert_eq!(retry_delay_ms(64, None), RETRY_MAX_MS);
+    }
+
+    /// 思考只有开/关两态：只有明确的「关」才是关，认不出来的值一律当开
+    #[test]
+    fn thinking_is_a_two_state_switch() {
+        for off in ["off", " 0 ", "false"] {
+            assert_eq!(thinking_from(Some(off)), Thinking::Disabled, "{off} 应为关");
+        }
+        for on in ["on", "", "8192", "whatever"] {
+            assert_eq!(
+                thinking_from(Some(on)),
+                Thinking::Budget(THINKING_BUDGET),
+                "{on:?} 应为开"
+            );
+        }
+        // 注入漏了（env 不存在）→ 开，与前端默认档一致
+        assert_eq!(thinking_from(None), Thinking::Budget(THINKING_BUDGET));
+
+        // 开档的 budget 必须严格小于它抬起来的 max_tokens，否则端点判参数非法
+        assert!(THINKING_BUDGET < max_tokens_for(Thinking::Budget(THINKING_BUDGET)));
+
+        // 关档的降级终点是「不发字段」，绝不退到 adaptive（那等于反手把思考打开）
+        assert_eq!(Thinking::Disabled.next(), Some(Thinking::Omit));
+        assert_eq!(Thinking::Disabled.to_json(), Some(json!({ "type": "disabled" })));
+    }
+
+    fn call(name: &str) -> (String, String, Value) {
+        ("id".into(), name.into(), json!({}))
+    }
+
+    /// 批次切分：区间无缝覆盖全部调用，且**只读批绝不跨越写类调用**
+    #[test]
+    fn batches_never_span_a_writing_call() {
+        let calls = vec![
+            call("Read"),
+            call("Grep"),
+            call("Write"), // 写类：必须打断只读批
+            call("Read"),
+            call("Glob"),
+        ];
+        let batches = plan_tool_batches(&calls);
+
+        // 区间必须无缝覆盖 [0, len)
+        assert_eq!(batches[0].1.start, 0);
+        assert_eq!(batches.last().unwrap().1.end, calls.len());
+        for w in batches.windows(2) {
+            assert_eq!(w[0].1.end, w[1].1.start, "相邻批之间不许有空隙/重叠");
+        }
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches[0].0, "Read+Grep 连续只读 → 并行批");
+        assert_eq!(batches[0].1, 0..2);
+        assert!(!batches[1].0, "Write 必须独占一批");
+        assert_eq!(batches[1].1, 2..3);
+        assert!(batches[2].0);
+        assert_eq!(batches[2].1, 3..5);
+    }
+
+    /// 单元素的只读段不标并行（省一次线程 spawn，行为与串行完全一致）
+    #[test]
+    fn single_read_only_call_is_not_marked_parallel() {
+        for calls in [
+            vec![call("Read")],
+            vec![call("Bash"), call("Read")],
+            vec![call("Read"), call("Bash")],
+        ] {
+            for (parallel, _) in plan_tool_batches(&calls) {
+                assert!(!parallel, "批内只有一个只读调用时不该标并行");
+            }
+        }
+        assert!(plan_tool_batches(&[]).is_empty());
+    }
 }

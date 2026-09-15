@@ -123,6 +123,8 @@
 
 **命令类工具**：`Bash` / `PowerShell` 用等宽字体显示命令原文（保留换行，最多 3 行 + 省略）；`Read` / `Write` / `Edit` / `Grep` / `Glob` 显示 `k=v` 摘要（现状逻辑保留）。`TodoWrite` 仍走 `.todo-panel`（不画卡片）。
 
+> **注意区分两个「复制」**：上面的操作区属于**执行卡片**（`.tool-row`，命令已经跑完）。**审批卡**（`.approval-batch-card`）的命令区**不放复制按钮**（2026-09 用户要求删除）—— 按钮固定在右上角，短命令与它之间会空出一大片（还得给 `.approval-cmd-list` 预留 56px 右边距），而命令文本本身已可选中复制（`.approval-cmd-box` 有 `user-select: text`），够了。**不得**为「方便复制」把按钮加回去。
+
 ### 3.4 结果与错误
 
 - 成功：`.tool-ok` 折叠体，summary 为「成功」+ 首行摘要。
@@ -137,6 +139,25 @@
 - 折叠态在 `.turn-footer` 显示摘要行：`N 步工具调用 · M 次失败 · 耗时 Xs`。
 - 用户手动展开后，该回合在本次会话内保持展开（不因后续回合而回弹）。
 - **开关**：`localStorage` 键 `lunac-agent-autofold`，默认 `1`（开）；入口放设置面板「AI」分区。关闭时行为与现状一致（全部展开）。
+
+### 3.6 权限卡（审批卡）
+
+一张批量卡（`.approval-batch-card`）承载**一次权限运行**里的所有请求，卡头有数量与「全部允许 / 全部拒绝」，卡体**一行一条**请求（`.approval-item`）。规范：
+
+- **命令置顶、行高自适应（2026-09 重构）**：`.approval-item` **不得设固定高度**。旧实现给 `height: 144px` 且 `.approval-body { flex: 1 }`，于是短命令后面留出一大片空档、命令文本看起来「浮在中间」而不是贴顶。现在行高由内容决定，命令区 `.approval-cmd-box` / `.approval-input` 用 `max-height: 72px; overflow-y: auto`（超长命令自身滚动，不撑高整行）。
+- **命令区不放复制按钮**（2026-09）：按钮固定右上角会给短命令留一大段空白（`.approval-cmd-list` 还得预留 56px 右边距）；命令文本本身可选中复制。注意这与执行卡片 `.tool-row` 的「复制命令」是**两个不同组件**，不要混。
+- **同一次权限运行内合并成一行**（2026-09 放宽）：同一条未应答的命令组行是**唯一合并目标**，`Bash` 与 `PowerShell` **视作同一族**（用户要求「短时间内不同类型的命令也合并进同一个权限运行」）。合并**只影响审批展示** —— 每条命令仍由 agent 各自执行，`&&` 短路、退出码、输出都不受影响，所以含 `&&` / `|` / 重定向 / 换行的**复杂命令同样入组**（旧实现按算子排除，正是「复杂任务里同类请求一行一条堆满卡片」的原因）。上限 `MAX_CMD_GROUP = 20` 条 / 单条 2000 字符。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。
+- **合并后标题要重画**：工具名可能不止一个（显示 `Bash + PowerShell`），⛔ / ⚠ 标记也可能来自后来合并进来的那条命令 —— `renderGroupTitle()` 在每次合并时重画标题；`renderCmdGroupBody()` 顺带兜掉「始终允许」（组内只要有一条危险 / 不透明，整组都不给）。行的 `danger` 类同步补上。
+- **「始终允许」写白名单要写**组内**每一条**命令的命令词（旧实现只记第一条 → 组里第二条以后的同类命令下次还要再问一遍，即用户反馈的「允许过还要再问」）。解释器 / 启动器前缀与危险 / 不透明命令照旧排除（§4.3）。
+- **自动档不该弹卡**：`opaque` 判据 2026-09 已收窄到「不知道要跑哪个程序」（参数里的 `$HOME` / `$env:TEMP` 不算，见 ai-spec §3.5）—— 旧口径会让自动档下每条带 `$` 的命令都弹卡。
+
+### 3.7 历史回顾（过程与表盘）
+
+历史会话（`ModuleData\history\chat-history.json`，Rust 侧 `load_chat_sessions` / `save_chat_sessions`）不只存气泡，还存：
+
+- **`steps`（过程快照）**：回合结束时由 `recordTurnSteps()` 采集一次（thinking / tool / text，超长截断），恢复历史时用 `renderHistoryProcess()` 渲染成插在该回合助手消息之后的**可折叠「过程 · N 步」块**，默认折叠。渲染复用对话流里同样的类名（`.think-block` / `.agent-text` / `.tool-card`），保证视觉一致。
+- **`usage`（表盘快照）**：恢复历史时写回 token 仪表盘（`usageTotals` + `updateTokenDashboard()`）—— 表盘口径是「当前这次对话」，所以此时显示的就是**那次对话**的数值。
+- 缺字段（旧记录）时两者都按空处理，不得报错。
 
 ---
 
@@ -179,9 +200,12 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 
 - **跳过**：默认行为，收起该卡片。
 - **改到工作区内重试**：把路径提示回填给输入框（用户可改后重发），**不**自动放宽边界。
-- **加入命令白名单**：仅对**命令类**工具出现，且**仅当该命令不含危险模式**时可用（`classifyRequest` 判定为 danger 的命令**永不显示此按钮**，与现状审批卡一致）。
+- **加入命令白名单**：仅对**命令类**工具出现，且**仅当该命令不含危险模式**时可用（`classifyRequest` 判定为 danger 的命令**永不显示此按钮**，与现状审批卡一致）。**三种情况额外不给此按钮**（2026-09）：
+  1. agent 判定 `analysis.dangerous` 非空（执行侧静态分析，见 ai-spec §11 规则 26）；
+  2. agent 判定 `analysis.opaque` 非空（含变量 / 编码执行等**无法静态判定**的成分）；
+  3. 命令词是**解释器 / 启动器**（`cmd` / `powershell` / `bash` / `python` / `node` / `npx` / `iex` / `env`…）—— 白名单是前缀匹配，放进去等于「以后任何 `powershell …` 都自动放行」。同一条限制在**命中用户白名单**时也要生效（历史遗留的这类条目必须拒绝自动放行）。
 
-危险命令被拦截时，卡片显示一行可读原因（复用 `CMD_BLACKLIST` 的中文标签，如「递归强制删除」），与 Trae 的「拦截原因可见」对齐。
+危险命令被拦截时，卡片显示一行可读原因（复用中文标签，如「递归强制删除」；标签可能来自 agent 的 `analysis.dangerous`，也可能是前端 `CMD_BLACKLIST`），与 Trae 的「拦截原因可见」对齐。含无法静态判定成分时，标题处显示一个 `--yellow` 的 **⚠**（`.approval-warn-inline`，tooltip 说明原因）—— 它不是危险命令，但**不会被自动放行**。
 
 ### 4.4 安全档位（补前端入口）
 
@@ -213,15 +237,27 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 
 AI 输入栏 `#chat-input-bar` 现有：附件、新建会话、**「更多」⋯ 菜单（2026-09 合并）**、历史、发送/停止。
 
-- **2026-09 修订（用户要求）**：思考档位、命令运行方式、工作区、工具黑名单**四个控件合并进一个 ⋯ 图标按钮**（`#chat-more-btn`），并把它排在**输入框（`#chat-input`）之后**、历史按钮之前。原先并排的 `#chat-mode-btn` / `#chat-runmode-btn` 两个文字胶囊与 `.chat-workspace-wrap` / `.chat-tools-wrap` 两个独立弹窗全部移除。
+- **2026-09 修订（用户要求）**：思考开关、命令运行方式、工作区、工具黑名单**四个控件合并进一个 ⋯ 图标按钮**（`#chat-more-btn`），并把它排在**输入框（`#chat-input`）之后**、历史按钮之前。原先并排的 `#chat-mode-btn` / `#chat-runmode-btn` 两个文字胶囊与 `.chat-workspace-wrap` / `.chat-tools-wrap` 两个独立弹窗全部移除。
 - 菜单（`#chat-more-menu`）自下向上展开、右对齐，内部四行（行间分隔线）：
-  1. 思考档位 —— 三档**分段控件**（快速 / 思考 / 深度），当前档高亮；
+  1. 思考开关 —— 两档**分段控件**（开 / 关），当前档高亮。**只有两档**：端点没有思考力度旋钮（预算不被 enforce、`effort` 字段被静默忽略），做三档等于承诺端点做不到的事，依据见 [ai-spec.md](./ai-spec.md) §3.5「思考开关跨模型自适应」。状态栏等处用完整说法（「思考开 / 思考关」）而不是单个「开 / 关」；
   2. 命令运行方式 —— **图标 + 三格档位点阵**（见下），点一下进一档；
   3. 工作区 —— 行内显示当前路径 + 「选择目录 / 清除」，**不嵌套弹窗**；
-  4. 工具黑名单 —— 行内列出可勾选工具 + 「保存」。
+  4. 工具黑名单 —— 行内列出工具，每行左侧是 **×/✓ 图标切换按钮**（× = 已禁用、红色 + 工具名加删除线；✓ = 启用、暗色），点一下切一格，点「保存」才写回并重启 agent。
 - **运行方式不写文字**：`#chat-runmode-btn` 由「盾牌图标 + 3 个圆点」构成，点阵数量 = 档位（1 手动 / 2 白名单 / 3 自动），颜色区分语义（手动 `--text-dim`、白名单 `--green`、自动 `--red`）；完整语义（档位名 + 提示句）只在 `title` / `aria-label` 里，避免输入栏被文字挤满。
 - **禁止**把控件放到 `#status-bar`（那里已有 token 面板与状态提示，且高度受限）。
 - 图标（⋯、盾牌、文件夹、扳手、思考灯泡）一律按 `docs/icon-style.md`：24 栅格、`fill:none`、`stroke:currentColor`、`stroke-width:2.2`、圆头端点，含「残影偏移 −0.7 / opacity 0.28 + 点彩高光」；**思考行图标复用既有的 `THINK_SVG` 常量**，不重复造路径。
+
+### 5.4 统一细滚动条（**优先级高，不得回退**）
+
+**项目内所有可滚动容器必须共用同一套细滚动条外观**，任何容器都不允许出现 WebView2 / 系统默认滚动条。实现**只有一处**：`styles.css` 里的全局 `::-webkit-scrollbar` 规则（宽/高 4px、轨道透明、滑块 `rgba(255,255,255,0.18)`、`border-radius: 2px`、hover `0.32`）。
+
+三条硬约束：
+
+1. **禁止再写 `scrollbar-width` / `scrollbar-color`**（任何地方，包括 `settings.ts` 这类动态注入的 `<style>`）。Chromium（WebView2）只要看到这两个属性取非 `auto` 值，就会**忽略 `::-webkit-scrollbar`**，滚动条立刻退回系统默认外观。历史事故：`#chat-input` / `.tool-result` 上的那两条声明把自定义样式整个架空，看起来就是「WebView2 默认滚动条」。
+2. **禁止按容器单独声明滚动条样式**（一定会漏 —— 新增容器就退回默认样式）。新容器只要写 `overflow-y: auto` 就自动获得统一外观，**不需要**任何额外 CSS。
+3. **不要"藏"滚动条**（`overflow: hidden` 或把滚动条伪元素设 `display:none`）；需要可滚动就保留 `overflow-y: auto`。
+
+> 依据：用户 2026-09 明确要求「⋯ 菜单里的滚动条要和项目里所有滚动条同一样式，不要 WebView2 默认样式」，并要求把这条规范的优先级调高。对应 [ai-spec.md](./ai-spec.md) §11 规则 21 的「不得回退」项。
 
 ---
 
@@ -265,8 +301,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 
 实施后必须仍满足：
 
-- [ ] `WIN_WIDTH`、缩放逻辑（0.6–2.5）、`#app.plugin-active` 的高度分支（360 / 600 / 520）**未被改动**。
-- [ ] AI 态高度仍是**离散直设**（`requestWindowHeight` 的 `!pluginActive` 条件未被修改），未把插件态拉进滑动动画。
+- [ ] `WIN_WIDTH`、缩放逻辑（0.6–2.5）、`#app.plugin-active` 的高度分支（360 / 600 / 520）**未被改动**。详细搜索大界面是**并列的固定档** `640 × zoom`（`DETAIL_HEIGHT`，见 ai-spec §2.1.2），不参与上述分支的复用。
+- [ ] AI 态高度仍是**离散直设**（`requestWindowHeight` / `animateWindowHeight` 的 `!pluginActive && !detailOpen` 条件未被放宽），未把插件态或详细搜索态拉进滑动动画。
 - [ ] 滚动仍由 `#results-list` 承担；新增长内容的块都有内部折叠，不出现「整体高度被撑爆」。
 - [ ] 未新增任何 `setSize` 调用；未在快速交互路径上引入逐帧测量。
 - [ ] 抽屉（历史）与 `#context-menu` 的 `overflow` 行为未被新的 `overflow:hidden` 破坏（code-rules §5.1）。
@@ -281,6 +317,13 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   1. 在 ai-spec §3.5 的 stdout 契约表登记字段名与语义；
   2. 保持 `tool_result.content` 文本不变（旧消费者仍可读）；
   3. 前端**兼容缺字段**（无字段时回落到文本解析）。
+- **已登记的结构化字段**（按上述流程走完的）：
+  | 字段 | 位置 | 语义 | 前端行为 |
+  |---|---|---|---|
+  | `analysis.dangerous` / `analysis.opaque` | `control_request.request`（`can_use_tool`） | 命令的**执行侧**静态安全分析（ai-spec §3.5「命令静态安全分析」/ §11 规则 26） | `dangerous` 非空 ⇒ 弹危险卡且不给「始终允许」（任何档位）；`opaque` 非空 ⇒ 不自动放行（fail-closed）。**缺字段时回落到 `CMD_BLACKLIST` 正则**（兼容旧 agent） |
+  | `elided` / `dropped` | `system/context_compacted` | 压缩计数 | 面板 tooltip 归因（§5.2） |
+  | `attempt` / `max_retries` / `error_status` | `system/api_retry` | 瞬时失败重试 | 状态行文案（ai-spec §11 规则 25） |
+  | `usage.requests[]` = `{in, read, create, out}` | `result.usage` | **每次 API 请求**的用量明细（顺序 = 请求顺序） | 前端**只落盘**（写进 `usage-*.jsonl` 的 `requests` 数组，与 DeepSeek 平台用量页逐行对账）；表盘口径不变（仍按每次提问累加）。**缺字段时写空数组**，`UsageRecord.requests` 为空则不写该键（旧记录兼容）。见 ai-spec §3.5「用量与对账」 |
 - 新增前端 → 后端的调用（如 `set_security_profile` 已有、`log_frontend` 已有）必须参数名与 Rust 签名逐一对齐（code-rules §3.1），并确认是否需要 `capabilities/default.json`（自定义 `#[tauri::command]` 不需要，插件 API 需要）。
 
 ---

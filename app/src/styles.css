@@ -55,8 +55,9 @@ html, body {
      （height:100%），面板内部滚动，高度由 JS 按 600/360/520 设计值下发。 */
 }
 #app.plugin-active,
-#app.detached {
-  height: 100%;            /* 插件/分离模式：窗口固定高，面板撑满 */
+#app.detached,
+#app.detail-mode {
+  height: 100%;            /* 插件/分离/详细搜索模式：窗口固定高，面板撑满 */
 }
 
 /* ── 自定义背景双图层（需求5：无默认图；嵌入结果区；两层处理） ──────
@@ -142,6 +143,17 @@ html, body {
 .context-menu-item-active {
   color: var(--accent) !important;
   background: var(--accent-bg) !important;
+}
+/* 置灰项（如无选区时的「复制/剪切」）：仍占位、点击无反应、hover 不高亮，
+   与 macOS/Windows 原生菜单的 disabled 语义一致。 */
+.context-menu-item.disabled {
+  color: var(--text-dim);
+  opacity: 0.45;
+  cursor: default;
+}
+.context-menu-item.disabled:hover {
+  background: transparent;
+  color: var(--text-dim);
 }
 
 /* ── Clipboard history items ───────────────────────────────── */
@@ -1740,10 +1752,11 @@ html, body {
   font-weight: 600;
 }
 .approval-batch-card .approval-item {
-  height: 144px; /* 原 72px + 72px：为固定 72px 命令区腾出空间 */
+  /* 不设固定高度：旧实现 height:144px 配上 .approval-body{flex:1} 会在命令区
+     与按钮之间留出一大片空档，看起来像「占位符」、命令也不贴顶。
+     现在整行按内容自适应，命令区永远从最上面开始。 */
   display: flex;
   flex-direction: column;
-  overflow: hidden;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
   padding: 6px 0;
   margin-top: 6px;
@@ -1769,8 +1782,7 @@ html, body {
 .approval-batch-card .approval-item .approval-title b { color: inherit; }
 .approval-batch-card .approval-item.danger .approval-title { color: var(--red); }
 .approval-batch-card .approval-item .approval-body {
-  flex: 1 1 auto;
-  min-height: 0;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
 }
@@ -1783,12 +1795,20 @@ html, body {
   margin-right: 4px;
 }
 
+/* 「含无法静态判定的内容」标记（变量 / 编码执行 / 间接执行器）——
+   不是危险命令，但也不会被自动放行，用 --yellow 提醒用户看一眼。 */
+.approval-warn-inline {
+  color: var(--yellow);
+  margin-right: 4px;
+}
+
 /* ── Command-group rows (Trae-style merged approvals) ──────────── */
 /* Fixed-height, scrollable command region: commands stay complete
    (never truncated), can be selected/copied, and the card stays compact. */
 .approval-batch-card .approval-cmd-box {
-  position: relative;
-  height: 72px; /* 固定命令显示高度（原 height:100% 在 72px 小框内仅剩 ~20px） */
+  /* 自适应高度 + 上限：短命令不留空档（旧 height:72px 会让一行命令下方空出
+     一大片），长命令仍可在框内滚动。 */
+  max-height: 72px;
   min-height: 0;
   overflow-y: auto;
   background: rgba(0, 0, 0, 0.25);
@@ -1798,27 +1818,9 @@ html, body {
   user-select: text;
   -webkit-user-select: text;
 }
-.approval-batch-card .approval-cmd-list {
-  /* Reserve right padding so the copy button never overlaps commands */
-  padding-right: 56px;
-}
-.approval-batch-card .approval-copy-btn {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  padding: 2px 8px;
-  font-size: 10px;
-  line-height: 1.4;
-  border: 1px solid var(--accent-border);
-  border-radius: 4px;
-  background: var(--accent-bg);
-  color: var(--accent);
-  cursor: pointer;
-  transition: background 0.1s;
-}
-.approval-batch-card .approval-copy-btn:hover {
-  background: rgba(192, 160, 160, 0.22);
-}
+/* 命令占满整宽：原先 .approval-cmd-list 要预留 56px 给右上角的复制按钮，短命令
+   会空出一大片（2026-09 已删掉该按钮，命令文本本身可选可复制）。 */
+/* Compact the per-row action buttons */
 .approval-batch-card .approval-cmd {
   font-family: Consolas, 'Cascadia Code', monospace;
   font-size: 11px;
@@ -1835,37 +1837,15 @@ html, body {
   margin-top: 3px;
 }
 .approval-batch-card .approval-input.compact {
-  height: 72px; /* 与 approval-cmd-box 一致：固定命令显示高度 */
+  max-height: 72px; /* 与 approval-cmd-box 一致：自适应 + 上限 */
   min-height: 0;
   overflow-y: auto;
   padding: 4px 8px;
   font-size: 10.5px;
   margin: 0;
 }
-/* Custom slim scrollbars (remove default OS scrollbar) for the permission
-   command boxes — theme-matched glass/dim look. */
-.approval-batch-card .approval-cmd-box::-webkit-scrollbar,
-.approval-batch-card .approval-input.compact::-webkit-scrollbar,
-.approval-batch-card .approval-batch-body::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
-}
-.approval-batch-card .approval-cmd-box::-webkit-scrollbar-track,
-.approval-batch-card .approval-input.compact::-webkit-scrollbar-track,
-.approval-batch-card .approval-batch-body::-webkit-scrollbar-track {
-  background: transparent;
-}
-.approval-batch-card .approval-cmd-box::-webkit-scrollbar-thumb,
-.approval-batch-card .approval-input.compact::-webkit-scrollbar-thumb,
-.approval-batch-card .approval-batch-body::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.18);
-  border-radius: 3px;
-}
-.approval-batch-card .approval-cmd-box::-webkit-scrollbar-thumb:hover,
-.approval-batch-card .approval-input.compact::-webkit-scrollbar-thumb:hover,
-.approval-batch-card .approval-batch-body::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.32);
-}
+/* 权限卡片的命令框/输入框沿用全局统一细滚动条（见文末「统一细滚动条」一节）——
+   这里不再单独声明，避免又出现一套宽度/颜色。 */
 /* Compact the per-row action buttons */
 .approval-batch-card .approval-actions .approval-btn {
   padding: 4px 0;
@@ -1892,47 +1872,31 @@ html, body {
   50% { opacity: 0; }
 }
 
-/* ── Scrollbar ─────────────────────────────────────────────────── */
-#results-list::-webkit-scrollbar {
-  width: 4px;
-}
-#results-list::-webkit-scrollbar-track {
-  background: transparent;
-}
-#results-list::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 2px;
-}
-#results-list::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.14);
-}
-
-/* ── AI 对话对话框滚动条（主题一致）───────────────────────────── */
-/* WebView 默认滚动条太突兀：工具输出块(.tool-result)与聊天输入框
-   (#chat-input) 内部滚动改用与全局一致的主题细条，鼠标滚轮仍可用
-   （overflow-y: auto 保留，仅替换滚动条外观）。 */
-.tool-result,
-#chat-input {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
-}
-.tool-result::-webkit-scrollbar,
-#chat-input::-webkit-scrollbar {
+/* ── 统一细滚动条（项目内所有可滚动容器共用一套）────────────────── */
+/* 为什么是全局 `::-webkit-scrollbar` 而不是逐个容器声明：
+   ① 逐个声明总会漏 —— 新增容器（如 ⋯「更多」菜单 #chat-more-menu）就退回
+      WebView2 默认滚动条，而这套外观必须处处一致；
+   ② **禁止再写 `scrollbar-width` / `scrollbar-color`**：Chromium（WebView2）
+      只要看到这两个属性取非 auto 值，就会**忽略 ::-webkit-scrollbar**，
+      滚动条直接退回系统默认外观。历史上聊天输入框/工具输出块就是这么变成
+      「WebView2 默认样式」的（两条声明把自定义样式整个架空了）。
+   规范：docs/agent-ui-spec.md §5.4（不得回退）。 */
+::-webkit-scrollbar {
   width: 4px;
   height: 4px;
 }
-.tool-result::-webkit-scrollbar-track,
-#chat-input::-webkit-scrollbar-track {
+::-webkit-scrollbar-track {
   background: transparent;
 }
-.tool-result::-webkit-scrollbar-thumb,
-#chat-input::-webkit-scrollbar-thumb {
+::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.18);
   border-radius: 2px;
 }
-.tool-result::-webkit-scrollbar-thumb:hover,
-#chat-input::-webkit-scrollbar-thumb:hover {
+::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.32);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* ── AI Chat messages ─────────────────────────────────────────── */
@@ -2242,8 +2206,7 @@ html, body {
   overflow-y: auto;
   padding: 6px 8px;
 }
-#chat-drawer-list::-webkit-scrollbar { width: 4px; }
-#chat-drawer-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+/* 历史抽屉滚动条沿用全局统一外观（见「统一细滚动条」一节） */
 
 /* ── New conversation button ──────────────────────────────────── */
 #chat-new-btn {
@@ -2364,7 +2327,7 @@ html, body {
   background: rgba(255, 255, 255, 0.12);
 }
 
-/* 思考档位：三档分段（快速 / 思考 / 深度） */
+/* 思考开关：两档分段（开 / 关） */
 .chat-more-seg {
   display: flex;
   gap: 2px;
@@ -3060,7 +3023,6 @@ html, body {
 .chat-more-actions button,
 #chat-tools-save,
 .approval-btn,
-.approval-batch-card .approval-copy-btn,
 .memo-save-btn,
 .memo-clear-btn,
 .memo-item-actions button {
@@ -3074,12 +3036,176 @@ html, body {
   box-shadow: none;
 }
 
-/* C 组 ─ 圆形小按钮：恢复原样（不再叠加背景图案） */
+/* C 类 ── 圆形小按钮：恢复原样（不再叠加背景图案） */
 .file-chip-remove:hover,
 .result-item-remove:hover,
 .history-item-delete:hover,
 .msg-actions button:hover {
   background-image: none;
   box-shadow: none;
+}
+
+/* ── 详细搜索大界面（双击搜索栏进入；见 docs/ai-spec.md §2.1.2）────────
+   毛玻璃语言与 #search-bar / #results-container 完全一致（同一套变量、同一圆角、
+   同一阴影）；结果条目直接复用 .result-item / .result-item-icon / -content /
+   -title / -desc / -badge（见上方 972 起的定义），所以这里只补面板骨架与筛选条。
+   滚动条走文件顶部那条**全局** ::-webkit-scrollbar，这里禁止再声明
+   scrollbar-width / scrollbar-color（会把 WebView2 打回系统默认外观）。 */
+#app.detail-mode #search-bar,
+#app.detail-mode #results-container {
+  display: none;
+}
+
+#detail-panel {
+  display: none;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  pointer-events: auto;
+  background: var(--surface-glass);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+#app.detail-mode #detail-panel {
+  display: flex;
+}
+
+#detail-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  min-height: 52px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-glass);
+}
+
+#detail-head button {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+#detail-head button:hover {
+  background: var(--surface-glass-hover);
+  color: var(--text);
+}
+
+#detail-input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 1.15rem;
+  line-height: 1.3;
+  caret-color: var(--accent);
+}
+
+#detail-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.45;
+}
+
+#detail-count {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+#detail-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-glass);
+}
+
+#detail-tabs,
+#detail-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.detail-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid transparent;
+  cursor: pointer;
+  user-select: none;
+}
+
+.detail-chip:hover {
+  background: var(--surface-glass-hover);
+  color: var(--text);
+}
+
+.detail-chip.active {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--text);
+}
+
+#detail-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px 10px;
+}
+
+.detail-group-title {
+  padding: 8px 8px 4px;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+#detail-results .result-item {
+  padding: 7px 10px;
+}
+
+/* 危险动作（关机 / 重启）二次确认期间标红，其余与普通条目一致 */
+#detail-results .result-item.danger-armed {
+  background: rgba(192, 138, 138, 0.16);
+}
+
+.detail-danger {
+  color: var(--red);
+}
+
+#detail-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 12px;
+  min-height: 26px;
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-glass);
 }
 

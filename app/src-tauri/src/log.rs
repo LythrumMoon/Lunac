@@ -296,6 +296,27 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// 凭据的**末 4 位**（空串 → `(empty)`；不足 5 位 → `****`，太短就没有「末 4 位」可言）。
+///
+/// 用途：日志里分辨「现在生效的是哪一把 key」。真实的坑是**改了凭据不生效**
+/// （`.env` 与另一份配置各执一词，2026-09-15 的 401 就是这么来的）——
+/// 有末 4 位就足以定位是哪一份在生效，而又不足以复原整把 key。
+///
+/// 调用方请把它写成 `key_tail=d423` 这种标签再拼进日志：`SECRET_KEYS` 只认
+/// `api_key` / `token` / `secret` 等**精确**键名，`key_tail` 不会被 `mask_secrets`
+/// 二次打码（也正因如此才留得住末 4 位）。
+pub fn key_tail(secret: &str) -> String {
+    let s = secret.trim();
+    if s.is_empty() {
+        return "(empty)".to_string();
+    }
+    let n = s.chars().count();
+    if n <= 4 {
+        return "****".to_string();
+    }
+    s.chars().skip(n - 4).collect()
+}
+
 /// 敏感键名：命中后其「值」整体打码。判据是键名后（可含空格）紧跟取值符
 /// （`:` / `=` / 引号），这样 `"max_tokens":8192` 里的 `token` 不会被误伤。
 const SECRET_KEYS: [&str; 9] = [
@@ -422,6 +443,18 @@ mod tests {
         let masked = mask_secrets(s);
         assert!(!masked.contains("abcdef123456"), "secret leaked: {masked}");
         assert!(masked.contains("deepseek-flash"), "non-secret mangled: {masked}");
+    }
+
+    /// 末 4 位是「改了 key 却没生效」这类问题唯一的现场线索，必须留得住 ——
+    /// 既不能被 `mask_secrets` 二次打码，太短的 key 也不能整段漏出去。
+    #[test]
+    fn key_tail_survives_masking_but_real_key_names_do_not() {
+        assert_eq!(key_tail("sk-46a5ed7ca9e54cfd9603d6113e85d423"), "d423");
+        assert_eq!(key_tail("   "), "(empty)");
+        assert_eq!(key_tail("ab"), "****");
+
+        assert_eq!(mask_secrets("key_tail=d423"), "key_tail=d423");
+        assert_eq!(mask_secrets("api_key=d423"), "api_key=***");
     }
 
     #[test]

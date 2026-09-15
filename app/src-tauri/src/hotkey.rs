@@ -26,7 +26,7 @@
 //    持久化到 <exe 根>\config\hotkey.json。
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
@@ -84,8 +84,19 @@ static HOTKEY_VK: AtomicU32 = AtomicU32::new(VK_SPACE);
 pub static QUERY_EMPTY: AtomicBool = AtomicBool::new(true);
 /// 设置面板正在录制快捷键（Esc 应取消录制而非隐藏窗口）
 pub static RECORDING: AtomicBool = AtomicBool::new(false);
-/// 插件结果面板正在展示（Esc 应关闭面板而非隐藏窗口）
-pub static PLUGIN_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 当前「界面层」。**Esc 的隐藏判据看层，不看内容**（2026-09-15 修正）。
+///
+/// 旧实现用「query 空 + chips 空 + 非插件态 ⇒ 隐藏」。详细搜索大界面把查询词放在
+/// `#detail-input`、简洁搜索栏是空的 ⇒ Esc 在详情态直接把整个窗口隐藏（用户报的 bug）。
+/// 根因是拿「有没有内容」代理「有没有层」，而这个代理在「内容在别处」的界面上必然失效。
+///
+/// 为什么用**单一枚举**而不是「每个界面一个 AtomicBool」：后者每加一个界面都要
+/// 改这里的 Esc 分支，且前端变量与 Rust 原子量是两个真相源、漏同步一处行为就漂。
+/// 现在新增界面 = 加一个常量 + 前端加一支处理，Rust 分支数不变。
+pub const UI_MODE_MAIN: u8 = 0;   // 简洁搜索（唯一的「按内容判空」层）
+pub const UI_MODE_PLUGIN: u8 = 1; // 插件 / AI 对话大界面
+pub const UI_MODE_DETAIL: u8 = 2; // 详细搜索大界面（双击搜索栏进入）
+pub static UI_MODE: AtomicU8 = AtomicU8::new(UI_MODE_MAIN);
 /// 窗口处于独立界面模式（前台守卫不应自动隐藏）
 pub static DETACHED: AtomicBool = AtomicBool::new(false);
 /// 搜索栏文件泡泡框是否为空（由 set_chips_empty 命令同步），
@@ -867,14 +878,23 @@ fn install_hook_thread() {
                         .get()
                         .map(|a| a.emit("lunac-esc-cancel-rec", ()).is_ok());
                     eprintln!("[lunac::hotkey] Esc({src}): recording -> cancel ok={:?}", ok);
-                } else if QUERY_EMPTY.load(Ordering::SeqCst) && CHIPS_EMPTY.load(Ordering::SeqCst) && !PLUGIN_ACTIVE.load(Ordering::SeqCst) {
+                } else if UI_MODE.load(Ordering::SeqCst) != UI_MODE_MAIN {
+                    // 处在插件 / 详细搜索等「大界面层」：层还没退完，一律交给前端逐级退出。
+                    // **不看 query/chips 是否空**——详细搜索把内容放在自己的输入框里，
+                    // 简洁搜索栏本来就是空的，按内容判空会在详情态误隐藏整个窗口。
+                    let mode = UI_MODE.load(Ordering::SeqCst);
+                    let ok = APP
+                        .get()
+                        .map(|a| a.emit("lunac-esc-clear", ()).is_ok());
+                    eprintln!("[lunac::hotkey] Esc({src}): ui_mode={mode} (non-main) -> emit clear ok={:?}", ok);
+                } else if QUERY_EMPTY.load(Ordering::SeqCst) && CHIPS_EMPTY.load(Ordering::SeqCst) {
                     eprintln!("[lunac::hotkey] Esc({src}): all empty -> hide");
                     hide_window();
                 } else {
                     let ok = APP
                         .get()
                         .map(|a| a.emit("lunac-esc-clear", ()).is_ok());
-                    eprintln!("[lunac::hotkey] Esc({src}): chips/query/plugin -> emit clear ok={:?}", ok);
+                    eprintln!("[lunac::hotkey] Esc({src}): chips/query -> emit clear ok={:?}", ok);
                 }
                 let _ = io::stderr().flush();
             }
@@ -985,7 +1005,10 @@ pub fn start_hotkey(app: AppHandle) {
             }
 
             // ── Foreground guard ───────────────────────────────────────
-            if !DETACHED.load(Ordering::SeqCst) && !PLUGIN_ACTIVE.load(Ordering::SeqCst) {
+            // 插件态可能正在跑长任务（AI 流式、OCR），不许失焦即隐藏；
+            // 详细搜索是被动视图、没有在跑的东西，故照旧允许自动隐藏
+            // —— 这里刻意只排除 PLUGIN，不是「非 Main 全排除」，以免顺手改了既有行为。
+            if !DETACHED.load(Ordering::SeqCst) && UI_MODE.load(Ordering::SeqCst) != UI_MODE_PLUGIN {
                 let fg = GetForegroundWindow();
                 if fg != 0 && fg != hwnd {
                     let now = GetTickCount();

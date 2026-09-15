@@ -87,6 +87,39 @@ Lunac 自动检测 Windows 系统显示语言（`GetUserDefaultUILanguage`），
 
 **热更新**：`setLanguage(tag)` 切换运行时语言 + 持久化到 localStorage，无需重启。
 
+### 2.1.2 详细搜索大界面（2026-09-15，双击搜索栏进入）
+
+简洁搜索旁边多一层**可选的**大界面：**在搜索栏上双击**即进入，Esc / 返回按钮退出。定位参照 Windows `Win+S`：一个大面板、结果**分组**、能搜文件与系统设置。**简洁搜索的一切行为不变** —— 进大界面只是叠一层视图，退出时把查询词带回搜索栏并重跑一次简洁搜索。
+
+| 面 | 约定 |
+|---|---|
+| 进入 / 退出 | 双击 `#search-bar`（`pluginActive` / `detached` / 已在大界面时忽略，插件锁定态的双击仍走既有的「分离窗口」）；退出口 = 返回按钮 **或 Esc**（见下一行的「界面层」）。隐藏窗口后重新唤出会自动落回简洁搜索（`lunac-window-shown` 里 `exitDetailSilently()`） |
+| **Esc 与「界面层」** | Rust 侧 `hotkey.rs` 有唯一一个**界面层枚举** `UI_MODE`（`main` / `plugin` / `detail`，由前端 `set_ui_mode` 同步）。Esc 的判据是**层**，不是内容：`RECORDING` → 取消录制；`UI_MODE != main` → **无条件 emit `lunac-esc-clear`**（层还没退完，交给前端）；`main` 且 query/chips 空 → 隐藏窗口；否则清内容。**禁止改回「query 空 + chips 空 + 非插件态 ⇒ 隐藏」** —— 详情态的查询词在自己的输入框里、简洁搜索栏本来就是空的，按内容判空会让一下 Esc 直接隐藏整个窗口（2026-09-15 修掉的 bug）。前端 `handleEscClear()` 的分支顺序：抽屉 → **详情大界面**（`exitDetail()`，把词带回搜索栏）→ 插件 → 泡泡 → 文本 |
+| 窗口尺寸 | 固定档 **640 × zoom**（`DETAIL_HEIGHT`，与插件态 600/520/360 同一套「设计 px × zoom = DIPs」算法），且**不进高度滑动动画**（离散切换，滑动只属于搜索/结果态） |
+| 分类 | 六个 Tab（全部 / 应用 / 文件 / 设置 / 系统动作 / 命令），**Tab 键循环切换**；切分类只筛已有结果、不重新查询。结果按 应用 → 文件 → 设置 → 系统动作 → 命令 → 网络搜索 分组显示（带组标题） |
+| 文件类型 | 顶部一排类型胶囊（全部类型 / 文件夹 / 文档 / 图片 / 视频 / 音频 / 压缩包 / 程序 / 其他）。**这是唯一走后端重查的筛选**（`search_files(kind)`），值必须与 `file_indexer::Kind` 一一对应 |
+| 数据源 | 应用 = `search_apps`；文件 = `search_files`（文件索引）；设置页 + 系统动作 = `system_catalog`（几十条，**前端本地匹配**）；命令 = `pluginRegistry.search`；网络搜索 = `web-search` 插件（回车兜底） |
+| 键盘 | ↑↓ 选择（跨分组连续）、Enter 打开、Tab / Shift+Tab 切分类。Enter 落在空分类时 → 直接用输入内容走网页搜索 |
+| 危险动作 | 关机 / 重启（目录里唯一 `danger: true` 的两条）**二次确认**：第一次 Enter 只把标题换成「再按一次 Enter 确认：…」并标红，3 秒内再按一次才执行 |
+| 图标 | 应用 / 文件用系统图标（`get_app_icon`，异步回填 + token 作废旧回包）；插件用 `pluginIconSvg`；设置 / 动作条目用目录数据里的 emoji（列表项图标，非功能按钮 —— 见 [icon-style.md](./icon-style.md) §4） |
+
+**文件索引**（`app/src-tauri/src/file_indexer.rs`）：与「应用列表」同一套纪律 —— 唯一存储是 `<exe 根>\temp\file-index-cache.json`，**搜索路径只读内存索引、永不扫盘**；扫盘只在后台线程（启动 600ms 后 / UI 上的「重建索引」按钮），写回原子（临时文件 + rename）。
+
+| 项 | 值 / 理由 |
+|---|---|
+| 扫描范围 | 系统盘（`%SystemDrive%`）→ **只扫 `%USERPROFILE%`**；其它固定盘（`GetDriveTypeW == DRIVE_FIXED`，手写 FFI）→ 全盘扫。Windows / Program Files 里没有用户要找的文件，却是扫盘耗时的大头 |
+| 存储形态 | **不存整条路径**：存「目录表下标 + 文件名 + 分类枚举 + 修改时间」。实测本机用户目录就有 19.6 万条，路径版缓存 20 万条 = 47.8MB，紧凑版 30 万条 = 30.8MB。全路径只在**返回命中的那几条**时拼回（`FileHit::path`） |
+| 匹配 | 全部**大小写无关、零分配**（`eq_ci` / `starts_with_ci` / `find_ci`）：精确 1000 > 前缀 700 > 包含 500 > 多词全中 400，同分按修改时间倒序。**空查询 = 最近修改的文件**（Win+S 的空态语义） |
+| 遍历顺序 | **广度优先**。截断是常态，BFS 保证浅层文件先入索引；深度优先会把预算全喂给第一个子目录，用户看到的是「随机缺文件」 |
+| 上限 | 条数 `MAX_ENTRIES = 300_000`（到顶即停并标记 `truncated`，UI 如实显示「索引不完整」）、深度 12、跳过 `SKIP_DIRS`（Windows / AppData / node_modules / target / .git / Temp…） |
+| 刷新节流 | 缓存 **24 小时**才算过期。实测扫一遍十几秒，绝不能每次启动都重扫（开机自启场景尤其不能）；想立刻纳新文件点「重建索引」 |
+| 就绪前 | 索引没载入 / 正在扫 → `search_files` 返回空数组，界面显示「正在建立文件索引…」（每 2 秒轮询状态，就绪后自动补一次查询）。**绝不在搜索线程里同步扫盘** |
+
+**系统设置与系统动作**（`app/src-tauri/src/system_catalog.rs`）：静态表 41 个常用 `ms-settings:` 页面 + 10 个系统动作，两条安全约束：
+
+- **`open_setting` 只接受 `ms-settings:` 前缀**，`run_system_action` **只认白名单 id**（绝不接受前端传来的命令行字符串）—— 前端能传什么，后端就只认什么，不给「任意 URI / 任意程序执行」开口子。
+- 条目名给 **zh / en 两套**（前端按系统语言取一套）。**不给五种语言**：Windows 设置页的名字是 OS 自己的资源，我们拿不到官方译名；搜索关键词里同时放中英与拼音首字母，所以任何语言下都搜得到。UI 外壳文案（Tab / 类型 / 提示）照旧走 i18n 五语言。
+
 ### 2.2 后端 — Rust 原生功能
 
 | 功能 | 文件 | 实现方式 |
@@ -99,6 +132,8 @@ Lunac 自动检测 Windows 系统显示语言（`GetUserDefaultUILanguage`），
 | AI 后台预加载 | `main.rs` + `commands.rs` | 启动时后台 `thread::spawn` 启动 proxy_server 内置代理，就绪后 `AI_READY` 置位 + emit `ai-ready`；退出时 `WindowEvent::Destroyed` 统一 kill |
 | 子进程清理 | `main.rs` | `Destroyed` 事件 kill CLI + proxy 两个进程 + `taskkill` 清端口 5173 |
 | OCR 引擎按需部署 | `paddle_ocr.rs` + `commands.rs` | PaddleOCR-json（`.7z` 约 88MB / 解压约 300MB）**不入库**；`ocr_engine_status` 查询、`ocr_engine_install` 后台下载 GitHub Release → `sevenz-rust` 解压到 staging → 校验 exe+config → 原子替换到 `<exe 根>\paddle-ocr`，进度经 `ocr-engine-progress`/`ready`/`error` 事件回传 |
+| 文件索引（详细搜索） | `file_indexer.rs` | `temp\file-index-cache.json` 唯一真相；搜索只读内存索引、永不扫盘；后台扫盘（启动 600ms 后 / 手动重建）+ 原子写；见 §2.1.2 |
+| 系统设置与动作目录 | `system_catalog.rs` | 静态表（41 个 `ms-settings:` 页 + 10 个动作）；`open_setting` 只认 `ms-settings:` 前缀、`run_system_action` 只认白名单 id；见 §2.1.2 |
 
 ### 2.3 热键 — 双后端 + 三层兜底（2026-09 修订）
 
@@ -132,8 +167,9 @@ Lunac 自动检测 Windows 系统显示语言（`GetUserDefaultUILanguage`），
 ```
 
 窗口高度由 JS `applyWindowSize()` 决定（2026-08-16 起改为**实测驱动**，取代 item-count 预测）：
-- **搜索/结果/空态**：`measurePanelHeight()` 用 `getBoundingClientRect().bottom` 实测 搜索栏/结果区/状态栏 最底者——该 API 返回**含 CSS zoom 的视觉尺寸**（WebView2 下=逻辑像素 DIP），直接喂 `LogicalSize`，无需再乘 zoom。`#app` 为 `height:auto`（内容驱动），`#app.plugin-active`/`.detached` 才 `height:100%`（插件固定高窗口，面板内部滚动）。
+- **搜索/结果/空态**：`measurePanelHeight()` 用 `getBoundingClientRect().bottom` 实测 搜索栏/结果区/状态栏 最底者——该 API 返回**含 CSS zoom 的视觉尺寸**（WebView2 下=逻辑像素 DIP），直接喂 `LogicalSize`，无需再乘 zoom。`#app` 为 `height:auto`（内容驱动），`#app.plugin-active`/`.detached`/`.detail-mode` 才 `height:100%`（固定高窗口，面板内部滚动）。
 - **插件模式（固定高度 × zoom = DIPs）**：独立插件窗口（detached）600px、OCR detached 520px、内嵌插件视图 360px。
+- **详细搜索大界面（2026-09-15）**：固定 **640px × zoom**（`DETAIL_HEIGHT`）。与插件模式同性质 = 离散跳变，**不进高度滑动动画**（`requestWindowHeight` / `animateWindowHeight` 里与 `pluginActive` 同条件排除）。
 - **防抖与防循环**：`scheduleApplySize()` 60ms 防抖；`requestedHeight` + `currentWindowHeight` 双守卫跳过重复 setSize；onResized 检测宽度变化/外部改高后重置重断言；`ResizeObserver` 观察 `#app` 兜底内容变化。
 - 宽度固定设计 800px（`WIN_WIDTH`），窗口宽度变化经 CSS `zoom`（clamp 0.6~2.5）等比缩放内容；`onResized` 载荷为 PhysicalSize，用启动快照 `BASE_DPR` 换算回逻辑宽度。
 
@@ -162,9 +198,8 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 ### 3.2 模式说明
 
-- **对话模式**：应用始终运行 Agent 进程（`ai_mode` 恒为 "agent"；`set_ai_mode` 拒绝其他值），但提供**对话级模式切换**：
-  - **Agent 模式**（默认）：完整工具链 + skills + 权限审批
-  - **简单问答模式**：复用同一 agent.exe，发送消息时注入"直接回答、勿用工具/skills"软约束提示词（`buildSimpleChatHint`），替代已删除的 chat.rs 简单模式；前端按钮 `#chat-mode-btn` 切换，localStorage `lunac-chat-mode` 持久化
+- **对话模式**：应用始终运行 Agent 进程（`ai_mode` 恒为 "agent"；`set_ai_mode` 拒绝其他值）。唯一的对话级开关是**思考开关**（开 / 关）：
+  - **思考开关**：`on` / `off` 两档，UI 在输入栏 ⋯ 菜单里（`#chat-mode-seg`），localStorage `lunac-chat-mode` 持久化，切换即重启 agent。端点为什么只配两档见 §3.5「思考开关跨模型自适应」。旧的 simple / agent 模式切换（`#chat-mode-btn` / `buildSimpleChatHint`）已废弃。
 - **权限审批**：agent 发 `can_use_tool` control_request → 前端卡片（`showPermissionCard` + 内置安全前缀 / 白名单 / 危险命令黑名单）→ 回包前 agent 阻塞等待（P2 已接通，超时 300s 按拒绝）
 - **工作区**：`AppState.workspace` 决定 agent.exe 的 cwd 与 `--add-dir`；为空回退用户主目录（整个系统可访问，敏感操作走 ask 弹卡）
 
@@ -184,7 +219,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 权限审批 | `main.ts` `showPermissionCard` | 多请求合并为单批处理卡片，pending 期间状态栏显示"对话已暂停"；白名单/安全前缀自动放行，危险命令只给手动确认（P2 已接通） |
 | 工具卡片 | `main.ts` `agentNewBlock("tool")` / `agentToolArgsDelta` / `agentToolResult` | `content_block_start(tool_use)` + `input_json_delta` 流式展开参数，`tool_result` 内联成功/失败（P1 起真正生效） |
 | 工作区设置 | `main.ts` AI 对话输入栏 `#chat-workspace-btn`（唯一入口） | 选择目录/重置 → `invoke("set_workspace")` + 重启 CLI；默认=用户主目录（整个系统可访问） |
-| 简单问答切换 | `main.ts` `#chat-mode-btn` + `buildSimpleChatHint` | 软约束"勿用工具/skills"，状态栏显示当前模式 |
+| 思考开关 | `main.ts` `#chat-mode-seg`（输入栏 ⋯ 菜单内）+ `set_thinking_mode` | `on` / `off` 两档 → `LUNAC_THINKING` → agent 侧 `Thinking`（见 §3.5「思考开关跨模型自适应」）；切换重启 agent |
 | Token 仪表盘 | `main.ts` `addUsageToTotals` / `updateTokenDashboard` / `appendUsageLog` | 计费口径：Hit=缓存读取，Miss=普通输入+缓存写入，Total=四类 token 之和。**数值 = 本地用量日志的「今日累计」**（每次提问落一行 JSONL，见 §3.5「用量与对账」），可与供应商平台按天对账 |
 
 ### 3.5 自研 agent 核心 `core-agent/`（2026-09，已接线）
@@ -202,10 +237,10 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 面 | 内容 |
 |---|---|
-| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `MAX_THINKING_TOKENS`（思考档位）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_PROVIDER` + `LUNAC_SEARCH_KEY`（WebSearch 主源的服务商与密钥，服务商可选 bocha / tavily / exa / firecrawl；缺任一项则只用无 key 的 Bing / 百度兜底源）、`LUNAC_LOG_DIR`（宿主注入的日志目录 = `<exe 根>\temp\logs`）、`LUNAC_LOG`（`off` = 关闭落盘日志）、`LUNAC_LOG_LEVEL`（`error\|warn\|info\|debug`，默认 `info`；见 §11 规则 20） |
+| env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `LUNAC_THINKING`（思考开关：`off` = 关，其余 = 开；见 §3.5「思考开关跨模型自适应」）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_PROVIDER` + `LUNAC_SEARCH_KEY`（WebSearch 主源的服务商与密钥，服务商可选 bocha / tavily / exa / firecrawl；缺任一项则只用无 key 的 Bing / 百度兜底源）、`LUNAC_LOG_DIR`（宿主注入的日志目录 = `<exe 根>\temp\logs`）、`LUNAC_LOG`（`off` = 关闭落盘日志）、`LUNAC_LOG_LEVEL`（`error\|warn\|info\|debug`，默认 `info`；见 §11 规则 20） |
 | 启动参数 | `--add-dir <dir>`（可重复，工作区外追加可访问目录）/ `--permission-mode plan`（只读）/ `--dangerously-skip-permissions`（忽略工作区锁）/ `--permission-prompt-tool stdio`（写类工具先审批）/ `--disallowedTools <name…>`（这些工具不进请求体）/ `--mcp-server stdio:<exe 路径>`（拉起该 exe 的 MCP server 并接入其工具，P3）；其余（`--print` / `--verbose` / `--input-format stream-json` / `--include-partial-messages` …）一律接受并忽略 |
 | stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"\|"deny",…}}}` 为审批回包（P2，由 stdin 线程按 request_id 直接投递给等待中的工具调用） |
-| stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
+| stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`，瞬时失败退避重试时补发，前端解析分支早已就绪）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
 
 **P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮按 `history.truncate(base)` 整体回滚，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
 
@@ -237,6 +272,26 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | `--dangerously-skip-permissions`（前端「完全」档） | 忽略工作区锁 |
 
 **P2 审批实现要点**：一批工具**先全部发请求、再逐个等回包**（前端才能把连续 Bash 合并成一行一次性决定，见 `findLastBashGroup`）；`updatedInput` 为非空对象时覆盖原参数，空对象表示按原参数执行；`behavior=deny` 转成 `is_error=true` 的 `tool_result` 交回模型（模型可改方案），回包带 `interrupt=true` 则本轮就此结束；等待上限 300s，超时按拒绝处理并回一条 `control_cancel_request` 让前端撤掉卡片。回包由 stdin 线程按 `request_id` 直接投递给等待中的调用，不进主消息队列。
+
+**命令静态安全分析（Bash / PowerShell，2026-09）**：`can_use_tool` 请求体里多了一个**可选字段** `analysis`（实现见 [core-agent/src/bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)）：
+
+```json
+{"type":"control_request","request_id":"req_…","request":{
+  "subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tu_1",
+  "input":{"command":"del /f/s/q %TMP%"},
+  "analysis":{"dangerous":["强制删除"],"opaque":["变量展开"]}}}
+```
+
+| 项 | 约定 |
+|---|---|
+| 为什么在 agent 侧 | 前端只拿到命令字符串，正则挡不住 ① 引号拼接（`r""m -rf /`）② 包装器（`cmd /c "del /f/s/q …"`、`powershell -Command "…"`、`bash -c '…'`）③ 变量（`%TMP%\x.bat`、`$env:TEMP\x`）④ 串联/管道的**后半段**（`echo hi & shutdown /r`）。agent 能拿到原命令并按子命令结构化拆分 |
+| 判定不代替决策 | agent **只上报判定**，不拒绝执行 —— 「自动放行 / 弹审批」仍是前端的唯一决策点（规则 21）。这样「用户明确点允许」依然能放行 |
+| `dangerous` | 命中的危险规则标签（中文）。**非空 ⇒ 任何运行方式档位都必须人工确认，且不提供「始终允许」**（与 `CMD_BLACKLIST` 同等强度，但不可被引号/变量/管道绕过） |
+| `opaque` | 含**无法静态判定**的成分。**判据 2026-09 收窄** —— 只拦「不知道要跑**哪个程序**」：① **命令词本身**是变量（`$cmd …` / `!CMD! …` / `%CMD% …`）；② 命令替换 `$(…)`（内层命令会被执行，而我们没分析它）；③ cmd 的 `%VAR%`（cmd 在解析阶段展开，值里的 `&` `|` 会变成新命令）；④ 编码执行（`-EncodedCommand`、`FromBase64String`）；⑤ 间接执行器（`certutil`/`wscript`/`cscript`/`mshta`/`rundll32`/`regsvr32`）；⑥ 动态启动进程（`Start-Process`）；⑦ 包装器嵌套过深、控制字符。**参数里的变量不再算**（`Get-ChildItem $HOME`、`$f = "…"; Get-Item $f` 是普通命令，`$HOME`/`$env:TEMP` 的展开结果不会被重新解析成**命令**）—— 旧口径把参数变量一并拦下，导致「自动」档位下每条带 `$` 的命令都弹卡。**非空 ⇒ 不得自动放行**（fail-closed：判不出来就当「要人看」） |
+| 规则口径 | 覆盖 Windows 两类 shell：递归/强制删除、格式化与分区、覆写物理磁盘、注册表、引导配置、系统还原点/备份、关机重启、强制结束进程、权限修改、账户/服务/计划任务、动态执行，以及 git 强制推送 / `reset --hard` / `clean -f` / `branch -D`。**单引号是字面量、双引号会展开**（三种 shell 一致）：`echo 'rm -rf /'` 不误报，`bash -c 'rm -rf /'` 仍会被递归解析出内层 |
+| 前端兼容 | **缺字段时回落到前端自己的正则**（`CMD_BLACKLIST`），旧 agent 照常工作；字段存在时**以 agent 判定为准**，正则降为二道网。`tool_result` 文本不变 |
+| 白名单化限制 | 解释器/启动器前缀（`cmd` / `powershell` / `bash` / `python` / `node` / `npx` / `iex` / `env` / `schtasks`…）**永不进白名单** —— 白名单是前缀匹配，放进去等于把「以后任何 `powershell …`」全自动放行；`opaque` 命令同样不给「始终允许」 |
+| 落盘 | 命中时写一条 `warn`（只记标签，不记命令原文，避免把命令里的凭据抄进日志；仍过 `mask_secrets`） |
 
 ✅ **档位已可切换（2026-09）**：两个入口共用 `set_security_profile`（`restart=true` 才重启 agent）——① 设置 · AI 面板的**安全档位**下拉（只读 / 项目 / 完全，边界 = 允不允许）；② AI 输入栏的**运行方式**胶囊（手动 / 白名单 / 自动，频率 = 问不问，「自动」档映射 `full`）。两者关系、自动档二次确认与常驻警示、越界卡片的三个动作见 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md) §4，规则见 §11 规则 21。
 
@@ -270,7 +325,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 |---|---|
 | 选型原因 | 兜底源必须**免 key 且国内可达**：原选的 DuckDuckGo 实测在本机（国内）15s 超时（`html.duckduckgo.com` 与 lite 版都连不上），等于「不配 key 也能搜」是假的；Bing（`www` / `cn` 均 200，<600ms）与百度（200，1.5s）均通。抓取之所以是「结果页」而不是 API：**Bing Search API 已于 2025-08-11 全部退役**（老 key 返 410 Gone、不再接受新注册），官方替代「Grounding with Bing Search」是绑定 Azure 项目的 AI 平台产品、不是 SERP API；DuckDuckGo / 百度同样没有公开免费的 SERP API |
 | 主源服务商 | `bocha`（博查，`api.bochaai.com/v1/web-search`，国内直连、中文结果最好，注册只需微信扫码）/ `tavily`（`api.tavily.com/search`，`Authorization: Bearer`）/ `exa`（`api.exa.ai/search`，`x-api-key`）/ `firecrawl`（`api.firecrawl.dev/v2/search`）。四家只差 endpoint / 鉴权头 / 响应字段名，共用一个 `post_json()` + `json_hits()`。**不做「猜服务商」**：服务商没选或名字不认识就退回兜底源并说明原因 —— 猜错等于把密钥发给无关的第三方服务器 |
-| key 存放 | `src-tauri` 的 `AI_SEARCH_PROVIDER` / `AI_SEARCH_KEY`（`set_ai_config` 写入、`get_ai_config` 回读），注入 agent.exe 的 `LUNAC_SEARCH_PROVIDER` / `LUNAC_SEARCH_KEY`（`configure_agent_env` + `start_cli_process` 两条路径都要给）；**空串 = 删除**，前端每次都回传输入框当前值。前端另存 localStorage `lunac-ai-config.search_provider` / `.search_key` —— 进程重启后 env 会丢，不还原就每次开机都退化成兜底源 |
+| key 存放 | **唯一真相源 = `<exe 根>\config\ai.json`**（`storage::load_ai_config` / `save_ai_config`，`set_ai_config` 写入并注入 env、`get_ai_config` 回读），启动时 `commands::apply_saved_ai_config()` 把它注入 `AI_SEARCH_PROVIDER` / `AI_SEARCH_KEY`，再经 `configure_agent_env` → agent.exe 的 `LUNAC_SEARCH_PROVIDER` / `LUNAC_SEARCH_KEY`（`configure_agent_env` + `start_cli_process` 两条路径都要给）；**空串 = 删除**，前端每次都回传输入框当前值。**不再用 localStorage**（它会覆盖 `.env`，见 §11 规则 2） |
 | 回落语义 | 未选服务商 / 未配 key / 服务商名未知 / 主源报错 / 主源 0 结果 → 走抓取兜底，结果尾部附 `[fallback] <原因>`；兜底三家按 **Bing RSS → Bing HTML → 百度** 顺序试，全失败则整条 `Err`（进 `is_error=true` 的 `tool_result`，原因含三家各自的报错），**不编造结果** |
 | 抓取限流 | 进程内 `OnceLock<Mutex<Instant>>` 强制两次抓取间隔 ≥1.1s；HTTP 202 / 429 视为限流并显式报错（区分「被限流」与「没结果」）；响应里连结果容器（`<item>` / `b_algo` / `result c-container`）都没有时**报错**而不是返回空列表 —— 不把「改版/被反爬」说成「没搜到」 |
 | 解析要点 | Bing RSS 是首选（干净 XML、`<link>` 就是真实 URL、无跳转壳），先切 `<item>` 块再在块内取字段（通道级同名标签会串）；Bing HTML 取 `<h2><a href>` + 就近 2KB 内的 `b_caption` 摘要；百度取 `class="result c-container"` 容器的 `mu="真实URL"`（**不必跟 `baidu.com/link?url=` 的 302**）+ 块内 `<h3>` 标题，摘要字段不稳定故留空 |
@@ -278,15 +333,59 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 审批 | 在 `needs_approval` 与 `gated_in_read_only` 里（查询词是外部出口），**plan 档同样弹审批**；前端工具黑名单候选名单同步补 `WebSearch` |
 | 不新增依赖 | 解析全部用既有 `regex` + `serde_json`（`head_chars()` 按 UTF-8 边界截断，避免中文页面切片 panic） |
 
-**思考档位跨模型自适应**（2026-09）：档位由 src-tauri 的 `MAX_THINKING_TOKENS` 传入（0=fast 不思考 / 8192=think / 32768=deep）。各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、原生 Messages 端点的新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
+**思考开关跨模型自适应**（2026-09；2026-09-15 由「fast/think/deep 三档」收敛为**开 / 关**）：开关由 src-tauri 的 `LUNAC_THINKING` 在 spawn 时传入（`off` = 关，其余含未设置 = 开）。
+
+**为什么不做「思考力度 / 深度」档位**（实测，2026-09-15）：本端点没有这个旋钮 ——
+
+| 探测 | 结果 | 含义 |
+|---|---|---|
+| `budget_tokens` = 1 / 1024 / 32768 | 思考量**完全一样** | 预算**不被 enforce** |
+| `output_config.effort` / `reasoning_effort` | 200 但行为无变化 | 被当**未知字段静默忽略** |
+| 顶层未知字段 `foo=bar` | 200 | 端点不校验未知字段 |
+| `thinking.type = nonsense` / `budget_tokens = "abc"` | **400** | `thinking` 对象本身会校验 |
+| 不发 `thinking` 字段 | 仍在思考（`[thinking, text]`） | 默认即开，只有显式 `disabled` 才真关 |
+
+即三档在端点上本就退化成两态 ⇒ UI 只做两档，**不得再对外声称有思考深度档位**（那是端点做不到的承诺）。
+
+各供应商的 Anthropic 兼容端点对 `thinking` 字段接受度不同（DeepSeek 只认 `enabled`/`disabled`、原生 Messages 端点的新模型要 `adaptive`、Kimi 等兼容层可能完全不支持），故**不硬编码模型名单**，而是：
 
 | 输入 | 首选形态 | `max_tokens` |
 |---|---|---|
-| `MAX_THINKING_TOKENS=0` | `{"type":"disabled"}` | 8192 基线 |
-| `MAX_THINKING_TOKENS=n>0` | `{"type":"enabled","budget_tokens":n}` | `max(n+4096, 8192)` —— 端点要求 `budget_tokens < max_tokens`，deep 档 32768 配 8192 会被判非法 |
-| 未设置 | 完全不发该字段 | 8192 基线 |
+| `LUNAC_THINKING=off` | `{"type":"disabled"}` | 8192 基线 |
+| 其余（`on` / 未设置 / 值不认识） | `{"type":"enabled","budget_tokens":8192}` | `max(8192+4096, 8192)` = 12288 —— 端点要求 `budget_tokens < max_tokens` |
 
-**400 降级链**（仅当错误正文含 `thinking`/`adaptive`/`budget_tokens` 才触发，避免把「模型名不存在」这类无关 400 也白重试）：`enabled+budget → adaptive → 不带字段`；fast 档为 `disabled → 不带字段`（**不退到 adaptive**，否则等于反过来把思考打开）。降级结果缓存在进程内，后续轮次不再试错，并往 stderr 打一行说明。
+预算值来自**单一常量** `THINKING_BUDGET`（[core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)）：端点不 enforce 时它无意义，真 enforce 的端点只要一个合法值。**不得**再把它做成用户可见的档位旋钮。
+
+**400 降级链**（仅当错误正文含 `thinking`/`adaptive`/`budget_tokens` 才触发，避免把「模型名不存在」这类无关 400 也白重试）：开档为 `enabled+budget → adaptive → 不带字段`；关档为 `disabled → 不带字段`（**不退到 adaptive**，否则等于反过来把思考打开）。降级结果缓存在进程内，后续轮次不再试错，并往 stderr 打一行说明。
+
+**单条工具输出预算**（2026-09-15）：单条工具结果超过 **12000 字符**时，把**全文**落到 `temp\tool-outputs\{毫秒}-{工具名}.txt`，上下文里只内联「头 8000 + 尾 2000 + 行数 + 路径」，并告诉模型可用 `Read`（带 `offset`/`limit`）或 `Grep` 取回。
+
+| 面 | 约定 |
+|---|---|
+| 唯一出口 | `tools::apply_budget(name, body)`，只在 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `run_tool` 调用 —— 只有那一层同时拿到**工具名**与**未经裁剪的完整输出**。各工具内部一律不再自行截断（Skill / MCP 的结果也走同一出口） |
+| 为什么不做硬截断 | 旧实现超 30000 字符直接丢，模型侧**永久看不到**（只有 `LUNAC_LOG_LEVEL=debug` 能在日志里翻到），长构建日志/整页抓取经常表现成「像是什么都没输出」 |
+| 尾部必留 | 报错结论通常压在输出末尾，只留头部等于把最值钱的部分丢掉 |
+| 落盘体积 | 正文按 **1.5MB 字节**封顶（切在字符边界）—— 必须低于 Read / Grep 的 `MAX_TEXT_BYTES`(2MB) 文件门槛，否则模型读不回自己落盘的文件；被砍时预览里如实写「only the first N chars」 |
+| 可读性 | 落盘目录由 `tools::prepare_output_dir()` 在启动时建好，并**并入 `Ctx.add_dirs`** —— 默认 project 档的工作区锁会拦工作区外路径，不并入等于模型读不到自己的输出 |
+| 保留 | 启动时清理 7 天前的 `*.txt`（与落盘日志同口径）。**不新增环境变量**：目录取 `log::log_dir()` 的父目录（宿主已注入 `LUNAC_LOG_DIR`，agent 独立运行也有回退） |
+| 落盘失败 | 磁盘满 / 无权限 → 仍按内联预算收口，末尾说明改成「全文落盘失败，超出部分已丢弃」，**不**把十几万字符塞回上下文 |
+
+**真机烟测（2026-09-15，deepseek-flash，工作区锁开启）**：让 agent 跑出 4000 行 / **170906 字符**的 PowerShell 输出 → 落盘 `1789477750484-PowerShell.txt`（170906 字节，与全文一致）、内联 **10229 字符**、日志记一行「输出超预算（170906 字符 / 4001 行，全文已落盘）」。**落盘目录刻意放在工作区之外**，模型仍成功 `Read(file_path=…, offset=3900, limit=1)` 取回该行（`add_dirs` 生效），全程 **0 次 `Access denied`**。
+
+**只读工具并行**（2026-09-15）：模型一轮里可以同时发多条工具调用（真机实测 DeepSeek 一次发 4 条）。**连续的只读调用**合成一批并行执行，其余各自串行。
+
+| 面 | 约定 |
+|---|---|
+| 白名单 | `tools::parallel_safe(name)`：`Read` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `Skill` / `TodoWrite`。**写类（`Write`/`Edit`）与 `Bash`/`PowerShell` 一律不并行** —— 它们有副作用，且顺序本身就是语义 |
+| **批必须连续** | 只读段**绝不允许跨越写类调用**：否则「写 A → 读 A」会被重排成「读 A（旧内容）→ 写 A」，错得无声无息。切分见 `plan_tool_batches`，单元素的只读段**不标并行**（省一次线程 spawn，行为与串行完全一致） |
+| 并发上限 | `TOOL_PARALLELISM = 4`，靠「分块 + 块内 join」实现（不引信号量），见 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) |
+| 回灌顺序 | **恒等于 `tool_use` 的原顺序** —— 结果按下标回填 `slots`，再统一用 `tool_result_block()` 组装。并行只改变执行时机，不改变任何可观测顺序 |
+| 审批仍在并行之前 | 先把整批 `pendings` 按原顺序逐个 `await_approval`，再执行。审批顺序乱了会打乱前端按「未应答行」合并同一批命令的结果 |
+| MCP 不并行 | 只读白名单里只有内置工具 ⇒ 并行批不需要 `mcp_bridge`，顺带绕开了 `&mut Bridge` 无法跨线程共享的问题。MCP 调用永远走串行路径 |
+| 为什么只在只读上做 | dev 实测本地读取是毫秒级（`Read 3ms` / `Glob 0ms`），并行对它们收益≈0；**真正有收益的是 `WebFetch`（网络）**，而长命令（构建/测试）带副作用与全局限流，不能并行 |
+| 可观测 | 每个并行批往落盘日志记一行「只读工具并行批 N 条（并发上限 4）: Read, Read, Glob」，否则线上无法判断并行到底有没有生效 |
+
+**真机烟测（2026-09-15，deepseek-flash）**：一次提问要求「同一条回复里发起 4 个工具调用」→ 模型发出 `Read ×3 + Glob ×1`，日志记「只读工具并行批 4 条（并发上限 4）: Read, Read, Read, Glob」，四条 `tool_result` 回灌顺序与 `tool_use` 完全一致。
 
 **上下文预算与压缩**（2026-09）：端点的上下文窗口是硬限制，超了就是 400，而失败轮会整体回滚 history —— 不管理体积的话对话会「越用越死」。预算取 `LUNAC_MAX_CONTEXT_TOKENS`（默认 128000，低于 8000 视为无效），**水位以端点实测值判断**（`message_start` 的 `input_tokens + cache_read + cache_creation`，跨轮保留在 `Cfg.last_input`），比按字符估算准。两级处理，都不额外调用模型：
 
@@ -300,15 +399,28 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 压缩发生时往 stderr 与 stdout 各报一次（stdout 为 `system/context_compacted`，含 `elided` / `dropped` 计数）。**压缩会左移 `history`，调用方的失败回滚锚点 `base` 必须同步减去 `dropped`**，否则回滚会误删保留段。单条用户输入超 100000 字符先截断（防一次粘贴顶爆窗口）。
 
+**瞬时失败重试（2026-09）**：这是**请求级**重试，不是「重新生成回答」—— 只在**还没读到响应体之前**退避重试，所以**永远不会产生重复内容**。它补的是「网络一抖就整轮失败」这个可用性缺口。
+
+| 项 | 约定 |
+|---|---|
+| 覆盖范围 | ① 网络层：连接失败 / 连接重置 / 超时（`reqwest` 的 `is_builder()` 错误除外 —— URL 非法、TLS 配置错重试也不会成功）；② **429 限流**与 **5xx**（含部分兼容端点表示「过载」的 **529**） |
+| 不在此列 | 400 + thinking 相关 → 走既有「思考降级链」换形态再试；400 + 上下文超限 → 强制压缩后再试；其余 4xx（鉴权 / 参数错）→ 重试也不会变，直接报错 |
+| 次数与退避 | `MAX_API_RETRIES = 3`；首次 1s，之后 2s / 4s 指数增长，**加 0..250ms 抖动**（取系统时间亚秒位，不引 `rand`，见规则 20），`RETRY_MAX_MS = 30s` 封顶 |
+| `Retry-After` | 端点给出**秒数**时优先采用（再被 30s 封顶），HTTP-date 形态忽略（不引日期解析） |
+| 上报 | 每次退避发一条 `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`），前端据此显示重试状态；同时落盘一条 `warn`（过 `mask_secrets`） |
+| SSE 流中途断开 | **不重试**（部分内容已经流给前端了，重来会重复）—— 只记一条 `warn`，本轮回复可能不完整 |
+| 与回滚的关系 | 重试发生在 `r` 成功之前，因此不触及 `history`；只有最终仍失败才走 `finish_error` → `history.truncate(base)` |
+
 **用量与对账（2026-09）**：`result.usage` 的四个字段是**本次提问的绝对值**（agent.exe 每次提问重置计数，提问内的工具往返在本轮内累加），**不是会话累计** —— 这是旧 cli.exe 的行为，前端一度按「累计值做差」处理，会把「前缀没变」的那几轮命中缓存算成 0（两轮 `cache_read` 相同 → 差值 0），本地命中率系统性低于供应商平台。现在前端只做**直接累加**。
 
 | 项 | 约定 |
 |---|---|
 | 口径映射 | 平台「输入（命中缓存）」= `cache_read_input_tokens`；「输入（未命中缓存）」= `input_tokens`（DeepSeek 走自动缓存，实测 `cache_creation_input_tokens` 恒为 0，Anthropic 原生端点才有值）；「输出」= `output_tokens`；平台的「合计」= 三者之和 |
-| 粒度差 | 平台**按每次 API 请求**记一行，本地**按每次提问**记一行 —— 一次带工具的提问在平台上就是多行（system prompt + tools 前缀每次重发），对账时把同一时间窗的平台各行相加 |
-| 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, input, output, cacheRead, cacheCreate}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init` |
+| 粒度差 | 平台**按每次 API 请求**记一行，本地**按每次提问**记一行 —— 一次带工具的提问在平台上就是多行（system prompt + tools 前缀每次重发）。**2026-09 起这个差已被抹平**：`result.usage.requests[]` 把每次请求的明细带上，本地日志里也逐条落盘，可直接与平台逐行对账 |
+| 每次请求明细 | `result.usage.requests` = `[{in, read, create, out}]`（顺序 = 请求顺序；`in` = 该次未命中输入、`read` = 该次命中、`create` = 缓存写入、`out` = 该次输出）。agent 在每条 `message_stop` 推一条（`message_delta.output_tokens` 是**该条消息的累计值**，故用赋值而非累加）。**旧 agent 不报该字段 → 前端写空数组**；`UsageRecord.requests` 为空时**不写该键**（旧记录读时按空表） |
+| 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, input, output, cacheRead, cacheCreate, elided, dropped, requests?}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init` |
 | 读写命令 | [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs) `append_usage_log(date, record)` / `read_usage_log(date)`；`date` 只接受严格 `YYYY-MM-DD`（文件名来自前端，必须挡路径拼串）；读取时单行损坏只跳过该行 |
-| 面板数值 | token 仪表盘 = 今日日志的合计（首次显示时播种一次，之后每次提问累加），因此重启、切会话都不再清零，与平台按天统计同口径。今日发生过压缩时，命中率的 tooltip 会追加一句「压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
+| 表盘数值 | token 仪表盘 = **当前这次对话**（新建会话 / 切到别的会话即归零），提问结束实时累加；**界面不再读日志**（`read_usage_log` 命令保留，供外部对账脚本或将来做「按天用量」面板）。发生过压缩时，命中率 tooltip 会追加「本对话压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
 | 计算口径 | Hit = `cacheRead`；Miss = `input + cacheCreate`（Anthropic 的 `input_tokens` **不含**缓存两项，故不能拿它减 `cache_read`）；Total = Miss + Hit + `output` |
 
 **P3 已完成（2026-09，MCP 工具桥）**：实现在 [core-agent/src/mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)。src-tauri 在 spawn 时把 lunac.exe 自己的路径交过来（`--mcp-server stdio:<路径>`），agent **作 client** 把该 exe 以 `--mcp-server` 拉起 —— 那个进程会拦截该参数、进 stdio MCP server 模式（实现在 [mcp_server.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/mcp_server.rs)），读 `<exe 根>\tools\*.json` 的用户自定义工具（handler 有 `shell` / `http` / `builtin` 三种）。
@@ -321,7 +433,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 接入范围 | 非 plan 档启动时接一次；`--disallowedTools` 里出现原名或带前缀名即不接入；plan（只读）档**不连接**（接进来只会每次被拒，还让工具清单随档位漂移） |
 | 审批 | MCP 工具一律先发 `can_use_tool`（见上表）；deny → `is_error=true` 的 `tool_result` |
 | 顺序 | `tools/list` 的返回顺序不保证稳定，接入时**按工具名排序后再入请求体** —— tools 数组属于请求前缀，顺序一变端点侧的前缀缓存整段失效 |
-| 错误 | 上游 `isError=true`、进程退出、超时都转成 `is_error=true` 的 `tool_result`，不中断整轮；结果按内置工具同一上限（30000 字符）截断 |
+| 错误 | 上游 `isError=true`、进程退出、超时都转成 `is_error=true` 的 `tool_result`，不中断整轮；结果与内置工具走**同一预算出口**（超 12000 字符落盘、只内联头尾，见 §3.5「单条工具输出预算」） |
 | 容错 | spawn/握手失败只往 stderr 记一行并继续 —— 十一件内置工具必须照常可用；MCP server 的 stderr 直接并入 agent stderr（上游会转发到前端/终端），stdout 独占给 JSON-RPC |
 | 生命周期 | agent.exe 退出时 kill 子进程（`Drop for Bridge`）；新增/改动 `tools\*.json` 后需重启 agent.exe 才生效（与工具黑名单同一套重启流程） |
 
@@ -443,7 +555,7 @@ searchInput (总端口)
 | **保存时机** | `closePluginView()` 关闭时保存；AI streaming `doneCallback` 完成时自动保存；新对话开始前自动 `saveCurrentSession()` |
 | **恢复时机** | `executePlugin()` 检测到已保存状态 → 恢复 HTML + 重新绑定监听器 |
 | **streamId 去重** | `startAIChat` 分配递增 `streamId`，回调中 `myStreamId !== streamId` 时忽略，解决中途关闭后旧 streaming 回调污染新对话的问题 |
-| **历史持久化** | `localStorage` 存储 `ChatSession[]`（id, title, messages, createdAt），最多 50 条；ai-agent 仅输入关键词时展示历史列表；新对话自动保存上一会话 |
+| **历史持久化** | **文件式**（不是 `localStorage`）：`<exe根>\ModuleData\history\chat-history.json`，由 Rust 侧 `load_chat_sessions` / `save_chat_sessions` 读写，最多 50 条。`ChatSession = { id, title, messages[], createdAt, usage?, steps? }` —— `usage` 是**表盘口径**的 token 用量快照（hit / miss / total / elided / dropped），`steps` 是**按回合分组的过程快照**（thinking / tool / text，超长截断，见 `recordTurnSteps`）。**回顾历史时把两者读回来**：表盘数值还原到 token 仪表盘，过程渲染成可折叠的「过程 · N 步」块（`renderHistoryProcess`）。ai-agent 仅输入关键词时展示历史列表；新对话自动保存上一会话 |
 
 ### 4.2 搜索匹配机制 (`registry.ts`)
 
@@ -480,6 +592,8 @@ searchInput (总端口)
 | **固定窗口 800×600** | 避免动态 resize 的竞态条件和不稳定性 |
 | **搜索内容不随失焦清空** | `hideWindow()` 纯隐藏不重置，Esc 才清空 |
 | **拖拽用 `startDragging()` API** | `data-tauri-drag-region` 在子元素(input/button)上不触发 |
+| **只读工具并行，写类串行** | 本地读取是毫秒级、真正省时间的是网络与命令；但写类/命令的顺序本身就是语义（见 §11 规则 28） |
+| **详细搜索单独一层视图，而不是第二个窗口** | 复用主窗口切大界面（`#app.detail-mode` + 640 固定档）能沿用全部窗口/热键/隐藏逻辑，避免新窗口带来的一整套焦点与单实例问题（见 §11 规则 29） |
 
 ## 6. 文件结构
 
@@ -507,6 +621,8 @@ app/
 │   │   ├── hotkey.rs                # 原生 Win32 热键
 │   │   ├── commands.rs              # IPC 命令
 │   │   ├── log.rs                   # 落盘日志（宿主侧：启动/退出、agent stderr、前端 JS 错误，见 §11 规则 20）
+│   │   ├── file_indexer.rs          # 文件索引（详细搜索用；见 §2.1.2 / §11 规则 29）
+│   │   ├── system_catalog.rs        # Windows 设置页 + 系统动作白名单（见 §2.1.2）
 │   │   └── mcp_server.rs            # MCP stdio 服务器 (Agent Tools 执行引擎)
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
@@ -622,7 +738,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | 搜索插件结果显示 | ✅ 已验证正常 |
 | 窗口拖拽 | ✅ uTools 式三区域拖拽：搜索栏（3px 阈值）、输入框（拖拽时 `pointerEvents:none` 禁用光标 + `startDragging`）、插件标题栏（delegate） |
 | 全局热键 Alt+Space | ✅ 已验证正常（三层防线：LL 钩子 + 子类化 + JS 兜底） |
-| Esc 行为 | ✅ 有内容清空；空白时隐藏（全由 Rust 统一处理） |
+| Esc 行为 | ✅ 逐级退出（全由 Rust 统一判定、前端只处理「层内」动作）：录制中 → 取消录制；`UI_MODE != main`（插件 / 详细搜索）→ 交给前端退层；`main` + 有内容 → 清空；`main` + 空白 → 隐藏窗口。判据是**界面层**而非内容，见 §2.1.2 |
 | 设置按钮进入设置面板 | ✅ 支持 toggle：已打开设置时再点击关闭；ESC 关闭任意插件面板 |
 | 幽灵框透明区点击穿透 | ✅ `pointer-events: none` 策略 |
 | AI 对话 (Agent 模式) | ✅ Agent 单模式 — agent.exe（自研 core-agent）直连 + cli-output 流式渲染（简单模式已移除） |
@@ -636,6 +752,132 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 | Agent 上下文预算与压缩 | ✅ 已完成 — 按端点实测体积走瘦身/丢弃两级水位 + 400 强制压缩兜底；真实端点烟测（`LUNAC_MAX_CONTEXT_TOKENS=8000`）连跑 17 轮工具往返不中断 |
 | Agent MCP 工具桥（插件面板的 tools\*.json） | ✅ P3 已完成 — agent.exe 作 client 连 `lunac.exe --mcp-server`，用户工具以 `mcp__<名>` 进请求体；真实端点烟测通过（注册、审批卡、成功/失败两条回灌路径） |
 | Agent 技能（技能扩展面板的 `<exe 根>\skills\<key>\SKILL.md`） | ✅ P4 已完成 — agent.exe 读 `LUNAC_SKILLS_DIR`，提示词只列 `key: 描述`，模型调 `Skill` 拿到正文（`$ARGUMENTS` 已替换）；面板增删改后自动重启 agent 生效 |
+
+### 9.1 疑难点（待攻关）
+
+> 这两条是**当前没有定论**的硬骨头：事实与可借鉴的实现已经查清，但**改法尚未决定**。每条记录「现象 / 已知事实（带证据）/ 可借鉴资料 / 候选方向 / 验收口径」，避免下次重新调研。
+
+#### 难点 1：DeepSeek 侧的 AI 缓存命中率（与平台口径对不上）
+
+**现象**：长会话的命中率明显低于 dsh（DeepSeek Harness）社区自述的 97–99% 区间；按天落盘的 `ModuleData\usage\usage-*.jsonl` 与 DeepSeek 平台用量页的「缓存命中」也对不上。
+
+**已知事实**
+
+1. **DS 的命中规则比「共同前缀」严格**：只认**完整匹配已落盘的缓存前缀单元**。落盘时机三条 —— ① 每次请求的**用户输入结束位置**与**模型输出结束位置**各产生一个单元；② 系统检测到多次请求存在公共前缀时，把该公共前缀**单独落盘**（所以「第二次不中、第三次才中」是正常现象）；③ 长输入/长输出按**固定 token 间隔**切单元。单元粒度 **64 token**（不足不缓存）、**尽力而为**不保证 100%、不用时数小时~数天后自动清空。官方文档说「缓存构建耗时秒级」，但**本项目的对照实验证明这秒级对本侧够快**（0ms 间隔的连续请求照样命中 97.9%，见下方 ⑤）—— 所以别再拿「来不及落盘」当低命中的解释。
+2. **本侧请求形状已经是理想形状**：`system = SYSTEM_PROMPT + env_block(cwd) + skills::listing()` 在 `main()` 里**只构建一次**（[main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs#L762-L766)），进程内逐字节不变；`tools` = 内置 + `Skill` + MCP（MCP 按名排序，见 §11 规则 18）；`history` 严格 append-only。⇒ 差距**不在形状**，只可能在「压缩改写前缀」「DS 落盘规则」「统计口径」三处。
+3. **本侧统计口径**：前端 `hit = cache_read_input_tokens`、`miss = input_tokens + cache_creation_input_tokens`（[main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts#L2165-L2177)），agent 侧对**一轮内每次 API 请求累加**（[main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs#L1179-L1195)）。DS 的 `/anthropic` 兼容端点会把顶层 `system` 折成 `messages[0]`、且 **`cache_control` 断点标记基本被丢弃**（DeepSeek 不实现该协议），所以本侧**用不上 Anthropic 那种显式缓存断点**，只能靠前缀自然匹配 —— 这也意味着「抄 Anthropic 的 `system_and_3` 断点」在这里没有意义。
+4. **已知的主动断裂源只有一个**：压缩（`compact_history` 的 elide / drop / 首条插 `TRIMMED_MARKER`）。已有缓解 = 水位 0.85 / 0.95 + 瘦身档滞回（§11 规则 23）。
+5. **现状没有任何「每次请求」粒度的记录**：日志里只有整轮累计值，无法与平台按请求对账。
+
+**可借鉴的三份资料（本次实地查过）**
+
+| 资料 | 关键做法 | 对本项目的启示 |
+|---|---|---|
+| **dsh（DeepSeek Harness）对话链路** | 会话是**事件溯源 append-only 日志**（历史写入即不可变）；系统提示词按模式固定；每轮只把新消息追加到尾部。原文结论：「前缀缓存稳定性是架构的**推论**，而不是被管理的目标」 | 本侧已是同一形状 ⇒ **别再为了省事去改早期消息**；任何「重排 / 回填 / 就地编辑历史」都是命中率杀手 |
+| **ponytail 的 skills 实现形式**（[仓库](https://github.com/DietrichGebert/ponytail)） | 一个 **always-on 规则文件**（同一份 ~2.5 KB 内容镜像进每个 agent 的原生 rule 路径：`.agents/rules` / `.clinerules` / `.cursor/rules` / `.windsurf/rules` / `copilot-instructions.md`，blob 完全相同）+ **按需加载的 `SKILL.md`**（1.4–6 KB，含 audit / debt / gain / help / review 五个）+ 两个轻量 Node 生命周期钩子 + 三档强度 | **固定前缀必须短**：能按需加载的能力（技能正文、工具 schema）都不要塞进每轮都发的前缀。本侧 `skills::listing()` 只列 `key: 描述`、正文由 `Skill` 工具按需取 —— 方向一致，可继续沿用到工具 schema |
+| **Hermes 的省 token 机制**（本机 `%LOCALAPPDATA%\hermes\hermes-agent`，逐文件查过） | ① system prompt **一 session 只构建一次、逐字节回放**；② 时间戳**降精度到日**且放 volatile 段**最末**；③ 插件上下文 / 记忆 recall **一律注入 user 消息**，绝不动 system；④ 传输层用**内容寻址 cache key**（`instructions` + **按名排序的 tools** 取 hash），而**不是** session_id（注释：用 session_id 会让 cron 每次 cache-cold）；⑤ **压缩是唯一被允许的前缀失效时机**，压缩后统一重建 system prompt，平时严格 append-only；⑥ **工具 schema 按需检索**（核心工具常驻，其余 BM25 桥接，默认在 deferrable schema 超上下文 10% 时才启用）；⑦ 单条工具输出设预算（默认 10 万字符落盘、内联仅 1500 字符预览） | ③⑤ 本侧已等价做到；①④⑦ 是**可直接抄**的；⑥ 是**最大的一块可省前缀**（本侧工具 schema 目前全量注入）；② 本侧 `env_block` 无时间戳，已天然满足 |
+
+**实测与处置（2026-09-15，按「先对账再动手」执行完一轮）**
+
+| # | 动作 | 结果 |
+|---|---|---|
+| ① | **补「每次 API 请求」粒度埋点** | 已做。agent 在 `message_stop` 记一条 `{in, read, create, out}`，随 `result.usage.requests` 上报，前端写进 `usage-*.jsonl` 的 `requests` 数组 —— 从此能与平台用量页**逐行**对齐 |
+| ② | **量固定前缀体积**（我原以为工具 schema 是「最大的一块」） | **前提不成立**。实测 `system=1058 字` + `tools=11 个/5860 字` ≈ **1730 tokens，只占 128k 预算的 1.4%**（启动时落盘一行 `固定前缀 …`）。⇒ 工具 schema 按需检索（Hermes `tool_search`）**决定不做**：省下的上限也就几百 token，却要引入检索桥 + 一次前缀变动，是净亏 |
+| ③ | **压缩边界收紧** | 已做。瘦身档加「值不值得」闸门：**可省体积 < 当前上下文的 5% 就不许动历史**（`ELIDE_MIN_SAVINGS_RATIO`）—— 旧实现只要过 0.85 水位就压，于是频繁出现「省 2% 体积、废掉 60% 前缀」。闸门只作用于瘦身档（可选档）；丢弃档与 400 兜底档是安全刚需，照旧无条件压。同时「决定不动」不再推进滞回时钟 |
+| ④ | **用本地真实日志反推命中率** | 见下。**结论：不是代码 bug** |
+
+**④ 的关键数据**（`app/src-tauri/target/debug/ModuleData/usage/`，dev 实例真实记录）：
+
+| 日期 | input（未命中） | cacheRead（命中） | 命中率 |
+|---|---|---|---|
+| 09-13 共 6 轮 | 2830 / 1315 / 2287 / 279 / 708 / 4612 | 12544 / 15104 / **0** / 2432 / 8960 / 15744 | 81.6% / 92.0% / **0%** / 89.7% / 92.7% / 77.3% |
+| 09-14 共 1 轮 | 6340 | 8192 | 56.4% |
+| **合计** | 18371 | 62976 | **77.4%** |
+
+- **本地命中率已经在自然上限附近**：例如 `in=4612 / read=15744` → 77.3%，恰好等于「上一轮上下文 ÷（上一轮 + 本轮新增）」——即 §11 规则 23 里那个上限公式。**差距来自会话太短**（这些记录上下文只有 15–20K），不是缺陷；dsh 的 97–99% 是**几十轮以后**新尾占比才变小的结果。
+- `read=0` 那一轮（in=2287，且 `elided/dropped` 都是 0）**不是「来不及落盘」**（⑤ 已证伪这条），剩两种可能：**前缀本身变了**（`skills::listing()` / 工具黑名单 / `cwd` 任一变化）或 DS 侧缓存被清。下一条立刻回到 89.7% 说明前缀随后又对上了 —— 值得用新加的埋点复现一次。
+- 这几轮 `elided/dropped` 全是 0 ⇒ 压缩在这些会话里**根本没触发**，所以当时的命中率与压缩无关；③ 是**预防性**收紧。
+
+| ⑤ | **间隔对照实验**（0ms vs 6s） | 已跑完，**「落盘慢」被证伪** —— 见下 |
+
+**⑤ 的对照实验（2026-09-15 跑完，`deepseek-v4-flash`）**
+
+方法：同一前缀 P（40500 字 ≈ **9016 tokens**），`R1 = P+Q1`，`R2 = P+Q1+Q2`（纯追加）；A 组两问**紧挨着**发，B 组**先等 6 秒**再发第二问；用不同 nonce 隔离两组避免互相污染。
+
+| 组 | 请求 | input（未命中） | cacheRead（命中） | 命中率 |
+|---|---|---|---|---|
+| A | 第 1 次（冷） | 9016 | 0 | 0% |
+| A | 第 2 次（**间隔 0ms**） | 193 | 8832 | **97.9%** |
+| B | 第 1 次（冷） | 9016 | 0 | 0% |
+| B | 第 2 次（**间隔 6s**） | 193 | 8832 | 97.9% |
+
+- **0ms 与 6s 的结果逐字节相同** ⇒ 对本项目这种「一轮内连续几次工具往返」的间隔，DS 的落盘**足够快**，**不会因为「还没落盘」而丢命中**。原先那条「秒级落盘是低命中主因」的假设**被证伪**。
+- 第 1 次必然 0%：全新前缀没有任何已落盘单元 —— **规则性的**，不是缺陷。
+- 命中量 8832 / 9016 ≈ 98%（即上一条请求的输入几乎整段被复用），与 §11 规则 23 的上限公式一致。
+
+**因此留下的唯一疑点**：dev 日志里那条 `in=2287 / read=0` **不能**再用「来不及落盘」解释（0ms 都能中）。剩余可能只有两种 —— ① **前缀本身变了**（`skills::listing()` / 工具黑名单 / `cwd` 任一变化都会改 `system` 或 `tools`）；② DS 侧缓存被清。现在有了 `requests[]` 与启动时那行 `固定前缀 …`，下次复现时可直接对照两者的前后取值来定位。
+
+复现脚本（原样保留，换 key 后可直接重跑）：
+
+```powershell
+# 在 app/src-tauri 下执行（.env 需有有效的 AI_API_KEY）。
+# A 组：R1 与 R2 紧挨着发；B 组：先等 6 秒再发 R2。比较两组 R2 的 cache_read_input_tokens。
+# R2 = R1 的原文 + 一句追加 ⇒ 纯 append-only，符合「缓存前缀单元」的匹配前提。
+$kv=@{};Get-Content .\.env|?{$_ -match '^[A-Z_]+='}|%{$p=$_ -split '=',2;$kv[$p[0]]=$p[1].Trim()}
+$model=$kv['AI_MODEL'];$uri='https://api.deepseek.com/anthropic/v1/messages'
+$hdr=@{authorization="Bearer $($kv['AI_API_KEY'])";'anthropic-version'='2023-06-01'}
+$filler=('The quick brown fox jumps over the lazy dog. '*900)
+$Ask={param($t)$b=@{model=$model;max_tokens=1;stream=$false;thinking=@{type='disabled'};messages=@(@{role='user';content=@(@{type='text';text=$t})})}
+  $j=$b|ConvertTo-Json -Depth 12 -Compress
+  (Invoke-RestMethod -Uri $uri -Method Post -Headers $hdr -ContentType 'application/json' -TimeoutSec 180 -Body ([Text.Encoding]::UTF8.GetBytes($j))).usage}
+$pa='[A-nonce]'+$filler;$u1=&$Ask ($pa+[char]10+'Reply with the single word: ok')
+$u2=&$Ask ($pa+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: done')
+Start-Sleep -Seconds 6
+$pb='[B-nonce]'+$filler;$u3=&$Ask ($pb+[char]10+'Reply with the single word: ok')
+$u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: done')
+"A(0ms) 2nd: in=$($u2.input_tokens) read=$($u2.cache_read_input_tokens)"
+"B(6s)  2nd: in=$($u4.input_tokens) read=$($u4.cache_read_input_tokens)"
+```
+
+判读口径（本次的实际读数即「两组都接近整段前缀」那种）：两组 `read` 相同 ⇒ **落盘不是瓶颈**，低命中只能由「新尾占比大」或「前缀本身变了」解释；若 B 组明显大于 A 组，才说明「落盘要时间」是短间隔连续请求丢命中的主因（属规则性，改代码无用）。
+
+**验收口径**：同一会话连续 20 轮工具往返，逐轮命中率不低于「上一轮上下文长度 ÷ 本轮总输入」这一自然下限；且压缩次数与未命中增量可分离统计（现在两者都有落盘字段：`requests[]` 与 `elided`/`dropped`）。
+
+#### 难点 2：Windows 开机自启 Lunac 慢（**不是** Lunac 自身冷启动慢）
+
+**现象**（用户 2026-09-15 澄清）：**手动双击是秒启**；但由 Windows 开机自启拉起时要等很久才可用（表现为热键很久才响应）。所以问题不在 Lunac 的冷启动，而在「**开机场景 + 自启机制**」这一组合。
+
+**已查明的事实（通读自启链路源码）**
+
+1. **代码上，自启比手动启动几乎不多做任何事**：`is_background` 在整个 Rust 侧只出现 3 次（解析 / 日志 / 是否 `show`），**唯一的行为差异是 `main.rs` 少调一次 `w.show()`**。窗口与 WebView2 由 `tauri.conf.json` 声明（`visible: false`），两种启动方式**都会创建窗口、都会在后台加载 WebView2**（代码注释原话：`a boot launch loads WebView2 invisibly`）。热键在 `setup` 里**同步注册**（[hotkey.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/hotkey.rs) `start_hotkey`），热键可用只取决于 `setup` 返回 + 事件循环启动。⇒ **「自启慢」不是 Lunac 内部多做了一步。**
+2. **热路径上没有固定 sleep**：全仓 8 处 `thread::sleep` 都不阻塞窗口/热键（4s 在 auto-start 修复线程、600ms 在索引线程、100ms 只在换键时命中、其余是轮询/重试间隔）。历史元凶 —— `--background` 分支里固定 15s 的 sleep —— 已于 2026-08-04 移除（[main.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/main.rs#L109-L115) 注释为证）。
+3. **项目自己实测过两种自启机制差约 60 秒**（[auto_start.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/auto_start.rs#L1-L11) 原文）：计划任务（`schtasks /sc onlogon`）**~19s** 触发，HKCU Run 键 **~79s**。这段差距**完全来自 OS 触发时机**（onlogon 任务 vs Explorer 串行处理 Run 项），与进程内代码无关。
+4. **非管理员下必然落到慢的那一条（已定案为权限问题）**：`enable_auto_start()` 先建计划任务，失败才回退写 HKCU Run。经日志实证失败原因是 `错误: 拒绝访问。` —— 计划任务在任务计划**根目录**，非管理员建不了（NSIS 安装模式是 `currentUser`，所以对普通用户这是**必然**而不是偶发）。而当时的 `is_auto_start_enabled()` **只返回 `bool`**，UI 从不告诉用户实际生效的是哪一条 ⇒ 用户感受到的延迟可能是 19s 也可能是 79s，且无从判断。**这是最能解释「开机自启慢」的一条。**
+5. **每次开机都无条件重建自启项**：`repair_auto_start_on_startup()`（延迟 4s 的后台线程）在 Run 键存在时**无条件重写注册表**；计划任务方式下则 `schtasks /query` + `schtasks /create` **各 spawn 一次 `schtasks.exe`**。而它真正要防的只有「exe 被移动/升级导致路径失效」。不阻塞热键，但与开机 IO 高峰叠加 —— 代码注释亲口说 `right after a boot auto-start the Task Scheduler service may still be starting, so a synchronous call could block the app for a long time`。
+6. **曾经没有单实例保护**（全仓无 `CreateMutex`、无 `tauri-plugin-single-instance`）：自启实例已在后台时用户再双击 → 第二实例的 `RegisterHotKey` 必然失败 → 退化装 `WH_KEYBOARD_LL` 全局钩子（同时也是杀软误报 `Prowloc` 的成因）。这会让热键表现为「要按好几次 / 反应慢」。**已修，见下「已做」第 7 条。**
+7. 前端 `index.html` 曾从 CDN 同步拉 KaTeX 造成白屏（注释里写明 `was a white-screen startup delay`），现已改为非阻塞；且 release 的 CSP 不含 `cdn.jsdelivr.net`，远程脚本会被直接拦掉 ⇒ 本配置下大概率不构成开机延迟（待实测确认）。
+
+**已做（2026-09-15）**
+
+1. ✅ **自启机制判定下沉 + 只进日志**：新增 `auto_start_info()` 返回 `{enabled, mechanism}`（`mechanism ∈ task / run / both / none`），**旧的 `is_auto_start_enabled()` 已删除**（它只能回答「开没开」），`get_auto_start` 命令换成 `get_auto_start_info`。前端只用 `enabled` 拨开关；`mechanism` 每次打开设置面板记一行「探测 run=? task=? ⇒ 机制=?」到落盘日志。**一度在面板上显示过机制小字 + 「改用计划任务」按钮，已按用户要求撤掉** —— 「Run 键 / 计划任务」是纯实现术语，终端用户既不会注意也看不懂。
+2. ✅ **自启项改成「按需重建」**：`repair_auto_start_on_startup()` 先比对再动手 —— Run 值等于 `startup_command_line()` 就什么都不做；否则读计划任务的 `<Command>` 与当前 exe 比对，一致就跳过。消掉了此前**每次开机**的两次 `schtasks.exe` 与一次注册表写入。
+3. ✅ **自启决策全部落盘**：`auto_start.rs` 里原来用 `eprintln!` 的那些决策日志（启用走了哪条、修复检查是跳过还是重建）在 release 下**写进空气**（GUI 子系统无控制台）—— 已统一改走 `crate::log::info`，落在 `<exe 根>\temp\logs\lunac-YYYY-MM-DD.log`，前缀 `auto_start:`。于是「开机到底走了哪条机制、有没有多 spawn `schtasks`」都可事后查证（`grep auto_start`）。**新增可诊断代码时不要用 `eprintln!`。**
+4. ✅ **权限根因定案**：日志实证 `schtasks create failed: 错误: 拒绝访问。`（GBK 原文，被按 UTF-8 解码成乱码，判读时别被吓到）⇒ **不是 `/tr` 引号/转义问题**，是非管理员无法在任务计划根目录建任务，所以默认**必然**落到慢约 60 秒的 Run 键。原打算用「临时探针任务」区分权限/参数，日志一出就无需再探（`cmd /c` 形式的探针也会被本机安全策略拦下）。
+5. ✅ **提权链路**：`ShellExecuteExW("runas")` 提权**跑自己的 exe**（`--lunac-auto-start-task=create|delete`）而不是直接提权跑 `schtasks` —— 后者的 `/tr` 里带引号路径与 `--background`，经 ShellExecute/PS/cmd 逐层转义极易出错；跑自己则命令行只是一个开关，真正的 `schtasks` 参数仍由已验证的 Rust 代码拼装。父进程 `WaitForSingleObject` 等它结束再**复查任务是否真的存在**（不轻信退出码）；用户点「否」时 `ShellExecuteExW` 直接失败（`ERROR_CANCELLED`），此时**绝不能顺手清 Run 键**，否则会把用户原有自启弄没。**删除同样走提权**（任务在根目录，删不掉就是「关不掉的自启」）。
+6. ✅ **开关改成一次点到位**：`enable_auto_start()` = ① 试建任务（本进程已是管理员则直接成功、不弹 UAC）→ ② 失败则**先写 Run 键保底** → ③ 自动弹一次 UAC 补建任务，成功就清 Run。取消 UAC 只在日志里记「继续用 Run 键」，**不算失败**（开关仍开、只是慢），避免「弹了窗、点了否、结果什么都没开」。`disable_auto_start()` 同步化：任务存在时先试无提权删除，仍存在则提权删除，最后复查，删不掉就返回 `Err` 让开关弹回去。
+7. ✅ **单实例保护**（原「待定」第 1 条）：新增 `single_instance.rs` —— 会话级命名互斥体 `Local\LunacSingleInstance` + 唤出事件 `Local\LunacActivate`（手写 FFI，约定同 `hotkey.rs`，未新增依赖）。第二实例立即退出；**非 `--background`** 的那次双击额外 `SetEvent` 让已有实例 `show_and_focus()`；`--background` 不唤出（机制为 `both` 时开机有两个实例，第二个不该弹窗）。名字里不含版本/exe 路径 ⇒ dev 与 release 互相排斥（用户明确要求）。进程退出（含被杀）由内核回收句柄，无残留文件、无陈旧锁。
+   - **真机验证（2026-09-15）**：`.NET OpenExisting` 能打开两个命名对象（证明 FFI 真建出来了）；新起的两个实例各记一行「已有实例在运行 → 本进程退出」并秒退，持有者仍在运行；对事件 `Set()` 后持有者记「收到唤出信号（用户又启动了一次）→ show_and_focus」且主窗口转为可见。`--lunac-auto-start-task=bogus` 正确走到提权分支、退出码 `1`。
+
+**过程中的两个硬事实（踩过，别再犯）**
+
+- **`schtasks` 的文本输出字段名会随系统语言本地化**：本机中文 Windows 上 `schtasks /query /fo LIST` 里连 `TaskName:` 都匹配不到（实测）。所以任务内容必须走 **`/xml`** —— `<Command>` 是固定标签，与语言无关。
+- **`/xml` 的输出编码无法在本机实测**：沙箱不允许枚举系统计划任务（`Get-ScheduledTask` 与 `schtasks /query` 都被 `win32 error 5` 挡下），本机又没注册过任何 Lunac 自启项。因此 `decode_task_xml()` **UTF-8 与 UTF-16LE 两种都试**（判据是解出来能否找到 `<Command>`），并且把「读不出内容」与「没有任务」**分成两种结果**：后者什么都不做，前者**按旧行为重建** —— 解析失败绝不能变成「以后不再自愈」的静默回归。`decode_task_xml` 有单测覆盖两种编码。
+
+**待定**
+
+1. **实测确认**前端 CDN 与 WebView2 冷启动在开机场景的真实占比；若确认无关，就在文档里写死这个结论，不再靠猜。
+
+**验收口径**：实际生效机制可在落盘日志里查证（`grep auto_start`）✅；开机后「登录完成 → 热键首次可响应」的时长与手动启动的差值不超过 OS 触发时机本身的差异（走任务 ~19s 量级）；自启实例在运行时再双击**不产生第二个进程**，且能把已有窗口唤出 ✅（2026-09-15 已实测）。
 
 ## 10. 待办路线
 
@@ -663,19 +905,37 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 
 > 仅保留仍然有效的架构规则与既定决策。逐条开发日志不再维护：修改以代码注释、Git 提交记录与 code-rules.md 承载。
 
-1. **开机自启（无需管理员）**：开启时**优先创建「用户登录时」计划任务**（更早触发），创建失败（非管理员常见被拒）**自动回退 HKCU Run** 写入 `"<exe>" --background`；关闭自启时清掉 Run 值与任务两者；状态 = Run 值存在 或 计划任务存在。相关 `schtasks` 只出现在用户点击开关/启动后后台修复线程，绝不阻塞启动热路径。实现见 [auto_start.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/auto_start.rs)。
+1. **开机自启**：开启时**优先创建「用户登录时」计划任务**（更早触发），创建失败（非管理员**必被拒**）**自动回退 HKCU Run** 写入 `"<exe>" --background`；关闭自启时清掉 Run 值与任务两者；状态 = Run 值存在 或 计划任务存在。相关 `schtasks` 只出现在用户点击开关/启动后后台修复线程，**绝不阻塞启动热路径**。实现见 [auto_start.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/auto_start.rs)。
+   - **权限事实与提权链路（2026-09，不得回退）**：计划任务落在任务计划**根目录**（`C:\Windows\System32\Tasks`），非管理员**创建与删除都会被拒**（实测日志原文 `schtasks create failed: 错误: 拒绝访问。`）。所以两条都得能提权：提权方式是 `ShellExecuteExW("runas")` **跑自己的 exe**（`--lunac-auto-start-task=create|delete`，参数是不含引号/空格的开关，绕开 `/tr` 那种多层转义），父进程 `WaitForSingleObject` 等子进程结束后**复查任务是否真的存在**（不轻信退出码）。**删除也必须能提权**，否则会出现「关不掉的自启」——比「慢」更糟；删不掉时如实报错让开关弹回去，禁止只 spawn 个后台线程了事。
+   - **开关一次点到位（2026-09，用户明确要求）**：`enable_auto_start()` 顺序固定为 ① 直接试建任务（本进程已是管理员则不弹 UAC）→ ② 失败则**先写 Run 键保底**（无条件成功，开关绝不空转）→ ③ 再自动弹一次 UAC 补建任务，成功就清 Run。**取消 UAC 不算失败**（仍是「已开启、只是慢」），绝不能出现「弹了窗、点了否、结果什么都没开」。禁止改回「先显示机制、再给一个『改用计划任务』按钮」那种两步式设计。
+   - **机制名只进日志、不进 UI（2026-09，不得回退）**：`auto_start_info()` 返回 `{enabled, mechanism}`（`task`/`run`/`both`/`none`），但 `mechanism` **只用于落盘日志**（每次打开设置面板记一行「探测 run=? task=? ⇒ 机制=?」）。「Run 键 / 计划任务」是纯实现术语，终端用户既不会注意也看不懂 —— 一度在设置面板显示过机制小字与升级按钮，用户明确要求撤掉。**禁止把 `is_auto_start_enabled()` 那种只回 bool 的实现加回来**（排查「开机后要等很久」时那个字段是唯一线索，但它不必给用户看）。
+   - **单实例保护（2026-09，不得回退）**：见 `single_instance.rs` —— 会话级命名互斥体 `Local\LunacSingleInstance`，第二实例**立即退出**；非 `--background` 的那次双击还要 `SetEvent(Local\LunacActivate)` 让已有实例 `show_and_focus()`。命名对象**不得含版本号或 exe 路径**（否则 dev / release 会各起一个，用户明确要求二者互相排斥）；用 `Local\` 而非 `Global\`（后者要 `SeCreateGlobalPrivilege`）。缺了它，「自启实例在后台 + 用户双击」会让第二实例 `RegisterHotKey` 失败并退化成 `WH_KEYBOARD_LL` 全局钩子（热键时灵时不灵，也是 Defender 报 `Prowloc` 的成因）。
+   - **`--background` 不得唤出窗口**：机制为 `both` 时开机有两个实例同时被拉起，若第二个实例也去「拍肩膀」，用户一开机就会看到界面。
+   - **自启项按需重建、不许无条件重建（2026-09）**：`repair_auto_start_on_startup()` 必须**先比对再动手**（Run 值 vs `startup_command_line()`；任务 vs 当前 exe），一致就什么都不做。理由：重建真正要防的只有「exe 被移动/升级」，而无条件重建会让**每次开机**都多付两次 `schtasks.exe` + 一次注册表写入，正好撞在开机 IO 高峰上。
+   - **读计划任务必须走 `/xml`**：`schtasks /fo LIST /v` 的字段名（`Task To Run:`、连 `TaskName:`）**会随系统语言本地化**，中文 Windows 上匹配不到；`<Command>` 是固定标签。解析失败要与「没有任务」**分开处理**（前者按旧行为重建，后者什么都不做），否则解析一变就会静默丢掉自愈能力。
 2. **设置 · AI 供应商 / 模型**：
    - 供应商预设与模型建议为单一数据源：PROVIDER_PRESETS / MODEL_SUGGESTIONS（pp/src/plugins/builtin/settings.ts），禁止两处重复维护。
    - 供应商 = 大节点：模型下拉只含**当前供应商**的预设模型 + 该供应商已保存的自定义模型；切换供应商时回落其默认模型，不把上一家模型带入。
    - 自定义模型确认 = 在**当前供应商模型列表内新增一项**，预设全部保留；内联编辑器只“追加编辑行”，禁止覆盖 dropdown 整体 innerHTML。
    - 接口地址默认**不带 /v1**；启动 agent 后端时先剥离末尾 /v1 再拼供应商的 /anthropic 路由（`AI_AGENT_URL` 可整体覆盖该端点）。
-   - 模型建议名必须与供应商**实际可用名**一致：DeepSeek 的 Anthropic 兼容端点只认 `deepseek-v4-pro` / `deepseek-flash`（实测臆造名如 `deepseek-v4.1-flash` 会直接 400 并回报支持列表）—— MODEL_SUGGESTIONS 已按此修正。
+   - 模型建议名必须与供应商**实际可用名**一致。DeepSeek 的 Anthropic 兼容端点实测可用 `deepseek-v4-pro` / `deepseek-flash` / `deepseek-v4-flash`（2026-09-15 用真实 key 逐个打到 200），臆造名如 `deepseek-v4.1-flash` 会 400 并回报支持列表 —— MODEL_SUGGESTIONS 按此维护，**实测可用的名字一个都不能漏列**（漏列 = 用户存过的那个名字被当成未知模型，见下条）。
+   - **面板不得静默改写已保存的模型名（2026-09-15 事故后定案）**：真实事故 —— dev 配置里存的是 `deepseek-v4-flash`，但它没被列进 MODEL_SUGGESTIONS，于是「切一次供应商」就按 `preset.default_model` 回落成 `deepseek-v4-pro`，面板一保存即落盘，表现为「我的模型怎么自己变回 v4-pro 了」。现在的判据只有一条：**旧模型属于别的供应商才回落本供应商默认值**（`belongsToOtherProvider()`），认不出来的名字一律**原样保留**并标成「(自定义)」。改这段逻辑必须保留这条不变量。
+   - **兜底模型 = `deepseek-flash`**：DeepSeek 预设的 `default_model`（新建配置/切换供应商后的初值）与宿主 `ai_credentials()` 在 `AI_MODEL` 完全未设时的回退值都用 flash —— 与规则 16「测试一律 flash」保持一致；要更强回答由用户在面板里显式选 `deepseek-v4-pro`。
+   - **AI 凭据的唯一真相源是 `<exe 根>\config\ai.json`（2026-09-15 事故后定案，不得回退）**：设置面板保存 → `set_ai_config` **先落盘**再注入进程 env；启动时 `commands::apply_saved_ai_config()` 读回注入，**没有该文件才用 `.env`**（`dotenvy` 在 `main()` 载入）。想回到 `.env` 默认值就删掉该文件。
+     - 事故经过：配置曾存前端 `localStorage["lunac-ai-config"]`，启动时由 `main.ts` 回灌 `set_ai_config`。于是 localStorage 里的**旧 key 覆盖**了用户刚改的 `.env`，表现为「key 改了不生效、一直 401」，且生效的是哪一份完全无从判断（排查得去翻 WebView2 的 leveldb）。更糟的是自锁：`get_ai_config` 读的是已被覆盖的 env → 面板 key 框被预填成旧 key → 用户一点保存又把旧 key 写回 localStorage。
+     - **禁止再用 localStorage 承载 AI 配置**（它不在 exe 根、违反便携约束，且 dev 与 release 各存一份、互不相同）。旧值只在「后端完全没有 key」时做**一次性迁移**回填，回填后立刻 `removeItem`，绝不覆盖已有配置。
+     - **落盘失败必须报错**，不许「面板看着保存成功、重启又变回去」。
+   - **凭据类日志必须写「末 4 位 + 来源」（2026-09-15）**：启动与保存时各记一行 `AI 配置来源=config\ai.json | .env … key_tail=d423`，喂给 agent 前再记一行 `agent 凭据: endpoint=… model=… key_tail=…`。三行对照，30 秒定位「现在生效的是哪一把 key」。`log::key_tail()` 是唯一实现（空 → `(empty)`、不足 5 位 → `****`）；**标签必须写成 `key_tail=`**，写成 `key=` / `api_key=` 会被 `mask_secrets` 整体打成 `***`（有单测钉住这个差别）。全程只出现末 4 位，不出现完整凭据。
 3. **设置 · 技能扩展**：固定目录 `<exe 根>\skills`（布局 `<技能key>/SKILL.md`）；lunac 负责 raw SKILL.md URL 安装 / 新建粘贴 / 编辑 / 删除；agent.exe 经 `LUNAC_SKILLS_DIR` 读取该目录，与编译内置技能互不影响；key 由 frontmatter.name 安全 slug 派生。
 4. **搜索性能**：应用列表（Start Menu + 自定义启动项）**只有一份存储 —— 落盘文件 `<exe 根>\temp\app-index-cache.json`**。Rust 侧**不持有任何进程内缓存**：没有 TTL、没有失效、没有 stale-while-revalidate。搜索路径（`search_apps` → `app_indexer::apps()`）**只读这个文件** —— 不扫目录、不写盘、无状态可失效，所以**任何动作（窗口唤出/隐藏、切进插件、增删自定义启动项）都不会让搜索卡住**；`search_apps` 另标 `#[tauri::command(async)]`（Tauri 同步命令跑在主线程，本命令每击键一次，放工作线程更稳）。全量扫描**只发生在后台刷新路径**（启动后 600ms、Alt+Space 唤出 / 托盘显示时若文件比 30s 更旧），扫完**原子写回**（同目录临时文件 + rename 覆盖 —— 直接 `fs::write` 会让并发读方看到半截 JSON，表现为「结果突然空了」）。**增删自定义启动项时就地重写文件**（系统项沿用文件现状 + custom 项按注册表现算，写完立刻可搜到）—— 旧实现在这里直接删文件，导致下一次搜索退化成全量**同步**扫描，正是「加完启动项后第一次搜索卡一下」的来源。合表时同名条目按来源优先级去重（系统项优先；**不能用 `dedup_by`**：排序键含来源优先级，同名条目不相邻，`dedup_by` 只处理相邻重复会漏）。自定义启动项本身属**业务数据**，存 `<exe 根>\ModuleData\custom\app_registry.json`，与列表文件分开，不会随缓存重建丢失。前端输入 60ms 去抖并丢弃过期输入，**内容检测（latest-wins）**：`search_apps` 晚回包时校验键入序号（`_searchSeq`），过期或期间已进插件态直接丢弃、不触碰 UI——快速键入只显示最终结果，杜绝旧结果覆盖/一次键入多次渲染闪烁；结果渲染不保留入场 / 开合动画。**窗口高度**：搜索路径懒测量（双 rAF 后实测），`setSize` 串行化（latest-wins，在途期间只记最新期望高度，完成后补发一次），杜绝快速键入时逐键 setSize IPC 风暴 / onResized 回环。
    - **窗口高度「滑动」动画（正式，2026-09）**：非插件/搜索态高度变化默认逐帧滑动（rail 模式——每步等上一 setSize 经 onResized 落地再走下一步），默认参数定稿 `rigidity 0.22`（每帧逼近比例，大=刚性/跟手，小=柔滑拖尾）/ `maxStep 14`（单步最大位移 px）/ `stepHz 120`（步频上限）/ `suppressMs 400`（唤出/启动抑制期）；DevTools Console `__lunac_resize_anim`（含 `enabled=false` 即回退原直设路径）可实时调节，`__lunac_resize_anim_stats` 记录步数/耗时。首次高度落位直设防启动滑屏；插件态离散跳变不走动画。**唤出抑制**：热键/托盘唤出（`lunac-window-shown`）后 `suppressMs` 内的高度变化一律直设并在期内顺延（内容分批到达：剪贴板探测 → 加泡泡 → 重跑搜索 → 实测），保证窗口**瞬时完整展开**——否则会看到结果区被物理窗口裁剪、逐帧“撑开”（WebView2 无法渲染超出窗口的内容）。
+   - **文件索引（2026-09-15，详细搜索用）沿用同一纪律**：`<exe 根>\temp\file-index-cache.json` 是唯一存储，`search_files` **只读内存索引、永不扫盘**，扫盘只在后台线程 + 原子写。见 §2.1.2 与规则 29。
+   - **拖拽：属性 + JS 两条通道**（2026-09-15 修「大界面有时候拖不动」）：Tauri 的 `data-tauri-drag-region` 是**裸属性语义** —— 只有事件目标**就是**带属性的那个元素才触发（`tauri/…/scripts/drag.js` 的 `el === composedPath[0]`），点在子元素上无效。所以标题/顶栏这类「中间被一个 flex:1 子元素占满」的条带**必须**同时挂 JS 拖动（`makeDragHandle(容器)`，它跳过 button），输入框则用 `makeInputDragHandle()`（3px 阈值后才 `startDragging()`，拖动期间关掉输入的 pointer-events）。“三处标题栏都能拖”这句话以前只对搜索栏成立，大界面顶栏实际只有 12px 内边距能拖。
+   - **拖拽只认左键 + 搜索栏右键菜单**（2026-09-15）：两个拖动工厂都必须 `if (e.button !== 0) return` —— 右键要弹上下文菜单，若右键也能启动拖动，菜单一弹出窗口就跟着跑。全局 `contextmenu` 早已统一 `preventDefault`（WebView2 默认菜单的「后退/重新加载/检查元素」对桌面工具无意义），故搜索栏原本是「右键没反应」；现在 `attachSearchContextMenu()` 给**简洁搜索栏与详细搜索输入框**共用一套四项菜单（全选 / 复制 / 剪切 / 粘贴），无选区时复制/剪切**置灰**（`.context-menu-item.disabled`，占位不隐藏）。**必须复用 `#context-menu` 那一套 `showContextMenu()`，禁止再造第二套菜单**（多菜单同帧重叠是历史 bug）。粘贴走 Tauri 剪贴板插件（`capabilities` 已授 `clipboard-manager:allow-read-text`），**不用 `navigator.clipboard`**（WebView2 下另需权限、未聚焦时直接 reject）。任何改值操作（剪切/粘贴）都必须补发 `input` 事件：简洁搜索栏靠它同步 Rust 空白态与重跑搜索，详细搜索靠它重跑查询。
 5. **通用自定义下拉框**：固定约 4 行（≈120px）可见，更多项内部滚动；滚轮强制内部滚动（`passive:false`）+ `overscroll-behavior:contain`；WebView2 透明窗口禁止原生 `<select>`。
+   - **展开下拉时绝不许改滚动容器的 `overflow`（2026-09 事故）**：设置面板的下拉框曾被 `.sel-open` 放宽到 `#results-list` / `#results-container` 上（原意是「别被面板裁剪」）。`#results-list` 是 `overflow-y:auto` 的**滚动容器**，把它改成 `visible` 会让它不再是滚动容器、`scrollTop` 被浏览器归零 —— 于是「AI 分页里一打开靠下的『搜索服务商』下拉，整页瞬间跳回最顶端」。正确做法（现已实施）：`.sel-open` **只**加在 `.settings-layout` / `.settings-content` 这类纯裁剪容器上；下拉框的**可用高度与上下翻转按滚动容器的可视区**（`#results-list` 的 `getBoundingClientRect`）计算并限高（`positionDropdown()`），从而永远落在可视区内、既不被裁剪也不动滚动容器。判断新面板是否踩坑：打开下拉后 `#results-list.scrollTop` 必须保持不变。
 6. **搜索引擎预设**：仅 Google / Bing / Baidu（DuckDuckGo 已移除），旧 localStorage 值自动回退 Google。
-7. **数据目录**（2026-09 修订）：根 = **exe 安装根目录**（`current_exe` 所在目录；release=安装根、dev=target\debug，dev/release 数据天然隔离）。统一结构：`temp\`（缓存类：WebView2 用户数据 `temp\webview-data`、应用扫描缓存 `temp\app-index-cache.json`）、`ModuleData\`（业务数据：`history\` 聊天会话/剪贴板、`memo\` 备忘录含图片与 tag、`custom\app_registry.json` 自定义启动项、`usage\usage-YYYY-MM-DD.jsonl` 用量对账日志）、`skills\`、`tools\`、`config\hotkey.json`、`paddle-ocr\`。**所有数据落盘模块统一走 `storage::lunac_root_dir()`，禁止各自硬编码路径**；首次启动将旧 `%LOCALAPPDATA%\Lunac(-dev)` 数据整体迁移到 exe 根并删除（`migrate_legacy_localappdata`）。
+7. **数据目录**（2026-09 修订）：根 = **exe 安装根目录**（`current_exe` 所在目录；release=安装根、dev=target\debug，dev/release 数据天然隔离）。统一结构：`temp\`（缓存类：WebView2 用户数据 `temp\webview-data`、应用扫描缓存 `temp\app-index-cache.json`、文件索引缓存 `temp\file-index-cache.json`（见规则 29）、落盘日志 `temp\logs`、超长工具输出 `temp\tool-outputs`，见规则 27）、`ModuleData\`（业务数据：`history\` 聊天会话/剪贴板、`memo\` 备忘录含图片与 tag、`custom\app_registry.json` 自定义启动项、`usage\usage-YYYY-MM-DD.jsonl` 用量对账日志）、`skills\`、`tools\`、`config\hotkey.json`、`config\ai.json`（AI 凭据唯一真相源，见规则 2）、`paddle-ocr\`。**所有数据落盘模块统一走 `storage::lunac_root_dir()`，禁止各自硬编码路径**；首次启动将旧 `%LOCALAPPDATA%\Lunac(-dev)` 数据整体迁移到 exe 根并删除（`migrate_legacy_localappdata`）。
 8. **备忘录插件**：主界面=编辑；保存后弹“检索标识”对话框完成完整保存；历史记录为独立子界面（预览/复制/编辑/删除，保存逻辑同主界面）；标识会同步为检索索引，搜索栏精确/前缀匹配标识可直达对应备忘录编辑界面；支持**粘贴/拖放图片**（存 `ModuleData\memo\images\<id>\`，条目 `images` 字段），编辑器与历史均缩略图显像。搜索无任何应用/插件匹配（含无关乱码）时结果区常驻 3 项：Web 搜索、AI 助手问答、备忘录录入。
 9. **图标风格**：统一线性 SVG（`fill:none; stroke:currentColor`，24 栅格，按钮内 12px，stroke-width 2.2，圆头端点），功能按钮禁止用 emoji；规范见 [icon-style.md](file:///d:/cc/claude-code-cli-master/docs/icon-style.md)。
 10. **文件附件省略折叠**（搜索栏 / AI 聊天输入栏共用）：前 **3** 个文件为独立泡泡，第 4 个起收进一个“省略泡泡”分支；点击 ⋯ 展开，展开项仍以泡泡框子分支显示，可单删；省略号内提供一键删除全部（仅作用于省略号内容，不影响前 3 个）；**Backspace 空输入删除同步**该按钮：折叠态下清空省略分支，展开或无分支时删最后一个泡泡。**进入任意插件界面自动隐藏**搜索栏泡泡（AI 聊天除外——其泡泡改在聊天输入栏内展示）；退出插件恢复搜索栏原样。Ctrl+V 粘贴支持文件/纯文本路径/**纯位图**（截图、ShareX 等经 Rust 原生剪贴板兜底存临时文件后成泡泡）。
@@ -687,7 +947,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 16. **测试一律用 flash 模型（2026-09）**：任何真实端点测试（工具往返、权限审批、上下文压缩、MCP 桥等）把 `AI_MODEL` / `LUNAC_AGENT_MODEL` 指向 **`deepseek-flash`**，**不要用 `deepseek-v4-pro`** —— 测试只验证链路、契约与结构，flash 足够且更快更省；只有当问题与回答质量本身相关、或需要复现线上行为时才用 pro。
 17. **MCP 工具命名与审批（P3，2026-09）**：接进请求体的用户工具名一律 `mcp__<原名>`，**前缀与清洗规则（非法字符换 `_`、超长截断、重名加 `_2`）不得随意改动** —— 前端审批卡的「始终允许」按完整工具名记 localStorage 白名单，改名等于让用户的白名单失效。MCP 工具**必须**先发 `can_use_tool`（handler 能跑 shell / 发 HTTP），且 plan（只读）档不接入；桥的失败（spawn/握手/超时）只记 stderr，**绝不允许影响十一件内置工具的可用性**。
 18. **前缀缓存不变量（第 19 点，2026-09）**：DeepSeek 等端点的自动前缀缓存按「最长公共前缀」命中，**请求体里任何靠前内容逐字节抖动都会让整段缓存失效**。已定稿的稳定化措施，改动时不得回退：① `history` 一律以 user 文本消息开头；② 压缩丢弃点左移 `base` 锚点而不是改历史首条；③ 系统提示词固定、技能清单按 `key` 排序；④ 内置工具名 PascalCase 稳定、MCP 工具数组**按名排序**后再入请求体；⑤ 工具黑名单只裁剪真实存在的工具名（`core-agent` 的内置十一件 + `Skill`），`src-tauri` 侧**不再内置旧 CLI 时代的默认名单** —— 那批名字对自研 agent 全是空转项，且按名精确比较会误伤同名 MCP 工具。判断「改了会不会掉缓存」的方法：把两次请求体开头做 diff，出现任何顺序变化即为回归。
-19. **用量口径不变量（2026-09）**：`result.usage` 是**每次提问的绝对值**（agent.exe 每次提问把四个计数器清零再累加本轮的工具往返），**永不改成会话累计** —— 累积是前端/面板的事，agent 侧一旦改成累计，回滚（失败轮 `history.truncate(base)`）就会让计数与上下文不一致。前端**禁止对 `result.usage` 做差**（旧 cli.exe 才是累计值，这条是历史包袱）；面板数值一律 = 本地日志 `ModuleData\usage\usage-YYYY-MM-DD.jsonl` 的今日合计。日志字段名 `cacheRead` / `cacheCreate`（驼峰）是 `read_usage_log` 的消费契约，改名前端读的是 undefined 会静默算成 0。详见 §3.5「用量与对账」。
+19. **用量口径不变量（2026-09）**：`result.usage` 是**每次提问的绝对值**（agent.exe 每次提问把四个计数器清零再累加本轮的工具往返），**永不改成会话累计** —— 累积是前端/面板的事，agent 侧一旦改成累计，回滚（失败轮 `history.truncate(base)`）就会让计数与上下文不一致。前端**禁止对 `result.usage` 做差**（旧 cli.exe 才是累计值，这条是历史包袱）。**表盘（命中率 / 总 token）口径 = 当前这次对话** —— 新建会话、切到别的会话都归零（用户 2026-09 明确要求；此前是「今日合计」，已改）。按天合计**照旧**落盘在 `ModuleData\usage\usage-YYYY-MM-DD.jsonl`，供与供应商平台逐条对账 —— **两套口径不要混**：日志是「天」，表盘是「对话」。日志字段名 `cacheRead` / `cacheCreate`（驼峰）是日志格式契约，改名会让外部对账脚本读不到。详见 §3.5「用量与对账」。
 20. **落盘日志（2026-09）**：release 是 GUI 子系统、没有控制台，`eprintln!` 线上全部丢失，前端也没有 DevTools —— 出问题原本**没有任何东西可查**。现在两个进程各自落盘到 **`<exe 根>\temp\logs\`**（`agent-YYYY-MM-DD.log` / `lunac-YYYY-MM-DD.log`，日期为 **UTC**、跨天自动换文件，启动时清理 7 天前的 `*.log`）：
     - **agent 侧**（[core-agent/src/log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs)）：启动/退出、`ready`（工具清单 / 审批档 / 技能与 MCP 数量）、`cfg`（端点与模型，token 只记 set/empty）、**每次工具调用**（`run_tool` 是唯一入口：名称 + 参数摘要 + 成功或 `FAILED` 文案 + 耗时，覆盖内置 / Skill / MCP 三类）、`run_shell` 的**退出码 / 是否超时 / 输出规模 / stderr 原文**、panic。
     - **宿主侧**（[app/src-tauri/src/log.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/log.rs)）：启动与退出、`stop_cli`、**agent 的每一行 stderr 原样落盘**（agent 自身没机会写日志时的兜底）、以及前端经 `log_frontend` 命令上报的未捕获 JS 错误（`window.onerror` / `unhandledrejection`，前端按内容去重后上报）。
@@ -703,6 +963,9 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
     - **展示信息从现有字段推导**：退出码 / 超时来自 `tool_result` 文本解析（`exit code: N` / `(timed out after N ms`），耗时 = `tool_use_id` 配对的前端时间戳，越界拒绝识别 `Access denied: … is outside the workspace`，用户拒绝识别 `User denied this action`。**不得**先私自给 `stream-json` 加字段（要走 §3.5 契约表登记流程）。
     - **折叠与省略**：思考块折叠态**不保留正文 DOM**（展开时惰性填充），超 4000 字只渲染首 2000 + 末 500；回合默认折叠门槛 = 工具调用 ≥2 或过程块 ≥3，开关 `lunac-agent-autofold`（默认 `1`，设置 · AI 面板）。折叠只做局部类名切换，不重排已完成块、不逐帧测量（code-rules §4.2/§4.3）。
     - **文案与图标**：新增文案一律进 `i18n.ts` 五语言 DICT（`agent.*` / `settings.*`），禁止硬编码中文；承担状态语义的图标必须按 [icon-style.md](file:///d:/cc/claude-code-cli-master/docs/icon-style.md) 用内联线性 SVG（emoji 只允许纯装饰）。
+    - **一次权限运行 = 一行命令组（2026-09）**：同一次运行内 `Bash` 与 `PowerShell` 视作**同一族**，合并成**一条**未应答行（含 `&&` / `|` / 重定向 / 换行的复杂命令同样入组 —— 按算子排除会让复杂任务里「一行一条」堆满卡片）；合并**只影响审批展示**，执行语义不变。`.approval-item` **不得设固定高度**（旧 `height:144px` + `.approval-body{flex:1}` 会把命令挤在中间、上方留大片空档），命令区用 `max-height` 自适应滚动。「始终允许」必须把**组内每一条**命令的命令词都写进白名单（只写第一条 = 用户反馈的「允许过还要再问」）；合并后标题要重画（工具名可能不止一个，⛔/⚠ 标记可能来自后并入的那条）。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。详见 [agent-ui-spec.md](./agent-ui-spec.md) §3.6。
+    - **历史回顾不得省略过程与表盘（2026-09）**：会话文件（`ModuleData\history\chat-history.json`）除 `messages` 外还存 `usage`（表盘口径的 token 快照）与 `steps`（按回合分组的过程快照）；恢复历史时把表盘数值写回仪表盘、把过程渲染成可折叠的「过程 · N 步」块。**不是 `localStorage`**。详见 [agent-ui-spec.md](./agent-ui-spec.md) §3.7。
+    - **滚动条统一（不得回退）**：项目内**所有**可滚动容器共用 `styles.css` 里**唯一**的全局 `::-webkit-scrollbar` 规则（4px / 轨道透明 / 滑块 `rgba(255,255,255,0.18)` / hover 0.32）。**禁止写 `scrollbar-width` / `scrollbar-color`** —— Chromium（WebView2）看到非 `auto` 值会让 `::-webkit-scrollbar` 整段失效、退回系统默认外观（历史事故：`#chat-input` / `.tool-result` 就是这么变成「WebView2 默认滚动条」的）；**禁止按容器单独声明**滚动条样式（新增容器必漏）。详见 [agent-ui-spec.md](./agent-ui-spec.md) §5.4。
 22. **系统提示词环境块（2026-09）**：agent 的系统提示词 = `SYSTEM_PROMPT`（身份 / 风格 / 工具使用） + `env_block(cwd)` + `skills::listing()`，三段拼接，见 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `env_block()`。环境块必须写明：宿主是 **Lunac**（不是任何其它 agent 框架的一部分）、**工作目录的绝对路径**、**Lunac 自己的技能目录**（`LUNAC_SKILLS_DIR`），并**显式禁止用磁盘上的文件反推宿主**。
     - **为什么必须写**（真实案例）：默认工作区是用户主目录，而用户主目录里可能躺着**别的 agent 框架**的目录（实测：`~/.hermes/skills`）。模型回答「我自己的 skills 在哪」时只能从文件系统反推 —— Glob 到那些目录后，它把宿主认成了那个框架，整个思考过程都锁死在那里（只是「你是 Lunac 的助手」这一句并不够）。
     - **不得回退**：这段话是身份纠偏的唯一来源，删掉就会退回「模型自己猜宿主」。内容在一次会话内必须**逐字节不变**（cwd 与技能目录在 agent 进程生命周期内都是常量），否则违反规则 18 的前缀缓存不变量。
@@ -710,12 +973,51 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
     - **全链路审计结论**：`system`（含 `env_block`）、`tools`（按名排序）、`history` 的四个追加点都是 append-only 且进程内恒定，**不是**命中率低的来源。
     - **断裂源按影响排序**（都在 `compact_history()` 及其调用点，[core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)）：① `drop`（>95% 水位才丢中段）> ② `elide`（>85% 水位 + 滞回）> ③ 首条插入 `TRIMMED_MARKER` > ④ 失败回滚 `history.truncate(base)` 与压缩叠加。任何改动这四处的代码都要意识到「这是在主动放弃整段前缀缓存」。
     - **已实施的减损措施（不得回退）**：水位从 0.70/0.90 抬到 **0.85/0.95**；瘦身档加**滞回**（`Cfg.last_compact`：一次压缩后要再长 ≥ 预算 ×0.15 才允许动第二次）；`Compact` 三档化，**瘦身档永不丢整条消息**（原先「无可瘦身内容就直接丢」会让 0.85 水位也丢整段，等于白废一次缓存）。丢弃档不受滞回约束 —— 到 0.95 不压就可能 400，安全优先。
-    - **思考模式不直接进前缀**：thinking 只进 `display`、**不进 history**（回灌会 400）；其 400 降级只改 `thinking` 形态与 `max_tokens` 两个生成参数（`Thinking` / `max_tokens_for`），是否掉缓存取决于端点侧 hash 口径（本仓库无法自证）。但**切档会重启 agent ⇒ history 清空 ⇒ 缓存必然重建**，这是「切档后命中率骤降」的合理解释，属预期行为。
-    - **归因方法**：本地 `ModuleData\usage\usage-YYYY-MM-DD.jsonl` 的今日合计给出命中/未命中（口径见 §3.5「用量与对账」，Hit = `cacheRead`，Miss = `input + cacheCreate`）；把 `system/context_compacted` 的 `elided`/`dropped` 计数按时间对齐上去，即可区分「自然未命中」与「压缩断裂」。对账时注意粒度差：平台**按每次 API 请求**记一行，本地**按每次提问**记一行。
+    - **瘦身档的「值不值得」闸门（2026-09 新增，不得回退）**：瘦身是**就地改写较早的消息**，端点侧从被改的那条起就再也匹配不上已落盘的缓存前缀单元 ⇒ **省下的体积必须明显大于被作废的后缀**。因此只有「可省字符数 ≥ 当前上下文 token × `ELIDE_MIN_SAVINGS_RATIO`(0.05) × 4」才允许瘦身；不够就**什么都不做**（打一行 `跳过瘦身：可省 X 字 < 阈值 Y 字` 到 stderr，便于归因）。**闸门只作用于瘦身档**（可选档）；`Drop` / `Force` 是安全刚需，照旧无条件压。配套：`compact_history()` 返回 `CompactOutcome{elided, dropped}`，「扫了一圈但决定不动」时**不推进 `last_compact` 滞回时钟**（否则会白等一个 15% 增长窗口，且压缩计数被污染）。
+    - **判断「命中率是否真的偏低」要先对账**：按 §9.1 难点 1 的做法，用 `requests[]` 与平台逐行对齐，并拿单轮数据去比「上一轮上下文 ÷（上一轮 + 本轮新增）」这个上限公式。2026-09-15 实测：dev 实例真实记录合计命中率 **77.4%**，单轮恰好贴着上限（如 `in=4612 / read=15744` → 77.3%）⇒ **低位来自会话短，不是缺陷**；不要为了「向 dsh 的 97–99% 看齐」去改结构。
+    - **思考开关不直接进前缀**：thinking 只进 `display`、**不进 history**（回灌会 400）；其 400 降级只改 `thinking` 形态与 `max_tokens` 两个生成参数（`Thinking` / `max_tokens_for`），是否掉缓存取决于端点侧 hash 口径（本仓库无法自证）。但**切思考开关会重启 agent ⇒ history 清空 ⇒ 缓存必然重建**，这是「切换后命中率骤降」的合理解释，属预期行为。
+    - **思考只有开 / 关两态（2026-09-15，不得回退）**：端点**没有**思考力度旋钮（`budget_tokens` 不被 enforce、`effort` 字段被静默忽略，实测见 §3.5），因此**禁止**再把档位做成「快速 / 思考 / 深度」这类深度分级、也禁止把 `budget_tokens` 暴露给用户 —— 那是在承诺端点做不到的事。开关值只有 `on` / `off`（`LUNAC_THINKING`），`budget_tokens` 退化为单一常量 `THINKING_BUDGET`。
+    - **归因方法**：本地 `ModuleData\usage\usage-YYYY-MM-DD.jsonl` 的今日合计给出命中/未命中（口径见 §3.5「用量与对账」，Hit = `cacheRead`，Miss = `input + cacheCreate`）；把 `system/context_compacted` 的 `elided`/`dropped` 计数按时间对齐上去，即可区分「自然未命中」与「压缩断裂」。**粒度差已抹平**：同一条记录里的 `requests[]` 是「每次 API 请求一行」，可与平台用量页逐行对账。
 24. **Agent 能力定位与本地扩展目录（2026-09）**：
     - **定位**：Lunac 的 agent 目标是**一个可以完全类比于完整 agent 类应用**的能力体。**不得**以「宿主是桌面启动器」为由把某项能力判定为「用不上」—— 缺口只做**优先级排序**，不做**价值否定**（旧文档把多代理协作等写成「与 Lunac 无关」是错的，已改）。
     - **文档分工**：[agent-implementation.md](./agent-implementation.md) = 实现全景（已实现能力矩阵 / 工具清单全表 / 本地 `skills\` 与 `tools\` 扩展格式）；[agent-feature-backlog.md](./agent-feature-backlog.md) = 待办与实施顺序。两者不互相搬运重复内容。
     - **发布包必须预置 `skills\` 与 `tools\` 模板**：源文件在仓库 `agent-templates/`，由 [build-release.ps1](file:///d:/cc/claude-code-cli-master/build-release.ps1) 拷进暂存目录、由 [lunac-installer.nsi](file:///d:/cc/claude-code-cli-master/scripts/lunac-installer.nsi) 打进 `$INSTDIR\skills` / `$INSTDIR\tools`。模板**必须是不可加载的形态**（`README.md` + `*.example` 后缀）—— `skills\` 下任何含 `SKILL.md` 的子目录都会被列进系统提示词、`tools\` 下任何 `.json` 都会被当工具加载并进入请求体前缀；放真实文件会污染模型的工具清单并破坏前缀缓存不变量（规则 18）。
+25. **瞬时失败重试（2026-09）**：agent 对「重试有意义」的瞬时失败做**请求级**退避重试 —— 只在**尚未读到响应体之前**重试，**永不产生重复内容**，因此**不是**「重新生成回答」。
+    - **范围收窄**：只有 ① 网络层（连接失败 / 重置 / 超时，`reqwest` 的 `is_builder()` 错误除外）与 ② 429 / 5xx（含 529「过载」）才重试。**4xx 一概不重试** —— 但 400 的两个专门分支保留：thinking 相关走思考降级链、上下文超限走强制压缩，二者各有各的「换形态再试」语义，不得并入本重试。
+    - **次数与退避**：`MAX_API_RETRIES = 3`，1s → 2s → 4s 指数增长 + 0..250ms 抖动（不引 `rand`，见规则 20），30s 封顶；端点给的 `Retry-After`（秒）优先。
+    - **必须上报**：每次退避发 `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`）并落盘一条 `warn`（过 `mask_secrets`）—— 否则界面在退避期间毫无反馈，用户会以为卡死。
+    - **SSE 流中途断开不重试**：部分内容已经流给前端，重来会重复；只记 `warn`，本轮回复可能不完整。
+    - 实现在 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `retryable_status()` / `retry_delay_ms()` / `emit_api_retry()` 与请求循环，纯函数有单测（`cargo test -p agent`）。
+26. **命令静态安全分析（2026-09）**：危险命令判定**必须在 agent（执行侧）做**，不能只靠前端正则 —— 前端只拿到命令字符串，正则挡不住引号拼接（`r""m -rf /`）、包装器（`cmd /c "…"` / `powershell -Command "…"` / `bash -c '…'`）、变量（`%TMP%\x.bat`）与串联/管道的后半段。实现在 [core-agent/src/bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)，结果作为 `can_use_tool` 的 `analysis` 字段上报（契约见 §3.5「命令静态安全分析」）。
+    - **只上报、不代替决策**：agent **不得**因自己判为危险就拒绝执行 —— 「自动放行 / 弹审批」永远是前端的唯一决策点（规则 21），否则用户点了「允许」也放行不了。判定是**增强**前端判定，不是替换。
+    - **fail-closed 是硬要求**：判不出来（命令词是变量、命令替换 `$(…)`、cmd 的 `%VAR%`、编码执行、间接执行器、包装器嵌套过深、控制字符）⇒ `opaque` 非空 ⇒ **不得自动放行**。宁可多弹一次卡片，也不能把「看不懂的命令」当安全放过去。
+    - **`opaque` 判据 2026-09 收窄到「不知道要跑哪个程序」**：**参数里的变量不算**（`Get-ChildItem $HOME`、`$f = "…"; Get-Item $f` 都是普通命令）。理由有两条 —— ① 参数展开的结果**不会被重新解析成命令**（不像 cmd 的 `%VAR%`，它的值里的 `&` / `|` 会变成新命令）；② 旧口径下 PowerShell 里几乎每条带 `$` 的命令都命中，**自动档位形同失效**（用户反馈的「自动运行开着还每条都弹卡」就是这个）。配套改动：`command_word()` 跳过环境赋值前缀（`FOO=bar rm -rf /` 的命令词是 `rm`，否则整条危险规则失效），`detect_opaque()` 对赋值子命令直接返回。
+    - **危险判定不许被绕过**：`dangerous` 非空时，**任何运行方式档位**（含「自动」）都必须人工确认，且**不提供「始终允许」**；与规则 14 的两道闸门是「与」关系。
+    - **白名单必须按命令词设限**：白名单是**前缀匹配**，`powershell` / `cmd` / `bash` / `python` / `node` / `npx` / `iex` / `env` 这类解释器与启动器前缀**永不入白名单**（否则「允许过一次 `powershell -Command A`」= 以后任何 `powershell …` 自动放行）；历史遗留的这类白名单条目在前端也要拒绝生效。
+    - **单引号是字面量、双引号会展开**（bash / PowerShell / cmd 三者一致）：危险判定走「抹掉单引号内容」的形态（`echo 'shutdown'` 不误报），包装器递归走「保留单引号内容」的形态（`bash -c 'shutdown'` 不能漏判）。
+    - **转义判定要认 Windows 路径**：`\` 只在后随**非字母数字**时才是转义（`C:\Windows` 里的 `\W` 是分隔符）—— 一律当转义会把路径揉成 `C:Windows`，危险规则再也匹配不上。
+    - 改动本模块后必须跑 `cargo test`（含 `catches_quote_splicing` / `catches_danger_in_later_subcommand` / `catches_wrapped_commands` / `single_quoted_literals_are_not_dangerous` / `unresolved_indirection_is_opaque` 等），并确认 `npx tsc --noEmit` 与前端审批卡渲染正常。
+27. **单条工具输出预算（2026-09-15）**：单条工具结果**超过 12000 字符就落盘全文**（`temp\tool-outputs\{毫秒}-{工具名}.txt`），上下文里只内联「头 8000 + 尾 2000 + 行数 + 落盘路径」，并提示模型用 `Read`（带 `offset`/`limit`）或 `Grep` 取回。契约见 §3.5「单条工具输出预算」。
+    - **唯一出口**：只在 `run_tool` 调 `tools::apply_budget(name, body)` —— 只有那一层同时拿到工具名与未经裁剪的完整输出。**各工具内部一律不得自行截断**（旧实现 7 处 `truncate()` 已删）：那样会在预算之前就把内容丢掉，落盘也就无从谈起。
+    - **不许退回硬截断**：模型看不到的内容等于不存在。尾部必须保留（报错结论压在末尾），落盘失败时也只能如实标注「已丢弃」，不许静默截断。
+    - **落盘目录必须并入 `Ctx.add_dirs`**（`tools::prepare_output_dir()` 在启动时做）：默认 project 档的工作区锁会拦工作区外路径，不并入等于模型读不回自己的输出。
+    - **落盘正文按 1.5MB 字节封顶**（切在字符边界）：必须低于 Read / Grep 的 `MAX_TEXT_BYTES`(2MB) 门槛，否则模型两个工具都打不开（Read 拒绝、Grep 跳过）。被砍时预览里必须如实写「only the first N chars」。
+    - **保留 7 天**（启动时清 `*.txt`，与规则 20 的落盘日志同口径）；**不新增环境变量**（目录取 `log::log_dir()` 的父目录）。每次落盘往日志记一行「超预算（N 字符 / M 行）→ 路径」，否则线上无法判断「模型为什么没看到完整输出」。
+28. **只读工具并行（2026-09-15）**：一轮里的多条工具调用，**连续的只读调用**合成一批并行（上限 `TOOL_PARALLELISM = 4`），其余串行。契约见 §3.5「只读工具并行」。
+    - **白名单只有 7 个**（`tools::parallel_safe`）：`Read` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `Skill` / `TodoWrite`。**新增工具默认串行** —— 要进白名单必须先自证「只读、不落盘、无全局状态」。
+    - **只读批绝不允许跨越写类调用**（「写 A → 读 A」被重排就是错得无声无息）。单元素只读段不标并行。
+    - **回灌顺序恒等于 `tool_use` 原顺序**：结果按下标回填，禁止「谁先跑完谁先回灌」。同样地，**审批必须在并行之前**按原顺序解完（否则会打乱前端按「未应答行」合并同一批命令的结果）。
+    - **MCP 与命令工具永不并行**：`&mut Bridge` 无法跨线程共享（也不该并发），命令工具带副作用。
+    - 改动本模块后必须跑 `cargo test`（含 `batches_never_span_a_writing_call` / `single_read_only_call_is_not_marked_parallel`），并用真机烟测确认日志里出现「只读工具并行批」且 `tool_result` 顺序未变。
+29. **详细搜索大界面（2026-09-15）**：双击搜索栏进入的大界面（类 Win+S）。契约见 §2.1.2。
+    - **简洁搜索的行为一律不许丢**：进大界面只是叠一层视图（`#app.detail-mode` 上隐藏搜索栏与结果区），退出时把查询词带回搜索栏并重跑简洁搜索；**不得**在大界面里私自改搜索栏/结果区的既有语义。
+    - **窗口档 = 640 × zoom 固定高，且不进滑动动画**（离散切换，与插件态同策略）。宽度不变。
+    - **切分类不重查**（只筛 `detailAllRows`）；**只有文件类型筛选走后端重查**。序号 `detailSeq` latest-wins，与简洁搜索同纪律。
+    - **文件索引只有一条纪律**：唯一存储 `<exe 根>\temp\file-index-cache.json`，**搜索路径只读内存索引、永不扫盘**；扫盘只在后台线程（启动 600ms 后 / 手动重建），写回原子。扫描范围/上限/存储形态的理由见 §2.1.2（拿 19.6 万条的真实数据定的口径）。
+    - **存储形态不许退回「每条一份完整路径」**：紧凑形态（目录表 + 文件名）是实测定的（20 万条路径版 47.8MB vs 30 万条紧凑版 30.8MB）；匹配算法必须**零分配**（`eq_ci`/`starts_with_ci`/`find_ci`），不许在每键击里对全量条目做 `to_lowercase()`。
+    - **截断必须如实告知**：达到 `MAX_ENTRIES` 时 `truncated=true` 并原样显示「索引不完整」，禁止静默丢掉一部分盘。
+    - **设置页与系统动作只走白名单**：`open_setting` 只收 `ms-settings:` 前缀、`run_system_action` 只认目录里的 id（**绝不接受前端传来的命令行/任意 URI**）。新增危险动作必须在 `system_catalog` 标 `danger: true`（前端据此二次确认）。改动这两个模块后必须跑 `cargo test`（含 `arbitrary_targets_are_rejected` / `only_shutdown_and_restart_are_dangerous`）。
+    - **Esc 的隐藏判据是「界面层」而不是「内容」**（2026-09-15 修）：Rust `hotkey.rs` 只用**一个** `UI_MODE` 枚举（`main`/`plugin`/`detail`，前端 `set_ui_mode` 同步），`UI_MODE != main` 时无条件 emit `lunac-esc-clear` 交给前端退层。**禁止新增「每界面一个 AtomicBool + Esc 加一条 else if」** —— 新增界面应当只加一个枚举值 + 前端 `handleEscClear()` 一支。禁止把判据改回「query 空 + chips 空」：详情态的查询词在自己的输入框里，按内容判空会一下 Esc 隐藏整个窗口（用户报的 bug）。Esc 的层级顺序 = 抽屉 → 详情大界面 → 插件 → 泡泡 → 文本 → 隐藏窗口。
 
 ## 12. Agent Plan 模式规范
 

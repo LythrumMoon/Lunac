@@ -31,6 +31,57 @@ pub fn module_data_dir() -> PathBuf {
     lunac_root_dir().join("ModuleData")
 }
 
+// ── AI 配置（<exe_dir>\config\ai.json）───────────────────────────
+//
+// **AI 凭据的唯一真相源**（2026-09-15 改）。设置面板保存的供应商/地址/key/模型落在这里，
+// 启动时由 `commands::apply_saved_ai_config()` 读回并注入环境变量。
+//
+// 为什么不继续用 localStorage：它曾与 `.env` **争话语权** —— 启动时前端把 localStorage
+// 里的旧值回灌进 env，**覆盖**了用户刚改过的 `.env`，表现为「key 改了不生效、一直 401」，
+// 而且用户完全无从判断生效的是哪一份；排查时还要去翻 WebView2 的 leveldb 才能看见。
+// 另外它不在 exe 根目录（违反便携约束），dev 与 release 还各存一份、互不相同。
+//
+// 放在 `config\` 与 hotkey.json 同级：都是「应用配置」，业务数据才进 ModuleData。
+// 想回到 `.env` 的默认值：删掉本文件即可（启动日志会写明当前生效来源）。
+
+/// 设置面板保存过的 AI 配置。字段级 `#[serde(default)]`：旧文件或手工编辑缺字段也能读。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AiConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub agent_url: String,
+    #[serde(default)]
+    pub search_provider: String,
+    #[serde(default)]
+    pub search_key: String,
+}
+
+fn ai_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("ai.json")
+}
+
+/// 读取 AI 配置；文件不存在或损坏时返回 `None`（调用方据此回落到 `.env`）。
+pub fn load_ai_config() -> Option<AiConfig> {
+    let text = fs::read_to_string(ai_config_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_ai_config(cfg: &AiConfig) -> Result<(), String> {
+    let path = ai_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())
+}
+
 // ── 旧数据整体迁移（%LOCALAPPDATA%\Lunac(-dev) → exe 根）──────────────
 // 迁移后会删除旧目录（用户决策）。幂等：仅当目标 ModuleData 尚未存在时才复制；
 // 若已存在则直接清理旧目录，避免每次启动重复搬移。
@@ -150,6 +201,45 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// 本次对话的 token 用量（**表盘口径**）。
+/// 随会话一起落盘，历史回顾时前端读回来还原表盘（旧记录没有该字段 → 全 0）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SessionUsage {
+    #[serde(default)]
+    pub hit: u64,
+    #[serde(default)]
+    pub miss: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub elided: u64,
+    #[serde(default)]
+    pub dropped: u64,
+}
+
+/// 过程快照里的一步：一条思考 / 一次工具调用（含结果摘要）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SessionStep {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(rename = "isError", default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+}
+
+/// 一个回合的过程（历史回顾时按回合渲染可折叠的「过程」块）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SessionProcess {
+    #[serde(default)]
+    pub turn: u64,
+    #[serde(default)]
+    pub items: Vec<SessionStep>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatSession {
     pub id: String,
@@ -157,6 +247,12 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
     #[serde(rename = "createdAt")]
     pub created_at: u64,
+    /// token 用量（表盘口径）——历史回顾时前端读回表盘
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SessionUsage>,
+    /// 过程快照（按回合分组）——历史回顾时渲染「查看过程」
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<SessionProcess>>,
 }
 
 const CHAT_FILE: &str = "chat-history.json";
@@ -225,6 +321,22 @@ pub fn load_clipboard_history() -> Result<Vec<ClipEntry>, String> {
 // 并发写坏。文件名用**本地日期**（由前端传入）：Rust 侧没有 chrono，不为一句
 // 时区换算引入新依赖。
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct UsageRequest {
+    /// 该次请求未命中缓存的输入 token（Anthropic 的 `input_tokens`）
+    #[serde(rename = "in")]
+    pub input: u64,
+    /// 命中缓存的输入 token（`cache_read_input_tokens`）
+    #[serde(default)]
+    pub read: u64,
+    /// 缓存写入 token（`cache_creation_input_tokens`；DeepSeek 自动缓存下恒为 0）
+    #[serde(default)]
+    pub create: u64,
+    /// 该次请求的输出 token
+    #[serde(default)]
+    pub out: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageRecord {
     /// 本地时钟的 epoch 毫秒（前端 Date.now()）
@@ -245,6 +357,12 @@ pub struct UsageRecord {
     pub elided: u64,
     #[serde(default)]
     pub dropped: u64,
+    /// **每次 API 请求**一行的用量明细（顺序 = 请求顺序）。
+    /// 平台上「一次带工具的提问」就是多行、本地只落一行 → 命中率没法逐行对齐；
+    /// 有了这个数组才能和 DeepSeek 平台用量页按请求对账（ai-spec §3.5「用量与对账」）。
+    /// 旧记录没有该字段，读时按空表。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<UsageRequest>,
 }
 
 fn usage_dir() -> PathBuf {
@@ -385,6 +503,9 @@ mod tests {
             output: 3,
             cache_read,
             cache_create: 0,
+            elided: 0,
+            dropped: 0,
+            requests: vec![],
         }
     }
 
@@ -398,13 +519,30 @@ mod tests {
         assert!(usage_log_path("1970-01-01").is_ok());
     }
 
-    /// 字段名是前端 `read_usage_log` 的消费契约（cacheRead/cacheCreate 驼峰）
+    /// 字段名是前端 `read_usage_log` 的消费契约（cacheRead/cacheCreate 驼峰；
+    /// `requests` 为空时不写该键）。
     #[test]
     fn usage_record_json_shape() {
         let line = serde_json::to_string(&rec(1536)).unwrap();
         assert_eq!(
             line,
-            r#"{"ts":1700000000000,"model":"deepseek-flash","input":212,"output":3,"cacheRead":1536,"cacheCreate":0}"#
+            r#"{"ts":1700000000000,"model":"deepseek-flash","input":212,"output":3,"cacheRead":1536,"cacheCreate":0,"elided":0,"dropped":0}"#
+        );
+    }
+
+    /// 每次 API 请求一行（对账粒度）—— `in` 是关键字，必须映射成 `in` 而不是 `input`
+    #[test]
+    fn usage_record_serializes_per_request_rows() {
+        let mut r = rec(1536);
+        r.requests = vec![
+            UsageRequest { input: 700, read: 0, create: 0, out: 12 },
+            UsageRequest { input: 20, read: 680, create: 0, out: 8 },
+        ];
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(line.contains(r#""requests":[{"in":700,"read":0,"create":0,"out":12}"#), "{line}");
+        assert_eq!(
+            serde_json::from_str::<UsageRecord>(&line).unwrap().requests[1].read,
+            680
         );
     }
 
