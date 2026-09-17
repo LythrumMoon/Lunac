@@ -657,22 +657,14 @@ fn toggle_window() {
             } else {
                 ShowWindow(hwnd, SW_SHOW);
             }
-            force_foreground(hwnd);
-
-            // 唤出时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）。
-            // 搜索路径只读文件、永不扫描，所以这一步只影响「列表有多新」，
-            // 不会让搜索等待。
-            crate::app_indexer::refresh_if_stale();
-
-            // Update toggle tick AFTER force_foreground completes, so the
-            // foreground guard cooldown doesn't start until the window is
-            // actually visible and in front. Previously this was set before
-            // ShowWindow, causing the guard to auto-hide the window if
-            // force_foreground took >500ms (e.g., AttachThreadInput +
-            // Tauri set_focus IPC roundtrip).
-            LAST_TOGGLE_TICK.store(GetTickCount(), Ordering::SeqCst);
-
-            // Notify frontend: window is now visible
+            // 顺序（2026-09-17 重排，**不得再改回「force_foreground 在最前」**）：
+            //   ① Notify frontend（本 if 块） → ② refresh_if_stale → ③ force_foreground
+            // 为什么激活要挪到最后：`AttachThreadInput` 的等待时间不可控（它要接前台
+            // 线程的输入队列），原来排在 emit 之前 ⇒ 前端必须等激活做完才收到
+            // `lunac-window-shown`。而前端对这个事件的反应正是「主动重跑当前查询」的
+            // 唯一入口（main.ts 的同名监听器），高负载下这段等待被放大，用户看到的就是
+            // 「唤出后停在上次搜索结果」。emit 只是投递、不入队等待；下面排队到主线程的
+            // 剪贴板读取也能与激活路径里的 sleep 并行执行。
             if let Some(app) = APP.get() {
                 let _ = app.emit("lunac-window-shown", ());
 
@@ -708,6 +700,22 @@ fn toggle_window() {
                     }
                 });
             }
+
+            // ② 唤出时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）。
+            // 搜索路径只读文件、永不扫描，所以这一步只影响「列表有多新」，
+            // 不会让搜索等待。
+            crate::app_indexer::refresh_if_stale();
+
+            // ③ 窗口激活 —— 放最后，理由见上面那段顺序注释。
+            force_foreground(hwnd);
+
+            // Update toggle tick AFTER force_foreground completes, so the
+            // foreground guard cooldown doesn't start until the window is
+            // actually visible and in front. Previously this was set before
+            // ShowWindow, causing the guard to auto-hide the window if
+            // force_foreground took >500ms (e.g., AttachThreadInput +
+            // Tauri set_focus IPC roundtrip).
+            LAST_TOGGLE_TICK.store(GetTickCount(), Ordering::SeqCst);
         }
     }
 }

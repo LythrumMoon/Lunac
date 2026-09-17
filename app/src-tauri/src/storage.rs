@@ -2,11 +2,17 @@
 // File-based persistent storage for chat history, clipboard history and memo.
 // 数据目录（2026-09 修订）：全部缓存与业务/插件数据统一放「exe 安装根目录」，
 // 即可执行文件所在目录，使应用数据结构清晰、随卸载一并清除：
-//   - <exe_dir>\ModuleData\history\chat-history.json / clipboard-history.json
+//   - <exe_dir>\ModuleData\history\chat.db（会话历史，SQLite。**2026-09-17 起**；同目录的
+//     chat-history.json 只是迁移前的旧文件，库建好后即不再是真相源，见 chat_db.rs）
+//   - <exe_dir>\ModuleData\history\clipboard-history.json
 //   - <exe_dir>\ModuleData\memo\memo.json（备忘录，含图片 images\<id>\）
 //   - <exe_dir>\ModuleData\custom\app_registry.json（自定义启动项）
 //   - <exe_dir>\temp\webview-data（WebView2 用户数据/缓存，见 main.rs）
 //   - <exe_dir>\temp\app-index-cache.json（应用扫描缓存，见 app_indexer.rs）
+//   - <exe_dir>\temp\transStorage（**agent 的默认工作目录**：未配置工作区时 agent 的 cwd，
+//     模型写的临时/草稿文件落在这里 —— 以前回退用户主目录，会堆到 C:\Users\<名> 根下，
+//     见 commands.rs 的 default_work_dir() 与 ai-spec §11 规则 34）
+//   - <exe_dir>\temp\logs、<exe_dir>\temp\tool-outputs（落盘日志与超长工具输出，见 log.rs）
 //   - <exe_dir>\skills、<exe_dir>\tools、<exe_dir>\config、<exe_dir>\paddle-ocr
 // 旧版本数据曾放在 %LOCALAPPDATA%\Lunac(-dev)，首次启动由
 // migrate_legacy_localappdata() 整体搬移后删除。
@@ -229,6 +235,12 @@ pub struct SessionStep {
     pub result: Option<String>,
     #[serde(rename = "isError", default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// `Write` / `Edit` 改动的文件绝对路径（2026-09-17，backlog §8.1 路径追踪）。
+    /// **只从 `tool_use` 的入参取**，绝不从工具输出正文里猜 —— 这是「改动过的文件」与
+    /// 「只是读过的文件」唯一可靠的区分。恢复历史时据此重建「本次会话改动过的文件」列表
+    /// （落盘走 `steps` 那一列的 JSON，**无需改表结构**）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// 一个回合的过程（历史回顾时按回合渲染可折叠的「过程」块）。
@@ -255,23 +267,40 @@ pub struct ChatSession {
     pub steps: Option<Vec<SessionProcess>>,
 }
 
+/// 旧会话历史文件（JSON）。**只用于一次性迁移**：库建好之后它不再是真相源。
 const CHAT_FILE: &str = "chat-history.json";
+/// 会话历史库（SQLite，取代上面的 JSON —— 见 chat_db.rs 的模块注释）。
+const CHAT_DB: &str = "chat.db";
+
+/// `<ModuleData>\history\chat.db`
+fn chat_db_path() -> PathBuf {
+    history_dir().join(CHAT_DB)
+}
 
 #[tauri::command]
 pub fn save_chat_sessions(sessions: Vec<ChatSession>) -> Result<(), String> {
     ensure_history_dir().map_err(|e| e.to_string())?;
-    let path = history_dir().join(CHAT_FILE);
-    let json = serde_json::to_string_pretty(&sessions).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())?;
-    Ok(())
+    crate::chat_db::save(&chat_db_path(), &sessions)
 }
 
 #[tauri::command]
 pub fn load_chat_sessions() -> Result<Vec<ChatSession>, String> {
-    match read_with_legacy_migration(CHAT_FILE)? {
-        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string()),
-        None => Ok(vec![]),
+    ensure_history_dir().map_err(|e| e.to_string())?;
+    let db = chat_db_path();
+    if !db.exists() {
+        // 一次性迁移（2026-09-17）：老 JSON 会话历史 → SQLite。
+        // **只在库文件不存在时走** —— 库一旦建好就是唯一真相源，绝不能再拿旧 JSON 覆盖它
+        // （否则用户删掉的会话会在下次启动时"复活"）。
+        // 迁移完**保留**旧 JSON 不删：留着只是几十 KB，删了就没有退路。
+        if let Ok(Some(json)) = read_with_legacy_migration(CHAT_FILE) {
+            match crate::chat_db::import_legacy(&db, &json) {
+                Ok(n) => eprintln!("[storage] 会话历史已迁移到 SQLite：{n} 个会话"),
+                // 迁移失败不阻断启动：库会建为空库，旧 JSON 原样留着可手工抢救。
+                Err(e) => eprintln!("[storage] 会话历史迁移失败（旧 JSON 保留）：{e}"),
+            }
+        }
     }
+    crate::chat_db::load(&db)
 }
 
 // ── Clipboard History ─────────────────────────────────────────────

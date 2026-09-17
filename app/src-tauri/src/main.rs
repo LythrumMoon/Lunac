@@ -12,6 +12,7 @@ mod system_catalog;
 mod icon_extractor;
 mod proxy_server;
 mod storage;
+mod chat_db;
 mod auto_start;
 mod mcp_server;
 mod windows_ocr;
@@ -30,7 +31,7 @@ use commands::{
     search_apps, launch_app, add_custom_app, remove_custom_app, list_custom_apps,
     get_app_icon,
     search_files, file_index_status, refresh_file_index,
-    system_catalog, open_setting, run_system_action,
+    system_catalog, open_setting, run_system_action, reveal_in_explorer,
     set_hotkey_combo, get_hotkey_combo,
     set_auto_start, get_auto_start_info,
     check_file_exists,
@@ -169,14 +170,31 @@ fn main() {
     // 把旧值覆盖进 env —— 用户改了 .env 也不生效，见 storage.rs 的注释。
     commands::apply_saved_ai_config();
 
-    if std::env::var("WEBVIEW2_USER_DATA_FOLDER").is_err() {
-        // 缓存统一放 <exe_dir>\temp\（2026-09 修订）：不再写入 LOCALAPPDATA / exe 目录以外
-        let lunac_root = crate::storage::lunac_root_dir();
-        let webview_data = lunac_root.join("temp").join("webview-data");
-        let _ = std::fs::create_dir_all(&webview_data);
-        // 确保业务数据根目录存在（storage.rs 也会惰性创建）
-        let _ = std::fs::create_dir_all(lunac_root.join("ModuleData"));
-        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_data);
+    // WebView2 profile 路径：**无论是否被外部预设都要记一行**（2026-09-17 加）。
+    //
+    // 为什么必须记：`WEBVIEW2_USER_DATA_FOLDER` 是「一旦存在就完全接管」的变量 —— 下一段
+    // 只在**未设**时才注入本应用自己的路径。实测踩过：某次调试在终端里 `$env:` 设成了
+    // release 的路径、事后忘了清，之后从同一终端启动的 **dev** lunac 就一直在用 release 的
+    // profile（`msedgewebview2.exe` 命令行实测 `--user-data-dir=D:\Lunac\temp\webview-data\EBWebView`），
+    // dev / release 的缓存与 leveldb 互相污染 —— 而日志里**一个字都没有**，只能去任务管理器
+    // 翻 WebView2 子进程的命令行才能发现。现在启动即留痕，一眼可辨。
+    match std::env::var("WEBVIEW2_USER_DATA_FOLDER") {
+        Ok(p) => {
+            crate::log::warn(format!(
+                "WebView2 profile 来自环境变量（非本应用默认目录）：{p} —— 若是 dev 实例，\
+                 说明该变量被外部预设，dev 与 release 会共用同一个 profile"
+            ));
+        }
+        Err(_) => {
+            // 缓存统一放 <exe_dir>\temp\（2026-09 修订）：不再写入 LOCALAPPDATA / exe 目录以外
+            let lunac_root = crate::storage::lunac_root_dir();
+            let webview_data = lunac_root.join("temp").join("webview-data");
+            let _ = std::fs::create_dir_all(&webview_data);
+            // 确保业务数据根目录存在（storage.rs 也会惰性创建）
+            let _ = std::fs::create_dir_all(lunac_root.join("ModuleData"));
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_data);
+            crate::log::info(format!("WebView2 profile: {}", webview_data.display()));
+        }
     }
 
     // ── Suppress WebView2 permission dialogs ──────────────────────
@@ -372,6 +390,7 @@ fn main() {
             system_catalog,
             open_setting,
             run_system_action,
+            reveal_in_explorer,
             storage::save_chat_sessions,
             storage::load_chat_sessions,
             storage::save_clipboard_history,

@@ -1381,6 +1381,13 @@ html, body {
   opacity: 0.85;
 }
 
+/* 写类工具（Write / Edit）的「路径之外」的剩余入参：路径本身已提成可点链接，
+   剩下的 json 是次要信息，压暗以免和链接抢注意力（backlog §8.1）。 */
+.tool-card .tool-cmd-rest {
+  color: var(--text-muted);
+  opacity: 0.8;
+}
+
 .tool-card .tool-state {
   flex: none;
   font-size: 11px;
@@ -1516,6 +1523,83 @@ html, body {
   color: var(--text-dim);
 }
 
+/* ── 被改动文件的路径追踪（backlog §8.1）────────────────────────────
+   路径**只来自 `tool_use` 的入参**（`Write` / `Edit` 的 `file_path`，见 main.ts
+   `changedFilePathFromArgs()`），渲染成可点链接 → Rust `reveal_in_explorer`
+   （`explorer.exe /select,`）。视觉沿用 .sys-note / .turn-footer 那套「左侧细线 +
+   弱化色」的次要信息族系，不新造卡片风格。
+   滚动：本面板不设 max-height、不出滚动条；若将来要写，走文件顶部那条**全局**
+   ::-webkit-scrollbar，**禁止**在此声明 scrollbar-width / scrollbar-color。 */
+.file-link {
+  color: var(--blue);
+  text-decoration: none;
+  cursor: pointer;
+  word-break: break-all;
+  border-bottom: 1px dashed rgba(148, 144, 180, 0.45);
+}
+.file-link:hover {
+  color: var(--text);
+  border-bottom-color: var(--text-dim);
+}
+
+.changed-files-card {
+  margin: 8px 0 10px 0;
+  padding: 5px 10px;
+  border-left: 2px solid var(--accent-border);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 0 8px 8px 0;
+  font-size: 11px;
+}
+.changed-files-head {
+  cursor: pointer;
+  list-style: none;
+  color: var(--text-dim);
+  user-select: none;
+}
+.changed-files-head::-webkit-details-marker {
+  display: none;
+}
+.changed-files-head::before {
+  content: "▸";
+  margin-right: 4px;
+  font-size: 9px;
+  opacity: 0.55;
+}
+.changed-files-card[open] > .changed-files-head::before {
+  content: "▾";
+}
+.changed-files-head:hover {
+  color: var(--text);
+}
+
+.changed-files-list {
+  margin: 6px 0 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.changed-file {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.changed-file > .file-link {
+  flex: none;
+}
+/* 目录部分才是长的那一段：让它吃满剩余宽度并截断，文件名（链接）保持完整。 */
+.changed-file-dir {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
 /* 回合折叠（Trae 的对话流节点自动折叠）：只留用户消息 + 正文 + 汇总行 */
 .agent-flow.flow-folded .think-block,
 .agent-flow.flow-folded .tool-card,
@@ -1556,12 +1640,31 @@ html, body {
 }
 
 /* ── Agent permission approval card (can_use_tool) ─────────────── */
+/* **`white-space: normal` 是必需的、不得删**（2026-09-17 定位，见 ai-spec §11 规则 33）：
+   审批卡的三处 DOM 都是 `innerHTML = \`…\`` 拼的**带缩进换行的模板**
+   （main.ts 的 `card.innerHTML` / `item.innerHTML` / `renderCmdGroupBody` 的
+   `bodyEl.innerHTML`）。这些模板里的空白文本节点（`"\n      "`）本身无害 ——
+   前提是它们按 HTML 默认规则被折叠。
+
+   但 `#chat-log`（= `.ai-response`）自己声明了 `white-space: pre-wrap`，
+   而 `.approval-cmd-box` / `.approval-cmd-list` / `.approval-body` 这些**中间容器
+   都没声明**，于是**继承 pre-wrap** ⇒ 模板里的每个空白节点都被当成**真实空行**渲染。
+   浏览器实测（2026-09-17）：一处空白节点 = 2 个 19px 的行盒 ≈ **45px**，
+   命令区深色块总高 471px 里有 **315px 是这种幽灵空行（67%）**，命令文本只占 129px。
+   用户看到的就是「命令浮在中间、上下空一大片」+「命令之间莫名空开」，
+   上一轮去改 `.approval-item` 固定高度 / `.approval-cmd-box` 内层滚动**都没用**，
+   因为根因在这里（不在高度、也不在滚动）。
+
+   为什么声明在**卡片根**而不是各个中间容器：三个模板分属三层，逐个声明必漏；
+   而真正需要保留空白的元素都**自己声明了** `pre-wrap`（`.approval-cmd` 见本节末尾、
+   `.approval-input` 见上方），继承被它们覆盖，不受影响。 */
 .approval-card {
   margin: 8px 12px;
   padding: 12px 14px;
   background: var(--accent-bg);
   border: 1px solid var(--accent-border);
   border-radius: 10px;
+  white-space: normal;
 }
 
 .agent-flow .approval-card {
@@ -1803,14 +1906,15 @@ html, body {
 }
 
 /* ── Command-group rows (Trae-style merged approvals) ──────────── */
-/* Fixed-height, scrollable command region: commands stay complete
-   (never truncated), can be selected/copied, and the card stays compact. */
+/* 命令区必须完整可见、可选可复制，滚动交给外层容器。 */
 .approval-batch-card .approval-cmd-box {
-  /* 自适应高度 + 上限：短命令不留空档（旧 height:72px 会让一行命令下方空出
-     一大片），长命令仍可在框内滚动。 */
-  max-height: 72px;
+  /* **内层不再限高、不再滚动**：外层 `.approval-batch-body`（max-height:380px,
+     overflow-y:auto）本来就是滚动容器，这里再套一层是「嵌套双滚动条」。
+     实测证据（2026-09-15）：两条稍长的命令折行后 scrollHeight=106 / clientHeight=72，
+     内层滚动条把 34px 内容裁在框外 —— 「已合并 N 条命令」整行不见、末尾折行只剩半行，
+     用户看到的就是「空白区域」（还以为是模型输出带了空行）。
+     注意：仍**不是**固定 height —— 短命令不留空档这条不能回退。 */
   min-height: 0;
-  overflow-y: auto;
   background: rgba(0, 0, 0, 0.25);
   border-radius: 6px;
   padding: 4px 8px;
@@ -1830,6 +1934,15 @@ html, body {
   white-space: pre-wrap;
   line-height: 1.4;
 }
+/* `└ ` 前缀行的**悬挂缩进**：前缀是 inline，折行后的续行会回到框左边缘，
+   于是续行比正文左移 2ch（实测 12.11px）—— 看起来就是「缩进对不齐」。
+   `padding-left: 2ch` + 负 `text-indent` 把首行（含前缀）拉回原位，续行落在
+   padding 上 ⇒ 与 `└ ` 之后的正文左对齐。用 `ch` 而不是像素：跟着等宽字号走，
+   换字体也不会差半个字。只给带前缀的行加（首条命令不需要）。 */
+.approval-batch-card .approval-cmd.with-sep {
+  padding-left: 2ch;
+  text-indent: -2ch;
+}
 .approval-cmd-sep { color: var(--text-muted); }
 .approval-cmd-merged {
   color: var(--text-dim);
@@ -1837,7 +1950,10 @@ html, body {
   margin-top: 3px;
 }
 .approval-batch-card .approval-input.compact {
-  max-height: 72px; /* 与 approval-cmd-box 一致：自适应 + 上限 */
+  /* 非命令类请求（工具入参 JSON，已在渲染时截到 180 字符）的紧凑预览。
+     这里保留上限只是兜底：180 字符在 10.5px 下最多两行，实际不会触发滚动。
+     命令区（.approval-cmd-box）**不再**有这一层，见该规则的注释。 */
+  max-height: 72px;
   min-height: 0;
   overflow-y: auto;
   padding: 4px 8px;

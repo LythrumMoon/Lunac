@@ -2415,6 +2415,28 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "할 일 목록",
     "en": "Task list",
   },
+  // ── 被改动文件的路径追踪（backlog §8.1）─────────────────────────
+  "agent.changed_files": {
+    "zh-CN": "{n} 个文件已改动",
+    "zh-TW": "{n} 個檔案已改動",
+    "ja": "{n} 個のファイルを変更",
+    "ko": "{n}개 파일 변경됨",
+    "en": "{n} files changed",
+  },
+  "agent.reveal_in_explorer": {
+    "zh-CN": "在资源管理器中显示",
+    "zh-TW": "在檔案總管中顯示",
+    "ja": "エクスプローラーで表示",
+    "ko": "탐색기에서 표시",
+    "en": "Reveal in Explorer",
+  },
+  "agent.reveal_failed": {
+    "zh-CN": "无法定位该文件（可能已被移动或删除）",
+    "zh-TW": "無法定位該檔案（可能已被移動或刪除）",
+    "ja": "ファイルを表示できません（移動または削除された可能性）",
+    "ko": "파일을 찾을 수 없습니다(이동 또는 삭제됨)",
+    "en": "Can't locate that file (it may have been moved or deleted)",
+  },
   "agent.please_wait": {
     "zh-CN": "请稍候...",
     "zh-TW": "請稍候...",

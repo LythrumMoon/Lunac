@@ -46,6 +46,7 @@ const AGENT_EXE: &str = "agent.exe";
 
 /// Returns the directory containing the compiled agent binary (`agent.exe`).
 /// Priority:
+///   0. **dev 布局**（`…/src-tauri/target/{debug,release}`）先看 `<repo>/core-agent/target/{release,debug}`
 ///   1. exe_dir/resources/  — Tauri 打包资源解压目录
 ///   2. exe_dir/            — 便携版 / NSIS 安装根（agent.exe 与 lunac.exe 同目录）
 ///   3. dev: <repo>/core-agent/target/{release,debug}  — cargo 产物
@@ -56,6 +57,39 @@ fn core_dir() -> std::path::PathBuf {
         .parent()
         .unwrap()
         .to_path_buf();
+
+    // ── dev 布局必须优先（2026-09-17 修，不得回退）──────────────────────────
+    // `src-tauri/target/{debug,release}/agent.exe` 是 **Tauri 构建时**按 tauri.conf.json 的
+    // `bundle.resources`（`../../core-agent/target/release/agent.exe` → `agent.exe`，map 形式）
+    // 从 core-agent **平铺过来的快照**，只在**构建 lunac 时**才刷新；它命中下面第 2 条
+    // 「agent.exe 与 lunac.exe 同级」，于是会**遮蔽** core-agent 的更新构建。
+    // 这条路径会静默失效：改完 core-agent → `cargo build --release` → **只重启 lunac.exe**
+    // （没有重新构建 lunac ⇒ 资源不会重新平铺）⇒ 跑起来的还是旧 agent.exe，且**毫无提示**。
+    // 实测代价：`set_history` 协议 09-17 就进了 core-agent 源码，dev 实际跑的却是 09-15 的
+    // agent.exe（日志里只剩 agent 侧一句「忽略输入类型: Some("set_history")」），用户侧表现为
+    // 「恢复历史后追问，AI 完全不记得上文」—— 排查时一度怀疑数据库与前端回灌。
+    // 用两级目录名（`target` + `src-tauri`）判定「是否仓库内的构建目录」，避免误伤便携版；
+    // 那里没有 cargo 产物时照旧往下走，行为与从前一致。
+    let is_dev_layout = exe_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("target")
+        && exe_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("src-tauri");
+    if is_dev_layout {
+        let repo_root = exe_dir.join("..").join("..").join("..").join("..");
+        for rel in ["core-agent/target/release", "core-agent/target/debug"] {
+            let dir = repo_root.join(rel);
+            if dir.join(AGENT_EXE).exists() {
+                return dir.canonicalize().unwrap_or(dir);
+            }
+        }
+    }
 
     // Release: Tauri's bundle extraction directory
     let resources_dir = exe_dir.join("resources");
@@ -384,9 +418,11 @@ fn start_cli_process(
         .unwrap_or_else(|_| "project".into());
 
     // AI workspace: the directory the agent may operate in (cwd + --add-dir).
-    // Empty = fall back to the user's home directory — the agent can reach
-    // the whole system; edits outside the home dir still trigger the
-    // ask/approval flow (warning cards) instead of silent auto-allow.
+    // 未配置工作区时用 `default_work_dir()` = `<exe 根>\temp\transStorage`（2026-09-17 改）：
+    // agent 的相对路径与模型写的临时脚本都落在应用自己的数据根下，dev / release 天然隔离。
+    // **不再回退用户主目录** —— 回退会让 `_tmp_*.py` 这类草稿直接堆在 `C:\Users\<用户名>` 根下。
+    // 全系统访问权不受影响：workspace 为空时**仍然不设** `LUNAC_WORKSPACE_LOCKED`，
+    // 读写工作目录之外的文件照旧走 ask/审批卡，而不是被拒。
     // When a workspace IS configured, LUNAC_WORKSPACE_LOCKED=1 is passed to
     // the CLI so file reads/writes OUTSIDE the workspace are denied outright
     // (instead of the default "ask" for the whole-system mode).
@@ -394,7 +430,7 @@ fn start_cli_process(
         let ws = state.workspace.lock().map(|g| g.clone()).unwrap_or_default();
         let ws = ws.trim().to_string();
         if ws.is_empty() {
-            (dirs_current_user_home(), false)
+            (default_work_dir(), false)
         } else {
             (std::path::PathBuf::from(ws), true)
         }
@@ -901,6 +937,45 @@ pub fn open_setting(target: String) -> Result<(), String> {
 #[tauri::command]
 pub fn run_system_action(id: String) -> Result<(), String> {
     crate::system_catalog::run_action(&id)
+}
+
+/// 在资源管理器中**定位并选中**一个文件（backlog §8.1「被改动文件的路径追踪」）。
+///
+/// 入参来自模型在 `Write` / `Edit` 的 `tool_use` 里给出的 `file_path`，属**外部输入**，
+/// 因此纪律与 `system_catalog::run_action` 完全一致：
+///   ① **必须绝对路径**（相对路径的基准是 agent 的工作目录，不是用户的直觉）；
+///   ② **必须真实存在**（不存在的路径 explorer 会静默退化成「打开文档目录」，用户会以为点错了）；
+///   ③ **只作为 `Command` 的单个参数传入，全程不经 shell** —— 路径里的 `&` / `|` / `"` 都
+///      不可能被解释成命令行语法。反面写法是 `cmd /c explorer /select,…`，那才是注入面。
+///
+/// 为什么用 `explorer.exe /select,`：这是「打开所在文件夹**并选中该文件**」唯一的系统级
+/// 做法；只打开文件夹不满足用户「点击可进入这个文件相对应文件夹」的诉求。
+/// `(async)` 与剪贴板命令同理：explorer 启动是同步系统调用，放工作线程避免卡住主线程。
+#[tauri::command(async)]
+pub fn reveal_in_explorer(path: String) -> Result<(), String> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err("路径为空".into());
+    }
+    let p = std::path::PathBuf::from(raw);
+    if !p.is_absolute() {
+        return Err(format!("只接受绝对路径：{raw}"));
+    }
+    if !p.exists() {
+        return Err(format!("路径不存在：{raw}"));
+    }
+    // `/select,<目录>` 带尾反斜杠时 explorer 会当成「打开该盘根」，先去掉。
+    // 长度 <= 3 的是盘符根（`C:\`），去掉就变成 `C:`（当前目录），必须保留。
+    let mut target = p.display().to_string();
+    while target.len() > 3 && (target.ends_with('\\') || target.ends_with('/')) {
+        target.pop();
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{target}"))
+        .spawn()
+        .map_err(|e| format!("无法启动资源管理器：{e}"))?;
+    crate::log::info(format!("reveal_in_explorer: {target}"));
+    Ok(())
 }
 
 /// Add a custom app to the registry.
@@ -1713,7 +1788,14 @@ pub fn delete_temp_image(path: String) -> Result<String, String> {
 /// Handles the case where user copies image files from Explorer
 /// rather than image data. Returns Vec of paths ending in common
 /// image extensions. Returns empty Vec if no image files on clipboard.
-#[tauri::command]
+///
+/// `(async)` = 抛到工作线程执行。**本命令只做 `OpenClipboard(0)` 开头的纯 Win32 FFI**
+/// （hWndNewOwner 传 0 = 关联当前任务，不依赖任何窗口句柄），因此没有线程亲和性，
+/// 放到工作线程是安全的。为什么必须这么做：同步命令跑在 Tauri 主线程上，而本命令在
+/// 唤出的那一刻就会被 `triggerJSClipboardRead()` 调用 —— 高负载下主线程一旦被拖住，
+/// 「剪贴板 → 合成 input → 去抖 → 重跑搜索」这条唯一的重算链整体推后，用户看到的就是
+/// 「唤出后停在上次搜索结果」的静态帧（与 L843 那里同因，见 ai-spec §11 规则 4）。
+#[tauri::command(async)]
 pub fn read_clipboard_files() -> Vec<String> {
     read_clipboard_image_files()
 }
@@ -1841,7 +1923,12 @@ fn read_clipboard_image_files() -> Vec<String> {
 ///
 /// 此方案与 arboard 无冲突（不同剪贴板格式），不触发任何 clipboard lock。
 /// 成功返回临时 BMP 文件路径，失败返回空字符串。
-#[tauri::command]
+///
+/// `(async)` 的理由同 `read_clipboard_files`：本命令（`clipboard_dib_to_bmp` /
+/// `clipboard_png_to_file`）同样是「`OpenClipboard(0)` + GetClipboardData + 写临时文件」
+/// 的纯 FFI + 文件 IO，无线程亲和性，但**体积可能很大**（一张 4K 截图展开成 BMP
+/// 有几十 MB），同步跑在主线程上是一次实打实的卡顿源。
+#[tauri::command(async)]
 pub fn read_clipboard_backup_image() -> String {
     #[cfg(not(target_os = "windows"))]
     { String::new() }
@@ -2175,6 +2262,41 @@ fn dirs_current_user_home() -> std::path::PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// 未配置工作区时 agent 的**默认工作目录**：`<exe 根>\temp\transStorage`。
+///
+/// 为什么不再回退到用户主目录（2026-09-17 用户要求）：agent 的相对路径以 cwd 为基准，
+/// 于是模型写的临时脚本会直接堆在 `C:\Users\<用户名>` **根下** —— 实测一次 docx 任务
+/// 就留下了 `_tmp_dump_docx.py` / `_tmp_fmt_docx.py` / `_tmp_test_docx.py` / `_tmp_imgs.py`
+/// 四个文件，用户主目录被当成草稿本用。改到应用自己的数据根下，与
+/// `temp\logs` / `temp\tool-outputs` / `temp\webview-data` 同级，**卸载时随目录一起清掉**。
+///
+/// - `<exe 根>` 走 `storage::lunac_root_dir()` ⇒ dev 落 `target\debug\temp\transStorage`、
+///   release 落安装目录（如 `D:\Lunac\temp\transStorage`），两个环境天然隔离。
+/// - **必须在这里建目录**：`spawn_child()` 用 `Command::current_dir(cwd)`，目录不存在时
+///   spawn 直接失败 ⇒ agent 起不来、整个 AI 面板不可用（所以不能"用到再建"）。
+/// - 建不出来（权限等）时**回退用户主目录**：宁可文件仍写到主目录，也不能让 AI 起不来。
+///
+/// 全系统访问权**不受影响**：workspace 为空时仍然不设 `LUNAC_WORKSPACE_LOCKED`
+/// （见 `start_cli` 里的说明），读写工作目录之外的文件照旧弹审批卡而不是被拒。
+fn default_work_dir() -> std::path::PathBuf {
+    let dir = crate::storage::lunac_root_dir()
+        .join("temp")
+        .join("transStorage");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(e) => {
+            let fallback = dirs_current_user_home();
+            crate::log::warn(format!(
+                "默认工作目录创建失败：{}（{}），回退到 {}",
+                dir.display(),
+                e,
+                fallback.display()
+            ));
+            fallback
+        }
+    }
 }
 
 // ── 系统语言检测 ──────────────────────────────────────────────

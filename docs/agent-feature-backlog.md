@@ -13,7 +13,7 @@
 >
 > **定位前提（2026-09-13 修正）**：Lunac 的 AI agent 目标是**一个可以完全类比于完整 agent 类应用**的能力体，不因「宿主是桌面启动器」而降级。因此下列分组只是**优先级**，不是**价值否定** —— 旧版把多代理协作等写成「与 Lunac 无关」是错的，已改。
 >
-> **最后核对时间**：2026-09-11（§0 差距总览）、2026-09-13（定位修正、瞬时失败重试、命令静态安全分析落地）、2026-09-15（新增 §8「Lunac 自身新目标」五项 + Hermes 调研）
+> **最后核对时间**：2026-09-11（§0 差距总览）、2026-09-13（定位修正、瞬时失败重试、命令静态安全分析落地）、2026-09-15（新增 §8「Lunac 自身新目标」五项 + Hermes 调研）、2026-09-17（§8.5 第一步落地：会话历史迁 SQLite + FTS5；§8.1 被改动文件路径追踪完成；§8.3 任务快照完成）
 
 ---
 
@@ -39,7 +39,7 @@
 | 工具 | 旧 CLI 位置 | 价值 | 说明 |
 |---|---|---|---|
 | ~~`PowerShell`~~ | `core/tools/PowerShellTool/` | **高** | ✅ **已完成（2026-09）**：`-NoProfile -NonInteractive -Command` + 双 UTF-8 编码兜底（中文输出不再变乱码），与 `Bash` 共用 `run_shell`；`plan` 档拒绝、非 plan 档先审批，真机烟测通过 |
-| ~~`WebSearch`~~ | `core/tools/WebSearchTool/` | **高** | ✅ **已完成（2026-09，同日重构）**：旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（`WebSearchTool.ts:76-84`），全仓无本地搜索源，**不能照搬**。自研方案：主源 = 设置面板的「搜索服务商 + 密钥」（`AI_SEARCH_PROVIDER`/`AI_SEARCH_KEY` → `LUNAC_SEARCH_PROVIDER`/`LUNAC_SEARCH_KEY`，可选 **bocha**（博查，国内直连、微信扫码即可注册）/ tavily / exa / firecrawl）；兜底 = **Bing RSS → Bing HTML → 百度 HTML 抓取**（无 key、≥1.1s 节流、202/429 视为限流），主源失败或未配齐时自动回落并附 `[fallback] <原因>`，三级全失败就如实报错不编造。**换掉 DuckDuckGo 的原因**：本机实测国内连不上 `html.duckduckgo.com`（15s 超时），而 Bing / 百度均 200 —— 「不配 key 也能搜」必须是真的。**Bing Search API 已于 2025-08-11 退役**（老 key 410 Gone、不再接受新注册），**DuckDuckGo 无官方搜索 API**（`api.duckduckgo.com` 只返维基摘要），故不存在「bing 首选 + ddg api 兜底」这条路。关键：`WebSearch` 进 `needs_approval` 与 `gated_in_read_only`（查询词是外部出口，plan 档也弹审批）。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「联网检索」 |
+| ~~`WebSearch`~~ | `core/tools/WebSearchTool/` | **高** | ✅ **已完成（2026-09，同日重构）**：旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（`WebSearchTool.ts:76-84`），全仓无本地搜索源，**不能照搬**。自研方案：主源 = 设置面板的「搜索服务商 + 密钥」（`AI_SEARCH_PROVIDER`/`AI_SEARCH_KEY` → `LUNAC_SEARCH_PROVIDER`/`LUNAC_SEARCH_KEY`，可选 **bocha**（博查，国内直连、微信扫码即可注册）/ tavily / exa / firecrawl）；兜底 = **Bing RSS → Bing HTML → 百度 HTML 抓取**（无 key、≥1.1s 节流、202/429 视为限流），主源失败或未配齐时自动回落并附 `[fallback] <原因>`，三级全失败就如实报错不编造。**换掉 DuckDuckGo 的原因**：本机实测国内连不上 `html.duckduckgo.com`（15s 超时），而 Bing / 百度均 200 —— 「不配 key 也能搜」必须是真的。**Bing Search API 已于 2025-08-11 退役**（老 key 410 Gone、不再接受新注册），**DuckDuckGo 无官方搜索 API**（`api.duckduckgo.com` 只返维基摘要），故不存在「bing 首选 + ddg api 兜底」这条路。关键：`WebSearch` 进 `needs_approval` 与 `gated_in_read_only`（查询词是外部出口，plan 档也弹审批）。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「联网检索」。**验收口径（2026-09-17 用户定）：四家付费主源（bocha / tavily / exa / firecrawl）的「成功」路径不验证**（预算原因拿不到可用 key，只保「请求形状 + 错误透传 + 回落」正确）—— 只守**兜底链**。复验 = `cd core-agent && cargo test fallback_scrapers -- --ignored --nocapture`（全仓唯一联网 `#[ignore]` 用例，故意不进常规 `cargo test`）；**2026-09-17 实测三级全部 OK 各 5 条**，对方改版后重跑这一条 |
 | ~~`WebFetch`~~ | `core/tools/WebFetchTool/` | **高** | ✅ **已完成（2026-09）**：HTML→纯文本抓取（无 DOM 依赖）、60s 超时 / ≤10MB / UA 标识 Lunac；**未照搬两处服务端依赖** —— 域名预检 `api.anthropic.com/api/web/domain_info` 与 Haiku 二次摘要。只读档同样走审批（唯一外部数据出口），烟测见 [ai-spec.md §9](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md) |
 | ~~`AskUserQuestion`~~ | `core/tools/AskUserQuestionTool/` | **高** | ✅ **已完成（2026-09）**：**答案复用 `can_use_tool` 的 `updatedInput` 回传**（旧 CLI 也是这条通道，不新增协议）；前端 `renderAskQuestions()` 渲染选项、`classifyRequest()` 对它恒定 `auto:false`；收不到答案时工具报错而非编造。plan 档可用且照常审批。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「结构化提问」 |
 | ~~`TodoWrite`~~ | `core/tools/TodoWriteTool/` | **中高** | ✅ **已完成（2026-09）**：长任务的进度可见性；工具**不持有状态**（清单唯一真相 = 模型最近一条 `tool_use`），前端拿流式入参就地重绘 `.todo-panel`；**免审批**、成功回执不重复渲染。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「待办面板」 |
@@ -188,6 +188,8 @@
 | 落点选择 | 推荐用 `assistant` 消息里 `tool_use` 的**入参**（`Write` / `Edit` 的 `file_path`）—— 语义精确、**零协议改动**；次选是在 `tool_result` 里加结构化字段（要走 agent-ui-spec §9 的字段登记流程） |
 | 后端 | 新命令走 `explorer.exe /select,<path>`（定位并选中）。**只接受绝对路径 + 存在性校验**，绝不接受任意命令行字符串 —— 与 [system_catalog.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/system_catalog.rs) 的 `run_action` 同一条纪律 |
 | 依赖 | 无（纯前端 + 一个 Rust 命令），**五项里最容易先做** |
+| **状态** | ✅ **已完成（2026-09-17）**。落点、协议、交互全部按上表实现：<br>**① 后端** `reveal_in_explorer(path)` → [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs)（`#[tauri::command(async)]`）。校验三条：非空 / **必须绝对路径** / **必须真实存在**；去尾部分隔符时**保留长度 ≤ 3 的盘符根**（`C:\` 不能变成 `C:`）；路径只作为 `Command` 的**单个参数**传入 `explorer.exe`（`/select,<path>`），**全程不经 shell** ⇒ 无注入面；成功/失败都记日志。<br>**② 前端路径来源**：`agentToolInput()` 遇到 `WRITE_TOOLS`（`Write` / `Edit`）就从 `tool_use` 的**入参** `file_path` 取值 —— **零协议改动**，且**绝不从工具输出正文正则猜**（否则只读过的文件会被误判为改动）。取到后把路径渲染成 `.file-link` 可点链接、余下入参压进 `.tool-cmd-rest`。<br>**③ 会话内列表**：`sessionChangedFiles`（去重）+ `.changed-files-card`（`<details>` 折叠面板，始终 `appendChild` 到 `#chat-log` 末尾），随 `noteChangedFile()` 增量重画。<br>**④ 落盘/恢复**：`SessionStep` 新增可选 `path` 字段（走既有的 `steps` JSON 列，**无需改表**），`recordTurnSteps()` 记 `el.dataset.file`；`restoreSession()` / `rollbackChat()` / 新对话清空三处都调 `rebuildChangedFilesFromSteps()` 或清空列表，保证「面板内容 ≡ 界面留下的那部分历史」。<br>**⑤ 交互**：`.file-link` 全是动态重绘的，故点击用 **document 级事件委托**（逐个绑监听会在重画后全部失效）。<br>**⑥ 文案**：`agent.changed_files` / `agent.reveal_in_explorer` / `agent.reveal_failed` 三 key × 五语言。<br>**⑦ 样式**：`styles.css` 的 `.file-link` / `.changed-files-card` / `.changed-files-head` / `.changed-files-list` / `.changed-file` / `.changed-file-dir` / `.tool-cmd-rest`（不新增滚动条声明，走全局 `::-webkit-scrollbar`）。<br>**⑧ 校验**：`npx tsc --noEmit` exit 0；`core-agent` 32 passed / 1 ignored；`app/src-tauri` 34 passed / 1 ignored。 |
+| 已知未覆盖 | 工具卡上的路径**不写回 agent 上下文**（纯前端展示）；`reveal_in_explorer` 只定位文件，**不打开文件**（`/select,` 的语义就是定位并选中） |
 
 ### 8.2 自动压缩上下文（调模型的摘要式压缩）
 
@@ -210,6 +212,7 @@
 | Lunac 设计要点 | 任务快照必须是**独立于会话消息的一条 pinned 上下文**（压缩不动它）；否则「压缩 → 快照也被压掉」= 白做 |
 | 推荐方案 | **不新造工具**：前端已有 `TodoWrite` 的 `.todo-panel`，而 `TodoWrite` 的语义本来就是「当前任务清单」（清单唯一真相 = 模型最近一条 `tool_use`，见 §1.1）。压缩时**把最近一条 `TodoWrite` 的清单原样 pin 住**即可，成本远低于再引一个工具 |
 | 依赖 | 无（可与 8.2 合并实现） |
+| **状态** | ✅ **已完成（2026-09-17）**。实现在 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `compact_history()` 与 `latest_todo_snapshot()`：<br>**① 触发点** = 只在本轮真的 `dropped > 0`（丢弃了中段）**且**「被丢的区间里含 `TodoWrite`」时才抄快照 —— 没丢、或清单本来就在保留区时都不动，避免与幸存的那份重复。<br>**② 时机** = **在 `drain` 之前抄**（源马上就不存在了），压缩完再钉回。<br>**③ 形态** = 插一条**纯文本 user 消息**（表头 `TASK_SNAPSHOT_HEADER`），**与 `tool_use` / `tool_result` 的配对结构完全解耦** —— 端点是硬校验配对的，直接「原样保留那条工具消息」会把配对拆坏；纯文本则完全绕开这个问题。<br>**④ 位置** = **第 1 条之后**，不抢「开头那条用户提问 = 任务目标」的位置（丢弃逻辑刻意保留 head 正是为了它）。<br>**⑤ 内容** = `N. [status] content`（取**最近一条** `TodoWrite`，因为它的契约是每次发完整清单、覆盖上一份）。<br>**⑥ 命中率明账**：插入位置靠前 ⇒ 其后前缀缓存作废，但**只在本来就已经 `drop` 的那一轮**发生（那一轮 drain 已把缓存废掉），**不额外增加损失**；已登记进 ai-spec §11 规则 23 的断裂源清单第 ⑤ 项与规则 37。<br>**⑦ 校验**：core-agent `cargo test` **35 passed**（新增 3 条：`task_snapshot_survives_a_drop` / `task_snapshot_is_not_pinned_when_nothing_is_dropped` / `task_snapshot_takes_the_latest_list`），已 `cargo build --release` 并部署 |
 
 ### 8.4 一次对话中的多任务并行（多个任务各自走独立 API 请求）
 
@@ -229,15 +232,15 @@
 | Hermes 参照（三层记忆） | ① **Prompt memory**：`~/.hermes/memories/MEMORY.md`（agent 自己的笔记，**2200 字符** ≈ 800 tokens）+ `USER.md`（用户画像，**1375 字符** ≈ 500 tokens），以**冻结快照**注入系统提示 —— 会话中途写入只落盘、**不改系统提示**（就是为了保住前缀缓存）；条目用 `§` 分隔；上限是**字符数**不是 token；`memory` 工具只有 `add` / `replace` / `remove`，**没有 `read`**（内容本来就在提示里）。② **Skills**：`~/.hermes/skills/<name>/SKILL.md`，可自主创建/改进。③ **Session search**：`~/.hermes/state.db`（SQLite），`messages` 表存全量消息 + **FTS5 虚拟表** `messages_fts(content)`（内容由触发器拼 `content + tool_name + tool_calls`）+ 第二张 `tokenize='trigram'` 的表专供 **CJK 子串检索**；工具是 `session_search`（discovery / window / bookend 三形态） |
 | Hermes 自动写入机制 | **不是定时器**，是**每轮后台复盘 fork**：`memory.nudge_interval`（默认 10 轮）触发，fork 里**只允许 `memory` 与 `skill_manage` 两个工具**（`agent/background_review.py:401`） |
 | Hermes 有意不做的 | 内核**不引向量库 / embedding**（无语义检索）；语义检索只存在于可插拔的外部 provider（Honcho / mem0 等）内部，且 `MemoryManager` **同时只允许 1 个外部 provider** |
-| Lunac 映射与差距 | Lunac 现有历史是 `ModuleData\history\chat-history.json` —— **单个 JSON 文件**（Rust `load_chat_sessions` / `save_chat_sessions`），与 SQLite + FTS5 差一个数量级；历史变大后**全量读改写**本身就是性能问题 |
-| **第一步（不是做检索 UI）** | 把历史存储换成 **SQLite + FTS5**。Lunac 是 Rust 宿主，**不引 Python 侧任何东西**，直接用 `rusqlite`（bundled）—— 立项前先验证该构建确实带 **FTS5**（bundled 默认含，但必须实测一次 `CREATE VIRTUAL TABLE … USING fts5` 通不通）；CJK 另起一张 `tokenize='trigram'` 表（照 Hermes 的做法，中文子串检索靠它） |
+| Lunac 映射与差距 | Lunac 原有历史是 `ModuleData\history\chat-history.json` —— **单个 JSON 文件**（Rust `load_chat_sessions` / `save_chat_sessions`），与 SQLite + FTS5 差一个数量级；历史变大后**全量读改写**本身就是性能问题 |
+| **第一步（不是做检索 UI）** | **已完成（2026-09-17）**。历史存储换成 **SQLite + FTS5**：库文件 `<exe 根>\ModuleData\history\chat.db`，实现在 [chat_db.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/chat_db.rs)（`rusqlite 0.40`，`bundled`）。实测确认该构建**带 FTS5**（`chat_db::tests::fts5_is_compiled_in` 查 `pragma_compile_options`）；两张索引表随写入由触发器同步 —— 默认 unicode61 + 第二张 `tokenize='trigram'` 专供 **CJK 子串检索**（照 Hermes 的做法；默认分词器对中文不切词，`MATCH` 永远命中 0）。旧 JSON 只在**库文件不存在**时导入一次（**迁移后保留旧文件不删**），因此 `chat-history.json` 从此不再是真相源。检索**接口暂未开放**（无界面调用），但索引已随写入维护，后续接 `session_search` 时不必回填。<br>**剩余**：② 把会话历史作为「长期记忆」注入（冻结快照式，遵守 ai-spec §11 规则 18/23 的前缀缓存纪律）；③ 照抄 Hermes 的**每轮后台复盘 fork**（`nudge_interval` 默认 10 轮，fork 里只放白名单工具）来触发写入 —— **不引定时器** |
 | 注入纪律 | 必须遵守前缀缓存纪律（ai-spec §11 规则 23）：会话中途写入只落盘、**不改系统提示**（Hermes 的冻结快照就是这个理由）；「自主学习」的触发点照抄**每轮后台复盘 fork**（不引定时器，按轮次门槛触发，fork 里只放白名单工具） |
 | 依赖 | 8.3（任务快照）+ SQLite 迁移。**五项里最大的一项，建议最后做** |
 
 ### 8.6 建议顺序
 
 1. **8.1 路径追踪** —— 无依赖、纯前端 + 一个 Rust 命令，用户直接可见
-2. **8.3 任务快照** —— 8.2 的前置，可与 8.2 合并一次做完
+2. ~~**8.3 任务快照** —— 8.2 的前置，可与 8.2 合并一次做完~~ ✅ **已完成（2026-09-17）**
 3. **8.2 自动压缩（调模型摘要）** —— 注意「少压」优先于「压得干净」（命中率纪律）
 4. **8.5 对话数据库** —— 先把存储换成 SQLite + FTS5，再做检索与记忆注入（工作量大，但 8.2 上线后会更需要它）
 5. **8.4 多任务并行** —— 依赖子代理框架 + 前端分栏，最后做

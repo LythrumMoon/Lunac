@@ -1,7 +1,8 @@
 ﻿# Lunac Release Build Script
-# Usage: .\build-release.ps1 [version]
-#   .\build-release.ps1           - reads version from package.json
-#   .\build-release.ps1 0.6.0     - explicit version
+# Usage: .\build-release.ps1 [-Version <x.y.z>] [-NoBump]
+#   .\build-release.ps1                   - 读 package.json 的版本，patch 自动 +1，并同步三处
+#   .\build-release.ps1 -Version 0.10.0   - 显式指定版本（不递增），并同步三处
+#   .\build-release.ps1 -NoBump           - 保持当前版本重新打包（调试用）
 #
 # Steps:
 #   1. Pre-flight checks (cargo / makensis)
@@ -15,7 +16,8 @@
 #   9. Update NSI version + run makensis → Setup.exe
 
 param(
-  [string]$Version = ""
+  [string]$Version = "",
+  [switch]$NoBump
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,17 +43,70 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Lunac Release Build"                    -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
-# ── Version ────────────────────────────────────────────────────────
-if (-not $Version) {
-  $PkgJsonPath = "$Root\app\package.json"
-  if (-not (Test-Path $PkgJsonPath)) {
-    throw "package.json not found at $PkgJsonPath"
+# ── Version：自动递增 + 三处同步（2026-09-17 改）────────────────────
+# 版本号在三处各写了一份，只改一处就会产出「安装包叫 0.9.1、exe 属性里还是 0.9.0」
+# 这种自相矛盾的包。所以这里统一：**递增一次 → 三处全部写回**。
+#
+# **必须在第 5 步 `cargo build` 之前**做完：`Cargo.toml` 的 version 参与编译，
+# 改晚了 exe 里的版本就与安装包名不一致（tauri.conf.json 的 version 也会被嵌进 exe）。
+$VersionFiles = @{
+  PackageJson = "$Root\app\package.json"
+  TauriConf   = "$Root\app\src-tauri\tauri.conf.json"
+  CargoToml   = "$Root\app\src-tauri\Cargo.toml"
+}
+
+function Get-DeclaredVersion {
+  # package.json 是唯一真相源（历史原因：本脚本一直读它）
+  if (-not (Test-Path $VersionFiles.PackageJson)) {
+    throw "package.json not found at $($VersionFiles.PackageJson)"
   }
-  $PkgJson = Get-Content $PkgJsonPath -Raw | ConvertFrom-Json
-  $Version = $PkgJson.version
-  if (-not $Version) {
-    throw "Could not read version from package.json"
+  $v = (Get-Content $VersionFiles.PackageJson -Raw | ConvertFrom-Json).version
+  if (-not $v) { throw "Could not read version from package.json" }
+  return $v
+}
+
+function Set-VersionEverywhere([string]$ver) {
+  if ($ver -notmatch '^\d+\.\d+\.\d+$') {
+    throw "版本号必须形如 x.y.z，收到：$ver"
   }
+  # 一律用「正则替换**第一处**匹配」，不用「解析 JSON 再整体写回」：后者会重排字段、
+  # 改缩进，diff 里全是无关改动。
+  # 编码统一 **UTF-8 无 BOM**：JSON / TOML 带 BOM 会让 cargo 报 unexpected character。
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $edits = @(
+    @{ Path = $VersionFiles.PackageJson; Pattern = '(?m)^(\s*"version"\s*:\s*")[^"]+(")' },
+    @{ Path = $VersionFiles.TauriConf;   Pattern = '(?m)^(\s*"version"\s*:\s*")[^"]+(")' },
+    @{ Path = $VersionFiles.CargoToml;   Pattern = '(?m)^(version\s*=\s*")[^"]+(")' }
+  )
+  foreach ($e in $edits) {
+    $text = [IO.File]::ReadAllText($e.Path)
+    $re = [regex]::new($e.Pattern)
+    if (-not $re.IsMatch($text)) {
+      throw "在 $($e.Path) 里找不到可替换的版本号字段"
+    }
+    [IO.File]::WriteAllText($e.Path, $re.Replace($text, "`${1}$ver`${2}", 1), $utf8)
+    Write-Host "    $($e.Path.Replace("$Root\", ''))  ->  $ver" -ForegroundColor DarkGray
+  }
+}
+
+$CurrentVersion = Get-DeclaredVersion
+if ($Version) {
+  # 显式指定：只同步、不递增（重复打同一个版本时用）
+  if ($Version -ne $CurrentVersion) {
+    Write-Host "  版本同步到指定值：$CurrentVersion -> $Version" -ForegroundColor Green
+    Set-VersionEverywhere $Version
+  }
+} elseif ($NoBump) {
+  $Version = $CurrentVersion
+  Write-Host "  -NoBump：保持 $Version 重新打包" -ForegroundColor DarkGray
+} else {
+  if ($CurrentVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "当前版本号不是 x.y.z，无法自动递增：$CurrentVersion（请显式传 -Version 或先修正）"
+  }
+  $parts = $CurrentVersion.Split('.')
+  $Version = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
+  Write-Host "  版本自动递增：$CurrentVersion -> $Version" -ForegroundColor Green
+  Set-VersionEverywhere $Version
 }
 Write-Host "  Version : $Version" -ForegroundColor White
 Write-Host "========================================" -ForegroundColor Cyan

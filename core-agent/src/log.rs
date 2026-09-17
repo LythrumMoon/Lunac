@@ -306,6 +306,21 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// FNV-1a 64 位哈希（调用方自己格式化成 16 位十六进制）。
+///
+/// 用途：给每次 API 请求的**固定前缀**留指纹（ai-spec §11 规则 23 的归因埋点）。
+/// 为什么不用真哈希库：本仓库不引依赖（与规则 20 同因），而这里只需要「两段文本
+/// 是否逐字节相同」这一个性质 —— FNV-1a 足够，且**只输出哈希、不输出原文**，
+/// 天然满足「进日志的字符串必须脱敏」这条硬要求（前缀里可能含用户文件内容）。
+pub fn hash64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// 敏感键名：命中后其「值」整体打码。判据是键名后（可含空格）紧跟取值符
 /// （`:` / `=` / 引号），这样 `"max_tokens":8192` 里的 `token` 不会被误伤。
 const SECRET_KEYS: [&str; 9] = [
@@ -425,6 +440,16 @@ fn value_end(chars: &[char], mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 指纹的**唯一**用途是「同一段文本是否逐字节相同」，所以两个性质必须成立：
+    /// 相同输入恒等、改一个字节即变（后者正是我们要抓的「前缀被改写」）。
+    #[test]
+    fn hash64_is_stable_and_sensitive() {
+        assert_eq!(hash64(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(hash64("abc"), hash64("abc"));
+        assert_ne!(hash64("abc"), hash64("abd"));
+        assert_ne!(hash64("abc"), hash64("abc "));
+    }
 
     #[test]
     fn mask_hides_json_key_values() {

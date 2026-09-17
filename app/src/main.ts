@@ -138,6 +138,70 @@ let sizeInFlight = false;
 const DETAIL_HEIGHT = 640;   // 固定高度档（设计 px × zoom = DIPs）
 let detailOpen = false;      // 是否处于详细搜索大界面
 
+/** 把「当前界面层」同步给 Rust（Esc 的隐藏判据，见 hotkey.rs 的 `UI_MODE`）。
+ *
+ *  界面的真相源在 WebView（`pluginActive` / `detailOpen`），而判据在 Rust 进程 ——
+ *  两边任何一次漏同步都会让 Rust 停在非 main 层，表现为「简洁界面里按 Esc 不隐藏
+ *  窗口，控制台一直打 `Esc(poll): ui_mode=2 (non-main)`」；WebView 一旦重载
+ *  （DevTools / 前端刷新），WebView 侧状态归零、Rust 侧还留着旧值，也会错位。
+ *
+ *  所以：① 由这里**从两个状态位推导**，新增转场一律只调本函数，不要再写字面量；
+ *  ② 挂在 `applyWindowSize()` 末尾 —— 那个函数本来就按「插件 / 详情 / 简洁」分支，
+ *  是「层」的天然汇聚点，任何忘记同步的转场都会在下一帧自愈，模块初始化时那次
+ *  调用还会把启动状态（简洁搜索 = main）无条件重报一次。
+ *  ③ **刻意不做「值没变就不发」的去重**：那要求所有发送点都经过同一份缓存，
+ *  一旦别处还留着裸 invoke，缓存就会与实际值脱节、反向压住一次必要的同步
+ *  （例如关掉插件后缓存仍是 plugin，再进插件时这一发被吞 → Rust 停在 main →
+ *  Esc 在插件里变成隐藏窗口）。一次 bool 级 IPC 而已，去重的收益不值这个风险。 */
+function syncUiMode() {
+  const mode = detailOpen ? "detail" : pluginActive ? "plugin" : "main";
+  invoke("set_ui_mode", { mode }).catch(() => {});
+}
+
+// ── 会话历史回灌（agent 上下文 ↔ 前端 chatHistory）──────────────────
+// 背景：agent 的对话上下文**完全自持在 agent 进程内**（stream-json 的 stdin/stdout），
+// 前端 `chatHistory` 只用于显示。旧实现在「回退历史」时用 `stop_cli` + `start_cli`
+// 清空 agent 上下文（当时的注释是 so the next turn doesn't see the removed messages），
+// 代价却是**保留下来的上文也一起丢了**，用户表现为「回退后引用不到上文」；
+// 「从磁盘恢复旧会话」同样只重建了 DOM，agent 侧一直是零上文。
+// 这里补上那座桥：把前端这份历史整体灌给 agent（协议 `{"type":"set_history"}`，
+// agent 只替换自己的 history、**不触发模型调用**，所以不花钱也不产生回答）。
+//
+// 为什么是 pending 队列而不是直接发：`cliReady` 由 `cli-status:stdout` 事件置位，而
+// 回退 / 恢复都可能发生在 agent 还没起来（懒启动）或刚重启完的瞬间 —— 那时直接发会被
+// 「CLI 未就绪」吞掉。挂起后等 `cliReady` 置位时冲刷，且**必须先灌历史再放行挂起的
+// 提问**：agent 是单线程顺序吃 stdin 的，顺序反了这一问仍然是零上文。
+let pendingAgentHistory: { role: string; content: string }[] | null = null;
+
+/** 历史只保留用户 / 助手的**纯文本** —— 工具调用细节本来就不落前端，这是有意的近似。 */
+async function sendAgentHistory(messages: { role: string; content: string }[]) {
+  const payload = JSON.stringify({
+    type: "set_history",
+    messages: messages.map(m => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: cleanUserContent(m.content ?? ""),
+    })),
+  });
+  await invoke("send_message", { message: payload });
+}
+
+/** 把历史同步给 agent；CLI 未就绪时挂起，等 `cli-status:stdout` 再发。 */
+function queueAgentHistory(messages: { role: string; content: string }[]) {
+  if (!cliReady) {
+    pendingAgentHistory = messages.map(m => ({ ...m }));
+    return;
+  }
+  void sendAgentHistory(messages).catch(() => {});
+}
+
+/** CLI 刚就绪时冲刷挂起的历史。返回 Promise，调用方据此排在「放行提问」之前。 */
+async function flushPendingAgentHistory() {
+  if (!pendingAgentHistory) return;
+  const msgs = pendingAgentHistory;
+  pendingAgentHistory = null;
+  try { await sendAgentHistory(msgs); } catch {}
+}
+
 // ── 窗口高度「滑动」动画（正式）── 结果区随界面高度变化平滑过渡 ─────
 // 非插件态下高度变化不再一次 setSize 到位，而是逐帧逼近（rail 模式：每步等
 // 上一个 setSize 经 onResized 落地后才走下一步，天然兼容现有防回环守卫）。
@@ -377,6 +441,11 @@ function applyWindowSize() {
     h = measurePanelHeight();
   }
   requestWindowHeight(h);
+  // 界面层在这里重报（去重后几乎零成本）：本函数本来就按「插件 / 详情 / 简洁」
+  // 分支，是「层」的天然汇聚点 —— 任何忘记调 syncUiMode() 的转场都会在下一帧自愈，
+  // 且模块初始化时这一次调用会把启动状态（简洁搜索 = main）无条件告诉 Rust，
+  // 修掉「WebView 重载后 Rust 还停在 detail、Esc 再也不隐藏窗口」这类错位。
+  syncUiMode();
 }
 
 // ── File chips management ──────────────────────────────────────
@@ -829,6 +898,10 @@ interface SessionStep {
   /** 工具输出（已截断，kind=tool 时） */
   result?: string;
   isError?: boolean;
+  /** `Write` / `Edit` 改动的文件绝对路径（2026-09-17，backlog §8.1）。
+   *  **只从 `tool_use` 入参取**（见 `WRITE_TOOLS`）—— 从工具输出正文里正则猜会把「只是读过的
+   *  文件」也算成改动。恢复历史时据此重建「本次会话改动过的文件」列表。 */
+  path?: string;
 }
 
 /** 一个回合的过程快照 —— 历史回顾时按回合渲染成可折叠的「过程」块。 */
@@ -849,7 +922,8 @@ interface ChatSession {
 }
 
 // ── Session persistence — file-based via Rust IPC ─────────────────
-// Chat sessions are stored in Lunac 数据根（exe 所在目录）\ModuleData\history\chat-history.json
+// Chat sessions are stored in Lunac 数据根（exe 所在目录）\ModuleData\history\chat.db
+// （SQLite；2026-09-17 起。同目录 chat-history.json 只是迁移前的旧文件）
 // 与 WebView2 缓存解耦，清除浏览器缓存不影响会话数据。
 
 const MAX_SESSIONS = 50;
@@ -871,10 +945,12 @@ function queueSessionSave(fn: () => Promise<void>): Promise<void> {
   return run;
 }
 
-/** Strip the injected system-prompt hint prefix (e.g. "## Output Style ... ---")
+/** Strip the injected keyword-hint prefix (e.g. "## Debugging Methodology ... ---")
  *  from a stored user message so restored conversations show the real question
  *  instead of the prompt boilerplate. Mirrors the title extraction in
- *  saveCurrentSession: the hint is a send-time wrapper, not conversation history. */
+ *  saveCurrentSession: the hint is a send-time wrapper, not conversation history.
+ *  注：2026-09-17 起用户消息里只剩**关键词条件块**（固定的「人格 + 文风」已搬进 agent
+ *  系统提示词），所以不含关键词的提问**根本没有** `\n\n---\n\n` —— 此时原样返回即可。 */
 function stripInjectedHint(text: string): string {
   const sep = text.indexOf("\n\n---\n\n");
   return sep >= 0 ? text.slice(sep + 7) : text;
@@ -939,14 +1015,14 @@ async function persistCurrentSessionInner(
   // this required 1 user + 1 assistant, so conversations where the CLI
   // errored / was closed mid-stream silently never reached history.
   if (snapshotChat.filter(m => m.role === "user" && m.content.trim()).length < 1) return;
-  // Strip injected system hints from stored user messages so the history
-  // file never accumulates the "## Output Style ... ---" boilerplate.
+  // Strip injected keyword hints from stored user messages so the history
+  // file never accumulates the "## Debugging Methodology ... ---" boilerplate.
   const cleaned = snapshotChat.map(m =>
     m.role === "user" ? { ...m, content: cleanUserContent(m.content) } : m
   );
   const pruned = pruneContext(cleaned);
   const firstUser = pruned.find(m => m.role === "user");
-  // Strip the injected system hint header (e.g. "## Simple Q&A Mode ... ---")
+  // Strip the injected keyword-hint header (e.g. "## Debugging Methodology ... ---")
   // and the attached-files wrapper from the title so sessions show the real
   // question instead of the prompt/format boilerplate.
   const rawClean = firstUser ? cleanUserContent(firstUser.content) : "";
@@ -1021,7 +1097,7 @@ function restoreSession(session: ChatSession) {
   }
   agentView = null;
   agentTurn = null;
-  // Strip injected system-prompt hints (## Output Style / ## Simple Q&A Mode ...)
+  // Strip injected keyword hints (## Debugging Methodology / ## TDD Requirement ...)
   // from stored user messages so restored content shows the real question text.
   chatHistory = session.messages.map(m =>
     m.role === "user" ? { ...m, content: cleanUserContent(m.content) } : m
@@ -1048,7 +1124,14 @@ function restoreSession(session: ChatSession) {
   renderChatLogHtml();
   // 过程快照：每个回合的过程块插到该回合的助手气泡之后（可折叠）
   renderHistoryProcess(session);
+  // 「本次会话改动过的文件」由过程快照重建（必须在 renderChatLogHtml() 之后 —— 那次调用
+  // 会重建 #chat-log，面板挂在它里面）。backlog §8.1。
+  rebuildChangedFilesFromSteps(sessionSteps);
   statusText.textContent = t("status.history_restored");
+  // 把该会话的历史灌回 agent：恢复只是重建了 DOM，agent 侧还留着它自己上一段对话的
+  // 上下文（甚至是另一个会话的）—— 不灌的话「恢复旧会话后追问」必然是零上文
+  // （2026-09-17，见 queueAgentHistory 的注释）。
+  queueAgentHistory(chatHistory);
   applyWindowSize();
   // Focus chat input so user can continue conversation immediately
   requestAnimationFrame(() => chatInput.focus());
@@ -1121,6 +1204,9 @@ function recordTurnSteps(flowEl: HTMLElement) {
           detail: clipStep(el.querySelector(".tool-cmd")?.textContent || ""),
           result: clipStep(el.querySelector(".tool-out")?.textContent || ""),
           isError: el.classList.contains("failed"),
+          // 写类工具卡上挂着 `data-file`（见 agentToolInput）—— 记进快照，恢复历史时据此
+          // 重建「本次会话改动过的文件」列表。**不从 detail 文本里解析路径**。
+          path: el.dataset.file || undefined,
         });
       } else {
         // TodoWrite 面板：把清单文本压成一行留痕
@@ -1298,11 +1384,14 @@ const COPY_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" st
 </svg>`;
 
 /** Roll back the conversation to message `idx` (inclusive): strips all later
- *  messages, persists the trimmed session, resets the CLI context and
- *  re-renders. A full snapshot is backed up to localStorage first so the
- *  operation is reversible (no data loss). idx=-1 表示回退到空对话（重试首条消息用）。 */
+ *  messages, persists the trimmed session, syncs the trimmed history back to
+ *  the agent's own context and re-renders. A full snapshot is backed up to
+ *  localStorage first so the operation is reversible (no data loss).
+ *  idx=-1 表示回退到空对话（重试首条消息用）。 */
 async function rollbackChat(idx: number) {
   if (idx < -1 || (idx >= 0 && !chatHistory[idx])) return;
+  // 必须在下面把 isStreaming 清零**之前**记住：第 4 步要靠它决定「要不要先取消这次运行」。
+  const wasStreaming = isStreaming;
   if (isStreaming) {
     streamId++;
     isStreaming = false;
@@ -1323,12 +1412,26 @@ async function rollbackChat(idx: number) {
   chatHistory = chatHistory.slice(0, idx + 1);
   // 3) Persist the trimmed session
   try { await saveCurrentSession(); } catch {}
-  // 4) Reset CLI context so the next turn doesn't see the removed messages
-  try { await invoke("stop_cli"); } catch {}
-  cliReady = false;
-  try { await invoke("start_cli"); } catch {}
+  // 4) 让 agent 的上下文与界面保持一致（2026-09-17 改）。
+  //    旧实现是 `stop_cli` + `start_cli`：注释说为了让下一轮看不到被剪掉的消息，
+  //    但它连**保留下来的上文一起清空了** —— 用户表现为「回退后引用不到上文」。
+  //    现在改为把保留下来的历史整体灌回 agent（协议 `set_history`）：只丢工具调用
+  //    细节（本来就不落前端），用户 / 助手的对话本身完整保留，且**不再重启进程**。
+  //    仍在流式中时要先取消这一次运行：否则它跑完会把已丢弃的内容写回 agent 历史，
+  //    还白烧 token。取消 = 重启进程，重启后 `queueAgentHistory` 会在 CLI 就绪时
+  //    把历史补上（`cliReady` 此刻为 false，它自己会挂起）。
+  if (wasStreaming) {
+    try { await invoke("stop_cli"); } catch {}
+    cliReady = false;
+    try { await invoke("start_cli"); } catch {}
+  }
+  queueAgentHistory(chatHistory);
   // 5) Re-render
   renderChatLogHtml();
+  // 「改动过的文件」跟着过程快照重建（`renderChatLogHtml()` 会重建 #chat-log，必须排在它之后）。
+  // 注：`sessionSteps` 本身不随回退裁剪（既有行为），所以这里通常与回退前一致 ——
+  // 但它保证「列表 = 记录里真实存在的改动」这一条恒成立，不依赖调用顺序。
+  rebuildChangedFilesFromSteps(sessionSteps);
   statusText.textContent = t("chat.rolled_back");
   requestAnimationFrame(() => chatInput.focus());
 }
@@ -1430,6 +1533,9 @@ function forceResetPluginUI() {
   pluginActive = false;
   activePluginId = null;
   isChatHistoryView = false;
+  // 本函数不走 applyWindowSize()，所以必须自己补一次界面层同步 —— 否则调用方
+  // 回到简洁搜索后 Rust 还停在 plugin，Esc 会一直 emit clear、永远隐藏不掉窗口。
+  syncUiMode();
   // Close drawer
   closeDrawer();
   // Reset agent state machine (Pi)
@@ -1716,6 +1822,10 @@ async function newConversation(skipCliRestart = false) {
   liveCompaction = { elided: 0, dropped: 0 };
   // 新对话 → 过程快照也重新开始（旧会话的已随它自己的记录落盘）
   sessionSteps = [];
+  // 「改动过的文件」跟着同一条生命周期（它本来就是从过程快照推导出来的）——
+  // 不跟着清会看到上一次对话改的文件还挂在列表里。
+  sessionChangedFiles = [];
+  renderChangedFilesPanel();
 
   // Restart CLI to clear accumulated conversation context.
   // Without this, the CLI retains all previous messages in its
@@ -3145,8 +3255,152 @@ function agentToolInput(name: string, rawJson: string) {
   const display = toolArgsDisplay(name, rawJson);
   card.cmd = display;
   const el = card.el.querySelector<HTMLElement>(".tool-cmd");
-  if (el) el.textContent = display.length > 200 ? display.slice(0, 200) + "…" : display;
+  if (!el) return;
+
+  // 写类工具：把 `file_path` 摘出来渲染成**可点链接**（点击 → 资源管理器定位该文件），
+  // 其余入参照旧跟在后面。同时把路径挂到卡片 dataset，`recordTurnSteps` 据此写进过程
+  // 快照 ⇒ 恢复历史时能重建「改动过的文件」列表（走 `steps` 已有那一列，不改表结构）。
+  const field = WRITE_TOOLS[name];
+  const file = field ? changedFilePathFromArgs(name, rawJson) : "";
+  if (file) {
+    card.el.dataset.file = file;
+    noteChangedFile(file);
+    const rest = argsWithoutPath(rawJson, field);
+    el.innerHTML =
+      fileLinkHtml(file) +
+      (rest
+        ? ` <span class="tool-cmd-rest">${esc(rest.length > 160 ? rest.slice(0, 160) + "…" : rest)}</span>`
+        : "");
+    return;
+  }
+  el.textContent = display.length > 200 ? display.slice(0, 200) + "…" : display;
 }
+
+// ── 被改动文件的路径追踪（backlog §8.1）──────────────────────────
+// 目标：工具卡里的**被改动文件**可点击 → 资源管理器定位到它；并把本次会话改动过的文件
+// 汇总成一块面板（参照 Trae 的效果）。
+//
+// **硬约束：路径只能取自 `tool_use` 的入参**（`Write` / `Edit` 的 `file_path`），
+// 禁止从工具输出正文里正则猜 —— 输出里出现的路径只说明模型**提到过**它（很可能只是刚
+// 读过的文件），拿它当「改动过的文件」会让列表混进一堆只读文件。入参是模型真正要写的
+// 那个文件，语义精确，而且**零协议改动**。
+
+/** 会改动文件的工具 → 入参里那条可信的路径字段。 */
+const WRITE_TOOLS: Record<string, string> = { Write: "file_path", Edit: "file_path" };
+
+/** 本次会话改动过的文件（按首次出现顺序去重）；恢复 / 回退历史时由 `sessionSteps` 重建。 */
+let sessionChangedFiles: string[] = [];
+
+/** 从写类工具入参里取路径。流式分片不是完整 JSON 时返回空串（末片一定会再调一次）。 */
+function changedFilePathFromArgs(toolName: string, rawJson: string): string {
+  const field = WRITE_TOOLS[toolName];
+  if (!field) return "";
+  try {
+    const v = (JSON.parse(rawJson) as Record<string, unknown> | null)?.[field];
+    return typeof v === "string" ? v.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+/** 摘要里去掉已单独展示的路径字段，其余参数照旧按 `k=v` 拼（保持原顺序）。 */
+function argsWithoutPath(rawJson: string, field: string): string {
+  try {
+    const obj = JSON.parse(rawJson) as Record<string, unknown>;
+    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return "";
+    return Object.entries(obj)
+      .filter(([k]) => k !== field)
+      .map(([k, val]) => `${k}=${typeof val === "string" ? val : JSON.stringify(val)}`)
+      .join("  ");
+  } catch {
+    return "";
+  }
+}
+
+/** `C:\a\b\c.txt` → `c.txt`（只按分隔符切，不碰盘符）。 */
+function pathBase(p: string): string {
+  const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+/** `C:\a\b\c.txt` → `C:\a\b` */
+function pathDir(p: string): string {
+  const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+  return i > 0 ? p.slice(0, i) : "";
+}
+
+/** 记一笔改动并刷新面板（同一路径只留一次）。 */
+function noteChangedFile(path: string) {
+  if (!path || sessionChangedFiles.includes(path)) return;
+  sessionChangedFiles.push(path);
+  renderChangedFilesPanel();
+}
+
+/** 由过程快照重建列表（恢复 / 回退历史后调用）：只有带 `path` 的步骤才算真改动。 */
+function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
+  const out: string[] = [];
+  for (const g of steps) {
+    for (const it of g?.items ?? []) {
+      if (it.path && !out.includes(it.path)) out.push(it.path);
+    }
+  }
+  sessionChangedFiles = out;
+  renderChangedFilesPanel();
+}
+
+/** 一次可点的文件链接。工具卡与面板共用同一套类名，点击走下面那个委托监听。 */
+function fileLinkHtml(path: string): string {
+  return `<a class="file-link" data-path="${esc(path)}" title="${esc(t("agent.reveal_in_explorer"))}">${esc(path)}</a>`;
+}
+
+/** 「本次会话改动过的文件」面板：只在有改动时出现，始终贴在对话流末尾。
+ *  用 `appendChild` 复用**同一个**节点 —— 它会把已存在的节点移到末尾，于是新回合开始时
+ *  面板自动跟在最新内容之后（不重排历史块，只移动自己这一个节点）。 */
+function renderChangedFilesPanel() {
+  const log = document.getElementById("chat-log");
+  if (!log) return;
+  let panel = log.querySelector<HTMLElement>(".changed-files-card");
+  if (sessionChangedFiles.length === 0) {
+    panel?.remove();
+    return;
+  }
+  if (!panel) {
+    panel = document.createElement("details");
+    panel.className = "changed-files-card";
+    panel.innerHTML =
+      `<summary class="changed-files-head"></summary>` + `<ul class="changed-files-list"></ul>`;
+  }
+  const head = panel.querySelector(".changed-files-head");
+  if (head) head.textContent = t("agent.changed_files", { n: String(sessionChangedFiles.length) });
+  const ul = panel.querySelector(".changed-files-list");
+  if (ul) {
+    const hint = esc(t("agent.reveal_in_explorer"));
+    ul.innerHTML = sessionChangedFiles
+      .map(
+        (p) =>
+          `<li class="changed-file">` +
+          `<a class="file-link" data-path="${esc(p)}" title="${hint}">${esc(pathBase(p))}</a>` +
+          `<span class="changed-file-dir" title="${esc(p)}">${esc(pathDir(p))}</span>` +
+          `</li>`
+      )
+      .join("");
+  }
+  log.appendChild(panel); // 移到末尾（新回合开始后仍贴在最新内容之后）
+}
+
+// 事件委托：`.file-link` 都是**动态重绘**的（面板每次重画、工具卡随流式增量重写），
+// 逐个绑监听会在重绘后全部失效 —— 挂在 document 上一次即可。
+document.addEventListener("click", (e) => {
+  const link = (e.target as HTMLElement | null)?.closest<HTMLElement>(".file-link");
+  const path = link?.dataset.path;
+  if (!path) return;
+  e.preventDefault();
+  invoke("reveal_in_explorer", { path }).catch((err) => {
+    // 路径可能已被移动 / 删除（Rust 侧做了存在性校验）—— 如实告诉用户，别静默失败。
+    console.warn("[lunac] reveal_in_explorer failed:", err);
+    if (statusText) statusText.textContent = t("agent.reveal_failed");
+  });
+});
 
 function agentToolArgsDelta(s: string) {
   const v = agentView;
@@ -3853,8 +4107,11 @@ function renderCmdGroupBody(item: CmdGroupItem) {
     const html = cmds
       .map((c, i) => {
         const sep = i > 0 ? `<span class="approval-cmd-sep">└ </span>` : "";
+        // with-sep 只用来给「带 └ 前缀」的行加悬挂缩进（见 styles.css）：
+        // 前缀是 inline，不给它挂 padding 的话折行后的续行会左移 2ch。
+        const cls = i > 0 ? " with-sep" : "";
         const shown = normalizeCmdForDisplay(c);
-        return `<div class="approval-cmd" title="${esc(shown)}">${sep}<span class="approval-cmd-text">${esc(shown)}</span></div>`;
+        return `<div class="approval-cmd${cls}" title="${esc(shown)}">${sep}<span class="approval-cmd-text">${esc(shown)}</span></div>`;
       })
       .join("");
     const count = cmds.length > 1
@@ -4293,12 +4550,17 @@ listen<{ state: string; message: string; instance?: number }>("cli-status", (eve
     if (event.payload.instance) cliCurrentInstance = event.payload.instance;
     statusText.textContent = t("status.ai", { mode: currentModeLabel() });
     updateAgentStatus("ready");
-    // Retry pending agent chat if CLI just became ready
-    const retryQuery = (window as any).__agent_pending_query;
-    if (retryQuery) {
-      (window as any).__agent_pending_query = null;
-      startAgentChat(retryQuery);
-    }
+    // 顺序：**先灌历史、再放行挂起的提问**。agent 是单线程顺序吃 stdin 的，反了这一问
+    // 仍然是在零上文里发出的 —— 而「回退 / 恢复历史后立刻追问」正是这个场景
+    // （2026-09-17，见 queueAgentHistory 的注释）。
+    void flushPendingAgentHistory().then(() => {
+      // Retry pending agent chat if CLI just became ready
+      const retryQuery = (window as any).__agent_pending_query;
+      if (retryQuery) {
+        (window as any).__agent_pending_query = null;
+        startAgentChat(retryQuery);
+      }
+    });
   } else if (event.payload.state === "closed") {
     // Stale close from a previous agent.exe instance (stop + fast restart) →
     // ignore, it must not null cliReady or end the new session's turn.
@@ -5196,35 +5458,25 @@ function processLatexDelimiters(text: string): string {
 }
 
 // ── Agent Chat (CLI subprocess) ─────────────────────────────────
-// ── Context-aware System Prompt Injection ──────────────────────
-// Detects user intent from query keywords and prepends relevant
-// methodology hints so the agent follows best practices automatically.
-
-/** Simple Q&A hint — soft-constrains the agent to answer directly
- *  without tools/skills/file access (replaces the old built-in chat.rs).
- *  Keeps the humanizer output style but drops debug/TDD/review hints
- *  that would otherwise encourage tool use. */
-function buildSimpleChatHint(query: string): string {
-  return `## Simple Q&A Mode
-Answer the user's question directly from your own knowledge. Do NOT call any tools (Bash, Read, Edit, Write, Glob, Grep, WebSearch, Skill, Task, etc.). Do NOT use any skills. Do NOT read files, search the codebase, or run commands — unless the user explicitly asks you to. Keep the answer concise and accurate.
-
-## Output Style
-Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions.`;
-}
+// ── 关键词条件式提示注入（System Prompt Injection）───────────────
+// 按当前提问的关键词，往**用户消息**里追加一段方法论提示（调试 / TDD / 代码审查）。
+//
+// 这里**只剩条件块**（2026-09-17 方案 B）。原先还有两块**每次必带**的常量
+// （`## Personality` 731 字符 + `## Output Style` 420 字符 ≈ 288 token）—— 它们拼在
+// 每条用户消息最前面，位置决定了**每次提问都必然未命中**（新用户消息是全新内容，
+// 天生不在上一轮的缓存前缀里）。实测闲聊类提问的首请求未命中量 `in = 236 / 289 / 313`
+// token 与这 288 token 几乎相等，即首请求未命中的约 90% 就是它。
+// 现已搬进 **agent 的系统提示词**（`PERSONA_AND_STYLE`，见 core-agent/src/main.rs）：
+// 那是固定前缀的一部分（进程内逐字节不变，ai-spec §11 规则 18），从此永远命中。
+//
+// 为什么条件块**不**跟着搬：它们随 query 变，搬进系统提示词会让提示词每轮都变、
+// 把整个固定前缀的缓存打掉（比原来更糟）。留在消息尾，只占自己那几十 token。
+// 修完这条后 `buildSystemPromptHint()` 可能返回空串 —— 调用方已按「空则不拼分隔符」
+// 处理，`cleanUserContent()` 也容忍没有 `\n\n---\n\n` 的消息。
 
 function buildSystemPromptHint(query: string): string {
   const q = query.toLowerCase();
   const hints: string[] = [];
-
-  // ── 固定人格（点6/7）────────────────────────────────────────
-  // 每次思考/回答都以同一「性格 + 思考方式 + 说话风格」呈现，
-  // 避免每次回答风格漂移。
-  hints.push(`## Personality (fixed — always apply)
-You are "Lunac", a sharp, fast desktop AI assistant built into a launcher. Stay in character every turn.
-- Thinking style: before acting, briefly structure your reasoning as Context → Analysis → Decision, then execute. Do not second-guess after deciding.
-- Speaking style: calm and direct, like a senior engineer explaining to a peer. Short varied sentences, first-person "I", concrete nouns and verbs.
-- No filler: never use "stands as / testament / delve / tapestry / moreover / furthermore / in conclusion / great question / I hope this helps". Have a clear opinion and recommend the single best option rather than listing everything.
-- Always reply in the user's language.`);
 
   // Debug intent: error / bug / fix / crash / not working
   if (/bug|error|crash|fail|break|fix|wrong|not work|不工作|报错|崩溃|修复|调试/.test(q)) {
@@ -5249,10 +5501,6 @@ No exceptions: delete any code written before its test exists.`);
     hints.push(`## Code Review Pipeline
 8-step pre-commit verification: diff → static scan → baseline tests → self-review → independent review → evaluate → auto-fix (max 2) → commit with [verified] prefix.`);
   }
-
-  // Text output — always apply humanizer for agent responses
-  hints.push(`## Output Style
-Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions.`);
 
   return hints.join('\n\n');
 }
@@ -6330,8 +6578,25 @@ win.listen("lunac-window-shown", () => {
   // 大界面不跨「隐藏 → 唤出」存活：唤出（热键 / 双击图标）一律回到简洁搜索 ——
   // 否则用户下次唤出面对的是上次留下的大界面，还占着 640 的固定高度。
   if (detailOpen) exitDetailSilently();
+  // 唤出时再无条件重报一次界面层：前端一定处在已知状态，而 Rust 那份可能因为
+  // 上一次「隐藏时正在换层」或 WebView 重载而残留旧值 —— Esc 是唤出后最常按的键，
+  // 这里对齐一次最划算（详见 syncUiMode 的注释）。
+  syncUiMode();
+  // 唤出即主动重跑一次当前查询（2026-09-17 新增）。
+  // Rust 侧的唤出路径**不会**重跑搜索：`hide_window()` 只有一行 `ShowWindow(SW_HIDE)`
+  // （不清结果、不发事件），唯一的重算链是「剪贴板事件 → 合成 input → 60ms 去抖」，
+  // 而剪贴板没变化时整段不执行 —— 高负载下用户看到的就是「呼出后卡在上次搜索结果」
+  // 的静态帧。这里主动补一次：成本与按一次键相同（`search_apps` 只读
+  // `app-index-cache.json`，永不扫描目录），静态帧最迟 60ms 后被新结果换掉。
+  // 复用 `refreshSearchResults()`（内部就是 dispatch input）而不是直接调
+  // `runSearchNow`：走同一套去抖 + seq 校验，不会与正在输入的字抢渲染。
+  if (!pluginActive && !drawerVisible) refreshSearchResults();
   triggerJSClipboardRead();
 });
+
+// 启动即自报一次界面层：脚本刚跑完 = 一定是简洁搜索，而 Rust 进程可能还是上一次
+// 会话残留的 plugin / detail（前端刷新但进程没重启就会错位）。这是最便宜的自愈点。
+syncUiMode();
 
 // Also try reading clipboard on initial startup
 setTimeout(triggerJSClipboardRead, 800);

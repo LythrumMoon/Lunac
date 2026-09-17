@@ -1996,4 +1996,57 @@ mod tests {
         assert!(out.ends_with("]"), "说明必须在最末");
         let _ = fs::remove_file(&path);
     }
+
+    /// 兜底源**真机联网**验证 —— 手动跑：`cargo test -- --ignored --nocapture`
+    ///
+    /// 为什么不进常规 `cargo test`：依赖外网 + 对方页面结构，离线 / CI 必挂，跑一次还要
+    /// 几秒（进程内 1.1s 节流）。但它**必须可一键重跑**：Bing / 百度都没有公开免费的
+    /// SERP API，兜底全是抓结果页，**对方一改版就会静默退化成 0 条** —— 只有真跑才看得见。
+    ///
+    /// 验收口径（2026-09-17 用户定）：**四家付费服务商（bocha / tavily / exa / firecrawl）
+    /// 的「成功」路径不验证** —— 预算原因拿不到可用 key，那条路径只保证「请求形状 + 错误
+    /// 透传 + 回落」正确（已验）。**只要兜底链在，WebSearch 在未配 key 时就是可用的**，
+    /// 这就是本测试要守的东西。
+    #[test]
+    #[ignore = "需要外网：真抓 Bing RSS / Bing HTML / 百度结果页"]
+    fn fallback_scrapers_still_parse_live_pages() {
+        let q = "Rust 异步编程";
+        let sources: [(&str, fn(&str, usize) -> Result<Vec<SearchHit>, String>); 3] = [
+            ("bing rss", bing_rss_search),
+            ("bing html", bing_html_search),
+            ("baidu", baidu_search),
+        ];
+
+        // 每家只打一次：兜底是「蹭」别人结果页，重复请求容易触发限流（202/429）。
+        let mut results: Vec<(&str, Result<usize, String>)> = Vec::new();
+        for (name, f) in sources {
+            let r = match f(q, 5) {
+                Ok(hits) => Ok(hits.len()),
+                Err(e) => Err(e),
+            };
+            results.push((name, r));
+        }
+        for (name, r) in &results {
+            match r {
+                Ok(n) => println!("[fallback-verify] {name}: OK {n} 条"),
+                Err(e) => println!("[fallback-verify] {name}: FAILED {e}"),
+            }
+        }
+
+        // 「至少一级可用」等价于 `scraped_search()` 能返回结果 —— 那条链就是按顺序取
+        // 第一个非空，不必再整个重跑一遍（会平白多三轮请求）。
+        assert!(
+            results.iter().any(|(_, r)| matches!(r, Ok(n) if *n > 0)),
+            "兜底三级全部不可用 ⇒ 未配 key 时 WebSearch 彻底失效：{results:?}"
+        );
+        // 另外单独钉住 Bing RSS：文档标注它「比抓 HTML 稳得多」（干净 XML、`<link>` 就是
+        // 真实 URL），是整条链的**首选**。不单独钉的话，「它挂了但百度还活着」会被上面
+        // 那条「至少一级」掩盖过去 —— 结果能用但质量/来源会悄悄降级。
+        let rss_ok = results
+            .iter()
+            .find(|(n, _)| *n == "bing rss")
+            .map(|(_, r)| matches!(r, Ok(n) if *n > 0))
+            .unwrap_or(false);
+        assert!(rss_ok, "Bing RSS 兜底挂了（UA / Accept-Language 失效或对方改版）：{results:?}");
+    }
 }

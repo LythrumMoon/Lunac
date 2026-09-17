@@ -144,7 +144,11 @@
 
 一张批量卡（`.approval-batch-card`）承载**一次权限运行**里的所有请求，卡头有数量与「全部允许 / 全部拒绝」，卡体**一行一条**请求（`.approval-item`）。规范：
 
-- **命令置顶、行高自适应（2026-09 重构）**：`.approval-item` **不得设固定高度**。旧实现给 `height: 144px` 且 `.approval-body { flex: 1 }`，于是短命令后面留出一大片空档、命令文本看起来「浮在中间」而不是贴顶。现在行高由内容决定，命令区 `.approval-cmd-box` / `.approval-input` 用 `max-height: 72px; overflow-y: auto`（超长命令自身滚动，不撑高整行）。
+- **命令置顶、行高自适应（2026-09 重构）**：`.approval-item` **不得设固定高度**。旧实现给 `height: 144px` 且 `.approval-body { flex: 1 }`，于是短命令后面留出一大片空档、命令文本看起来「浮在中间」而不是贴顶。现在行高由内容决定，命令区 `.approval-cmd-box` 高度自适应内容（`.approval-input.compact` 仍保留自己的 `max-height`）。
+- **命令区不许有第二层滚动容器（2026-09-15 修）**：`.approval-cmd-box` 曾自带 `max-height: 72px; overflow-y: auto`，与外层 `.approval-batch-body`（`max-height: 380px; overflow-y: auto`）叠成**嵌套双滚动条**。实测（两条稍长的命令各折 3 行 / 2 行）：`scrollHeight = 106` vs `clientHeight = 72`，内层把 34px 内容裁在框外 —— 「已合并 N 条命令」整行看不到、末尾折行只剩半行，用户描述为「空白区域」并怀疑是模型输出带了空行。**滚动只由 `.approval-batch-body` 承担。**
+- **`└ ` 前缀行要有悬挂缩进（2026-09-15 修）**：`.approval-cmd-sep`（`└ `）是 inline 前缀，第 2 条命令起必须给行挂 `.with-sep`（`padding-left: 2ch; text-indent: -2ch`）。不挂的话折行续行回到框左边缘、比正文左移 **2ch**（实测 12.11px），看起来就是「缩进对不齐」。用 `ch` 不写像素 —— 跟等宽字号走。
+- **命令区出现大片空白 / 内容不贴顶 = `pre-wrap` 继承把模板缩进渲染成了空行（2026-09-17 定位，真因）**：用户三次反馈「命令缩进 + 空白」，前两次改的固定高度（`height:144px`）与嵌套双滚动**都是真问题、也都该修**，但**症状仍在**。真因是：`#chat-log`（`.ai-response`）自己声明了 `white-space: pre-wrap`，而 `.approval-body` / `.approval-cmd-box` / `.approval-cmd-list` 这些**中间容器没声明** ⇒ 继承 `pre-wrap` ⇒ `main.ts` 里三处 `innerHTML = \`…\`` 模板（`card.innerHTML` / `item.innerHTML` / `renderCmdGroupBody()`）的**缩进换行被当成真实空行渲染**。实测：一处空白节点 ≈ **45px**，命令区 471px 里 **315px（67%）是空行**，命令文本只占 129px。修法是 `.approval-card { white-space: normal; }`（声明在卡片根，一次覆盖三层模板），修后 471 → **156px（−315px）**、文本仍 129px 不变、外层滚动条消失。**通用纪律**：往 `#chat-log` / `.agent-flow` 里拼 `innerHTML` 的模板**不得带缩进换行**（写成一行，或给结构容器声明 `white-space: normal`）。见 ai-spec §11 规则 33。
+- **排查心法**：用户说「命令有缩进 / 有空行」时，**先按这个顺序查，别凭截图猜** —— ① **把实际命令字符串取出来看**（`ModuleData\history\chat.db` 里该会话的 `steps` 快照；注意 `detail` 是**截断到 200 字符**的显示文本，不是全文，落盘日志也只记「等待审批 PowerShell」不记命令原文）；② 查 `white-space` 的**计算值**（`getComputedStyle(el).whiteSpace`）与容器高度能否**逐项对账**（文本高度 + padding + 附属行，有无余数）；③ 用 `Range.getClientRects()` 数容器内**空白文本节点**是否产生了行盒（`rectCount > 0` 即幽灵空行）。实测多次命令原文都是**干净单行、`normalizeCmdForDisplay()` 也没改坏**，别去改 agent 侧输出或那个归一化函数。
 - **命令区不放复制按钮**（2026-09）：按钮固定右上角会给短命令留一大段空白（`.approval-cmd-list` 还得预留 56px 右边距）；命令文本本身可选中复制。注意这与执行卡片 `.tool-row` 的「复制命令」是**两个不同组件**，不要混。
 - **同一次权限运行内合并成一行**（2026-09 放宽）：同一条未应答的命令组行是**唯一合并目标**，`Bash` 与 `PowerShell` **视作同一族**（用户要求「短时间内不同类型的命令也合并进同一个权限运行」）。合并**只影响审批展示** —— 每条命令仍由 agent 各自执行，`&&` 短路、退出码、输出都不受影响，所以含 `&&` / `|` / 重定向 / 换行的**复杂命令同样入组**（旧实现按算子排除，正是「复杂任务里同类请求一行一条堆满卡片」的原因）。上限 `MAX_CMD_GROUP = 20` 条 / 单条 2000 字符。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。
 - **合并后标题要重画**：工具名可能不止一个（显示 `Bash + PowerShell`），⛔ / ⚠ 标记也可能来自后来合并进来的那条命令 —— `renderGroupTitle()` 在每次合并时重画标题；`renderCmdGroupBody()` 顺带兜掉「始终允许」（组内只要有一条危险 / 不透明，整组都不给）。行的 `danger` 类同步补上。
@@ -153,11 +157,26 @@
 
 ### 3.7 历史回顾（过程与表盘）
 
-历史会话（`ModuleData\history\chat-history.json`，Rust 侧 `load_chat_sessions` / `save_chat_sessions`）不只存气泡，还存：
+历史会话（**2026-09-17 起存放于 `ModuleData\history\chat.db`（SQLite + FTS5），旧位置是 `chat-history.json`**；Rust 侧 `load_chat_sessions` / `save_chat_sessions` 命令名与入参形状都没变）不只存气泡，还存：
 
 - **`steps`（过程快照）**：回合结束时由 `recordTurnSteps()` 采集一次（thinking / tool / text，超长截断），恢复历史时用 `renderHistoryProcess()` 渲染成插在该回合助手消息之后的**可折叠「过程 · N 步」块**，默认折叠。渲染复用对话流里同样的类名（`.think-block` / `.agent-text` / `.tool-card`），保证视觉一致。
 - **`usage`（表盘快照）**：恢复历史时写回 token 仪表盘（`usageTotals` + `updateTokenDashboard()`）—— 表盘口径是「当前这次对话」，所以此时显示的就是**那次对话**的数值。
 - 缺字段（旧记录）时两者都按空处理，不得报错。
+
+### 3.8 被改动文件的路径追踪（2026-09-17）
+
+被 `Write` / `Edit` 动过的文件在两个地方出现，且**两处共用 `.file-link` 这一个类名与同一套委托点击**：
+
+| 位置 | 内容 | 形态 |
+|---|---|---|
+| 工具卡头部 `.tool-cmd` | 可点 `.file-link`（**完整路径**）+ `.tool-cmd-rest`（该次调用的其余入参，压暗、超 160 字符截断） | 行内替换原来的纯文本摘要 |
+| 对话流末尾 `.changed-files-card` | 「N 个文件已改动」，`<details>` 折叠，展开是 `.changed-file` 列表：左侧 `.file-link` 显示**文件名**、右侧 `.changed-file-dir` 显示所在目录 | 只在 `sessionChangedFiles` 非空时存在；每次更新 `appendChild` 到 `#chat-log` 末尾（复用节点即自动移到末尾），新回合开始后仍贴在最新内容之后 |
+
+- **点击 → `reveal_in_explorer(path)`**：调 `explorer.exe /select,<path>` 打开所在文件夹并选中该文件。**只定位、不打开**（不是「用默认程序打开文件」）。失败（文件已被移动 / 删除）时把状态行文案换成 `agent.reveal_failed`，**不弹窗、不清列表**。
+- **路径只来自 `tool_use` 入参**（`Write` / `Edit` 的 `file_path`），不是从工具输出正文里解析 —— 详见 ai-spec §11 规则 32（含为什么不能猜）。
+- **`.file-link` 一律不设固定宽度、`word-break: break-all`**（工具卡里路径可能很长）；列表里的**目录段才是被截断的那一段**（`text-overflow: ellipsis`），文件名必须完整可读。
+- **列表内容与界面留下的历史一致**：`steps` 快照每条带可选 `path`（`SessionStep.path`），`restoreSession()` / `rollbackChat()` 用 `rebuildChangedFilesFromSteps()` 重建、新对话清空列表。工具卡上的路径**不写回 agent 上下文**（纯前端展示）。
+- **不新增滚动容器**：面板不过度增长（每文件一行）、不设 `max-height`；将来若要设，走 §5.4 那条唯一的全局 `::-webkit-scrollbar`，**禁止**在此声明 `scrollbar-width` / `scrollbar-color`。
 
 ---
 

@@ -135,6 +135,10 @@ const MAX_USER_CHARS: usize = 100_000;
 /// 历史被丢弃后插在开头的提示（保证历史以 user 文本消息开头）
 const TRIMMED_MARKER: &str =
     "[earlier conversation was trimmed to fit the model context window]";
+/// 任务快照的固定表头（backlog §8.3）。英文的原因同 `TRIMMED_MARKER`：这些是**给模型看的
+/// 元信息**，不是给用户看的 UI 文案，所以不进 i18n。
+const TASK_SNAPSHOT_HEADER: &str =
+    "[current task list — pinned so it survives context compaction; keep working on these]";
 
 fn max_context_tokens() -> u64 {
     std::env::var(MAX_CONTEXT_ENV)
@@ -154,6 +158,57 @@ fn is_tool_result_msg(msg: &Value) -> bool {
                 .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
         })
         .unwrap_or(false)
+}
+
+/// 该消息里是否含 `TodoWrite` 的 tool_use（backlog §8.3 的任务快照要用）。
+fn has_todo_write(msg: &Value) -> bool {
+    msg.get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks.iter().any(|b| {
+                b.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && b.get("name").and_then(Value::as_str) == Some("TodoWrite")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 把**最近一条** `TodoWrite` 的清单渲染成一段纯文本快照（backlog §8.3「任务快照」）。
+///
+/// 为什么取「最近一条」而不是累积：`TodoWrite` 的契约就是**每次发完整清单、覆盖上一份**
+/// （见 tools.rs 的工具描述），所以最后一条即当前真相。
+/// 返回 `None` = 历史里没有 `TodoWrite`，或清单为空 / 结构不对。
+fn latest_todo_snapshot(history: &[Value]) -> Option<String> {
+    for msg in history.iter().rev() {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks.iter().rev() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use")
+                || block.get("name").and_then(Value::as_str) != Some("TodoWrite")
+            {
+                continue;
+            }
+            let todos = block
+                .get("input")
+                .and_then(|i| i.get("todos"))
+                .and_then(Value::as_array)?;
+            if todos.is_empty() {
+                return None;
+            }
+            let mut out = String::from(TASK_SNAPSHOT_HEADER);
+            for (i, t) in todos.iter().enumerate() {
+                let content = t.get("content").and_then(Value::as_str).unwrap_or("").trim();
+                if content.is_empty() {
+                    continue;
+                }
+                let status = t.get("status").and_then(Value::as_str).unwrap_or("pending");
+                out.push_str(&format!("\n{}. [{}] {}", i + 1, status, content));
+            }
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// 判断 400 是否由「上下文超限」引起 —— 只有这类才值得压缩后重试
@@ -250,6 +305,11 @@ fn compact_history(
         Compact::Force => true,
     };
     let mut dropped = 0usize;
+    // 任务快照（backlog §8.3）：`TodoWrite` 的清单躺在**历史中段**，而它恰恰是「当前在做什么」
+    // 的唯一载体 —— drop 一压就没了，模型随后就会跑偏（这正是 §8.3 要解决的问题）。
+    // 所以**在 drain 之前**先把最近一条抄下来（源马上就不存在了），压缩完再钉回历史开头。
+    // 只在「被丢的区间里真的含 TodoWrite」时抄 —— 否则与幸存的那份重复，反而干扰模型。
+    let mut pinned_task_snapshot: Option<String> = None;
     if can_drop {
         let head = if history
             .first()
@@ -268,6 +328,9 @@ fn compact_history(
             cut += 1;
         }
         if cut > head {
+            if history[head..cut].iter().any(has_todo_write) {
+                pinned_task_snapshot = latest_todo_snapshot(history);
+            }
             history.drain(head..cut);
             dropped = cut - head;
         }
@@ -285,6 +348,20 @@ fn compact_history(
             0,
             json!({ "role": "user", "content": [{ "type": "text", "text": TRIMMED_MARKER }] }),
         );
+    }
+
+    // 把任务快照钉回去：**插在第一条之后**，不抢「开头那条用户提问 = 任务目标」的位置
+    // （丢弃逻辑刻意保留 head 那条，就是为了这个）。
+    // 它是一条**纯文本 user 消息**，与 `tool_use` / `tool_result` 的配对结构完全解耦 ——
+    // 所以不会像「原样保留那条工具消息」那样把配对拆坏（端点是硬校验的）。
+    // 副作用：插在靠前位置 ⇒ 从这条之后的前缀缓存作废。但这只在**已经丢弃过**的轮次才发生，
+    // 那一轮本来就已经因为 drain 把缓存废掉了，不算额外损失。
+    if let Some(snapshot) = pinned_task_snapshot {
+        history.insert(
+            1.min(history.len()),
+            json!({ "role": "user", "content": [{ "type": "text", "text": snapshot }] }),
+        );
+        eprintln!("[agent] 任务快照已钉住：丢弃历史时保住了当前任务清单（backlog §8.3）");
     }
 
     if elided > 0 || dropped > 0 {
@@ -308,6 +385,29 @@ Answer in the user's language and keep it concise. \
 You can inspect and modify the local machine with the provided tools: prefer Read/Glob/Grep \
 before editing, make the smallest change that solves the problem, and say what you changed. \
 Relative paths resolve against your working directory.";
+
+/// 固定的「人格 + 文风」块 —— 系统提示词的第二段（2026-09-17，方案 B）。
+///
+/// **为什么搬到这里**（原先由前端 `buildSystemPromptHint()` 拼在**每条用户消息最前面**）：
+/// 这两段共 1153 字符 ≈ 288 token。位置决定了它**每次提问都必然未命中** —— 新的用户消息
+/// 是全新内容，天生不在上一轮的缓存前缀里。实测闲聊类提问的首请求未命中量
+/// `in = 236 / 289 / 313` token，与这 288 token 几乎相等（问题本身只占几十 token），
+/// 即**首请求未命中的约 90% 就是它**。挪进系统提示词后它成为固定前缀的一部分
+/// （进程内逐字节不变，见 ai-spec §11 规则 18），从此**永远命中**。
+///
+/// 硬约束：**这段必须与请求内容无关**。任何按 query / 时间 / 环境变化的东西都不能进来 ——
+/// 那会让系统提示词每轮都变，把整个固定前缀的缓存打掉（这正是原先那份不能留在这里的原因：
+/// 它按关键词条件拼接）。关键词条件块（调试方法论 / TDD / 代码审查）**仍留在用户消息里**，
+/// 它们本来就随 query 变，且只占自己那几十 token。
+const PERSONA_AND_STYLE: &str = r#"## Personality (fixed — always apply)
+You are "Lunac", a sharp, fast desktop AI assistant built into a launcher. Stay in character every turn.
+- Thinking style: before acting, briefly structure your reasoning as Context → Analysis → Decision, then execute. Do not second-guess after deciding.
+- Speaking style: calm and direct, like a senior engineer explaining to a peer. Short varied sentences, first-person "I", concrete nouns and verbs.
+- No filler: never use "stands as / testament / delve / tapestry / moreover / furthermore / in conclusion / great question / I hope this helps". Have a clear opinion and recommend the single best option rather than listing everything.
+- Always reply in the user's language.
+
+## Output Style
+Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions."#;
 
 /// 环境说明（接在 SYSTEM_PROMPT 之后）。
 ///
@@ -833,7 +933,7 @@ fn main() {
         );
     }
     let system_prompt = format!(
-        "{SYSTEM_PROMPT}{}{}",
+        "{SYSTEM_PROMPT}\n\n{PERSONA_AND_STYLE}{}{}",
         env_block(&tools_ctx.cwd),
         skills::listing(if skills_on { &skills } else { &[] })
     );
@@ -959,6 +1059,27 @@ fn main() {
                     &system_prompt,
                 );
             }
+            // 会话历史整体替换（宿主 → agent，2026-09-17）。
+            // 用途：① 回退历史后让 agent 的上下文与界面**保留下来的那部分**一致。
+            // 旧实现靠宿主侧 `stop_cli` + `start_cli` 把上下文整个清空，代价是保留下来
+            // 的上文也一起丢了 —— 用户表现为「回退后引用不到上文」。
+            // ② 从磁盘恢复一个旧会话后把它的消息灌回来（恢复只重建了 DOM，agent 侧为空）。
+            // **只替换历史、不触发模型调用**：这不是一次提问，不该产生回答与 token。
+            Some("set_history") => {
+                let msgs = msg
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                history = normalize_history(msgs);
+                eprintln!("[agent] set_history: {} 条", history.len());
+                log::info(format!("set_history: {} 条", history.len()));
+                emit(json!({
+                    "type": "system",
+                    "subtype": "history_set",
+                    "messages": history.len(),
+                }));
+            }
             // 没被认领的 control_response（如请求已超时）在这里丢弃即可
             Some("control_response") => {}
             other => eprintln!("[agent] 忽略输入类型: {other:?}"),
@@ -966,6 +1087,48 @@ fn main() {
     }
     eprintln!("[agent] stdin closed, exiting");
     log::info("=== agent exit (stdin closed) ===");
+}
+
+/// 把宿主送来的「用户 / 助手」纯文本消息列表转成 API 历史。
+///
+/// 三条规则：
+/// 1. **只认 `user` / `assistant`**，认不出的角色直接丢 —— 宁可少一条，也不要把
+///    端点不认的形状发出去换回一个 400。
+/// 2. **丢掉空文本**：空 content 会让部分端点报错，也没有语义。
+/// 3. **合并连续同角色**：宿主手里只有每条消息的 `role` + 纯文本（工具调用细节不落
+///    前端），而 Anthropic 形态的 `messages` 要求 role 交替 —— 回退到某条用户消息后
+///    紧接着的新提问，会与它构成两条连续 `user` ⇒ 端点 400。合并成一条既合法、语义
+///    又不变（同角色的相邻文本本来就是一段连续输入）。
+fn normalize_history(msgs: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in msgs {
+        let role = match m.get("role").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let text = m
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if last.get("role").and_then(Value::as_str) == Some(role) {
+                if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                    arr.push(json!({ "type": "text", "text": text }));
+                    continue;
+                }
+            }
+        }
+        out.push(json!({
+            "role": role,
+            "content": [{ "type": "text", "text": text }],
+        }));
+    }
+    out
 }
 
 /// 从上游消息里取出纯文本。content 既可能是 block 数组，也可能是裸字符串。
@@ -1238,6 +1401,35 @@ fn run_query(
             }
             if let Some(t) = plan.to_json() {
                 body["thinking"] = t;
+            }
+
+            // ── 请求前缀指纹（2026-09-17，ai-spec §11 规则 23 的归因埋点）──────
+            // 要回答的问题：同会话内跨提问时，上一次请求明明命中到 `read=N`，下一次的
+            // `read` 却回落到 2048 / 2304（实测 `usage-2026-09-16.jsonl`：记录 6 末次
+            // `read=3712` → 记录 7 首次 `read=2304`，丢 1408；记录 8→9 丢 3584）。
+            // 静态读用量日志**无法判定**这是「本侧前缀被改写」还是「端点侧淘汰了已落盘
+            // 的缓存单元」—— 两者的 read 曲线一模一样。
+            // 所以每次请求前把三块前缀的**指纹 + 体积**落一行（只记哈希不记原文，
+            // 前缀里可能含用户文件内容，哈希天然脱敏）：
+            //   · 三块指纹与上一次逐字节相同而 read 掉了 ⇒ 端点侧淘汰，本侧无责；
+            //   · 某一块指纹变了 ⇒ 本侧改了前缀，直接去那一块找原因
+            //     （system = 身份/环境块/技能清单，tools = 工具 schema，history = 历史）。
+            // 放在 send 之前：重试路径 `continue` 回来会再记一行，正好能看出「同一次
+            // 提问的哪次尝试前缀变了」。
+            {
+                let tools_json = serde_json::to_string(&tool_defs).unwrap_or_default();
+                let hist_json = serde_json::to_string(history).unwrap_or_default();
+                log::info(format!(
+                    "请求前缀 #{} system={:016x}/{}字 tools={:016x}/{}字 history={:016x}/{}条/{}字",
+                    turns,
+                    log::hash64(system_prompt),
+                    system_prompt.chars().count(),
+                    log::hash64(&tools_json),
+                    tools_json.chars().count(),
+                    log::hash64(&hist_json),
+                    history.len(),
+                    hist_json.chars().count(),
+                ));
             }
 
             let sent = cfg
@@ -1764,6 +1956,63 @@ fn finish_error(
 mod tests {
     use super::*;
 
+    /// 系统提示词的**前缀缓存不变量**（2026-09-17 方案 B 的守门测试）。
+    ///
+    /// 方案 B 把「人格 + 文风」两块从**用户消息**（每问重发、必未命中）搬进了**系统提示词**
+    /// （固定前缀的一部分、永远命中）。搬错了地方 —— 比如塞进任何按 query 拼的字符串 ——
+    /// 就会让系统提示词每轮都变，把整个固定前缀的缓存打掉，比原来更糟。所以这里钉两件事：
+    /// ① 同一 cwd 下逐字节可复现；② 两块文案真的在里面。
+    #[test]
+    fn system_prompt_is_stable_and_carries_persona() {
+        let build = || {
+            format!(
+                "{SYSTEM_PROMPT}\n\n{PERSONA_AND_STYLE}{}",
+                env_block(std::path::Path::new("C:/work"))
+            )
+        };
+        let a = build();
+        assert_eq!(a, build(), "同一 cwd 下系统提示词必须逐字节相同（否则前缀缓存每轮作废）");
+        assert!(a.contains("## Personality (fixed — always apply)"), "人格块丢了");
+        assert!(a.contains("## Output Style"), "文风块丢了");
+        assert!(!a.contains('{'), "残留了未被 format! 替换的占位符");
+    }
+
+    /// 回灌历史的三条规则各测一次。重点在**合并连续同角色**：回退到一条用户消息后
+    /// 紧接着的新提问会构成两条连续 `user`，不合并就是端点 400（这就是本次要修的场景）。
+    #[test]
+    fn normalize_history_merges_and_filters() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "Q1" }),
+            json!({ "role": "assistant", "content": "A1" }),
+            // 回退到 Q2 后紧接着追问 → 连续两条 user，必须合并成一条
+            json!({ "role": "user", "content": "Q2" }),
+            json!({ "role": "user", "content": "Q2 追问" }),
+            // 认不出的角色 / 空文本都要丢掉
+            json!({ "role": "system", "content": "ignored" }),
+            json!({ "role": "assistant", "content": "   " }),
+        ];
+        let out = normalize_history(msgs);
+        assert_eq!(out.len(), 3, "user/assistant 交替 + 两条 user 合并");
+
+        // 合并后仍是交替的 role 序列（端点的硬要求）
+        let roles: Vec<&str> = out
+            .iter()
+            .map(|m| m.get("role").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+
+        // 被合并的那条两段文本都在，且都是合法 text block
+        let blocks = out[2].get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].get("text").and_then(Value::as_str), Some("Q2"));
+        assert_eq!(blocks[1].get("text").and_then(Value::as_str), Some("Q2 追问"));
+        assert_eq!(
+            blocks[0].get("type").and_then(Value::as_str),
+            Some("text"),
+            "必须是 type+text 的 block 形状，不能把裸字符串塞进 content 数组"
+        );
+    }
+
     /// 造一段历史：开头是用户提问，中间塞一条大 tool_result，尾部留 COMPACT_KEEP_TAIL 条。
     fn history_with_big_tool_result(chars: usize) -> (Vec<Value>, Value) {
         let big = json!("x".repeat(chars));
@@ -1804,6 +2053,97 @@ mod tests {
         let (mut history, _) = history_with_big_tool_result(3_000);
         let out = compact_history(&mut history, Compact::Force, 100_000);
         assert_eq!(out.elided, 1);
+    }
+
+    /// backlog §8.3：丢弃历史时，「当前任务清单」必须活下来（否则模型会跑偏）。
+    #[test]
+    fn task_snapshot_survives_a_drop() {
+        // 历史：用户提问（head，丢弃逻辑刻意保留它）→ TodoWrite → 它的 tool_result → 一堆后续消息。
+        // 后续消息要够多，保证 drop 区间 [head, cut) 覆盖到 TodoWrite 那两条。
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"帮我改脚本"}]}),
+            json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"t1","name":"TodoWrite",
+                "input":{"todos":[
+                    {"content":"改 build-release.ps1","status":"completed","activeForm":"改脚本"},
+                    {"content":"继续 docs 未完成任务","status":"in_progress","activeForm":"做任务"}
+                ]}
+            }]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL * 2 {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("m{i}")}]}));
+        }
+
+        let out = compact_history(&mut history, Compact::Force, 0);
+        assert!(out.dropped > 0, "Force 档必须真的丢了消息，否则这个用例没测到东西");
+        assert!(
+            !history.iter().any(has_todo_write),
+            "原始 TodoWrite 消息应当已被丢弃 —— 快照是唯一的幸存者"
+        );
+
+        let snap = history
+            .iter()
+            .find(|m| {
+                m["content"][0]["text"]
+                    .as_str()
+                    .map(|t| t.contains(TASK_SNAPSHOT_HEADER))
+                    .unwrap_or(false)
+            })
+            .expect("应当把任务快照钉回历史");
+        assert_eq!(snap["role"].as_str(), Some("user"), "快照必须是 user 文本消息（配对结构无关）");
+        let text = snap["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("继续 docs 未完成任务"), "快照要带上清单内容：{text}");
+        assert!(text.contains("[in_progress]"), "快照要保留状态：{text}");
+        assert!(text.contains("[completed]"), "快照要保留状态：{text}");
+
+        // 位置：插在第一条之后，第一条仍是那次提问（head 的语义不能被抢走）
+        assert_eq!(history[0]["content"][0]["text"].as_str(), Some("帮我改脚本"));
+    }
+
+    /// 没丢东西时**不插**快照 —— 原清单还在历史里，插了就是重复。
+    #[test]
+    fn task_snapshot_is_not_pinned_when_nothing_is_dropped() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"t1","name":"TodoWrite",
+                "input":{"todos":[{"content":"a","status":"pending","activeForm":"a"}]}
+            }]}),
+        ];
+        let out = compact_history(&mut history, Compact::Elide, 0);
+        assert_eq!(out.dropped, 0);
+        assert!(
+            !history.iter().any(|m| m["content"][0]["text"]
+                .as_str()
+                .map(|t| t.contains(TASK_SNAPSHOT_HEADER))
+                .unwrap_or(false)),
+            "没丢消息时不该插快照"
+        );
+    }
+
+    /// 取「最近一条」清单；空清单 / 空历史 / 结构不对都返回 None。
+    #[test]
+    fn task_snapshot_takes_the_latest_list() {
+        let older = json!({"role":"assistant","content":[{
+            "type":"tool_use","id":"a","name":"TodoWrite",
+            "input":{"todos":[{"content":"旧的","status":"pending","activeForm":"旧的"}]}
+        }]});
+        let newer = json!({"role":"assistant","content":[{
+            "type":"tool_use","id":"b","name":"TodoWrite",
+            "input":{"todos":[{"content":"新的","status":"in_progress","activeForm":"新的"}]}
+        }]});
+        let snap = latest_todo_snapshot(&[older, newer]).expect("应当取到快照");
+        assert!(snap.contains("新的") && !snap.contains("旧的"), "必须取最近一条：{snap}");
+
+        assert!(latest_todo_snapshot(&[]).is_none(), "空历史没有快照");
+        assert!(
+            latest_todo_snapshot(&[json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"c","name":"TodoWrite","input":{"todos":[]}
+            }]})])
+            .is_none(),
+            "空清单不该产出快照"
+        );
     }
 
     #[test]
