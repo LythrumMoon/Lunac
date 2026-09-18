@@ -197,17 +197,50 @@ fn main() {
         }
     }
 
-    // ── Suppress WebView2 permission dialogs ──────────────────────
+    // ── Inject WebView2 browser flags ─────────────────────────────
     // Chromium prompts "Allow site to see text and images on clipboard?"
     // when navigator.clipboard.read() is called. We use the Tauri
     // clipboard plugin (native Win32) exclusively — disable the
     // browser-level API entirely to prevent accidental dialog triggers.
     // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS is read by WebView2 at startup.
-    if std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_err() {
-        std::env::set_var(
-            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    //
+    // **必须是「合并」而不是「没有才设」（2026-09-18 修，不得回退）**：
+    // 原实现是 `if var(...).is_err() { set_var(...) }` —— 可是这个变量**很容易被外部预设**
+    // （HKCU\Environment 里一条 `--remote-debugging-port=9222` 就够了，实测 2026-09-18：
+    // 用户级就有这一条）。一旦被预设，`is_err()` 为假 ⇒ **我们的旗标一个都不会生效**，
+    // 而且**完全静默**：权限弹窗抑制、剪贴板 API 禁用全部形同虚设，日志里也看不出异常。
+    // 取证：实测浏览器进程命令行里只有 WebView2 自带的
+    // `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`，
+    // 我们那串根本不在 —— 这就是「代码写了但没生效」的典型。
+    // 这与 WEBVIEW2_USER_DATA_FOLDER 的坑（上面那段）是同一类：**外部预设会整体接管**。
+    // 差别在于：profile 路径被接管只能告警（无法合并），而命令行参数**可以拼接**。
+    //
+    // Chromium 解析 argv 时对重复的 `--disable-features` 逐项逗号合并（union），
+    // 所以这里再追加一个同名 switch 不会挤掉 WebView2 自带的那份。
+    {
+        // 本应用**必须**存在的旗标。逐项检查、只补缺失的那些 —— 于是外部预设的
+        // `--remote-debugging-port=9222`（HKCU，用户决定长期保留）会被原样留下。
+        const REQUIRED_WEBVIEW_FLAGS: [&str; 2] = [
+            // 权限弹窗抑制 + 禁用浏览器侧剪贴板读 API（见上方注释）
             "--disable-features=PermissionPrompt,ClipboardContentRead",
-        );
+            // 压 V8 新生代（scavenger）堆上限，官方旗标表收录。**只降内存、不减进程**；
+            // 代价是小 GC 更频繁（2026-09-18 定案纳入）。
+            "--js-flags=--scavenger_max_new_space_capacity_mb=8",
+        ];
+        let mut merged = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        let mut added = 0usize;
+        for flag in REQUIRED_WEBVIEW_FLAGS {
+            if merged.split_whitespace().any(|a| a == flag) {
+                continue;
+            }
+            if !merged.trim().is_empty() {
+                merged.push(' ');
+            }
+            merged.push_str(flag);
+            added += 1;
+        }
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", &merged);
+        crate::log::info(format!("WebView2 browser args（合并 {added} 项）: {merged}"));
     }
 
     tauri::Builder::default()

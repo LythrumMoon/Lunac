@@ -13,7 +13,9 @@
 >
 > **定位前提（2026-09-13 修正）**：Lunac 的 AI agent 目标是**一个可以完全类比于完整 agent 类应用**的能力体，不因「宿主是桌面启动器」而降级。因此下列分组只是**优先级**，不是**价值否定** —— 旧版把多代理协作等写成「与 Lunac 无关」是错的，已改。
 >
-> **最后核对时间**：2026-09-11（§0 差距总览）、2026-09-13（定位修正、瞬时失败重试、命令静态安全分析落地）、2026-09-15（新增 §8「Lunac 自身新目标」五项 + Hermes 调研）、2026-09-17（§8.5 第一步落地：会话历史迁 SQLite + FTS5；§8.1 被改动文件路径追踪完成；§8.3 任务快照完成）
+> **最后核对时间**：2026-09-11（§0 差距总览）、2026-09-13（定位修正、瞬时失败重试、命令静态安全分析落地）、2026-09-15（新增 §8「Lunac 自身新目标」五项 + Hermes 调研）、2026-09-17（§8.5 第一步落地：会话历史迁 SQLite + FTS5；§8.1 被改动文件路径追踪完成；§8.3 任务快照完成）、2026-09-18（**§8.2 摘要式压缩完成**；渲染层架构决策定案为「全局保留 WebView2」）
+>
+> **⚠ 优先级高于本文的架构决策（2026-09-17 立项 / 2026-09-18 定案）**：渲染层**维持现状的全局 WebView2**，**不脱离 WebView2 / Tauri**（原「原生搜索主层 + WebView 按需创建」方向已废弃）。决策、实测基线与被否方案的记录见 **[architecture-rendering.md](./architecture-rendering.md)** —— 它**优先于本文全部条目**，包括下面 §8 的五项新目标。该决策的结论是「不改渲染层」，所以**不产生新的实现待办**，本文待办照旧推进。
 
 ---
 
@@ -78,7 +80,7 @@
 
 | 子系统 | 旧 CLI 位置 | 说明 |
 |---|---|---|
-| ~~**上下文压缩 / 长度预算**~~ | `core/services/compact/`（`autoCompact` / `microCompact` / `apiMicrocompact` / `snipCompact` / `sessionMemoryCompact`）、`core/query/tokenBudget.ts` | ✅ **已完成（2026-09）**：预算 + 0.85/0.95 双水位（带滞回）+ 400 强制压缩兜底，**不额外调模型**（见 ai-spec §3.5）。与旧 CLI 的差别只是缺「调模型做摘要」那一类变体，已不再是可用性缺口 |
+| ~~**上下文压缩 / 长度预算**~~ | `core/services/compact/`（`autoCompact` / `microCompact` / `apiMicrocompact` / `snipCompact` / `sessionMemoryCompact`）、`core/query/tokenBudget.ts` | ✅ **已完成（2026-09）**：预算 + 0.85/0.95 双水位（带滞回）+ 400 强制压缩兜底，**不额外调模型**（见 ai-spec §3.5）。另外旧 CLI 的「调模型做摘要」那一类变体也已补齐（2026-09-18，**§8.2**）：只在丢弃档 / 400 兜底档触发一次摘要调用 ⇒ 已**不再是**缺口 |
 | ~~**模型输出重试**~~ | `core/services/api/withRetry.ts`、前端已解析的 `system/api_retry` | ✅ **已完成（2026-09）**：网络抖动 / 429 / 5xx（含 529）**请求级**退避重试（1s→2s→4s + 抖动、30s 封顶、尊重 `Retry-After`），只在读到响应体前重试故**不产生重复内容**；4xx 不重试（400 的两个专门分支保留）；SSE 流中途断开不重试（只记日志）。补发 `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`）。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「瞬时失败重试」与 §11 规则 25 |
 | ~~**Bash 静态安全分析**~~ | `core/tools/BashTool/`（`bashParser.ts`、`bashSecurity.ts`、`sedValidation.ts`、`readOnlyValidation.ts`、`destructiveCommandWarning.ts`）、`core/utils/bash/` | ✅ **已完成（2026-09，自研方案）**：旧 CLI 是一整套手写 bash 语法树（面向 unix/zsh，且其自身承认 `bash -c` / `cmd /c` / `powershell -Command` 无递归解析），**不照搬**。自研 [core-agent/src/bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)：子命令拆分（`;` `\n` `\|` `&`，引号感知）+ 引号/转义归一（`r""m`→`rm`，且不把 `C:\Windows` 揉成 `C:Windows`）+ 包装器递归（`cmd /c` / `powershell -Command` / `bash -c`，`-EncodedCommand` 判不透明）+ **Windows 危险规则集**（递归/强制删除、格式化与分区、覆写物理磁盘、注册表、bcdedit、vssadmin/wbadmin、关机重启、taskkill、icacls、账户/服务/计划任务、`iex`、git 强制推送/`reset --hard`/`clean -f`/`branch -D`…）+ **fail-closed**：变量/子表达式/编码执行/间接执行器/嵌套过深/控制字符 ⇒ 不得自动放行。结果随 `can_use_tool.analysis` 上报（见 §3 与 ai-spec §11 规则 26），前端以它为准、原正则降为二道网；解释器前缀永不进白名单 |
 | **写文件前的安全扫描** | `core/security/index.ts`（`scanContent()`，`core/security/patterns.ts`） | 写入前扫凭据/危险模式，我们现在没有 |
@@ -202,6 +204,8 @@
 | Hermes 会话策略 | **原地压缩为默认**：`compression.in_place` 默认 True → 旧轮 `active=0` 软归档、**session id 不变**（`agent/conversation_compression.py:347` + `hermes_state.py:2854 archive_and_compact`）；legacy 路径才 fork 新会话并写 `parent_session_id`（`conversation_compression.py:568-667`） |
 | Lunac 硬约束 | ① 摘要要**真实花钱与耗时**（一次额外 API 调用）⇒ 只在「机械压缩已不足以腾空间」时才触发，要有单轮成本上限 + 可关闭开关；② 压缩**必然改写请求前缀 ⇒ 端点侧缓存整段作废**，与 ai-spec §11 规则 23 的命中率纪律直接冲突，所以**触发频次要尽量低**，宁可压得晚也不要压得勤；③ 不引 session 分裂（Lunac 的 `session_id` 恒为 `""`，前端也不读）|
 | 依赖 | **8.3 先行** —— 摘要模板的核心就是任务快照 |
+| **状态** | ✅ **已完成（2026-09-18）**。实现在 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)：`render_dropped_for_summary()` / `summarize_dropped()` / `pin_summary_of_dropped()`，提示词常量 `SUMMARY_PROMPT`。<br>**① 触发点只有两个** —— >95% 的丢弃档 + 400「上下文超限」的 `Force` 兜底档；**0.85 的瘦身档绝不触发**。理由是「改写前缀 ⇒ 缓存整段作废 ⇒ 触发频次要尽量低」：这两档本来就必然 `drain`、本来就已经把缓存废掉，摘要属**净赚**；挂在别处就是额外制造压缩时机（违反「宁可压得晚也不要压得勤」）。<br>**② 三道成本闸**：`SUMMARY_MIN_INPUT_CHARS`(4000) 太短不付费 / `SUMMARY_MAX_INPUT_CHARS`(24000) 输入封顶（**从最近的往老的取**）/ `SUMMARY_MAX_OUTPUT_TOKENS`(1024)（摘要要长期留在上下文里，故意压短）。<br>**③ 开关 `LUNAC_SUMMARY_COMPACT`**（`0`/`false`/`off`/`no` 关；默认开）。<br>**④ 失败一律降级**：网络错误 / 非 2xx / 非 JSON / 空摘要 —— 四种都 `warn` + `None`，调用方照旧走纯机械压缩。**摘要挂掉不能让整轮对话失败**。<br>**⑤ 非流式**（`"stream": false`）+ **不新增 stdout 协议** ⇒ 前端零改动、零解析风险。<br>**⑥ 位置** = 第 1 条之后（同 §8.3）；两者同时存在时为 `[摘要][任务快照]`（由远及近）。<br>**⑦ `CompactOutcome` 新增 `dropped_msgs` 与 `pinned`** —— 前者让 `compact_history` **保持纯的**（不卷进网络请求，8 处现有测试照旧可跑）；后者**顺带修掉一个既有 off-by-one**：回滚锚点 `base` 原实现只做减法，于是「丢弃 + 钉任务快照」那一轮若出错，`finish_error` 的 `history.truncate(base)` 会多切掉一条真实历史。<br>**⑧ Hermes 口径**：首段固定 `## Historical Task Snapshot`、**逐字捕获最近一条未完成输入**、显式写明「刚问了一个问题也算 active task，不要写 None」、**latest user message WINS**、历史里的 `Historical Task`/`In Progress`/`Pending`/`Remaining Work` 章节一律视为历史；另加「用原文语言」+「保留精确标识符」。<br>**⑨ 校验**：core-agent `cargo test` **43 passed** / 2 ignored（新增 8 条：6 条纯逻辑 + 1 条本地 stub 形状用例 + 1 条真端点 `#[ignore]` 用例），已 `cargo build --release`。规范固化在 ai-spec §11 规则 39，断裂源清单见规则 23 第 ⑥ 项。 |
+| **测试途径**（三条，各覆盖不同的东西 —— 详见 ai-spec §11 规则 39） | ① **本地 stub 单测**（`cd core-agent; cargo test summary`，零成本不联网）：覆盖请求形状（`stream:false` / 不带 `tools` / `system` 是提示词 / 单条 user）、响应解析、**五种失败降级**、触发守卫、渲染上限。**证不了真端点是否接受这个形状**。<br>② **真端点 `#[ignore]` 用例**（`cargo test summary_compaction_against_the_real_endpoint -- --ignored --nocapture` + 三个 `LUNAC_AGENT_*` 凭据）：补上①证不了的「端点是否接受 `stream:false` + 无 `tools`」，并验摘要模板（首段 `## Historical Task Snapshot`）与 **latest user message WINS**（内嵌 sentinel `LUNAC-SENTINEL-8421`）。成本 = 一次摘要调用（≤6k 输入 token + ≤1024 输出 token）。<br>③ **端到端验触发**（前两条都绕过了 `run_query` 的水位检查）：**别等跑满 128k** —— 把 `LUNAC_MAX_CONTEXT_TOKENS` 压到最小值 **8000**（dev 写 `app/src-tauri/.env`，release 在启动 shell 里设），让 agent 读一个 ≥40KB 的文件（如 `docs/ai-spec.md`）再追问一句；判据 = 日志出现 `摘要压缩：N 条旧消息 / M 字 → 摘要 K 字（输出 T tokens，耗时 Ums）`。**必做对照**：同流程把 `LUNAC_SUMMARY_COMPACT=0` 再跑一遍 ⇒ 应当只有 `上下文压缩：…` 而没有 `摘要压缩：…`。<br>**✅ 已跑通（2026-09-18，A/B 闭环）** —— 实操上改成**直接驱动 `agent.exe`**（它只吃 stdin/stdout，不需要 WebView2 与 `D:\Lunac`，因此可绕开 Trae 沙箱）：run1 出 `摘要压缩：10 条旧消息 / 23402 字 → 摘要 786 字（输出 728 tokens，耗时 3646ms）`，turn2 上下文 2503 tokens 且**能复述只存在于被丢段里的 sentinel**；run2（`=0`）**无摘要行**、turn2 答「不知道」、上下文 2092 tokens。完整 A/B 表 + 两个造数据陷阱（`normalize_history` 合并同角色 / `cut` 要按 `len-8` 且检查发生在 push 之后）见 ai-spec §11 规则 39。 |
 
 ### 8.3 任务总结工具（压缩时不丢「本次对话的主要任务」）
 
@@ -239,8 +243,10 @@
 
 ### 8.6 建议顺序
 
-1. **8.1 路径追踪** —— 无依赖、纯前端 + 一个 Rust 命令，用户直接可见
+1. ~~**8.1 路径追踪** —— 无依赖、纯前端 + 一个 Rust 命令，用户直接可见~~ ✅ **已完成（2026-09-17）**
 2. ~~**8.3 任务快照** —— 8.2 的前置，可与 8.2 合并一次做完~~ ✅ **已完成（2026-09-17）**
-3. **8.2 自动压缩（调模型摘要）** —— 注意「少压」优先于「压得干净」（命中率纪律）
-4. **8.5 对话数据库** —— 先把存储换成 SQLite + FTS5，再做检索与记忆注入（工作量大，但 8.2 上线后会更需要它）
+3. ~~**8.2 自动压缩（调模型摘要）**~~ ✅ **已完成（2026-09-18）** —— 见 §8.2 状态行：只在丢弃档 / 400 兜底档各触发**一次**，三道成本闸 + `LUNAC_SUMMARY_COMPACT` 开关 + 失败一律降级
+4. **8.5 对话数据库** —— 第一步（SQLite + FTS5 迁移）✅ 已完成（2026-09-17）；**剩余 ② 记忆注入（冻结快照式）+ ③ 每轮后台复盘 fork**
 5. **8.4 多任务并行** —— 依赖子代理框架 + 前端分栏，最后做
+
+> **§8 以外仍未完成的相关项**（不在本节排序内，列此防遗忘）：§2.1 的**写文件前安全扫描**（`core/security/scanContent()`）、§2.2 的 MCP 远程传输 / Skills fork·remote / 权限 hooks / 自动权限分类器 / 多模态输入、§3 的 `system/task_started`·`task_progress`、§1.1 的 `ListMcpResourcesTool`·`ReadMcpResourceTool`。

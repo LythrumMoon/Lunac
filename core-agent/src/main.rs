@@ -140,6 +140,65 @@ const TRIMMED_MARKER: &str =
 const TASK_SNAPSHOT_HEADER: &str =
     "[current task list — pinned so it survives context compaction; keep working on these]";
 
+// ── 摘要式压缩（backlog §8.2）───────────────────────────────────────
+//
+// 与上面「机械压缩」（瘦身 / 丢弃）的关系：机械压缩**不额外调模型**，是默认且唯一
+// 无条件执行的那条路。摘要压缩是它的**可选补强** —— 当丢弃档真的把一大段历史扔了，
+// 与其只留一句 `TRIMMED_MARKER`，不如花**一次** API 调用把它压成摘要留下来。
+//
+// 三条硬约束（backlog §8.2 的「Lunac 硬约束」，不得放宽）：
+//   ① 真实花钱与耗时 ⇒ 只在**丢弃档 / 400 兜底档**触发（0.85 的瘦身档不碰），
+//      且被丢的内容少于 `SUMMARY_MIN_INPUT_CHARS` 时**直接跳过**（不值得为一点点内容付费）；
+//   ② 改写前缀 ⇒ 缓存整段作废 ⇒ 触发频次要尽量低。「宁可压得晚也不要压得勤」：
+//      它只挂在本来就必然会 drain 的那两档上，**不额外制造压缩时机**；
+//   ③ 不引 session 分裂（Lunac 的 `session_id` 恒为 `""`）。
+//
+/// 开关：`0` / `false` / `off` / `no` 关闭。**默认开**（只在丢弃档触发，本身已很稀有）。
+const SUMMARY_COMPACT_ENV: &str = "LUNAC_SUMMARY_COMPACT";
+/// 送进摘要模型的原文上限（字符）。超出时**从最近的往老的取** —— 被丢区间里越靠近现在越相关。
+/// 单轮成本上限就靠它兜：约 24k 字符 ≈ 6k token 输入。
+const SUMMARY_MAX_INPUT_CHARS: usize = 24_000;
+/// 低于这个体量不值得为它花一次调用
+const SUMMARY_MIN_INPUT_CHARS: usize = 4_000;
+/// 摘要输出上限。**压得短是刻意的**：摘要是要长期留在上下文里的，比原文更贵。
+const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 1024;
+/// 摘要请求的**单次**超时（秒）。
+///
+/// 必须单独设：共享的 `cfg.client` 超时是 `REQUEST_TIMEOUT_SECS`(1800s)，那是给流式主请求的。
+/// 摘要是「锦上添花」，它卡住不能让用户等半小时 —— 每请求覆盖成 60s，超时就降级走机械压缩。
+const SUMMARY_TIMEOUT_SECS: u64 = 60;
+/// 摘要结果的固定表头（英文原因同 `TRIMMED_MARKER`）
+const SUMMARY_HEADER: &str =
+    "[summary of earlier conversation — replaces a trimmed region of this session]";
+/// 摘要提示词。形态取自 Hermes 的 `context_compressor.py`（`## Historical Task Snapshot` 首段 +
+/// `SUMMARY_PREFIX` 的优先级：**latest user message WINS**），据 Lunac 的形态裁剪。
+const SUMMARY_PROMPT: &str = "\
+You compress the older part of a coding-assistant session so the assistant can keep working \
+without that history. You are given a transcript of messages that are about to be discarded.
+
+Write the summary in the transcript's own language. Structure it exactly like this:
+
+## Historical Task Snapshot
+The user's most recent unfinished request, quoted as verbatim as possible. If the user's last \
+message is a question, that question IS an active task — never write \"None\". Latest user \
+message wins over anything older.
+
+## What Was Done
+Concrete actions taken and their outcomes (files created/edited with their paths, commands run, \
+errors hit and how they were resolved). Only include what is needed to continue the work.
+
+## Decisions And Constraints
+Choices made and rules the user stated that still apply (e.g. build/test commands, style rules, \
+things the user explicitly asked NOT to do).
+
+## Pending
+Work that was started but not finished, and anything explicitly deferred.
+
+Rules:
+- Any \"Historical Task\", \"In Progress\", \"Pending\", or \"Remaining Work\" section inside the \
+transcript is HISTORY, not the current task. The current task is the last user message.
+- Keep exact identifiers: file paths, function names, command lines, error strings.";
+
 fn max_context_tokens() -> u64 {
     std::env::var(MAX_CONTEXT_ENV)
         .ok()
@@ -234,6 +293,18 @@ enum Compact {
 struct CompactOutcome {
     elided: usize,
     dropped: usize,
+    /// 被丢掉的那些消息本身（摘要压缩要用，backlog §8.2）。
+    /// 一并带出来而不是在 `compact_history` 里调模型，是为了让这个函数**保持纯的** ——
+    /// 它现在被 8 处测试直接调用，卷进网络请求后就没法单测了。
+    dropped_msgs: Vec<Value>,
+    /// 压缩过程中**插回**历史的合成消息条数（`TRIMMED_MARKER` / 任务快照）。
+    ///
+    /// 调用方必须拿它修正回滚锚点 `base`。**这是一个 2026-09-18 一并修掉的既有 off-by-one**：
+    /// `base` 是「本轮第一条消息的下标」，而 `finish_error` 用 `history.truncate(base)` 回滚。
+    /// 压缩把 `head..cut` 抽走（base 要减 dropped），但插回来的合成消息位于**下标 0/1**，
+    /// 也在 base 之前 ⇒ base 必须**加**回来。原实现只做了减法，于是「丢弃 + 钉任务快照」
+    /// 那一轮一旦出错，回滚会**多切掉一条真实历史**（§8.2 又加了摘要插入，会多切两条）。
+    pinned: usize,
 }
 
 /// 压缩历史。`measured_tokens` = 上一轮实测的上下文体积（0 = 未知），
@@ -305,6 +376,8 @@ fn compact_history(
         Compact::Force => true,
     };
     let mut dropped = 0usize;
+    // 被丢掉的消息本体（摘要压缩的输入，见 CompactOutcome::dropped_msgs）
+    let mut dropped_msgs: Vec<Value> = Vec::new();
     // 任务快照（backlog §8.3）：`TodoWrite` 的清单躺在**历史中段**，而它恰恰是「当前在做什么」
     // 的唯一载体 —— drop 一压就没了，模型随后就会跑偏（这正是 §8.3 要解决的问题）。
     // 所以**在 drain 之前**先把最近一条抄下来（源马上就不存在了），压缩完再钉回历史开头。
@@ -331,12 +404,13 @@ fn compact_history(
             if history[head..cut].iter().any(has_todo_write) {
                 pinned_task_snapshot = latest_todo_snapshot(history);
             }
-            history.drain(head..cut);
-            dropped = cut - head;
+            dropped_msgs = history.drain(head..cut).collect();
+            dropped = dropped_msgs.len();
         }
     }
 
     // 历史必须以 user 文本消息开头，否则端点可能拒绝
+    let mut pinned = 0usize;
     let starts_ok = history
         .first()
         .map(|m| {
@@ -348,6 +422,7 @@ fn compact_history(
             0,
             json!({ "role": "user", "content": [{ "type": "text", "text": TRIMMED_MARKER }] }),
         );
+        pinned += 1;
     }
 
     // 把任务快照钉回去：**插在第一条之后**，不抢「开头那条用户提问 = 任务目标」的位置
@@ -361,6 +436,7 @@ fn compact_history(
             1.min(history.len()),
             json!({ "role": "user", "content": [{ "type": "text", "text": snapshot }] }),
         );
+        pinned += 1;
         eprintln!("[agent] 任务快照已钉住：丢弃历史时保住了当前任务清单（backlog §8.3）");
     }
 
@@ -375,7 +451,210 @@ fn compact_history(
             "dropped": dropped,
         }));
     }
-    CompactOutcome { elided, dropped }
+    CompactOutcome {
+        elided,
+        dropped,
+        dropped_msgs,
+        pinned,
+    }
+}
+
+/// 摘要压缩是否启用（backlog §8.2）。默认开，只有显式关才关。
+fn summary_compact_enabled() -> bool {
+    match std::env::var(SUMMARY_COMPACT_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// 把一条历史消息渲染成摘要模型看得懂的纯文本。工具调用只留「做了什么」的骨架
+/// （名字 + 关键入参），工具结果按需截断 —— 摘要是压缩，不是搬运。
+fn render_one_message_for_summary(msg: &Value) -> String {
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or("?");
+    let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => {
+                let t = b.get("text").and_then(Value::as_str).unwrap_or("").trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+            "tool_use" => {
+                let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
+                let input = b
+                    .get("input")
+                    .map(|i| i.to_string())
+                    .unwrap_or_default()
+                    .chars()
+                    .take(RENDER_TOOL_INPUT_CHARS)
+                    .collect::<String>();
+                parts.push(format!("[tool_use {name}] {input}"));
+            }
+            "tool_result" => {
+                let t = b
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .chars()
+                    .take(RENDER_TOOL_RESULT_CHARS)
+                    .collect::<String>();
+                if !t.is_empty() {
+                    parts.push(format!("[tool_result] {t}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{role}: {}", parts.join("\n"))
+}
+
+/// 送进摘要模型的单条工具入参 / 结果上限（字符）
+const RENDER_TOOL_INPUT_CHARS: usize = 400;
+const RENDER_TOOL_RESULT_CHARS: usize = 600;
+
+/// 把将被丢弃的消息渲染成摘要输入，**总量封顶在 `SUMMARY_MAX_INPUT_CHARS`**。
+///
+/// 从**最近的往老的**取：被丢区间里越靠近现在的内容越相关，预算不够时优先保它；
+/// 最后再翻转回时间顺序（模型读起来才是顺的）。
+fn render_dropped_for_summary(dropped: &[Value]) -> String {
+    let mut chosen: Vec<String> = Vec::new();
+    let mut budget = SUMMARY_MAX_INPUT_CHARS;
+    for msg in dropped.iter().rev() {
+        let line = render_one_message_for_summary(msg);
+        let n = line.chars().count();
+        if line.is_empty() {
+            continue;
+        }
+        if n > budget {
+            // 单条就超预算：不再往前找（再老的更不重要），保留已选的即可
+            break;
+        }
+        budget -= n;
+        chosen.push(line);
+    }
+    chosen.reverse();
+    chosen.join("\n\n")
+}
+
+/// 调模型把被丢弃的历史压成摘要（backlog §8.2）。
+///
+/// **失败一律返回 `None`，绝不把错误往上抛** —— 摘要压缩是「锦上添花」，它失败时必须
+/// 让调用方照旧走纯机械压缩，而不是让整轮对话挂掉（对照规则 25 的瞬时失败处理思路）。
+fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
+    let transcript = render_dropped_for_summary(dropped);
+    // 不值得为一点点内容花一次调用
+    if transcript.chars().count() < SUMMARY_MIN_INPUT_CHARS {
+        eprintln!(
+            "[agent] 跳过摘要压缩：被丢内容仅 {} 字 < 阈值 {SUMMARY_MIN_INPUT_CHARS} 字",
+            transcript.chars().count()
+        );
+        return None;
+    }
+    let body = json!({
+        "model": cfg.model,
+        "max_tokens": SUMMARY_MAX_OUTPUT_TOKENS,
+        // **非流式**：摘要是内部产物，不必往前端流 —— 也不该占用 stream_event 通道
+        "stream": false,
+        "system": SUMMARY_PROMPT,
+        "messages": [{ "role": "user", "content": [{ "type": "text", "text": transcript }] }],
+    });
+    let started = Instant::now();
+    let resp = cfg
+        .client
+        .post(&cfg.endpoint)
+        // 单请求覆盖超时：共享客户端是 1800s（给流式主请求），摘要不能占用那么久
+        .timeout(Duration::from_secs(SUMMARY_TIMEOUT_SECS))
+        .header("authorization", format!("Bearer {}", cfg.token))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn(format!("摘要压缩失败（网络层）：{e}"));
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail: String = resp
+            .text()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        log::warn(format!("摘要压缩失败：HTTP {status} {detail}"));
+        return None;
+    }
+    let v: Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn(format!("摘要压缩失败（响应不是 JSON）：{e}"));
+            return None;
+        }
+    };
+    let text = v
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        log::warn("摘要压缩失败：模型返回空摘要");
+        return None;
+    }
+    let out_tokens = v
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    log::info(format!(
+        "摘要压缩：{} 条旧消息 / {} 字 → 摘要 {} 字（输出 {out_tokens} tokens，耗时 {}ms）",
+        dropped.len(),
+        transcript.chars().count(),
+        text.chars().count(),
+        started.elapsed().as_millis()
+    ));
+    Some(format!("{SUMMARY_HEADER}\n{text}"))
+}
+
+/// 摘要压缩的落点：把摘要钉回历史开头（`compact_history` 之后调用）。
+///
+/// 与任务快照同一个位置策略 —— **插在第一条之后**，不抢「开头那条用户提问 = 任务目标」。
+/// 两者同时存在时的顺序是 [摘要][任务快照]：摘要是「过去发生了什么」，任务快照是「现在要做什么」，
+/// 读起来正好由远及近。
+fn pin_summary_of_dropped(cfg: &Cfg, history: &mut Vec<Value>, dropped: &[Value]) -> bool {
+    if !summary_compact_enabled() || dropped.is_empty() {
+        return false;
+    }
+    let Some(summary) = summarize_dropped(cfg, dropped) else {
+        return false;
+    };
+    history.insert(
+        1.min(history.len()),
+        json!({ "role": "user", "content": [{ "type": "text", "text": summary }] }),
+    );
+    true
 }
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
@@ -1365,12 +1644,18 @@ fn run_query(
                 measured > cfg.last_compact.get() + (budget as f64 * COMPACT_MIN_GROWTH) as u64;
             if ratio > DROP_RATIO {
                 let out = compact_history(history, Compact::Drop, measured);
-                base = base.saturating_sub(out.dropped);
+                base = base.saturating_sub(out.dropped) + out.pinned;
+                // 摘要压缩（backlog §8.2）：丢弃档是它**唯一**的常规触发点 ——
+                // 这一档本来就必然会 drain 并废掉缓存，多留一段摘要是净赚。
+                // 它又插了一条合成消息 ⇒ 回滚锚点再 +1（见 CompactOutcome::pinned）。
+                if pin_summary_of_dropped(cfg, history, &out.dropped_msgs) {
+                    base += 1;
+                }
                 cfg.last_input.set(0);
                 cfg.last_compact.set(measured);
             } else if ratio > ELIDE_RATIO && grew_enough {
                 let out = compact_history(history, Compact::Elide, measured);
-                base = base.saturating_sub(out.dropped);
+                base = base.saturating_sub(out.dropped) + out.pinned;
                 cfg.last_input.set(0);
                 // 闸门判定「不值得」时什么都没改 —— 那时**不推进滞回时钟**，
                 // 否则会白等一个 15% 增长窗口才重新评估（压缩次数统计也不会被污染）。
@@ -1486,7 +1771,11 @@ fn run_query(
             if status == 400 && !compacted_for_retry && context_related_error(&detail) {
                 compacted_for_retry = true;
                 let out = compact_history(history, Compact::Force, cfg.last_input.get());
-                base = base.saturating_sub(out.dropped);
+                base = base.saturating_sub(out.dropped) + out.pinned;
+                // 兜底档也做摘要 —— 这一档丢弃量最大（连尾部都瘦），摘要在此时最值钱
+                if pin_summary_of_dropped(cfg, history, &out.dropped_msgs) {
+                    base += 1;
+                }
                 cfg.last_compact.set(cfg.last_input.get());
                 cfg.last_input.set(0);
                 eprintln!("[agent] 端点回报上下文超限 → 压缩 {} 条后重试", out.dropped);
@@ -2143,6 +2432,369 @@ mod tests {
             }]})])
             .is_none(),
             "空清单不该产出快照"
+        );
+    }
+
+    // ── 摘要式压缩（backlog §8.2）─────────────────────────────────────
+
+    /// 测试用的 `Cfg`。端点指向一个必然连不上的本机端口 —— 只用于「**不该发请求**」的断言：
+    /// 万一哪天守卫被改坏、请求真发出去了，用例会因连接失败而变红，而不是悄悄通过。
+    fn cfg_for_tests() -> Cfg {
+        cfg_pointing_at("http://127.0.0.1:1/v1/messages")
+    }
+
+    fn cfg_pointing_at(endpoint: &str) -> Cfg {
+        Cfg {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("build test client"),
+            endpoint: endpoint.to_string(),
+            token: "test".to_string(),
+            model: "test-model".to_string(),
+            thinking: Cell::new(Thinking::Disabled),
+            last_input: Cell::new(0),
+            last_compact: Cell::new(0),
+        }
+    }
+
+    /// 起一个**只服务一次请求**的本地 HTTP stub，返回 (端点 URL, 收到的请求体)。
+    ///
+    /// 为什么值得写：摘要压缩唯一真正没被单测覆盖的东西就是**它发出去的 HTTP 形状**
+    /// —— 非流式、不带 tools、system 是提示词、messages 是单条 user。真打端点要花钱且不确定，
+    /// 而用一个 stub 就能把这些**逐字节断言**下来，且进常规 `cargo test`（零成本、不联网）。
+    fn start_stub_server(response_body: String) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(sock.try_clone().expect("clone sock"));
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let t = line.trim_end().to_string();
+                if t.is_empty() {
+                    break;
+                }
+                let lower = t.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            use std::io::Read as _;
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send(String::from_utf8_lossy(&body).to_string());
+
+            use std::io::Write as _;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+        });
+        (format!("http://{addr}/v1/messages"), rx)
+    }
+
+    /// 摘要压缩的**请求形状 + 响应解析**（零成本、不联网）。
+    ///
+    /// 覆盖：`stream:false` / `max_tokens` / `system` 是提示词 / **不带 tools** / messages 是
+    /// 单条 user 且内容是渲染后的原文；以及响应侧 `content[].text` 抽取 + `SUMMARY_HEADER` 前缀。
+    #[test]
+    fn summary_request_shape_and_response_parsing() {
+        let canned = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "## Historical Task Snapshot\n继续验证 §8.2"}
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 42}
+        })
+        .to_string();
+        let (endpoint, rx) = start_stub_server(canned);
+        let cfg = cfg_pointing_at(&endpoint);
+
+        // 造一段够长的被丢历史（必须过 SUMMARY_MIN_INPUT_CHARS）
+        let dropped: Vec<Value> = (0..6)
+            .map(|i| {
+                json!({"role":"assistant","content":[{
+                    "type":"text","text":format!("m{i}:{}", "x".repeat(1_000))
+                }]})
+            })
+            .collect();
+
+        let out = summarize_dropped(&cfg, &dropped).expect("stub 返回正常时应当拿到摘要");
+        assert!(out.starts_with(SUMMARY_HEADER), "摘要必须带固定表头：{out}");
+        assert!(
+            out.contains("继续验证 §8.2"),
+            "必须用响应的 content[].text：{out}"
+        );
+
+        let sent: Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).expect("应当收到请求"))
+                .expect("请求体是 JSON");
+        assert_eq!(sent["stream"], json!(false), "摘要请求必须是非流式");
+        assert_eq!(sent["max_tokens"], json!(SUMMARY_MAX_OUTPUT_TOKENS));
+        assert_eq!(
+            sent["system"].as_str(),
+            Some(SUMMARY_PROMPT),
+            "system 必须是摘要提示词"
+        );
+        assert!(sent.get("tools").is_none(), "摘要请求不该带 tools");
+        assert_eq!(sent["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(sent["messages"][0]["role"].as_str(), Some("user"));
+        let text = sent["messages"][0]["content"][0]["text"]
+            .as_str()
+            .expect("渲染后的原文要放在 text 块里");
+        for kept in ["m5:", "m4:", "m3:"] {
+            assert!(text.contains(kept), "送进去的应当是被丢的原文（含 {kept}）");
+        }
+    }
+
+    /// 端点返回非 2xx / 非 JSON / 空摘要时，一律降级为 `None`（不能让整轮对话失败）。
+    #[test]
+    fn summary_failures_degrade_instead_of_erroring() {
+        // 非 JSON 的 200
+        let (endpoint, _rx) = start_stub_server("not json at all".to_string());
+        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped()).is_none());
+
+        // 200 但 content 为空
+        let (endpoint, _rx) = start_stub_server(
+            json!({"content": [], "usage": {"output_tokens": 0}}).to_string(),
+        );
+        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped()).is_none());
+
+        // 200 但文本全空白
+        let (endpoint, _rx) = start_stub_server(
+            json!({"content": [{"type": "text", "text": "   \n  "}]}).to_string(),
+        );
+        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped()).is_none());
+
+        // 连不上（端口 1）
+        assert!(summarize_dropped(&cfg_for_tests(), &long_dropped()).is_none());
+    }
+
+    fn long_dropped() -> Vec<Value> {
+        (0..6)
+            .map(|i| {
+                json!({"role":"assistant","content":[{
+                    "type":"text","text":format!("m{i}:{}", "x".repeat(1_000))
+                }]})
+            })
+            .collect()
+    }
+
+    /// **真打端点**验「非流式摘要请求被接受」+ 摘要内容符合模板（需要外网 + 真实凭据）。
+    ///
+    /// 为什么 stub 用例不够：stub 只能证明**我们发出去的形状自洽**，证明不了**真端点接受它**
+    /// —— 例如端点是否允许 `stream:false`、是否强制要求 `tools`、是否只认 SSE、`system` 是否被接受。
+    /// 这是摘要压缩唯一必须靠真实端点才能验的部分。
+    ///
+    /// 跑法（沿用 `fallback_scrapers` 的范式：唯一依赖真实凭据的摘要用例，故意不进常规 `cargo test`）：
+    ///
+    /// ```text
+    /// $env:LUNAC_AGENT_BASE_URL="https://api.deepseek.com"
+    /// $env:LUNAC_AGENT_TOKEN="sk-..."
+    /// $env:LUNAC_AGENT_MODEL="deepseek-flash"
+    /// cd core-agent; cargo test summary_compaction_against_the_real_endpoint -- --ignored --nocapture
+    /// ```
+    ///
+    /// 注意：`## Historical Task Snapshot` 里那句 sentinel 是**模型逐字引用**的检查项。
+    /// 它偶尔会因模型改写而失败 —— 那是**模型行为**，不是代码 bug；此时改为人工看 `--nocapture` 的打印。
+    #[test]
+    #[ignore = "需要外网 + 真实凭据：直打 /v1/messages 验非流式摘要请求"]
+    fn summary_compaction_against_the_real_endpoint() {
+        let cfg = match Cfg::from_env() {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[summary-live] 跳过：{e}（需要 LUNAC_AGENT_BASE_URL / TOKEN / MODEL）");
+                return;
+            }
+        };
+
+        // 拟真的一段待丢历史：早先的任务描述 + 一次工具调用 + 若干轮往返 + **最后一条用户输入**
+        let sentinel = "LUNAC-SENTINEL-8421";
+        let mut dropped = vec![
+            json!({"role":"user","content":[{"type":"text","text":
+                "帮我把渲染层架构决策写进 docs 里，并把优先级调到最高。"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":
+                "好，我先读一遍现有规范再动笔。"}]}),
+            json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"t1","name":"Read",
+                "input":{"file_path":"d:/cc/claude-code-cli-master/docs/ai-spec.md"}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1",
+                "content":"（此处是 20000 字规范正文，演示用省略）"}]}),
+        ];
+        for i in 0..12 {
+            dropped.push(json!({"role":"assistant","content":[{"type":"text","text":
+                format!("第 {i} 步：核对 §{} 的表述，确认与既定决策一致。{}", i, "内容".repeat(60))}]}));
+        }
+        dropped.push(json!({"role":"user","content":[{"type":"text","text":format!(
+            "先停下。现在改成去验证摘要压缩，记住这个标记 {sentinel}，别丢。"
+        )}]}));
+
+        let transcript_len: usize = dropped
+            .iter()
+            .map(|m| render_one_message_for_summary(m).chars().count())
+            .sum();
+        assert!(
+            transcript_len >= SUMMARY_MIN_INPUT_CHARS,
+            "用例自身的输入太短（{transcript_len} 字），改长一点才有意义"
+        );
+
+        let summary = summarize_dropped(&cfg, &dropped).expect("真端点应当接受非流式摘要请求");
+        println!(
+            "[summary-live] 原文 {transcript_len} 字 → 摘要 {} 字：\n{summary}",
+            summary.chars().count()
+        );
+
+        assert!(summary.starts_with(SUMMARY_HEADER), "必须带固定表头：{summary}");
+        assert!(
+            summary.contains("## Historical Task Snapshot"),
+            "提示词要求首段固定为该标题：{summary}"
+        );
+        assert!(summary.chars().count() > 80, "摘要不该是空壳：{summary}");
+        assert!(
+            summary.contains(sentinel),
+            "「latest user message WINS」要求逐字留住最后一条用户输入，但摘要里没有 {sentinel}：{summary}"
+        );
+    }
+
+    /// 被丢弃的消息必须**原样带出来** —— 摘要压缩的输入就是它。
+    #[test]
+    fn dropped_messages_are_handed_to_the_caller_for_summarising() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"帮我改脚本"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"好"}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL * 2 {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("m{i}")}]}));
+        }
+        let out = compact_history(&mut history, Compact::Force, 0);
+        assert!(out.dropped > 0, "Force 档必须真的丢了消息");
+        assert_eq!(
+            out.dropped_msgs.len(),
+            out.dropped,
+            "带出来的消息条数必须与 dropped 一致"
+        );
+        assert!(
+            out.dropped_msgs
+                .iter()
+                .any(|m| m["content"][0]["text"].as_str() == Some("好")),
+            "带出来的应当是**被丢掉的那段**（含那条 assistant 消息）"
+        );
+    }
+
+    /// 纯机械压缩返回 `pinned = 0`；钉了任务快照才为 1。
+    ///
+    /// 这个计数是回滚锚点 `base` 的修正项 —— 漏掉它，`finish_error` 的
+    /// `history.truncate(base)` 会多切掉一条真实历史。
+    #[test]
+    fn pinned_counts_the_synthetic_messages_inserted() {
+        // 不带 TodoWrite：不应插入任何合成消息
+        let mut plain = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
+        for i in 0..COMPACT_KEEP_TAIL * 2 {
+            plain.push(json!({"role":"assistant","content":[{"type":"text","text":format!("m{i}")}]}));
+        }
+        let out = compact_history(&mut plain, Compact::Force, 0);
+        assert_eq!(out.pinned, 0, "没插合成消息时 pinned 必须是 0");
+
+        // 带 TodoWrite：会钉回一条快照 ⇒ pinned == 1
+        let mut with_todo = vec![
+            json!({"role":"user","content":[{"type":"text","text":"帮我改脚本"}]}),
+            json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"t1","name":"TodoWrite",
+                "input":{"todos":[{"content":"a","status":"pending","activeForm":"a"}]}
+            }]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL * 2 {
+            with_todo.push(json!({"role":"assistant","content":[{"type":"text","text":format!("m{i}")}]}));
+        }
+        let out = compact_history(&mut with_todo, Compact::Force, 0);
+        assert!(out.dropped > 0);
+        assert_eq!(out.pinned, 1, "钉了任务快照 ⇒ pinned 必须是 1");
+    }
+
+    /// 渲染进摘要的原文：**保留最近的内容**、按时间顺序、总量封顶。
+    #[test]
+    fn summary_input_keeps_the_newest_and_stays_under_the_cap() {
+        let dropped: Vec<Value> = (0..10)
+            .map(|i| {
+                json!({"role":"assistant","content":[{
+                    "type":"text","text":format!("m{i}:{}", "x".repeat(5_000))
+                }]})
+            })
+            .collect();
+        let rendered = render_dropped_for_summary(&dropped);
+
+        assert!(
+            rendered.chars().count() <= SUMMARY_MAX_INPUT_CHARS,
+            "必须封顶在 {SUMMARY_MAX_INPUT_CHARS} 字以内，实际 {}",
+            rendered.chars().count()
+        );
+        // 只剩 4 条放得下（4×~5005 = 20020），应当是被丢段里**最新的**那 4 条
+        for kept in ["m9:", "m8:", "m7:", "m6:"] {
+            assert!(rendered.contains(kept), "应当保留 {kept}");
+        }
+        assert!(!rendered.contains("m5:"), "超预算时应当丢掉更老的，不该包含 m5");
+
+        // 时间顺序：老的在前
+        let pos = |s: &str| rendered.find(s).unwrap();
+        assert!(pos("m6:") < pos("m7:") && pos("m7:") < pos("m8:") && pos("m8:") < pos("m9:"));
+    }
+
+    /// 工具调用在摘要输入里只留骨架（名字 + 截断的入参），空消息直接跳过。
+    #[test]
+    fn summary_input_skeletonises_tools_and_skips_empty_messages() {
+        let long = "y".repeat(5_000);
+        let msg = json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"t1","name":"Bash","input":{"command": long}},
+            {"type":"tool_result","tool_use_id":"t1","content": long},
+        ]});
+        let rendered = render_one_message_for_summary(&msg);
+        assert!(rendered.starts_with("assistant: [tool_use Bash]"), "{rendered}");
+        assert!(rendered.contains("[tool_result]"));
+        assert!(
+            rendered.chars().count()
+                < RENDER_TOOL_INPUT_CHARS + RENDER_TOOL_RESULT_CHARS + 60,
+            "工具入参 / 结果都必须截断，实际 {} 字",
+            rendered.chars().count()
+        );
+
+        assert_eq!(render_one_message_for_summary(&json!({"role":"user","content":[]})), "");
+        assert_eq!(render_one_message_for_summary(&json!({"role":"user"})), "");
+    }
+
+    /// 没有可丢的内容时，摘要压缩**一条网络请求都不该发**。
+    #[test]
+    fn nothing_is_summarised_when_nothing_was_dropped() {
+        let cfg = cfg_for_tests();
+        let mut history = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
+        assert!(
+            !pin_summary_of_dropped(&cfg, &mut history, &[]),
+            "dropped 为空必须直接返回 false（不发请求）"
+        );
+        assert_eq!(history.len(), 1, "不该改动历史");
+    }
+
+    /// 内容太短时跳过 —— 不值得为一点点东西花一次调用（单轮成本上限的一道闸）。
+    #[test]
+    fn tiny_dropped_regions_are_not_summarised() {
+        let cfg = cfg_for_tests();
+        let small = vec![json!({"role":"assistant","content":[{"type":"text","text":"很短"}]})];
+        assert!(
+            summarize_dropped(&cfg, &small).is_none(),
+            "低于 SUMMARY_MIN_INPUT_CHARS 时不该调模型"
         );
     }
 
