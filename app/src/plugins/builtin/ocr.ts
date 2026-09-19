@@ -6,8 +6,10 @@
 // 界面：进入 OCR 插件自动 detach 为独立窗口
 //   ┌────────────────────┬──────────────────────┐
 //   │  图片预览（左半）   │  文字编辑区（右半）    │
-//   │  [+ 添加图片]      │  [📋 复制结果]        │
+//   │  [识别剪贴板]      │  [复制结果]           │
 //   └────────────────────┴──────────────────────┘
+// 按钮/状态行/占位提示**一律纯文字，不带 emoji 图标**（2026-09-19 批 8，
+// 用户明确要求；判据与例外见 docs/icon-style.md §4）。
 //
 // 工作流程：
 //   文件路径 → invoke("run_paddle_ocr") → PaddleOCR-json 子进程 → JSON → 文本
@@ -55,7 +57,7 @@ export function installOcrEngine(
 /** 引擎缺失时在状态行内联「下载并安装」按钮。 */
 function renderEngineInstallPrompt(statusEl: HTMLElement | null) {
   if (!statusEl) return;
-  statusEl.innerHTML = `\u26A0\uFE0F ${t("ocr.engine_missing")} `;
+  statusEl.innerHTML = `${t("ocr.engine_missing")} `;
   const btn = document.createElement("button");
   btn.className = "ocr-action-btn ocr-primary-btn";
   btn.style.marginLeft = "6px";
@@ -69,8 +71,8 @@ function renderEngineInstallPrompt(statusEl: HTMLElement | null) {
         : t("ocr.engine_downloading_unknown").replace("{mb}", mb.toFixed(1));
     });
     statusEl.textContent = ok
-      ? `\u2705 ${t("ocr.engine_ready")}`
-      : `\u274C ${t("ocr.engine_failed")}`;
+      ? `${t("ocr.engine_ready")}`
+      : `${t("ocr.engine_failed")}`;
   });
   statusEl.appendChild(btn);
 }
@@ -183,14 +185,14 @@ function buildDetachedPanelHtml(): string {
       <!-- 左半：图片预览 -->
       <div class="ocr-image-panel">
         <div id="ocr-image-preview" class="ocr-image-preview">
-          <span class="ocr-image-placeholder">\uD83D\uDDBC\uFE0F ${t("ocr.no_image")}</span>
+          <span class="ocr-image-placeholder">${t("ocr.no_image")}</span>
         </div>
         <div class="ocr-image-actions">
           <button id="ocr-clipboard-btn" class="ocr-action-btn ocr-primary-btn">
-            \uD83D\uDCCB ${t("ocr.clipboard_btn")}
+            ${t("ocr.clipboard_btn")}
           </button>
           <button id="ocr-file-btn" class="ocr-action-btn">
-            \uD83D\uDCC1 ${t("ocr.file_btn")}
+            ${t("ocr.file_btn")}
           </button>
         </div>
       </div>
@@ -200,7 +202,7 @@ function buildDetachedPanelHtml(): string {
         <div id="ocr-status-line" class="ocr-status-line">
           ${t("ocr.default_status")}
         </div>
-        <button id="ocr-copy-btn" class="ocr-copy-btn">\uD83D\uDCCB ${t("ocr.copy_btn")}</button>
+        <button id="ocr-copy-btn" class="ocr-copy-btn">${t("ocr.copy_btn")}</button>
         <textarea
           id="ocr-result" class="ocr-textarea"
           spellcheck="false"
@@ -217,10 +219,10 @@ export async function autoStartClipboardOcr() {
   const resultEl = document.getElementById("ocr-result") as HTMLTextAreaElement | null;
   const previewEl = document.getElementById("ocr-image-preview");
 
-  if (statusEl) statusEl.textContent = "\u23F3 " + t("ocr.reading");
+  if (statusEl) statusEl.textContent = t("ocr.reading");
   const img = await getClipboardImage();
   if (!img) {
-    if (statusEl) statusEl.textContent = "\u26A0\uFE0F " + t("ocr.no_clipboard");
+    if (statusEl) statusEl.textContent = t("ocr.no_clipboard");
     return;
   }
 
@@ -237,17 +239,17 @@ export async function autoStartClipboardOcr() {
   }
 
   if (!(await ensureEngineReady(statusEl))) return;
-  if (statusEl) statusEl.textContent = "\u23F3 " + t("ocr.recognizing");
+  if (statusEl) statusEl.textContent = t("ocr.recognizing");
   try {
     const result = await ocrFromDataUrl(img);
-    if (statusEl) statusEl.textContent = "\u2705 " + t("ocr.done");
+    if (statusEl) statusEl.textContent = t("ocr.done");
     if (resultEl) {
       resultEl.value = result.text || t("ocr.no_text");
       resultEl.style.height = "auto";
       resultEl.style.height = Math.max(resultEl.scrollHeight, 120) + "px";
     }
   } catch (e) {
-    if (statusEl) statusEl.textContent = `\u274C ${t("ocr.failed")}${e}`;
+    if (statusEl) statusEl.textContent = `${t("ocr.failed")}${e}`;
   }
 }
 
@@ -256,7 +258,7 @@ export async function ocrImageFile(imagePath: string) {
   const resultEl = document.getElementById("ocr-result") as HTMLTextAreaElement | null;
   const previewEl = document.getElementById("ocr-image-preview");
 
-  if (statusEl) statusEl.textContent = "\u23F3 " + t("ocr.loading_image");
+  if (statusEl) statusEl.textContent = t("ocr.loading_image");
 
   if (!(await ensureEngineReady(statusEl))) return;
 
@@ -264,23 +266,23 @@ export async function ocrImageFile(imagePath: string) {
   if (previewEl) {
     try {
       const dataUrl = await fileToDataUrl(imagePath);
-      previewEl.innerHTML = `<img src="${dataUrl}" class="ocr-preview-img" alt="OCR image" onerror="this.parentElement!.innerHTML='<span class=\\'ocr-image-placeholder\\'>\\u26A0\\uFE0F ${t("ocr.load_failed").replace("'", "\\'")}</span>'" />`;
+      previewEl.innerHTML = `<img src="${dataUrl}" class="ocr-preview-img" alt="OCR image" onerror="this.parentElement!.innerHTML='<span class=\\'ocr-image-placeholder\\'>${t("ocr.load_failed").replace("'", "\\'")}</span>'" />`;
     } catch {
-      previewEl.innerHTML = `<img src="${convertFileSrc(imagePath)}" class="ocr-preview-img" alt="OCR image" onerror="this.parentElement!.innerHTML='<span class=\\'ocr-image-placeholder\\'>\\uD83D\\uDDBC\\uFE0F ${imagePath.split("\\").pop()}</span>'" />`;
+      previewEl.innerHTML = `<img src="${convertFileSrc(imagePath)}" class="ocr-preview-img" alt="OCR image" onerror="this.parentElement!.innerHTML='<span class=\\'ocr-image-placeholder\\'>${imagePath.split("\\").pop()}</span>'" />`;
     }
   }
 
-  if (statusEl) statusEl.textContent = "\u23F3 " + t("ocr.recognizing");
+  if (statusEl) statusEl.textContent = t("ocr.recognizing");
   try {
     const result = await ocrFromFile(imagePath);
-    if (statusEl) statusEl.textContent = "\u2705 " + t("ocr.done");
+    if (statusEl) statusEl.textContent = t("ocr.done");
     if (resultEl) {
       resultEl.value = result.text || t("ocr.no_text");
       resultEl.style.height = "auto";
       resultEl.style.height = Math.max(resultEl.scrollHeight, 120) + "px";
     }
   } catch (e) {
-    if (statusEl) statusEl.textContent = `\u274C ${t("ocr.failed")}${e}`;
+    if (statusEl) statusEl.textContent = `${t("ocr.failed")}${e}`;
   }
 }
 
@@ -292,11 +294,11 @@ export function attachOcrListeners(doc: Document) {
     const s = doc.getElementById("ocr-status-line");
     const r = doc.getElementById("ocr-result") as HTMLTextAreaElement | null;
     const previewEl = doc.getElementById("ocr-image-preview");
-    if (s) s.textContent = "\u23F3 " + t("ocr.reading");
+    if (s) s.textContent = t("ocr.reading");
     if (r) r.value = "";
     const img = await getClipboardImage();
     if (!img) {
-      if (s) s.textContent = "\u26A0\uFE0F " + t("ocr.no_clipboard");
+      if (s) s.textContent = t("ocr.no_clipboard");
       return;
     }
     // Handle file path marker (CF_HDROP from Explorer)
@@ -308,16 +310,16 @@ export function attachOcrListeners(doc: Document) {
       previewEl.innerHTML = `<img src="${img}" class="ocr-preview-img" alt="Clipboard image" />`;
     }
     if (!(await ensureEngineReady(s))) return;
-    if (s) s.textContent = "\u23F3 " + t("ocr.recognizing");
+    if (s) s.textContent = t("ocr.recognizing");
     try {
       const result = await ocrFromDataUrl(img);
-      if (s) s.textContent = "\u2705 " + t("ocr.done");
+      if (s) s.textContent = t("ocr.done");
       if (r) {
         r.value = result.text || t("ocr.no_text");
         r.style.height = "auto";
         r.style.height = Math.max(r.scrollHeight, 120) + "px";
       }
-    } catch (e) { if (s) s.textContent = `\u274C ${t("ocr.failed")}${e}`; }
+    } catch (e) { if (s) s.textContent = `${t("ocr.failed")}${e}`; }
   });
 
   // "选择文件" button
@@ -330,7 +332,7 @@ export function attachOcrListeners(doc: Document) {
       const r = doc.getElementById("ocr-result") as HTMLTextAreaElement | null;
       const previewEl = doc.getElementById("ocr-image-preview");
       if (!(await ensureEngineReady(s))) return;
-      if (s) s.textContent = "\u23F3 " + t("ocr.recognizing");
+      if (s) s.textContent = t("ocr.recognizing");
       if (r) r.value = "";
       try {
         const dataUrl = await blobToDataUrl(file);
@@ -338,13 +340,13 @@ export function attachOcrListeners(doc: Document) {
           previewEl.innerHTML = `<img src="${dataUrl}" class="ocr-preview-img" alt="Selected image" />`;
         }
         const result = await ocrFromDataUrl(dataUrl);
-        if (s) s.textContent = "\u2705 " + t("ocr.done");
+        if (s) s.textContent = t("ocr.done");
         if (r) {
           r.value = result.text || t("ocr.no_text");
           r.style.height = "auto";
           r.style.height = Math.max(r.scrollHeight, 120) + "px";
         }
-      } catch (e) { if (s) s.textContent = `\u274C ${t("ocr.failed")}${e}`; }
+      } catch (e) { if (s) s.textContent = `${t("ocr.failed")}${e}`; }
     };
     document.body.appendChild(input); input.click();
   });
@@ -356,10 +358,10 @@ export function attachOcrListeners(doc: Document) {
     navigator.clipboard.writeText(text).then(() => {
       const btn = doc.getElementById("ocr-copy-btn");
       if (btn) {
-        btn.textContent = "\u2705 " + t("ocr.copied");
+        btn.textContent = t("ocr.copied");
         btn.classList.add("ocr-copied");
         setTimeout(() => {
-          btn.textContent = "\uD83D\uDCCB " + t("ocr.copy_btn");
+          btn.textContent = t("ocr.copy_btn");
           btn.classList.remove("ocr-copied");
         }, 1500);
       }

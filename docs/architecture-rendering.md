@@ -223,7 +223,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\lunac-ab.ps1"
 | R3 | R1 + `--in-process-gpu` | **已判定不采用**（§4.3）；保留用于将来复测 |
 | R4 | R1 + `--js-flags=…` | **已纳入生产**（§4.5） |
 
-**仍未复核的一点（低优先）**：`disable-feat` 字段里**两个 `--disable-features` 是否逗号合并**
+**仍未复核的一点（低优先 → backlog M1-3）**：`disable-feat` 字段里**两个 `--disable-features` 是否逗号合并**
 （WebView2 自带的 `msWebOOUI,msPdfOOUI,msSmartScreenProtection` 与我们的 `PermissionPrompt,ClipboardContentRead`
 应同时在场）。§4.2 的代码注释按「Chromium 逗号合并重复 switch」写的；**若实测发现我们的串挤掉了 WebView2 自带的那份**，
 合并策略要改成「并入同一个 switch 的值」。ai-spec 规则 38 已登记该待验证项。
@@ -244,7 +244,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\lunac-ab.ps1"
 
 ## 8. 与现有规范的关系
 
-- **优先级**：本文**高于** [agent-feature-backlog.md](./agent-feature-backlog.md) §8 的五项新目标（用户 2026-09-17 明确「优先级调到最高」）。
+- **优先级**：本文**高于** [agent-feature-backlog.md](./agent-feature-backlog.md) §3「Lunac 自身新目标」（用户 2026-09-17 明确「优先级调到最高」）。
 - **本决策的结论是「不改渲染层」** ⇒ 它**不产生新的实现待办**，只产生两条纪律：
   1. 环境变量注入**一律用合并语义**，不得再用「没有才设」（§4.2，已固化进 ai-spec §11 规则 38）；
   2. 任何「换渲染层」的提案都要先回答 §3 的对比表 —— 尤其是「收益是否只有 50 MB」。
@@ -261,4 +261,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\lunac-ab.ps1"
 | 2 | `HKCU` 的 `--remote-debugging-port=9222` 保留还是清掉？ | **长期保留**（合并语义原样保留它；已知「每次启动开本地调试端口」的代价） |
 | 3 | `--js-flags=--scavenger_max_new_space_capacity_mb=8` 是否纳入？ | **纳入**（官方旗标、风险低；代价是小 GC 更频繁） |
 
-**唯一遗留的验证项**（不阻塞）：§6 末尾那条 ——「两个 `--disable-features` 是否逗号合并」。
+**唯一遗留的验证项**（不阻塞）：§6 末尾那条 ——「两个 `--disable-features` 是否逗号合并」。已登记为 [agent-feature-backlog.md](./agent-feature-backlog.md) **M1-3**，**本文不另开待办**（全文其余部分均无待确认项）。

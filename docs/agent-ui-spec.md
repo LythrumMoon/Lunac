@@ -1,7 +1,8 @@
 # Lunac AI 对话界面规范（参照 Trae 侧栏）
 
 > 定位：本文是 **AI 对话区（agent 面板）内部** 的界面与交互规范，供「参照 Trae AI 侧栏改造 Lunac 对话界面」使用。
-> 状态：**已批准并实施（2026-09）**。阶段 1（思考省略 / 命令卡片 / 系统提示块 / 回合折叠）与阶段 2（运行方式三档 + 安全档位入口 + 越界卡片三动作）已落地，对应约束已回写 [ai-spec.md](./ai-spec.md) §3.5、§3.7B、§11 规则 21。阶段 3（diff 卡 / Fork / 真沙箱）仍未做。
+> 状态：**已批准并实施（2026-09）**。阶段 1（思考省略 / 命令卡片 / 系统提示块 / 回合折叠）与阶段 2（运行方式三档 + 安全档位入口 + 越界卡片三动作）**已全部落地**，对应约束已回写 [ai-spec.md](./ai-spec.md) §3.5、§3.7B、§11 规则 21。
+> **待办不在这里**：阶段 3（diff 卡 / 多轮导航·Fork / 真沙箱调研）已挪进 **[agent-feature-backlog.md](./agent-feature-backlog.md)** §2（U1 / U2 / U3）—— 本文只维护**规范**，不再维护实施清单。
 > 关联规范：[icon-style.md](./icon-style.md)（图标）、[code-rules.md](./code-rules.md)（前端硬规则）、[ai-spec.md](./ai-spec.md) §3.5（agent 协议契约）、§11 规则 4（窗口高度与搜索性能）。
 
 ---
@@ -59,7 +60,7 @@
 | 沙箱 / 运行方式三档 | **适配**（重点，见 §4） | Lunac 无 OS 级沙箱，用「运行方式 + 工作区锁 + 危险命令拦截」表达同等意图，**且不得自称沙箱** |
 | 白名单（命令前缀） | **采用** | 已有机制，补 UI 与说明 |
 | 高危命令拦截 | **采用**（已有 `CMD_BLACKLIST`） | 补「拦截原因」在卡片上的可读展示 |
-| 代码变更接受/拒绝 + DiffView | **暂不做**（P3 评估） | 需要后端回传 diff 或前端重算，改动面大于本轮目标。先在 §10 记录路线 |
+| 代码变更接受/拒绝 + DiffView | **暂不做**（评估项） | 需要后端回传 diff 或前端重算，改动面大于阶段 1/2 ⇒ 登记为 [backlog](./agent-feature-backlog.md) **U1** |
 | 会话 Fork / 分享 | **不做** | Lunac 是本地单机工具，分享链路与产品定位不符；Fork 收益低 |
 | 恢复到 N 回合前 | **已有**（`.msg-rollback`） | 保持现状，不扩 |
 | 多轮缩略导航 | **P2** | 与现有历史抽屉职责重叠，先做抽屉增强 |
@@ -210,6 +211,8 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 - `safe`（只读）档**不作为运行方式选项**，它属于「我不给它动手」的另一种模式，归入设置面板的安全档位里（§4.4）。
 - 运行方式存 `localStorage` 键 `lunac-agent-run-mode`（`manual` / `allowlist` / `auto`），切换即调 `set_security_profile` 对应值，并重启 agent（与现有工具黑名单的「重启生效」路径一致）。
 - **手动档必须"照问不误"**：若手动档也让白名单自动放行，它与「白名单」档就完全等价、三档退化成两档。前端 `classifyRequest()` 在 `manual` 下直接返回「不自动放行」（危险命令仍走 `CMD_BLACKLIST` 拦截，优先级最高）。
+- **「自动」档要真的不再弹卡（2026-09-20 与后端对齐，已落地）**：`classifyRequest()` 里 `analysis.opaque`（判不出来：变量 / 编码执行 / 间接执行器）曾**无条件**返回「不自动放行」，于是自动档下每一条带 `%TMP%` / `$env:` / `cmd /c` 的命令照样弹卡 —— 而这一档本来就无门槛放行 `python train.py` 这类任意代码执行，单独让「判不出来」比它更严，只会让自动档名不副实（§3 的既有结论「自动档不该弹卡」）。现在 opaque 也**先看档位**：`auto` 放行，`manual` / `allowlist` 仍然弹卡（fail-closed 只在需要人看的两档生效）。**危险的优先级不变**：`analysis.dangerous` 与 `CMD_BLACKLIST` 命中在任何档位都要人工确认，且不给「始终允许」。
+- **审批的最终决策点只有前端一处**：后端只上报 `analysis` 与「要不要问」（`needs_approval`），是否放行完全由 `classifyRequest()` 按档位决定。写这段时别在后端另加一道「自动档就跳过审批」的旁路 —— 那会让危险命令拦截（前端）彻底失效。
 - **控件形态**：运行方式在输入栏的 ⋯ 菜单里是「**图标 + 三格点阵**」，不写文字（位置与画法见 §5.3）；档位名与提示句只出现在 `title` / `aria-label`。
 - 切到 **自动** 时：**不做全宽警示条**，改为在实际切换点就地提示 —— ① 运行方式行右侧的 `.chat-more-hint` 换成红字常驻警示（`agent.run_mode_auto_warning`：命令不再询问、`full` 档会忽略工作区锁）；② 该行的图标按钮与输入栏的 `#chat-more-btn` 一并标红（`.run-mode-auto`），菜单收起时也能一眼看出「自动运行开着」。二次确认同样就地内联在 `.chat-more-hint` 里（`.run-mode-confirm`），不再单独占一行。
 
@@ -224,7 +227,7 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
   2. agent 判定 `analysis.opaque` 非空（含变量 / 编码执行等**无法静态判定**的成分）；
   3. 命令词是**解释器 / 启动器**（`cmd` / `powershell` / `bash` / `python` / `node` / `npx` / `iex` / `env`…）—— 白名单是前缀匹配，放进去等于「以后任何 `powershell …` 都自动放行」。同一条限制在**命中用户白名单**时也要生效（历史遗留的这类条目必须拒绝自动放行）。
 
-危险命令被拦截时，卡片显示一行可读原因（复用中文标签，如「递归强制删除」；标签可能来自 agent 的 `analysis.dangerous`，也可能是前端 `CMD_BLACKLIST`），与 Trae 的「拦截原因可见」对齐。含无法静态判定成分时，标题处显示一个 `--yellow` 的 **⚠**（`.approval-warn-inline`，tooltip 说明原因）—— 它不是危险命令，但**不会被自动放行**。
+危险命令被拦截时，卡片显示一行可读原因（复用中文标签，如「递归强制删除」；标签可能来自 agent 的 `analysis.dangerous`，也可能是前端 `CMD_BLACKLIST`），与 Trae 的「拦截原因可见」对齐。含无法静态判定成分时，标题处显示一个 `--yellow` 的 **⚠**（`.approval-warn-inline`，tooltip 说明原因）—— 它不是危险命令，但**不会被自动放行**（**唯一例外**：运行方式 = **自动** 档时放行，理由见 §4.2）。
 
 ### 4.4 安全档位（补前端入口）
 
@@ -323,9 +326,29 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 - [ ] `WIN_WIDTH`、缩放逻辑（0.6–2.5）、`#app.plugin-active` 的高度分支（360 / 600 / 520）**未被改动**。详细搜索大界面是**并列的固定档** `640 × zoom`（`DETAIL_HEIGHT`，见 ai-spec §2.1.2），不参与上述分支的复用。
 - [ ] AI 态高度仍是**离散直设**（`requestWindowHeight` / `animateWindowHeight` 的 `!pluginActive && !detailOpen` 条件未被放宽），未把插件态或详细搜索态拉进滑动动画。
 - [ ] 滚动仍由 `#results-list` 承担；新增长内容的块都有内部折叠，不出现「整体高度被撑爆」。
+- [ ] **搜索态结果区高度 = 行数 × 56px**（`#results-container` 已**无** `min-height` / `max-height` 定值，唯一上限是 JS 写的 `--results-max-h = screen.availHeight − 120`；`applyResultsMaxHeight()` 在 `applyWindowSize()` 测量**之前**调用）。**不得**退回固定 `min-height: 120px` / `max-height: 380px`，也**不得**改用 `100vh` 当上限（会与内容驱动高度构成循环）—— 详见 ai-spec §11 规则 44。
+- [ ] **唤出路径**（`lunac-window-shown`）必须调 `forceHeightReassert()`：`requestWindowHeight` 的 `requestedHeight` 缓存与 `|Δh| < 3` 两条早退会把「隐藏期被改过的窗口高」静默吞掉（ai-spec §11 规则 44）。
+- [ ] **任何往 `#results-list` 增删条目的函数，收尾都要同步调一次 `applyWindowSize()`**（不能只靠 ResizeObserver / 双 rAF —— 唤出瞬间 WebView 常被判定为未渲染，两者都会被推迟）。已覆盖：`renderAIEntry` / `renderMixedResults` / `renderClipboardOCREntry`（2026-09-19 补，此前漏掉 ⇒ 唤出时第 3 项被截一半）—— ai-spec §11 规则 44。
+- [ ] **外观/主题改动不得破坏「关掉染色 = 原配色」**：新增 CSS 变量全部带默认值（`--bg-opacity 0.5` / `--bg-blur 4px` / `--bg-saturate 0.92` / `--glass-sheen-alpha 0` / `--surface-alpha 0.88` / `--radius-search var(--radius)` / `--radius-results var(--radius)` / `--search-pattern-image none`），且这些默认值 == 改造前的硬编码值；`tintBase: false` 必须精确回到 `:root` 的冷灰 `28,26,32` / 文本 `#eae2da`（浏览器实测口径）。`main.ts` 的 `APPEARANCE_DEFAULTS` 与 `styles.css` 的 `:root` 必须同步改 —— 见 ai-spec §11 规则 45。
+- [ ] **主题色 / 主题包只经 CSS 变量落地**，不在渲染点里写死颜色或逐元素改 `style`；主题图标只走 `pluginIconSvg()` 一个出口；设置面板只调 `window.__lunac_appearance`，不自己写 localStorage。
+- [ ] **「风格」分区的三处既定形态不得回退**（ai-spec §11 规则 45）：① 背景区的「自定义」= **展开/收起五个拉条**（不是另一种背景来源）；② 取色器是**应用内自绘**的（色号框在最左 + 色块 + 30×30 圆角方展开按钮，面板整宽、SV 高 40px），不得退回系统 `<input type=color>` 或色轮；③ 分组小标题必须是「放大 + 600 字重 + accent 竖条 + 淡底框」。
+- [ ] **主题色只能有一个真相源 `--accent-rgb`**：样式表里凡「accent 带其它 alpha」必须写 `rgba(var(--accent-rgb), x)`，**不得**再出现 `rgba(192, 160, 160, x)` 这类硬编码 rgb 分量（`styles.css` 20 余处 + `settings.ts` / `tool-editor.ts` 数处已于 2026-09-19 收口）。判据：把主色改成 `#3a7bd5` 后，这些元素的 `border-color` / `background-color` / `color` 三处**都要**跟着变 —— 见 ai-spec §11 规则 45。
+- [ ] **动作按钮跟随主题色、语义状态色固定**：可点的「动作」（`.settings-save-btn` / `.settings-install-btn` / `.settings-hotkey` / `.settings-skill-open` / `.custom-model-ok` / `.memo-save-btn` / `#tool-editor-save` 等）走 `--accent` 系；表达「状态」的 `--green`(成功/放行) / `--red`(危险/拒绝) / `--yellow`(警告) / `--blue`(信息) 保持固定不跟随主题（`.settings-save-msg` / `.tool-badge.valid|invalid` / `.approval-allow|deny` / `.agent-status.*` / `.file-chip`）。**不得**把语义色也塞进 accent。
+- [ ] **选中态的文字保持中性**：分段控件与主题包按钮的 `.active` 是 `background: var(--accent-bg)` + `color: var(--text)`（灰阶），**不得**写 `color: var(--accent)` —— 与「文字一律纯灰阶、不带色相」同一条约束（`.ap-seg-btn.active` / `.ap-theme.active`）。
+- [ ] **「文字灰阶 / 图标 accent」的边界未越界**（ai-spec §11 规则 45 末条，2026-09-19 批 6）：全工程的 `color: var(--accent)` 只允许出现在**白名单**上 —— `#settings-btn:hover` / `#chat-send-btn` / `#chat-stop-btn` / `#chat-new-btn` / `#humanize-btn:hover` / `.result-item-elevate:hover` / `.ai-response .cursor-blink::after` / `.ap-picker-toggle:hover` 与全部 `caret-color`（含 `settings.ts` / `tool-editor.ts`）。实测口径：把主色改 `#3a7bd5` 后，**设置各大类侧栏选中项、下拉选中项、热键按钮、聊天区用户气泡正文、memo 标签、复制/编辑/保存等按钮上的文字**必须仍是灰阶（只有底色/边框/图标变色）。**注意 `caret-color: var(--accent)` 里含子串 `color: var(--accent)`，批量替换必须按 CSS 规则块切分，不能整文字符串替换。**
+- [ ] **中性叠加 / 凹陷层全部走 token**（ai-spec §11 规则 48，2026-09-19 批 6）：`rgba(255, 255, 255, α)` → `rgba(var(--ink-rgb), α)`、`rgba(0, 0, 0, α)` → `rgba(0, 0, 0, calc(α * var(--shade-scale)))`，两类的剩余出现次数必须为 0（例外只允许三处：取色器相关的彩虹/黑白渐变与 `.ap-sv-cursor` 描边、语义红绿、`--glass-sheen-image` 的玻璃反光白高光）。实测口径：主色换成**浅色**（如 `#ffffff`）后，`--ink-rgb` 必须变 `0, 0, 0`、`--shade-scale` 变 `0.35`，且各 hover 底色仍然可见（不能「白叠白」等于没画）。
+- [ ] **插件/面板/菜单/抽屉/下拉的底色不得硬编码**（ai-spec §11 规则 48）：`#chat-more-menu`（更多设置菜单）、`#chat-drawer`（历史记录抽屉）、`.custom-select-dropdown`（AI 模型下拉）必须走 `var(--surface-glass)`；全工程不得再出现 `rgba(28, 26, 32` / `rgba(24,24,37` / `#1c1a20` 这类常量底色。实测口径：换主色后这三块的 `background-color` 必须跟着变。
+- [ ] **顶层插件面板不自加压暗**（ai-spec §11 规则 48 末条）：OCR 的 `.ocr-image-panel` / `.ocr-text-panel` 必须 `background: transparent`（与 memo 的 `.plugin-result` 一致，实测同为 `rgba(0,0,0,0)`），左右分栏靠 `border-right`；`rgba(0, 0, 0, calc(α * var(--shade-scale)))` 只允许出现在**嵌套**的次级块（输入框 / 工具卡 / 弹层 / 遮罩）上。
+- [ ] **控件文案里没有 emoji**（ai-spec §11 规则 49 + `icon-style.md` §4.1，2026-09-19 批 8）：按钮标签 / 状态行 / 占位提示一律「纯文字」或「线性 SVG + 文字」，不得出现 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ …` / `⏳ …` / `✅ …` / `❌ …`。**允许保留**：列表项 / 条目图标（`.clip-item-icon` 📁📋、`.history-item-icon` 💬、`.file-chip-icon` 📦📎、`plugin.icon`、`item.icon`、TODO 头 📋、tool-editor 🔧、web-search 引擎图标）与单色状态符号（`✓ ✗ ⚠ ✔ ◐ ○ ✕ ×`）。回归口径：对插件面板做一次「叶子节点 textContent 命中 emoji 正则」扫描，计数应为 0（列表项图标节点除外）。
+- [ ] **设置侧栏五项 + 分类归属正确**（ai-spec §11 规则 50）：侧栏**恰好**「常规 / 风格 / AI / 搜索 / 插件」五项（无独立「技能扩展」）；`#sp-ai` 内 `.settings-group-title` 恰好 3 个（AI 模型 / 技能 (Skill Store) / 工具 (MCP)），且 `#settings-save-ai-btn` / `#settings-skill-install-url-btn` / `#settings-tool-url` / `#settings-open-tools` 全部落在 `#sp-ai` 作用域内；`#sp-plugins` 内是插件总览（`.settings-plugin-item` 数量 == `pluginRegistry.getAll().length`，每行「打开」按钮），且 `#settings-tool-url` **不在** `#sp-plugins` 内（tools 与插件必须分开）。
+- [ ] **插件名/描述已本地化**（ai-spec §11 规则 50）：结果区插件行、右键「运行 X」、详细搜索 commands 行、插件总览四处都走 `pluginName()` / `pluginDesc()`；把语言切到 `zh-CN` 后这些位置**不得出现英文常量**（`Custom Launch` / `Web Search` / `Search the web with your default browser`…）。新增插件必须同时补 `plugin.<id>` 与 `plugin.<id>.desc` 五语言。
+- [ ] **主题包锁定态不得回退**（ai-spec §11 规则 46）：`themeId !== "default"` 时 `#ap-color-group` 必须带 `.locked`（灰掉 + 不可点）、`#ap-bg-pick` 必须 `disabled`、`#ap-lock-note` 必须可见；**切换主题时实时同步**（不能只在构建时算一次）；**「自定义」那五个玻璃质感拉条在任何主题下都必须还能拖动**（实测口径：aurora 主题下拖 `bgBlur` → 行内 `--bg-blur` 必须变）。
+- [ ] **简洁搜索结果区不再有 `.result-item-badge`**（ai-spec §11 规则 47）：`#results-list` 内该元素计数必须为 0。两处**例外必须保留**：详细搜索面板的行标签、`quicklaunch` 面板的「常驻 / 本次」状态标记。
+- [ ] **详细搜索右侧预览区在位且不挤爆列表**（ai-spec §11 规则 47）：`#detail-main` 是横向 flex，`#detail-preview` 宽 210、随选中行变化给出「来源 / 完整路径 / 修改时间」与「打开 / 复制路径」；`#detail-results` 的 **`min-width: 0` 不能漏**（漏了长文件名会把预览挤出面板）。缩略图必须走 `get_file_thumbnail`（图片真解码、其余回落系统图标），并且有 `detailPreviewKey` 早退 + `detailThumbCache` 缓存两层防抖。
 - [ ] 未新增任何 `setSize` 调用；未在快速交互路径上引入逐帧测量。
 - [ ] 抽屉（历史）与 `#context-menu` 的 `overflow` 行为未被新的 `overflow:hidden` 破坏（code-rules §5.1）。
 - [ ] 未使用原生 `<select>`（透明窗口不渲染，code-rules §5.2）——运行方式/安全档位必须用既有 `.custom-select` 或胶囊菜单。
+- [ ] **新增按钮 / 控件都显式声明了主题样式**（ai-spec §11 规则 51，2026-09-19）：**WebView2 没有「自动继承主题」的原生按钮** —— 漏写 CSS 的 class 会退回原生外观。同族按钮**并入同一族规则**（动作按钮 → `--accent` 系底色/边框 + 灰阶文字；中性/危险按钮 → 无底色 + `--border-glass` + `--text-dim` + hover `--red`）。回归口径：`getComputedStyle` 里 **`borderTopStyle` 不得是 `outset`**、`backgroundColor` 不得是 `buttonface` / `rgb(239,239,239)`；**并顺带读一条靠后规则的值**（inline `<style>` 若被语法错误打断，该规则**之后**的规则会被整体丢弃）。已知实例：`.settings-skill-edit` / `.settings-skill-del-installed` 曾长期漏 CSS ⇒ 已修，且 `[data-armed="1"]` 有独立红色确认态。
 
 ---
 
@@ -349,25 +372,15 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 
 ## 10. 分期实施与验收
 
-### 阶段 1（低风险，纯前端，建议先做）
+**阶段 1 与阶段 2 已全部落地（2026-09）**，逐条清单已撤下 —— 它们的约束已回写 [ai-spec.md](./ai-spec.md) §3.5 / §3.7B / §11 规则 21。已落地内容：思考块规范化（i18n 文案 + 省略策略 + 惰性渲染 + SVG 图标替换 `💭`）、命令卡片（状态 / 退出码 / 耗时 / 折叠输出 / 复制）、`cli-stderr` 落成 `.sys-note-error`、回合自动折叠 + 开关、运行方式三档 + `set_security_profile` 接线（含「自动」档就地二次确认与常驻警示）、安全档位设置项、越界 / 拦截卡片三动作。
 
-1. 思考块规范化：i18n 文案、省略策略、惰性渲染、SVG 图标替换 `💭`。
-2. 命令卡片：状态 / 退出码 / 耗时 / 折叠输出 / 复制；`cli-stderr` 落成 `.sys-note-error`。
-3. 回合自动折叠 + 开关。
-4. 验收：`npx tsc --noEmit` + `npm run build` 通过；长回合（≥10 次工具调用）下窗口高度与滚动正常；无新增 `setSize` 调用。
+**阶段 3（评估项）已挪进 [agent-feature-backlog.md](./agent-feature-backlog.md) §2**，本文件不再维护待办：
 
-### 阶段 2（含后端接线）
-
-5. 运行方式三档控件 + `set_security_profile` 接线（含「自动」档二次确认与常驻警示）。
-6. 安全档位设置项 + 与运行方式的关系说明。
-7. 越界/拦截卡片的三个动作。
-8. 验收：三档各自跑一次真实工具往返（**按 ai-spec §11 规则 16 用 `deepseek-flash`**）；确认「自动」档下危险命令仍被 `CMD_BLACKLIST` 拦下并去掉「始终允许」；工作区锁在 `project` 档仍拒绝越界（审批通过也不放行）。
-
-### 阶段 3（评估，不在本轮承诺）
-
-9. 代码变更 diff 卡（Write/Edit 的变更预览与接受/拒绝）、DiffView 汇总。
-10. 多轮缩略导航 / 会话 Fork。
-11. （若要做真沙箱）Windows 侧隔离手段调研：Job Object 资源限制、低完整性级别令牌、AppContainer；结论需单独立文档，不得与本文的「运行方式」混称。
+| 原编号 | 项 | 现位置 |
+|---|---|---|
+| 9 | 代码变更 diff 卡（Write/Edit 变更预览与接受/拒绝）+ DiffView 汇总 | backlog **U1** |
+| 10 | 多轮缩略导航 / 会话 Fork | backlog **U2** |
+| 11 | 真沙箱调研（Job Object 资源限制 / 低完整性级别令牌 / AppContainer） | backlog **U3** |
 
 ### 全局验收
 

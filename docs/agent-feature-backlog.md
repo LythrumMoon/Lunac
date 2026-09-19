@@ -1,252 +1,260 @@
-# agent.exe 待实现功能清单（对照旧 cli.exe）
+# Lunac 待办清单（**唯一待办真相源**）
 
-> **用途**：把「旧 cli.exe 有、自研 agent.exe 没有」的能力集中登记为待实现项，并说明每一项对 Lunac（Windows 桌面启动器 + AI 对话）的实际价值，避免重复考古 `core/`。
+> **用途**：本项目**全部未完成工作**的唯一登记处。`ai-spec.md` / `agent-implementation.md` / `agent-ui-spec.md` / `architecture-rendering.md` **只保留规则与现状，不再各自维护待办**；任何新想法一律登记到本文。
 >
-> **状态基线**：agent.exe 目前 = P0 多轮循环/流式/用量 + P1 十一件内置工具 + P2 权限审批 + P3 MCP 工具桥 + P4 技能 + 上下文预算/压缩 + **瞬时失败重试**（2026-09），见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。
+> **三条维护纪律**
+> 1. **做完就删** —— 条目完成后从本文**删除**，不标 ✅ 留在原地。「为什么这么做、踩了什么坑」的结论落进 `ai-spec.md` §11 规则、代码注释与 Git 提交记录，**不由待办条目承载**（本文因此不再有历史包袱，读一遍就知道还剩什么）。
+> 2. **每条必须能落地** —— 写清「做什么 / 为什么值得 / 依赖 / 落点文件」；写不出落点的东西属于设想，一律放 §4 设想区，不混进待办。
+> 3. **优先级只按本文顺序** —— 级别（P0–P3）是粗档，档内顺序即实施顺序。
 >
-> **核对口径**（本文的「全集」从这三个真源枚举，不是靠目录名猜的）：
-> 1. 工具：[core/tools.ts](file:///d:/cc/claude-code-cli-master/core/tools.ts) `getAllBaseTools()` —— 旧 CLI 自己标注的「ALL tools 的唯一真源」
-> 2. 斜杠命令：[core/commands.ts](file:///d:/cc/claude-code-cli-master/core/commands.ts) `COMMANDS` 数组
-> 3. 子系统：`core/` 顶层目录结构 + 各子系统入口文件
+> **最后核对**：2026-09-20（逐条对照 `core-agent/src/`、`app/src/`、`app/src-tauri/src/` 实测，非照抄旧文档）
 >
-> **本文只回答「还差什么、先做什么」**；已实现能力的全景、工具清单全表、以及本地 `skills\` / `tools\` 的扩展格式，见 [agent-implementation.md](./agent-implementation.md)。
+> **口径说明**：本文的前身是「对照旧 `cli.exe` 的完整差距清单」。差距面已核对完毕（见 §5 边界声明），**已完成项全部撤下**，现只保留未完成项。Lunac 的目标仍是 **一个可以完全类比于完整 agent 类应用**的能力体（见 [agent-implementation.md](./agent-implementation.md) §1）—— 所以下面的分组只是**优先级**，不是**价值否定**。
 >
-> **定位前提（2026-09-13 修正）**：Lunac 的 AI agent 目标是**一个可以完全类比于完整 agent 类应用**的能力体，不因「宿主是桌面启动器」而降级。因此下列分组只是**优先级**，不是**价值否定** —— 旧版把多代理协作等写成「与 Lunac 无关」是错的，已改。
+> **§ 号变更对照**（代码注释与规范里仍散落旧编号 `backlog §8.x` 等，按此换算即可，不必逐处回改）：
 >
-> **最后核对时间**：2026-09-11（§0 差距总览）、2026-09-13（定位修正、瞬时失败重试、命令静态安全分析落地）、2026-09-15（新增 §8「Lunac 自身新目标」五项 + Hermes 调研）、2026-09-17（§8.5 第一步落地：会话历史迁 SQLite + FTS5；§8.1 被改动文件路径追踪完成；§8.3 任务快照完成）、2026-09-18（**§8.2 摘要式压缩完成**；渲染层架构决策定案为「全局保留 WebView2」）
->
-> **⚠ 优先级高于本文的架构决策（2026-09-17 立项 / 2026-09-18 定案）**：渲染层**维持现状的全局 WebView2**，**不脱离 WebView2 / Tauri**（原「原生搜索主层 + WebView 按需创建」方向已废弃）。决策、实测基线与被否方案的记录见 **[architecture-rendering.md](./architecture-rendering.md)** —— 它**优先于本文全部条目**，包括下面 §8 的五项新目标。该决策的结论是「不改渲染层」，所以**不产生新的实现待办**，本文待办照旧推进。
+> | 旧编号 | 现在在哪 |
+> |---|---|
+> | §0 差距总览 / §4 不是缺> | §1.1 组 A（工具） | **A5 / A8 /口 / §7 完整性声明 | **§5 边界声明** |
+ A14**（A3 已落地）；其余见 §4 设想区 |
+> | §1.2 组 B / §1.3 组 C | **A13 按需重估**（+ §4 设想区） |
+> | §2.1 组 A（子系统） | **A6**（A4 长期记忆与后台复盘、会话持久化与检索均已完成，见 `ai-spec.md` §3.5） |
+> | §2.2 组 B | **A5 / A8 / A9 / A10 / A11**（A3 已落地） |
+> | §2.3 组 C | **A13** + §4 设想区 |
+> | §3 协议 / 接口层 | **A11**（其中的 A1 子代理框架已于 2026-09-20 落地） |
+> | §5 空转 UI / 失实文案 | **已全部修复**，条目已删 |
+> | §6 建议实施顺序 | 本文 **「优先级总表」** |
+> | §8.1 被改动文件路径追踪 | **已完成** ⇒ 结论在 `ai-spec.md` §11 规则 32 |
+> | §8.2 摘要式压缩 | **已完成** ⇒ 结论在 `ai-spec.md` §11 规则 39 |
+> | §8.3 任务快照 | **已完成** ⇒ 结论在 `ai-spec.md` §11 规则 37 |
+> | §8.4 一次对话中的多任务并行 | **A14** |
+> | §8.5 对话数据库 | 五步全落地 ⇒ **已删除**（检索侧见 `ai-spec.md` §3.5「往期会话检索」；剩余的记忆**写入**触发点就是本文 **A4**） |
+> | §8.6 建议顺序 | 本文 **「优先级总表」** |
 
 ---
 
-## 0. 差距总览（数字口径）
+## 优先级总表
 
-| 维度 | 旧 cli.exe | agent.exe 现在 | 缺口 |
-|---|---|---|---|
-| 工具 | 37 个具名（其中默认启用约 21 个）+ 15 个已置空的历史工具 | 11 个内置 + `Skill`（技能）+ 动态接入的 MCP 用户工具（`mcp__*`，来自 `tools\*.json`） | 25 个具名工具 |
-| 斜杠命令 | 75+ | 0 | 全部 |
-| 命令行开关 | 123+ 个 `--flag` | 7 个（`--add-dir` / `--permission-mode` / `--permission-prompt-tool` / `--dangerously-skip-permissions` / `--disallowedTools` / `--mcp-server` + 忽略其余） | ~116 个 |
-| 顶层子系统 | ~22 | 6（Agent 循环、工具执行、权限审批、上下文预算/压缩、MCP 桥、技能） | ~16 |
-| stdout 消息类型 | 8 类 | 9 类 | 无（`system/api_retry` 已于 2026-09 补发） |
-| 上下文压缩 | `services/compact/` 全套 | 两级压缩 + 400 兜底（不额外调模型） | 差「调模型摘要」式变体，见 §2.1（已不再是可用性缺口） |
-
-> **怎么读这张表**：缺口数 = **能力差距**，不是「用不上」。目标是让 Lunac 的 agent 成为一个可以完全类比于完整 agent 类应用的能力体（见 [agent-implementation.md](./agent-implementation.md) §1）；本文剩下要做的只是**排序**，不是**筛掉**。
+| 级别 | 条目 | 为什么在这个位置 |
+|---|---|---|
+| **P1** | A5 Skills fork / remote | 技能体系的剩余两种模式 |
+| **P1** | A6 写文件内容级安全扫描 | 唯一还没做的安全短板（命令侧已有 `bash_safety.rs`） |
+| **P2** | A7 计划模式闭环 | 需前端配套计划卡片，工作量集中在前端 |
+| **P2** | A8 多模态输入（真内容块） | 依赖协议扩字段，收益随用户场景 |
+| **P2** | A9 权限 hooks | 用户脚本介入的工具链，属生态能力 |
+| **P2** | A10 自动权限分类器 | 减少询问频率，可与 A9 一起评估 |
+| **P2** | L1 插件市场（含 Live2D 桌宠） | **用户已定方向**，卡在三条硬约束（CSP / 资产 / 常驻开销） |
+| **P2** | L2 AI 人格 / 风格录入 | **用户已选「人格编辑器」**，改动集中在提示词装配 |
+| **P3** | A11 会话续接 / rewind | 现状靠 `set_history` 灌历史已够用，属体验增强 |
+| **P3** | A12 成本面板 | 数据（按天用量日志）已在，只缺展示 |
+| **P3** | A13 记忆目录 / 斜杠命令 / 剩余工具 | 按需重估，见各项 |
+| **P3** | A14 多任务并行 | 依赖**已落地**的子代理（原 A1）+ 前端分栏 UI，排在功能项之后 |
+| **P3** | A15 压缩策略的成本模型 | 命中价是 miss 价的 1/50 ⇒ 就地瘦身多数净亏，水位需重估 |
+| **P3** | A16 跨提问首轮的缓存接力 | 首请求是单次提问里权重最大的一次 miss，直接决定能否守住 92% |
+| **P3** | U1 diff 卡 / U2 缩略导航·Fork / U3 真沙箱调研 | 界面增强与调研，排在功能之后 |
+| **P3** | M1 两个待实测项 | 不阻塞任何开发，攒到复现时做 |
 
 ---
 
-## 1. 工具层缺口
+## 1. Agent 能力缺口
 
-### 1.1 组 A —— 对 Lunac 有真实价值（建议实现）
+### P1
 
-| 工具 | 旧 CLI 位置 | 价值 | 说明 |
-|---|---|---|---|
-| ~~`PowerShell`~~ | `core/tools/PowerShellTool/` | **高** | ✅ **已完成（2026-09）**：`-NoProfile -NonInteractive -Command` + 双 UTF-8 编码兜底（中文输出不再变乱码），与 `Bash` 共用 `run_shell`；`plan` 档拒绝、非 plan 档先审批，真机烟测通过 |
-| ~~`WebSearch`~~ | `core/tools/WebSearchTool/` | **高** | ✅ **已完成（2026-09，同日重构）**：旧实现是 Anthropic 服务端的 `web_search_20250305` server tool（`WebSearchTool.ts:76-84`），全仓无本地搜索源，**不能照搬**。自研方案：主源 = 设置面板的「搜索服务商 + 密钥」（`AI_SEARCH_PROVIDER`/`AI_SEARCH_KEY` → `LUNAC_SEARCH_PROVIDER`/`LUNAC_SEARCH_KEY`，可选 **bocha**（博查，国内直连、微信扫码即可注册）/ tavily / exa / firecrawl）；兜底 = **Bing RSS → Bing HTML → 百度 HTML 抓取**（无 key、≥1.1s 节流、202/429 视为限流），主源失败或未配齐时自动回落并附 `[fallback] <原因>`，三级全失败就如实报错不编造。**换掉 DuckDuckGo 的原因**：本机实测国内连不上 `html.duckduckgo.com`（15s 超时），而 Bing / 百度均 200 —— 「不配 key 也能搜」必须是真的。**Bing Search API 已于 2025-08-11 退役**（老 key 410 Gone、不再接受新注册），**DuckDuckGo 无官方搜索 API**（`api.duckduckgo.com` 只返维基摘要），故不存在「bing 首选 + ddg api 兜底」这条路。关键：`WebSearch` 进 `needs_approval` 与 `gated_in_read_only`（查询词是外部出口，plan 档也弹审批）。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「联网检索」。**验收口径（2026-09-17 用户定）：四家付费主源（bocha / tavily / exa / firecrawl）的「成功」路径不验证**（预算原因拿不到可用 key，只保「请求形状 + 错误透传 + 回落」正确）—— 只守**兜底链**。复验 = `cd core-agent && cargo test fallback_scrapers -- --ignored --nocapture`（全仓唯一联网 `#[ignore]` 用例，故意不进常规 `cargo test`）；**2026-09-17 实测三级全部 OK 各 5 条**，对方改版后重跑这一条 |
-| ~~`WebFetch`~~ | `core/tools/WebFetchTool/` | **高** | ✅ **已完成（2026-09）**：HTML→纯文本抓取（无 DOM 依赖）、60s 超时 / ≤10MB / UA 标识 Lunac；**未照搬两处服务端依赖** —— 域名预检 `api.anthropic.com/api/web/domain_info` 与 Haiku 二次摘要。只读档同样走审批（唯一外部数据出口），烟测见 [ai-spec.md §9](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md) |
-| ~~`AskUserQuestion`~~ | `core/tools/AskUserQuestionTool/` | **高** | ✅ **已完成（2026-09）**：**答案复用 `can_use_tool` 的 `updatedInput` 回传**（旧 CLI 也是这条通道，不新增协议）；前端 `renderAskQuestions()` 渲染选项、`classifyRequest()` 对它恒定 `auto:false`；收不到答案时工具报错而非编造。plan 档可用且照常审批。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「结构化提问」 |
-| ~~`TodoWrite`~~ | `core/tools/TodoWriteTool/` | **中高** | ✅ **已完成（2026-09）**：长任务的进度可见性；工具**不持有状态**（清单唯一真相 = 模型最近一条 `tool_use`），前端拿流式入参就地重绘 `.todo-panel`；**免审批**、成功回执不重复渲染。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「待办面板」 |
-| ~~`Skill`~~ | `core/tools/SkillTool/` | **中高** | ✅ **已完成（P4，2026-09）**：渐进披露（提示词只列 `key: 描述`，模型调 `Skill` 取正文，`$ARGUMENTS` 已替换），见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)；fork / remote 两种模式未做 |
-| `ListMcpResourcesTool` / `ReadMcpResourceTool` / `mcp`（动态工具代理） | `core/tools/MCPTool/`、`core/services/mcp/` | **中高** | ✅ **动态工具代理已完成（P3，2026-09）**：`<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 进请求体，见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)。`ListMcpResourcesTool` / `ReadMcpResourceTool` 两件仍未做（`mcp_server.rs` 只实现了 `resources/list`） |
-| `Agent`（子代理，legacy 名 `Task`） | `core/tools/AgentTool/` | 中 | 长任务并行探索；代价是要配一整套子代理生命周期，收益不如上面几项直接 |
-| `TaskCreate` / `TaskGet` / `TaskUpdate` / `TaskList`（任务 v2）与 `TodoWrite` 二选一 | `core/tools/Task*Tool/` | 中 | **已选 `TodoWrite`（2026-09 落地）**，故不再上任务 v2 —— 后者要配一整套任务状态存储与生命周期，收益与 `TodoWrite` 重叠 |
-| `EnterPlanMode` / `ExitPlanMode` | `core/tools/Enter/ExitPlanModeTool/` | 中 | 先出计划再动手；需前端配合新增计划卡片 UI（目前前端**零相关代码**） |
-| `TaskOutput` / `TaskStop` | `core/tools/TaskOutputTool/`、`TaskStopTool/` | 低 | 依赖后台任务框架，只有做了 `Agent`/后台 Bash 才有意义 |
-| `NotebookEdit` | `core/tools/NotebookEditTool/` | 低 | Jupyter 场景，Lunac 用户群不大 |
-| `StructuredOutput` | `core/tools/SyntheticOutputTool/` | 低 | 强制 JSON schema 输出，主要给 SDK 用 |
+**A5. Skills 的 fork / remote 两种模式**
 
-### 1.2 组 B —— 有条件才有意义（暂不实现）
+- 现状：`core-agent/src/skills.rs` **只有 inline 模式** —— `load()` 读 `<key>/SKILL.md`、`run()` 返回正文并替换 `$ARGUMENTS`。fork（在子代理里执行技能）与 remote（远端拉取）均无代码，技能自带脚本 / 资源也没有。
+- 依赖：fork 模式依赖**已落地**的子代理（`Agent`，2026-09-20）—— 但 `Agent` 只回最终报告、**不给中间过程**，fork 语义（技能自己的脚本/资源要在子代理里跑）仍需一轮重估再动手。
 
-| 工具 | 前提条件 |
+**A6. 写文件的内容级安全扫描**
+
+- 做什么：`Write` / `Edit` 落盘前扫凭据与危险模式，命中则告警或拦截。
+- 为什么是唯一的安全短板：命令侧已有自研 `core-agent/src/bash_safety.rs`（子命令拆分 + 引号归一 + 包装器递归 + Windows 危险规则集 + fail-closed），**文件内容侧完全空白** —— 全仓搜 `scanContent` / `scan_content` / `security` / `patterns` 零匹配。
+- 注意区分：`bash_safety.rs` 扫的是**命令**、在**执行前**判定；本条扫的是**文件内容**、在**写入前**判定。两者方向不同，别混（`ai-spec` §13.1 已登记这个区别）。
+- 参考：旧 CLI 的 `core/security/scanContent()`（25 条规则：代码注入 / XSS / 反序列化 / 加密缺陷 / CI 注入）。
+
+### P2
+
+**A7. 计划模式闭环（`EnterPlanMode` / `ExitPlanMode` / `VerifyPlanExecution`）**
+
+- 做什么：模型先出计划、用户确认后再动手。
+- 现状：**前端零相关代码**，所以工作量主要不在 agent 侧，而在计划卡片 UI（可参照 `agent-ui-spec.md` 的分期思路）。
+- 规范前提：计划文档结构、任务粒度、铁律已写在 `ai-spec.md` §12（Agent Plan 模式规范）—— 实现时按那节走。
+
+**A8. 多模态输入（真正的图片 / PDF 内容块）**
+
+- 现状：图片走 `save_temp_image()` 落成**临时文件**，再把**路径**拼进 `[Attached files]` 文本让 agent 自己读；全仓无 `{"type":"image"}` / `image_url` / `{"type":"document"}` 的 content block，PDF 处理也没有。
+- 措辞要点：**附件本身可用**（路径 → agent 读取这条路是通的），缺的是「把图片/PDF 作为内容块直发模型」。
+- 依赖：协议扩字段 —— 走 `agent-ui-spec.md` §9 的字段登记流程（登记字段名与语义 + 保持文本不变 + 前端兼容缺字段）。
+
+**A9. 权限 hooks（19 类事件）**
+
+- 做什么：`PreToolUse` / `PostToolUse` / `SessionStart` / `PreCompact` / `PermissionRequest` … 供用户脚本介入。
+- 现状：全仓零匹配（只有 NSIS 的 `installerHooks` 与键盘 LL 钩子，与本条无关）。
+
+**A10. 自动权限分类器**
+
+- 做什么：自动判定「这条命令能不能不问」，减少审批卡频率。
+- 现状：只有**前端**白名单前缀 + `CMD_BLACKLIST`（`main.ts` 的 `classifyRequest()`）；agent 侧的 `bashClassifier` 类实现不存在。
+- 注意：任何「自动放行」都**不得取消**审批与工作区锁这两道硬边界（`ai-spec` §11 规则 14），只能改变**询问频率**。
+
+### P3
+
+**A11. 会话续接与 rewind**
+
+- 现状（别误读）：`session_id` **恒为 `""`**（`main.rs` 四处硬编码），且无 `--resume` / `--continue`。但**「续接」在行为上是存在的** —— 靠 `set_history` 协议由前端把整段历史灌回 agent 上下文（`main.rs` ↔ `main.ts` `queueAgentHistory()`）。所以缺的是「由 agent 侧自持会话 id」这一形态，不是「无法续接」。
+- rewind 现状：只有「按消息索引回退到某个**用户轮**」（`rollbackChat()` + `.msg-rollback`，按钮只挂在用户提问气泡上）；**不能回到助手回复 / 工具调用中途**，也没有**文件内容历史快照**（全仓无 `fileHistory`）。
+
+**A12. 本地成本面板**
+
+- 做什么：在既有的按天用量日志（`<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`，含每次 API 请求的 `{in, read, create, out}` 明细）上做本地成本统计。
+- 为什么：数据**已经在落盘、且与供应商平台可逐行对账**，只缺展示；**不必**照搬旧 CLI 的运营上报链路。
+
+**A13. 按需重估的剩余项**（不做只因为优先级，不是因为没价值）
+
+| 项 | 说明 / 何时重估 |
 |---|---|
-| `LSP`（`core/tools/LSPTool/` + `core/services/lsp/`） | 需要一个常驻语言服务器；桌面启动器无 IDE 上下文 |
+| 斜杠命令 | 旧 CLI 有 75+，多数是 CLI 会话内操作（`/theme` `/vim` `/statusline` `/login` …），桌面端另有 UI。**只挑与能力相关的子集**（`/compact`、`/rewind`、memory 类）评估，不整体照搬 |
+| 记忆目录（CLAUDE.md 体系） | 跨会话记忆；Lunac 已有 `ModuleData` 体系，**先照 `SessionSearch` 那套（会话库 + 冻结快照注入）设计**，别另起一套 |
+| `NotebookEdit` | Jupyter 场景，用户群不大 |
 | `EnterWorktree` / `ExitWorktree` | 需要 git worktree 工作流 |
-| `CronCreate` / `CronDelete` / `CronList`（`core/tools/ScheduleCronTool/`） | 需要后台常驻调度（`core/utils/cron*.ts`）；Lunac 已有 Windows 计划任务做自启，不必复制 |
-| `Config`（ant-only） | 改 CLI 自身设置 |
-| `SendUserMessage` / `Brief`、`SendUserFile`、`PushNotification` | 面向远端/移动端的推送通道 |
+| `CronCreate` / `CronDelete` / `CronList` | 后台定时任务；Lunac 已有 Windows 计划任务做自启，能力不重叠 |
+| `WebBrowser`（浏览器控制） / `LSP` | 需要常驻上下文（浏览器会话 / 语言服务器） |
+| `SendUserFile` / `PushNotification` / `Brief` | 面向远端 / 移动端的推送通道 |
+| 多代理协作（`TeamCreate` / `TeamDelete` / `SendMessage` / `ListPeers`） | **前置已落地**（子代理 `Agent`，2026-09-20）—— 应立刻重估，不要再按「与 Lunac 无关」处理 |
+| 输出样式 / statusline | CLI 的终端样式体系，已被 WebView 取代 |
+| Ink TUI / Vim / 语音 / buddy / chrome / 桥接远程控制 / OAuth 账号体系 / 自动更新 / 代理证书 mTLS / IDE 集成 | 绑定的分别是旧 CLI 的终端形态、当前交互形态没有的入口、企业网关场景；**由 NSIS 安装包与 `vscode-extension/` 各自负责的部分已完成**。逐项都要「先确认它在新宿主下还有意义」再重估 |
 
-### 1.3 组 C —— 需要前置能力 / 绑定旧 CLI 形态（按完整 agent 路线图排后，**不是不做**）
+**A14. 一次对话中的多任务并行（多个任务各自走独立 API 请求）**
 
-`TeamCreate` / `TeamDelete` / `SendMessage` / `ListPeers`（多代理协作，`core/utils/swarm/`、`core/utils/teammate*.ts`）、`RemoteTrigger`、`Monitor`、`VerifyPlanExecution`、`Workflow`、`SubscribePR` / `SuggestBackgroundPR`、`WebBrowser`（浏览器控制）、`TerminalCapture`、`OverflowTest` / `CtxInspect` / `Snip` / `Sleep`（调试与实验）、`REPL`（ant 专用 VM 工具）、`TestingPermission`（测试用）。
+- 目标：一次对话里互不依赖的多个任务并发跑，而不是严格的一问一答。
+- 现状（别与「只读工具并行」混淆）：**只读工具并行已经做了** —— 一轮里**连续的**只读调用合成一批并发（上限 4），写类 / 命令 / MCP 串行，结果按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序。那是「同一次 API 响应里的多个工具调用」；**模型请求本身仍然串行**。
+- 硬约束：① 每个任务须有**独立的消息数组与独立工具环境**；② 结果回灌必须**能归因到任务**（Lunac 的 `session_id` 恒为 `""`，得先补内存态 task id）；③ 并发 = 花钱 ⇒ 并发上限 + 预算封顶；④ 前端要能把多任务的流式输出**分栏 / 分组**，否则用户看到的是交织成一团乱的流。
+- 依赖：子代理框架（**已落地**，见 `ai-spec.md` §3.5「子代理」）+ 前端分栏 UI。区别：本项要的是**多个子代理同时跑**（`Agent` 现在是**串行**的，且 `parallel_safe` 为 `false`），所以不是「有了 `Agent` 就自动有了 A14」。
 
-> **读法**：多代理协作（`TeamCreate` / `SendMessage` / `ListPeers`）是「完整 agent 类应用」的正当能力，**前置是子代理框架（`Agent`）** —— 框架落地后应重估，不再按「无关」处理。
-> 其余各项绑定的分别是：旧 CLI 的 Ink TUI 形态、ant 内部构建、IDE 常驻上下文、远端推送通道、或调试开关。它们不是「没价值」，而是**当前没有对应形态的宿主**；随能力补齐逐项重估。
-> 这些在 `getAllBaseTools()` 里大多已被显式置为 `null` 停用，属旧 CLI 自己的历史包袱 —— 照搬前先确认它在新宿主下还有意义。
+**A15. 压缩策略的成本模型重估（就地瘦身多数情况净亏）**
+
+- 做什么：按 DeepSeek 的**真实价差**重估 `compact_history()` 三档的水位与「值不值得」闸门，减少「省小废大」。
+- 为什么值得（2026-09-20 量化）：`deepseek-v4-flash` 的命中价是 miss 价的 **1/50**（0.02 vs 1 元/M）。就地瘦身**省下的是廉价 `read`、废掉的是全价 miss**：
+  - 收益 ≈ 省下的 token × **剩余轮数** × 0.02；代价 ≈ 被作废的后缀（≈ 当前总输入）× 1.0
+  - 实测（`usage-2026-09-18.jsonl` 第 2 条）：一次 `elide` 瘦身 23 个 `tool_result`（省 176101 字 ≈ 91k token），当轮 `read` 从 108160 塌到 2176；按上式剩余 9 轮 ⇒ 收益 ≈ 16k、代价 ≈ 23.5k，**净亏**。
+- 候选手段（需实测择一，不要一次全上）：① 抬高 `ELIDE_RATIO`（减少次数，但单次损失更大，拐点要实测）；② 瘦身**从靠近尾部开始**（失效点靠后 ⇒ 作废的后缀更小）；③ 把 `elide` 降级为「防止 drop 的缓冲」，只在逼近 `DROP_RATIO` 时才允许。
+- 硬约束：`Drop` / `Force` 两档是**防 400 的安全刚需**，不在重估范围内。
+- 前置：需要一个**可重复的大上下文回归**（先把上下文养到 0.85 水位以上、再打满轮次），否则改完无法验证。可复用 A16 的探针。
+- 落点：`core-agent/src/main.rs` 的 `compact_history()` / `ELIDE_RATIO` / `ELIDE_MIN_SAVINGS_RATIO`；结论回写 `ai-spec.md` §11 规则 23。
+
+**A16. 跨提问首轮的缓存接力不稳定（待查）**
+
+- 现象（2026-09-20 实测）：同一个 agent 进程内连续提问两次，第二次的**首个请求**有时能吃到上一次留下的缓存（`usage-2026-09-18.jsonl` 第 2 条的首请求 `read=81792`），有时只命中到 `system + tools`（探针 `-Runs 2` 的第二次提问首请求 `read=2560`，而第一次提问末轮的 `total=13745`）。
+- 为什么值得查：首请求是单次提问里**权重最大**的一次 miss（整段历史重发），它直接决定 92% 这条线守不守得住。
+- 判据已就绪：`请求前缀` 行的 `公共前缀=N/M条` + `请求用量` 行的 `read`（见 `ai-spec.md` §11 规则 23 的埋点条目）—— 先判定是不是本侧在两次提问之间动了 `history`。
+- 落点：`core-agent/src/main.rs` 的提问入口与 `run_query()` 边界。
 
 ---
 
-## 2. 子系统层缺口
+## 2. 界面层待办（`agent-ui-spec.md` 阶段 3）
 
-### 2.1 ⚠️ 组 A —— 会真实影响可用性（建议优先）
+> `agent-ui-spec.md` §10 的阶段 1 / 阶段 2 **已全部落地**，清单已撤下；阶段 3 的三项挪到此处统一排序。**界面规范本身（§0–§9 与 §8 复核清单）继续有效，不回退。**
 
-| 子系统 | 旧 CLI 位置 | 说明 |
+| # | 项 | 说明 |
 |---|---|---|
-| ~~**上下文压缩 / 长度预算**~~ | `core/services/compact/`（`autoCompact` / `microCompact` / `apiMicrocompact` / `snipCompact` / `sessionMemoryCompact`）、`core/query/tokenBudget.ts` | ✅ **已完成（2026-09）**：预算 + 0.85/0.95 双水位（带滞回）+ 400 强制压缩兜底，**不额外调模型**（见 ai-spec §3.5）。另外旧 CLI 的「调模型做摘要」那一类变体也已补齐（2026-09-18，**§8.2**）：只在丢弃档 / 400 兜底档触发一次摘要调用 ⇒ 已**不再是**缺口 |
-| ~~**模型输出重试**~~ | `core/services/api/withRetry.ts`、前端已解析的 `system/api_retry` | ✅ **已完成（2026-09）**：网络抖动 / 429 / 5xx（含 529）**请求级**退避重试（1s→2s→4s + 抖动、30s 封顶、尊重 `Retry-After`），只在读到响应体前重试故**不产生重复内容**；4xx 不重试（400 的两个专门分支保留）；SSE 流中途断开不重试（只记日志）。补发 `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`）。见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「瞬时失败重试」与 §11 规则 25 |
-| ~~**Bash 静态安全分析**~~ | `core/tools/BashTool/`（`bashParser.ts`、`bashSecurity.ts`、`sedValidation.ts`、`readOnlyValidation.ts`、`destructiveCommandWarning.ts`）、`core/utils/bash/` | ✅ **已完成（2026-09，自研方案）**：旧 CLI 是一整套手写 bash 语法树（面向 unix/zsh，且其自身承认 `bash -c` / `cmd /c` / `powershell -Command` 无递归解析），**不照搬**。自研 [core-agent/src/bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)：子命令拆分（`;` `\n` `\|` `&`，引号感知）+ 引号/转义归一（`r""m`→`rm`，且不把 `C:\Windows` 揉成 `C:Windows`）+ 包装器递归（`cmd /c` / `powershell -Command` / `bash -c`，`-EncodedCommand` 判不透明）+ **Windows 危险规则集**（递归/强制删除、格式化与分区、覆写物理磁盘、注册表、bcdedit、vssadmin/wbadmin、关机重启、taskkill、icacls、账户/服务/计划任务、`iex`、git 强制推送/`reset --hard`/`clean -f`/`branch -D`…）+ **fail-closed**：变量/子表达式/编码执行/间接执行器/嵌套过深/控制字符 ⇒ 不得自动放行。结果随 `can_use_tool.analysis` 上报（见 §3 与 ai-spec §11 规则 26），前端以它为准、原正则降为二道网；解释器前缀永不进白名单 |
-| **写文件前的安全扫描** | `core/security/index.ts`（`scanContent()`，`core/security/patterns.ts`） | 写入前扫凭据/危险模式，我们现在没有 |
+| **U1** | 代码变更 diff 卡 | `Write` / `Edit` 的变更预览 + 单条 / 单文件 / 全部接受与拒绝，外加 DiffView 汇总受影响文件数与变更行数。需要后端回传 diff 或前端重算，改动面大于阶段 1/2 |
+| **U2** | 多轮缩略导航 / 会话 Fork | 与现有历史抽屉职责重叠，先做抽屉增强；Fork 收益低（本地单机工具，无分享链路） |
+| **U3** | 真沙箱调研 | Windows 侧隔离手段（Job Object 资源限制 / 低完整性级别令牌 / AppContainer）。**结论需单独立文档**，不得与 `agent-ui-spec.md` §4 的「运行方式」混称 —— 那三档是**策略级**的，`agent-ui-spec.md` §4.1 的诚实原则继续有效 |
 
-### 2.2 组 B —— 有价值但依赖前置项
+---
 
-| 子系统 | 旧 CLI 位置 | 依赖/说明 |
+## 3. Lunac 自身新目标
+
+> 本节不是「旧 cli.exe 有而我们没有」，而是用户直接提出的新方向。
+> 调研参照物 = **Hermes Agent**（Nous Research，MIT，`github.com/NousResearch/hermes-agent`）；其「三层记忆」骨架（`MEMORY.md` 2200 字符 + `USER.md` 1375 字符 + `state.db` FTS5 会话检索）与省 token 机制（解析见 `ai-spec.md` §9.1 难点 1）仍是主要参考。
+
+**L1. 插件市场（阶段 2，用户已定方向）**
+
+- 目标：设置 ·「插件」分区列出全部插件，可从用户 GitHub 仓库下载 / 卸载；下载前提示需要一并下载的前置与依赖。**Live2D 桌宠做成插件**而非内置依赖。本地（dev）全部内置。
+- 现成先例：`download_tool_from_url` / `install_skill_from_url`（工具与技能的 URL 安装链路已经通了）。
+- **三条硬约束必须先解决**（否则一动手就撞墙）：
+  1. **CSP 是 `script-src 'self'`**（见 `ai-spec.md` §3.7 的 KaTeX 缺陷）⇒ 运行时依赖必须随插件**本地打包**，**不能走 CDN**；
+  2. Live2D 需要 pixi + Cubism Core + 数 MB 模型资产（**Cubism 有商用授权条款**）⇒ 走「插件自带依赖 + 下载时提示」；
+  3. 常驻画布有持续 GPU / rAF 开销，**窗口隐藏时必须暂停** —— 与国际化的「轻量」目标冲突，**接入前先做最小原型验证**。
+- 相关：`ai-spec.md` §20 的「路径 2」是本节的前身。**注意 `core/` 的含义**：它是**本机参考用的旧 CLI 源码**（被 `.gitignore` 排除、**不在仓库里**），所以 `core/plugins/...` 一类路径只表示「参考它的设计、在新宿主重建」，**照它去找一定找不到**；真要做时**先重写落地路径**。
+
+**L2. AI 人格 / 风格录入（阶段 2，用户已选「人格编辑器」）**
+
+- 目标：设置里可编辑人格与输出风格，内容落到 exe 根 config（如 `config\persona.md`），**agent 启动时拼进系统提示词的固定段**。
+- 硬约束：**绝不按消息拼接**（那会让提示词每轮都变、把整个固定前缀缓存打掉，`ai-spec.md` §11 规则 23）。现状 `PERSONA_AND_STYLE` 是 `core-agent/src/main.rs` 的 **Rust 常量**（2026-09-17 从「前端每条消息拼接」搬到 agent 侧常量化，就是为了缓存命中），所以本项要动的是「常量 → 启动时可配置的固定段」。
+
+**L3. 上下文感知提示词注入的剩余子集**
+
+- 现状（**部分已落地，别当从零做**）：① 工作目录 / 宿主 / 技能目录已由 `core-agent` 的 `env_block()` 拼进系统提示词；② 前端已有按 query 关键词（debug / TDD / review）的 `buildSystemPromptHint()`，拼进**消息**；③ 附件路径走 `[Attached files]` 文本。
+- **缺的只有**：「当前打开的插件 / 当前选中的文件」进上下文。补的时候注意区分「进系统提示词」（必须固定，否则破坏缓存）与「进消息」（可变）。
+
+**L4. 调试阶段状态栏**
+
+- 原 `ai-spec.md` §19.6 的 P2 遗留项。做一个只由开关控制的阶段状态栏，展示 agent 当前处于哪个阶段。现状只有**常显**的状态机与运行时提示（`.sys-note`，展示 agent stderr），没有分阶段的调试视图。
+
+**M1. 两个待实测项（不阻塞开发）**
+
+| # | 项 | 说明 |
 |---|---|---|
-| MCP 全栈 | `core/services/mcp/`（stdio / sse / http / WebSocket 传输、tools、resources、prompts、roots、elicitation、OAuth、`.mcp.json`） | **stdio + tools 部分已完成（P3，2026-09）**：agent 侧作 client 连本机 `lunac.exe --mcp-server`、注册并调用其工具。仍缺：远程传输（sse/http/ws）、resources/prompts/roots/elicitation/OAuth、`.mcp.json` 配置（目前工具来源只有 `<exe 根>\tools\*.json`） |
-| Skills（含 inline / fork / remote 三模式） | `core/skills/`、`core/tools/SkillTool/` | **inline 模式已完成（P4，2026-09）**：`LUNAC_SKILLS_DIR` 的 `<key>/SKILL.md` 列进提示词 + `Skill` 工具取正文（含 `$ARGUMENTS` 替换）。仍缺：fork（子代理执行技能）、remote（远端拉取）、技能自带脚本/资源 |
-| 插件市场 / 插件命令 | `core/plugins/`、`core/utils/plugins/` | 桌面端的「插件」面板目前只读展示 `list_tool_files`，没有下发通道 |
-| 权限 hooks（19 类事件） | `core/services/tools/toolHooks.ts`、`core/utils/hooks/`、`core/schemas/hooks.ts`、`core/hooks/useCanUseTool.tsx` | PreToolUse / PostToolUse / SessionStart / PreCompact / PermissionRequest … 供用户脚本介入 |
-| 自动权限分类器 | `core/utils/permissions/`（`bashClassifier.ts`、`yoloClassifier.ts`、`classifierDecision.ts`） | 自动判定「这条命令能不能不问」；我们现在靠前端白名单前缀 |
-| 会话持久化 / resume / rewind | `core/utils/sessionStorage.ts`、`sessionRestore.ts`、`fileHistory.ts`、`core/commands/rewind` | **前端不依赖**（会话历史由前端 localStorage 自持，`session_id` 恒空），故价值低 |
-| 记忆目录（CLAUDE.md 体系） | `core/memdir/`、`core/utils/claudemd.ts`、`core/commands/memory` | 跨会话记忆；Lunac 已有 `ModuleData` 体系，可另设计 |
-| 图片 / PDF / 附件多模态输入 | `core/utils/attachments.ts`、`imagePaste.ts`、`pdf.ts`、`FileReadTool/imageProcessor.ts`、`xlsxReader.ts` | 前端只把附件**路径**拼进文本让 agent 自己读；真正的图片内容块未实现 |
-| 输出样式 / statusline | `core/outputStyles/`、`core/constants/outputStyles.ts` | CLI 的终端样式体系，Lunac 用 WebView 替代 |
+| **M1-1** | 前端 CDN 与 WebView2 冷启动在**开机场景**的真实占比 | 现象侧已定论（开机自启慢的根因是 OS 触发时机 + 计划任务权限，见 `ai-spec.md` §9.1 难点 2）；此项只差「实测确认 CDN/冷启动无关」后写死结论，不再靠猜 |
+| **M1-2** | 缓存命中率唯一遗留疑点：复现 `in=2287 / read=0` 那一轮 | 「落盘慢」已被 0ms vs 6s 对照实验**证伪**（两组逐字节相同、均 97.9%）。剩余两种可能：① 前缀本身变了（`skills::listing()` / 工具黑名单 / `cwd` 任一变化）；② 供应商侧缓存被清。**工具已就绪** —— 用 `result.usage.requests[]` 与启动时落盘的 `固定前缀 …` 行前后对照即可定位 |
+| **M1-3** | 两个 `--disable-features` 是否逗号合并（`architecture-rendering.md` §6 末尾） | WebView2 自带的 `msWebOOUI,msPdfOOUI,msSmartScreenProtection` 与我们的 `PermissionPrompt,ClipboardContentRead` **是否同时在场**。现按「Chromium 逗号合并重复 switch」实现；若实测发现我们的串**挤掉了** WebView2 自带那份，合并策略要改成「并入同一个 switch 的值」。ai-spec §11 规则 38 已登记 |
 
-### 2.3 组 C —— 绑定旧 CLI 形态（排后，按需重估）
+---
 
-| 子系统 | 位置 | 为什么排后 / 何时重估 |
+## 4. 设想区（**没有落点，勿当成待办**）
+
+以下是不再有实现意图、或只有一句话想法的东西。**保留只为防止重复讨论**，真要做时先重写落地路径再挪进正文。
+
+- **旧 CLI 的 `Config`（ant-only）/ `REPL`（ant 专用 VM）/ `Workflow` / `RemoteTrigger` / `Monitor` / `SubscribePR`·`SuggestBackgroundPR` / `TerminalCapture` / `Snip` / `Sleep` / `StructuredOutput` / `OverflowTest`·`CtxInspect` / `TestingPermission`** —— 要么绑定旧 CLI 的特定形态（Ink TUI / ant 内部构建），要么是调试与实验开关；在 `getAllBaseTools()` 里大多已被显式置为 `null` 停用，属旧 CLI 自己的历史包袱。
+- **按分类的会话临时文件清理服务**（Hermes 的 `disk-cleanup` 插件思路）—— 本项目的临时产物集中在 `<exe 根>\temp\`，**卸载时由 NSIS 整目录删除**，`logs` 另有 7 天保留清理（`log::purge_old`，`KEEP_DAYS=7`）。便携式布局下「整个 temp 目录」就是清理单位，**不需要**按 test / temp / session / download 分类。详见 `ai-spec.md` §13.2。
+
+---
+
+## 5. 边界声明（本清单覆盖什么、不覆盖什么）
+
+**覆盖**：用户可以观察到的能力面 —— **工具名**、**子系统**、**协议消息类型**、**界面分期**、**自身新目标**。
+
+- **工具面已核对完毕**：旧 CLI 的 `getAllBaseTools()` 里的每一个名字都已归位（实现 / 待办 / 设想）；Lunac 当前实际注册的是 **13 件内置工具**（`Read` / `Write` / `Edit` / `Bash` / `PowerShell` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `AskUserQuestion` / `TodoWrite` / `SessionSearch` / `Agent`）+ **条件注册**的四件：`Skill`（技能目录非空且未被黑名单裁掉时）+ `ListMcpResourcesTool` / `ReadMcpResourceTool`（**桥接上了用户工具时**，2026-09-20）+ `Remember`（**桥接通时**，2026-09-20，长期记忆写入侧）+ `mcp__*`（来自 `<exe 根>\tools\*.json`），可用 `--disallowedTools` 裁剪。
+- **不覆盖一**：`core-agent/src/` 里的实现细节级能力（如各工具的解析细节、日志格式），按子系统归并。
+- **不覆盖二**：旧 CLI 终端渲染组件（`core/tools/**/UI.tsx`）随 Ink TUI 一并排除。
+- **不覆盖三**：Lunac 与旧 CLI **都有**的能力不再列出（例如前端依赖的 stdout 契约 `system/init` / `stream_event` / `assistant` / `user/tool_result` / `control_request` / `result` **全部已提供**；`--disallowedTools` 链路已通；思考开关跨模型自适应是**超集**——只有开 / 关两档，不要按「多档更深」扩）。
+- **口径提醒**：`session_id` 恒为 `""`、`total_cost_usd` / `num_turns` / `duration_ms` 前端零引用、`stop_reason` 未提供 —— 这几项**当前无影响**，不列为待办，改动前先确认有消费者。
+
+---
+
+## 6. 环境变量与数据根（核对基线）
+
+`core-agent` 当前读取的 `LUNAC_*` 环境变量共 **16 个**（均**只在 spawn 时注入**；切换其中任何一项 = `kill_and_cleanup()` 重启 agent）：
+
+| 变量 | 落点 | 用途 |
 |---|---|---|
-| Ink TUI 全套 | `core/ink/`、`core/components/`、`core/screens/REPL.tsx` | CLI 自己的终端渲染器，已被 WebView 取代；若要重估，先看它的**交互模式**（如 REPL 的批量工具调用）是否有价值，而不是照搬渲染层 |
-| 75+ 斜杠命令 | `core/commands/` | 多数是 CLI 会话内操作（`/theme` `/vim` `/statusline` `/login` `/upgrade` `/doctor` …），桌面端另有 UI。**逐项评估**：与能力相关的（如 `/compact`、`/rewind`、memory 类）值得单列出来看，不要因为挂在这个目录下就一并丢弃 |
-| Vim 模式 / 语音 / buddy / chrome | `core/vim/`、`core/voice/`、`core/buddy/`、`core/commands/chrome` | 当前交互形态没有对应入口 |
-| 桥接 / 远程控制 / teleport | `core/bridge/`、`core/utils/teleport.tsx`、`core/commands/bridge` | 面向 Claude 云端会话接管；若将来做「远端会话接管」再重估 |
-| 遥测 / 成本统计 | `core/utils/telemetry/`、`cost-tracker.ts`、`core/services/analytics/` | 旧 CLI 的运营与计费上报。**成本统计值得重估**：Lunac 已有按天用量日志（ai-spec §3.5），可在此基础上做本地成本面板，不必照搬上报链路 |
-| OAuth / 账号 / 订阅额度 | `core/services/oauth/`、`core/utils/auth.ts`、`commands/login`、`extraUsage` | Lunac 用自己的 API Key 直连供应商 |
-| 自动更新 / 安装器 | `core/utils/autoUpdater.ts` | 由 NSIS 安装包负责 |
-| 代理 / 证书 / mTLS / bedrock / aws | `core/proxy/`、`core/upstreamproxy/`、`core/utils/{proxy,mtls,caCerts,aws,bedrock}.ts` | 企业网关场景；用户提需求再评估 |
-| IDE 集成（VSCode / JetBrains / Desktop） | `core/utils/ide.ts`、`jetbrains.ts`、`claudeDesktop.ts` | Lunac 已有自己的 VSCode 扩展（`vscode-extension/`） |
-| 其余 utils 级实现细节 | `core/utils/`（约 200 文件：`ripgrep.ts`、`glob.ts`、`fileRead.ts`、`bashParser.ts` …） | 我们已用 11 个内置工具 + glob/regex crate 覆盖同等能力，只是实现更薄；其中 `bashParser.ts` 已单列进 §2.1（安全短板） |
+| `LUNAC_AGENT_BASE_URL` / `LUNAC_AGENT_TOKEN` / `LUNAC_AGENT_MODEL` | `main.rs` | 端点 / 凭据 / 模型 |
+| `LUNAC_MAX_CONTEXT_TOKENS` | `main.rs` | 上下文预算（未设走默认） |
+| `LUNAC_SUMMARY_COMPACT` | `main.rs` | 摘要式压缩开关（`0`/`false`/`off`/`no` 关，默认开） |
+| `LUNAC_HISTORY_INDEX` | `main.rs` | **往期会话索引**注入开关（`0`/`false`/`off`/`no` 关，默认开）；工具侧另可用 `--disallowedTools SessionSearch` 连索引一起停 |
+| `LUNAC_MEMORY` | `main.rs` | **长期记忆**注入开关（写法同上，默认开）；`--disallowedTools Remember` 会连注入一起停（两者同源，见 ai-spec §11 规则 56） |
+| `LUNAC_NUDGE_INTERVAL` | `main.rs` | **后台复盘的轮次门槛**（每 N 次用户提问跑一次，默认 10，`0` = 关；非数字回落默认） |
+| `LUNAC_SKILLS_DIR` | `main.rs` / `skills.rs` | 技能目录 |
+| `LUNAC_THINKING` | `main.rs` | 思考开关（`off` / 其余=开） |
+| `LUNAC_WORKSPACE_LOCKED` | `main.rs` | 工作区锁（硬边界，见 `ai-spec.md` §11 规则 14） |
+| `LUNAC_SEARCH_PROVIDER` / `LUNAC_SEARCH_KEY` | `tools.rs` | 联网检索主源 |
+| `LUNAC_LOG_DIR` / `LUNAC_LOG` / `LUNAC_LOG_LEVEL` | `log.rs` | 落盘日志 |
+
+**数据根 = `<exe 根>`（便携式，无独立 HOME）**：`skills\`（技能）、`tools\`（用户工具定义）、`ModuleData\`（`history\chat.db`、`memory\MEMORY.md`、`usage\usage-*.jsonl`）、`temp\`（`logs\`、`tool-outputs\`、`transStorage`、`webview-data`）、`config\`。用户资产的扩展格式见 [agent-implementation.md](./agent-implementation.md) §5。
 
 ---
 
-## 3. 协议 / 接口层缺口
+*本轮整理说明（2026-09-19）：本文由「旧 CLI 差距清单 + 五项用户新目标 + 界面阶段 3 + 散落在 `ai-spec.md` §10/§13/§19.6/§20 的待办」合并而成，**删除全部已完成条目**（其结论已落进 `ai-spec.md` §3.5 / §11 规则与 Git 记录），**按优先级重排**，并补入逐条实测的现状。对照面的审计结论保留在 §5 边界声明。*
 
-| 项 | 现状 | 影响 |
-|---|---|---|
-| `system/api_retry` | **已发**（2026-09，瞬时失败退避重试时） | 无 |
-| `system/task_started` / `task_progress` | 未发（前端有解析与文案） | 子代理进度文案永不出现 |
-| `control_cancel_request` | 仅审批超时时发 | 已够用 |
-| `session_id` | 恒为 `""` | 前端不读，无影响 |
-| `stop_reason` | 未提供（前端写死 `end_turn`） | 无影响 |
-| `total_cost_usd` / `num_turns` / `duration_ms` | 已发但前端零引用 | 无影响 |
-| 123+ 命令行开关 | 只解析 6 个 | 其余（`--resume` / `--settings` / `--agents` / `--mcp-config` / `--allowedTools` / `--max-turns` / `--json-schema` …）均被忽略 |
+*2026-09-19 追加：**A2（会话历史检索 + 记忆注入）已完成并已从本文删除** —— 契约与实测数据在 `ai-spec.md` §3.5「往期会话检索」、纪律在 §11 规则 53。*
 
----
+*2026-09-20 追加：**B 类缓存崩塌已修复**（打满 `MAX_TOOL_ROUNDS` 时追加的收口消息改变了 `history` 末尾的块结构 ⇒ 端点侧前缀缓存单元整体失配：第 17 轮 `read` 2560 / 命中率 23.3%；修复后 10880 / 91.3%，整次提问汇总 **87.2% → 95.9%**）。三种形态的单变量对照表与归因套路在 `ai-spec.md` §11 规则 23。本次新登记 **A15 / A16** 两条待办。*
 
-## 4. 已核对：以下不是缺口
+*2026-09-20 追加（同日第二批）：**A1 子代理框架已完成并从本文删除** —— 内置工具 `Agent`（第 13 件）落地，五条硬约束全部满足并经端到端实测（`cargo test` 45 passed；deepseek-flash 真机：`tool_use(Agent)` → `task_started` → `task_progress`×6 → `task_done(ok=true, ms=3938)`，报告 `Total lines: 21` 正确；plan 档拒绝亦已实测）。契约与实测数据在 `ai-spec.md` §3.5「子代理」、纪律在 §11 规则 54；工具总数口径 13（`agent-implementation.md` §4.1）。**A3 / A4 / A5 / A14 的前置据此全部满足**（A14 仍需前端分栏 UI，且 `Agent` 目前是串行的）。当前未落地 **14 项**（A3–A16）。*
 
-- **前端依赖的 stdout 契约**：`system/init`（含 `model`，用量日志的元数据来源）、`stream_event`（4 种 delta）、`assistant`、`user/tool_result`、`control_request`、`result`（含 4 个 token 字段，**每次提问的绝对值**）—— agent.exe **全部已提供**，token 面板数据源正常；对账口径见 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)「用量与对账」。
-- **工具名硬编码**：前端特判的 `Bash`（及 `PowerShell`）命名一致；十一件内置工具名字与旧 CLI 完全同名同义。
-- **`--disallowedTools` 链路**：Rust → agent.exe → 请求体过滤已通，UI 黑名单候选列表已换成真实工具名（见 §5）。
-- **思考开关跨模型自适应**：旧 CLI 没有对应机制（它绑定自家模型），我们反而是超集。注意**只有开 / 关两档**（端点无思考力度旋钮，见 [ai-spec.md](./ai-spec.md) §3.5），不要按「多档更深」的方向扩。
+*2026-09-20 追加（同日第三批，**A1 复查**）：对 A1 逐行复查后修掉三处 —— ① **子代理工具集只剔了 `Agent`**，把 `mcp__*` 与 `SessionSearch` 一起发了过去（而子代理不接桥 ⇒ 调用必然失败，`mcp__*` 还会先弹一张白问的审批卡）⇒ 提取 `subagent_tool_defs()` 剔三类 + 守门单测；② **子代理的系统提示词只有角色段**，不知道自己的工作目录、也不知道有哪些技能（`Skill` 在它的工具集里却没有清单）⇒ 补 `env_block(cwd)` + `skills::listing()`；③ **生成参数与主循环不一致**（固定 `max_tokens: 4096` 且不发 `thinking` ⇒ 端点默认开着思考、思考文本会把报告挤空，且 `LUNAC_THINKING=off` 对子代理失效）⇒ 与主循环同源复用 `cfg.thinking`。复查后 `cargo test` **46 passed**，release 真机复跑：子代理自报工具 11 件（13 − `Agent` − `SessionSearch`，无 `mcp__*`）、报出正确 cwd、数出 21 行，`task_done(ok=true, ms=5825)`。*
 
----
+*2026-09-20 追加（同日第四批）：**A3（MCP resources 读侧）已完成并从本文删除** —— 服务端补 `resources/read`（**硬边界**：只允许读 `tools\` 目录内的 `.json`，`canonicalize()` 后比前缀，挡 `..` 与符号链接），客户端加 `Bridge::list_resources()` / `read_resource()`，两件工具 `ListMcpResourcesTool` / `ReadMcpResourceTool` **条件注册**（只在桥真的接上了用户工具时才进请求体，与 `Skill` 同理 —— 出厂时 `tools\` 只有模板，无条件注册就是在固定前缀里放两件空转工具）。契约与实测在 `ai-spec.md` §3.5「MCP resources 读侧」、纪律在 §11 规则 55。桥工具的名单收口到 `tools::BRIDGE_TOOLS` 一处（`dispatch_tool` 早退 / `subagent_tool_defs` 剔除 / 条件注册三处共用）。`cargo test`：core-agent **47 passed**、src-tauri **56 passed**。当前未落地 **13 项**（A4–A16）。*
 
-## 5. 顺带要清理的「空转 UI / 失实文案」（不是新功能，但会造成误解）
-
-| 项 | 位置 | 处理 |
-|---|---|---|
-| ~~工具黑名单候选列表全是旧工具名，用户**无法禁用**真实内置工具~~ | [main.ts](file:///d:/cc/claude-code-cli-master/app/src/main.ts) `TOOL_BLACKLIST_CANDIDATES` | ✅ 已修（2026-09，第 19 点缓存优化）：候选换成真实内置工具名（含 `Skill`），Rust 侧删掉对自研 agent 全为空转的 `DEFAULT_TOOL_BLACKLIST` —— 勾选即真正从请求体 `tools` 裁掉，缩短前缀、提升缓存命中 |
-| ~~「技能扩展」文案声称 agent.exe 会加载该目录，实际不读~~ | [settings.ts L386-446](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L386-L446)、i18n `settings.skills_*` | ✅ 文案已属实（P4，2026-09）：agent.exe 启动时读该目录，增删改后前端自动重启 agent 生效 |
-| 「插件 (MCP 工具)」面板只读展示，无下发通道 | [settings.ts L448+](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts#L448) | ✅ 已随 P3 落地：agent.exe 现在会读 `<exe 根>\tools\*.json`（面板的安装/编辑/删除 + 重启 agent 流程已生效）；面板自身仍是只读列表 + 安装入口，编辑在 Tool Editor 插件里 |
-| ~~安全档位 `set_security_profile` 无前端入口~~ | `app/src-tauri/src/commands.rs` `set_security_profile` | ✅ 已落地（2026-09）：设置面板「AI」分区有只读/项目/完全下拉，经 `lunac-security-profile-changed` → `main.ts` `setSecurityProfile()` 单一 IPC 下发（与运行方式共用，避免重启两遍） |
-
----
-
-## 6. 建议实施顺序
-
-1. ~~**上下文预算 + 压缩**（§2.1）——唯一「用久了必然坏掉」的缺口，属防回归性质~~ ✅ **已完成（2026-09）**
-2. ~~**P3 MCP 工具桥** —— 让「插件」面板与 `tools\*.json` 真正生效~~ ✅ **已完成（2026-09）**；resources 两件未做
-3. ~~**P4 Skills** —— 让「技能扩展」面板生效，并修掉失实文案~~ ✅ **已完成（2026-09）**；fork / remote 未做
-4. ~~**低成本高收益**~~ ✅ **已全部完成（2026-09）**：~~`PowerShell` 工具~~、~~工具黑名单候选列表刷新~~（同步提升前缀缓存命中）、~~`WebFetch`~~、~~`AskUserQuestion`~~、~~`TodoWrite`~~、~~`WebSearch`~~（主源可配置多后端 + Bing RSS / HTML、百度三级免 key 兜底，见 §1.1）。§1.1 组 A 中仅剩 `ListMcpResourcesTool` / `ReadMcpResourceTool`（MCP resources，需先扩 `mcp_server.rs`）
-5. ~~**模型输出重试**~~ / ~~**Bash 静态安全分析**~~ ✅ **已完成（2026-09）** —— 见 §2.1 与 [ai-spec.md §3.5](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md) 的「瞬时失败重试」/「命令静态安全分析」。余下视需要：**写文件前安全扫描**、**子代理框架（`Agent`）**、权限 hooks、自动权限分类器
-6. ~~**前缀缓存命中率优化**（第 19 点）~~ ✅ **已完成（2026-09）**：MCP 工具数组按名排序、技能清单按 `key` 排序、工具黑名单不再内置空转旧名 —— 不变量见 [ai-spec.md §11 规则 18](file:///d:/cc/claude-code-cli-master/docs/ai-spec.md)
-
----
-
-## 7. 完整性声明
-
-**统计边界**：本文按「用户可见能力」三级粒度枚举 —— **工具名**（取自 `getAllBaseTools()`，共 37 具名 + 15 置空）、**斜杠命令**（取自 `COMMANDS`，75+）、**子系统**（取自 `core/` 顶层目录）。因此：
-
-- ✅ 可以确认：**在旧 CLI 代码里能枚举出的工具/命令/子系统层面，没有遗漏项**。凡 `core/` 里存在的顶层子系统，均已在上文 §1–§3 归位（实现 / 不做 / 归并为实现细节）。
-- ⚠️ 边界一：`core/utils/` 下约 200 个文件属**实现细节级**能力（如 `ripgrep.ts`、`fileHistory.ts`、`ansiToPng.ts`），本文按子系统归并，不再逐文件列；其中少数有独立价值（`fileHistory` = rewind、`attachments` = 多模态）已单列。
-- ⚠️ 边界二：`core/tools/` 里带 `UI.tsx` 的文件是终端渲染组件，随 Ink TUI 一起不做，未计入缺口。
-- ⚠️ 边界三：本清单只覆盖「旧 cli.exe 已有」的对照面；**Lunac 自身的新需求**（如多模态输入、本地模型、插件市场）不在本文范围，应另立路线。
-
----
-
-## 8. Lunac 自身新目标（2026-09-15 用户提出，不在 §1–3 的对照面内）
-
-> 本节的五项**不是**「旧 cli.exe 有而我们没有」，而是用户直接提出的新方向，按 §7 边界三单独立节。
-> 调研参照物 = **Hermes Agent**（Nous Research，MIT，`github.com/NousResearch/hermes-agent`）。两份证据：
-> ① 本机源码检出 `C:\Users\15242\AppData\Local\hermes\hermes-agent\`（`hermes_state.py` 声明 `SCHEMA_VERSION = 16`，对应 0.17.x）；
-> ② 在线文档与 release notes（截至 2026-09-07 的 v0.21.2「Pantheon」）。
-> **版本差说明**：本机那份落后于 GitHub 约 4 个小版本，但「三层记忆」这个骨架在 v0.21 的官方文档里**没有变化**（仍是 `MEMORY.md` 2200 字符 + `USER.md` 1375 字符 + `state.db` FTS5 会话检索），故下文的机制引用对本机版本有效，不影响结论。v0.21 新增的是外围能力（Bot Mode、`hermes peer`、cron continuity、子代理 live steering）。
-
-### 8.1 被改动文件的路径追踪（点击 → 打开所在文件夹）
-
-| 项 | 内容 |
-|---|---|
-| 目标 | 工具卡里出现的「被改动的文件路径」可点击 → 资源管理器定位到该文件；并在面板里留一份「本次会话改动过的文件」列表（参照用户提供的 Trae 截图） |
-| 现状 | 工具结果里的路径是**纯文本**（`.tool-row` 是 `<details>` 折叠块），零交互；前端也没有「改动过的文件」这个概念 |
-| 关键约束 | **路径必须来自可信来源，不能靠前端正则从自由文本里猜** —— 否则「输出里提到的路径」会被误当「被改动的路径」，列表里混进一堆只读过的文件 |
-| 落点选择 | 推荐用 `assistant` 消息里 `tool_use` 的**入参**（`Write` / `Edit` 的 `file_path`）—— 语义精确、**零协议改动**；次选是在 `tool_result` 里加结构化字段（要走 agent-ui-spec §9 的字段登记流程） |
-| 后端 | 新命令走 `explorer.exe /select,<path>`（定位并选中）。**只接受绝对路径 + 存在性校验**，绝不接受任意命令行字符串 —— 与 [system_catalog.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/system_catalog.rs) 的 `run_action` 同一条纪律 |
-| 依赖 | 无（纯前端 + 一个 Rust 命令），**五项里最容易先做** |
-| **状态** | ✅ **已完成（2026-09-17）**。落点、协议、交互全部按上表实现：<br>**① 后端** `reveal_in_explorer(path)` → [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs)（`#[tauri::command(async)]`）。校验三条：非空 / **必须绝对路径** / **必须真实存在**；去尾部分隔符时**保留长度 ≤ 3 的盘符根**（`C:\` 不能变成 `C:`）；路径只作为 `Command` 的**单个参数**传入 `explorer.exe`（`/select,<path>`），**全程不经 shell** ⇒ 无注入面；成功/失败都记日志。<br>**② 前端路径来源**：`agentToolInput()` 遇到 `WRITE_TOOLS`（`Write` / `Edit`）就从 `tool_use` 的**入参** `file_path` 取值 —— **零协议改动**，且**绝不从工具输出正文正则猜**（否则只读过的文件会被误判为改动）。取到后把路径渲染成 `.file-link` 可点链接、余下入参压进 `.tool-cmd-rest`。<br>**③ 会话内列表**：`sessionChangedFiles`（去重）+ `.changed-files-card`（`<details>` 折叠面板，始终 `appendChild` 到 `#chat-log` 末尾），随 `noteChangedFile()` 增量重画。<br>**④ 落盘/恢复**：`SessionStep` 新增可选 `path` 字段（走既有的 `steps` JSON 列，**无需改表**），`recordTurnSteps()` 记 `el.dataset.file`；`restoreSession()` / `rollbackChat()` / 新对话清空三处都调 `rebuildChangedFilesFromSteps()` 或清空列表，保证「面板内容 ≡ 界面留下的那部分历史」。<br>**⑤ 交互**：`.file-link` 全是动态重绘的，故点击用 **document 级事件委托**（逐个绑监听会在重画后全部失效）。<br>**⑥ 文案**：`agent.changed_files` / `agent.reveal_in_explorer` / `agent.reveal_failed` 三 key × 五语言。<br>**⑦ 样式**：`styles.css` 的 `.file-link` / `.changed-files-card` / `.changed-files-head` / `.changed-files-list` / `.changed-file` / `.changed-file-dir` / `.tool-cmd-rest`（不新增滚动条声明，走全局 `::-webkit-scrollbar`）。<br>**⑧ 校验**：`npx tsc --noEmit` exit 0；`core-agent` 32 passed / 1 ignored；`app/src-tauri` 34 passed / 1 ignored。 |
-| 已知未覆盖 | 工具卡上的路径**不写回 agent 上下文**（纯前端展示）；`reveal_in_explorer` 只定位文件，**不打开文件**（`/select,` 的语义就是定位并选中） |
-
-### 8.2 自动压缩上下文（调模型的摘要式压缩）
-
-| 项 | 内容 |
-|---|---|
-| 目标 | 补上「调模型生成摘要」这一类压缩变体（见 §2.1 的差异项） |
-| 现状 | 已有预算 + 0.85/0.95 双水位（带滞回）+ 400 兜底，但**不额外调模型**（机械 elide/drop 历史消息） |
-| Hermes 参照 | 摘要模板首段固定为 `## Historical Task Snapshot`（`agent/context_compressor.py:37`），要求**逐字捕获用户最近一条未完成输入**，并显式写明「用户刚问了一个问题也算 active task，不要写 None」；交接前缀 `SUMMARY_PREFIX`（`context_compressor.py:45-62`）定死优先级：**latest user message WINS**，历史上那些 `Historical Task` / `In-Progress` / `Pending Asks` / `Remaining Work` 章节一律视为历史 |
-| Hermes 预算 | `_MIN_SUMMARY_TOKENS = 2000`、`_SUMMARY_RATIO = 0.20`、`_SUMMARY_TOKENS_CEILING = 12_000`（`context_compressor.py:142-147`）；摘要失败降级兜底 `_FALLBACK_SUMMARY_MAX_CHARS = 8000`（`166-170`） |
-| Hermes 会话策略 | **原地压缩为默认**：`compression.in_place` 默认 True → 旧轮 `active=0` 软归档、**session id 不变**（`agent/conversation_compression.py:347` + `hermes_state.py:2854 archive_and_compact`）；legacy 路径才 fork 新会话并写 `parent_session_id`（`conversation_compression.py:568-667`） |
-| Lunac 硬约束 | ① 摘要要**真实花钱与耗时**（一次额外 API 调用）⇒ 只在「机械压缩已不足以腾空间」时才触发，要有单轮成本上限 + 可关闭开关；② 压缩**必然改写请求前缀 ⇒ 端点侧缓存整段作废**，与 ai-spec §11 规则 23 的命中率纪律直接冲突，所以**触发频次要尽量低**，宁可压得晚也不要压得勤；③ 不引 session 分裂（Lunac 的 `session_id` 恒为 `""`，前端也不读）|
-| 依赖 | **8.3 先行** —— 摘要模板的核心就是任务快照 |
-| **状态** | ✅ **已完成（2026-09-18）**。实现在 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)：`render_dropped_for_summary()` / `summarize_dropped()` / `pin_summary_of_dropped()`，提示词常量 `SUMMARY_PROMPT`。<br>**① 触发点只有两个** —— >95% 的丢弃档 + 400「上下文超限」的 `Force` 兜底档；**0.85 的瘦身档绝不触发**。理由是「改写前缀 ⇒ 缓存整段作废 ⇒ 触发频次要尽量低」：这两档本来就必然 `drain`、本来就已经把缓存废掉，摘要属**净赚**；挂在别处就是额外制造压缩时机（违反「宁可压得晚也不要压得勤」）。<br>**② 三道成本闸**：`SUMMARY_MIN_INPUT_CHARS`(4000) 太短不付费 / `SUMMARY_MAX_INPUT_CHARS`(24000) 输入封顶（**从最近的往老的取**）/ `SUMMARY_MAX_OUTPUT_TOKENS`(1024)（摘要要长期留在上下文里，故意压短）。<br>**③ 开关 `LUNAC_SUMMARY_COMPACT`**（`0`/`false`/`off`/`no` 关；默认开）。<br>**④ 失败一律降级**：网络错误 / 非 2xx / 非 JSON / 空摘要 —— 四种都 `warn` + `None`，调用方照旧走纯机械压缩。**摘要挂掉不能让整轮对话失败**。<br>**⑤ 非流式**（`"stream": false`）+ **不新增 stdout 协议** ⇒ 前端零改动、零解析风险。<br>**⑥ 位置** = 第 1 条之后（同 §8.3）；两者同时存在时为 `[摘要][任务快照]`（由远及近）。<br>**⑦ `CompactOutcome` 新增 `dropped_msgs` 与 `pinned`** —— 前者让 `compact_history` **保持纯的**（不卷进网络请求，8 处现有测试照旧可跑）；后者**顺带修掉一个既有 off-by-one**：回滚锚点 `base` 原实现只做减法，于是「丢弃 + 钉任务快照」那一轮若出错，`finish_error` 的 `history.truncate(base)` 会多切掉一条真实历史。<br>**⑧ Hermes 口径**：首段固定 `## Historical Task Snapshot`、**逐字捕获最近一条未完成输入**、显式写明「刚问了一个问题也算 active task，不要写 None」、**latest user message WINS**、历史里的 `Historical Task`/`In Progress`/`Pending`/`Remaining Work` 章节一律视为历史；另加「用原文语言」+「保留精确标识符」。<br>**⑨ 校验**：core-agent `cargo test` **43 passed** / 2 ignored（新增 8 条：6 条纯逻辑 + 1 条本地 stub 形状用例 + 1 条真端点 `#[ignore]` 用例），已 `cargo build --release`。规范固化在 ai-spec §11 规则 39，断裂源清单见规则 23 第 ⑥ 项。 |
-| **测试途径**（三条，各覆盖不同的东西 —— 详见 ai-spec §11 规则 39） | ① **本地 stub 单测**（`cd core-agent; cargo test summary`，零成本不联网）：覆盖请求形状（`stream:false` / 不带 `tools` / `system` 是提示词 / 单条 user）、响应解析、**五种失败降级**、触发守卫、渲染上限。**证不了真端点是否接受这个形状**。<br>② **真端点 `#[ignore]` 用例**（`cargo test summary_compaction_against_the_real_endpoint -- --ignored --nocapture` + 三个 `LUNAC_AGENT_*` 凭据）：补上①证不了的「端点是否接受 `stream:false` + 无 `tools`」，并验摘要模板（首段 `## Historical Task Snapshot`）与 **latest user message WINS**（内嵌 sentinel `LUNAC-SENTINEL-8421`）。成本 = 一次摘要调用（≤6k 输入 token + ≤1024 输出 token）。<br>③ **端到端验触发**（前两条都绕过了 `run_query` 的水位检查）：**别等跑满 128k** —— 把 `LUNAC_MAX_CONTEXT_TOKENS` 压到最小值 **8000**（dev 写 `app/src-tauri/.env`，release 在启动 shell 里设），让 agent 读一个 ≥40KB 的文件（如 `docs/ai-spec.md`）再追问一句；判据 = 日志出现 `摘要压缩：N 条旧消息 / M 字 → 摘要 K 字（输出 T tokens，耗时 Ums）`。**必做对照**：同流程把 `LUNAC_SUMMARY_COMPACT=0` 再跑一遍 ⇒ 应当只有 `上下文压缩：…` 而没有 `摘要压缩：…`。<br>**✅ 已跑通（2026-09-18，A/B 闭环）** —— 实操上改成**直接驱动 `agent.exe`**（它只吃 stdin/stdout，不需要 WebView2 与 `D:\Lunac`，因此可绕开 Trae 沙箱）：run1 出 `摘要压缩：10 条旧消息 / 23402 字 → 摘要 786 字（输出 728 tokens，耗时 3646ms）`，turn2 上下文 2503 tokens 且**能复述只存在于被丢段里的 sentinel**；run2（`=0`）**无摘要行**、turn2 答「不知道」、上下文 2092 tokens。完整 A/B 表 + 两个造数据陷阱（`normalize_history` 合并同角色 / `cut` 要按 `len-8` 且检查发生在 push 之后）见 ai-spec §11 规则 39。 |
-
-### 8.3 任务总结工具（压缩时不丢「本次对话的主要任务」）
-
-| 项 | 内容 |
-|---|---|
-| 目标 | 压缩前后，「当前在做什么任务」这条信息必须存活 |
-| Hermes 参照 | 就是 8.2 里那段 `Historical Task Snapshot`。**Hermes 并没有一个独立的「任务总结工具」** —— 它是压缩器提示词里的一段；而且 `agent/prompt_builder.py:144-165` 的 `MEMORY_GUIDANCE` 明确**禁止**把摘要/任务进度写进 `MEMORY.md`（任务快照只活在压缩摘要里，不污染长期记忆） |
-| Lunac 设计要点 | 任务快照必须是**独立于会话消息的一条 pinned 上下文**（压缩不动它）；否则「压缩 → 快照也被压掉」= 白做 |
-| 推荐方案 | **不新造工具**：前端已有 `TodoWrite` 的 `.todo-panel`，而 `TodoWrite` 的语义本来就是「当前任务清单」（清单唯一真相 = 模型最近一条 `tool_use`，见 §1.1）。压缩时**把最近一条 `TodoWrite` 的清单原样 pin 住**即可，成本远低于再引一个工具 |
-| 依赖 | 无（可与 8.2 合并实现） |
-| **状态** | ✅ **已完成（2026-09-17）**。实现在 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `compact_history()` 与 `latest_todo_snapshot()`：<br>**① 触发点** = 只在本轮真的 `dropped > 0`（丢弃了中段）**且**「被丢的区间里含 `TodoWrite`」时才抄快照 —— 没丢、或清单本来就在保留区时都不动，避免与幸存的那份重复。<br>**② 时机** = **在 `drain` 之前抄**（源马上就不存在了），压缩完再钉回。<br>**③ 形态** = 插一条**纯文本 user 消息**（表头 `TASK_SNAPSHOT_HEADER`），**与 `tool_use` / `tool_result` 的配对结构完全解耦** —— 端点是硬校验配对的，直接「原样保留那条工具消息」会把配对拆坏；纯文本则完全绕开这个问题。<br>**④ 位置** = **第 1 条之后**，不抢「开头那条用户提问 = 任务目标」的位置（丢弃逻辑刻意保留 head 正是为了它）。<br>**⑤ 内容** = `N. [status] content`（取**最近一条** `TodoWrite`，因为它的契约是每次发完整清单、覆盖上一份）。<br>**⑥ 命中率明账**：插入位置靠前 ⇒ 其后前缀缓存作废，但**只在本来就已经 `drop` 的那一轮**发生（那一轮 drain 已把缓存废掉），**不额外增加损失**；已登记进 ai-spec §11 规则 23 的断裂源清单第 ⑤ 项与规则 37。<br>**⑦ 校验**：core-agent `cargo test` **35 passed**（新增 3 条：`task_snapshot_survives_a_drop` / `task_snapshot_is_not_pinned_when_nothing_is_dropped` / `task_snapshot_takes_the_latest_list`），已 `cargo build --release` 并部署 |
-
-### 8.4 一次对话中的多任务并行（多个任务各自走独立 API 请求）
-
-| 项 | 内容 |
-|---|---|
-| 目标 | 一次对话里互不依赖的多个任务并发跑，而不是严格的一问一答 |
-| 现状 | 只做了**只读工具并行**（`TOOL_PARALLELISM = 4`，ai-spec §11 规则 28）—— 那是「同一次 API 响应里的多个只读工具调用」并发；**模型请求本身仍然串行** |
-| Hermes 参照 | `delegate_task` 子代理（v0.21 起支持 live steering：列出运行中的子代理、中途纠偏、停止并保留部分结果、子代理可用 JSON schema 校验返回值并单独成本核算）；旧 CLI 侧的对应物是 `Agent` 工具（见 §1.1） |
-| Lunac 硬约束 | ① 每个任务须有**独立的消息数组与独立的工具执行环境**，否则「A 任务的写」会污染「B 任务的读」；② 结果回灌必须能**归因到任务** —— Hermes 靠 `session_id` 天然隔离，Lunac 的 `session_id` 恒为 `""`，**得先补一个内存态 task id**；③ 并发 = 花钱，必须有并发上限 + 预算封顶；④ 前端要能把多任务的流式输出**分栏/分组**，否则用户看到的是交织成一团乱的流 |
-| 依赖 | `Agent`（子代理）框架 + 前端分栏 UI。**排在 8.2 / 8.3 之后** |
-
-### 8.5 Lunac 自主学习往期对话的数据库
-
-| 项 | 内容 |
-|---|---|
-| 目标 | 历史对话变成可检索的长期记忆，跨会话复用 |
-| Hermes 参照（三层记忆） | ① **Prompt memory**：`~/.hermes/memories/MEMORY.md`（agent 自己的笔记，**2200 字符** ≈ 800 tokens）+ `USER.md`（用户画像，**1375 字符** ≈ 500 tokens），以**冻结快照**注入系统提示 —— 会话中途写入只落盘、**不改系统提示**（就是为了保住前缀缓存）；条目用 `§` 分隔；上限是**字符数**不是 token；`memory` 工具只有 `add` / `replace` / `remove`，**没有 `read`**（内容本来就在提示里）。② **Skills**：`~/.hermes/skills/<name>/SKILL.md`，可自主创建/改进。③ **Session search**：`~/.hermes/state.db`（SQLite），`messages` 表存全量消息 + **FTS5 虚拟表** `messages_fts(content)`（内容由触发器拼 `content + tool_name + tool_calls`）+ 第二张 `tokenize='trigram'` 的表专供 **CJK 子串检索**；工具是 `session_search`（discovery / window / bookend 三形态） |
-| Hermes 自动写入机制 | **不是定时器**，是**每轮后台复盘 fork**：`memory.nudge_interval`（默认 10 轮）触发，fork 里**只允许 `memory` 与 `skill_manage` 两个工具**（`agent/background_review.py:401`） |
-| Hermes 有意不做的 | 内核**不引向量库 / embedding**（无语义检索）；语义检索只存在于可插拔的外部 provider（Honcho / mem0 等）内部，且 `MemoryManager` **同时只允许 1 个外部 provider** |
-| Lunac 映射与差距 | Lunac 原有历史是 `ModuleData\history\chat-history.json` —— **单个 JSON 文件**（Rust `load_chat_sessions` / `save_chat_sessions`），与 SQLite + FTS5 差一个数量级；历史变大后**全量读改写**本身就是性能问题 |
-| **第一步（不是做检索 UI）** | **已完成（2026-09-17）**。历史存储换成 **SQLite + FTS5**：库文件 `<exe 根>\ModuleData\history\chat.db`，实现在 [chat_db.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/chat_db.rs)（`rusqlite 0.40`，`bundled`）。实测确认该构建**带 FTS5**（`chat_db::tests::fts5_is_compiled_in` 查 `pragma_compile_options`）；两张索引表随写入由触发器同步 —— 默认 unicode61 + 第二张 `tokenize='trigram'` 专供 **CJK 子串检索**（照 Hermes 的做法；默认分词器对中文不切词，`MATCH` 永远命中 0）。旧 JSON 只在**库文件不存在**时导入一次（**迁移后保留旧文件不删**），因此 `chat-history.json` 从此不再是真相源。检索**接口暂未开放**（无界面调用），但索引已随写入维护，后续接 `session_search` 时不必回填。<br>**剩余**：② 把会话历史作为「长期记忆」注入（冻结快照式，遵守 ai-spec §11 规则 18/23 的前缀缓存纪律）；③ 照抄 Hermes 的**每轮后台复盘 fork**（`nudge_interval` 默认 10 轮，fork 里只放白名单工具）来触发写入 —— **不引定时器** |
-| 注入纪律 | 必须遵守前缀缓存纪律（ai-spec §11 规则 23）：会话中途写入只落盘、**不改系统提示**（Hermes 的冻结快照就是这个理由）；「自主学习」的触发点照抄**每轮后台复盘 fork**（不引定时器，按轮次门槛触发，fork 里只放白名单工具） |
-| 依赖 | 8.3（任务快照）+ SQLite 迁移。**五项里最大的一项，建议最后做** |
-
-### 8.6 建议顺序
-
-1. ~~**8.1 路径追踪** —— 无依赖、纯前端 + 一个 Rust 命令，用户直接可见~~ ✅ **已完成（2026-09-17）**
-2. ~~**8.3 任务快照** —— 8.2 的前置，可与 8.2 合并一次做完~~ ✅ **已完成（2026-09-17）**
-3. ~~**8.2 自动压缩（调模型摘要）**~~ ✅ **已完成（2026-09-18）** —— 见 §8.2 状态行：只在丢弃档 / 400 兜底档各触发**一次**，三道成本闸 + `LUNAC_SUMMARY_COMPACT` 开关 + 失败一律降级
-4. **8.5 对话数据库** —— 第一步（SQLite + FTS5 迁移）✅ 已完成（2026-09-17）；**剩余 ② 记忆注入（冻结快照式）+ ③ 每轮后台复盘 fork**
-5. **8.4 多任务并行** —— 依赖子代理框架 + 前端分栏，最后做
-
-> **§8 以外仍未完成的相关项**（不在本节排序内，列此防遗忘）：§2.1 的**写文件前安全扫描**（`core/security/scanContent()`）、§2.2 的 MCP 远程传输 / Skills fork·remote / 权限 hooks / 自动权限分类器 / 多模态输入、§3 的 `system/task_started`·`task_progress`、§1.1 的 `ListMcpResourcesTool`·`ReadMcpResourceTool`。
+*2026-09-20 追加（同日第五批）：**A4（每轮后台复盘 fork + 长期记忆）已完成并从本文删除** —— 落点 `<exe 根>\ModuleData\memory\MEMORY.md`（桥上的 `lunac/memory_read` / `lunac/memory_write` 两个自定义方法，不进 `tools/list`），启动时**冻结快照**注入系统提示词（与会话索引同纪律），写入侧新增**条件注册**的 `Remember` 工具；每 `LUNAC_NUDGE_INTERVAL`（默认 10）次**用户提问**在**提问之间**派一次后台复盘 fork（白名单工具 `Read`/`Glob`/`Grep`/`Write`/`Edit`/`Skill`/`Remember`、自己连一条桥、独立 `Cfg` 副本、不发 `task_*` 事件、审批走同一条 `can_use_tool` 通道随前端运行方式，**不引定时器**）。顺带修掉前端一处**与后端语义不一致**：`classifyRequest()` 的 `opaque`（判不出来的命令）在**自动档**也弹卡 ⇒ 现改为按档位判定（自动档放行，手动 / 白名单仍弹卡），危险命令的优先级不变 —— 见 agent-ui-spec §4.2。契约与实测在 `ai-spec.md` §3.5「长期记忆与后台复盘 fork」、纪律在 §11 规则 56。`cargo test`：core-agent **52 passed**、src-tauri **57 passed**。当前未落地 **12 项**（A5–A16）。*

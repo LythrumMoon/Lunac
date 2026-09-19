@@ -21,6 +21,9 @@ const MAX_DESC_CHARS: usize = 250;
 /// 技能清单在系统提示词里的总字符预算，超出部分只报数量
 const LISTING_BUDGET_CHARS: usize = 8_000;
 
+/// `Clone` 是为了后台复盘 fork：它在另一条线程上跑，需要自己那份技能清单
+/// （见 main.rs 的 `run_review_fork`）。
+#[derive(Clone)]
 pub struct Skill {
     /// 目录名 —— 模型调用 Skill 时用它
     pub key: String,

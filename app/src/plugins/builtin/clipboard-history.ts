@@ -111,7 +111,7 @@ export const clipboardHistoryPlugin: Plugin = {
           <span class="clip-item-icon" style="flex-shrink:0;font-size:1rem;">${icon}</span>
           <div class="clip-item-preview">${esc(preview)}</div>
           <div class="clip-item-meta">${timeStr}${sizeHint}</div>
-          <button class="clip-item-copy" data-idx="${i}" title="${t("clipboard.copy_tooltip")}">${isFile ? "📎 " : "📋 "}${t("clipboard.copy_label")}</button>
+          <button class="clip-item-copy" data-idx="${i}" title="${t("clipboard.copy_tooltip")}">${t("clipboard.copy_label")}</button>
         </div>`;
     }).join("");
 
@@ -143,12 +143,12 @@ export const clipboardHistoryPlugin: Plugin = {
             }
             (btn as HTMLElement).textContent = t("clipboard.copied");
             setTimeout(() => {
-              (btn as HTMLElement).textContent = `${entry.clip_type === "file" ? "📎 " : "📋 "}${t("clipboard.copy_label")}`;
+              (btn as HTMLElement).textContent = t("clipboard.copy_label");
             }, 1500);
           } catch {
             (btn as HTMLElement).textContent = t("clipboard.copy_failed");
             setTimeout(() => {
-              (btn as HTMLElement).textContent = `${entry.clip_type === "file" ? "📎 " : "📋 "}${t("clipboard.copy_label")}`;
+              (btn as HTMLElement).textContent = t("clipboard.copy_label");
             }, 1500);
           }
         });
@@ -164,7 +164,7 @@ export const clipboardHistoryPlugin: Plugin = {
             (el.querySelector(".clip-item-copy") as HTMLElement).textContent = t("clipboard.copied");
             setTimeout(() => {
               const btn = el.querySelector(".clip-item-copy") as HTMLElement;
-              if (btn) btn.textContent = `${entry.clip_type === "file" ? "📎 " : "📋 "}${t("clipboard.copy_label")}`;
+              if (btn) btn.textContent = t("clipboard.copy_label");
             }, 1500);
           } catch { /* ignore */ }
         });

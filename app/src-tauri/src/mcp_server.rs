@@ -107,6 +107,221 @@ fn load_tools() -> Vec<ToolDef> {
     tools
 }
 
+// ── Resources（A3，MCP 读侧）────────────────────────────────────────
+//
+// `resources/list` 把 `<exe 根>\tools\*.json` 报成 resource；`resources/read` 把其中
+// 一个**原样读回来**。为什么要有读侧：模型虽然能从 `mcp__*` 的工具 schema 知道每个用户
+// 工具的名字与入参，但**看不到 handler**（它到底跑哪条命令 / 打哪个 HTTP 端点），
+// 而 `tools\` 通常在**工作区之外** ⇒ 内置 `Read` 会被工作区锁直接拒掉。
+//
+// **安全边界（硬，不得放宽）**：`uri` 是**模型**给的，而模型会被它读到的文件内容
+// 提示注入 —— 所以这里只允许「`tools\` 目录内的 `.json` 文件」，其余一律拒。
+// 判据是 `canonicalize()` 之后比前缀（`..` 与符号链接都会被展开），不是字符串检查。
+
+/// 单个 resource 的读取上限。用户工具定义是小的 JSON（几 KB），给足余量即可；
+/// 真正超长的工具结果由 agent 侧的 `tools::apply_budget` 统一收口（落盘 + 头尾内联）。
+const MAX_RESOURCE_BYTES: u64 = 512 * 1024;
+
+/// 把 `uri` 解析成「`root` 之内的一个 `.json` 文件」。
+///
+/// 接受三种写法（模型不一定照抄我们给的 URI）：
+///   · `file:///C:/…/tools/foo.json`（`resources/list` 给出的原始形状）
+///   · `foo.json`
+///   · `foo`（后两种都在 `root` 下解析）
+///
+/// 拆成「只依赖 `root`、不碰全局状态」的纯函数是为了**可测** —— 边界条件（越界、
+/// 非 .json、目录、空串）都要有单测钉住，而 `tools_dir()` 依赖 exe 根、测试里不能碰。
+fn resolve_resource(root: &std::path::Path, uri: &str) -> Result<PathBuf, String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return Err("缺少 uri 参数".into());
+    }
+    let candidate = if let Some(rest) = trimmed.strip_prefix("file:///") {
+        PathBuf::from(rest)
+    } else if trimmed.contains("://") {
+        return Err(format!("只支持 file:// 资源，收到：{trimmed}"));
+    } else {
+        if trimmed.contains(['/', '\\']) {
+            return Err("资源名不得包含路径分隔符，请传 resources/list 给出的 uri".into());
+        }
+        root.join(format!("{}.json", trimmed.trim_end_matches(".json")))
+    };
+
+    // 必须落在 root 之内：canonicalize 会展开 `..` 与符号链接，比前缀才靠得住。
+    let real_root = root
+        .canonicalize()
+        .map_err(|e| format!("tools 目录不可用：{e}"))?;
+    let real = candidate
+        .canonicalize()
+        .map_err(|_| format!("资源不存在：{}", candidate.display()))?;
+    if !real.starts_with(&real_root) {
+        return Err(format!(
+            "拒绝访问：{} 不在 tools 目录内（只允许读该目录下的 .json）",
+            real.display()
+        ));
+    }
+    if !real.is_file() {
+        return Err(format!("不是文件：{}", real.display()));
+    }
+    if real.extension().map_or(true, |e| e != "json") {
+        return Err("只支持 .json 工具定义文件".into());
+    }
+    let size = fs::metadata(&real).map(|m| m.len()).unwrap_or(0);
+    if size > MAX_RESOURCE_BYTES {
+        return Err(format!(
+            "资源过大（{size} 字节，上限 {MAX_RESOURCE_BYTES}）"
+        ));
+    }
+    Ok(real)
+}
+
+/// `resources/read` 的 `result` 部分（规范形状 `{contents:[{uri,mimeType,text}]}`）。
+fn read_resource_result(uri: &str) -> Result<Value, String> {
+    let path = resolve_resource(&tools_dir(), uri)?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("读取失败：{e}"))?;
+    Ok(json!({
+        "contents": [{
+            "uri": format!("file:///{}", path.display()),
+            "mimeType": "application/json",
+            "text": text,
+        }]
+    }))
+}
+
+// ── 长期记忆（A4，2026-09-20）──────────────────────────────────────
+//
+// 落点 `<exe 根>\ModuleData\memory\MEMORY.md`（与 `history\chat.db` 同在 ModuleData 下），
+// 两个自定义方法（与 history 那两个同构：**不进 `tools/list`、不吃审批卡**）：
+//   · `lunac/memory_read`  —— agent 启动时注入系统提示词；复盘 fork 开跑前读一次
+//   · `lunac/memory_write` —— 内置工具 `Remember` 的后端，**按条目追加**
+//
+// 为什么是独立的小文本、而不是往 chat.db 里再开一张表（backlog §4 要求「照 SessionSearch
+// 那套设计」，指通道与冻结快照纪律，不是指存储介质）：两者**不是一类东西** ——
+//   · `chat.db` 是**原始流水**（全量、按会话、FTS5 检索，靠 `SessionSearch` 现查）；
+//   · `MEMORY.md` 是从流水里**提炼出来的少量结论**（用户偏好 / 项目约定 / 踩过的坑）。
+//     流水里没有「哪句值得留」这个判断，提炼那一步正是 A4 复盘 fork 的职责。
+// 选文本而非 DB 的现实理由：① 它要进**系统提示词的固定前缀**（启动时读一次、进程内冻结），
+// 必须是一段稳定纯文本；② 用户要能直接读、直接改（Hermes 的分层同款）；③ 写入是
+// 「追加 + 上限」的小文件，为它开表属过度设计。
+//
+// **上限是硬闸，不是提示**：这段内容每轮都随系统提示词重发，无限增长会同时吃掉上下文与
+// 命中率。超限**报错**而不是静默截断 —— 静默截断会让模型以为已经记住了。
+
+const MEMORY_FILE: &str = "MEMORY.md";
+/// 单条记忆上限（一条通常只有一两句；超过这个量级说明该拆成多条或先提炼）
+const MAX_MEMORY_ENTRY_CHARS: usize = 2_000;
+/// 记忆文件上限 ≈ 1500 token（占 128k 预算的 1.2%）。注入侧同口径 —— 文件整段进固定前缀。
+const MAX_MEMORY_CHARS: usize = 6_000;
+
+fn memory_path() -> PathBuf {
+    crate::storage::module_data_dir().join("memory").join(MEMORY_FILE)
+}
+
+/// 读记忆全文（不存在 ⇒ 空串，属全新安装的正常情况）。
+///
+/// 与 `resolve_resource` 同理拆出「只依赖 path」的形态：单测必须能指向临时目录，
+/// 绝不能碰真实的 `<exe 根>\ModuleData`（那是用户数据）。
+fn read_memory_at(path: &std::path::Path) -> Result<String, String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(path).map_err(|e| format!("读取记忆失败：{e}"))
+}
+
+fn read_memory() -> Result<String, String> {
+    read_memory_at(&memory_path())
+}
+
+/// 追加（或整体替换）一条记忆。
+///
+/// 去重按**整条条目**比对：复盘 fork 每 10 轮跑一次，很容易把同一条事实反复写进来，
+/// 而重复条目既占上限又稀释提示词。
+fn write_memory_at(
+    path: &std::path::Path,
+    content: &str,
+    replace: bool,
+) -> Result<String, String> {
+    let text = content.trim();
+    if text.is_empty() {
+        return Err("缺少 content 参数：要记的内容不能为空".into());
+    }
+    let len = text.chars().count();
+    let existing = read_memory_at(path).unwrap_or_default();
+
+    let next = if replace {
+        if len > MAX_MEMORY_CHARS {
+            return Err(format!(
+                "替换内容过长（{len} 字符 > 上限 {MAX_MEMORY_CHARS}）：先精简再写"
+            ));
+        }
+        format!("{text}\n")
+    } else {
+        if len > MAX_MEMORY_ENTRY_CHARS {
+            return Err(format!(
+                "单条记忆过长（{len} 字符 > 上限 {MAX_MEMORY_ENTRY_CHARS}）：请拆成多条，或先提炼成结论"
+            ));
+        }
+        // 多行条目缩进成一条 bullet，保证「一行 = 一条」这个形状不被破坏
+        let bullet = format!("- {}", text.replace('\n', "\n  "));
+        if existing.contains(&bullet) {
+            return Ok("(already remembered — nothing changed)".into());
+        }
+        let mut head = existing.clone();
+        if !head.is_empty() && !head.ends_with('\n') {
+            head.push('\n');
+        }
+        let merged = format!("{head}{bullet}\n");
+        if merged.chars().count() > MAX_MEMORY_CHARS {
+            return Err(format!(
+                "长期记忆已满（{} 字符上限）：先用 `Remember` 的 `replace` 模式整理合并，再追加新条目",
+                MAX_MEMORY_CHARS
+            ));
+        }
+        merged
+    };
+
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("建记忆目录失败 {e}"))?;
+    }
+    fs::write(path, next.as_bytes()).map_err(|e| format!("写入记忆失败：{e}"))?;
+    Ok(format!(
+        "{} 记忆已保存（{} 字符）。",
+        if replace { "整体替换：" } else { "追加一条：" },
+        next.chars().count()
+    ))
+}
+
+fn write_memory_entry(content: &str, replace: bool) -> Result<String, String> {
+    write_memory_at(&memory_path(), content, replace)
+}
+
+/// 分派长期记忆的自定义方法（形状与 `handle_history_method` 一致：错误走
+/// `result + isError`，因为这是「这次没写成」，不是「方法不存在」）。
+fn handle_memory_method(method: &str, params: Option<&Value>) -> Result<String, String> {
+    match method {
+        "lunac/memory_read" => {
+            let text = read_memory()?;
+            if text.trim().is_empty() {
+                Ok("(long-term memory is empty)".into())
+            } else {
+                Ok(text)
+            }
+        }
+        "lunac/memory_write" => {
+            let content = params
+                .and_then(|p| p.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let replace = params
+                .and_then(|p| p.get("replace"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            write_memory_entry(content, replace)
+        }
+        other => Err(format!("未知记忆方法: {other}")),
+    }
+}
+
 // ── Tool executor ─────────────────────────────────────────────────
 
 fn resolve_template(template: &str, params: &Value) -> String {
@@ -594,6 +809,139 @@ fn build_tools_list(tools: &[ToolDef]) -> Value {
     json!({ "tools": items, "nextCursor": null })
 }
 
+// ── 往期会话检索（自定义方法，2026-09-19，A2）──────────────────────
+//
+// 这两个方法**不进 `tools/list`**，因此不会出现在用户的工具列表里、也不经过审批卡。
+//
+// 为什么不做成 `<exe 根>\tools\*.json` 里的用户工具：
+//   ① 那是**用户**的工具目录 —— 内置能力混进去，用户能在 Tool Editor 里改坏或删掉；
+//   ② MCP 工具的调用在 core-agent 里**一律要弹审批卡**（`needs_approval` 对 `mcp__*`
+//      恒真），而「读自己本地的会话历史」与 `Read` / `Grep` 同级，不该每问一句就打扰一次。
+// 所以走自定义方法，由 agent 侧注册成一等公民工具 `SessionSearch`（免审批、串行）。
+
+/// `history_search` 单次返回的消息条数默认值与上限（上限防模型一次要太多把上下文吃掉）。
+const HISTORY_SEARCH_DEFAULT_LIMIT: usize = 10;
+const HISTORY_SEARCH_MAX_LIMIT: usize = 30;
+/// 注入系统提示词的「往期会话索引」：最多列多少条会话、总字符预算。
+///
+/// 预算刻意压得小（≈500 token）：这段属于**每轮都发**的固定前缀。虽然它会被前缀缓存
+/// 覆盖，但冷启动那一轮要实打实付这笔钱，而且它会挤占其它内容的可见度。
+const HISTORY_INDEX_SESSIONS: usize = 20;
+const HISTORY_INDEX_BUDGET_CHARS: usize = 2000;
+
+/// 现在（毫秒）。与前端 `Date.now()` 同口径 —— 会话的 `created_at` 就是这么存的。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 相对天数标签（与 `chat_db::render_digest` 内部同口径，检索结果里也要用）。
+fn rel_age(created_at: u64, now: u64) -> String {
+    match now.saturating_sub(created_at) / 86_400_000 {
+        0 => "today".into(),
+        1 => "1d ago".into(),
+        n => format!("{n}d ago"),
+    }
+}
+
+/// 把检索命中渲染成给模型看的文本：**按会话分组**，方便它一眼看出「这些是同一段对话」。
+fn render_hits(query: &str, hits: &[crate::chat_db::HistoryHit], now: u64) -> String {
+    if hits.is_empty() {
+        return format!(
+            "No past message matched \"{query}\".\n\
+             (Searched this app's own chat history only — not files on disk.)"
+        );
+    }
+    let mut out = format!(
+        "{} matching message(s) for \"{query}\" in past sessions (newest first).\n\
+         Note: messages are truncated; re-run with a narrower query if you need more.",
+        hits.len()
+    );
+    let mut cur = String::new();
+    for h in hits {
+        if h.session_id != cur {
+            cur = h.session_id.clone();
+            let title = if h.title.trim().is_empty() {
+                "(untitled)"
+            } else {
+                h.title.trim()
+            };
+            out.push_str(&format!(
+                "\n\n## {}  [{}]\n",
+                title,
+                rel_age(h.created_at, now)
+            ));
+        }
+        out.push_str(&format!("- {} #{}: {}\n", h.role, h.idx, h.content.trim()));
+    }
+    out
+}
+
+/// 分派往期会话检索的自定义方法。
+fn handle_history_method(method: &str, params: Option<&Value>) -> Result<String, String> {
+    let db = crate::storage::chat_db_path();
+    match method {
+        "lunac/history_search" => {
+            let query = params
+                .and_then(|p| p.get("query"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if query.is_empty() {
+                return Err("缺少 query 参数：需要传入要在往期会话里检索的关键词".into());
+            }
+            let limit = params
+                .and_then(|p| p.get("limit"))
+                .and_then(Value::as_u64)
+                .unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT as u64)
+                .clamp(1, HISTORY_SEARCH_MAX_LIMIT as u64) as usize;
+            let hits = crate::chat_db::search(&db, &query, limit)?;
+            Ok(render_hits(&query, &hits, now_ms()))
+        }
+        "lunac/history_index" => {
+            // 库还不存在（全新安装）⇒ 空库、什么都不注入，属正常情况。
+            let briefs = crate::chat_db::recent_sessions(&db, HISTORY_INDEX_SESSIONS)?;
+            Ok(crate::chat_db::render_digest(
+                &briefs,
+                HISTORY_INDEX_BUDGET_CHARS,
+                now_ms(),
+            ))
+        }
+        other => Err(format!("未知历史方法: {other}")),
+    }
+}
+
+/// 自定义方法的成功回包（形状与 `tools/call` 一致）。
+fn text_ok(id: Option<Value>, text: String) -> McpResponse {
+    McpResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: Some(json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": false
+        })),
+        error: None,
+    }
+}
+
+/// 自定义方法的失败回包：**用 `result + isError`，不用 JSON-RPC error**。
+/// 语义区别 —— 这是「这次没做成」（库打不开 / 参数缺失 / 记忆已满），不是「方法不存在」；
+/// 走 error 会让 agent 侧把它当成桥坏了。
+fn text_err(id: Option<Value>, msg: String) -> McpResponse {
+    McpResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: Some(json!({
+            "content": [{ "type": "text", "text": msg }],
+            "isError": true
+        })),
+        error: None,
+    }
+}
+
 fn handle_request(req: &McpRequest, tools: &[ToolDef]) -> McpResponse {
     match req.method.as_deref() {
         Some("initialize") => McpResponse {
@@ -686,6 +1034,50 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef]) -> McpResponse {
                 error: None,
             }
         }
+        // 读侧（A3）：`uri` 来自**模型**，因此边界检查在 `read_resource_result` 里
+        // （只允许 tools 目录内的 .json）。错误走 JSON-RPC error（这是标准方法，
+        // 不是工具调用 —— 工具调用才用 `result + isError`）。
+        Some("resources/read") => {
+            let uri = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("uri"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match read_resource_result(uri) {
+                Ok(result) => McpResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    result: Some(result),
+                    error: None,
+                },
+                Err(message) => McpResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    result: None,
+                    error: Some(McpError {
+                        code: -32002,
+                        message,
+                    }),
+                },
+            }
+        }
+        // 往期会话检索：**自定义方法，不列进 tools/list**（见 handle_history_method 的注释）。
+        Some(m) if m.starts_with("lunac/history_") => {
+            let method = m.to_string();
+            match handle_history_method(&method, req.params.as_ref()) {
+                Ok(text) => text_ok(req.id.clone(), text),
+                Err(msg) => text_err(req.id.clone(), msg),
+            }
+        }
+        // 长期记忆（A4）：同上，**自定义方法，不列进 tools/list**（见 handle_memory_method）。
+        Some(m) if m.starts_with("lunac/memory_") => {
+            let method = m.to_string();
+            match handle_memory_method(&method, req.params.as_ref()) {
+                Ok(text) => text_ok(req.id.clone(), text),
+                Err(msg) => text_err(req.id.clone(), msg),
+            }
+        }
         _ => {
             // Notifications (no id) should be silently ignored per MCP spec
             if req.id.is_some() {
@@ -759,3 +1151,119 @@ pub fn run_stdio() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `resources/read` 的**安全边界**（A3，2026-09-20）。`uri` 是模型给的，而模型会被
+    /// 读到的文件内容提示注入 ⇒ 「只能读 tools 目录内的 .json」这条必须由单测钉死，
+    /// 否则一次改动就可能把任意文件读取能力悄悄放出去。
+    ///
+    /// 用临时目录而不是 `tools_dir()`：后者指向真实 exe 根，测试不许碰用户数据。
+    #[test]
+    fn resources_read_is_confined_to_the_tools_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "lunac-mcp-res-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("deploy.json"), "{\"name\":\"deploy\"}").unwrap();
+        fs::write(root.join("readme.md"), "not a tool").unwrap();
+        // 目录外的诱饵：越界读取如果成功，就是这条测试要抓的回归
+        fs::write(&outside, "secret").unwrap();
+
+        // ① 三种合法写法都要能解析到同一个文件
+        for uri in [
+            format!("file:///{}", root.join("deploy.json").display()),
+            "deploy.json".to_string(),
+            "deploy".to_string(),
+        ] {
+            let got = resolve_resource(&root, &uri).unwrap_or_else(|e| panic!("{uri} 应可解析: {e}"));
+            assert_eq!(got, root.join("deploy.json").canonicalize().unwrap());
+        }
+
+        // ② 越界 / 非 .json / 目录 / 空串 / 别的 scheme 一律拒
+        for bad in [
+            format!("file:///{}", outside.display()),
+            format!("file:///{}/../{}", root.display(), outside.file_name().unwrap().to_string_lossy()),
+            "readme.md".to_string(),
+            "readme".to_string(),
+            String::new(),
+            "https://example.com/x.json".to_string(),
+            "..\\deploy".to_string(),
+            "sub/deploy.json".to_string(),
+        ] {
+            assert!(
+                resolve_resource(&root, &bad).is_err(),
+                "必须拒绝：{bad:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside);
+    }
+
+    /// 长期记忆的**追加 / 去重 / 上限**三条硬行为（A4，2026-09-20）。
+    /// 用临时目录而不是 `memory_path()`：后者指向真实 ModuleData，测试不许碰用户数据。
+    #[test]
+    fn memory_appends_dedupes_and_enforces_the_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-mcp-mem-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = dir.join("MEMORY.md");
+
+        // ① 文件不存在 ⇒ 读到空串（全新安装的正常情况，不是错误）
+        assert_eq!(read_memory_at(&file).unwrap(), "");
+
+        // ② 追加两条 ⇒ 逐条成行，先写的在前
+        assert!(write_memory_at(&file, "用户偏好中文", false).is_ok());
+        assert!(write_memory_at(&file, "项目用 Rust", false).is_ok());
+        let text = read_memory_at(&file).unwrap();
+        assert_eq!(text, "- 用户偏好中文\n- 项目用 Rust\n");
+
+        // ③ 同一条重写 ⇒ 不改文件（去重）
+        let before = text.clone();
+        assert!(write_memory_at(&file, "用户偏好中文", false).unwrap().contains("already"));
+        assert_eq!(read_memory_at(&file).unwrap(), before, "重复条目不得写进去");
+
+        // ④ 空条目 / 超长单条 / 超长替换 ⇒ 拒绝（**不许静默截断**）
+        assert!(write_memory_at(&file, "   ", false).is_err());
+        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false).is_err());
+        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_CHARS + 1), true).is_err());
+
+        // ⑤ 写满再追加 ⇒ 报错（而不是悄悄丢掉旧条目）
+        // 每条都不同 —— 相同的条目会被去重挡掉（③），那样这条测试就变成测去重了。
+        let filler = "y".repeat(400);
+        let mut wrote = 0;
+        loop {
+            let entry = format!("{filler}{wrote}");
+            if write_memory_at(&file, &entry, false).is_err() {
+                break;
+            }
+            wrote += 1;
+            if wrote > 50 {
+                panic!("上限没有生效：一直写得进去");
+            }
+        }
+        assert!(read_memory_at(&file).unwrap().chars().count() <= MAX_MEMORY_CHARS);
+        assert!(wrote > 0, "上限之前应当还能写进去几条");
+
+        // ⑥ replace 模式：整体替换，旧内容不再保留
+        assert!(write_memory_at(&file, "- 只剩这一条", true).is_ok());
+        assert_eq!(read_memory_at(&file).unwrap(), "- 只剩这一条\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+

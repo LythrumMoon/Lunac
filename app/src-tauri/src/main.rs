@@ -13,6 +13,7 @@ mod icon_extractor;
 mod proxy_server;
 mod storage;
 mod chat_db;
+mod appearance;
 mod auto_start;
 mod mcp_server;
 mod windows_ocr;
@@ -30,8 +31,10 @@ use commands::{
     set_workspace, get_workspace, set_tool_blacklist,
     search_apps, launch_app, add_custom_app, remove_custom_app, list_custom_apps,
     get_app_icon,
+    get_file_thumbnail,
     search_files, file_index_status, refresh_file_index,
-    system_catalog, open_setting, run_system_action, reveal_in_explorer,
+    system_catalog, open_setting, run_system_action, run_system_action_elevated,
+    launch_app_elevated, reveal_in_explorer,
     set_hotkey_combo, get_hotkey_combo,
     set_auto_start, get_auto_start_info,
     check_file_exists,
@@ -417,12 +420,15 @@ fn main() {
             remove_custom_app,
             list_custom_apps,
             get_app_icon,
+            get_file_thumbnail,
             search_files,
             file_index_status,
             refresh_file_index,
             system_catalog,
             open_setting,
             run_system_action,
+            run_system_action_elevated,
+            launch_app_elevated,
             reveal_in_explorer,
             storage::save_chat_sessions,
             storage::load_chat_sessions,
@@ -462,6 +468,9 @@ fn main() {
             ocr_engine_status,
             ocr_engine_install,
             hide_lunac,
+            appearance::get_system_theme,
+            appearance::list_themes,
+            appearance::themes_dir,
             commands::log_frontend,
         ])
         .run(tauri::generate_context!())

@@ -32,6 +32,12 @@ const MAX_DEPTH: usize = 12;
 const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// 结果条数上限（前端 limit 的硬上限）
 const MAX_RESULTS: usize = 200;
+/// 模糊（子序列）/ 拼音兜底的查询长度上限：更长的查询靠模糊命中只会是噪声。
+const FUZZY_MAX_QUERY_LEN: usize = 12;
+/// 拼音兜底**每次搜索最多转换多少个文件名**。`pinyin` crate 的转换要分配字符串，
+/// 而索引上限是 30 万条 —— 不封顶的话每次击键都会在工作线程里白烧几十毫秒。
+/// 封顶后 `zjl` 这类拼音查询仍能命中（名字里带汉字的条目在索引里本来就占少数）。
+const PINYIN_SCAN_CAP: usize = 30_000;
 
 /// 跳过的目录名（全部小写比较）。这些都是「扫了没用却极贵」的重目录。
 const SKIP_DIRS: &[&str] = &[
@@ -507,7 +513,76 @@ fn score_name(name: &str, tokens: &[&str]) -> Option<i32> {
     None
 }
 
+/// 子序列（模糊）匹配打分 —— 查询的字符按**顺序**出现在名字里即可命中，允许中间插字。
+/// `zjl` 能命中「最近记录列表」。返回 `None` = 不构成子序列。
+///
+/// 分数刻意落在 200 一档（低于「包含」的 500 一档）：模糊命中永远是兜底，
+/// 不能把精确命中的结果挤下去。跨度越大、名字越长扣分越多。
+fn score_subsequence(name: &str, q: &str) -> Option<i32> {
+    if q.is_empty() {
+        return None;
+    }
+    let mut want = q.chars();
+    let mut cur = want.next();
+    let mut first = 0usize;
+    let mut last = 0usize;
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    for (i, c) in name.chars().enumerate() {
+        total = i + 1;
+        let Some(w) = cur else { break };
+        if c.eq_ignore_ascii_case(&w) {
+            if matched == 0 {
+                first = i;
+            }
+            last = i;
+            matched += 1;
+            cur = want.next();
+        }
+    }
+    if cur.is_some() {
+        return None; // 还有没匹配上的字符
+    }
+    let span = last - first + 1;
+    let gaps = span - matched;
+    Some(200 - (gaps as i32).min(80) - (total.min(80) as i32) / 4)
+}
+
+/// 拼音兜底打分：名字里有汉字时，用全拼 / 首字母各试一遍。
+/// 分数落在 300 一档（低于「包含」的 500）：拼音是「猜用户想打什么」，不是直接匹配。
+///
+/// **首字母整体比全拼低一档**（340 / 300）：「weixin」命中「微信截图」比「wx」命中更确定，
+/// 而 `wx` 这类两字母首字母几乎能匹配一大片中文名，不给它降档就会把全拼命中盖掉。
+///
+/// 只对含汉字的条目生效（`has_chinese` 先判一次），所以纯英文文件名零开销。
+fn score_pinyin(name: &str, q: &str) -> Option<i32> {
+    if !crate::app_indexer::has_chinese(name) {
+        return None;
+    }
+    let tokens = crate::app_indexer::generate_pinyin_tokens(name);
+    let mut best: Option<i32> = None;
+    for (idx, t) in tokens.iter().enumerate() {
+        // tokens[0] = 全拼，tokens[1]（若存在）= 首字母
+        let base = if idx == 0 { 340 } else { 300 };
+        let s = if eq_ci(t, q) {
+            base
+        } else if starts_with_ci(t, q) {
+            base - 20 - t.len().min(40) as i32
+        } else if let Some(pos) = find_ci(t, q) {
+            base - 60 - pos.min(60) as i32
+        } else {
+            continue;
+        };
+        best = Some(best.map_or(s, |b: i32| b.max(s)));
+    }
+    best
+}
+
 /// 在给定集合上排序取前 N（纯函数，单测用）。`dirs` 提供目录表以拼回完整路径。
+///
+/// 两轮：**第一轮**是精确 / 前缀 / 包含 / 多词全中（语义与 2026-09-15 定稿一致，
+/// 零分配）；只有第一轮**没凑够 limit** 时才跑**第二轮**兜底 —— 模糊子序列 + 拼音。
+/// 这条门控很重要：单字母查询在第一轮就已经填满 200 条，不该再为它多扫一遍全表。
 fn rank(
     dirs: &[String],
     entries: &[FileEntry],
@@ -518,22 +593,78 @@ fn rank(
     let raw = query.trim();
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let wanted = kind.filter(|k| !k.is_empty());
-    let mut hits: Vec<(i32, &FileEntry)> = Vec::new();
-    for e in entries {
+    // 命中项的 `entries` 下标（用于第二轮去重，避免同一条被两轮各推一次）
+    let mut hits: Vec<(i32, usize)> = Vec::new();
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, e) in entries.iter().enumerate() {
         if let Some(k) = wanted {
             if e.kind.as_str() != k {
                 continue;
             }
         }
         if let Some(score) = score_name(&e.name, &tokens) {
-            hits.push((score, e));
+            seen.insert(i);
+            hits.push((score, i));
         }
     }
+
+    // ── 第二轮：模糊（子序列）+ 拼音兜底 ─────────────────────────────
+    if !tokens.is_empty() && hits.len() < limit {
+        let tokens_l: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+        let single = tokens_l.len() == 1;
+        let q_all = &tokens_l[0];
+        // 拼音只在「单 token + 纯 ASCII + 长度合理」时试 —— 多词/带标点的查询
+        // 走拼音没有意义，徒增开销。
+        let allow_pinyin =
+            single && q_all.len() >= 2 && q_all.len() <= FUZZY_MAX_QUERY_LEN
+                && q_all.chars().all(|c| c.is_ascii_alphanumeric());
+        let mut pinyin_budget = PINYIN_SCAN_CAP;
+        for (i, e) in entries.iter().enumerate() {
+            if seen.contains(&i) {
+                continue;
+            }
+            if let Some(k) = wanted {
+                if e.kind.as_str() != k {
+                    continue;
+                }
+            }
+            let mut score = if single {
+                score_subsequence(&e.name, q_all)
+            } else {
+                // 多词：每个词都必须是子序列（与第一轮的「多词全中」同语义）
+                let mut total = 0i32;
+                let mut ok = true;
+                for t in &tokens_l {
+                    match score_subsequence(&e.name, t) {
+                        Some(v) => total += v,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok { Some(total / tokens_l.len() as i32) } else { None }
+            };
+            if score.is_none() && allow_pinyin && pinyin_budget > 0 {
+                pinyin_budget -= 1;
+                score = score_pinyin(&e.name, q_all);
+            }
+            if let Some(s) = score {
+                seen.insert(i);
+                hits.push((s, i));
+            }
+        }
+    }
+
     // 同分时新修改的排前面（空查询=「最近文件」，就靠 modified 排序）
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.modified.cmp(&a.1.modified)));
+    hits.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| entries[b.1].modified.cmp(&entries[a.1].modified))
+    });
     hits.into_iter()
         .take(limit)
-        .map(|(_, e)| {
+        .map(|(_, i)| {
+            let e = &entries[i];
             let dir = dirs.get(e.dir as usize).map(String::as_str).unwrap_or("");
             FileHit {
                 name: e.name.clone(),
@@ -708,6 +839,58 @@ mod tests {
         assert_eq!(clamp_limit(0), 1);
         assert_eq!(clamp_limit(usize::MAX), MAX_RESULTS);
         assert_eq!(clamp_limit(30), 30);
+    }
+
+    /// 子序列打分：顺序命中即算，顺序不对/字符缺失不命中；且**永远低于「包含」档（500）**
+    #[test]
+    fn subsequence_matching_is_a_fallback_tier() {
+        assert!(score_subsequence("最近记录列表.docx", "zjl").is_none(), "中文名不吃 ASCII 子序列");
+        assert!(score_subsequence("recent-journal-list.md", "zjl").is_none(), "没有 z 就不该命中");
+        let s = score_subsequence("Zebra Journal List.md", "zjl").expect("z-j-l 按顺序出现");
+        assert!((100..200).contains(&s), "子序列必须落在包含档之下，实测 {s}");
+        assert!(s < 500, "模糊命中不得盖过包含命中");
+        assert!(score_subsequence("abc", "").is_none(), "空查询不算子序列命中");
+    }
+
+    /// 拼音兜底：全拼（weixin）与首字母（wx）都能命中含汉字的文件名，全拼更确定
+    #[test]
+    fn pinyin_fallback_matches_full_and_initials() {
+        let full = score_pinyin("微信截图.png", "weixin").expect("全拼应命中");
+        let initial = score_pinyin("微信截图.png", "wx").expect("首字母应命中");
+        assert!(full > initial, "全拼比首字母更确定：{full} vs {initial}");
+        assert!(full < 500, "拼音是兜底档，不得盖过包含命中");
+        assert!(score_pinyin("report.docx", "weixin").is_none(), "无汉字不产生拼音命中");
+    }
+
+    /// 第一轮没凑够才跑兜底：精确/前缀/包含优先，模糊只补空缺
+    #[test]
+    fn fuzzy_only_fills_the_gap_left_by_exact_passes() {
+        let entries = vec![
+            hit("report.docx", Kind::Document, 1),
+            hit("recent-journal-list.md", Kind::Document, 2),
+        ];
+        // "report" 有精确命中；另一条既不含 report、也不是 report 的子序列 → 只出一条
+        assert_eq!(rank_names(&entries, "report", None), vec!["report.docx"]);
+        // "rjl" 第一轮零命中 → 走子序列兜底，命中 recent-journal-list
+        assert_eq!(rank_names(&entries, "rjl", None), vec!["recent-journal-list.md"]);
+        // 兜底轮跑完后，精确命中的那条仍排在模糊命中的前面
+        let both = vec![
+            hit("rjl-report.docx", Kind::Document, 1),
+            hit("recent-journal-list.md", Kind::Document, 2),
+        ];
+        assert_eq!(
+            rank_names(&both, "rjl", None)[0],
+            "rjl-report.docx",
+            "前缀命中必须压过子序列命中"
+        );
+    }
+
+    /// 拼音兜底走的是同一轮门控（`zjt` 这种查询在第一轮必然零命中）
+    #[test]
+    fn pinyin_entries_reach_the_ranking_through_the_fallback_pass() {
+        let entries = vec![hit("微信截图.png", Kind::Image, 3)];
+        assert_eq!(rank_names(&entries, "weixin", None), vec!["微信截图.png"]);
+        assert_eq!(rank_names(&entries, "wx", None), vec!["微信截图.png"]);
     }
 
     /// 真机扫盘烟测（默认 `#[ignore]`，只在手动验索引时跑）：

@@ -939,6 +939,30 @@ pub fn run_system_action(id: String) -> Result<(), String> {
     crate::system_catalog::run_action(&id)
 }
 
+/// **以管理员身份运行**一个系统动作（`runas`，会弹 UAC）。
+///
+/// 只认 `system_catalog()` 里的动作 id，且**只有 `CatalogItem::elevatable == true`
+/// 的那些能执行**（判据与目录同源，见 `system_catalog::run_action_elevated`）——
+/// 前端多传一个 id 也只会拿到 Err，不会变成「任意命令的提权执行入口」。
+/// `(async)`：`ShellExecuteW(runas)` 会阻塞等 UAC 交互，绝不能占主线程。
+#[tauri::command(async)]
+pub fn run_system_action_elevated(id: String) -> Result<(), String> {
+    crate::system_catalog::run_action_elevated(&id)
+}
+
+/// **以管理员身份运行**任意启动目标（.exe / .lnk / .msc / .cpl / URL）。
+/// 详细搜索里对「应用 / 文件 / 插件命令」结果的提权入口（Shift+Enter）。
+/// 与 `launch_app` 同一信任边界（入参来自我们自己的 WebView 前端），
+/// 额外的一层闸门是 UAC 本身。`(async)` 理由同 `run_system_action_elevated`。
+#[tauri::command(async)]
+pub fn launch_app_elevated(path: String) -> Result<(), String> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err("路径为空".into());
+    }
+    crate::app_indexer::launch_elevated(raw, None)
+}
+
 /// 在资源管理器中**定位并选中**一个文件（backlog §8.1「被改动文件的路径追踪」）。
 ///
 /// 入参来自模型在 `Write` / `Edit` 的 `tool_use` 里给出的 `file_path`，属**外部输入**，
@@ -1010,6 +1034,14 @@ pub fn list_custom_apps() -> Vec<AppEntry> {
 #[tauri::command]
 pub fn get_app_icon(path: String) -> Result<Option<String>, String> {
     Ok(crate::icon_extractor::extract_icon_base64(&path))
+}
+
+/// 文件缩略图（详细搜索右侧预览区）：图片真解码、其余回落系统类型图标。
+/// `max` = 长边像素上限。`(async)` —— 解码 + 缩放是 CPU 密集的，
+/// 不能占着主线程（详细搜索每移动一次选中行就会调一次）。
+#[tauri::command(async)]
+pub fn get_file_thumbnail(path: String, max: u32) -> Result<Option<String>, String> {
+    Ok(crate::icon_extractor::extract_thumbnail_base64(&path, max))
 }
 
 // ── Query / recording / plugin / detached / chips state ──────────

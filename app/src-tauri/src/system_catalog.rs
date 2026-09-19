@@ -23,6 +23,9 @@ pub struct CatalogItem {
     pub target: String,
     /// 危险动作（关机 / 重启）：前端必须二次确认
     pub danger: bool,
+    /// **是否有「以管理员身份运行」形态**（`run_action_elevated` 能执行它）。
+    /// 由 `action_spec()` 推导，**不在表里手写** —— 手写必然与执行表漂移。
+    pub elevatable: bool,
     /// 搜索关键词（zh + en + 拼音首字母，命中任一即可）
     pub keywords: Vec<String>,
 }
@@ -36,6 +39,8 @@ fn setting(id: &str, icon: &str, zh: &str, en: &str, uri: &str, kw: &[&str]) -> 
         title_en: en.into(),
         target: uri.into(),
         danger: false,
+        // ms-settings: 页面是 Windows 自己拉起的设置宿主，没有提权形态
+        elevatable: false,
         keywords: kw.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -49,9 +54,86 @@ fn action(id: &str, icon: &str, zh: &str, en: &str, kw: &[&str], danger: bool) -
         title_en: en.into(),
         target: id.into(),
         danger,
+        elevatable: has_elevated_form(id),
         keywords: kw.iter().map(|s| s.to_string()).collect(),
     }
 }
+
+// ── 动作执行表 ────────────────────────────────────────────────────
+//
+// **新增一个动作 = 在 `all()` 里加一条 + 在 `action_spec()` 里加一个分支**，
+// 不要再往 `run_action()` 里堆 `match` 分支 —— 两种启动形态（普通 / 提权）
+// 必须读同一张表，否则「界面上写着能以管理员运行、执行时却说没有提权形态」。
+
+/// 一个动作怎么被拉起来。
+enum Launch {
+    /// 命令行 argv —— 用 `Command::spawn` 起，**不走 shell**（无拼接面）
+    Argv(&'static [&'static str]),
+    /// 交给 `ShellExecuteW` 的 `"open"` verb —— `.msc` / `.cpl` / `shell:` 这类
+    /// 由 Windows 自己解析的目标必须走这条（`Command::spawn` 起不来 .msc）
+    Shell(&'static str),
+}
+
+struct ActionSpec {
+    launch: Launch,
+    /// 「以管理员身份运行」的形态；`None` = 该动作没有提权形态。
+    /// 注意：`runas` 一律弹 UAC，所以只给「真的需要管理员」的东西开这一档。
+    elevate: Option<Launch>,
+}
+
+/// 动作 id → 启动描述。**这是动作的唯一真相源**（见上方注释）。
+fn action_spec(id: &str) -> Option<ActionSpec> {
+    // 可 `open` 可提权的常规目标（exe / msc / cpl）
+    let both = |f: &'static str| ActionSpec {
+        launch: Launch::Shell(f),
+        elevate: Some(Launch::Shell(f)),
+    };
+    // 只能普通打开（不需要 / 不该提权，比如 shell: 命名空间、娱乐性动作）
+    let plain = |f: &'static str| ActionSpec {
+        launch: Launch::Shell(f),
+        elevate: None,
+    };
+    // 自带 argv、不提权（rundll32 / shutdown 这类不该也不需要在提权环境跑）
+    let argv = |a: &'static [&'static str]| ActionSpec {
+        launch: Launch::Argv(a),
+        elevate: None,
+    };
+    Some(match id {
+        // ── 电源 / 会话（不提权）──
+        "act.lock" => argv(&["rundll32.exe", "user32.dll,LockWorkStation"]),
+        "act.sleep" => argv(&["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]),
+        "act.shutdown" => argv(&["shutdown.exe", "/s", "/t", "0"]),
+        "act.restart" => argv(&["shutdown.exe", "/r", "/t", "0"]),
+        "act.recyclebin" => plain("shell:RecycleBinFolder"),
+
+        // ── 系统管理工具（都可提权）──
+        "act.taskmgr" => both("taskmgr.exe"),
+        "act.control" => both("control.exe"),
+        "act.devmgmt" => both("devmgmt.msc"),
+        "act.resmon" => both("resmon.exe"),
+        "act.sysinfo" => both("msinfo32.exe"),
+        "act.services" => both("services.msc"),
+        "act.diskmgmt" => both("diskmgmt.msc"),
+        "act.compmgmt" => both("compmgmt.msc"),
+        "act.eventvwr" => both("eventvwr.msc"),
+        "act.perfmon" => both("perfmon.msc"),
+        "act.taskschd" => both("taskschd.msc"),
+        "act.appwiz" => both("appwiz.cpl"),
+        "act.ncpa" => both("ncpa.cpl"),
+        "act.sysdm" => both("sysdm.cpl"),
+        "act.optionalfeatures" => both("optionalfeatures.exe"),
+        "act.cleanmgr" => both("cleanmgr.exe"),
+        "act.mstsc" => both("mstsc.exe"),
+
+        // ── 命令行与编辑器（提权是常见诉求）──
+        "act.cmd" => both("cmd.exe"),
+        "act.powershell" => both("powershell.exe"),
+        "act.regedit" => both("regedit.exe"),
+        "act.gpedit" => both("gpedit.msc"),
+        _ => return None,
+    })
+}
+
 
 /// 全部条目（设置页 + 动作）。数据量很小（几十条），前端一次拉走、本地过滤。
 pub fn all() -> Vec<CatalogItem> {
@@ -159,7 +241,49 @@ pub fn all() -> Vec<CatalogItem> {
             &["shutdown", "power off", "guanji", "关机"], true),
         action("act.restart", "🔄", "重启", "Restart",
             &["restart", "reboot", "chongqi", "重启"], true),
+
+        // ── 系统命令与工具（2026-09-19 补齐：Win+S 能搜到而我们搜不到的）──
+        // 这些是「Windows 搜索里输入 cmd / 服务 / 事件查看器就能直接打开」的那批，
+        // 之前只能靠开始菜单的 .lnk 命中 `cmd.exe` 之类的快捷方式，`regedit` /
+        // `services.msc` / `appwiz.cpl` 则**完全搜不到**（开始菜单里没有它们的入口）。
+        action("act.cmd", "⬛", "命令提示符", "Command Prompt",
+            &["cmd", "command prompt", "mingling tishi", "命令提示符", "命令行", "cmd.exe"], false),
+        action("act.powershell", "🔷", "Windows PowerShell", "Windows PowerShell",
+            &["powershell", "ps", "shell", "脚本", "命令行"], false),
+        action("act.regedit", "📝", "注册表编辑器", "Registry Editor",
+            &["regedit", "registry", "zhucebiao", "注册表"], false),
+        action("act.gpedit", "🧭", "本地组策略编辑器", "Group Policy Editor",
+            &["gpedit", "group policy", "zucelue", "组策略"], false),
+        action("act.services", "⚙", "服务", "Services",
+            &["services", "service", "fuwu", "服务", "services.msc"], false),
+        action("act.diskmgmt", "💽", "磁盘管理", "Disk Management",
+            &["disk management", "diskmgmt", "cipan guanli", "磁盘管理", "分区"], false),
+        action("act.compmgmt", "🖥", "计算机管理", "Computer Management",
+            &["computer management", "compmgmt", "jisuanji guanli", "计算机管理"], false),
+        action("act.eventvwr", "📋", "事件查看器", "Event Viewer",
+            &["event viewer", "eventvwr", "shijian chakanqi", "事件查看器", "日志"], false),
+        action("act.perfmon", "📊", "性能监视器", "Performance Monitor",
+            &["performance monitor", "perfmon", "xingneng jianshiqi", "性能监视器"], false),
+        action("act.taskschd", "⏰", "任务计划程序", "Task Scheduler",
+            &["task scheduler", "taskschd", "renwu jihua", "任务计划程序", "计划任务"], false),
+        action("act.appwiz", "📦", "程序和功能", "Programs and Features",
+            &["programs and features", "appwiz", "uninstall", "程序", "卸载", "功能"], false),
+        action("act.ncpa", "🔗", "网络连接", "Network Connections",
+            &["network connections", "ncpa", "wangluo lianjie", "网络连接", "网卡", "适配器"], false),
+        action("act.sysdm", "🧾", "系统属性", "System Properties",
+            &["system properties", "sysdm", "xitong shuxing", "系统属性", "环境变量", "高级"], false),
+        action("act.optionalfeatures", "🧩", "启用或关闭 Windows 功能", "Windows Features",
+            &["windows features", "optionalfeatures", "gongneng", "功能", "组件"], false),
+        action("act.cleanmgr", "🧹", "磁盘清理", "Disk Cleanup",
+            &["disk cleanup", "cleanmgr", "cipan qingli", "磁盘清理", "清理"], false),
+        action("act.mstsc", "🖥", "远程桌面连接", "Remote Desktop Connection",
+            &["remote desktop", "mstsc", "yuancheng zhuomian", "远程桌面", "rdp"], false),
     ]
+}
+
+/// 该动作是否有「以管理员身份运行」形态（`CatalogItem::elevatable` 的数据源）。
+fn has_elevated_form(id: &str) -> bool {
+    action_spec(id).map(|s| s.elevate.is_some()).unwrap_or(false)
 }
 
 /// 打开 Windows 设置页。**只接受 `ms-settings:` 前缀** —— 前端能传的东西必须被
@@ -177,18 +301,38 @@ fn is_setting_uri(target: &str) -> bool {
 
 /// 执行系统动作。**只认白名单 id**（前端传的是 id，不是命令）。
 pub fn run_action(id: &str) -> Result<(), String> {
-    match id {
-        "act.lock" => spawn(&["rundll32.exe", "user32.dll,LockWorkStation"]),
-        "act.sleep" => spawn(&["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]),
-        "act.shutdown" => spawn(&["shutdown.exe", "/s", "/t", "0"]),
-        "act.restart" => spawn(&["shutdown.exe", "/r", "/t", "0"]),
-        "act.taskmgr" => crate::app_indexer::launch_app("taskmgr.exe"),
-        "act.control" => crate::app_indexer::launch_app("control.exe"),
-        "act.devmgmt" => crate::app_indexer::launch_app("devmgmt.msc"),
-        "act.resmon" => crate::app_indexer::launch_app("resmon.exe"),
-        "act.sysinfo" => crate::app_indexer::launch_app("msinfo32.exe"),
-        "act.recyclebin" => crate::app_indexer::launch_app("shell:RecycleBinFolder"),
-        other => Err(format!("unknown action: {other}")),
+    let spec = action_spec(id).ok_or_else(|| format!("unknown action: {id}"))?;
+    start(&spec.launch)
+}
+
+/// 以管理员身份运行一个系统动作（**会弹 UAC**）。
+/// 没有提权形态的动作（`elevatable == false`）在这里返回 Err，前端据此提示 ——
+/// 判据与 `CatalogItem::elevatable` 同源，不会出现「界面说有、执行说没有」。
+pub fn run_action_elevated(id: &str) -> Result<(), String> {
+    let spec = action_spec(id).ok_or_else(|| format!("unknown action: {id}"))?;
+    let el = spec
+        .elevate
+        .ok_or_else(|| format!("该动作没有提权形态: {id}"))?;
+    start_elevated(&el)
+}
+
+fn start(l: &Launch) -> Result<(), String> {
+    match l {
+        Launch::Argv(argv) => spawn(argv),
+        Launch::Shell(target) => crate::app_indexer::launch_app(target),
+    }
+}
+
+/// 提权启动：一律走 `ShellExecuteW` 的 `runas` verb（`Argv` 形态则把 argv 拆成
+/// file + parameters —— `runas` 只能作用在 ShellExecuteW 上，`Command::spawn` 没有提权通道）。
+fn start_elevated(l: &Launch) -> Result<(), String> {
+    match l {
+        Launch::Argv(argv) => {
+            let (file, args) = argv.split_first().ok_or("empty argv")?;
+            let params = if args.is_empty() { None } else { Some(args.join(" ")) };
+            crate::app_indexer::launch_elevated(file, params.as_deref())
+        }
+        Launch::Shell(target) => crate::app_indexer::launch_elevated(target, None),
     }
 }
 
@@ -250,6 +394,81 @@ mod tests {
         assert_eq!(dangerous, vec!["act.shutdown", "act.restart"]);
     }
 
+    /// **每个动作条目都必须在执行表里有分支** —— 防「界面上搜得到、点了说 unknown action」。
+    /// 这是把条目表和执行表绑在一起的那道闸门，新增动作时最先被它拦住。
+    #[test]
+    fn every_action_id_has_an_execution_spec() {
+        for it in all().into_iter().filter(|i| i.kind == "action") {
+            assert!(
+                action_spec(&it.id).is_some(),
+                "{} 在 all() 里出现了，但 action_spec() 里没有对应的启动描述",
+                it.id
+            );
+            assert_eq!(it.target, it.id, "动作的 target 就是 id");
+        }
+    }
+
+    /// `elevatable` 必须恰好等于约定好的那批 id：**多一个（偷偷开了提权）少一个（界面漏了盾牌）
+    /// 都要在这里失败**。设置页永远不可提权。
+    #[test]
+    fn elevatable_set_is_exactly_the_reviewed_list() {
+        const EXPECTED: &[&str] = &[
+            "act.appwiz", "act.cleanmgr", "act.cmd", "act.compmgmt", "act.control",
+            "act.devmgmt", "act.diskmgmt", "act.eventvwr", "act.gpedit", "act.mstsc",
+            "act.ncpa", "act.optionalfeatures", "act.perfmon", "act.powershell",
+            "act.regedit", "act.resmon", "act.services", "act.sysdm", "act.sysinfo",
+            "act.taskmgr", "act.taskschd",
+        ];
+        let mut got: Vec<String> = all()
+            .into_iter()
+            .filter(|i| i.elevatable)
+            .map(|i| i.id)
+            .collect();
+        got.sort();
+        assert_eq!(got, EXPECTED);
+        for it in all().into_iter().filter(|i| i.kind == "setting") {
+            assert!(!it.elevatable, "设置页不该有提权形态: {}", it.id);
+        }
+    }
+
+    /// 2026-09-19 补齐的那批系统命令/工具必须在表里，且能被常见关键词搜到。
+    /// （缺了就是「Win+S 搜得到、Lunac 搜不到」的老问题复发。）
+    #[test]
+    fn shell_and_admin_tools_are_present_and_searchable() {
+        let items = all();
+        let has = |id: &str| items.iter().any(|i| i.id == id);
+        for id in [
+            "act.cmd", "act.powershell", "act.regedit", "act.gpedit", "act.services",
+            "act.diskmgmt", "act.compmgmt", "act.eventvwr", "act.perfmon", "act.taskschd",
+            "act.appwiz", "act.ncpa", "act.sysdm", "act.optionalfeatures", "act.cleanmgr",
+            "act.mstsc",
+        ] {
+            assert!(has(id), "缺少系统工具 {id}");
+        }
+        // 关键词必须覆盖用户在 Windows 搜索框里会敲的那几个串
+        let kw_of = |id: &str| -> Vec<String> {
+            items
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.keywords.clone())
+                .unwrap_or_default()
+        };
+        for (id, needle) in [
+            ("act.cmd", "cmd"),
+            ("act.powershell", "powershell"),
+            ("act.services", "services.msc"),
+            ("act.appwiz", "appwiz"),
+            ("act.ncpa", "ncpa"),
+            ("act.regedit", "regedit"),
+            ("act.eventvwr", "eventvwr"),
+        ] {
+            assert!(
+                kw_of(id).iter().any(|k| k.eq_ignore_ascii_case(needle)),
+                "{id} 的关键词里应含 {needle}"
+            );
+        }
+    }
+
     /// 只接受设置页 URI；动作只认白名单 id。
     /// 这里**不真去打开**任何东西（测试不能有副作用），只验校验层。
     #[test]
@@ -269,5 +488,10 @@ mod tests {
             assert!(run_action(bad).is_err(), "{bad} 不该被执行");
         }
         assert!(run_action("act.unknown").is_err());
+        assert!(run_action_elevated("act.unknown").is_err());
+        // 没有提权形态的动作，提权入口必须直接拒绝（**不弹 UAC**）
+        assert!(run_action_elevated("act.recyclebin").is_err(), "回收站没有提权形态");
+        assert!(run_action_elevated("act.lock").is_err(), "锁定会话没有提权形态");
+        assert!(run_action_elevated("act.shutdown").is_err(), "关机没有提权形态");
     }
 }

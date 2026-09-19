@@ -169,7 +169,7 @@ export function attachToolEditorListeners() {
     style.id = styleId;
     style.textContent = `
       .tool-item { display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:6px;margin-bottom:2px;cursor:default;transition:background 0.1s; }
-      .tool-item:hover { background:rgba(255,255,255,0.05); }
+      .tool-item:hover { background:rgba(var(--ink-rgb), 0.05); }
       .tool-item-header { display:flex;align-items:center;gap:8px;flex:1;min-width:0; }
       .tool-item-icon { flex-shrink:0; }
       .tool-item-info { min-width:0; }
@@ -179,22 +179,22 @@ export function attachToolEditorListeners() {
       .tool-status.valid { background:rgba(157,180,172,0.15);color:var(--green); }
       .tool-status.invalid { background:rgba(192,138,138,0.15);color:var(--red); }
       .tool-item-actions { display:flex;gap:4px;flex-shrink:0; }
-      .tool-item-actions button { padding:3px 10px;font-size:0.68rem;border-radius:4px;border:1px solid var(--border-glass);background:rgba(255,255,255,0.05);color:var(--text-dim);cursor:pointer;transition:background 0.1s; }
-      .tool-item-actions button:hover { background:rgba(255,255,255,0.1);color:var(--text); }
+      .tool-item-actions button { padding:3px 10px;font-size:0.68rem;border-radius:4px;border:1px solid var(--border-glass);background:rgba(var(--ink-rgb), 0.05);color:var(--text-dim);cursor:pointer;transition:background 0.1s; }
+      .tool-item-actions button:hover { background:rgba(var(--ink-rgb), 0.1);color:var(--text); }
       .tool-btn-del:hover { color:var(--red) !important; }
       .tool-btn-del.armed { background:var(--red) !important;color:#fff !important;border-color:var(--red) !important; }
       .tool-editor { display:flex;flex-direction:column;gap:8px;padding:8px 12px;height:280px; }
       .tool-editor-header { display:flex;align-items:center;justify-content:space-between; }
       .tool-editor-header span { font-size:0.82rem;font-weight:600;color:var(--text); }
       .tool-editor-header button { padding:4px 10px;font-size:0.72rem;border-radius:4px;border:1px solid var(--border-glass);background:none;color:var(--text-dim);cursor:pointer; }
-      .tool-editor-header button:hover { color:var(--text);background:rgba(255,255,255,0.05); }
-      #tool-editor-textarea { flex:1;background:rgba(0,0,0,0.3);border:1px solid var(--border-glass);border-radius:6px;padding:10px;color:var(--text);font-family:'Cascadia Code','Fira Code','Consolas',monospace;font-size:0.75rem;line-height:1.5;outline:none;resize:none;caret-color:var(--accent); }
+      .tool-editor-header button:hover { color:var(--text);background:rgba(var(--ink-rgb), 0.05); }
+      #tool-editor-textarea { flex:1;background:rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));border:1px solid var(--border-glass);border-radius:6px;padding:10px;color:var(--text);font-family:'Cascadia Code','Fira Code','Consolas',monospace;font-size:0.75rem;line-height:1.5;outline:none;resize:none;caret-color:var(--accent); }
       #tool-editor-textarea:focus { border-color:var(--accent-border); }
       .tool-editor-actions { display:flex;gap:6px;justify-content:flex-end; }
-      #tool-editor-save { padding:5px 16px;font-size:0.75rem;border-radius:6px;border:1px solid var(--accent-border);background:var(--accent-bg);color:var(--accent);cursor:pointer; }
-      #tool-editor-save:hover { background:rgba(192,160,160,0.2); }
+      #tool-editor-save { padding:5px 16px;font-size:0.75rem;border-radius:6px;border:1px solid var(--accent-border);background:var(--accent-bg);color:var(--text);cursor:pointer; }
+      #tool-editor-save:hover { background:rgba(var(--accent-rgb),0.2); }
       #tool-editor-cancel { padding:5px 12px;font-size:0.75rem;border-radius:6px;border:1px solid var(--border-glass);background:none;color:var(--text-dim);cursor:pointer; }
-      #tool-editor-cancel:hover { color:var(--text);background:rgba(255,255,255,0.05); }
+      #tool-editor-cancel:hover { color:var(--text);background:rgba(var(--ink-rgb), 0.05); }
       /* 印象派按钮背景清理（与全局 styles.css 一致：背景全透明，无扫笔/光效） */
       .tool-item-actions button, .tool-editor-header button,
       #tool-editor-save, #tool-editor-cancel {
@@ -269,7 +269,7 @@ const toolEditor: Plugin = {
     let html = '<div class="plugin-result">';
     html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 12px 8px;">
       <span style="font-size:0.75rem;color:var(--text-dim);">${t("tooleditor.tool_count", { count: String(tools.length) })}</span>
-      <button id="tool-new-btn" style="padding:4px 12px;font-size:0.72rem;border-radius:6px;border:1px solid var(--accent-border);background:var(--accent-bg);color:var(--accent);">${t("tooleditor.new_tool")}</button>
+      <button id="tool-new-btn" style="padding:4px 12px;font-size:0.72rem;border-radius:6px;border:1px solid var(--accent-border);background:var(--accent-bg);color:var(--text);">${t("tooleditor.new_tool")}</button>
     </div>`;
     html += '<div style="overflow-y:auto;max-height:260px;">';
 

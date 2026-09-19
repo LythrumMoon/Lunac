@@ -9,7 +9,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
-import { initI18n, loadSavedLanguage, t, pluginName, lang } from "./i18n.js";
+import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
 
 // ── 全局错误上报 ─────────────────────────────────────────────────
 // release 下前端没有控制台、用户平时也不会开 DevTools，未捕获的错误必须送到
@@ -285,6 +285,21 @@ function scheduleSearchResize() {
   });
 }
 
+/** 唤出窗口时**强制**再断言一次高度（2026-09-19 新增）。
+ *
+ *  `requestWindowHeight` 有两条会「跳过 setSize」的早退：`h === requestedHeight`（缓存命中）
+ *  与 `|h − currentWindowHeight| < 3`（认为窗口已经是内容高）。这两条在键入时是对的
+ *  （防 IPC 风暴、防 setSize→onResized 回环），但**唤出时是错的**：
+ *  窗口在隐藏期间的真实高度可能已经被 OS / 上一次会话改动过，而 `requestedHeight`
+ *  还留着旧值 ⇒ 量出来的 h 与缓存一致 ⇒ 一声不响地不下发 ⇒ 窗口停在旧高度
+ *  （用户看到的就是「呼出后高度不对，过一会才自己恢复」）。
+ *  所以唤出路径先把 `requestedHeight` 复位成 -1，让这一轮测量必定落地。 */
+function forceHeightReassert() {
+  requestedHeight = -1;
+  bootHeightSettled = true;  // 启动首屏已过；suppress 窗口内本来就走直设
+  scheduleSearchResize();
+}
+
 /** setSize 串行下发（latest-wins）：在途期间新期望高度只记 pendingHeight，
  *  本次完成后若与已发高度不同再补发一次 —— 杜绝快速键入时 setSize IPC 排队堆积。 */
 function requestWindowHeight(h: number) {
@@ -413,6 +428,33 @@ function animateWindowHeight(h: number) {
   animRaf = requestAnimationFrame(tick);
 }
 
+/** 结果区可用的最大高度（DIP）—— 去掉固定 `max-height: 380px` 后**唯一**的闸门。
+ *
+ *  为什么必须由 JS 算、且必须取自 `screen.availHeight` 而不是 CSS 的 `100vh`：
+ *  本窗口的高度是**内容驱动**的（`#app` 为 `height:auto`，量完再 `setSize`）。
+ *  若用 `100vh` 当上限，就构成「窗口高 ← 内容高 ← vh ← 窗口高」的循环，
+ *  实测会来回抖。`screen.availHeight` 只依赖显示器，与窗口自身无关，是干净的常量。
+ *
+ *  余量 `SEARCH_CHROME_PX` = 搜索栏（~52）+ 状态栏（~30）+ 一点不贴屏幕底边的余量。
+ *  超上限时结果区内部滚动（`#results-list` 本来就是 `overflow-y: auto`）。 */
+const SEARCH_CHROME_PX = 120;
+function resultsMaxHeight(): number {
+  const avail = window.screen?.availHeight || 1080;
+  // 下限 120：屏幕极小时也别把结果区压成 0（那时宁可内部滚动）
+  return Math.max(120, Math.round(avail - SEARCH_CHROME_PX));
+}
+
+/** 把算好的上限写到 `#results-container` 上（CSS 变量，见 styles.css 那段注释）。
+ *  这里用行内 style 是刻意的例外：**值每块屏都不一样**，写进 class 或样式表做不到；
+ *  且它只是喂给 CSS 的一个数字，不与任何 class 规则争优先级（不像 `overflow` 那样
+ *  会被 `.hidden` / `.plugin-open` 之类的规则覆盖回去）。 */
+function applyResultsMaxHeight() {
+  const px = resultsMaxHeight();
+  if (resultsContainer.style.getPropertyValue("--results-max-h") !== `${px}px`) {
+    resultsContainer.style.setProperty("--results-max-h", `${px}px`);
+  }
+}
+
 /** Apply window size based on current UI state.
  *  插件模式：固定高度（detached 600 / embedded 360 / OCR detached 520），
  *    设计 px × zoom = DIPs（插件面板按设计宽度 800 的 CSS px 排版）。
@@ -425,6 +467,9 @@ function animateWindowHeight(h: number) {
 function applyWindowSize() {
   // 插件/分离/详细搜索模式 #app 撑满窗口（CSS height:100%）；搜索模式内容驱动（height:auto）
   document.getElementById("app")!.classList.toggle("plugin-active", pluginActive);
+
+  // 结果区的屏幕高上限必须先写进去，再测量 —— 否则量到的是「没封顶」的高度。
+  applyResultsMaxHeight();
 
   let h: number;
   if (pluginActive) {
@@ -446,6 +491,9 @@ function applyWindowSize() {
   // 且模块初始化时这一次调用会把启动状态（简洁搜索 = main）无条件告诉 Rust，
   // 修掉「WebView 重载后 Rust 还停在 detail、Esc 再也不隐藏窗口」这类错位。
   syncUiMode();
+  // 外观：「跟随系统」模式下唤起时顺手取一次系统强调色（用户很可能正是刚在
+  // Windows 设置里改完颜色才切回来）。非系统模式走一次空转判断，成本可忽略。
+  if (appearance.colorMode === "system") void refreshSystemTheme();
 }
 
 // ── File chips management ──────────────────────────────────────
@@ -2103,6 +2151,21 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "WebFetch" },
   { name: "AskUserQuestion" },
   { name: "TodoWrite" },
+  // 往期会话检索（2026-09-19，A2）：只读本机会话库，免审批。列在这里是为了让用户
+  // 能主动关掉它 —— 前缀缓存里会带一段「往期会话索引」，不想让模型看到就往这里禁。
+  { name: "SessionSearch" },
+  // 子代理（2026-09-20，A1）：默认可用。之所以列出来，是因为它**很花钱** ——
+  // 一个子代理能跑 8 轮工具往返、并有自己的 token 预算。不想让模型自作主张派
+  // 代理出去的用户，可以在设置里把它禁掉（`--disallowedTools Agent`）。
+  { name: "Agent" },
+  // MCP resources 读侧（2026-09-20，A3）：只在用户真的配了 `tools\*.json` 时才注册
+  // （没配就压根不在请求体里）。列在这里同样是给用户一个关掉它们的入口。
+  { name: "ListMcpResourcesTool" },
+  { name: "ReadMcpResourceTool" },
+  // 长期记忆写入侧（2026-09-20，A4）：它只在桥接通时注册（没桥就写不进去）。
+  // 列出来是给用户一个「别让模型自己写长期记忆」的开关；禁掉它并不影响**读取**
+  // 已存的记忆（那是 `LUNAC_MEMORY` 管的事）。
+  { name: "Remember" },
   { name: "Skill" },
 ];
 
@@ -2585,8 +2648,30 @@ const PLUGIN_ICON_PATHS: Record<string, string> = {
   "clipboard-history": `<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
 };
 
-/** 生成插件的印象派 SVG icon；未知插件回退 🔧（原 emoji 保底）。 */
+/** 当前主题包提供的插件图标（插件 id → 已 convertFileSrc 的 URL）。
+ *
+ *  声明在这里而不是外观模块里（外观模块在文件末尾）是**必须**的：`pluginIconSvg`
+ *  可能在模块初始化阶段就被调用，而 `const` 在声明前处于 TDZ —— 放末尾就是一次
+ *  必然的 ReferenceError（白屏）。所以只把「存储 + 取值」放前面，填充逻辑（拉取
+ *  主题、解析资产）留在外观模块，容量极小、无副作用。 */
+const themeIconUrls = new Map<string, string>();
+
+/** 查当前主题是否为该插件提供了专属图标；没有则返回 null（调用方回退内联 SVG）。 */
+function themeIconUrl(id: string): string | null {
+  return themeIconUrls.get(id) ?? null;
+}
+
+/** 生成插件的印象派 SVG icon；未知插件回退 🔧（原 emoji 保底）。
+ *
+ *  **主题包图标的唯一覆盖点**（2026-09-19）：当前主题若为某插件提供了专属图标
+ *  （`theme.json` 的 `assets.icons.<插件 id>`），这里返回 `<img>` 而不是内联 SVG。
+ *  全项目的插件图标都从这个函数出（`pluginIconSvg` 是图标汇聚点），所以在这一处
+ *  接主题包即可全覆盖 —— 分散到各个渲染点去判断必然漏（历史教训：同名图标曾出现
+ *  三份拷贝）。复用 `.result-item-icon-img` 是刻意的：与「开始菜单应用图标」同一套
+ *  CSS（尺寸/圆角/居中），不必再写第二份样式。 */
 function pluginIconSvg(id: string): string {
+  const themed = themeIconUrl(id);
+  if (themed) return `<img src="${themed}" class="result-item-icon-img" alt="">`;
   const inner = PLUGIN_ICON_PATHS[id];
   if (!inner) return "🔧";
   return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2643,7 +2728,6 @@ function renderClipboardOCREntry(): void {
       <div class="result-item-title">${t("plugin.ocr")}</div>
       <div class="result-item-desc">${t("chat.attach_ocr_clipboard")} (PP-OCRv4)</div>
     </div>
-    <span class="result-item-badge">OCR</span>
   `;
   ocrItem.addEventListener("click", () => {
     executePlugin(ocrPlugin);
@@ -2661,6 +2745,20 @@ function renderClipboardOCREntry(): void {
   items.forEach(item => item.classList.remove("selected"));
   ocrItem.classList.add("selected");
   selectedIndex = 0;
+
+  // **插入第 3 项后必须重新断言高度**（2026-09-19 修，不得删）。
+  // 两个调用方（`win.onFocusChanged` 的唤出分支、`runSearchNow` 的空查询分支）都是
+  // 「先 `renderAIEntry()` 渲染 2 项（Web 搜索 + AI）→ 它内部 applyWindowSize() 量到
+  // 2 项高 → 再调本函数插 OCR」。实测 `.result-item` 56px/行：2 项 = 199、3 项 = 255。
+  // 少了这一步，窗口就停在 2 项高度 —— 用户看到的正是「唤出时第 3 项被截掉一半，
+  // 直到下一次搜索变动（重渲染）才恢复」（ai-spec §11 规则 44）。
+  //
+  // 这里用**同步**的 `applyWindowSize()`（不是 ResizeObserver，也不是逐帧滑动）：
+  // `getBoundingClientRect()` 会强制一次布局，当场就能量到 3 项高度；而唤出瞬间
+  // WebView 可能仍被判定为「未渲染」，RO 回调与 rAF 都会被推迟 —— 靠它们兜底
+  // 就等于把这个错误高度一直留在屏幕上。与 `renderAIEntry` / `renderMixedResults`
+  // 收尾处的做法一致。
+  applyWindowSize();
 }
 
 // ── Focus lost → hide; focus gained → 聚焦输入框 ─────────────────
@@ -3855,9 +3953,15 @@ function classifyRequest(
     // 危险命令任何档位都要人工确认（含「自动」档），且不给「始终允许」
     return { auto: false, danger: agentDanger.join("、"), opaque: null, bashCmd };
   }
-  // ② 含无法静态判定的成分（变量 / 编码执行 / 间接执行器）→ **不得自动放行**。
-  //    fail-closed 是刻意的：判不出来就当「要人看」，绝不当「安全」。
-  if (agentOpaque.length) {
+  // ② 含无法静态判定的成分（变量 / 编码执行 / 间接执行器）→ **不自动放行**（fail-closed：
+  //    判不出来就当「要人看」，绝不当「安全」）。
+  //
+  //    **唯一的例外是「自动」档**（2026-09-20 与后端对齐）。这一档的规范语义就是
+  //    「不再弹卡」（agent-ui-spec §4.2「自动档不该弹卡」），而且这一档本来就无门槛放行
+  //    `python train.py` 这类任意代码执行 —— 单独让「判不出来」的那类比它更严，结果就是
+  //    用户开了「自动」却每条带 `%TMP%` / `cmd /c` 的命令都被拦住，自动档名不副实。
+  //    **危险命令（①）不在此列**：它有正面的破坏性证据，任何档位都要人确认。
+  if (agentOpaque.length && getRunMode() !== "auto") {
     return { auto: false, danger: null, opaque: agentOpaque.join("、"), bashCmd };
   }
 
@@ -4427,7 +4531,10 @@ listen<{ line: string }>("cli-output", (event) => {
     }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {
-      agentTransition("approval");
+      // 空闲时收到的审批来自**后台复盘 fork**（A4）：它按轮次门槛在**提问之间**跑，
+      // 不是任何一次提问的一部分 —— 因此不推状态机（`idle → approval` 本就是非法迁移），
+      // 卡片照常显示/自动放行（自动档下它会以「✓ 自动允许」一行出现在流里）。
+      if (agentState !== "idle") agentTransition("approval");
       showPermissionCard(
         data.request_id,
         data.request.tool_name || "unknown tool",
@@ -4771,7 +4878,6 @@ async function runSearchNow(searchSeq: number) {
         <div class="result-item-title">${t("chat.ai_entry")}</div>
         <div class="result-item-desc">${hasFiles ? `"${esc(q.slice(0, 60)) || t("chat.ask_files")}"` : `"${esc(q.slice(0, 60))}"`}</div>
       </div>
-      <span class="result-item-badge">AI</span>
     `;
     aiItem.addEventListener("click", () => startAIChat(q || "", attachedFiles));
     resultsList.appendChild(aiItem);
@@ -4792,7 +4898,6 @@ async function runSearchNow(searchSeq: number) {
             <div class="result-item-title">${t("plugin.ocr")}</div>
             <div class="result-item-desc">${t("chat.attach_ocr_file")}</div>
           </div>
-          <span class="result-item-badge">OCR</span>
         `;
         ocrItem.addEventListener("click", () => {
           const imgFile = attachedFiles.find(f => imageExtensions.test(f));
@@ -4813,7 +4918,6 @@ async function runSearchNow(searchSeq: number) {
         <div class="result-item-title">${t("chat.custom_launch")}</div>
         <div class="result-item-desc">${t("chat.files_attached", { count: String(attachedFiles.length) })}</div>
       </div>
-      <span class="result-item-badge app-badge">${t("chat.launch_app")}</span>
     `;
     const qlPlugin = pluginRegistry.getAll().find(p => p.id === "quick-launch");
     if (qlPlugin) {
@@ -4881,7 +4985,6 @@ function buildWebSearchItem(wsPlugin: Plugin, query: string, appendTo: HTMLEleme
       <div class="result-item-title">${t("plugin.web-search")}</div>
       <div class="result-item-desc">${esc(desc)}</div>
     </div>
-    <span class="result-item-badge">${t("chat.badge_web")}</span>
   `;
   wsItem.addEventListener("click", () => wsPlugin.execute(query));
 
@@ -5033,14 +5136,12 @@ function renderMixedResults(apps: AppEntry[], plugins: Plugin[]) {
       const ext = extMatch ? extMatch[1].toLowerCase() : "";
       const isFolder = !ext || ext === "lnk";
       const iconText = isFolder ? "📁" : (ext.length <= 3 ? ext : ext.slice(0, 3));
-      const badgeText = isFolder ? (ext === "lnk" ? t("chat.badge_shortcut") : t("chat.badge_folder")) : ext;
       item.innerHTML = `
         <div class="result-item-icon" data-icon-path="${esc(app.path)}">${iconText}</div>
         <div class="result-item-content">
           <div class="result-item-title">${esc(app.name)}</div>
           <div class="result-item-desc">${t("chat.launch_app")}</div>
         </div>
-        <span class="result-item-badge app-badge">${esc(badgeText)}</span>
       `;
       item.addEventListener("click", () => launchApp(app.path));
       frag.appendChild(item);
@@ -5059,10 +5160,9 @@ function renderMixedResults(apps: AppEntry[], plugins: Plugin[]) {
       item.innerHTML = `
         <div class="result-item-icon">${pluginIconSvg(plugin.id)}</div>
         <div class="result-item-content">
-          <div class="result-item-title">${esc(plugin.name)}</div>
-          <div class="result-item-desc">${esc(plugin.description)}</div>
+          <div class="result-item-title">${esc(pluginName(plugin.id, plugin.name))}</div>
+          <div class="result-item-desc">${esc(pluginDesc(plugin.id, plugin.description))}</div>
         </div>
-        <span class="result-item-badge">${esc(plugin.badge || t("chat.badge_tool"))}</span>
       `;
       item.addEventListener("click", async () => {
         if (pluginActive && activePluginId !== plugin.id) {
@@ -5086,7 +5186,6 @@ function renderMixedResults(apps: AppEntry[], plugins: Plugin[]) {
           <div class="result-item-title">${t("chat.ai_entry")}</div>
           <div class="result-item-desc">"${esc(q.slice(0, 40))}"</div>
         </div>
-        <span class="result-item-badge">AI</span>
       `;
       item.addEventListener("click", () => startAIChat(q));
       frag.appendChild(item);
@@ -5101,7 +5200,6 @@ function renderMixedResults(apps: AppEntry[], plugins: Plugin[]) {
           <div class="result-item-title">${esc(pluginName("memo"))}</div>
           <div class="result-item-desc">"${esc(q.slice(0, 40))}"</div>
         </div>
-        <span class="result-item-badge">${esc(memoPlugin.badge || "memo")}</span>
       `;
       item.addEventListener("click", () => executePlugin(memoPlugin));
       frag.appendChild(item);
@@ -5117,7 +5215,6 @@ function renderMixedResults(apps: AppEntry[], plugins: Plugin[]) {
           <div class="result-item-title">${t("chat.memo_edit_tag", { tag: esc(entry.tag) })}</div>
           <div class="result-item-desc">${esc(entry.tag)}</div>
         </div>
-        <span class="result-item-badge">memo</span>
       `;
       item.addEventListener("click", () => {
         (window as any).__lunac_memo_open = { id: entry.id };
@@ -5906,6 +6003,16 @@ async function startAIChat(query: string, files?: string[]) {
   const te = pluginRegistry.getAll().find(p => p.id === "tool-editor");
   if (te) { resultsContainer.classList.remove("hidden"); searchBar.classList.add("has-results"); await executePlugin(te); }
 };
+// 设置 → 插件总览：按 id 打开任意插件（2026-09-19 批 9）。
+// 设置面板不自己 executePlugin —— 那要动结果区 / 搜索栏状态，是主界面的职责。
+(window as any).__lunac_open_plugin = async (id: string) => {
+  if (pluginActive) { await closePluginView(); await new Promise(r => setTimeout(r, 50)); }
+  const p = pluginRegistry.getAll().find(pl => pl.id === id);
+  if (p) { resultsContainer.classList.remove("hidden"); searchBar.classList.add("has-results"); await executePlugin(p); }
+};
+// 插件图标出口（主题包优先）—— 插件总览必须与结果区用同一套图标，
+// 否则会出现「结果区线稿 SVG / 设置面板 emoji」两套。
+(window as any).__lunac_plugin_icon = pluginIconSvg;
 
 // ── Runtime language application ──────────────────────────────────
 // Re-applies t() to static UI elements (placeholders + tooltips from
@@ -6253,25 +6360,433 @@ resultsContainer.addEventListener("contextmenu", (e) => {
 // 语言与当前实际热键都取到最新值。
 refreshHotkeyHint();
 
-// ── 自定义背景（需求：透明 + 毛玻璃，无默认图）──────────────────
-// 图层 #app-bg-image 已嵌入 #results-container 内部（absolute 贴合结果区/
-// 插件界面，随面板大小缩放，不随窗口 fixed 导致脱离）；透明由 CSS opacity
-// 控制，圆角由容器 overflow:hidden 裁剪，毛玻璃由面板 backdrop-filter 承担。
-// 设置值存 localStorage("lunac-bg-image")，settings 插件写入后调用
-// 全局 __lunac_apply_bg 即时生效；启动时恢复上次设置。
-function applyBgImage(url: string | null) {
+// ══════════════════════════════════════════════════════════════════
+// 外观 / 主题（设置 → 风格）— 2026-09-19 新增
+// ══════════════════════════════════════════════════════════════════
+// 三层，优先级 **用户配置 > 主题包 > styles.css 的 :root 默认值**：
+//   ① 配置：localStorage `lunac-appearance`（本机偏好，量小、随 WebView 走）
+//   ② 主题包：`<exe 根>\themes\<名>\theme.json`（含图片资产，必须落文件才能
+//      导入导出/分享 —— 与 skill / tool 同一套 portable 约束，见 ai-spec 规则 24）
+//   ③ 应用：`applyAppearance()` 把 ①② 合成 CSS 变量写在 `<html>` 行内 style 上
+//
+// **本功能唯一的回归风险点**：`APPEARANCE_DEFAULTS` 必须逐项等于 styles.css
+// `:root` 里的原硬编码值（accent #c0a0a0 / blur 4px / saturate 0.92 /
+// opacity 0.5 / surfaceAlpha 0.88）。老用户升级时没有这个 localStorage 键，
+// 走全默认值 —— 只要上面对得上，渲染结果与改造前逐像素一致。
+//
+// 为什么走 CSS 变量而不是 JS 逐个改元素 style：主题色被几十处引用（按钮 / 选中态 /
+// 边框 / 滚动条 / 审批卡），逐个改必然漏；变量是唯一汇聚点（同 `--results-max-h` 的
+// 例外论据：值来自用户配置，写不进样式表）。
+
+interface ThemeAssets {
+  background: string | null;
+  search_pattern: string | null;
+  icons: Record<string, string>;
+}
+interface ThemeTokens {
+  accent: string | null;
+  text: string | null;
+  text_dim: string | null;
+  text_muted: string | null;
+  border_glass: string | null;
+  surface: string | null;
+  radius_search: string | null;
+  radius_results: string | null;
+  pattern_opacity: number | null;
+}
+interface ThemeManifest {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  tokens: ThemeTokens;
+  assets: ThemeAssets;
+}
+/** Rust `list_themes()` 的返回项。`resolved` 是**绝对路径**版资产（`assets` 里是
+ *  主题目录内的相对路径，前端不该自己拼路径）。 */
+interface ThemeInfo {
+  manifest: ThemeManifest;
+  dir: string;
+  builtin: boolean;
+  resolved: ThemeAssets;
+}
+interface SystemTheme { accent: string; dark: boolean; source: string }
+
+interface Appearance {
+  bgImage: string | null;   // 自定义背景图（已 convertFileSrc 的 asset URL）
+  bgBlur: number;           // 背景模糊 px
+  bgSaturate: number;       // 背景饱和度 %
+  bgOpacity: number;        // 背景不透明度 0~1
+  sheen: number;            // 玻璃反光强度 0~1
+  surfaceAlpha: number;     // 玻璃底色 alpha
+  tintBase: boolean;        // 底色/文字/边框是否跟随主题色派生（false = 用 :root 原配色）
+  colorMode: "custom" | "system";
+  customAccent: string;     // #rrggbb
+  themeId: string;          // "default" = 不套主题包
+}
+
+const APPEARANCE_KEY = "lunac-appearance";
+const APPEARANCE_DEFAULTS: Appearance = {
+  bgImage: null, bgBlur: 4, bgSaturate: 92, bgOpacity: 0.5,
+  sheen: 0, surfaceAlpha: 0.88, tintBase: true,
+  colorMode: "custom", customAccent: "#c0a0a0", themeId: "default",
+};
+/** 各数值的合法区间：滑块的 min/max 只是 UI 提示，手工改 localStorage 或旧版本
+ *  残留都可能给出越界值（`bgOpacity: 5` 会让背景变成纯色块直接盖住面板）。 */
+const APPEARANCE_RANGE: Record<string, [number, number]> = {
+  bgBlur: [0, 40], bgSaturate: [0, 200], bgOpacity: [0, 1], sheen: [0, 1], surfaceAlpha: [0.3, 1],
+};
+
+let appearance: Appearance = { ...APPEARANCE_DEFAULTS };
+/** 主题包缓存：id → ThemeInfo。`list_themes` 只在启动与「打开设置」时拉一次。 */
+const themeInfos = new Map<string, ThemeInfo>();
+let systemTheme: SystemTheme = { accent: "", dark: true, source: "fallback" };
+
+function clampAppearance(a: Appearance): Appearance {
+  const out = { ...a };
+  for (const [k, [lo, hi]] of Object.entries(APPEARANCE_RANGE)) {
+    const v = Number((out as any)[k]);
+    (out as any)[k] = Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : (APPEARANCE_DEFAULTS as any)[k];
+  }
+  if (out.colorMode !== "system") out.colorMode = "custom";
+  if (!/^#[0-9a-fA-F]{6}$/.test(out.customAccent)) out.customAccent = APPEARANCE_DEFAULTS.customAccent;
+  if (typeof out.themeId !== "string" || !out.themeId) out.themeId = "default";
+  if (out.bgImage !== null && typeof out.bgImage !== "string") out.bgImage = null;
+  // tintBase 只接受真布尔
+  if (typeof out.tintBase !== "boolean") out.tintBase = APPEARANCE_DEFAULTS.tintBase;
+  return out;
+}
+
+function loadAppearance(): Appearance {
+  let raw: unknown = null;
+  try { raw = JSON.parse(localStorage.getItem(APPEARANCE_KEY) || "null"); } catch { /* 坏 JSON 按无配置 */ }
+  const merged = { ...APPEARANCE_DEFAULTS, ...(raw && typeof raw === "object" ? raw : {}) } as Appearance;
+  // 一次性迁移：改造前背景图单独存在 `lunac-bg-image`（当时只有这一个外观项）。
+  // 迁移后立即删旧键 —— 留着它就会变成第二个真相源，以后改背景时两者打对台。
+  if (!merged.bgImage) {
+    try {
+      const legacy = localStorage.getItem("lunac-bg-image");
+      if (legacy) { merged.bgImage = legacy; localStorage.removeItem("lunac-bg-image"); }
+    } catch { /* localStorage 不可用则保持无背景 */ }
+  }
+  return clampAppearance(merged);
+}
+
+function persistAppearance() {
+  try { localStorage.setItem(APPEARANCE_KEY, JSON.stringify(appearance)); } catch { /* 配额/隐私模式 */ }
+}
+
+// ── 颜色工具 ─────────────────────────────────────────────────────
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(hex.trim());
+  if (!m) return null;
+  let h = m[1];
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  const n = parseInt(h, 16);
+  return { r: (n >> 16) & 0xff, g: (n >> 8) & 0xff, b: n & 0xff };
+}
+
+const toHex = (r: number, g: number, b: number) =>
+  "#" + [r, g, b].map(v => Math.min(255, Math.max(0, Math.round(v))).toString(16).padStart(2, "0")).join("");
+
+/** `"#1c1a20" | "28,26,32"` → `"r, g, b"`（喂给 CSS 的 `rgb(var(--x))` 用）。 */
+function toRgbTriplet(v: string): string | null {
+  const hex = hexToRgb(v);
+  if (hex) return `${hex.r}, ${hex.g}, ${hex.b}`;
+  const parts = v.split(",").map(s => Number(s.trim()));
+  if (parts.length === 3 && parts.every(n => Number.isFinite(n))) {
+    return parts.map(n => Math.round(Math.min(255, Math.max(0, n)))).join(", ");
+  }
+  return null;
+}
+
+/** rgb → HSL（h 0~360，s/l 0~100）。派生整套配色用，见 `derivePalette`。 */
+function rgbToHsl(r: number, g: number, b: number): { h: number; s: number; l: number } {
+  const rn = r / 255, gn = g / 255, bn = b / 255;
+  const mx = Math.max(rn, gn, bn), mn = Math.min(rn, gn, bn), d = mx - mn;
+  let h = 0;
+  if (d > 0) {
+    if (mx === rn) h = ((gn - bn) / d) % 6;
+    else if (mx === gn) h = (bn - rn) / d + 2;
+    else h = (rn - gn) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  const l = (mx + mn) / 2;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) };
+}
+
+function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: number } {
+  const k = (n: number) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const to = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
+  return { r: to(f(0)), g: to(f(8)), b: to(f(4)) };
+}
+
+/** hsl → `"r, g, b"` 三元组（喂给 CSS 的 `rgba(var(--surface-rgb), α)`）。 */
+function hslTriplet(h: number, s: number, l: number): string {
+  const c = hslToRgb(h, s / 100, l / 100);
+  return `${c.r}, ${c.g}, ${c.b}`;
+}
+
+/** 主色的**相对亮度**（WCAG 口径，0=黑 1=白）。
+ *  判「颜色亮不亮」必须用它而不是 HSL 的 L：HSL 的 L 只看 (max+min)/2，纯黄
+ *  `#ffe066` 的 L 是 70%（看着「中等」），但人眼觉得它很亮（相对亮度 ≈0.75）——
+ *  用户要的「颜色很亮就调成黑字」用的正是人眼口径。 */
+function relativeLuminance(hex: string): number | null {
+  const c = hexToRgb(hex);
+  if (!c) return null;
+  const ch = (v: number) => {
+    const x = v / 255;
+    return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b);
+}
+
+/** 由**一个主色**派生整套界面配色。三条规则（2026-09-19 按用户反馈定稿）：
+ *
+ *  ① **色相只用在底色一处**（底色跟随主色色相）；**文字一律纯灰阶、不带色相** ——
+ *     用户明确要求「不采用红绿蓝的色相调整，只在黑白之间渐变」。
+ *  ② 文字明暗**只跟随主色的明暗、方向相反**：主色很亮 → 文字黑；主色很暗 → 文字白。
+ *  ③ 底色明度与文字**同步反向**走，否则「亮主色 + 黑字」会落在深底上（不可读）。
+ *
+ *  转折点 = `APPEARANCE_DEFAULTS.customAccent`（#c0a0a0）的相对亮度：bright=0 时的
+ *  取值逐项等于改造前那套原配色（底色 `28,26,32`、文字近 `#eae2da`），**默认外观因此
+ *  不受影响**；主色越亮越往「浅底 + 黑字」走（最亮：底色 83% / 文字 9%）。
+ *  中段用 `t = (bright−0.5)×2` 做**过渡带**：亮度落在 0~0.5 区间的颜色一律按深色主题
+ *  处理 —— 否则中等亮度的主色会得到「中灰底 + 中灰字」，对比度不够等于看不清。 */
+function derivePalette(accentHex: string): Record<string, string> | null {
+  const c = hexToRgb(accentHex);
+  const lum = relativeLuminance(accentHex);
+  if (!c || lum == null) return null;
+  const anchor = relativeLuminance(APPEARANCE_DEFAULTS.customAccent) ?? 0.42;
+  const raw = Math.min(1, Math.max(0, (lum - anchor) / Math.max(0.05, 1 - anchor)));
+  const t = Math.min(1, Math.max(0, (raw - 0.5) * 2));   // 过渡带：0~0.5 一律深色主题
+  const { h, s } = rgbToHsl(c.r, c.g, c.b);
+  const surfaceL = Math.round(11 + t * 72);              // 11% → 83%
+  // 底色越亮，主色色相越该收敛：浅底上还挂着明显色相会变成一块彩板
+  const surfaceS = Math.round(Math.min(16, Math.max(6, s * 0.55)) * (1 - t * 0.55));
+  const textL = Math.round(89 - t * 80);                 // 89% → 9%
+  const dimL = Math.round(68 - t * 58);
+  const mutedL = Math.round(50 - t * 42);
+  // 边框用「文字那一侧」的对比色：深色主题下用白、浅色主题下用黑（否则浅底上看不见）
+  const inkLight = textL > 50;
+  const ink = inkLight ? 255 : 0;
+  return {
+    "--surface-rgb": hslTriplet(h, surfaceS, surfaceL),
+    "--surface-rgb-hover": hslTriplet(h, surfaceS, Math.min(96, surfaceL + 7)),
+    "--border-glass": `rgba(${ink}, ${ink}, ${ink}, ${inkLight ? 0.1 : 0.14})`,
+    "--text": `hsl(0, 0%, ${textL}%)`,
+    "--text-dim": `hsl(0, 0%, ${dimL}%)`,
+    "--text-muted": `hsl(0, 0%, ${mutedL}%)`,
+    // 中性叠加基色：与文字同侧（深色主题 = 白、浅色主题 = 黑）。
+    // 样式表里所有 `rgba(var(--ink-rgb), α)`（hover 底 / 分隔线 / 次级面板）
+    // 靠它翻转 —— 浅底上白叠白等于没画，hover 反馈会整片消失。
+    "--ink-rgb": inkLight ? "255, 255, 255" : "0, 0, 0",
+    // 凹陷底（输入框 / 卡片 / 次级块）压暗强度的缩放：深色主题 1（== 改造前），
+    // 浅色主题 0.35（亮底上同样的黑会脏得多）。
+    "--shade-scale": inkLight ? "1" : "0.35",
+  };
+}
+
+/** 写一个 CSS 变量；值为空串时**删除**该内联变量（回落到 :root 的默认值）。
+ *  CSSOM 规定 `setProperty(name, "")` 等价于 `removeProperty` —— 靠这条语义
+ *  实现「切回默认主题 = 清掉主题包留下的形状/花纹」，不必逐个记变量名。 */
+function setVar(name: string, value: string) {
+  const s = document.documentElement.style;
+  if (value === "") s.removeProperty(name);
+  else s.setProperty(name, value);
+}
+
+/** 主题色 → CSS 变量。**只写两行**（2026-09-19 批 4 任务 1）：
+ *  - `--accent-rgb` = `r, g, b` 三元组，是**唯一真相源**；
+ *  - `--accent` = 标准 hex（滚动条 / SVG `currentColor` 等需要完整颜色的地方用）。
+ *  `--accent-bg`(0.14) / `--accent-border`(0.32) 以及样式表里各处
+ *  `rgba(var(--accent-rgb), x)` 全部由 :root 派生，不再逐个 setVar —— 此前那三行
+ *  各写各的，导致「accent 带别的 alpha」只能硬编码 #c0a0a0 的 rgb 分量，
+ *  那些按钮/选中态**不跟随主题色**（用户报的 save 按钮问题之一）。 */
+function applyAccent(hex: string) {
+  const c = hexToRgb(hex);
+  if (!c) { setVar("--accent", ""); setVar("--accent-rgb", ""); return; }
+  setVar("--accent", toHex(c.r, c.g, c.b));
+  setVar("--accent-rgb", `${c.r}, ${c.g}, ${c.b}`);
+}
+
+// ── 应用 ─────────────────────────────────────────────────────────
+
+/** 背景图层 `#app-bg-image`（在 #results-container 内部，absolute 贴合结果区 /
+ *  插件界面，随面板缩放）。透明与滤镜由 styles.css 的变量控制。 */
+function applyBgLayer(image: string | null) {
   const bg = document.getElementById("app-bg-image");
   if (!bg) return;
-  if (url) {
-    bg.style.backgroundImage = `url("${url.replace(/"/g, '\\"')}")`;
-  } else {
-    bg.style.backgroundImage = "";
+  bg.style.backgroundImage = image ? `url("${image.replace(/"/g, '\\"')}")` : "";
+}
+
+/** 把当前配置 + 当前主题包合成到 CSS 变量上。可反复调用（幂等）。
+ *
+ *  **顺序即优先级，不许调换**：主题包（设计稿层）先写，用户染色（`tintBase`）后写。
+ *  这条顺序是踩出来的 —— 内置 `themes/default/theme.json` 曾经钉了 `surface: #1c1a20`，
+ *  而当时主题排在后，于是「底色跟随主题色」永远是 #1c1a20 的冷灰（用户报的
+ *  「1C1A20 没跟随、有一层颜色蒙版」就是这层玻璃底色）。 */
+function applyAppearance() {
+  const theme = themeInfos.get(appearance.themeId);
+  const tk = theme?.manifest.tokens;
+  const rs = theme?.resolved;
+
+  // ① 背景优先级：**主题自带背景 > 用户图片**。主题要能钉死背景
+  //    （「背景图片固定」），所以它排最前。
+  applyBgLayer(rs?.background ? convertFileSrc(rs.background)
+    : appearance.bgImage ? appearance.bgImage : null);
+
+  // ② 背景滑块 + 玻璃透明度 + 反光：用户配置，任何主题下都生效。
+  setVar("--bg-blur", `${appearance.bgBlur}px`);
+  setVar("--bg-saturate", String(appearance.bgSaturate / 100));
+  setVar("--bg-opacity", String(appearance.bgOpacity));
+  setVar("--surface-alpha", String(appearance.surfaceAlpha));
+  // 反光滑块 0~1 → 高光 alpha 0~0.22（再亮就成「一块白斑」而不是玻璃反光）
+  setVar("--glass-sheen-alpha", String(Math.round(appearance.sheen * 22) / 100));
+
+  // ③ 主题色：跟随系统 → 用系统强调色（读不到则退回自定义色，不能变成无色）。
+  const accent = appearance.colorMode === "system"
+    ? (systemTheme.accent || appearance.customAccent)
+    : appearance.customAccent;
+  applyAccent(accent);
+
+  // ④ 主题包（设计稿层）：形状 / 花纹 / 颜色 / 玻璃底色。
+  //    **每一项都要能被置空**（`setVar(v, "")` 删掉内联变量、回落 :root），
+  //    否则切回「默认」主题时上一个主题的形状与颜色会残留。
+  setVar("--radius-search", tk?.radius_search ?? "");
+  setVar("--radius-results", tk?.radius_results ?? "");
+  setVar("--pattern-opacity", tk?.pattern_opacity != null ? String(tk.pattern_opacity) : "");
+  setVar("--search-pattern-image", rs?.search_pattern ? `url("${convertFileSrc(rs.search_pattern)}")` : "");
+  setVar("--text", tk?.text ?? "");
+  setVar("--text-dim", tk?.text_dim ?? "");
+  setVar("--text-muted", tk?.text_muted ?? "");
+  setVar("--border-glass", tk?.border_glass ?? "");
+  const surface = tk?.surface ? toRgbTriplet(tk.surface) : null;
+  setVar("--surface-rgb", surface ?? "");
+  // hover 底色 = 常态 +20/通道（原配色 28,26,32 → 48,44,54 正好是这个关系）
+  setVar("--surface-rgb-hover", surface
+    ? surface.split(",").map(s => String(Number(s.trim()) + 20)).join(", ")
+    : "");
+
+  // ⑤ 整套配色跟随主色（`tintBase`）：底色/边框/文字按主色的**明暗**派生。
+  //    排在主题之后是刻意的：这是用户显式打开的开关，应当压过主题包里钉死的颜色。
+  //    关掉时不需要额外清理 —— ④ 已经把这几项清成「主题值或空」。
+  if (appearance.tintBase) {
+    const pal = derivePalette(accent);
+    if (pal) for (const [k, v] of Object.entries(pal)) setVar(k, v);
+  }
+
+  // ⑥ 主题图标表（`pluginIconSvg` 从这里取；换主题必须重建，否则残留上一个主题的图标）
+  themeIconUrls.clear();
+  for (const [id, abs] of Object.entries(rs?.icons ?? {})) {
+    themeIconUrls.set(id, convertFileSrc(abs));
   }
 }
-(window as any).__lunac_apply_bg = applyBgImage;
-try {
-  applyBgImage(localStorage.getItem("lunac-bg-image"));
-} catch {}
+
+/** 拉一次主题列表并缓存。任何失败都只是「没有主题包」——不能因此挡住外观应用。 */
+async function loadThemes(force = false): Promise<ThemeInfo[]> {
+  if (!force && themeInfos.size > 0) return [...themeInfos.values()];
+  let list: ThemeInfo[] = [];
+  try {
+    list = await invoke<ThemeInfo[]>("list_themes");
+  } catch (e) {
+    console.warn("[lunac] list_themes failed (按无主题包处理):", e);
+  }
+  themeInfos.clear();
+  for (const t of list) themeInfos.set(t.manifest.id, t);
+  // 兜底「默认」项：磁盘上没有 default 主题时（dev 模式读不到仓库里的 themes/）
+  // 也要有一个可选项，否则设置面板里会出现「选不中任何主题」的空档。
+  if (!themeInfos.has("default")) {
+    themeInfos.set("default", {
+      manifest: { id: "default", name: "", version: "", author: "", tokens: {} as ThemeTokens, assets: { background: null, search_pattern: null, icons: {} } },
+      dir: "", builtin: true,
+      resolved: { background: null, search_pattern: null, icons: {} },
+    });
+  }
+  return [...themeInfos.values()];
+}
+
+/** 启动/唤出时刷新系统主题（只在「跟随系统」模式下才用到）。 */
+async function refreshSystemTheme() {
+  try {
+    const t = await invoke<SystemTheme>("get_system_theme");
+    if (t && t.accent === systemTheme.accent && t.dark === systemTheme.dark) return; // 没变不动
+    systemTheme = t ?? systemTheme;
+    if (appearance.colorMode === "system") applyAppearance();
+  } catch { /* 读不到就保持上一次的值 */ }
+}
+
+/** 设置面板的对外接口。**必须挂在 window 上**：settings 是独立插件模块，
+ *  与 main.ts 是单向依赖（main.ts 引插件注册表，插件不能反向 import main.ts，
+ *  否则循环）。这是既有约定（原 `__lunac_apply_bg` 同一套）。 */
+(window as any).__lunac_appearance = {
+  get: (): Appearance => ({ ...appearance }),
+  /** 改配置：夹取 → 落盘 → 立即应用。`themeId` 变化时顺带重画结果列表，
+   *  否则刚换的图标要等下次搜索才出现（插件态下 refreshSearchResults 自身会早退）。 */
+  set: (patch: Partial<Appearance>) => {
+    const prevTheme = appearance.themeId;
+    const merged: Appearance = { ...appearance, ...patch };
+    // 选主题 = **套用它整套预设（含主色）**：主题包声明了 accent 就写进 customAccent。
+    // 这样主色在界面上是可见、可继续微调的，也就不需要一条「主题色 vs 用户色」的
+    // 优先级裁决 —— 那种裁决会让用户改完色不知道为什么没生效。
+    if (patch.themeId !== undefined && patch.themeId !== prevTheme) {
+      const themeAccent = themeInfos.get(patch.themeId)?.manifest.tokens.accent;
+      if (themeAccent) merged.customAccent = themeAccent; // clampAppearance 会校验 hex
+    }
+    appearance = clampAppearance(merged);
+    persistAppearance();
+    applyAppearance();
+    // 换主题要重画结果列表（主题图标）；染色/滑块不必（不产生新 DOM）。
+    if (patch.themeId !== undefined && patch.themeId !== prevTheme) refreshSearchResults();
+  },
+  themes: (force?: boolean): Promise<ThemeInfo[]> => loadThemes(force),
+  systemTheme: (): SystemTheme => ({ ...systemTheme }),
+  refreshSystemTheme: (): Promise<void> => refreshSystemTheme(),
+  themesDir: (): Promise<string> => invoke<string>("themes_dir"),
+  /** 选择背景图（设置面板只管选文件，落配置与应用都走这里，避免两处实现漂移）。 */
+  pickBgImage: async (): Promise<boolean> => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({
+        multiple: false,
+        title: t("settings.appearance_bg_apply"),
+        filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif", "avif"] }],
+      });
+      if (typeof picked !== "string" || !picked) return false;
+      appearance = clampAppearance({ ...appearance, bgImage: convertFileSrc(picked) });
+      persistAppearance();
+      applyAppearance();
+      return true;
+    } catch (e) {
+      console.error("[lunac] pick background failed:", e);
+      return false;
+    }
+  },
+};
+
+// 启动即应用：**先同步**应用用户配置（背景图/滑块/主题色立刻生效，避免首帧闪一下
+// 默认外观），再去拉主题包并补一次（主题包读文件是异步的）。
+appearance = loadAppearance();
+applyAppearance();
+void (async () => {
+  await loadThemes(true);
+  // **无条件**取一次系统色：设置面板要显示「当前系统色」，而且用户切到「跟随系统」
+  // 的那一刻必须已经有值 —— 只在系统模式下才取，会出现「切了模式却不生效、要点
+  // 一次刷新才对」（浏览器实测踩到）。成本是两次注册表读，可忽略。
+  await refreshSystemTheme();
+  applyAppearance();
+})();
+// 「跟随系统」的轮询：15s 一次，非系统模式直接跳过（两次注册表读，成本可忽略）。
+// 为什么不做成消息驱动（WM_DWMCOLORIZATIONCOLORCHANGED）：那要动 hotkey.rs 的
+// WndProc 子类化，收益只是「变色后 15s 内察觉」→ 不值得；真要即时可后续加。
+window.setInterval(() => {
+  if (appearance.colorMode === "system") void refreshSystemTheme();
+}, 15000);
 
 // ── Drag & drop files onto search bar / chat bar ────────────────
 
@@ -6575,6 +7090,9 @@ function triggerJSClipboardRead() {
 // 同时进入「抑制滑动」期：唤出瞬间窗口应完整展开，而不是被结果区逐帧撑开。
 win.listen("lunac-window-shown", () => {
   suppressResizeAnimBriefly();
+  // 强制重新断言高度：隐藏期间窗口高可能已被改动，而 `requestedHeight` 缓存会让
+  // 本轮测量被静默跳过（2026-09-19，见 forceHeightReassert 的注释）。
+  forceHeightReassert();
   // 大界面不跨「隐藏 → 唤出」存活：唤出（热键 / 双击图标）一律回到简洁搜索 ——
   // 否则用户下次唤出面对的是上次留下的大界面，还占着 640 的固定高度。
   if (detailOpen) exitDetailSilently();
@@ -6619,8 +7137,8 @@ interface DetailFile {
   path: string;
   kind: string;
   ext: string;
+  /** 修改时间（毫秒时间戳；读不到为 0）。Rust `file_indexer::FileHit` 只给这一个元数据。 */
   modified: number;
-  size: number;
 }
 
 /** 系统设置页 / 系统动作条目（Rust `system_catalog::CatalogItem`） */
@@ -6632,6 +7150,8 @@ interface DetailCatalogItem {
   title_en: string;
   target: string;
   danger: boolean;
+  /** 该动作有「以管理员身份运行」形态（Rust 由 `action_spec()` 推导，别在前端重算） */
+  elevatable: boolean;
   keywords: string[];
 }
 
@@ -6659,7 +7179,20 @@ const DETAIL_CATS: DetailCat[] = ["all", "apps", "files", "settings", "actions",
 /// 文件类型筛选（"" = 全部类型；值必须与 Rust `kind_for` 的分类一一对应）
 const DETAIL_KINDS = ["", "folder", "document", "image", "video", "audio", "archive", "program", "other"];
 /// 文件结果条数上限（其余分类体量都很小，不需要上限）
-const DETAIL_FILE_LIMIT = 40;
+/// 2026-09-19：40 → 200（= Rust 侧 `file_indexer::MAX_RESULTS` 的硬上限）。
+/// 用户反馈「只能固定到这么多」—— 40 条对「找文件」这个主用途太窄；
+/// 200 条是后端本来就允许的上限，前端不再自我设限。
+const DETAIL_FILE_LIMIT = 200;
+/// 应用结果上限：6 → 20（同上，开始菜单条目通常几十个，20 条足够覆盖一次检索）
+const DETAIL_APP_LIMIT = 20;
+/// 插件命令结果上限：6 → 12
+const DETAIL_PLUGIN_LIMIT = 12;
+/// 设置页 / 系统动作结果上限：8 → 20（目录一共六十来条）
+const DETAIL_CATALOG_LIMIT = 20;
+/// 能交给 `ShellExecuteW(runas)` 提权的扩展名。**判据必须与 Rust 侧同源**：
+/// `system_catalog` 的动作看各自的 `elevatable` 字段，应用/文件看这张表。
+/// 文件夹、`ms-settings:` 页、网页搜索都没有提权形态。
+const DETAIL_ELEVATABLE_EXTS = ["exe", "lnk", "msc", "cpl", "bat", "cmd", "com"];
 /// 结果区分组顺序（Tab「全部」时按这个顺序分组显示）
 const DETAIL_GROUPS: Array<{ cat: DetailRowCat; key: string }> = [
   { cat: "apps", key: "detail.group_apps" },
@@ -6675,6 +7208,7 @@ const detailInput = el("detail-input") as HTMLInputElement;
 const detailTabs = el("detail-tabs");
 const detailKinds = el("detail-kinds");
 const detailResults = el("detail-results");
+const detailPreview = el("detail-preview");
 const detailCount = el("detail-count");
 const detailHint = el("detail-hint");
 const detailIndexEl = el("detail-index");
@@ -6693,7 +7227,33 @@ let detailEntryQuery = "";    // 进大界面时简洁搜索里的查询词（�
 let detailArmed = "";         // 危险动作二次确认中的 id
 let detailArmedTimer: ReturnType<typeof setTimeout> | null = null;
 let detailStatusTimer: ReturnType<typeof setInterval> | null = null;
+/** 「按键提示行临时改文案」的定时器（提权被拒等必须让用户看见的一次性反馈） */
+let detailHintTimer: ReturnType<typeof setTimeout> | null = null;
 let detailIconToken = 0;      // 图标异步回填的失效令牌（重渲染后旧回包作废）
+
+/** 把按键提示行临时改成一条反馈文案，3 秒后恢复。
+ *
+ *  详细搜索大界面里**没有 toast 设施**，而「以管理员身份运行」失败（用户点了 UAC 的
+ *  「否」、或策略禁止）是**必须被看见**的：静默失败与「点了没反应」在用户眼里一样。
+ *  提示行是唯一常驻且位置合适的文本位。 */
+function flashDetailHint(msg: string) {
+  if (detailHintTimer) clearTimeout(detailHintTimer);
+  detailHint.textContent = msg;
+  detailHint.classList.add("detail-hint-error");
+  detailHintTimer = setTimeout(() => {
+    detailHintTimer = null;
+    detailHint.classList.remove("detail-hint-error");
+    if (detailOpen) detailHint.textContent = t("detail.hint_keys");
+  }, 3000);
+}
+
+function clearDetailHint() {
+  if (detailHintTimer) {
+    clearTimeout(detailHintTimer);
+    detailHintTimer = null;
+  }
+  detailHint.classList.remove("detail-hint-error");
+}
 
 /** 目录条目的显示名：系统语言是中文就用中文名，其余语言用英文名。
  *  为什么不给五种语言：Windows 设置页的名字是 OS 自己的资源，我们拿不到官方译名。 */
@@ -6705,12 +7265,43 @@ function detailKindLabel(kind: string): string {
   return t(kind ? `detail.kind_${kind}` : "detail.kind_all");
 }
 
-/** 目录（设置页 + 系统动作）本地匹配：几十条数据，不必走后端。 */
+/** 模糊（子序列）兜底的最低查询长度。
+ *  对齐 Win11 新版搜索的「2 字符起」：1 个字符做子序列匹配等于把整张表都拉进来，
+ *  那不叫容错、叫没过滤。 */
+const DETAIL_FUZZY_MIN_CHARS = 2;
+
+/** 子序列打分：查询的字符按**顺序**出现在目标里即命中，允许中间插字。
+ *  语义与 Rust `file_indexer::score_subsequence` 故意保持一致 ——
+ *  `utlook` 命中 Outlook、`instaled` 命中 Installed apps，这是 Win11 新版搜索
+ *  最被称道的一条（拼错不再直接丢给网页搜索）。
+ *  分数刻意压在「包含」档（30）之下：模糊命中是兜底，**永远不能把精确命中挤下去**。 */
+function scoreSubsequence(hay: string, q: string): number {
+  let i = 0;
+  let first = -1;
+  let last = -1;
+  for (let j = 0; j < hay.length && i < q.length; j++) {
+    if (hay[j] === q[i]) {
+      if (first < 0) first = j;
+      last = j;
+      i++;
+    }
+  }
+  if (i < q.length) return 0;                     // 还有字符没匹配上
+  const gaps = last - first + 1 - q.length;       // 跨度里被跳过的字符数
+  return 20 - Math.min(12, gaps);
+}
+
+/** 目录（设置页 + 系统动作）本地匹配：几十条数据，不必走后端。
+ *
+ *  两轮（2026-09-19 批 5 任务 3c 补第二轮）：**第一轮**精确 / 前缀 / 包含 / 多词全中；
+ *  只有第一轮没凑够上限才跑**第二轮**子序列兜底 —— 与 `file_indexer::rank` 同一套门控，
+ *  单字符查询在第一轮就已命中该命中的，不必再扫一遍全表。 */
 function matchDetailCatalog(q: string): DetailCatalogItem[] {
   if (!q) return [];
   const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
   if (!tokens.length) return [];
   const scored: Array<{ it: DetailCatalogItem; score: number }> = [];
+  const taken = new Set<string>();
   for (const it of detailCatalog) {
     const zh = it.title_zh.toLowerCase();
     const en = it.title_en.toLowerCase();
@@ -6725,10 +7316,57 @@ function matchDetailCatalog(q: string): DetailCatalogItem[] {
       }
       total += hit === zh || hit === en ? 100 : hit.startsWith(tk) ? 60 : 30;
     }
-    if (all) scored.push({ it, score: total });
+    if (all) {
+      scored.push({ it, score: total });
+      taken.add(it.id);
+    }
+  }
+  if (scored.length < DETAIL_CATALOG_LIMIT && tokens.every(tk => tk.length >= DETAIL_FUZZY_MIN_CHARS)) {
+    for (const it of detailCatalog) {
+      if (taken.has(it.id)) continue;
+      const hay = [it.title_zh.toLowerCase(), it.title_en.toLowerCase(), ...it.keywords.map(k => k.toLowerCase())];
+      let total = 0;
+      let all = true;
+      for (const tk of tokens) {
+        let best = 0;
+        for (const h of hay) best = Math.max(best, scoreSubsequence(h, tk));
+        if (!best) {
+          all = false;
+          break;
+        }
+        total += best;
+      }
+      if (all) scored.push({ it, score: total });
+    }
   }
   scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, 8).map(s => s.it);
+  return scored.slice(0, DETAIL_CATALOG_LIMIT).map(s => s.it);
+}
+
+/** 该结果是否支持「以管理员身份运行」。**必须与 Rust 侧同源**（见 DETAIL_ELEVATABLE_EXTS
+ *  与 `system_catalog::CatalogItem::elevatable`）：界面画了盾牌而 Rust 拒绝执行，
+ *  或者反过来 —— 都会让用户觉得「这个按钮是坏的」。 */
+function detailElevatable(row: DetailRow): boolean {
+  switch (row.cat) {
+    case "actions":
+      return !!row.item?.elevatable;
+    case "settings":
+      return false;
+    case "apps":
+      // 开始菜单条目基本都是 .lnk（runas 到 .lnk 会作用到它指向的目标）；文件夹排除掉
+      return detailElevatablePath(row.app!.path);
+    case "files":
+      // `kind === "folder"` 优先于扩展名 —— 「名为 xxx.exe 的目录」不该显示盾牌
+      if (row.file!.kind === "folder") return false;
+      return detailElevatablePath(row.file!.path);
+    default:
+      return false; // 插件命令 / 网页搜索没有提权形态
+  }
+}
+
+function detailElevatablePath(path: string): boolean {
+  const ext = (path.match(/\.([a-zA-Z0-9]+)$/)?.[1] || "").toLowerCase();
+  return DETAIL_ELEVATABLE_EXTS.includes(ext);
 }
 
 async function ensureDetailCatalog() {
@@ -6748,6 +7386,7 @@ function enterDetail() {
   detailOpen = true;
   detailEntryQuery = searchInput.value;
   detailInput.value = detailEntryQuery;
+  clearDetailHint();
   detailInput.placeholder = t("detail.placeholder");
   detailHint.textContent = t("detail.hint_keys");
   detailPanel.classList.remove("hidden");
@@ -6773,6 +7412,7 @@ function exitDetailSilently() {
   detailOpen = false;
   stopDetailStatusPolling();
   clearDetailArmed();
+  clearDetailHint();
   document.getElementById("app")!.classList.remove("detail-mode");
   detailPanel.classList.add("hidden");
   applyWindowSize();
@@ -6800,7 +7440,7 @@ async function runDetailSearch() {
   const seq = ++detailSeq;
   const q = detailInput.value.trim();
   const [apps, files] = await Promise.all([
-    invoke<AppEntry[]>("search_apps", { query: q, limit: 6 }).catch(() => [] as AppEntry[]),
+    invoke<AppEntry[]>("search_apps", { query: q, limit: DETAIL_APP_LIMIT }).catch(() => [] as AppEntry[]),
     invoke<DetailFile[]>("search_files", { query: q, kind: detailKind || null, limit: DETAIL_FILE_LIMIT })
       .catch(() => [] as DetailFile[]),
   ]);
@@ -6811,7 +7451,7 @@ async function runDetailSearch() {
   for (const it of matchDetailCatalog(q)) {
     rows.push({ cat: it.kind === "setting" ? "settings" : "actions", item: it });
   }
-  for (const p of pluginRegistry.search(q).slice(0, 6)) rows.push({ cat: "commands", plugin: p });
+  for (const p of pluginRegistry.search(q).slice(0, DETAIL_PLUGIN_LIMIT)) rows.push({ cat: "commands", plugin: p });
   if (q) rows.push({ cat: "web", query: q });
   detailAllRows = rows;
   if (detailSel >= rows.length) detailSel = 0;
@@ -6883,6 +7523,7 @@ function renderDetail() {
   detailCount.textContent = detailRows.length ? String(detailRows.length) : "";
   renderDetailStatus();
   scrollDetailSelectionIntoView();
+  renderDetailPreview();
 }
 
 /** 父目录（结果条目的副行文案；根目录时原样回显盘符）。 */
@@ -6894,6 +7535,7 @@ function parentDir(path: string): string {
 function buildDetailItem(row: DetailRow, idx: number, token: number): HTMLElement {
   const item = doc("div");
   const armed = !!row.item?.danger && detailArmed === row.item.id;
+  const canElevate = detailElevatable(row);
   item.className = `result-item${idx === detailSel ? " selected" : ""}${armed ? " danger-armed" : ""}`;
   item.dataset.idx = String(idx);
 
@@ -6942,8 +7584,8 @@ function buildDetailItem(row: DetailRow, idx: number, token: number): HTMLElemen
     case "commands": {
       const p = row.plugin!;
       iconHtml = pluginIconSvg(p.id);
-      title = p.name;
-      desc = p.description;
+      title = pluginName(p.id, p.name);
+      desc = pluginDesc(p.id, p.description);
       badge = p.badge || t("detail.badge_command");
       break;
     }
@@ -6962,12 +7604,24 @@ function buildDetailItem(row: DetailRow, idx: number, token: number): HTMLElemen
       <div class="result-item-title${armed ? " detail-danger" : ""}">${esc(title)}</div>
       ${desc ? `<div class="result-item-desc">${esc(desc)}</div>` : ""}
     </div>
+    ${canElevate ? `<button type="button" class="result-item-elevate" title="${esc(t("detail.elevate_title"))}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 4.5 5.6V11c0 4.7 3.2 8.8 7.5 10.5 4.3-1.7 7.5-5.8 7.5-10.5V5.6Z"/></svg></button>` : ""}
     <span class="result-item-badge">${esc(badge)}</span>
   `;
   item.addEventListener("click", () => {
     detailSel = idx;
     void activateDetailRow(row);
   });
+  // 盾牌 = 「以管理员身份运行」（会弹 UAC）。**必须 stopPropagation**，
+  // 否则这一次点击会先命中行上的普通「打开」监听器（用户看到的是「点了盾牌却普通启动了」）。
+  if (canElevate) {
+    item.querySelector<HTMLElement>(".result-item-elevate")?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      detailSel = idx;
+      markDetailSelection();
+      void activateDetailRow(row, true);
+    });
+  }
   item.addEventListener("mousemove", () => {
     if (detailSel !== idx) {
       detailSel = idx;
@@ -6995,6 +7649,7 @@ function markDetailSelection() {
     it.classList.toggle("selected", Number(it.dataset.idx) === detailSel);
   });
   scrollDetailSelectionIntoView();
+  renderDetailPreview();
 }
 
 function scrollDetailSelectionIntoView() {
@@ -7003,22 +7658,228 @@ function scrollDetailSelectionIntoView() {
     ?.scrollIntoView({ block: "nearest" });
 }
 
+// ── 右侧预览区（2026-09-19 批 5 任务 3a）──────────────────────────
+//
+// 对齐 Win11 新版搜索（KB5120998）：选中一条结果 → 右侧给出缩略图、完整路径、
+// 最后修改日期，以及「打开」「复制路径」两个动作。
+//
+// 两条防抖纪律（这块会在鼠标划过每一行时被重建，不节流会把缩略图请求打爆）：
+//   ① `detailPreviewKey` —— 同一行重复进入直接早退，不重建 DOM、不重发请求；
+//   ② `detailThumbCache` —— 缩略图按路径缓存（含「失败」这个结果，用空串表示），
+//      上下键来回扫同一批文件时只在第一次真的走 IPC。
+
+/** 缩略图缓存：path → data URL（`""` = 取过但拿不到，别再问第二次） */
+const detailThumbCache = new Map<string, string>();
+/** 上一次已渲染的预览键（path 或 cat:title），相同则早退 */
+let detailPreviewKey = "";
+/** 异步缩略图回包的失效令牌（重渲染后旧回包作废，与 detailIconToken 同理） */
+let detailPreviewToken = 0;
+
+/** 把毫秒时间戳格式化成「本地时间」，读不到（0）返回空串。 */
+function formatModified(ms: number): string {
+  if (!ms) return "";
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function renderDetailPreview() {
+  const row = detailRows[detailSel];
+  if (!row) {
+    detailPreviewKey = "";
+    detailPreview.classList.add("hidden");
+    detailPreview.replaceChildren();
+    return;
+  }
+
+  let title = "";
+  let glyph = "";
+  let path = "";
+  let modified = 0;
+  let source = "";
+  let iconHtml = "";
+  switch (row.cat) {
+    case "apps": {
+      const app = row.app!;
+      title = app.name;
+      path = app.path;
+      source = t("detail.src_apps");
+      break;
+    }
+    case "files": {
+      const f = row.file!;
+      title = f.name;
+      path = f.path;
+      modified = f.modified;
+      source = t("detail.src_files");
+      glyph = f.kind === "folder" ? "📁" : (f.ext || "📄");
+      break;
+    }
+    case "settings": {
+      const it = row.item!;
+      title = detailCatalogTitle(it);
+      path = it.target;
+      source = t("detail.src_settings");
+      glyph = it.icon;
+      break;
+    }
+    case "actions": {
+      const it = row.item!;
+      title = detailCatalogTitle(it);
+      path = it.target;
+      source = t("detail.src_actions");
+      glyph = it.icon;
+      break;
+    }
+    case "commands": {
+      const p = row.plugin!;
+      title = p.name;
+      source = t("detail.src_commands");
+      iconHtml = pluginIconSvg(p.id);
+      break;
+    }
+    case "web": {
+      title = t("plugin.web-search");
+      source = t("detail.src_web");
+      glyph = "🌐";
+      break;
+    }
+  }
+
+  const key = path || `${row.cat}:${title}`;
+  if (key === detailPreviewKey) return;
+  detailPreviewKey = key;
+  const token = ++detailPreviewToken;
+  detailPreview.classList.remove("hidden");
+
+  // 缩略图容器：apps/files 走真实缩略图（图片真解码、其余系统类型图标），
+  // 其余分类用图标 / 字形占位。
+  const thumb = doc("div");
+  thumb.className = "detail-preview-thumb";
+  if (iconHtml) {
+    thumb.innerHTML = iconHtml;
+  } else if (glyph) {
+    const g = doc("span");
+    g.className = "detail-preview-glyph";
+    g.textContent = glyph;
+    thumb.appendChild(g);
+  }
+
+  const titleEl = doc("div");
+  titleEl.className = "detail-preview-title";
+  titleEl.textContent = title;
+
+  const rowsEl = doc("div");
+  rowsEl.className = "detail-preview-rows";
+  const addRow = (labelKey: string, value: string) => {
+    if (!value) return;   // 没有这一项就不画（例如插件命令没有路径）
+    const rowEl = doc("div");
+    rowEl.className = "detail-preview-row";
+    const k = doc("div");
+    k.className = "detail-preview-key";
+    k.textContent = t(labelKey);
+    const v = doc("div");
+    v.className = "detail-preview-val";
+    v.textContent = value;
+    rowEl.append(k, v);
+    rowsEl.appendChild(rowEl);
+  };
+  addRow("detail.preview_source", source);
+  addRow("detail.preview_path", path);
+  addRow("detail.preview_modified", formatModified(modified));
+
+  // 动作区：打开（与点击该行完全同一条路径，含危险动作二次确认/提权）
+  const actions = doc("div");
+  actions.className = "detail-preview-actions";
+  const openBtn = doc("button") as HTMLButtonElement;
+  openBtn.type = "button";
+  openBtn.textContent = t("detail.preview_open");
+  openBtn.addEventListener("click", () => void activateDetailRow(row));
+  actions.appendChild(openBtn);
+  if (path) {
+    const copyBtn = doc("button") as HTMLButtonElement;
+    copyBtn.type = "button";
+    copyBtn.textContent = t("detail.preview_copy_path");
+    copyBtn.addEventListener("click", async () => {
+      try {
+        const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+        await writeText(path);
+        copyBtn.textContent = t("detail.preview_copied");
+        setTimeout(() => { copyBtn.textContent = t("detail.preview_copy_path"); }, 1200);
+      } catch (e) {
+        console.warn("[lunac] copy path failed:", e);
+      }
+    });
+    actions.appendChild(copyBtn);
+  }
+
+  detailPreview.replaceChildren(thumb, titleEl, rowsEl, actions);
+
+  // 缩略图异步回填（缓存 + 令牌双重保护）
+  if (row.cat === "apps" || row.cat === "files") {
+    const cached = detailThumbCache.get(path);
+    if (cached !== undefined) {
+      if (cached) thumb.innerHTML = `<img src="${cached}" alt="">`;
+    } else {
+      invoke<string | null>("get_file_thumbnail", { path, max: 256 })
+        .then(dataUrl => {
+          detailThumbCache.set(path, dataUrl || "");
+          if (token !== detailPreviewToken) return;   // 已切到别的行
+          if (dataUrl) thumb.innerHTML = `<img src="${dataUrl}" alt="">`;
+        })
+        .catch(() => { detailThumbCache.set(path, ""); });
+    }
+  }
+}
+
 // ── 执行 ─────────────────────────────────────────────────────────
 
-async function activateDetailRow(row: DetailRow) {
+/** 执行一个结果行。`elevated = true` 走「以管理员身份运行」（`ShellExecuteW(runas)`，弹 UAC）。
+ *
+ *  提权路径与普通路径有两点刻意不同：
+ *    ① **先等结果再收界面** —— UAC 被拒（`SE_ERR_ACCESSDENIED`）时必须把原因显示出来，
+ *       而详情面板一收，提示就没有落点了；
+ *    ② **不记使用频次、不走 launchApp** —— `launchApp` 自己会隐藏窗口并写频次，
+ *       那是「普通启动」的语义，混进来会让频次统计失真。
+ *  判据（哪一行有提权形态）由 `detailElevatable()` 给出，与 Rust 侧同源。 */
+async function activateDetailRow(row: DetailRow, elevated = false) {
   switch (row.cat) {
     case "apps":
-    case "files":
+    case "files": {
+      const path = row.app ? row.app.path : row.file!.path;
+      if (elevated) {
+        try {
+          await invoke("launch_app_elevated", { path });
+        } catch (err) {
+          flashDetailHint(t("detail.elevate_failed", { err: String(err) }));
+          return;
+        }
+        exitDetailSilently();
+        return;
+      }
       // launchApp 自带「隐藏窗口 + 记录使用频次」；先还原视图，下次唤出回到简洁搜索
       exitDetailSilently();
-      launchApp(row.app ? row.app.path : row.file!.path);
+      launchApp(path);
       return;
+    }
     case "settings":
       exitDetailSilently();
       invoke("open_setting", { target: row.item!.target }).catch(e => console.warn("[lunac] open_setting:", e));
       return;
     case "actions": {
       const it = row.item!;
+      // 提权分支：只对 `elevatable` 的动作开放（Rust 侧还会再校验一次）
+      if (elevated && it.elevatable) {
+        try {
+          await invoke("run_system_action_elevated", { id: it.id });
+        } catch (err) {
+          flashDetailHint(t("detail.elevate_failed", { err: String(err) }));
+          return;
+        }
+        exitDetailSilently();
+        return;
+      }
       // 危险动作（关机 / 重启）二次确认：3 秒内再按一次才真执行
       if (it.danger && detailArmed !== it.id) {
         clearDetailArmed();
@@ -7144,7 +8005,13 @@ detailInput.addEventListener("keydown", (e) => {
     e.preventDefault();
     const row = detailRows[detailSel];
     if (row) {
-      void activateDetailRow(row);
+      // Shift+Enter = 以管理员身份运行（会弹 UAC）。没有提权形态的行直接给反馈，
+      // 而不是静默按普通方式打开 —— 用户按了带修饰键的 Enter 就是想提权。
+      if (e.shiftKey && !detailElevatable(row)) {
+        flashDetailHint(t("detail.elevate_unsupported"));
+        return;
+      }
+      void activateDetailRow(row, e.shiftKey);
     } else if (detailInput.value.trim()) {
       // 当前分类下没有结果 → 回车直接走网页搜索（与 Win+S 的兜底一致）
       void activateDetailRow({ cat: "web", query: detailInput.value.trim() });

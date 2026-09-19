@@ -1,5 +1,29 @@
 # Parse a Windows kernel minidump to extract the bugcheck (BSOD) code.
-param([string]$Path = "C:\Windows\Minidump\080226-14562-01.dmp")
+#
+# 用法：  powershell -File docs\parse-minidump.ps1 -Path 'C:\Windows\Minidump\xxxx.dmp'
+#         powershell -File docs\parse-minidump.ps1            # 不给就取该目录下最新的一个
+#
+# **不得把某台机器的 .dmp 文件名写死成默认值**（2026-09-19 改）：原来默认值是
+# `C:\Windows\Minidump\080226-14562-01.dmp` —— 那是某次排查时本机的产物，
+# 换台机器就必然 `ReadAllBytes` 抛异常（见 ai-spec：禁止硬编码本机绝对路径）。
+param([string]$Path = "")
+
+if (-not $Path) {
+    $dir = Join-Path $env:SystemRoot "Minidump"
+    $latest = Get-ChildItem -LiteralPath $dir -Filter *.dmp -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $latest) {
+        Write-Error "没有找到 dump 文件（默认目录 $dir）。请用 -Path 显式指定。"
+        exit 1
+    }
+    $Path = $latest.FullName
+    Write-Host "未指定 -Path，取最新的 dump：$Path"
+}
+
+if (-not (Test-Path -LiteralPath $Path)) {
+    Write-Error "dump 文件不存在：$Path"
+    exit 1
+}
 
 $bytes = [System.IO.File]::ReadAllBytes($Path)
 $br = New-Object System.IO.BinaryReader (New-Object System.IO.MemoryStream (,$bytes))

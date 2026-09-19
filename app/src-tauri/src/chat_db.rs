@@ -10,8 +10,10 @@
 //! 表：FTS5 默认分词器（unicode61）对中文不切词，中文子串检索在默认表上永远命中 0，
 //! 必须走 trigram（照 Hermes `state.db` 的做法）。
 //!
-//! 对外只暴露 `load` / `save` / `import_legacy`，数据形状（`ChatSession`）留在
-//! `storage.rs` —— 本模块不定义业务类型，免得出现两份「会话长什么样」的真相。
+//! 对外暴露 `load` / `save` / `import_legacy`（存取与迁移）以及
+//! `search` / `recent_sessions` / `render_digest`（往期会话检索，2026-09-19）——
+//! 数据形状（`ChatSession`）留在 `storage.rs` —— 本模块不定义业务类型，
+//! 免得出现两份「会话长什么样」的真相。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -231,6 +233,245 @@ pub fn import_legacy(path: &Path, json: &str) -> Result<usize, String> {
     Ok(sessions.len())
 }
 
+// ── 往期会话检索（2026-09-19，A2）──────────────────────────────────
+//
+// 两张 FTS 索引表从 2026-09-17 起就随写入用触发器维护着，但**一直没有调用方**
+// （见模块头注释）。本节是那个调用方：给 agent 一个只读的「往期会话检索」。
+//
+// **为什么 FTS 与 LIKE 两条路都要**：FTS5 的 trigram 分词器要求查询词 **≥3 字符**，
+// 而中文常用词大量是 2 字（「缓存」「命中」「热键」）—— 只走 trigram 会**静默漏掉**
+// 这类查询（不报错、只是永远 0 条），是最难排查的那种「功能看起来在、其实没生效」。
+// 所以短词落到 `LIKE` 全表扫；会话库是个人规模（万条消息级），一次 LIKE 完全可以接受。
+
+/// 一条检索命中（未渲染成给模型看的文本）。
+pub struct HistoryHit {
+    pub session_id: String,
+    pub title: String,
+    pub created_at: u64,
+    pub role: String,
+    pub idx: i64,
+    pub content: String,
+}
+
+/// 单条命中内联的正文上限（字符）。一条 assistant 消息可能是一整篇长文，
+/// 全量回灌会把上下文一次吃掉 —— 模型要更多可以换个词再搜一次。
+const HIT_CONTENT_CHARS: usize = 700;
+
+/// 检索往期会话消息。排序 = 会话（新→旧），会话内按 `idx`。
+pub fn search(path: &Path, query: &str, limit: usize) -> Result<Vec<HistoryHit>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = open(path)?;
+    init_schema(&conn)?;
+
+    // FTS 语法 / 分词器对某些查询串会**直接报错**（例如全是标点、没有可索引的 token）。
+    // 那种情况不该让整次检索失败 —— 落到 LIKE 照样能给出结果。
+    match search_fts(&conn, q, limit) {
+        Ok(hits) if !hits.is_empty() => Ok(hits),
+        _ => search_like(&conn, q, limit),
+    }
+}
+
+/// FTS 路径：trigram（CJK 子串）与 unicode61（英文 / 代码词）**任一命中**即算。
+///
+/// 查询串必须包成**带引号的短语**（内部的 `"` 双写转义）：不包的话 FTS5 会把它当查询
+/// 语法解析，`AND` / `*` / `-` / `(` 这类字符会让整条语句报错。
+fn search_fts(conn: &Connection, q: &str, limit: usize) -> Result<Vec<HistoryHit>, String> {
+    let phrase = format!("\"{}\"", q.replace('"', "\"\""));
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.session_id, s.title, s.created_at, m.role, m.idx, substr(m.content, 1, ?3)
+             FROM messages m JOIN sessions s ON s.id = m.session_id
+             WHERE m.rowid IN (SELECT rowid FROM messages_trgm WHERE messages_trgm MATCH ?1)
+                OR m.rowid IN (SELECT rowid FROM messages_fts  WHERE messages_fts  MATCH ?1)
+             ORDER BY s.created_at DESC, m.idx ASC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![phrase, limit as i64, HIT_CONTENT_CHARS as i64],
+            |row| {
+                Ok(HistoryHit {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    created_at: row.get::<_, i64>(2)? as u64,
+                    role: row.get(3)?,
+                    idx: row.get(4)?,
+                    content: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// LIKE 路径（兜底）：FTS 未命中或查询词太短（<3 字符）时用。
+///
+/// 通配符必须转义 —— 否则用户搜 `100%` 会变成「匹配任意结尾」，`a_b` 会连 `axb` 一起命中。
+fn search_like(conn: &Connection, q: &str, limit: usize) -> Result<Vec<HistoryHit>, String> {
+    let escaped = q
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.session_id, s.title, s.created_at, m.role, m.idx, substr(m.content, 1, ?3)
+             FROM messages m JOIN sessions s ON s.id = m.session_id
+             WHERE m.content LIKE ?1 ESCAPE '\\'
+             ORDER BY s.created_at DESC, m.idx ASC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![pattern, limit as i64, HIT_CONTENT_CHARS as i64],
+            |row| {
+                Ok(HistoryHit {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    created_at: row.get::<_, i64>(2)? as u64,
+                    role: row.get(3)?,
+                    idx: row.get(4)?,
+                    content: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// 一条会话的摘要（供「往期会话索引」注入用）。
+pub struct SessionBrief {
+    pub id: String,
+    pub title: String,
+    pub created_at: u64,
+    pub msgs: usize,
+    /// 首条 user 消息（已截断）—— 标题常是自动生成的泛泛之词，
+    /// 「这条会话到底在问什么」看开头第一句最准。
+    pub opening: String,
+}
+
+/// 取最近 N 条**非空**会话的摘要，按创建时间新→旧。
+pub fn recent_sessions(path: &Path, limit: usize) -> Result<Vec<SessionBrief>, String> {
+    let conn = open(path)?;
+    init_schema(&conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.title, s.created_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                    COALESCE((SELECT substr(m2.content, 1, 300) FROM messages m2
+                              WHERE m2.session_id = s.id AND m2.role = 'user'
+                              ORDER BY m2.idx ASC LIMIT 1), '')
+             FROM sessions s
+             ORDER BY s.created_at DESC, s.pos ASC
+             LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit as i64], |row| {
+            Ok(SessionBrief {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at: row.get::<_, i64>(2)? as u64,
+                msgs: row.get::<_, i64>(3)?.max(0) as usize,
+                opening: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        let b = r.map_err(|e| e.to_string())?;
+        // 空会话（只有标题、没有消息）对模型没有任何价值，纯占前缀预算。
+        if b.msgs > 0 {
+            out.push(b);
+        }
+    }
+    Ok(out)
+}
+
+/// 单行里标题 / 开场白的字符上限。
+const DIGEST_TITLE_CHARS: usize = 60;
+const DIGEST_OPENING_CHARS: usize = 120;
+
+/// 把会话摘要渲染成**系统提示词里的固定段**。
+///
+/// 三条纪律：
+/// ① **英文**：与 `env_block` / 技能清单位于同一段，模型看到的身份与环境说明都是英文；
+/// ② **日期用相对天数**：Rust 标准库没有时区表（项目为此不引 chrono，见 `log.rs`），
+///    绝对日期只能是 UTC，会出现「本地已是今天、UTC 还是昨天」的错位；相对天数是纯差值，
+///    与本地时区无关 —— 而「上次 / 前几天」这类指代要的正是相对先后；
+/// ③ **总预算硬截断**：这段进的是**每轮都发**的固定前缀，必须封顶（预算由调用方给）。
+pub fn render_digest(briefs: &[SessionBrief], budget_chars: usize, now_ms: u64) -> String {
+    if briefs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "## Past sessions (newest first)\n\
+         These are the user's earlier conversations in this app. This list carries only titles \
+         and opening lines — you do NOT know what was actually discussed. Call the \
+         `SessionSearch` tool to read a session's real content, and never claim to remember \
+         something you have not read.\n",
+    );
+    let mut omitted = 0usize;
+    for b in briefs {
+        let line = format!(
+            "\n- [{}] {} ({} msgs) — {}",
+            age_label(b.created_at, now_ms),
+            clip(&b.title, DIGEST_TITLE_CHARS),
+            b.msgs,
+            clip(&b.opening, DIGEST_OPENING_CHARS)
+        );
+        if out.chars().count() + line.chars().count() > budget_chars {
+            omitted += 1;
+            continue;
+        }
+        out.push_str(&line);
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n\n({omitted} older session(s) omitted — narrow the question and search instead.)"
+        ));
+    }
+    out
+}
+
+/// 相对天数标签。`created_at` 是毫秒时间戳（前端 `Date.now()` 口径）。
+fn age_label(created_at: u64, now_ms: u64) -> String {
+    let days = now_ms.saturating_sub(created_at) / 86_400_000;
+    match days {
+        0 => "today".into(),
+        1 => "1d ago".into(),
+        n => format!("{n}d ago"),
+    }
+}
+
+/// 按**字符**（不是字节）截断并加省略号 —— 中文按字节截会切出半个字。
+fn clip(s: &str, max_chars: usize) -> String {
+    // 标题 / 开场白里的换行会把「一行一条」的列表结构打散，先压成单行。
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    if flat.chars().count() <= max_chars {
+        return flat.to_string();
+    }
+    let head: String = flat.chars().take(max_chars).collect();
+    format!("{head}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +610,161 @@ mod tests {
         assert_eq!(load(&path).unwrap().len(), 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── 往期会话检索（A2）─────────────────────────────────────────
+
+    /// 指定 `created_at` 的会话（默认 helper 固定写 123，索引测试要控制先后）。
+    fn at(id: &str, title: &str, created_at: u64, user: &str, asst: &str) -> ChatSession {
+        let mut s = session(id, title, user, asst);
+        s.created_at = created_at;
+        s
+    }
+
+    /// 每个测试一个独立库文件（`search` / `recent_sessions` 的入参是路径）。
+    fn tmp_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lunac-chatdb-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("chat.db");
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// ≥3 字符的中文子串走 trigram；英文 / 代码词走 unicode61。
+    #[test]
+    fn search_finds_cjk_substring_and_ascii_word() {
+        let p = tmp_db("cjk");
+        save(&p, &[session("s1", "标题", "帮我看看缓存命中率", "cache hit rate")]).unwrap();
+
+        let hits = search(&p, "缓存命中", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, "user");
+        assert_eq!(hits[0].session_id, "s1");
+
+        assert_eq!(search(&p, "rate", 10).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **关键回归**：2 字中文查询必须命中。
+    ///
+    /// trigram 分词器要求查询词 ≥3 字符 ⇒ 只走 FTS 时「缓存」这种 2 字词**永远 0 条**
+    /// （不报错、静默失效）。而 2 字词恰恰是中文里最典型的查询形态，所以 `search()`
+    /// 必须保留 `LIKE` 兜底。这条测试就是钉住那个兜底。
+    #[test]
+    fn search_falls_back_to_like_for_short_cjk_query() {
+        let p = tmp_db("short");
+        save(&p, &[session("s1", "标题", "帮我看看缓存命中率", "ok")]).unwrap();
+        let hits = search(&p, "缓存", 10).unwrap();
+        assert_eq!(hits.len(), 1, "2 字中文查询被漏掉 = 兜底路径失效");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 覆盖写之后，已删除会话的内容不能再被搜到（索引与数据同步）。
+    #[test]
+    fn search_does_not_resurrect_deleted_sessions() {
+        let p = tmp_db("sync");
+        save(&p, &[session("old", "旧", "独一无二的关键字甲乙丙", "旧回答")]).unwrap();
+        assert_eq!(search(&p, "关键字甲乙丙", 10).unwrap().len(), 1);
+
+        save(&p, &[session("new", "新", "换了一条会话", "新回答")]).unwrap();
+        assert_eq!(
+            search(&p, "关键字甲乙丙", 10).unwrap().len(),
+            0,
+            "旧会话的索引行没被触发器清掉"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// LIKE 兜底路径必须转义通配符：不转义的话 `%` 会变成「匹配任意结尾」。
+    #[test]
+    fn search_treats_like_wildcards_literally() {
+        let p = tmp_db("wild");
+        save(
+            &p,
+            &[
+                at("a", "A", 20, "进度 100% 完成", "x"),
+                at("b", "B", 10, "进度 1000 完成", "y"),
+            ],
+        )
+        .unwrap();
+        let hits = search(&p, "%", 10).unwrap();
+        assert_eq!(hits.len(), 1, "% 必须按字面匹配（只有带百分号的那条算命中）");
+        assert_eq!(hits[0].session_id, "a");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 检索结果按「会话新→旧」排序，且会话内保持消息顺序。
+    #[test]
+    fn search_orders_sessions_newest_first() {
+        let p = tmp_db("order");
+        save(
+            &p,
+            &[
+                at("old", "旧", 100, "热键不起作用", "a"),
+                at("new", "新", 200, "热键又坏了", "b"),
+            ],
+        )
+        .unwrap();
+        let hits = search(&p, "热键", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].session_id, "new");
+        assert_eq!(hits[1].session_id, "old");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 空会话不进索引（没有信息量，纯占固定前缀预算）。
+    #[test]
+    fn digest_skips_empty_sessions_and_labels_relative_days() {
+        let p = tmp_db("digest");
+        let mut empty = session("e", "空会话", "x", "y");
+        empty.messages.clear();
+        save(&p, &[empty, at("n", "有内容", 0, "开场白第一句", "回答")]).unwrap();
+
+        let briefs = recent_sessions(&p, 10).unwrap();
+        assert_eq!(briefs.len(), 1);
+        assert_eq!(briefs[0].id, "n");
+        assert_eq!(briefs[0].msgs, 2);
+
+        let text = render_digest(&briefs, 4000, 86_400_000);
+        assert!(text.contains("[1d ago] 有内容 (2 msgs) — 开场白第一句"), "实际: {text}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 固定前缀里的这段必须**封顶**，并把被截掉的行数如实写出来。
+    #[test]
+    fn digest_respects_budget() {
+        let briefs: Vec<SessionBrief> = (0..50)
+            .map(|i| SessionBrief {
+                id: format!("s{i}"),
+                title: format!("会话{i}"),
+                created_at: 0,
+                msgs: 2,
+                opening: "开场白".into(),
+            })
+            .collect();
+
+        let text = render_digest(&briefs, 600, 0);
+        assert!(text.chars().count() <= 700, "必须封顶在预算附近，实际 {}", text.chars().count());
+        assert!(text.contains("older session(s) omitted"), "被截掉的行数要如实说明");
+
+        let full = render_digest(&briefs[..1], 4000, 0);
+        assert!(!full.contains("omitted"), "没截断就不该出现省略提示");
+    }
+
+    /// 超长标题 / 带换行的开场白：按字符截断、换行压成空格（不能打散「一行一条」）。
+    #[test]
+    fn digest_clips_long_fields_and_flattens_newlines() {
+        let b = SessionBrief {
+            id: "s".into(),
+            title: "标题".repeat(40),
+            created_at: 0,
+            msgs: 3,
+            opening: "第一行\n第二行".into(),
+        };
+        let text = render_digest(std::slice::from_ref(&b), 4000, 5 * 86_400_000);
+        assert!(text.contains("[5d ago]"));
+        assert!(text.contains('…'), "超长标题必须截断");
+        assert!(text.contains("— 第一行 第二行"), "开场白的换行要压成空格");
+        assert_eq!(text.matches("\n- ").count(), 1, "一条会话只能占一行");
     }
 }

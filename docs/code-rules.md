@@ -21,6 +21,10 @@
 | 7 | 窗口操作是否正确处理前台锁定（`ForegroundLockTimeout`）？ | §8 |
 | 8 | 流式传输中途关闭组件时是否递增 `streamId` 防止回调污染？ | §9 |
 | 9 | 新增 UI 字符串是否使用 `t("key")` 并在 `i18n.ts` 中添加了翻译？ | §13 |
+| 10 | 新增的按钮 / 控件**是否写了 CSS**？（WebView2 没有「自动继承主题」的原生按钮 —— 漏写就退回原生外观） | ai-spec §11 规则 51 |
+| 11 | 若改动了发往端点的 `history`（尤其**末尾消息的形态**），是否确认 `read` 没塌到 `system + tools` 的量级？追加内容**只能拼进已有 `tool_result` 的文本内部**，不得新增消息、也不得新增内容块。 | ai-spec §11 规则 23 |
+| 12 | 新增 / 改名内置工具时，是否同步了**四处**：① `tools.rs` 的 `defs()`（含 `needs_approval` / `parallel_safe` / `gated_in_read_only` 三张表的判断，**走 MCP 桥的还要进 `BRIDGE_TOOLS`**，**条件注册的别塞进 `defs()`**）、② ai-spec §3.5 契约表与权限策略表、③ `agent-implementation.md` §4.1 与总数口径、④ 前端 `main.ts` 的工具黑名单候选名单？是否改完**读回确认**工具定义真的在文件里（编辑工具报成功但未落盘的情况出现过）并跑 `cargo test`（守门单测断言工具总数）？ | ai-spec §11 规则 14 / 54 / 55 / 56 |
+| 13 | 若新增的是一份**每轮都要发**的提示词段落（记忆 / 索引 / 清单），是否满足：① 只在**启动时取一次**（冻结快照，进程内逐字节不变）；② 与「对应的工具是否真的在工具池里」**同源判断**（工具被禁 / 桥没接通 ⇒ 一并停注，否则提示词会指挥模型去调一个不存在的工具）？（2026-09-20 A4 的记忆块与 A2 的会话索引是同一条纪律） | ai-spec §11 规则 53 / 56 |
 
 ---
 
@@ -184,6 +188,12 @@ setTimeout(() => { /* fallback logic */ }, 500);
 }
 ```
 
+> **⚠️ 只对本条描述的「纯裁剪容器」生效（2026-09-19 补 —— 缺这一句就是事故）**
+>
+> `.plugin-open` 把 `overflow` 改成 `visible`，对**做裁剪用**的容器是对的；但加到一个**靠自身滚动**的列表上（典型：`#results-list`、`.tool-result`、`#chat-log` 的子滚动盒），会直接把它的滚动盒拆掉 —— 表现是 `scrollTop` 归零、整页跳回顶部、再也滚不动。判断口径只有一条：**这个元素是不是滚动条真正出现的那一层？** 是 → 不能用这个 pattern，改用「把弹窗挂到 `body` 下」或「换自定义下拉组件」。
+>
+> 依据：`docs/agent-ui-spec.md` §5.4 第 3 条「不要『藏』滚动条」——`overflow: visible` 与 `overflow: hidden` 在「把滚动盒拆掉」这件事上是同一个后果。
+
 ### 5.2 原生 `<select>` 在 WebView2 透明窗口中不可用
 
 `tauri.conf.json` 中 `"transparent": true` 时，WebView2 不会渲染原生 `<select>` 弹出层。**必须用自定义下拉组件替代。**
@@ -200,17 +210,21 @@ setTimeout(() => { /* fallback logic */ }, 500);
 - 所有交互子元素必须显式 `pointer-events: auto`
 - 窗口边缘 padding 会制造不可交互死区 — 用子元素 margin 替代
 
-### 5.4 自定义滚动条隐藏
+### 5.4 自定义滚动条：**统一细滚动条，不得按容器声明、不得隐藏**
 
-```css
-.custom-select-dropdown {
-  overflow-y: auto;
-  scrollbar-width: none;          /* Firefox */
-}
-.custom-select-dropdown::-webkit-scrollbar {
-  display: none;                  /* Chrome/WebView2 */
-}
-```
+> **本节 2026-09-19 重写。** 旧版本教的是下面这段，**它是被明令禁止的写法，照抄会直接制造事故**：
+>
+> ```css
+> /* ❌ 禁止。历史事故就是这一段被复制到新容器上 */
+> .custom-select-dropdown { scrollbar-width: none; }
+> .custom-select-dropdown::-webkit-scrollbar { display: none; }
+> ```
+>
+> 两个错误：① `scrollbar-width: none` 一出现，Chromium 就**忽略全部 `::-webkit-scrollbar`**（滚动条退回系统默认外观）；② 「藏滚动条」与项目要求相反。
+
+**唯一真相源是 [agent-ui-spec.md](./agent-ui-spec.md) §5.4**（三条硬约束：禁止写 `scrollbar-width` / `scrollbar-color`；禁止按容器单独声明；不要「藏」滚动条）。实现只有一处 —— `styles.css` 的全局 `::-webkit-scrollbar` 规则；新容器**只要写 `overflow-y: auto` 就自动获得统一外观，不需要任何额外 CSS**。
+
+对应 [ai-spec.md](./ai-spec.md) §11 规则 21 的「不得回退」项。
 
 ### 5.5 隐藏元素用 class 控制，避免 display 冲突
 
@@ -504,8 +518,12 @@ if (firstPart === searchInput.value.trim()) {
 - [ ] 热键修改兼顾 RegisterHotKey + LL 钩子 + WndProc + JS 四层（不可无条件装钩子）
 - [ ] 新增 UI 字符串使用 `t("key")` 而非硬编码文本（包括英文）
 - [ ] 新增 `t()` key 需要同时在 `i18n.ts` 的 DICT 中添加翻译（至少 zh-CN, en）
+- [ ] 新增按钮 / 控件已声明主题样式（`border-style` 不得为 `outset`；同族按钮并入同一族规则 —— ai-spec §11 规则 51）
+- [ ] 改动过 `history` 装配的，已按 ai-spec §11 规则 23 核过 agent 日志的 `公共前缀=N/M条`（出现 `N < M` 即本侧就地改写）与 `请求用量` 行的 `read`（是否塌到 `system+tools` 量级）
+- [ ] 新增 / 改名内置工具的，已同步 `defs()` + 三张判断表 + ai-spec §3.5 契约表 + `agent-implementation.md` §4.1 总数口径 + 前端黑名单候选名单，且 `cargo test` 的工具总数守门单测通过（ai-spec §11 规则 14 / 54）
 - [ ] `npx tsc --noEmit` 通过
 - [ ] `cargo check` 通过
+- [ ] `cargo test` 通过（`core-agent` 与 `src-tauri` 两侧）
 
 ---
 ## 第 13 章：国际化 (i18n) 规则
@@ -545,4 +563,4 @@ setLanguage("ja");      // 切换 + 持久化
 ```
 
 ---
-*最后更新：2026-07-28 · 来源：项目 100+ 条 bug 修复经验 + 5 天高强度迭代 · 关联文档：[ai-spec.md](./ai-spec.md)*
+*最后更新：2026-09-19 · 来源：项目 100+ 条 bug 修复经验 + 5 天高强度迭代 · 关联文档：[ai-spec.md](./ai-spec.md)（规范正文）、[agent-ui-spec.md](./agent-ui-spec.md)（界面/滚动条的唯一真相源）*

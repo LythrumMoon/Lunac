@@ -9,10 +9,20 @@
 // 握手顺序（MCP 2024-11-05）：
 //   initialize → notifications/initialized → tools/list → （模型调用时）tools/call
 //
-// 工具名统一加 `mcp__` 前缀，避免与六件内置工具重名；前缀必须稳定，因为
+// 除工具调用外，本桥还承载两组**自定义方法**（`lunac/history_index` / `lunac/history_search`
+// 与 `lunac/memory_read` / `lunac/memory_write`）—— 它们**不列进 `tools/list`**，因此不出现在
+// 用户的工具列表里、也不弹审批卡；支撑的是内置工具 `SessionSearch`（往期会话检索，2026-09-19）
+// 与 `Remember`（长期记忆，2026-09-20）。
+// 不列进去的理由见 `app/src-tauri/src/mcp_server.rs` 的 `handle_history_method`。
+//
+// 另有两条**标准** MCP 方法由本模块直接用：`resources/list` / `resources/read`（A3，2026-09-20），
+// 支撑条件注册的两件只读工具 `ListMcpResourcesTool` / `ReadMcpResourceTool`。
+//
+// 工具名统一加 `mcp__` 前缀，避免与内置工具重名；前缀必须稳定，因为
 // 前端审批卡的「始终允许」是按完整工具名记进 localStorage 白名单的。
 //
-// 桥是尽力而为：连不上 / 握手失败只往 stderr 记一行，六件内置工具照常工作。
+// 桥是尽力而为：连不上 / 握手失败只往 stderr 记一行，内置工具照常工作
+// （往期会话索引也只是不注入，不影响任何其它能力）。
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -137,6 +147,119 @@ impl Bridge {
             json!({ "name": raw, "arguments": input }),
             CALL_TIMEOUT,
         )?;
+        self.result_text(&res)
+    }
+
+    /// 取「往期会话索引」固定段（**自定义方法**，不列进 `tools/list`，见 mcp_server.rs）。
+    ///
+    /// 只在 agent 启动时调**一次**，结果拼进系统提示词：系统提示词在一次会话内必须
+    /// 逐字节不变（ai-spec §11 规则 18），中途新存的会话只落盘、不改本进程的提示词。
+    pub fn history_index(&mut self) -> Result<String, String> {
+        let res = self.request("lunac/history_index", json!({}), HANDSHAKE_TIMEOUT)?;
+        self.result_text(&res)
+    }
+
+    /// 检索往期会话正文 —— `SessionSearch` 工具的后端（同一个自定义方法通道）。
+    pub fn history_search(&mut self, query: &str, limit: u32) -> Result<String, String> {
+        let res = self.request(
+            "lunac/history_search",
+            json!({ "query": query, "limit": limit }),
+            CALL_TIMEOUT,
+        )?;
+        self.result_text(&res)
+    }
+
+    /// 读长期记忆（A4）—— 启动时注入系统提示词、复盘 fork 开跑前读一次。
+    ///
+    /// 空记忆（全新安装）时服务端返回 `(long-term memory is empty)`，注入侧据此跳过。
+    pub fn memory_read(&mut self) -> Result<String, String> {
+        let res = self.request("lunac/memory_read", json!({}), HANDSHAKE_TIMEOUT)?;
+        self.result_text(&res)
+    }
+
+    /// 写长期记忆（A4）—— `Remember` 工具的后端。
+    ///
+    /// `replace` = 整体替换（整理合并时用），默认按条目追加；服务端的去重与上限
+    /// 报错都会以 `isError` 回来 ⇒ 这里变成 `Err`，模型看得见原因，可自行改小重写。
+    pub fn memory_write(&mut self, content: &str, replace: bool) -> Result<String, String> {
+        let res = self.request(
+            "lunac/memory_write",
+            json!({ "content": content, "replace": replace }),
+            CALL_TIMEOUT,
+        )?;
+        self.result_text(&res)
+    }
+
+    /// 列出 MCP resources（A3）—— `ListMcpResourcesTool` 的后端。
+    ///
+    /// 规范回包是 `{resources:[{uri,name,mimeType}]}`，**与 `tools/call` 的 `content`
+    /// 形状不同**，所以不能走 `result_text`。这里在客户端把它渲染成一张紧凑的表：
+    /// 模型读表比读 JSON 省 token，且 uri 原样给出（`resources/read` 要拿它当参数）。
+    pub fn list_resources(&mut self) -> Result<String, String> {
+        let res = self.request("resources/list", json!({}), HANDSHAKE_TIMEOUT)?;
+        let Some(list) = res.get("resources").and_then(Value::as_array) else {
+            return Err("MCP resources/list 回包缺少 resources 数组".into());
+        };
+        if list.is_empty() {
+            return Ok("No MCP resource is available: the user has no custom tool definition \
+                       file (`tools\\*.json`) yet."
+                .into());
+        }
+        let mut out = format!("MCP resources ({}):\n", list.len());
+        for r in list {
+            out.push_str(&format!(
+                "- {}  {}  {}\n",
+                r.get("name").and_then(Value::as_str).unwrap_or("(unnamed)"),
+                r.get("uri").and_then(Value::as_str).unwrap_or("(no uri)"),
+                r.get("mimeType").and_then(Value::as_str).unwrap_or(""),
+            ));
+        }
+        out.push_str("\nPass one of these URIs to ReadMcpResourceTool to see the file.\n");
+        Ok(out)
+    }
+
+    /// 读一个 MCP resource（A3）—— `ReadMcpResourceTool` 的后端。
+    ///
+    /// 回包形状是 `{contents:[{uri,mimeType,text|blob}]}`（同样不是 `content`）。
+    /// `blob`（二进制）只报大小**不渲染 base64** —— 那种内容进上下文既没用又极贵。
+    pub fn read_resource(&mut self, uri: &str) -> Result<String, String> {
+        let res = self.request("resources/read", json!({ "uri": uri }), CALL_TIMEOUT)?;
+        let Some(items) = res.get("contents").and_then(Value::as_array) else {
+            return Err("MCP resources/read 回包缺少 contents 数组".into());
+        };
+        if items.is_empty() {
+            return Err(format!("resource {uri} 没有任何内容"));
+        }
+        let mut out = String::new();
+        for c in items {
+            out.push_str(&format!(
+                "Resource: {}\n",
+                c.get("uri").and_then(Value::as_str).unwrap_or(uri)
+            ));
+            if let Some(m) = c.get("mimeType").and_then(Value::as_str) {
+                if !m.is_empty() {
+                    out.push_str(&format!("MIME: {m}\n"));
+                }
+            }
+            out.push_str("---\n");
+            if let Some(t) = c.get("text").and_then(Value::as_str) {
+                out.push_str(t);
+                out.push('\n');
+            } else if let Some(b) = c.get("blob").and_then(Value::as_str) {
+                out.push_str(&format!(
+                    "(binary resource: {} base64 chars, not rendered)\n",
+                    b.len()
+                ));
+            } else {
+                out.push_str("(empty)\n");
+            }
+        }
+        Ok(out)
+    }
+
+    /// 解析 `{content:[{type:"text",…}], isError}` 形态的回包。
+    /// `tools/call` 与上面两个自定义方法共用它 —— 两边的回包形状是刻意做成一样的。
+    fn result_text(&self, res: &Value) -> Result<String, String> {
         let text = content_text(res.get("content"));
         if res.get("isError").and_then(Value::as_bool).unwrap_or(false) {
             Err(text)

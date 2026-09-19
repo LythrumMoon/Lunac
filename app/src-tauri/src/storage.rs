@@ -273,7 +273,11 @@ const CHAT_FILE: &str = "chat-history.json";
 const CHAT_DB: &str = "chat.db";
 
 /// `<ModuleData>\history\chat.db`
-fn chat_db_path() -> PathBuf {
+///
+/// `pub(crate)`：MCP server（`mcp_server.rs`）要以 `--mcp-server` 子进程身份读同一个库
+/// 来回答 agent 的「往期会话检索」（2026-09-19，A2）—— 检索 SQL 归 `chat_db.rs` 独有，
+/// 这里只交出路径，两个进程共用同一份 schema 真相。
+pub(crate) fn chat_db_path() -> PathBuf {
     history_dir().join(CHAT_DB)
 }
 

@@ -139,7 +139,13 @@
         <div id="detail-tabs"></div>
         <div id="detail-kinds"></div>
       </div>
-      <div id="detail-results"></div>
+      <div id="detail-main">
+        <div id="detail-results"></div>
+        <!-- 右侧预览区（2026-09-19 批 5 任务 3a，对齐 Win11 新版搜索）：
+             选中一条结果就显示缩略图 / 完整路径 / 最后修改日期 + 打开 / 复制路径。
+             由 main.ts 的 renderDetailPreview() 整块重建，这里只留空壳。 -->
+        <div id="detail-preview" class="hidden"></div>
+      </div>
       <div id="detail-foot">
         <span id="detail-hint"></span>
         <span id="detail-index"></span>

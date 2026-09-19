@@ -1,5 +1,8 @@
 // Keep track of the last active settings category across open/close cycles
 let activeSettingsCategory = "general";
+// 「背景 → 自定义」那组拉条的展开状态：跨「关掉设置再打开」保留（否则每次进来都要
+// 再点一次「自定义」才看得到滑块，用户会以为设置在跳）。
+let bgSlidersOpen = false;
 
 // Unlisten functions for hotkey recording events — cleaned up on re-attach to avoid memory leaks
 let _clickOutsideHandler: ((e: Event) => void) | null = null;
@@ -8,10 +11,11 @@ let _onRecordingCancelled: (() => void) | null = null;
 let _unlistenHotkeyRecorded: (() => void) | null = null; // Tauri event (for Alt+Space via WndProc)
 
 import type { Plugin } from "../registry";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { pluginRegistry } from "../registry";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
-import { t, setLanguage, resetToSystemLanguage } from "../../i18n.js";
+import { t, setLanguage, resetToSystemLanguage, pluginName, pluginDesc } from "../../i18n.js";
 import { installOcrEngine } from "./ocr.js";
 
 
@@ -95,13 +99,7 @@ function buildGeneralPane(hotkey: string, autoStart: boolean): string {
           <button id="settings-ocr-install" class="settings-btn">${t("ocr.engine_download")}</button>
         </div>
       </div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.background_title")}</span>
-        <div class="settings-bg-actions">
-          <button id="settings-bg-apply" class="settings-btn">${t("settings.background_apply")}</button>
-          <button id="settings-bg-clear" class="settings-btn">${t("settings.background_clear")}</button>
-        </div>
-      </div>
+      <!-- 自定义背景已于 2026-09-19 移到「风格」分区（含三项滑块与主题色）。 -->
     </div>`;
 }
 
@@ -119,6 +117,432 @@ function renderCustomSelectInline(id: string, options: { value: string; label: s
       </button>
       <div class="custom-select-dropdown">${optsHtml}</div>
     </div>`;
+}
+
+// ── 外观 / 主题分区（「风格」，2026-09-19 新增）──────────────────
+//
+// **配置与落地全在 main.ts**（`window.__lunac_appearance` 这座桥），本分区只做
+// 界面与事件绑定：不自己写 localStorage、不自己拼 CSS 变量。理由：改造前的背景图
+// 就是「设置写 localStorage + main.ts 读」两份实现，一旦再分出去（滑块/主题色），
+// 两处必然漂移（改了一处忘了另一处 = 用户看到「拖了没反应」）。
+
+/** 外观配置（与 main.ts 的 `Appearance` 同形；这里只声明界面用得到的部分）。 */
+interface AppearanceConfig {
+  bgImage: string | null;
+  bgBlur: number;
+  bgSaturate: number;
+  bgOpacity: number;
+  sheen: number;
+  surfaceAlpha: number;
+  tintBase: boolean;
+  colorMode: "custom" | "system";
+  customAccent: string;
+  themeId: string;
+}
+interface AppearanceThemeInfo {
+  manifest: { id: string; name: string; version: string; author: string };
+  builtin: boolean;
+}
+interface AppearanceBridge {
+  get(): AppearanceConfig;
+  set(patch: Partial<AppearanceConfig>): void;
+  themes(force?: boolean): Promise<AppearanceThemeInfo[]>;
+  systemTheme(): { accent: string; dark: boolean; source: string };
+  refreshSystemTheme(): Promise<void>;
+  themesDir(): Promise<string>;
+  pickBgImage(): Promise<boolean>;
+}
+
+/** 取 main.ts 的外观桥。拿不到时（WebView 刚重载、热重载竞态）返回 null，
+ *  界面照常画出来但所有控件早退 —— 比抛异常把整个设置面板打空要好。 */
+function appearanceBridge(): AppearanceBridge | null {
+  return ((window as any).__lunac_appearance as AppearanceBridge | undefined) ?? null;
+}
+
+// ── 应用内取色器（2026-09-19）────────────────────────────────────
+//
+// 为什么不用 `<input type="color">` 直接了事：它打开的是 **Windows 系统取色对话框**，
+// 与 Lunac 的暗色玻璃界面完全脱节（用户要求「取色器的界面跟 lunac 界面主题对齐」），
+// 而且它在 WebView2 里是原生窗口、样式一个像素都改不了。
+// 为什么不再留「色轮 + 饱和度/明度滑块」：那三件和取色器表达的是同一个自由度，
+// 并存只会互相打架（用户明确指出「功能发生冲突，只采用取色器」）。
+// 现在的形态 = 一个色块按钮 → 展开**一个**面板：色相条 + 饱和度/明度方块 + hex 输入
+// + 预设色板。全部用项目自己的 token 画（--border-glass / --text-dim / --accent）。
+
+/** 取色器的 HTML。`id` 是前缀，便于在同一页挂两个实例（主色 / 背景纯色）。 */
+function colorPickerHtml(id: string, hex: string): string {
+  const presets = ["#c0a0a0", "#3a7bd5", "#5b9a68", "#c9a227", "#c05555", "#8e6fc0", "#3f9a9a", "#d07aa0"];
+  return `
+    <div class="ap-picker" id="${id}">
+      <div class="ap-picker-head">
+        <!-- 色号输入放在最左：用户要求「具体色号的整个区域向左移动、与左侧 label 对齐」，
+             放在色块之后永远差一个色块+间距的宽度。 -->
+        <input type="text" class="ap-hex" id="${id}-hex" value="${esc(hex)}" spellcheck="false" maxlength="7">
+        <button type="button" class="ap-swatch-btn" id="${id}-swatch"></button>
+        <button type="button" class="ap-picker-toggle" id="${id}-toggle">▾</button>
+      </div>
+      <div class="ap-pick-panel hidden" id="${id}-panel">
+        <div class="ap-sv" id="${id}-sv"><div class="ap-sv-cursor" id="${id}-sv-cursor"></div></div>
+        <div class="ap-hue" id="${id}-hue"><div class="ap-hue-cursor" id="${id}-hue-cursor"></div></div>
+        <div class="ap-presets" id="${id}-presets">
+          ${presets.map(p => `<button type="button" class="ap-preset" data-color="${p}" style="background:${p}"></button>`).join("")}
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── HSV ↔ RGB（取色器用 HSV：方块的两轴天然对应「饱和度 / 明度」）──
+function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: number } {
+  const rn = r / 255, gn = g / 255, bn = b / 255;
+  const mx = Math.max(rn, gn, bn), mn = Math.min(rn, gn, bn), d = mx - mn;
+  let h = 0;
+  if (d > 0) {
+    if (mx === rn) h = ((gn - bn) / d) % 6;
+    else if (mx === gn) h = (bn - rn) / d + 2;
+    else h = (rn - gn) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return { h: Math.round(h), s: mx === 0 ? 0 : d / mx, v: mx };
+}
+function hsvToRgb(h: number, s: number, v: number): { r: number; g: number; b: number } {
+  const c = v * s;
+  const k = (n: number) => (n + h / 60) % 6;
+  const f = (n: number) => v - c * Math.max(0, Math.min(k(n), 4 - k(n), 1));
+  return { r: Math.round(f(5) * 255), g: Math.round(f(3) * 255), b: Math.round(f(1) * 255) };
+}
+function hsvToHex(h: number, s: number, v: number): string {
+  const c = hsvToRgb(h, s, v);
+  const to = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${to(c.r)}${to(c.g)}${to(c.b)}`;
+}
+function hexToHsv(hex: string): { h: number; s: number; v: number } | null {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return rgbToHsv((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
+}
+
+/** 挂载一个取色器实例。`onCommit` 只在用户真的动了控件时调用（初始化不调）——
+ *  否则每打开一次设置就把 HSV 往返的舍入误差写一次配置。 */
+function mountColorPicker(
+  container: HTMLElement, id: string, initialHex: string, onCommit: (hex: string) => void,
+): void {
+  const pick = <T extends HTMLElement>(suffix: string) => container.querySelector(`#${id}-${suffix}`) as T | null;
+  const panel = pick("panel");
+  const swatch = pick("swatch");
+  const hexInput = pick<HTMLInputElement>("hex");
+  const sv = pick("sv");
+  const svCursor = pick("sv-cursor");
+  const hue = pick("hue");
+  const hueCursor = pick("hue-cursor");
+  let hsv = hexToHsv(initialHex) ?? { h: 0, s: 0, v: 0.75 };
+  let open = false;
+
+  const paint = (commit: boolean, exactHex?: string) => {
+    // exactHex：hex 输入框 / 预设色板给的**原始值必须原样落盘**，不能走
+    // hex→HSV→hex 往返（会丢 1/255，用户会觉得「我选的颜色被改了」）。
+    if (exactHex) {
+      const parsed = hexToHsv(exactHex);
+      if (parsed) hsv = parsed;
+    }
+    const hex = exactHex ?? hsvToHex(hsv.h, hsv.s, hsv.v);
+    if (hexInput) hexInput.value = hex;
+    if (swatch) swatch.style.background = hex;
+    if (sv) sv.style.setProperty("--ap-hue-color", `hsl(${hsv.h} 100% 50%)`);
+    if (svCursor) { svCursor.style.left = `${hsv.s * 100}%`; svCursor.style.top = `${(1 - hsv.v) * 100}%`; }
+    if (hueCursor) hueCursor.style.left = `${(hsv.h / 360) * 100}%`;
+    if (commit) onCommit(hex);
+  };
+  paint(false);
+
+  const setOpen = (v: boolean) => {
+    open = v;
+    panel?.classList.toggle("hidden", !v);
+    const tgl = pick("toggle");
+    if (tgl) tgl.textContent = v ? "▴" : "▾";
+  };
+  pick("toggle")?.addEventListener("click", () => setOpen(!open));
+  swatch?.addEventListener("click", () => setOpen(!open));
+
+  // 饱和度/明度方块：x = 饱和度，y = 明度（上亮下暗）
+  const dragSv = (e: PointerEvent) => {
+    if (!sv) return;
+    const r = sv.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    hsv = { ...hsv, s: x, v: 1 - y };
+    paint(true);
+  };
+  if (sv) {
+    let dragging = false;
+    sv.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      try { sv.setPointerCapture(e.pointerId); } catch { /* 捕获失败也能拖 */ }
+      dragSv(e);
+    });
+    sv.addEventListener("pointermove", (e) => { if (dragging) dragSv(e); });
+    const stop = () => { dragging = false; };
+    sv.addEventListener("pointerup", stop);
+    sv.addEventListener("pointercancel", stop);
+  }
+  // 色相条：0° 在最左（红），与 linear-gradient 的排布一致
+  const dragHue = (e: PointerEvent) => {
+    if (!hue) return;
+    const r = hue.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    hsv = { ...hsv, h: Math.round(x * 360) % 360 };
+    paint(true);
+  };
+  if (hue) {
+    let dragging = false;
+    hue.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      try { hue.setPointerCapture(e.pointerId); } catch { /* 同上 */ }
+      dragHue(e);
+    });
+    hue.addEventListener("pointermove", (e) => { if (dragging) dragHue(e); });
+    const stop = () => { dragging = false; };
+    hue.addEventListener("pointerup", stop);
+    hue.addEventListener("pointercancel", stop);
+  }
+
+  const commitHex = (raw: string) => {
+    const v = raw.trim().startsWith("#") ? raw.trim() : `#${raw.trim()}`;
+    if (!/^#[0-9a-fA-F]{6}$/.test(v)) return; // 打字中间态不提交
+    paint(true, v.toLowerCase());
+  };
+  hexInput?.addEventListener("input", () => commitHex(hexInput.value));
+  hexInput?.addEventListener("blur", () => paint(false));  // 失焦时把非法输入回滚成合法值
+  pick("presets")?.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-color]");
+    if (btn?.dataset.color) paint(true, btn.dataset.color);
+  });
+}
+
+/** 外观滑块行。`data-ap` = 配置字段名 —— 事件绑定走**一个**委托监听，
+ *  以后加滑块只写这行 HTML，不必再动事件代码（少一处必漏的地方）。 */
+function appearanceSliderRow(
+  labelKey: string, field: string, min: number, max: number, step: number, value: number, fmt: (v: number) => string,
+): string {
+  return `
+    <div class="settings-row">
+      <span class="settings-label">${t(labelKey)}</span>
+      <div class="ap-slider">
+        <input type="range" data-ap="${field}" min="${min}" max="${max}" step="${step}" value="${value}">
+        <span class="ap-slider-val" data-ap-val="${field}">${esc(fmt(value))}</span>
+      </div>
+    </div>`;
+}
+
+/** 滑块的数值文案格式（与 APPEARANCE_RANGE 的字段一一对应）。 */
+function formatAppearanceValue(field: string, v: number): string {
+  if (field === "bgBlur") return `${Math.round(v)}px`;
+  if (field === "bgSaturate") return `${Math.round(v)}%`;
+  return v.toFixed(2);
+}
+
+async function buildAppearancePane(): Promise<string> {
+  const ap = appearanceBridge();
+  const cfg: AppearanceConfig = ap?.get() ?? {
+    bgImage: null, bgBlur: 4, bgSaturate: 92, bgOpacity: 0.5,
+    sheen: 0, surfaceAlpha: 0.88, tintBase: true,
+    colorMode: "custom", customAccent: "#c0a0a0", themeId: "default",
+  };
+  let themes: AppearanceThemeInfo[] = [];
+  try { themes = (await ap?.themes()) ?? []; } catch { /* 主题包读不到 → 只留默认项 */ }
+  const sys = ap?.systemTheme() ?? { accent: "", dark: true, source: "fallback" };
+  const sysAccent = sys.accent || cfg.customAccent;
+  // 背景来源标注：已设置图片 / 未设置
+  const bgLabel = cfg.bgImage ? t("settings.appearance_bg_set") : t("settings.appearance_bg_none");
+  // 只有内置的「默认」主题允许自定义主题色与背景图片（2026-09-19 批 5 任务 1）：
+  // 主题包的意义就是「一整套定好的外观」，放开这两项会让它被改得不像自己。
+  // 「自定义」那五个拉条是**窗口玻璃质感**、与配色无关，任何主题下都保留。
+  const locked = cfg.themeId !== "default";
+
+  const themeButtons = themes.map(th => {
+    const id = th.manifest.id;
+    const active = id === cfg.themeId;
+    // 内置默认主题的 name 可能为空（兜底项）→ 用界面语言显示「默认」
+    const label = th.manifest.name || t("settings.appearance_theme_default");
+    const badge = th.builtin && id !== "default"
+      ? `<span class="ap-badge">${t("settings.appearance_theme_builtin")}</span>` : "";
+    return `<button type="button" class="ap-theme${active ? " active" : ""}" data-theme="${esc(id)}">${esc(label)}${badge}</button>`;
+  }).join("");
+
+  return `
+    <div class="settings-pane" data-pane="appearance" id="sp-appearance">
+      <div class="settings-pane-title">${t("settings.appearance")}</div>
+
+      <div class="settings-group-title">${t("settings.appearance_bg_section")}</div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_bg_title")}</span>
+        <div class="settings-bg-actions">
+          <span class="ap-bg-name" id="ap-bg-name">${esc(bgLabel)}</span>
+          <button type="button" class="settings-btn" id="ap-bg-pick"${locked ? " disabled" : ""}>${t("settings.appearance_bg_apply")}</button>
+          <button type="button" class="settings-btn ap-bg-custom" id="ap-bg-custom">${t("settings.appearance_bg_custom")}<span class="ap-toggle-caret" id="ap-bg-caret">▾</span></button>
+          <button type="button" class="settings-btn" id="ap-bg-clear">${t("settings.appearance_bg_clear")}</button>
+        </div>
+      </div>
+      <!-- 「自定义」展开的就是这一块：五个拉条（毛玻璃化 / 饱和度 / 背景透明度 / 反光 / 界面玻璃透明度） -->
+      <div id="ap-bg-sliders" class="ap-sliders-panel${bgSlidersOpen ? "" : " hidden"}">
+        ${appearanceSliderRow("settings.appearance_bg_blur", "bgBlur", 0, 40, 1, cfg.bgBlur, v => formatAppearanceValue("bgBlur", v))}
+        ${appearanceSliderRow("settings.appearance_bg_saturate", "bgSaturate", 0, 200, 1, cfg.bgSaturate, v => formatAppearanceValue("bgSaturate", v))}
+        ${appearanceSliderRow("settings.appearance_bg_opacity", "bgOpacity", 0, 1, 0.01, cfg.bgOpacity, v => formatAppearanceValue("bgOpacity", v))}
+        ${appearanceSliderRow("settings.appearance_bg_sheen", "sheen", 0, 1, 0.01, cfg.sheen, v => formatAppearanceValue("sheen", v))}
+        ${appearanceSliderRow("settings.appearance_bg_surface", "surfaceAlpha", 0.3, 1, 0.01, cfg.surfaceAlpha, v => formatAppearanceValue("surfaceAlpha", v))}
+      </div>
+
+      <div class="settings-group-title">${t("settings.appearance_color_section")}</div>
+      <!-- 锁定说明 + 锁定组：非「默认」主题时主题包自己带配色，用户不允许再改它
+           （2026-09-19 批 5 任务 1）。禁用而不是隐藏 —— 用户要能看见「这个能力存在、
+           只是被主题锁了」，隐藏会被当成 bug。 -->
+      <div id="ap-lock-note" class="ap-lock-note${locked ? "" : " hidden"}">${t("settings.appearance_theme_locked")}</div>
+      <div id="ap-color-group" class="ap-locked-group${locked ? " locked" : ""}">
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_color_mode")}</span>
+        <div class="ap-seg">
+          <button type="button" class="ap-seg-btn${cfg.colorMode === "custom" ? " active" : ""}" data-color-mode="custom">${t("settings.appearance_color_custom")}</button>
+          <button type="button" class="ap-seg-btn${cfg.colorMode === "system" ? " active" : ""}" data-color-mode="system">${t("settings.appearance_color_system")}</button>
+        </div>
+      </div>
+      <div id="ap-color-custom" class="ap-color-body${cfg.colorMode === "system" ? " hidden" : ""}">
+        <div class="settings-row ap-row-block">
+          <span class="settings-label">${t("settings.appearance_color_picker")}</span>
+          ${colorPickerHtml("ap-accent", cfg.customAccent)}
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">${t("settings.appearance_tint_base")}</span>
+          <label class="settings-toggle">
+            <input type="checkbox" id="ap-tint-base" ${cfg.tintBase ? "checked" : ""}>
+            <span class="settings-toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div id="ap-color-system" class="ap-color-body${cfg.colorMode === "system" ? "" : " hidden"}">
+        <div class="settings-row">
+          <span class="settings-label">${t("settings.appearance_color_system_current")}</span>
+          <div class="settings-bg-actions">
+            <span class="ap-swatch" id="ap-sys-swatch" style="background:${esc(sysAccent)}"></span>
+            <span class="ap-sys-label" id="ap-sys-label">${esc(sys.accent ? sys.accent : t("settings.appearance_color_system_unavailable"))}</span>
+            <button type="button" class="settings-btn" id="ap-sys-refresh">${t("settings.appearance_color_system_refresh")}</button>
+          </div>
+        </div>
+      </div>
+      </div>
+
+      <div class="settings-group-title">${t("settings.appearance_theme_section")}</div>
+      <div class="ap-themes" id="ap-themes">${themeButtons}</div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_theme_hint")}</span>
+        <div class="settings-bg-actions">
+          <button type="button" class="settings-btn" id="ap-theme-dir">${t("settings.appearance_theme_open_dir")}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+/** 「风格」分区的事件绑定。独立成函数（不塞进 attachSettingsListeners）是为了
+ *  让外观这块的改动范围收敛在一个地方。 */
+function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge): void {
+  const pick = <T extends HTMLElement>(sel: string) => container.querySelector(sel) as T | null;
+  const cfg = ap.get();
+
+  // ── 滑块（三滑块 + 玻璃透明度）：一个监听覆盖所有 data-ap ──
+  container.querySelectorAll<HTMLInputElement>('input[type="range"][data-ap]').forEach(el => {
+    el.addEventListener("input", () => {
+      const field = el.dataset.ap as keyof AppearanceConfig;
+      const v = Number(el.value);
+      ap.set({ [field]: v } as Partial<AppearanceConfig>);
+      const out = container.querySelector(`[data-ap-val="${field}"]`);
+      if (out) out.textContent = formatAppearanceValue(field, v);
+    });
+  });
+
+  // ── 背景：三个按钮（选择图片 / 自定义 / 清除）───────────────
+  // 「自定义」= 展开/收起**五个拉条**，不是另一种背景来源 —— 用户明确要的是
+  // 「点自定义才出现 毛玻璃化/饱和度/背景透明度/反光/界面玻璃透明度」。
+  const bgName = pick("#ap-bg-name");
+  const bgSliders = pick("#ap-bg-sliders");
+  const bgCaret = pick("#ap-bg-caret");
+  const syncBgRow = () => {
+    const c = ap.get();
+    if (bgName) bgName.textContent = c.bgImage ? t("settings.appearance_bg_set") : t("settings.appearance_bg_none");
+  };
+  pick("#ap-bg-pick")?.addEventListener("click", async () => {
+    if (await ap.pickBgImage()) syncBgRow();
+  });
+  pick("#ap-bg-custom")?.addEventListener("click", () => {
+    bgSlidersOpen = !bgSlidersOpen;
+    bgSliders?.classList.toggle("hidden", !bgSlidersOpen);
+    if (bgCaret) bgCaret.textContent = bgSlidersOpen ? "▴" : "▾";
+  });
+  pick("#ap-bg-clear")?.addEventListener("click", () => {
+    ap.set({ bgImage: null });
+    syncBgRow();
+  });
+
+  // ── 主题色：**唯一**取色入口（方块 + 色相条 + hex + 预设）──
+  // 原来的「色轮 + 饱和度/明度滑块 + <input type=color>」三件套已删除：它们与取色器
+  // 表达同一组自由度，并存只会互相打架（用户明确要求只留取色器，且界面要对齐主题）。
+  mountColorPicker(container, "ap-accent", cfg.customAccent, (hex) => {
+    ap.set({ customAccent: hex });
+  });
+
+  // ── 底色跟随主色：开 = 由主色派生整套底色/边框/文字；关 = 用 :root 原配色 ──
+  const tintToggle = pick<HTMLInputElement>("#ap-tint-base");
+  tintToggle?.addEventListener("change", () => {
+    ap.set({ tintBase: !!tintToggle.checked });
+  });
+
+  // ── 跟随系统 / 自定义：切模式只重画显隐与选中态 ──
+  const sysSwatch = pick("#ap-sys-swatch");
+  const sysLabel = pick("#ap-sys-label");
+  /** 把「当前系统色」这一行刷成最新。切到跟随模式时**必须**调它：不调则 `--accent`
+   *  还停在上一个自定义色，用户看到的是「切了没反应，要再点一次刷新才对」
+   *  （浏览器实测踩到）。 */
+  const syncSystemRow = async () => {
+    await ap.refreshSystemTheme();
+    const sys = ap.systemTheme();
+    if (sysSwatch) sysSwatch.style.background = sys.accent || cfg.customAccent;
+    if (sysLabel) sysLabel.textContent = sys.accent || t("settings.appearance_color_system_unavailable");
+  };
+  container.querySelectorAll<HTMLElement>("[data-color-mode]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const mode = btn.dataset.colorMode as "custom" | "system";
+      ap.set({ colorMode: mode });
+      container.querySelectorAll<HTMLElement>("[data-color-mode]").forEach(b =>
+        b.classList.toggle("active", b.dataset.colorMode === mode));
+      pick("#ap-color-custom")?.classList.toggle("hidden", mode === "system");
+      pick("#ap-color-system")?.classList.toggle("hidden", mode !== "system");
+      if (mode === "system") void syncSystemRow();
+    });
+  });
+  pick("#ap-sys-refresh")?.addEventListener("click", () => { void syncSystemRow(); });
+
+  // ── 主题包：单选。`main.ts` 的 set() 会在 themeId 变化时重画结果列表（图标）──
+  // 同步「主题锁」：只有默认主题允许改主题色与背景图片（见 buildAppearancePane）。
+  const colorGroup = pick("#ap-color-group");
+  const lockNote = pick("#ap-lock-note");
+  const bgPickBtn = pick<HTMLButtonElement>("#ap-bg-pick");
+  const syncThemeLock = (themeId: string) => {
+    const locked = themeId !== "default";
+    colorGroup?.classList.toggle("locked", locked);
+    lockNote?.classList.toggle("hidden", !locked);
+    if (bgPickBtn) bgPickBtn.disabled = locked;
+  };
+  container.querySelectorAll<HTMLElement>("[data-theme]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.theme || "default";
+      ap.set({ themeId: id });
+      container.querySelectorAll<HTMLElement>("[data-theme]").forEach(b =>
+        b.classList.toggle("active", b.dataset.theme === id));
+      syncThemeLock(id);
+    });
+  });
+  pick("#ap-theme-dir")?.addEventListener("click", async () => {
+    try { await open(await ap.themesDir()); } catch (e) { console.error("[lunac] open themes dir failed:", e); }
+  });
 }
 
 async function buildSearchPane(): Promise<string> {
@@ -239,7 +663,10 @@ function belongsToOtherProvider(model: string, provider: string): boolean {
   return false;
 }
 
-function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): string {
+/** AI 模型这一块的**内部内容**（不含 pane 外壳与分块标题）——
+ *  由 buildAIPane 组装进「AI」分类。2026-09-19 批 9 起 AI 分类下有三个分块
+ *  （AI 模型 / 技能 / 工具），每个分块用与「风格」相同的 .settings-group-title。 */
+function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -346,8 +773,6 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
   } catch {}
 
   return `
-    <div class="settings-pane" data-pane="ai" id="sp-ai">
-      <div class="settings-pane-title">${t("settings.ai_model")}</div>
       <div class="settings-row">
         <span class="settings-label">${t("settings.provider")}</span>
         ${provSelectHtml}
@@ -388,7 +813,25 @@ function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: s
       <div class="settings-row" style="justify-content: flex-end;">
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
         <span id="settings-save-msg" class="settings-save-msg"></span>
-      </div>
+      </div>`;
+}
+
+// ── AI 分类（2026-09-19 批 9：三个分块合成一个分类）────────────────
+/** AI 分类 = **AI 模型 + 技能（Skills）+ 工具（Tools / MCP）** 三个分块。
+ *  用户要求：「将 skills 和 tools 和 ai模型 分类到 ai 分类里，各个分块采用跟
+ *  风格里的分块一样」—— 所以三块都用 .settings-group-title（与「风格」的
+ *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。 */
+async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): Promise<string> {
+  const [skillsHtml, toolsHtml] = await Promise.all([buildSkillsSection(), buildToolsSection()]);
+  return `
+    <div class="settings-pane" data-pane="ai" id="sp-ai">
+      <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
+      <div class="settings-group-title">${t("settings.ai_model")}</div>
+      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey)}
+      <div class="settings-group-title">${t("settings.skills")}</div>
+      ${skillsHtml}
+      <div class="settings-group-title">${t("settings.group_tools")}</div>
+      ${toolsHtml}
     </div>`;
 }
 
@@ -454,7 +897,10 @@ function installedSkillRowHtml(s: { name: string; description: string; dir: stri
     </div>`;
 }
 
-async function buildSkillsPane(): Promise<string> {
+/** 技能（Skill Store）分块的内部内容 —— 组装进 AI 分类（见 buildAIPane）。
+ *  2026-09-19 批 9：不再是独立侧栏分类，块内的次级标题仍用
+ *  .settings-marketplace-title（与分块标题 .settings-group-title 区分层级）。 */
+async function buildSkillsSection(): Promise<string> {
   const recommendedHtml = SKILL_SITES.map(r => skillEntryHtml(r.name, r.desc, r.url, false)).join("");
   const custom = loadSkillSites();
   const customHtml = custom.length === 0
@@ -474,8 +920,6 @@ async function buildSkillsPane(): Promise<string> {
   }
 
   return `
-    <div class="settings-pane" data-pane="skills" id="sp-skills">
-      <div class="settings-pane-title">${t("settings.skills")}</div>
       <div class="settings-marketplace-section">
         <div class="settings-marketplace-title">${t("settings.skills_installed")}</div>
         <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.skills_installed_hint")}</div>
@@ -512,11 +956,13 @@ async function buildSkillsPane(): Promise<string> {
       <div class="settings-marketplace-section">
         <div class="settings-marketplace-title">${t("settings.skill_custom")}</div>
         <div class="settings-skill-list" id="settings-skill-custom">${customHtml}</div>
-      </div>
-    </div>`;
+      </div>`;
 }
 
-async function buildPluginsPane(): Promise<string> {
+/** 工具（Tools / MCP）分块的内部内容 —— 组装进 AI 分类（见 buildAIPane）。
+ *  2026-09-19 批 9：此前它被挂在「插件」分类下，用户指出「这个应该是 tools」
+ *  —— 它是 AI Agent 的自定义工具（MCP 桥），与 Lunac 插件是两回事。 */
+async function buildToolsSection(): Promise<string> {
   let toolsHtml = "";
   let communityHtml = "";
   try {
@@ -570,9 +1016,6 @@ async function buildPluginsPane(): Promise<string> {
   }
 
   return `
-    <div class="settings-pane" data-pane="plugins" id="sp-plugins">
-      <div class="settings-pane-title">${t("settings.plugins")}</div>
-
       <!-- Install from URL -->
       <div class="settings-marketplace-section">
         <div class="settings-marketplace-title">${t("settings.install_from_url")}</div>
@@ -596,7 +1039,39 @@ async function buildPluginsPane(): Promise<string> {
 
       <div class="settings-pane-footer">
         <button id="settings-open-tools" class="settings-tool-btn">${t("settings.open_tool_editor")}</button>
-      </div>
+      </div>`;
+}
+
+/** 「插件」分类 = **插件市场总览**（2026-09-19 批 9，用户明确要求）。
+ *
+ *  **与 AI 分类下的 tools 严格区分**：tools 是「AI Agent 能调用的自定义工具
+ *  （MCP 桥）」，这里列的是 **Lunac 自己的插件**（结果区里能搜到、点开的那些）。
+ *  此前两者混在同一个分类里，分类名还叫「插件 (MCP 工具)」—— 用户报的正是这里。
+ *
+ *  只读总览（用户选定）：图标 + 本地化名称 + 本地化描述 + 「打开」；
+ *  **搜索关键词进 title 属性**（悬停可见），不铺在界面上 —— 关键词数组里
+ *  中英混杂且动辄十几个，平铺会把面板糊成一片。 */
+async function buildPluginsPane(): Promise<string> {
+  const rows = pluginRegistry.getAll().map(p => {
+    const icon = (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "";
+    const kw = p.keywords.join(" · ");
+    return `
+      <div class="settings-plugin-item" title="${esc(kw)}">
+        <div class="settings-plugin-icon">${icon}</div>
+        <div class="settings-plugin-info">
+          <span class="settings-plugin-name">${esc(pluginName(p.id, p.name))}</span>
+          <span class="settings-plugin-desc">${esc(pluginDesc(p.id, p.description))}</span>
+        </div>
+        <button class="settings-install-btn" data-open-plugin="${esc(p.id)}">${t("settings.skill_open")}</button>
+      </div>`;
+  }).join("");
+
+  return `
+    <div class="settings-pane" data-pane="plugins" id="sp-plugins">
+      <div class="settings-pane-title">${t("settings.plugins")}</div>
+      <div class="settings-group-title">${t("settings.plugins_installed")}</div>
+      <div class="settings-plugin-list" id="settings-plugin-overview">${rows}</div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);line-height:1.5;margin:10px 0 0;">${t("settings.plugins_hint")}</div>
     </div>`;
 }
 
@@ -620,7 +1095,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         width: 30%;
         min-width: 100px;
         border-right: 1px solid var(--border-glass);
-        background: rgba(255,255,255,0.02);
+        background: rgba(var(--ink-rgb), 0.02);
         display: flex;
         flex-direction: column;
         flex-shrink: 0;
@@ -638,11 +1113,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
         user-select: none;
       }
       .settings-sidebar-item:hover {
-        background: rgba(255,255,255,0.04);
+        background: rgba(var(--ink-rgb), 0.04);
         color: var(--text);
       }
       .settings-sidebar-item.active {
-        color: var(--accent);
+        color: var(--text);
         background: var(--accent-bg);
         border-left-color: var(--accent);
       }
@@ -720,7 +1195,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         box-sizing: border-box;
         padding: 5px 8px;
         font-size: 0.73rem;
-        background: rgba(0,0,0,0.25);
+        background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
         border: 1px solid var(--border-glass);
         border-radius: 6px;
         color: var(--text);
@@ -734,13 +1209,13 @@ export async function attachSettingsListeners(container: HTMLElement) {
         font-size: 0.7rem;
         border-radius: 6px;
         border: 1px solid var(--border-glass);
-        background: rgba(255,255,255,0.06);
+        background: rgba(var(--ink-rgb), 0.06);
         color: var(--text-dim);
         cursor: pointer;
         transition: background 0.1s, color 0.1s;
       }
       .settings-btn:hover {
-        background: rgba(255,255,255,0.12);
+        background: rgba(var(--ink-rgb), 0.12);
         color: var(--text);
       }
       .settings-select {
@@ -750,7 +1225,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         box-sizing: border-box;
         padding: 5px 8px;
         font-size: 0.73rem;
-        background: rgba(0,0,0,0.25);
+        background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
         border: 1px solid var(--border-glass);
         border-radius: 6px;
         color: var(--text);
@@ -762,13 +1237,13 @@ export async function attachSettingsListeners(container: HTMLElement) {
         border-radius: 6px;
         border: 1px solid var(--accent-border);
         background: var(--accent-bg);
-        color: var(--accent);
+        color: var(--text);
         cursor: pointer;
         min-width: 90px;
         text-align: center;
         transition: background 0.1s;
       }
-      .settings-hotkey:hover { background: rgba(192,160,160,0.2); }
+      .settings-hotkey:hover { background: rgba(var(--accent-rgb), 0.2); }
       .settings-hotkey.recording {
         border-color: var(--yellow);
         background: rgba(201,184,150,0.15);
@@ -790,7 +1265,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         position: absolute;
         cursor: pointer;
         top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(255,255,255,0.1);
+        background: rgba(var(--ink-rgb), 0.1);
         border-radius: 20px;
         transition: background 0.2s;
       }
@@ -823,8 +1298,18 @@ export async function attachSettingsListeners(container: HTMLElement) {
         border-radius: 6px;
         transition: background 0.1s;
       }
-      .settings-plugin-item:hover { background: rgba(255,255,255,0.04); }
-      .settings-plugin-info { display: flex; flex-direction: column; min-width: 0; }
+      .settings-plugin-item:hover { background: rgba(var(--ink-rgb), 0.04); }
+      .settings-plugin-icon {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        color: var(--text-dim);
+      }
+      .settings-plugin-icon .result-item-icon-img { width: 18px; height: 18px; }
+      .settings-plugin-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
       .settings-plugin-name { font-size: 0.76rem; color: var(--text); display: flex; align-items: center; gap: 6px; }
       .settings-plugin-desc { font-size: 0.68rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .settings-plugin-empty { color: var(--text-dim); font-size: 0.75rem; padding: 8px 0; }
@@ -837,11 +1322,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
         border-radius: 6px;
         border: 1px solid var(--accent-border);
         background: var(--accent-bg);
-        color: var(--accent);
+        color: var(--text);
         cursor: pointer;
         transition: background 0.1s;
       }
-      .settings-tool-btn:hover { background: rgba(192,160,160,0.2); }
+      .settings-tool-btn:hover { background: rgba(var(--accent-rgb), 0.2); }
       .settings-marketplace-section { margin-bottom: 14px; }
       .settings-marketplace-title {
         font-size: 0.7rem;
@@ -864,7 +1349,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         border-radius: 6px;
         transition: background 0.1s;
       }
-      .settings-marketplace-item:hover { background: rgba(255,255,255,0.04); }
+      .settings-marketplace-item:hover { background: rgba(var(--ink-rgb), 0.04); }
       .settings-marketplace-info { display: flex; flex-direction: column; min-width: 0; }
       .settings-marketplace-name { font-size: 0.76rem; color: var(--text); }
       .settings-marketplace-desc { font-size: 0.68rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -872,32 +1357,39 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 3px 10px;
         font-size: 0.68rem;
         border-radius: 4px;
-        border: 1px solid var(--green);
-        background: rgba(157,180,172,0.1);
-        color: var(--green);
+        border: 1px solid var(--accent-border);
+        background: rgba(var(--accent-rgb), 0.1);
+        color: var(--text);
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.1s;
       }
-      .settings-install-btn:hover { background: rgba(157,180,172,0.2); }
+      .settings-install-btn:hover { background: rgba(var(--accent-rgb), 0.2); }
       .settings-install-btn.installed {
         border-color: var(--text-muted);
-        background: rgba(255,255,255,0.05);
+        background: rgba(var(--ink-rgb), 0.05);
         color: var(--text-dim);
         cursor: default;
       }
+      /* 保存按钮：**动作按钮一律跟随主题色**（accent 三态 + 半透明档），
+         不跟随主题色的是「语义状态色」—— --green(成功) / --red(危险) /
+         --yellow(警告) 保持固定（见下方 .settings-save-msg / .tool-badge）。
+         用户报的「搜索分类的 save 按钮没跟随主题颜色」根因就在这里：
+         它此前用 var(--green) + rgba(157,180,172,*) 硬编码，与主题色无关。
+         注意：本文件整段样式是模板字符串，注释里**不许出现反引号**。 */
       .settings-save-btn {
         padding: 6px 18px;
         font-size: 0.74rem;
         border-radius: 6px;
-        border: 1px solid var(--green);
-        background: rgba(157,180,172,0.12);
-        color: var(--green);
+        border: 1px solid var(--accent-border);
+        background: rgba(var(--accent-rgb), 0.12);
+        color: var(--text);
         cursor: pointer;
         transition: background 0.15s, color 0.15s;
       }
-      .settings-save-btn:hover { background: rgba(157,180,172,0.25); }
-      .settings-save-btn:active { background: rgba(157,180,172,0.35); }
+      .settings-save-btn:hover { background: rgba(var(--accent-rgb), 0.25); }
+      .settings-save-btn:active { background: rgba(var(--accent-rgb), 0.35); }
+      /* 保存结果提示**保留语义绿**：它表达的是「操作成功」这一状态，不是动作按钮。 */
       .settings-save-msg {
         font-size: 0.72rem;
         color: var(--green);
@@ -929,7 +1421,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 5px 8px;
         font-size: 0.73rem;
         font-family: inherit;
-        background: rgba(0,0,0,0.25);
+        background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
         border: 1px solid var(--border-glass);
         border-radius: 6px;
         color: var(--text);
@@ -955,7 +1447,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         max-height: 240px;
         overflow-y: auto;
         overscroll-behavior: contain; /* 滚轮不穿透到外层列表 */
-        background: rgba(24,24,37,0.97);
+        background: var(--surface-glass);
         backdrop-filter: blur(20px);
         -webkit-backdrop-filter: blur(20px);
         border: 1px solid var(--border-glass);
@@ -963,7 +1455,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         z-index: 999;
         display: none;
         margin-top: 0;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, calc(0.4 * var(--shade-scale)));
         /* 滚动条外观走全局统一细条（styles.css 的「统一细滚动条」一节）。
            这里**不要**再写 scrollbar-width / scrollbar-color —— 在 Chromium
            (WebView2) 里它们会让 ::-webkit-scrollbar 整段失效、退回系统默认样式。 */
@@ -979,14 +1471,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
         text-overflow: ellipsis;
       }
       .custom-select-option:hover { background: var(--accent-bg); color: var(--text); }
-      .custom-select-option.selected { color: var(--accent); font-weight: 600; }
+      .custom-select-option.selected { color: var(--text); font-weight: 600; }
       .custom-model-input {
         width: 100%;
         box-sizing: border-box;
         padding: 6px 10px;
         font-size: 0.73rem;
         color: var(--text);
-        background: rgba(0,0,0,0.35);
+        background: rgba(0, 0, 0, calc(0.35 * var(--shade-scale)));
         border: 1px solid var(--accent-border);
         border-radius: 4px;
         outline: none;
@@ -1006,12 +1498,12 @@ export async function attachSettingsListeners(container: HTMLElement) {
         font-size: 0.85rem;
         line-height: 1;
         color: var(--text);
-        background: rgba(192,160,160,0.18);
+        background: rgba(var(--accent-rgb), 0.18);
         border: 1px solid var(--accent-border);
         border-radius: 4px;
         cursor: pointer;
       }
-      .custom-model-ok:hover { background: rgba(192,160,160,0.35); }
+      .custom-model-ok:hover { background: rgba(var(--accent-rgb), 0.35); }
       .cs-del {
         display: inline-block;
         margin-left: 6px;
@@ -1036,19 +1528,22 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       /* Skill store list */
       .settings-skill-list { max-height: 220px; overflow-y: auto; }
-      .settings-skill-open {
+      /* 动作按钮（打开 / 编辑）：底色与边框走 --accent 系，**文字走灰阶**
+         （ai-spec §11 规则 45 —— 文字只跟明暗、不带色相）。 */
+      .settings-skill-open, .settings-skill-edit {
         padding: 3px 10px;
         font-size: 0.68rem;
         border-radius: 4px;
         border: 1px solid var(--accent-border);
         background: var(--accent-bg);
-        color: var(--accent);
+        color: var(--text);
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.1s;
       }
-      .settings-skill-open:hover { background: rgba(192,160,160,0.2); }
-      .settings-skill-del {
+      .settings-skill-open:hover, .settings-skill-edit:hover { background: rgba(var(--accent-rgb), 0.2); }
+      /* 中性/危险按钮（移除）：无底色，hover 转 --red。 */
+      .settings-skill-del, .settings-skill-del-installed {
         padding: 3px 10px;
         font-size: 0.68rem;
         border-radius: 4px;
@@ -1059,14 +1554,159 @@ export async function attachSettingsListeners(container: HTMLElement) {
         flex-shrink: 0;
         transition: background 0.1s, color 0.1s;
       }
-      .settings-skill-del:hover { color: var(--red); background: rgba(192,138,138,0.1); }
+      .settings-skill-del:hover, .settings-skill-del-installed:hover { color: var(--red); background: rgba(192,138,138,0.1); }
+      /* 两段式确认的「待确认」态：语义色常亮，提示「再点一次才真删」。
+         没有它的话 armed 态与常态只差文字，看不出是危险确认。 */
+      .settings-skill-del[data-armed="1"],
+      .settings-skill-del-installed[data-armed="1"] { color: var(--red); background: rgba(192,138,138,0.14); }
       /* 印象派按钮背景清理（与全局 styles.css 一致：背景全透明，无扫笔/光效） */
-      .settings-tool-btn, .settings-skill-open, .settings-install-btn,
-      .settings-save-btn, .custom-model-ok, .settings-skill-del {
+      .settings-tool-btn, .settings-skill-open, .settings-skill-edit, .settings-install-btn,
+      .settings-save-btn, .custom-model-ok, .settings-skill-del, .settings-skill-del-installed {
         background-image: none;
         box-shadow: none;
       }
       .settings-install-btn.installed { background-image: none; box-shadow: none; }
+
+      /* ── 「风格」分区（外观 / 主题，2026-09-19）───────────────────
+         全部用既有 token（--accent / --text-dim / --border-glass），
+         这样主题色与主题包一改，这块界面自己也跟着变 —— 唯一例外是色轮环
+         与取色器（它们本来就是「展示颜色」的控件，必须显示真实色相）。
+         不新增任何滚动条声明（走全局 ::-webkit-scrollbar，见 agent-ui-spec §5.4）。 */
+      /* 分组小标题：用户要求「字号大一点、加粗、或用方框圈出来」——
+         三者都用上（放大 + 600 字重 + 左侧 accent 竖条 + 淡底框），
+         这样「背景 / 主题颜色 / 主题包」在长面板里一眼能找到。
+         去掉了 text-transform: uppercase（中文无大小写，纯属噪声）。 */
+      .settings-group-title {
+        margin: 18px 0 8px;
+        padding: 5px 10px;
+        font-size: 0.84rem;
+        font-weight: 600;
+        color: var(--text);
+        background: var(--accent-bg);
+        border-left: 3px solid var(--accent);
+        border-radius: 4px;
+      }
+      .settings-group-title:first-of-type { margin-top: 6px; }
+      /* 「自定义」展开的拉条面板 */
+      .ap-sliders-panel {
+        display: flex; flex-direction: column; gap: 2px;
+        padding: 6px 10px; margin: 4px 0 2px;
+        border: 1px solid var(--border-glass); border-radius: 8px;
+        background: rgba(var(--ink-rgb), 0.03);
+      }
+      .ap-sliders-panel.hidden { display: none; }
+      .ap-toggle-caret { margin-left: 5px; font-size: 0.62rem; opacity: 0.75; }
+      /* 取色器那一行整宽上下列（label 在上、取色器在下并占满宽度）：
+         原先是 .settings-row 的右侧窄列，色盘被压成 26px 宽根本没法用。
+         整宽后 hex 输入区自然与同面板其它行的左端点对齐。 */
+      .ap-row-block { flex-direction: column; align-items: stretch; gap: 6px; }
+      .ap-slider { display: flex; align-items: center; gap: 8px; flex: 1; justify-content: flex-end; }
+      .ap-slider input[type="range"] { width: 140px; accent-color: var(--accent); cursor: pointer; }
+      .ap-slider-val {
+        font-size: 0.7rem; color: var(--text-dim);
+        min-width: 48px; text-align: right; font-variant-numeric: tabular-nums;
+      }
+      .ap-bg-name { font-size: 0.7rem; color: var(--text-dim); margin-right: 8px; }
+      .ap-seg { display: flex; border: 1px solid var(--border-glass); border-radius: 6px; overflow: hidden; }
+      .ap-seg-btn {
+        padding: 4px 10px; font-size: 0.7rem;
+        background: none; border: none; color: var(--text-dim); cursor: pointer;
+      }
+      /* 选中态：底色用主色、**文字保持中性**（--text 是由主色明暗派生的灰阶，
+         见 ai-spec 规则 45）—— 用户明确要求「选定的『自定义』这几个字不该有颜色」。
+         选中与否由背景/边框表达即可，文字再上色就与「文字不带色相」那条规则打架。 */
+      .ap-seg-btn.active { background: var(--accent-bg); color: var(--text); }
+      /* 主题锁：非默认主题下灰掉「主题颜色」整块（见 buildAppearancePane 的 locked）。
+         用 opacity + pointer-events 而不是给每个控件加 disabled 属性 —— 这块里
+         有十几个控件（分段按钮 / 取色器 / hex 框 / 色相条 / 预设 / 开关），逐个加
+         disabled 必然漏，且取色器的自绘面板不认 disabled。 */
+      .ap-locked-group.locked { opacity: 0.42; pointer-events: none; }
+      .ap-lock-note {
+        font-size: 0.7rem; line-height: 1.45; margin: 0 0 6px;
+        color: var(--yellow);
+      }
+      .ap-lock-note.hidden { display: none; }
+      .settings-btn:disabled { opacity: 0.42; cursor: not-allowed; }
+      .ap-color-body.hidden { display: none; }
+      /* ── 应用内取色器（与界面同一套 token，不用系统取色对话框）────
+         为什么自己做：input[type=color] 弹出的是 Windows 原生对话框，
+         在 WebView2 里样式一个像素都改不了，与暗色玻璃界面完全脱节。 */
+      /* 尺寸（2026-09-19 按用户反馈放大）：整宽约 410px（= 设置内容区宽度）、
+         总高约 110~120px。原来是挤在行右侧的 26px 宽窄条，色盘根本没法用。 */
+      .ap-picker { display: flex; flex-direction: column; gap: 5px; width: 100%; }
+      .ap-picker-head { display: flex; align-items: center; gap: 6px; }
+      .ap-swatch-btn {
+        width: 34px; height: 26px; padding: 0; cursor: pointer;
+        border: 1px solid var(--border-glass); border-radius: 6px;
+      }
+      .ap-hex {
+        width: 96px; padding: 4px 8px; font-size: 0.74rem;
+        font-family: ui-monospace, Consolas, monospace;
+        background: rgba(var(--ink-rgb), 0.04); color: var(--text);
+        border: 1px solid var(--border-glass); border-radius: 5px;
+      }
+      /* 展开/收起按钮：圆角正方形（用户要求「调大调成圆框正方形」） */
+      .ap-picker-toggle {
+        width: 30px; height: 30px; padding: 0; cursor: pointer;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 0.8rem; line-height: 1;
+        background: none; border: 1px solid var(--border-glass);
+        border-radius: 8px; color: var(--text-dim);
+      }
+      .ap-picker-toggle:hover { border-color: var(--accent-border); color: var(--accent); }
+      .ap-pick-panel {
+        display: flex; flex-direction: column; gap: 4px; padding: 6px;
+        border: 1px solid var(--border-glass); border-radius: 8px;
+        background: rgba(var(--ink-rgb), 0.03);
+      }
+      .ap-pick-panel.hidden { display: none; }
+      /* 饱和度/明度面板：宽而扁（整宽 × 40px）—— 用户要的是「宽度调宽、高度调低」 */
+      .ap-sv {
+        position: relative; width: 100%; height: 40px; cursor: crosshair; touch-action: none;
+        border-radius: 6px; border: 1px solid var(--border-glass);
+        background-image:
+          linear-gradient(to top, #000, rgba(0,0,0,0)),
+          linear-gradient(to right, #fff, rgba(255,255,255,0));
+        background-color: var(--ap-hue-color, #f00);
+      }
+      .ap-sv-cursor, .ap-hue-cursor {
+        position: absolute; width: 12px; height: 12px; margin: -6px;
+        border-radius: 50%; border: 2px solid #fff;
+        box-shadow: 0 0 0 1px rgba(0,0,0,0.5); pointer-events: none;
+      }
+      /* 色相条：0° 在最左（红），与 TS 侧的 x/宽度 → 0~360 口径必须一致 */
+      .ap-hue {
+        position: relative; height: 14px; border-radius: 7px; cursor: pointer; touch-action: none;
+        border: 1px solid var(--border-glass);
+        background: linear-gradient(to right,
+          hsl(0 100% 50%), hsl(60 100% 50%), hsl(120 100% 50%), hsl(180 100% 50%),
+          hsl(240 100% 50%), hsl(300 100% 50%), hsl(360 100% 50%));
+      }
+      .ap-hue-cursor { top: 50%; }
+      .ap-presets { display: flex; gap: 5px; flex-wrap: wrap; }
+      .ap-preset {
+        width: 18px; height: 18px; padding: 0; cursor: pointer;
+        border-radius: 4px; border: 1px solid var(--border-glass);
+      }
+      .ap-swatch {
+        display: inline-block; width: 16px; height: 16px; border-radius: 4px;
+        border: 1px solid var(--border-glass);
+      }
+      .ap-sys-label {
+        font-size: 0.7rem; color: var(--text-dim); margin-right: 8px;
+        font-variant-numeric: tabular-nums;
+      }
+      .ap-themes { display: flex; flex-wrap: wrap; gap: 6px; }
+      .ap-theme {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 5px 10px; font-size: 0.72rem; border-radius: 6px;
+        border: 1px solid var(--border-glass); background: none;
+        color: var(--text-dim); cursor: pointer;
+      }
+      /* 选中态同 .ap-seg-btn.active：主题名也是「文字」，一律保持中性灰阶，
+         不带主题色相 —— 选中与否靠底色/边框表达（用户批 4 任务 2 的要求）。 */
+      .ap-theme.active { border-color: var(--accent-border); background: var(--accent-bg); color: var(--text); }
+      .ap-badge { font-size: 0.62rem; opacity: 0.75; }
     `;
     document.head.appendChild(style);
   }
@@ -1227,36 +1867,13 @@ export async function attachSettingsListeners(container: HTMLElement) {
     });
   }
 
-  // ── 自定义背景（需求：透明 + 毛玻璃，无默认图）────────────────
-  // 选择图片 → convertFileSrc 转 asset URL → localStorage 持久化 →
-  // 调用 main.ts 暴露的 __lunac_apply_bg 即时更新 #app-bg-image。
-  const bgApply = container.querySelector("#settings-bg-apply") as HTMLElement | null;
-  const bgClear = container.querySelector("#settings-bg-clear") as HTMLElement | null;
-  if (bgApply) {
-    bgApply.addEventListener("click", async () => {
-      try {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const picked = await open({
-          multiple: false,
-          title: t("settings.background_apply"),
-          filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] }],
-        });
-        if (typeof picked === "string" && picked) {
-          const url = convertFileSrc(picked);
-          try { localStorage.setItem("lunac-bg-image", url); } catch {}
-          (window as any).__lunac_apply_bg?.(url);
-        }
-      } catch (e) {
-        console.error("[lunac settings] background apply failed:", e);
-      }
-    });
-  }
-  if (bgClear) {
-    bgClear.addEventListener("click", () => {
-      try { localStorage.removeItem("lunac-bg-image"); } catch {}
-      (window as any).__lunac_apply_bg?.(null);
-    });
-  }
+  // ── 外观 / 主题（「风格」分区）─────────────────────────────────
+  // 2026-09-19：原来写在这里的「自定义背景」两个按钮被这一段整体取代 —— 配置与
+  // 应用统一收敛到 main.ts 的 `__lunac_appearance`（背景/滑块/主题色/主题包），
+  // 设置侧只调桥，不再自己写 localStorage（两处实现必然漂移，见该分区顶部注释）。
+  const apBridge = appearanceBridge();
+  if (apBridge) attachAppearanceControls(container, apBridge);
+  else console.warn("[lunac settings] appearance bridge unavailable — 风格分区控件不生效");
 
   // ── OCR 引擎（按需下载，不随发行包分发）──────────────────────
   const ocrInstallBtn = container.querySelector("#settings-ocr-install") as HTMLButtonElement | null;
@@ -1678,6 +2295,16 @@ export async function attachSettingsListeners(container: HTMLElement) {
   if (searchEngineDD) {
     setupCustomDropdown(searchEngineDD, () => {}); // onChange is no-op, save button handles persistence
   }
+
+  // ── 插件总览：每行的「打开」按钮（2026-09-19 批 9）──────────────
+  // 走 main.ts 的 __lunac_open_plugin 桥：设置面板不能自己 executePlugin
+  // （那要动结果区 / 搜索栏状态，属于主界面的职责）。
+  container.querySelectorAll<HTMLElement>("[data-open-plugin]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.openPlugin;
+      if (id) (window as any).__lunac_open_plugin?.(id);
+    });
+  });
 
   // ── AI 安全档位（文件边界）─────────────────────────────────────
   // 单独一个下拉，不跟 provider/model 那条保存链路混：切换立即生效（会重启 agent）。
@@ -2177,10 +2804,10 @@ export const settingsPlugin: Plugin = {
     if (!model && preset) model = preset.default_model;
 
     const generalPane = buildGeneralPane(hotkey, autoStart);
-    const aiPane = buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey);
+    const appearancePane = await buildAppearancePane();
+    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey);
     const pluginsPane = await buildPluginsPane();
     const searchPane = await buildSearchPane();
-    const skillsPane = await buildSkillsPane();
 
     const html = `
       <div class="settings-layout">
@@ -2188,14 +2815,14 @@ export const settingsPlugin: Plugin = {
           <div class="settings-sidebar-item" data-cat="general">
             <span>${t("settings.sidebar_general")}</span>
           </div>
+          <div class="settings-sidebar-item" data-cat="appearance">
+            <span>${t("settings.sidebar_appearance")}</span>
+          </div>
           <div class="settings-sidebar-item" data-cat="ai">
             <span>${t("settings.sidebar_ai")}</span>
           </div>
           <div class="settings-sidebar-item" data-cat="search">
             <span>${t("settings.sidebar_search")}</span>
-          </div>
-          <div class="settings-sidebar-item" data-cat="skills">
-            <span>${t("settings.sidebar_skills")}</span>
           </div>
           <div class="settings-sidebar-item" data-cat="plugins">
             <span>${t("settings.sidebar_plugins")}</span>
@@ -2203,9 +2830,9 @@ export const settingsPlugin: Plugin = {
         </div>
         <div class="settings-content">
           ${generalPane}
+          ${appearancePane}
           ${aiPane}
           ${searchPane}
-          ${skillsPane}
           ${pluginsPane}
         </div>
       </div>`;

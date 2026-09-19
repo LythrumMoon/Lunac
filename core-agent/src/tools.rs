@@ -88,7 +88,12 @@ const SKIP_DIRS: [&str; 13] = [
     "__pycache__", ".idea", ".vscode", "build",
 ];
 
-/// 工具执行上下文（由 main.rs 依据启动参数构建）
+/// 工具执行上下文（由 main.rs 依据启动参数构建）。
+///
+/// `Clone` 是为了后台复盘 fork：它在**另一条线程**上跑（见 main.rs 的 `run_review_fork`），
+/// 拿不到主循环那份 `&Ctx`（也不是 `'static` 借用）。克隆一份只含路径与两个布尔量，
+/// 代价可忽略 —— 但语义上必须是**同一份工作区视图**，否则 fork 里的读写在另一个边界下。
+#[derive(Clone)]
 pub struct Ctx {
     /// 进程工作目录 —— src-tauri 用它传「AI 工作区」
     pub cwd: PathBuf,
@@ -102,7 +107,7 @@ pub struct Ctx {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 十一个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 十三个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -301,6 +306,58 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["todos"]
             }
         }),
+        json!({
+            "name": "SessionSearch",
+            "description": "Search the user's OWN past chat sessions in this app (a local \
+                full-text index over earlier conversations) and return matching messages \
+                grouped by session. Use it whenever the user refers to an earlier \
+                conversation — \"last time\", \"we discussed that before\", \"上次\", \
+                \"之前聊过的\" — because you cannot recall past sessions from memory. The \
+                history index in your system prompt lists only titles and opening lines; \
+                this tool reads what was actually said. Read-only and local: it never \
+                touches the network.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to look for. Chinese substrings work; keep it short and specific."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum matching messages to return (default 10, max 30)"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "Agent",
+            "description": "Launch a subagent: an isolated assistant instance with its OWN \
+                context window that works on ONE self-contained task using the same tools, \
+                then reports back. Use it when a task needs many exploratory tool calls \
+                (searching, reading lots of files, comparing options) whose raw output you \
+                do NOT want to keep in this conversation — the subagent's intermediate tool \
+                output never enters your context, only its final report does. Also useful to \
+                investigate something without derailing your current line of work. \
+                The subagent cannot see this conversation and cannot ask the user questions, \
+                so `prompt` must be completely self-contained. It can read and modify files, \
+                so make the task description precise. It cannot launch further subagents.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Short (3-5 words) label for the task, shown to the user"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The complete task for the subagent: what to do, which paths or commands to use, and what its report must contain. It sees nothing but this string."
+                    }
+                },
+                "required": ["description", "prompt"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -319,6 +376,102 @@ pub fn names(tools: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// **必须走 MCP 桥**才能跑的工具名（A3/A4，2026-09-20）。
+///
+/// 四件里只有 `SessionSearch` 在 `defs()` 恒返回的那张表里（内置一等公民，桥没接通时
+/// 调用会**如实报错**而不是编造结果）；另外三件都由 `main.rs` **条件注册** ——
+/// resources 读侧要「桥真的接上了用户工具」才追加，`Remember` 要「桥接通了」才追加。
+///
+/// 集中在一处是为了三件事**不会各写各的**：
+///   ① `dispatch_tool` 的「无桥就早退」（给模型的错误文案要一致）；
+///   ② `subagent_tool_defs()` 要把它们剔掉（子代理不接桥 ⇒ 留着就是保证失败）；
+///   ③ 启动时的条件注册。
+/// **新增这类工具只改这个数组**，别在三处分别硬编码字符串。
+pub const BRIDGE_TOOLS: [&str; 4] = [
+    "SessionSearch",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "Remember",
+];
+
+/// 该工具是否必须走 MCP 桥（见 [`BRIDGE_TOOLS`]）。
+pub fn needs_bridge(name: &str) -> bool {
+    BRIDGE_TOOLS.contains(&name)
+}
+
+/// `Remember` 的 schema（A4，长期记忆的**写入侧**）。**不进 `defs()`** —— 由 `main.rs`
+/// 在桥接通时条件追加（没桥就写不进去，注册了就是一件必然失败的工具）。
+///
+/// 与 `TodoWrite` 的区别要说清（模型最容易混）：`TodoWrite` 只改**本回合**的待办面板，
+/// 回合结束即失去意义；`Remember` 写的是**跨会话**的长期记忆，进程重启后仍会注入。
+pub fn remember_tool() -> Value {
+    json!({
+        "name": "Remember",
+        "description": "Save ONE durable fact to the user's long-term memory (a small local \
+            file that is loaded into your context at the start of every future session). Use \
+            it for things that stay true across conversations and that you would otherwise \
+            have to be told again: the user's stated preferences, project conventions, how \
+            their environment is set up, decisions reached and why. Do NOT use it for \
+            one-off details, for anything already in the long-term memory you were given, or \
+            for the current task's progress (use TodoWrite for that). Write one concise \
+            self-contained fact per call, in the user's own language.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "One self-contained fact to remember (a sentence or two)."
+                },
+                "replace": {
+                    "type": "boolean",
+                    "description": "Replace the ENTIRE memory with `content` instead of appending. Only for consolidating/rewriting when the memory is full or messy."
+                }
+            },
+            "required": ["content"]
+        }
+    })
+}
+
+/// `ListMcpResourcesTool` 的 schema（A3）。**不进 `defs()`** —— 它由 `main.rs`
+/// 在「桥接上了用户工具」时才条件追加（理由见那里的注释）。
+pub fn list_resources_tool() -> Value {
+    json!({
+        "name": "ListMcpResourcesTool",
+        "description": "List the MCP resources this app exposes. Right now that is the \
+            user's own custom tool definition files (`tools\\*.json`) — one resource per \
+            file. Use it when you need to know which user-defined tools exist, then \
+            ReadMcpResourceTool to look at one. Read-only and local: it never touches \
+            the network. Returns an empty list when the user has no custom tools.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    })
+}
+
+/// `ReadMcpResourceTool` 的 schema（A3）。同上，条件注册。
+pub fn read_resource_tool() -> Value {
+    json!({
+        "name": "ReadMcpResourceTool",
+        "description": "Read one MCP resource by `uri` (get the URI from \
+            ListMcpResourcesTool). This is how you inspect a user-defined tool definition \
+            when you need more than its schema — e.g. which shell command or HTTP endpoint \
+            its handler actually uses. Only resources under this app's own tools directory \
+            can be read; anything else is refused. Read-only and local.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "Resource URI, exactly as returned by ListMcpResourcesTool (e.g. file:///C:/…/tools/deploy.json). A bare file name such as `deploy` also works."
+                }
+            },
+            "required": ["uri"]
+        }
+    })
+}
+
 /// 是否需要先过用户审批（P2 的 `can_use_tool`）。
 ///
 /// 只读四件（`Read`/`Glob`/`Grep`/`WebFetch`）里的前三件不需要 —— 工作区锁
@@ -330,6 +483,9 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 /// `AskUserQuestion` 也必须问：**交互本身就是它的功能**（答案经审批卡的
 /// `updatedInput` 回传，不问就拿不到答案）。
 /// `TodoWrite` **不问**：它只改前端那块待办面板，不碰本机任何东西。
+/// 走桥的两件只读工具（`SessionSearch` / resources 读侧）**也不问** —— 它们只读本机
+/// 自己的数据（会话库 / 用户的工具定义文件），与 `Read`/`Grep` 同级；**不构成先例**：
+/// 判据仍是「执行会不会改变本机或把数据带出」。
 ///
 /// `plan` 档下的例外见 [`gated_in_read_only`]。
 pub fn needs_approval(name: &str) -> bool {
@@ -342,6 +498,16 @@ pub fn needs_approval(name: &str) -> bool {
             | "WebSearch"
             | "WebFetch"
             | "AskUserQuestion"
+            // `Remember` **要问**：它写的是**跨会话长期记忆**，而记忆会在用户没看见的
+            // 时候被注入以后的每一次对话 —— 副作用比「改一个文件」更持久。
+            // 问不代表每次都弹卡：前端按运行方式决定（自动档静默放行），复盘 fork 的
+            // 写入也走同一条路（见 main.rs 的 `run_review_fork`）。
+            | "Remember"
+            // `Agent` **要问**：它自己不直接碰本机，但它派生的是一个**能写文件、能跑命令**
+            // 的子代理 —— 「派一个代理出去干活」这个决定本身值得确认。
+            // 子代理内部的每次写操作**仍会各自再走一次审批**（见 `run_subagent`），
+            // 所以这不是「一次批准、后面全放行」。
+            | "Agent"
     )
 }
 
@@ -369,6 +535,11 @@ pub fn gated_in_read_only(name: &str) -> bool {
 ///   · `Write` / `Edit` / `Bash` / `PowerShell` —— 有副作用，且「写文件 → 读该文件」
 ///     的相对顺序必须保持（并行批绝不允许跨越它们，见 `plan_tool_batches`）
 ///   · MCP 工具 —— 副作用未知，且共用一条 stdio JSON-RPC 通道
+///   · `SessionSearch` —— **只读，但同样串行**：它也走那条 stdio 通道
+///     （`Bridge::request` 是单线程「发一条、按 id 等一条」，并发只会互相排队甚至错配）。
+///     同理还有 resources 读侧的 `ListMcpResourcesTool` / `ReadMcpResourceTool`
+///     与写入侧的 `Remember`
+///     —— **判据是「要不要走桥」，不是「是不是只读」**（见 [`BRIDGE_TOOLS`]）。
 ///   · `AskUserQuestion` —— 要等人回答，并发弹问没有意义
 pub fn parallel_safe(name: &str) -> bool {
     matches!(
@@ -1903,6 +2074,91 @@ fn safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Agent`（A1 子代理）必须注册进内置工具表，且能被 `--disallowedTools` 正常裁掉。
+    /// 这条顺带钉住「内置工具总数」—— 数量真的变了就该有人来这里改数字，而不是悄悄漂移。
+    #[test]
+    fn agent_tool_is_registered_and_filterable() {
+        let all = defs(&[]);
+        let total = all.len();
+        assert!(
+            names(&all).contains(&"Agent".to_string()),
+            "Agent 必须在内置工具表里"
+        );
+        assert_eq!(total, 13, "内置工具应为 13 件（12 件原有 + Agent）");
+
+        let cut = defs(&["Agent".to_string()]);
+        assert!(
+            !names(&cut).contains(&"Agent".to_string()),
+            "disallowed 必须能裁掉 Agent"
+        );
+        assert_eq!(cut.len(), total - 1);
+    }
+
+    /// `Agent` 的审批 / 并行 / 只读三条口径（A1 约束③）：
+    /// 要问（派生的是能写文件的代理）、必须串行（并发派子代理 = 并发花钱 + 争抢文件）、
+    /// 只读档不放行。
+    #[test]
+    fn agent_is_gated_and_serial() {
+        assert!(needs_approval("Agent"), "派子代理这个决定要用户确认");
+        assert!(!parallel_safe("Agent"), "子代理必须串行执行");
+        assert!(!gated_in_read_only("Agent"), "只读档不放行 Agent");
+    }
+
+    /// resources 读侧两件（A3）的口径：**不在 `defs()` 里**（条件注册）、**必须走桥**、
+    /// 免审批、必须串行。
+    #[test]
+    fn mcp_resource_tools_are_bridge_only_and_conditional() {
+        let all = defs(&[]);
+        for n in ["ListMcpResourcesTool", "ReadMcpResourceTool"] {
+            assert!(
+                !names(&all).contains(&n.to_string()),
+                "{n} 不该出现在 defs() 里：它是条件注册的（用户没有工具文件时，它在固定前缀里纯占位）"
+            );
+            assert!(needs_bridge(n), "{n} 必须走 MCP 桥");
+            assert!(!needs_approval(n), "{n} 只读本机自己的文件，与 Read 同级");
+            assert!(!parallel_safe(n), "{n} 走单线程 stdio 桥，必须串行");
+        }
+        // 条件注册用的 schema 必须是一等公民形状
+        for t in [list_resources_tool(), read_resource_tool()] {
+            assert!(t.get("name").and_then(Value::as_str).is_some(), "缺 name");
+            assert!(t.get("description").and_then(Value::as_str).is_some(), "缺 description");
+            assert!(t.get("input_schema").map_or(false, Value::is_object), "缺 input_schema");
+        }
+        // `SessionSearch` 是「走桥但在 defs() 里」的那一个 —— 两边都要成立
+        assert!(names(&all).contains(&"SessionSearch".to_string()));
+        assert!(needs_bridge("SessionSearch"));
+        // 反向：普通内置工具不得被误判成走桥
+        assert!(!needs_bridge("Read") && !needs_bridge("Agent"));
+    }
+
+    /// `Remember`（A4 长期记忆的写入侧）的口径：**不在 `defs()` 里**（条件注册）、
+    /// **必须走桥**、**要审批**（跨会话副作用，比改一个文件更持久）、必须串行。
+    ///
+    /// 它与 resources 读侧那两件**刻意不同**的一点是「要不要问」—— 那两件是只读，
+    /// 这件是写，别为了「统一」把它改成免审批。
+    #[test]
+    fn remember_is_bridge_only_gated_and_serial() {
+        let all = defs(&[]);
+        assert!(
+            !names(&all).contains(&"Remember".to_string()),
+            "Remember 不该出现在 defs() 里：没桥就写不进去，注册了也是必然失败"
+        );
+        assert!(needs_bridge("Remember"));
+        assert!(needs_approval("Remember"), "写长期记忆要用户确认（前端按运行方式决定放不放行）");
+        assert!(!gated_in_read_only("Remember"), "只读档不放行 Remember");
+        assert!(!parallel_safe("Remember"), "走单线程 stdio 桥，必须串行");
+
+        let t = remember_tool();
+        assert_eq!(t.get("name").and_then(Value::as_str), Some("Remember"));
+        assert!(t.get("description").and_then(Value::as_str).is_some(), "缺 description");
+        let required = t
+            .pointer("/input_schema/required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(required.contains(&json!("content")), "content 必填");
+    }
 
     /// 没超预算的结果必须**逐字节原样**回给模型（不许多出任何说明文字、不许碰磁盘）
     #[test]

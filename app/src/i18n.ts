@@ -253,11 +253,34 @@ const DICT: Record<string, Record<LangTag, string>> = {
   // Esc 是「退回简洁搜索」而不是「关窗」：Rust 侧 UI_MODE=detail 时把这一下 Esc
   // 交给前端逐级退出（见 hotkey.rs 的 Esc 分支）。详情里再按 Esc 才清词/隐藏窗口。
   "detail.hint_keys": {
-    "zh-CN": "↑↓ 选择 · Tab 切换分类 · Enter 打开 · Esc 返回",
-    "zh-TW": "↑↓ 選擇 · Tab 切換分類 · Enter 開啟 · Esc 返回",
-    "ja": "↑↓ 選択 · Tab カテゴリ切替 · Enter 開く · Esc 戻る",
-    "ko": "↑↓ 선택 · Tab 분류 전환 · Enter 열기 · Esc 뒤로",
-    "en": "↑↓ Select · Tab Switch category · Enter Open · Esc Back",
+    "zh-CN": "↑↓ 选择 · Tab 切换分类 · Enter 打开 · Shift+Enter 管理员运行 · Esc 返回",
+    "zh-TW": "↑↓ 選擇 · Tab 切換分類 · Enter 開啟 · Shift+Enter 管理員執行 · Esc 返回",
+    "ja": "↑↓ 選択 · Tab カテゴリ切替 · Enter 開く · Shift+Enter 管理者として実行 · Esc 戻る",
+    "ko": "↑↓ 선택 · Tab 분류 전환 · Enter 열기 · Shift+Enter 관리자 권한 실행 · Esc 뒤로",
+    "en": "↑↓ Select · Tab Switch category · Enter Open · Shift+Enter Run as admin · Esc Back",
+  },
+  // 提权（ShellExecuteW runas）相关的三条文案。失败文案**必须带原因**：
+  // 用户点掉 UAC 弹框与「被组策略拒绝」是两件事，只回一句「失败」等于没说。
+  "detail.elevate_title": {
+    "zh-CN": "以管理员身份运行（会弹 UAC）",
+    "zh-TW": "以管理員身分執行（會彈 UAC）",
+    "ja": "管理者として実行（UAC が出ます）",
+    "ko": "관리자 권한으로 실행 (UAC 표시됨)",
+    "en": "Run as administrator (UAC prompt)",
+  },
+  "detail.elevate_failed": {
+    "zh-CN": "提权失败：{err}",
+    "zh-TW": "提權失敗：{err}",
+    "ja": "管理者実行に失敗：{err}",
+    "ko": "관리자 실행 실패: {err}",
+    "en": "Elevation failed: {err}",
+  },
+  "detail.elevate_unsupported": {
+    "zh-CN": "该结果没有「以管理员身份运行」形态",
+    "zh-TW": "此結果沒有「以管理員身分執行」形態",
+    "ja": "この項目に「管理者として実行」はありません",
+    "ko": "이 항목은 관리자 권한 실행을 지원하지 않습니다",
+    "en": "This result has no 'run as administrator' form",
   },
   "detail.confirm_danger": {
     "zh-CN": "再按一次 Enter 确认：{title}",
@@ -286,6 +309,100 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "コマンド",
     "ko": "명령",
     "en": "Command",
+  },
+
+  // ── 详细搜索 · 右侧预览区（2026-09-19 批 5 任务 3a）──────────
+  "detail.preview_source": {
+    "zh-CN": "来源",
+    "zh-TW": "來源",
+    "ja": "種類",
+    "ko": "종류",
+    "en": "Source",
+  },
+  "detail.preview_path": {
+    "zh-CN": "完整路径",
+    "zh-TW": "完整路徑",
+    "ja": "フルパス",
+    "ko": "전체 경로",
+    "en": "Full path",
+  },
+  "detail.preview_modified": {
+    "zh-CN": "修改时间",
+    "zh-TW": "修改時間",
+    "ja": "更新日時",
+    "ko": "수정한 날짜",
+    "en": "Modified",
+  },
+  "detail.preview_open": {
+    "zh-CN": "打开",
+    "zh-TW": "開啟",
+    "ja": "開く",
+    "ko": "열기",
+    "en": "Open",
+  },
+  "detail.preview_copy_path": {
+    "zh-CN": "复制路径",
+    "zh-TW": "複製路徑",
+    "ja": "パスをコピー",
+    "ko": "경로 복사",
+    "en": "Copy path",
+  },
+  "detail.preview_copied": {
+    "zh-CN": "已复制",
+    "zh-TW": "已複製",
+    "ja": "コピーしました",
+    "ko": "복사됨",
+    "en": "Copied",
+  },
+  "detail.preview_empty": {
+    "zh-CN": "选中一条结果查看详情",
+    "zh-TW": "選取一筆結果查看詳情",
+    "ja": "結果を選ぶと詳細が表示されます",
+    "ko": "결과를 선택하면 세부 정보가 표시됩니다",
+    "en": "Select a result to see details",
+  },
+  // 来源标签（预览区「来源」一行）
+  "detail.src_apps": {
+    "zh-CN": "应用",
+    "zh-TW": "應用程式",
+    "ja": "アプリ",
+    "ko": "앱",
+    "en": "App",
+  },
+  "detail.src_files": {
+    "zh-CN": "本地文件",
+    "zh-TW": "本機檔案",
+    "ja": "ローカルファイル",
+    "ko": "로컬 파일",
+    "en": "Local file",
+  },
+  "detail.src_settings": {
+    "zh-CN": "系统设置",
+    "zh-TW": "系統設定",
+    "ja": "システム設定",
+    "ko": "시스템 설정",
+    "en": "System setting",
+  },
+  "detail.src_actions": {
+    "zh-CN": "系统动作",
+    "zh-TW": "系統動作",
+    "ja": "システム操作",
+    "ko": "시스템 동작",
+    "en": "System action",
+  },
+  "detail.src_commands": {
+    "zh-CN": "插件命令",
+    "zh-TW": "外掛命令",
+    "ja": "プラグインコマンド",
+    "ko": "플러그인 명령",
+    "en": "Plugin command",
+  },
+  "detail.src_web": {
+    "zh-CN": "网页搜索",
+    "zh-TW": "網頁搜尋",
+    "ja": "ウェブ検索",
+    "ko": "웹 검색",
+    "en": "Web search",
   },
 
   // ── Status bar ──────────────────────────────────────────────
@@ -677,11 +794,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
   },
   // 命令静态安全分析（agent 随 can_use_tool 上报 analysis 字段，见 ai-spec §3.5）
   "agent.static_danger": {
-    "zh-CN": "⛔ 危险命令（{labels}）— 不可加入白名单，请谨慎确认",
-    "zh-TW": "⛔ 危險指令（{labels}）— 不可加入白名單，請謹慎確認",
-    "ja": "⛔ 危険なコマンド（{labels}）— 許可リストに追加できません。慎重に確認してください",
-    "ko": "⛔ 위험한 명령({labels}) — 허용 목록에 추가할 수 없습니다. 신중히 확인하세요",
-    "en": "⛔ Dangerous command ({labels}) — cannot be allow-listed, confirm carefully",
+    "zh-CN": "危险命令（{labels}）— 不可加入白名单，请谨慎确认",
+    "zh-TW": "危險指令（{labels}）— 不可加入白名單，請謹慎確認",
+    "ja": "危険なコマンド（{labels}）— 許可リストに追加できません。慎重に確認してください",
+    "ko": "위험한 명령({labels}) — 허용 목록에 추가할 수 없습니다. 신중히 확인하세요",
+    "en": "Dangerous command ({labels}) — cannot be allow-listed, confirm carefully",
   },
   "agent.static_opaque": {
     "zh-CN": "⚠ 命令含无法静态判定的内容（{reasons}）— 不会自动放行，请人工确认",
@@ -918,6 +1035,67 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "メモ",
     "ko": "메모",
     "en": "Memo",
+  },
+  // ── Plugin descriptions ──────────────────────────────────────
+  // 结果区 / 插件总览展示用。**必须与 plugin.<id> 名字键成对出现**：
+  // 渲染点一律走 pluginName(id, fallback) / pluginDesc(id, fallback)，
+  // 不许直接读插件清单里的 name / description（那是英文兜底，用户报的
+  // 「中文下结果区插件名与描述还是英文」就是这么来的，见 ai-spec §11 规则 50）。
+  "plugin.quick-launch.desc": {
+    "zh-CN": "启动自定义文件、程序或路径",
+    "zh-TW": "啟動自訂檔案、程式或路徑",
+    "ja": "カスタムのファイル・アプリ・パスを起動",
+    "ko": "사용자 지정 파일·앱·경로 실행",
+    "en": "Launch custom files, apps, or paths",
+  },
+  "plugin.settings.desc": {
+    "zh-CN": "常规 / 风格 / AI / 搜索 / 插件 —— 全部设置",
+    "zh-TW": "一般 / 外觀 / AI / 搜尋 / 外掛 —— 全部設定",
+    "ja": "一般・外観・AI・検索・プラグインの設定",
+    "ko": "일반·모양·AI·검색·플러그인 설정",
+    "en": "General, appearance, AI, search and plugin settings",
+  },
+  "plugin.ai-agent.desc": {
+    "zh-CN": "向 AI 提问任何事 —— 代码、写作、分析",
+    "zh-TW": "向 AI 提問任何事 —— 程式、寫作、分析",
+    "ja": "コード・文章・分析など何でも AI に質問",
+    "ko": "코드·글쓰기·분석 등 무엇이든 AI에게 질문",
+    "en": "Ask AI anything — code, writing, analysis & more",
+  },
+  "plugin.ocr.desc": {
+    "zh-CN": "图片文字识别（PaddleOCR · 离线高精度）",
+    "zh-TW": "圖片文字辨識（PaddleOCR · 離線高精度）",
+    "ja": "画像から文字を認識（PaddleOCR・オフライン高精度）",
+    "ko": "이미지 문자 인식 (PaddleOCR · 오프라인 고정밀)",
+    "en": "Extract text from images (PaddleOCR, offline)",
+  },
+  "plugin.web-search.desc": {
+    "zh-CN": "用默认浏览器搜索网页",
+    "zh-TW": "用預設瀏覽器搜尋網頁",
+    "ja": "既定のブラウザーでウェブ検索",
+    "ko": "기본 브라우저로 웹 검색",
+    "en": "Search the web with your default browser",
+  },
+  "plugin.tool-editor.desc": {
+    "zh-CN": "管理 AI Agent 自定义工具（MCP 桥接）",
+    "zh-TW": "管理 AI Agent 自訂工具（MCP 橋接）",
+    "ja": "AI Agent のカスタムツールを管理（MCP ブリッジ）",
+    "ko": "AI Agent 사용자 지정 도구 관리 (MCP 브리지)",
+    "en": "Manage AI Agent custom tools (MCP bridge)",
+  },
+  "plugin.clipboard-history.desc": {
+    "zh-CN": "剪贴板历史管理 —— 复制时自动保存",
+    "zh-TW": "剪貼簿歷史管理 —— 複製時自動儲存",
+    "ja": "クリップボード履歴の管理 —— コピー時に自動保存",
+    "ko": "클립보드 기록 관리 — 복사 시 자동 저장",
+    "en": "Clipboard history manager — auto-saves on copy",
+  },
+  "plugin.memo.desc": {
+    "zh-CN": "本地自动保存的备忘录",
+    "zh-TW": "本機自動儲存的備忘錄",
+    "ja": "ローカルに自動保存されるメモ",
+    "ko": "로컬에 자동 저장되는 메모",
+    "en": "Local auto-save memo",
   },
 
   // ── OCR Plugin ──────────────────────────────────────────────
@@ -1290,27 +1468,6 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "일반",
     "en": "General",
   },
-  "settings.background_title": {
-    "zh-CN": "自定义背景",
-    "zh-TW": "自訂背景",
-    "ja": "カスタム背景",
-    "ko": "사용자 배경",
-    "en": "Custom background",
-  },
-  "settings.background_apply": {
-    "zh-CN": "选择图片",
-    "zh-TW": "選擇圖片",
-    "ja": "画像を選択",
-    "ko": "이미지 선택",
-    "en": "Choose image",
-  },
-  "settings.background_clear": {
-    "zh-CN": "重置",
-    "zh-TW": "重置",
-    "ja": "リセット",
-    "ko": "재설정",
-    "en": "Reset",
-  },
   "settings.ocr_engine": {
     "zh-CN": "OCR 引擎",
     "zh-TW": "OCR 引擎",
@@ -1410,11 +1567,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "General",
   },
   "settings.sidebar_ai": {
-    "zh-CN": "AI 模型",
-    "zh-TW": "AI 模型",
-    "ja": "AI モデル",
-    "ko": "AI 모델",
-    "en": "AI Model",
+    "zh-CN": "AI",
+    "zh-TW": "AI",
+    "ja": "AI",
+    "ko": "AI",
+    "en": "AI",
   },
   "settings.sidebar_search": {
     "zh-CN": "搜索",
@@ -1429,6 +1586,212 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "プラグイン",
     "ko": "플러그인",
     "en": "Plugins",
+  },
+  // ── 外观 / 主题（「风格」分区，2026-09-19 新增）──────────────────
+  "settings.sidebar_appearance": {
+    "zh-CN": "风格",
+    "zh-TW": "風格",
+    "ja": "スタイル",
+    "ko": "스타일",
+    "en": "Style",
+  },
+  "settings.appearance": {
+    "zh-CN": "风格",
+    "zh-TW": "風格",
+    "ja": "スタイル",
+    "ko": "스타일",
+    "en": "Style",
+  },
+  "settings.appearance_bg_section": {
+    "zh-CN": "背景",
+    "zh-TW": "背景",
+    "ja": "背景",
+    "ko": "배경",
+    "en": "Background",
+  },
+  "settings.appearance_bg_title": {
+    "zh-CN": "背景图片",
+    "zh-TW": "背景圖片",
+    "ja": "背景画像",
+    "ko": "배경 이미지",
+    "en": "Background image",
+  },
+  "settings.appearance_bg_apply": {
+    "zh-CN": "选择图片",
+    "zh-TW": "選擇圖片",
+    "ja": "画像を選択",
+    "ko": "이미지 선택",
+    "en": "Choose image",
+  },
+  "settings.appearance_bg_clear": {
+    "zh-CN": "清除",
+    "zh-TW": "清除",
+    "ja": "クリア",
+    "ko": "지우기",
+    "en": "Clear",
+  },
+  "settings.appearance_bg_set": {
+    "zh-CN": "已设置",
+    "zh-TW": "已設定",
+    "ja": "設定済み",
+    "ko": "설정됨",
+    "en": "Set",
+  },
+  "settings.appearance_bg_none": {
+    "zh-CN": "未设置",
+    "zh-TW": "未設定",
+    "ja": "未設定",
+    "ko": "설정 안 됨",
+    "en": "Not set",
+  },
+  "settings.appearance_bg_blur": {
+    "zh-CN": "毛玻璃化",
+    "zh-TW": "毛玻璃化",
+    "ja": "ぼかし",
+    "ko": "흐림",
+    "en": "Blur",
+  },
+  "settings.appearance_bg_saturate": {
+    "zh-CN": "饱和度",
+    "zh-TW": "飽和度",
+    "ja": "彩度",
+    "ko": "채도",
+    "en": "Saturation",
+  },
+  "settings.appearance_bg_sheen": {
+    "zh-CN": "反光",
+    "zh-TW": "反光",
+    "ja": "反射光",
+    "ko": "반사광",
+    "en": "Reflection",
+  },
+  // 「自定义」= 展开/收起背景那五个拉条（不是另一种背景来源）
+  "settings.appearance_bg_custom": {
+    "zh-CN": "自定义",
+    "zh-TW": "自訂",
+    "ja": "カスタム",
+    "ko": "사용자 지정",
+    "en": "Customize",
+  },
+  "settings.appearance_bg_opacity": {
+    "zh-CN": "背景透明度",
+    "zh-TW": "背景透明度",
+    "ja": "背景の不透明度",
+    "ko": "배경 불투명도",
+    "en": "Background opacity",
+  },
+  "settings.appearance_bg_surface": {
+    "zh-CN": "界面玻璃透明度",
+    "zh-TW": "介面玻璃透明度",
+    "ja": "パネルの不透明度",
+    "ko": "패널 유리 투명도",
+    "en": "Panel glass opacity",
+  },
+  "settings.appearance_color_section": {
+    "zh-CN": "主题颜色",
+    "zh-TW": "主題顏色",
+    "ja": "テーマカラー",
+    "ko": "테마 색상",
+    "en": "Accent color",
+  },
+  "settings.appearance_color_mode": {
+    "zh-CN": "取色方式",
+    "zh-TW": "取色方式",
+    "ja": "色の決め方",
+    "ko": "색상 방식",
+    "en": "Color source",
+  },
+  "settings.appearance_color_custom": {
+    "zh-CN": "自定义",
+    "zh-TW": "自訂",
+    "ja": "カスタム",
+    "ko": "사용자 지정",
+    "en": "Custom",
+  },
+  "settings.appearance_color_system": {
+    "zh-CN": "跟随 Windows",
+    "zh-TW": "跟隨 Windows",
+    "ja": "Windows に合わせる",
+    "ko": "Windows 따르기",
+    "en": "Follow Windows",
+  },
+  "settings.appearance_color_picker": {
+    "zh-CN": "取色器",
+    "zh-TW": "取色器",
+    "ja": "カラーピッカー",
+    "ko": "색상 선택기",
+    "en": "Color picker",
+  },
+  "settings.appearance_tint_base": {
+    "zh-CN": "底色跟随主题色",
+    "zh-TW": "底色跟隨主題色",
+    "ja": "背景色をテーマカラーに合わせる",
+    "ko": "배경색을 테마 색으로",
+    "en": "Tint base with accent",
+  },
+  "settings.appearance_color_system_current": {
+    "zh-CN": "当前系统色",
+    "zh-TW": "目前系統色",
+    "ja": "現在のシステム色",
+    "ko": "현재 시스템 색",
+    "en": "Current system color",
+  },
+  "settings.appearance_color_system_refresh": {
+    "zh-CN": "刷新",
+    "zh-TW": "重新整理",
+    "ja": "更新",
+    "ko": "새로 고침",
+    "en": "Refresh",
+  },
+  "settings.appearance_color_system_unavailable": {
+    "zh-CN": "读不到系统强调色",
+    "zh-TW": "讀不到系統強調色",
+    "ja": "システムのアクセントカラーを取得できません",
+    "ko": "시스템 강조 색을 읽을 수 없음",
+    "en": "System accent color unavailable",
+  },
+  "settings.appearance_theme_section": {
+    "zh-CN": "主题包",
+    "zh-TW": "主題包",
+    "ja": "テーマパック",
+    "ko": "테마 팩",
+    "en": "Theme packs",
+  },
+  "settings.appearance_theme_default": {
+    "zh-CN": "默认",
+    "zh-TW": "預設",
+    "ja": "デフォルト",
+    "ko": "기본",
+    "en": "Default",
+  },
+  "settings.appearance_theme_builtin": {
+    "zh-CN": "内置",
+    "zh-TW": "內建",
+    "ja": "内蔵",
+    "ko": "내장",
+    "en": "Built-in",
+  },
+  "settings.appearance_theme_hint": {
+    "zh-CN": "主题目录",
+    "zh-TW": "主題目錄",
+    "ja": "テーマフォルダ",
+    "ko": "테마 폴더",
+    "en": "Themes folder",
+  },
+  "settings.appearance_theme_open_dir": {
+    "zh-CN": "打开目录",
+    "zh-TW": "開啟目錄",
+    "ja": "フォルダを開く",
+    "ko": "폴더 열기",
+    "en": "Open folder",
+  },
+  // 非「默认」主题下的锁定提示（主题包自带配色与背景，用户不允许再改这两项）
+  "settings.appearance_theme_locked": {
+    "zh-CN": "当前主题已锁定「主题颜色」与「背景图片」，切回「默认」才能自定义",
+    "zh-TW": "目前主題已鎖定「主題顏色」與「背景圖片」，切回「預設」才能自訂",
+    "ja": "このテーマでは「テーマカラー」と「背景画像」は固定です。「デフォルト」に戻すと変更できます",
+    "ko": "이 테마에서는 '테마 색상'과 '배경 이미지'가 고정됩니다. '기본'으로 돌아가면 변경할 수 있습니다",
+    "en": "This theme locks the theme color and background image. Switch back to “Default” to customize them.",
   },
   "settings.web_search": {
     "zh-CN": "网页搜索",
@@ -1620,12 +1983,35 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "— 사용자 정의 —",
     "en": "— Custom —",
   },
+  // 2026-09-19 批 9：这个分类从「AI Agent 的 MCP 工具列表」改成了**插件总览**，
+  // 而工具列表整体移到 AI 分类下的 tools 分块（见 settings.group_tools）。
   "settings.plugins": {
-    "zh-CN": "插件 (MCP 工具)",
-    "zh-TW": "外掛 (MCP 工具)",
-    "ja": "プラグイン (MCP ツール)",
-    "ko": "플러그인 (MCP 도구)",
-    "en": "Plugins (MCP Tools)",
+    "zh-CN": "插件总览",
+    "zh-TW": "外掛總覽",
+    "ja": "プラグイン一覧",
+    "ko": "플러그인 개요",
+    "en": "Plugin Overview",
+  },
+  "settings.plugins_installed": {
+    "zh-CN": "已安装插件",
+    "zh-TW": "已安裝外掛",
+    "ja": "インストール済みプラグイン",
+    "ko": "설치된 플러그인",
+    "en": "Installed Plugins",
+  },
+  "settings.plugins_hint": {
+    "zh-CN": "这里是 Lunac 的全部插件总览。AI 模型、技能（Skills）与工具（Tools / MCP）已归到左侧「AI」分类下。",
+    "zh-TW": "這裡是 Lunac 的全部外掛總覽。AI 模型、技能（Skills）與工具（Tools / MCP）已歸到左側「AI」分類下。",
+    "ja": "ここは Lunac の全プラグインの一覧です。AI モデル・スキル（Skills）・ツール（Tools / MCP）は左の「AI」カテゴリに移動しました。",
+    "ko": "여기는 Lunac의 전체 플러그인 개요입니다. AI 모델·스킬(Skills)·도구(Tools / MCP)는 왼쪽 'AI' 분류로 이동했습니다.",
+    "en": "Overview of every Lunac plugin. AI model, Skills and Tools (MCP) now live under the AI category.",
+  },
+  "settings.group_tools": {
+    "zh-CN": "工具 (MCP)",
+    "zh-TW": "工具 (MCP)",
+    "ja": "ツール (MCP)",
+    "ko": "도구 (MCP)",
+    "en": "Tools (MCP)",
   },
   "settings.install_from_url": {
     "zh-CN": "从 URL 安装",
@@ -1648,12 +2034,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "사용자 정의 도구가 없습니다.",
     "en": "No custom tools installed.",
   },
+  // 这是 AI 分类下 tools 分块里的「预设工具」，不是插件（2026-09-19 批 9 改名）
   "settings.community_plugins": {
-    "zh-CN": "社区插件",
-    "zh-TW": "社群外掛",
-    "ja": "コミュニティプラグイン",
-    "ko": "커뮤니티 플러그인",
-    "en": "Community Plugins",
+    "zh-CN": "社区工具",
+    "zh-TW": "社群工具",
+    "ja": "コミュニティツール",
+    "ko": "커뮤니티 도구",
+    "en": "Community Tools",
   },
   "settings.install": {
     "zh-CN": "安装",
@@ -2640,18 +3027,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "— 사용자 정의 제공자 —",
     "en": "— Custom Provider —",
   },
-  "settings.sidebar_skills": {
-    "zh-CN": "技能扩展",
-    "zh-TW": "技能擴充",
-    "ja": "スキル拡張",
-    "ko": "스킬 확장",
-    "en": "Skills",
-  },
   "settings.skills": {
-    "zh-CN": "技能扩展 (Skill Store)",
-    "zh-TW": "技能擴充 (Skill Store)",
-    "ja": "スキル拡張 (Skill Store)",
-    "ko": "스킬 확장 (Skill Store)",
+    "zh-CN": "技能 (Skill Store)",
+    "zh-TW": "技能 (Skill Store)",
+    "ja": "スキル (Skill Store)",
+    "ko": "스킬 (Skill Store)",
     "en": "Skills (Skill Store)",
   },
   "settings.skill_add_url": {
@@ -2846,11 +3226,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Clear all",
   },
   "clipboard.copy": {
-    "zh-CN": "\uD83D\uDCCB 复制",
-    "zh-TW": "\uD83D\uDCCB 複製",
-    "ja": "\uD83D\uDCCB コピー",
-    "ko": "\uD83D\uDCCB 복사",
-    "en": "\uD83D\uDCCB Copy",
+    "zh-CN": "复制",
+    "zh-TW": "複製",
+    "ja": "コピー",
+    "ko": "복사",
+    "en": "Copy",
   },
   "clipboard.copy_label": {
     "zh-CN": "复制",
@@ -3160,9 +3540,21 @@ export function t(key: string, params?: Record<string, string>): string {
   return text;
 }
 
-/** Type-safe plugin name translation by plugin ID. */
-export function pluginName(id: string): string {
-  return t(`plugin.${id}`);
+/** 插件显示名：按 id 取 `plugin.<id>`。
+ *  `fallback` 用于**用户自装插件**（没有 i18n 键）—— 用插件清单里的 `name`；
+ *  再没有就退回 id 本身。**禁止再直接渲染 `plugin.name`**（那是英文常量，
+ *  中文界面下会露英文，见 ai-spec §11 规则 50）。 */
+export function pluginName(id: string, fallback?: string): string {
+  const key = `plugin.${id}`;
+  const v = t(key);
+  return v === key ? (fallback || id) : v;
+}
+
+/** 插件描述：按 id 取 `plugin.<id>.desc`，缺键时退回插件清单里的 `description`。 */
+export function pluginDesc(id: string, fallback?: string): string {
+  const key = `plugin.${id}.desc`;
+  const v = t(key);
+  return v === key ? (fallback || "") : v;
 }
 
 /** Switch language at runtime (used by settings). Returns new tag. */

@@ -110,13 +110,18 @@ pub fn refresh_in_background() {
 }
 
 /// Check if a string contains any Chinese character
-fn has_chinese(s: &str) -> bool {
+///
+/// `pub(crate)`：`file_indexer` 的拼音兜底要复用同一个判据（见 `score_pinyin`）——
+/// 「有汉字才转拼音」这一条两边必须一致，各写一份必然漂移。
+pub(crate) fn has_chinese(s: &str) -> bool {
     s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
 /// Generate pinyin tokens for a Chinese name: full pinyin + first letters.
 /// Returns empty vec if the name has no Chinese characters.
-fn generate_pinyin_tokens(name: &str) -> Vec<String> {
+///
+/// `pub(crate)`：`file_indexer::score_pinyin` 复用（同上，避免两套拼音口径）。
+pub(crate) fn generate_pinyin_tokens(name: &str) -> Vec<String> {
     if !has_chinese(name) {
         return vec![];
     }
@@ -499,6 +504,70 @@ pub fn launch_app(path: &str) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to launch: {}", e))?;
     Ok(())
+}
+
+/// **以管理员身份运行**（Windows 专用）：`ShellExecuteW` 的 `runas` verb 会走
+/// UAC 提权通道。两点必须清楚：
+///
+///   ① **这是全项目唯一一处「主动请求提权」的用户界面入口**（另一处是
+///      `auto_start.rs` 里创建登录计划任务，只在自启修复时用）。`runas` 的
+///      弹框就是用户的同意闸门 —— 用户点「否」时 `ShellExecuteW` 返回
+///      `SE_ERR_ACCESSDENIED (5)`，我们把错误原样回给前端提示，**不静默失败**。
+///   ② **不接受命令行字符串**：`file` 与 `params` 分开传入，`ShellExecuteW`
+///      自己拼参数，全程不经 `cmd.exe`。纪律与 `launch_app` 一致（前端可传任意
+///      路径 —— 信任边界是「这是我们自己的 WebView 前端」，不是「任意 URI 都放行」）。
+///
+/// 注意：本进程自身**不是**提升的（`asInvoker`，见 ai-spec §11 规则 29），
+/// 所以 UAC 一定会弹；这也意味着提权后的目标与我们**不在同一个权限上下文**里。
+#[cfg(target_os = "windows")]
+pub fn launch_elevated(file: &str, params: Option<&str>) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_cmd: i32,
+        ) -> isize;
+    }
+
+    const SW_SHOWNORMAL: i32 = 1;
+    const SE_ERR_ACCESSDENIED: isize = 5;
+
+    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect() };
+    let op: Vec<u16> = OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
+    let file_w = wide(file);
+    let params_w = params.map(wide);
+
+    let ret = unsafe {
+        ShellExecuteW(
+            0,
+            op.as_ptr(),
+            file_w.as_ptr(),
+            params_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if ret > 32 {
+        crate::log::info(format!("launch_elevated: {file} {}", params.unwrap_or("")));
+        Ok(())
+    } else if ret == SE_ERR_ACCESSDENIED {
+        Err(format!("提权被拒绝（UAC 取消或策略限制）: {file}"))
+    } else {
+        Err(format!("ShellExecuteW(runas) failed with code {}", ret))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn launch_elevated(file: &str, _params: Option<&str>) -> Result<(), String> {
+    Err(format!("以管理员身份运行仅支持 Windows: {file}"))
 }
 
 #[cfg(test)]

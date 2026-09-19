@@ -642,6 +642,56 @@ unsafe fn read_clipboard_files() -> Vec<String> {
     files
 }
 
+/// 通知前端「窗口已被唤出」，并在主线程读一次系统剪贴板。
+///
+/// **热键与托盘 / 菜单 / 单实例必须是同一条路（2026-09-19 修，不得只改一边）**：
+/// 前端把 `lunac-window-shown` 当作唤出的**唯一**信号 —— 监听器里会退出详细搜索、
+/// 重报界面层、抑制高度滑动并主动重跑当前查询。此前只有 `toggle_window()` 发这个事件，
+/// `show_and_focus()`（托盘 / 菜单 / 单实例）完全不发 ⇒ 从那三条路唤出时前端停在旧状态：
+/// 卡在上次搜索结果、大界面不退出、静态帧不刷新（用户报的「残影 / 卡在上次搜索页」）。
+/// 顺序纪律见 docs/ai-spec.md §11 规则 31。
+///
+/// 剪贴板必须在主线程读（`run_on_main_thread`），否则 WebView2 会弹权限框；
+/// 这里只排队、不入队等待，所以不会拖慢后面的 `force_foreground()`。
+fn notify_window_shown() {
+    let Some(app) = APP.get() else { return };
+    let _ = app.emit("lunac-window-shown", ());
+
+    // Read system clipboard on main thread and pass text directly to frontend.
+    // This avoids the WebView2 permission prompt and thread-safety issues
+    // that occur when reading clipboard from a spawned thread.
+    let app_for_clip = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let mut payload = String::new();
+
+        // Try reading text from clipboard
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => {
+                if let Ok(text) = cb.get_text() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && trimmed.len() < 2000 {
+                        payload = trimmed.to_string();
+                    }
+                }
+            }
+            Err(_) => { /* clipboard inaccessible */ }
+        }
+
+        // Also check for files in clipboard (CF_HDROP)
+        // `read_clipboard_files` 是 unsafe（裸 Win32 FFI，调用方保证已在主线程）——
+        // 本闭包就是 `run_on_main_thread` 投递的，满足这个前提。
+        let files = unsafe { read_clipboard_files() };
+        for path in &files {
+            if !payload.is_empty() { payload.push('\n'); }
+            payload.push_str(path);
+        }
+
+        if !payload.is_empty() {
+            let _ = app_for_clip.emit("lunac-clipboard", payload);
+        }
+    });
+}
+
 fn toggle_window() {
     let hwnd = MAIN_HWND.load(Ordering::SeqCst);
     if hwnd == 0 {
@@ -665,41 +715,7 @@ fn toggle_window() {
             // 唯一入口（main.ts 的同名监听器），高负载下这段等待被放大，用户看到的就是
             // 「唤出后停在上次搜索结果」。emit 只是投递、不入队等待；下面排队到主线程的
             // 剪贴板读取也能与激活路径里的 sleep 并行执行。
-            if let Some(app) = APP.get() {
-                let _ = app.emit("lunac-window-shown", ());
-
-                // Read system clipboard on main thread and pass text directly to frontend.
-                // This avoids the WebView2 permission prompt and thread-safety issues
-                // that occur when reading clipboard from a spawned thread.
-                let app_for_clip = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    let mut payload = String::new();
-
-                    // Try reading text from clipboard
-                    match arboard::Clipboard::new() {
-                        Ok(mut cb) => {
-                            if let Ok(text) = cb.get_text() {
-                                let trimmed = text.trim();
-                                if !trimmed.is_empty() && trimmed.len() < 2000 {
-                                    payload = trimmed.to_string();
-                                }
-                            }
-                        }
-                        Err(_) => { /* clipboard inaccessible */ }
-                    }
-
-                    // Also check for files in clipboard (CF_HDROP)
-                    let files = read_clipboard_files();
-                    for path in &files {
-                        if !payload.is_empty() { payload.push('\n'); }
-                        payload.push_str(path);
-                    }
-
-                    if !payload.is_empty() {
-                        let _ = app_for_clip.emit("lunac-clipboard", payload);
-                    }
-                });
-            }
+            notify_window_shown();
 
             // ② 唤出时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）。
             // 搜索路径只读文件、永不扫描，所以这一步只影响「列表有多新」，
@@ -722,17 +738,26 @@ fn toggle_window() {
 
 // ── 公共 API ─────────────────────────────────────────────────────
 
-/// Show the window and force it to foreground (for tray / menu "Show" action).
-/// Uses the same proven mechanism as the hotkey toggle: send_alt_unlock +
-/// SetForegroundWindow + set_focus. Also updates LAST_TOGGLE_TICK so the
-/// foreground guard doesn't auto-hide during the transition.
+/// Show the window and force it to foreground (for tray / menu / single-instance
+/// "activate" signal).
+///
+/// **与 `toggle_window()` 的唤出路径完全同构（2026-09-19 修，不得回退成「只 ShowWindow」）**：
+/// 顺序 = ① 先写一次 `LAST_TOGGLE_TICK`（挡住前台守卫在转场期间自动隐藏）→
+/// ② `ShowWindow` → ③ `notify_window_shown()`（emit + 剪贴板）→ ④ `refresh_if_stale()`
+/// → ⑤ `force_foreground()` → ⑥ 再写一次 `LAST_TOGGLE_TICK`（激活完成才算冷却起点，
+/// 同规则 31）。此前本函数缺 ③，导致托盘 / 菜单 / 单实例唤出时前端收不到
+/// `lunac-window-shown`：详细搜索不退出、结果不重跑、静态帧停在旧画面。
+///
+/// 两次写 `LAST_TOGGLE_TICK` 是刻意的：这里走的是 `SW_SHOW`（窗口此前不可见），
+/// 若只在最后写，`force_foreground()` 期间守卫会读到上一次的旧 tick
+/// （`now - last >= 2000`）而把刚显示的窗口又隐藏掉。
 pub fn show_and_focus() {
     let hwnd = MAIN_HWND.load(Ordering::SeqCst);
     if hwnd == 0 {
         return;
     }
     unsafe {
-        // Prevent foreground guard from auto-hiding us
+        // ① Prevent foreground guard from auto-hiding us during the transition
         LAST_TOGGLE_TICK.store(GetTickCount(), Ordering::SeqCst);
 
         if IsIconic(hwnd) != 0 {
@@ -740,9 +765,14 @@ pub fn show_and_focus() {
         } else {
             ShowWindow(hwnd, SW_SHOW);
         }
-        force_foreground(hwnd);
-        // 显示时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）
+        // ③ 通知前端（与热键同一条路）
+        notify_window_shown();
+        // ④ 显示时若应用列表文件比刷新间隔更旧 → 后台重扫（非阻塞）
         crate::app_indexer::refresh_if_stale();
+        // ⑤ 窗口激活 —— 放最后，理由见 toggle_window 的顺序注释
+        force_foreground(hwnd);
+        // ⑥ 激活完成才算冷却起点（规则 31）
+        LAST_TOGGLE_TICK.store(GetTickCount(), Ordering::SeqCst);
     }
 }
 

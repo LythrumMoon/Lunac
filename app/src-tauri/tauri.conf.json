@@ -46,7 +46,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../core-agent/target/release/agent.exe": "agent.exe"
+      "../../core-agent/target/release/agent.exe": "agent.exe",
+      "themes": "themes"
     },
     "windows": {
       "nsis": {

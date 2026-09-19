@@ -6,6 +6,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use base64::Engine as _;
 
 // ── Windows GDI FFI ─────────────────────────────────────────────
@@ -357,4 +358,56 @@ unsafe fn cleanup_icon_info(ii: &ICONINFO) {
     if ii.hbmMask != 0 {
         DeleteObject(ii.hbmMask);
     }
+}
+
+// ── 文件缩略图（详细搜索右侧预览区，2026-09-19 批 5 任务 3a）──────────
+
+/// 能**真解码**出缩略图的扩展名白名单。
+/// 只放 `image` crate 实际开了 feature 的格式（Cargo.toml 里是 png + jpeg）——
+/// gif / webp / bmp / tiff 走系统类型图标，别在这里假装能缩略（会得到一张
+/// 「解码失败」的空图，比直接给类型图标更糟）。
+const THUMBNAIL_EXTS: &[&str] = &["png", "jpg", "jpeg", "jfif"];
+
+/// 解码体积上限。预览区是「顺手看一眼」：为一个 40MB 的 PNG 解码 + 缩放会把
+/// 详细搜索的重渲染卡住（该命令虽是 `async`，但内存峰值是实打实的）。超限回落类型图标。
+const THUMBNAIL_MAX_BYTES: u64 = 24 * 1024 * 1024;
+
+/// 文件缩略图 → base64 PNG data URL。
+///
+/// 图片（`THUMBNAIL_EXTS`）真解码并缩到长边 `max`；**其余一切情况**
+/// （非图片 / 解码失败 / 文件过大 / 路径不存在）回落 [`extract_icon_base64`]
+/// 的系统类型图标。所以调用方永远只面对「有图 / 没图」两种结果，
+/// 不必自己兜底 —— 预览区拿到 `None` 就画占位符即可。
+pub fn extract_thumbnail_base64(path: &str, max: u32) -> Option<String> {
+    if is_thumbnail_candidate(path) {
+        if let Some(url) = decode_thumbnail_base64(path, max) {
+            return Some(url);
+        }
+    }
+    extract_icon_base64(path)
+}
+
+fn is_thumbnail_candidate(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    THUMBNAIL_EXTS.contains(&ext.as_str())
+}
+
+fn decode_thumbnail_base64(path: &str, max: u32) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > THUMBNAIL_MAX_BYTES {
+        return None;
+    }
+    let img = image::open(path).ok()?;
+    // `thumbnail` 保持纵横比、只缩不放（比 max 小的图原样返回）
+    let thumb = img.thumbnail(max.clamp(16, 512), max.clamp(16, 512));
+    let mut png: Vec<u8> = Vec::new();
+    thumb
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    Some(format!("data:image/png;base64,{}", b64))
 }
