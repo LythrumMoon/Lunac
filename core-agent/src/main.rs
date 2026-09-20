@@ -1973,6 +1973,15 @@ fn main() {
 
     // system/init 由 run_query 每轮发出（前端据此推进 agentState），启动时不必发
     let mut history: Vec<Value> = Vec::new();
+    // ── 跨提问的前缀归因状态（A16，2026-09-21）─────────────────────────
+    // `prev_hist_hashes` = 上一次请求的 history **逐条**指纹，必须**跨提问**存活：
+    // 原先它声明在 `run_query` 内部（局部）⇒ 每一问的首请求都看不到上一问末请求的
+    // 指纹，日志里只剩 `公共前缀=0/0条`，于是「两次提问之间本侧有没有改写 history」
+    // 这件事**在日志里根本没有证据**（这正是 A16 一开始卡住的地方）。
+    // `question_seq` = 第几次用户提问（刻意**不复用** `questions`：那个只为复盘门槛
+    // 计数、递增时机不同），只进日志，让离线时能一眼认出「本问首请求」。
+    let mut prev_hist_hashes: Vec<u64> = Vec::new();
+    let mut question_seq: u64 = 0;
     // ── 后台复盘（A4）的装配状态 ────────────────────────────────────
     // `questions` = 已完成的**用户提问**数（不是工具轮次：一次提问内部可以有 16 轮工具
     // 往返，按那个计数会在一次长提问中途触发复盘，而那时复盘看到的还是半截对话）。
@@ -2021,9 +2030,12 @@ fn main() {
                     }));
                     continue;
                 }
+                question_seq += 1;
                 run_query(
                     &cfg,
                     &mut history,
+                    &mut prev_hist_hashes,
+                    question_seq,
                     &prompt,
                     &images,
                     &tools_ctx,
@@ -3413,9 +3425,29 @@ fn needs_approval_with(name: &str, input: &Value, skills: &[skills::Skill]) -> b
     false
 }
 
+/// 两串「history **逐条**指纹」的公共前缀长度 —— A16 判据的核心（2026-09-21）。
+///
+/// 读法（与 `请求前缀` 行的 `公共前缀=N/M条` 同一语义）：
+///   · `N == prev.len()` ⇒ **纯追加**：本侧没有就地改写历史，`read` 若掉了是端点侧的事；
+///   · `N <  prev.len()` ⇒ **本侧在第 N 条改写了历史**，其后整段前缀缓存必然失效，
+///     顺着 `上下文压缩` 行找是哪一档压的。
+///
+/// 之所以单独成函数：它的 `prev` 必须**跨提问**存活（由 `main()` 持有、`&mut` 传进来）。
+/// 早先它是 `run_query` 的局部变量 ⇒ 每一问的首请求都拿不到上一问末请求的指纹，
+/// 日志只会打 `0/0条`，「两次提问之间本侧有没有改写 history」就**永远无法判定**
+/// —— 这正是 A16 一开始卡住的地方。
+fn common_prefix_len(prev: &[u64], cur: &[u64]) -> usize {
+    prev.iter().zip(cur.iter()).take_while(|(a, b)| a == b).count()
+}
+
 fn run_query(
     cfg: &Cfg,
     history: &mut Vec<Value>,
+    // 上一次请求的 history 逐条指纹（**跨提问**存活，见 `main()` 里那处声明的注释）：
+    // 每问的首请求因此能和**上一问的末请求**比，A16 的判据才立得住。
+    prev_hist_hashes: &mut Vec<u64>,
+    // 第几次用户提问（只进日志：`请求前缀` / `请求用量` 两行都带它）
+    question_seq: u64,
     prompt: &str,
     raw_images: &[Value],
     tctx: &tools::Ctx,
@@ -3516,7 +3548,9 @@ fn run_query(
     // 逐条指纹给出判据：`公共前缀/上轮条数`
     //   · 等于上轮条数 ⇒ 纯追加，本侧无责（read 掉了就是端点侧）；
     //   · 小于上轮条数 ⇒ **本侧就地改写了历史**，改在第 N 条，其后整段缓存必然失效。
-    let mut prev_hist_hashes: Vec<u64> = Vec::new();
+    // **A16 起它跨提问存活**（由 `main()` 持有、按 `&mut` 传进来）：每一问的首请求
+    // 直接与上一问的末请求比 —— 「两次提问之间本侧改没改 history」才能被判出来，
+    // 局部声明时这里永远是 `0/0条`。
     // 每次请求前算出的「与上一轮 history 逐字节相同的条数」，按请求顺序累积
     // （`message_stop` 时取最后一条随用量落盘）。用 Vec 而不是标量：一来避开
     // 「赋初值后必被覆盖」的 unused_assignments 警告，二来重试路径（send 前
@@ -3611,16 +3645,13 @@ fn run_query(
                     .iter()
                     .map(|m| log::hash64(&serde_json::to_string(m).unwrap_or_default()))
                     .collect();
-                let cur_common = prev_hist_hashes
-                    .iter()
-                    .zip(cur_hashes.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                let cur_common = common_prefix_len(prev_hist_hashes, &cur_hashes);
                 let prev_len = prev_hist_hashes.len();
-                prev_hist_hashes = cur_hashes;
+                *prev_hist_hashes = cur_hashes;
                 common_log.push(cur_common);
                 log::info(format!(
-                    "请求前缀 #{} system={:016x}/{}字 tools={:016x}/{}字 history={:016x}/{}条/{}字 公共前缀={}/{}条{}",
+                    "请求前缀 问#{} #{} system={:016x}/{}字 tools={:016x}/{}字 history={:016x}/{}条/{}字 公共前缀={}/{}条{}",
+                    question_seq,
                     turns,
                     log::hash64(system_prompt),
                     system_prompt.chars().count(),
@@ -3895,7 +3926,8 @@ fn run_query(
                     // 不必再去前端 usage-*.jsonl 里对齐（2026-09-20，规则 23 的归因埋点）
                     let ctx = cur_in + cur_read + cur_create;
                     log::info(format!(
-                        "请求用量 #{} in={} read={} create={} out={} 命中率={:.1}% 公共前缀={}条",
+                        "请求用量 问#{} #{} in={} read={} create={} out={} 命中率={:.1}% 公共前缀={}条",
+                        question_seq,
                         req_log.len(),
                         cur_in,
                         cur_read,
@@ -4382,6 +4414,25 @@ mod tests {
         assert!(ms.parse::<u128>().unwrap() > 1_600_000_000_000, "毫秒时间戳不合理：{ms}");
         // 第二次取值必须逐字节相同
         assert_eq!(id, session_id());
+    }
+
+    /// `公共前缀` 这一列（A16 判据）必须能分辨「纯追加」与「就地改写」。
+    ///
+    /// 这是**唯一**能判定「两次提问之间本侧动了 history 没有」的东西：整体 hash 只回答
+    /// 「变没变」，而 history 每轮必然变（只追加也会变）。所以两条边界都要钉住：
+    /// 纯追加 ⇒ 等于上轮条数；在第 k 条改写 ⇒ 恰好等于 k（其后整段缓存必然失效）。
+    #[test]
+    fn common_prefix_counts_only_byte_identical_messages() {
+        assert_eq!(common_prefix_len(&[], &[]), 0);
+        assert_eq!(common_prefix_len(&[], &[1, 2, 3]), 0);
+        // 纯追加：旧的全在，只是后面多了几条
+        assert_eq!(common_prefix_len(&[7, 8], &[7, 8, 9]), 2);
+        // 就地改写第 1 条（0-based 下标 1）⇒ 只剩第 0 条还相同
+        assert_eq!(common_prefix_len(&[7, 8, 9], &[7, 42, 9]), 1);
+        // 连第 0 条都变了（前缀整体漂移，例如 system/cwd 参与拼接）
+        assert_eq!(common_prefix_len(&[7, 8], &[42, 8]), 0);
+        // cur 比 prev 短（裁剪 / 丢弃）也必须如实报，不许当真前缀
+        assert_eq!(common_prefix_len(&[7, 8, 9], &[7]), 1);
     }
 
     /// 系统提示词的**前缀缓存不变量**（2026-09-17 方案 B 的守门测试）。
