@@ -1382,7 +1382,7 @@ async function copyMsgText(msg: HTMLElement, idx: number | undefined) {
  *    助手回复同样是一个合法回退点（「保留这段回答、丢掉后面的」）；
  *  - **重试**：只对用户提问成立（要重发的是用户那句话），由 `opts.retry` 控制。
  *
- *  `idx` 无效（undefined / 越界）时**只给复制按钮** —— 这条消息已经随上下文裁剪离开
+ *  `idx` 无效（undefined / 负数）时**只给复制按钮** —— 这条消息已经随上下文裁剪离开
  *  会话（见 `shiftRenderedMsgIdx`），回退过去只会切错位置；复制会退化成「按气泡文本复制」。
  *  回退**只动对话与 agent 上下文，不还原磁盘上的文件**（见 ai-spec §11 规则 64）。 */
 function attachMsgActions(msg: HTMLElement, idx: number | undefined, opts: { retry?: boolean } = {}) {
