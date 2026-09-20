@@ -23,14 +23,14 @@ uTools 风格的 Windows 桌面启动器 / 搜索工具。按全局热键唤出�
 
 | 插件 | 触发关键词 |
 |------|-----------|
-| 🚀 快速启动 Quick Launch | open / launch / run / app / 打开 / 启动 / 运行 |
-| ⚙️ 设置 Settings | settings / shortcut / hotkey / config / 设置 / 快捷键 |
-| 📋 剪贴板历史 Clipboard History | clipboard / history / paste / 剪贴板 / 粘贴 |
-| 🌐 网页搜索 Web Search | search / google / baidu / bing / 搜索 / 网页 |
-| 🔧 工具编辑器 Tool Editor | tool / tools / 工具 / mcp / agent / 技能 |
-| 🔍 文字识别 OCR | ocr / 识别 / 文字识别 / 图片转文字 |
-| 📝 备忘录 Memo | memo / note / 备忘录 / 笔记 |
-| 🤖 AI 助手 AI Agent | 无匹配时的兜底入口 |
+| 快速启动 Quick Launch | open / launch / run / app / 打开 / 启动 / 运行 |
+| 设置 Settings | settings / shortcut / hotkey / config / 设置 / 快捷键 |
+| 剪贴板历史 Clipboard History | clipboard / history / paste / 剪贴板 / 粘贴 |
+| 网页搜索 Web Search | search / google / baidu / bing / 搜索 / 网页 |
+| 工具编辑器 Tool Editor | tool / tools / 工具 / mcp / agent / 技能 |
+| 文字识别 OCR | ocr / 识别 / 文字识别 / 图片转文字 |
+| 备忘录 Memo | memo / note / 备忘录 / 笔记 |
+| AI 助手 AI Agent | 无匹配时的兜底入口 |
 
 ---
 

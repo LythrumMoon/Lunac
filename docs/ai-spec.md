@@ -961,6 +961,8 @@ powershell -ExecutionPolicy Bypass -File build-release.ps1 0.9.1  # 或显式指
 
 **README 对外页面纪律**：不出现上游 CLI / `cli.exe` 相关说明，不设「快速开始」栏目（构建与自检步骤仅在 `docs/` 与本规范内维护）。
 
+**页面一律不插 emoji（2026-09-20，用户明确要求）**：**GitHub 上会被人读到的页面** —— `README.md`、`agent-templates/**/README.md`、`docs/**` 正文 —— 一律**不出现装饰性 emoji**（火箭、齿轮、剪贴板、地球、扳手、放大镜、备忘录、机器人这类图标字符，以及勾叉、星标、火花等）。清单、表格、标题一律**纯文字**（插件名就写「快速启动 Quick Launch」，不带图标前缀）。三条理由：① 与既有的「控件文案不带 emoji」（§11 规则 49 + `icon-style.md` §4.1）是**同一条纪律**，只是范围从界面扩到仓库页面；② 这些字符在 GitHub / 终端 / 编辑器里的**字形与宽度各不相同**，对齐会散；③ 一个图标前缀会让整份文档看起来像营销页，与「规范文档」的定位不符。**本规范与 `code-rules.md` 预检 #26 自身也按此写** —— 需要指认某个字符时用**文字描述**（「思考那个对话气泡字符」「剪贴板图标」），不把字符本身写进页面。新增页面 / 段落时按此写，**不要**事后清理。
+
 **必备文件**：`.gitignore`、`LICENSE`（MIT，版权人 `LythrumMoon`）、`README.md`、`.env.example`。
 
 **运行时按需下载的第三方资产**：`paddle-ocr/`（PaddleOCR-json，`hiroi-sora/PaddleOCR-json` v1.4.1，Apache-2.0 兼容）体积过大且属第三方产物，不入库也不随发行包分发。用户侧由前端触发 `ocr_engine_install` 从 GitHub Release 自动下载到 exe 根；构建侧由 [download-paddle-ocr.ps1](file:///d:/cc/claude-code-cli-master/scripts/download-paddle-ocr.ps1) 预置（打包离线版时才需要）。注意该 Release 的 **Windows 资产是 `.7z` 而非 `.zip`**，`Expand-Archive` 解不了，必须走 `sevenz-rust`（Rust 侧）或 7z.exe / bsdtar（脚本侧）。
