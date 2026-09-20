@@ -28,7 +28,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | 形态 | `agent.exe`（Rust，约 2.5MB），**独立进程**，由 `lunac.exe` 的 `start_cli` 以子进程方式拉起 |
 | 通信 | stdin/stdout 上的 **stream-json**（NDJSON），契约见 [ai-spec.md](./ai-spec.md) §3.5；agent 的 stdout **只走协议**，日志一律落盘 |
 | 数据根 | **便携模式**：一律 `<exe 根>`（`current_exe()` 所在目录），实现 dev/release 物理隔离与卸载彻底化 |
-| 关键路径 | `skills\`（技能）、`tools\`（用户工具定义）、`ModuleData\`（`history\chat.db`、`usage\*.jsonl`）、`temp\logs\`（落盘日志） |
+| 关键路径 | `skills\`（技能）、`tools\`（用户工具定义）、`config\`（`ai.json` 凭据 / `hooks.json` 权限 hooks / `pricing.json` 定价表）、`ModuleData\`（`history\chat.db`、`usage\*.jsonl`）、`temp\logs\`（落盘日志） |
 | 环境注入 | 端点 / token / 模型 / 思考开关 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_HOOKS_FILE` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent（**例外**：hooks 配置本身按 mtime 热重载，改 `hooks.json` 内容不必重启）。完整变量表（17 个 `LUNAC_*`）见 [agent-feature-backlog.md](./agent-feature-backlog.md) §6 |
 | 源码 | [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)（主循环 + 上下文压缩/摘要）、[tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)、[skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)、[mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)、[bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)（命令静态安全分析 → 审批卡判据）、[log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs) |
 
@@ -58,6 +58,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | **P4** | 技能（渐进披露；**inline + fork 两种执行模式**；可自带脚本 / 资源） | `LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`；提示词只列 `key: 描述`，模型调 `Skill` 取正文（inline）或由子代理执行后回报告（`context: fork`）。目录里**除 `SKILL.md` 之外的文件**在扫描时登记、**调用时**附在返回里（相对路径 + 深度 ≤ 3 / ≤ 40 条，**不进提示词**，见 ai-spec §3.5「P4」与 §11 规则 57） |
 | **会话** | 历史持久化 / 恢复 / 回退到某个用户轮 | `ModuleData\history\chat.db`（SQLite + FTS5，含专供 CJK 的 `trigram` 索引表）；`set_history` 协议把历史灌回 agent 上下文（见 ai-spec §11 规则 30） |
 | **UI** | AI 对话面板（思考省略 / 命令卡片 / 回合折叠 / 运行方式三档 / 用量面板 / 被改动文件路径追踪） | 规范见 [agent-ui-spec.md](./agent-ui-spec.md) |
+| **成本** | 本地成本面板（A12）：按天 + **按模型**汇总用量，乘 `config\pricing.json` 里的单价算出金额 | 汇总在宿主（`storage::read_usage_range`）、金额在前端（价格表用户可改，改完即时重算）；「更新价格」由 agent 抓官方定价页写**候选文件**、用户在面板上确认才覆盖。契约见 ai-spec §3.5「定价表与成本面板」与 §11 规则 63 |
 | 运维 | 落盘日志（两进程各写 `temp\logs\{agent,lunac}-YYYY-MM-DD.log`，含每次工具调用与耗时） | ai-spec §11 规则 20 |
 
 ---

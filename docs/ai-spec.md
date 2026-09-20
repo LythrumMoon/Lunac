@@ -521,9 +521,26 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 粒度差 | 平台**按每次 API 请求**记一行，本地**按每次提问**记一行 —— 一次带工具的提问在平台上就是多行（system prompt + tools 前缀每次重发）。**2026-09 起这个差已被抹平**：`result.usage.requests[]` 把每次请求的明细带上，本地日志里也逐条落盘，可直接与平台逐行对账 |
 | 每次请求明细 | `result.usage.requests` = `[{in, read, create, out}]`（顺序 = 请求顺序；`in` = 该次未命中输入、`read` = 该次命中、`create` = 缓存写入、`out` = 该次输出）。agent 在每条 `message_stop` 推一条（`message_delta.output_tokens` 是**该条消息的累计值**，故用赋值而非累加）。**旧 agent 不报该字段 → 前端写空数组**；`UsageRecord.requests` 为空时**不写该键**（旧记录读时按空表） |
 | 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, input, output, cacheRead, cacheCreate, elided, dropped, requests?}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init` |
-| 读写命令 | [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs) `append_usage_log(date, record)` / `read_usage_log(date)`；`date` 只接受严格 `YYYY-MM-DD`（文件名来自前端，必须挡路径拼串）；读取时单行损坏只跳过该行 |
-| 表盘数值 | token 仪表盘 = **当前这次对话**（新建会话 / 切到别的会话即归零），提问结束实时累加；**界面不再读日志**（`read_usage_log` 命令保留，供外部对账脚本或将来做「按天用量」面板）。发生过压缩时，命中率 tooltip 会追加「本对话压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
+| 读写命令 | [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs) `append_usage_log(date, record)` / `read_usage_log(date)` / `read_usage_range(dates)`（后者一次读多天并汇总成「按天 + 按模型」，成本面板用）；`date` 只接受严格 `YYYY-MM-DD`（文件名来自前端，必须挡路径拼串）；读取时单行损坏只跳过该行 |
+| 表盘数值 | token 仪表盘 = **当前这次对话**（新建会话 / 切到别的会话即归零），提问结束实时累加；按天用量与金额改到设置面板的「用量与成本」分块（A12，读 `read_usage_range`，见 §3.5「定价表与成本面板」）。发生过压缩时，命中率 tooltip 会追加「本对话压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
 | 计算口径 | Hit = `cacheRead`；Miss = `input + cacheCreate`（Anthropic 的 `input_tokens` **不含**缓存两项，故不能拿它减 `cache_read`）；Total = Miss + Hit + `output` |
+
+**定价表与成本面板（A12，2026-09-20）**：把「这些提问花了多少钱」从本地用量日志算出来。**价格不写进代码** —— 各家单价差十倍以上、官方还会调价，写死一个数字等于把错误金额当事实展示。实现在 [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs)（定价表 / 候选文件 / 按天汇总）+ [settings.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts)（面板与金额计算）。要点：
+
+| 项 | 约定 |
+|---|---|
+| 价格表 | `<exe 根>\config\pricing.json`，**用户可编辑**（与 `ai.json` / `hooks.json` 同级）。单位**元 / 百万 token**，四类分别计价：`input`（未命中缓存的输入）/ `cache_read`（命中缓存）/ `cache_write`（缓存写入）/ `output`（输出）—— 字段名与用量日志的四类 token **一一对应** |
+| 出处必须可核 | 每个模型可带 `source_url` / `updated_at`；顶层 `updated_at` 由**宿主**在落盘那一刻盖上（表示「这份文件什么时候写进去的」，**不是**「官方什么时候调的价」）。**不预置任何价格数字** —— 本仓没有逐项核对过官方定价页，凭空填一行「看着很像」的数会被用户当事实拿去对账 |
+| 校验 | `validate_pricing_text`：顶层是对象 / `models` 是对象 / 每个模型的四类价格**齐全且为非负数字**。**缺字段也算非法**：「少一个字段」在面板上的表现是金额悄悄少算一块，比当场报错难查得多。未知字段忽略（允许用户自己加注释字段） |
+| 「更新价格」 | 面板自己**不抓**（它既没有网络也没有模型），把任务交给 agent：注入一条提示词让它用 `WebSearch` / `WebFetch` 查官方定价页，再用 `Write` 落**候选文件**；抓不到就如实报错并保留原值。安全档位为「只读」时按钮直接说明原因（`write_blocked` 会拦住 Write） |
+| 候选文件 | = **agent 工作目录**下的 `lunac-pricing.pending.json`（`effective_workdir()`，与 `start_cli_process` 同一套判据）。**刻意不放 `config\`**：配了工作区时 agent 的文件工具被硬锁在工作区内（`tools::guard()`，越界直接拒、连审批卡都没有），写 `config\` 必然失败。面板列出「旧值 → 新值」（只列变化的 + 新增 + 「确认后失去价格」）——**确认前一个字都不动正式价格** |
+| 确认 / 放弃 | `commit_pricing_pending(workdir, today)`：**先校验后覆盖**，校验不过**一个字都不写**；成功后盖顶层 `updated_at` 并删候选文件。「放弃」只删候选文件。写文件本身由用户点按钮触发，不经 agent |
+| 汇总粒度 | `read_usage_range(dates)` 一次读多天，返回**按天 + 按模型**（`UsageDay{date,turns,input,output,cacheRead,cacheCreate,models[]}`）。**必须分模型**：一天里换过模型的话，只按天合计就把两模型的量混在一起了（单价差十倍），算出来的钱没有意义。没有任何记录的天不返回 |
+| 金额计算 | 在**前端**算（价格表是用户随时会改的，改完即时重算，不必再跑一趟 IPC）：`(input*p.input + cacheRead*p.cache_read + cacheCreate*p.cache_write + output*p.output) / 1e6` |
+| 未定价 | 没价格的模型**只标「未定价」并单列提示，绝不当 0 计**；此时金额前缀 `≥` —— 面板显示的必须是「已知部分的合计」，不是假装准确的总数。历史记录里模型名为空（见下条）同样落进这一档 |
+| 区间 | 默认近 **30** 天。日期列表由前端按**本地日期**算好传给宿主（`YYYY-MM-DD`，与 `append_usage_log` 同一套：Rust 侧没有 chrono） |
+| `model` 字段 | 用量日志的 `model` 取自 `system/init`（见上表）。**2026-09-20 之前它一直是空串**：前端声明了 `agentModel` 却没在 init 分支赋值 ⇒ 历史记录没有模型名（面板显示 `—` 并计入未定价），本次一并修好 —— 分模型计价是这个面板成立的前提 |
+| 实测（2026-09-20） | 宿主侧：`cargo test`（`usage_range_groups_by_day_and_model` / `pricing_candidate_is_validated_before_commit`）+ 拿**真实日志**跑一次 `read_usage_range`（2026-09-17 / 09-18：按天分片、四类 token 汇总与分组均正确）。agent 侧真机（`core-agent\target\hooktest\e2e-a12.ps1`，5 条断言全过）：工作区锁开着时，写**工作目录内**的候选文件成功（按 JSON 读回，`input=2`），写**工作目录外**被拒（`Access denied: … outside the workspace`）—— 候选文件放工作目录的理由由实测坐实 |
 
 **P3 已完成（2026-09，MCP 工具桥）**：实现在 [core-agent/src/mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)。src-tauri 在 spawn 时把 lunac.exe 自己的路径交过来（`--mcp-server stdio:<路径>`），agent **作 client** 把该 exe 以 `--mcp-server` 拉起 —— 那个进程会拦截该参数、进 stdio MCP server 模式（实现在 [mcp_server.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/mcp_server.rs)），读 `<exe 根>\tools\*.json` 的用户自定义工具（handler 有 `shell` / `http` / `builtin` 三种）。
 
@@ -1625,6 +1642,14 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **四条结构判据缺一不可**：单条命令（不拆段）、无输出重定向（`2>&1` 这类 fd 复制先摘掉）、无包装器/命令替换、命令词命中白名单。**任何一条放宽都要重新走一遍 §3.5 那张表**：`echo hi > f` 被放行一次，就等于零询问地写了文件。
     - **必须与 `dangerous` / `opaque` 自洽**：命中危险或判不出来的命令**一律**拿不到 `readonly:true`（`is_provably_readonly` 第一件事就是 `rep.is_clean()`）。这条是纵深防御 —— 前端另有优先级，但结论之间不许互相矛盾。
     - **前端缺字段按不放行处理**：只认显式的 `true`（旧 agent 不带该字段）。**不许**退回「缺字段就用本地前缀表兜底」—— 那会把已经修掉的误放行原样还回来。
+
+63. **定价表与成本面板（A12，2026-09-20）**：契约与实测见 §3.5「定价表与成本面板」。**六条不得回退**：
+    - **价格不得写进代码**：单位、币种、四类分档、每个模型一条 —— 全部落在用户可编辑的 `config\pricing.json` 里；**不预置任何价格数字**。要「开箱就有数」的冲动必须压住：填错的单价会把面板变成错误信息的来源，而用户是拿它对账的。
+    - **金额必须逐模型算**：`read_usage_range` 的返回带 `models[]`，绝不能只按天合计（一天里换过模型 = 两个单价被混算）。任何「反正只有几厘，按天算就行」的简化都是错的。
+    - **没价格就不算，不许当 0**：未定价的模型只标「未定价」并单列提示、金额前缀 `≥`。**禁止**用当前模型的单价代替缺失模型的单价，也禁止把缺失当 0 —— 两种都会让面板显示一个看起来很确定的假数字。
+    - **候选与正式必须分成两个文件**：agent 只能写候选（`lunac-pricing.pending.json`），确认动作**只由用户在面板上点**。**不许**让 agent 直接改 `config\pricing.json`（提示词里也明写了这条），也不许给「自动确认」留开关。
+    - **候选文件的落点是 agent 的工作目录**，不是 `config\`：配了工作区时写 `config\` 会被 `tools::guard()` 直接拒（实测见 §3.5）。改这个落点前必须先确认「agent 在工作区锁下仍写得进去」。
+    - **校验不过一个字都不写**：`commit_pricing_pending` 先 `validate_pricing_text` 再覆盖；「缺字段」也算非法（金额会悄悄少算一块）。候选文件缺失时**报错**，不许静默当成「没有变化」。
 
 ## 12. Agent Plan 模式规范
 
