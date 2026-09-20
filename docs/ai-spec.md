@@ -338,6 +338,25 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 缺字段 | 旧 agent / 非写入类工具不带该字段 ⇒ 按「无命中」处理 |
 | 落盘 | 命中写一条 `warn`（**只记规则名与行号**，绝不记内容原文，仍过 `mask_secrets`） |
 
+**只读分类 / 可证只读（A10，2026-09-20）**：同一个 `analysis` 下再多一个 `readonly: bool`，供**「白名单」运行档**自动放行只读命令（实现见 [core-agent/src/bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs) 的 `is_provably_readonly`，纪律见 §11 规则 62）：
+
+```json
+{"type":"control_request","request_id":"req_…","request":{
+  "subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tu_3",
+  "input":{"command":"git status"},
+  "analysis":{"dangerous":[],"opaque":[],"readonly":true}}}
+```
+
+| 项 | 约定 |
+|---|---|
+| 谁用它 | **只有「白名单」档**。手动档连只读命令也照问；自动档本来就不问（三档语义见 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md) §4.2，**刻意不改**） |
+| 取代了什么 | 原先前端的 `BUILTIN_SAFE_PREFIXES` **前缀表（已删除）**。前缀是**字符串匹配**，看不见重定向与管道 ⇒ `echo hi > important.txt`、`cat a.txt > b.txt` 会因为「echo / cat 是安全前缀」被自动放行，等于零询问地写文件 |
+| 判据（四条全过才 true） | ① **单条**命令（`;` / `&` / `\|` / 换行一律不算 —— 保守档不逐段判定）；② **无输出重定向**（`>` / `>>` / `>& file`；`2>&1` 这类 fd 复制先摘掉再判）；③ 无包装器（`cmd /c …` / `powershell -Command …`）与命令替换（`$( … )`）；④ 命令词（+ 子命令词）落在**正向白名单**里 |
+| 白名单是正向的 | `ls` / `cat` / `dir` / `echo` / `Get-ChildItem` 这类**整条即只读**的命令词；`git` / `npm` / `pip` / `cargo` 只认列出的**子命令**（`git status` 放行，`git add` / `npm run build` 不放行）；`python` / `node` 只放行 `--version` 这类。刻意**不含** `find`（`-delete` / `-exec`）/ `sort -o` / `uniq IN OUT` / `sed -i` / `awk` / `tee` / `xargs` |
+| 保守优先 | **证不出来就 false**，而 false **不表示危险**，只表示「不给自动放行」—— 仍然照常弹卡。`dangerous` / `opaque` 非空的命令**一律**拿不到 `readonly:true`（`is_provably_readonly` 第一件事就是 `rep.is_clean()`） |
+| 缺字段 | 旧 agent 不带该字段 ⇒ 前端按「不放行」处理（**只认显式的 `true`**，不回落到任何本地前缀表）。用户白名单（`canWhitelistCmd` + 用户列表）照旧独立生效 |
+| 实测（2026-09-20） | `cargo test` core-agent **95 passed / 0 failed / 2 ignored**（新增 `readonly_classification_is_conservative`，逐条钉住放行与不放行）；真机（假端点 + 真 `agent.exe --permission-prompt-tool stdio`）：`git status` ⇒ `analysis.readonly=true`、`echo hi > out.txt` ⇒ `analysis.readonly=false` |
+
 ✅ **档位已可切换（2026-09）**：两个入口共用 `set_security_profile`（`restart=true` 才重启 agent）——① 设置 · AI 面板的**安全档位**下拉（只读 / 项目 / 完全，边界 = 允不允许）；② AI 输入栏的**运行方式**胶囊（手动 / 白名单 / 自动，频率 = 问不问，「自动」档映射 `full`）。两者关系、自动档二次确认与常驻警示、越界卡片的三个动作见 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md) §4，规则见 §11 规则 21。
 
 **结构化提问（AskUserQuestion，2026-09）**：模型发 `AskUserQuestion{questions:[…]}` → agent 发 `can_use_tool` → 前端把选项渲染成按钮 → 用户点选后**经 `updatedInput` 回答案**，agent 用它覆盖原参数并执行工具（答案不带 `interrupt`，一轮照常继续）。
@@ -1598,6 +1617,14 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **`PostToolUse` 的文本只拼进 `tool_result` 的文本内部**：它是**追加**到既有 `content` 字符串里，**不得**新增消息、也不得新增内容块（规则 23 —— 末尾消息形态一变，缓存 `read` 就塌到 `system + tools` 的量级）。
     - **Windows 下起 `cmd /C` 子进程必须用 `raw_arg` 拼命令行**：`cmd /C` 的引号语义由 cmd 自己解释，而 `Command::arg` 会按 MSVC 规则把命令里的 `"` 转义成 `\"`（命令含空格时必然触发）⇒ 形如 `python "C:\my hooks\check.py"` 的命令**整条失败**（实测：同一条 `type "<file>"` 带引号时 hook 拿不到任何输出，去掉引号即正常）。**判据是「被解释的是 `cmd`，不是 MSVC」**，所以同一坑在**每个把整条命令字符串塞给 `cmd /C` 的地方**都存在，与它属于哪个模块无关 —— 2026-09-20 已按此判据全仓清理：`hooks.rs` / `tools.rs` 的 `Bash` / `host` 的 `mcp_server.rs`（用户 `tools\*.json` 的执行通道）/ `host` 的 `kill_port` 四处。**`PowerShell` 是例外**：它自己的解析器认得 `\"`，实测 `Write-Output "a b"` 输出正确 ⇒ **刻意不改**（改了反而要自己重拼一遍命令行）。断言钉在 `tools.rs` 的单测 `quoted_shell_arguments_survive_the_command_line`。
     - **`cmd` 的两条「解释权」陷阱**（同一天在 `kill_port` 上一并实测）：① `for /f ('…')` 里那句命令是**交给另一层 cmd 执行**的，所以写在里面的重定向要写成 `2^>nul` —— 裸 `2>nul` 会被外层 cmd 抢先解释，直接报「此时不应有 2>」，整条循环一次都不跑；② 但 `do` 子句末尾的 `2>nul` **不要**转义 —— `do @echo x 2^>nul` 会把 `2>nul` 当普通文本打进输出（实测输出 `FOUND 8896 2>nul`）。**判据：这段文本是「外层 cmd 读」还是「子 cmd 读」，只有子 cmd 读的才转义。**
+
+62. **只读分类（A10，2026-09-20）**：契约与实测见 §3.5「只读分类 / 可证只读」。**六条不得回退**：
+    - **`readonly` 只是「放行建议」，不是安全判定**：它的反面（`false`）**不表示危险**，只表示「证不出来」。任何把 false 当危险处理、或据此拒绝执行的改法都是错的 —— 与 `dangerous` / `opaque` 的语义方向不同，别混用。
+    - **只对「白名单」档生效**：手动档照问、自动档照放（三档语义见 `agent-ui-spec` §4.2）。**不许**拿它去收紧自动档，也**不许**拿它当第二道安全闸。
+    - **它是正向白名单，不是黑名单**：判据是「命中受信命令表」，没列到的一律 false。加规则时**只加证实过只读的**，不要用「排除已知危险写法」的反向写法 —— 那正是旧前缀表翻车的方式。
+    - **四条结构判据缺一不可**：单条命令（不拆段）、无输出重定向（`2>&1` 这类 fd 复制先摘掉）、无包装器/命令替换、命令词命中白名单。**任何一条放宽都要重新走一遍 §3.5 那张表**：`echo hi > f` 被放行一次，就等于零询问地写了文件。
+    - **必须与 `dangerous` / `opaque` 自洽**：命中危险或判不出来的命令**一律**拿不到 `readonly:true`（`is_provably_readonly` 第一件事就是 `rep.is_clean()`）。这条是纵深防御 —— 前端另有优先级，但结论之间不许互相矛盾。
+    - **前端缺字段按不放行处理**：只认显式的 `true`（旧 agent 不带该字段）。**不许**退回「缺字段就用本地前缀表兜底」—— 那会把已经修掉的误放行原样还回来。
 
 ## 12. Agent Plan 模式规范
 

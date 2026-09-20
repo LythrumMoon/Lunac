@@ -32,7 +32,7 @@
 | 工具调用 | 单行 `.tool-row`：`🔧 <工具名> <参数摘要>`（`main.ts` L2512-2516、L2556-2575）。**不显示**退出码 / 耗时 / 输出 |
 | 工具结果 | `.tool-row.tool-ok`（可折叠 `<details>`，正文截 600 字符）/ `.tool-error`（`main.ts` L2654-2680）；连续 3 次失败追加 `.tool-warn` |
 | 回合汇总 | `.turn-footer` + `.turn-tool-count`（成功/失败计数，`main.ts` L4410-4421） |
-| 审批卡 | 已相当完整：批量卡 `.approval-batch-card`、危险命令 `classifyRequest`（L2734）+ `CMD_BLACKLIST`（L2701）高亮并**移除「始终允许」**、白名单自动放行（`BUILTIN_SAFE_PREFIXES` L2692 + localStorage `lunac-approve-whitelist`）、连续简单命令合并（L2796/L2819/L2913）、`AskUserQuestion` 专属卡片 |
+| 审批卡 | 已相当完整：批量卡 `.approval-batch-card`、危险命令 `classifyRequest`（L2734）+ `CMD_BLACKLIST`（L2701）高亮并**移除「始终允许」**、只读命令自动放行（**agent 侧 `analysis.readonly`**（A10，2026-09-20 起取代 `BUILTIN_SAFE_PREFIXES`）+ 用户白名单 localStorage `lunac-approve-whitelist`）、连续简单命令合并（L2796/L2819/L2913）、`AskUserQuestion` 专属卡片 |
 | 安全档位 | **后端已就绪、前端零入口**：`set_security_profile`（`commands.rs` L710）无人调用，默认恒为 `project`（ai-spec L241 已记为缺口） |
 | 「沙箱」 | 前端不存在该概念与文案 |
 | 主题 | **仅一套固定深色**：`:root` 变量（`styles.css` L4-23）`--surface-glass / --border-glass / --text / --text-dim / --text-muted / --accent / --accent-bg / --accent-border / --green / --red / --yellow / --blue / --radius`；无 `data-theme`、无浅色、无 `prefers-color-scheme` |
@@ -58,7 +58,7 @@
 | 命令执行卡片 | **采用**（重点） | §3.3：状态 / 退出码 / 耗时 / 可折叠输出 / 复制 |
 | 对话流自动折叠 | **采用** | §3.5：回合完成后折叠为摘要行，设置可关 |
 | 沙箱 / 运行方式三档 | **适配**（重点，见 §4） | Lunac 无 OS 级沙箱，用「运行方式 + 工作区锁 + 危险命令拦截」表达同等意图，**且不得自称沙箱** |
-| 白名单（命令前缀） | **采用** | 已有机制，补 UI 与说明 |
+| 白名单（命令前缀） | **采用** | 已有机制；2026-09-20（A10）升级为 agent 侧的**可证只读**分类（`analysis.readonly`，见 §4.2），不再用前端本地前缀表 |
 | 高危命令拦截 | **采用**（已有 `CMD_BLACKLIST`） | 补「拦截原因」在卡片上的可读展示 |
 | 代码变更接受/拒绝 + DiffView | **暂不做**（评估项） | 需要后端回传 diff 或前端重算，改动面大于阶段 1/2 ⇒ 登记为 [backlog](./agent-feature-backlog.md) **U1** |
 | 会话 Fork / 分享 | **不做** | Lunac 是本地单机工具，分享链路与产品定位不符；Fork 收益低 |
@@ -206,12 +206,13 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 | 档位 | 行为 | 落到的既有机制 |
 |---|---|---|
 | **手动**（手动运行） | 每个写类工具（Write / Edit / Bash / PowerShell）都弹审批卡 | `security_profile=project` + 审批；**手动档连白名单命中也要问**（这是它与「白名单」档的唯一差别，见 §4.2 末） |
-| **白名单**（信任前缀自动运行，默认档 = 现状） | 命中内置安全前缀或用户白名单 → 自动放行；其余仍弹卡 | 现有白名单逻辑，仅**显性化**为可选档位 |
+| **白名单**（默认档） | **只读命令**（agent 判定 `analysis.readonly`）或命中用户白名单 → 自动放行；其余仍弹卡 | `analysis.readonly`（A10，见 ai-spec §3.5「只读分类」/ §11 规则 62）+ 用户白名单。**2026-09-20 起不再用前端本地前缀表** |
 | **自动**（全部自动运行，高风险） | 不再弹卡 | `security_profile=full`（`--dangerously-skip-permissions`）。**必须**二次确认弹窗 + 顶部常驻警示标识 |
 
 - `safe`（只读）档**不作为运行方式选项**，它属于「我不给它动手」的另一种模式，归入设置面板的安全档位里（§4.4）。
 - 运行方式存 `localStorage` 键 `lunac-agent-run-mode`（`manual` / `allowlist` / `auto`），切换即调 `set_security_profile` 对应值，并重启 agent（与现有工具黑名单的「重启生效」路径一致）。
 - **手动档必须"照问不误"**：若手动档也让白名单自动放行，它与「白名单」档就完全等价、三档退化成两档。前端 `classifyRequest()` 在 `manual` 下直接返回「不自动放行」（危险命令仍走 `CMD_BLACKLIST` 拦截，优先级最高）。
+- **白名单档的自动放行改由 agent 的「可证只读」结论决定（2026-09-20，A10）**：原先前端有一张 `BUILTIN_SAFE_PREFIXES` 前缀表（`ls` / `cat` / `echo` / `git status`…），它是**字符串匹配**，看不见重定向与管道 ⇒ `echo hi > important.txt`、`cat a.txt > b.txt` 会被当「安全前缀」自动放行（等于零询问地写文件）。现在改看 `analysis.readonly`：**单条命令 + 无输出重定向 + 无包装器/命令替换 + 命令词命中只读白名单**四条全过才为真；**缺字段按「不放行」处理**（只认显式的 `true`，不回落到任何本地前缀表）。判据在 agent 侧（`bash_safety.rs`），因此子代理 / fork 技能 / 后台复盘那几条路径**自动共享**同一套口径 —— 这是把它从「前端正则表」搬到「执行侧分类器」的主要理由。
 - **「自动」档要真的不再弹卡（2026-09-20 与后端对齐，已落地）**：`classifyRequest()` 里 `analysis.opaque`（判不出来：变量 / 编码执行 / 间接执行器）曾**无条件**返回「不自动放行」，于是自动档下每一条带 `%TMP%` / `$env:` / `cmd /c` 的命令照样弹卡 —— 而这一档本来就无门槛放行 `python train.py` 这类任意代码执行，单独让「判不出来」比它更严，只会让自动档名不副实（§3 的既有结论「自动档不该弹卡」）。现在 opaque 也**先看档位**：`auto` 放行，`manual` / `allowlist` 仍然弹卡（fail-closed 只在需要人看的两档生效）。**危险的优先级不变**：`analysis.dangerous` 与 `CMD_BLACKLIST` 命中在任何档位都要人工确认，且不给「始终允许」。
 - **审批的最终决策点只有前端一处**：后端只上报 `analysis` 与「要不要问」（`needs_approval`），是否放行完全由 `classifyRequest()` 按档位决定。写这段时别在后端另加一道「自动档就跳过审批」的旁路 —— 那会让危险命令拦截（前端）彻底失效。
 - **控件形态**：运行方式在输入栏的 ⋯ 菜单里是「**图标 + 三格点阵**」，不写文字（位置与画法见 §5.3）；档位名与提示句只出现在 `title` / `aria-label`。
@@ -375,6 +376,7 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   |---|---|---|---|
   | `analysis.dangerous` / `analysis.opaque` | `control_request.request`（`can_use_tool`） | 命令的**执行侧**静态安全分析（ai-spec §3.5「命令静态安全分析」/ §11 规则 26） | `dangerous` 非空 ⇒ 弹危险卡且不给「始终允许」（任何档位）；`opaque` 非空 ⇒ 不自动放行（fail-closed）。**缺字段时回落到 `CMD_BLACKLIST` 正则**（兼容旧 agent） |
   | `analysis.secrets` | `control_request.request`（`can_use_tool`） | **写入内容**的凭据扫描结果 `[{rule, line}]`（ai-spec §3.5「写入内容的凭据扫描」/ §13.1 / §11 规则 58） | 非空 ⇒ 与 `dangerous` 同级但**走独立通道**：不自动放行（任何档位）、不给「始终允许」、标题加 🔑 标记 + tooltip，且命中项以 🔑 明细行（`.approval-secret-warn`）**可见地**列在正文里。缺字段 ⇒ 按「无命中」处理 |
+| `analysis.readonly` | `control_request.request`（`can_use_tool`） | **可证只读**结论（A10）：单条命令 + 无输出重定向 + 无包装器/命令替换 + 命令词命中只读白名单，四条全过才为 `true`（ai-spec §3.5「只读分类」/ §11 规则 62） | **只有「白名单」档**用它：`true` ⇒ 自动放行（与用户白名单同级）。`false` / **缺字段** ⇒ 照常弹卡。**它不是安全闸**（`false` 不表示危险），也**不许**在缺字段时回落到本地前缀表 |
   | `elided` / `dropped` | `system/context_compacted` | 压缩计数 | 面板 tooltip 归因（§5.2） |
   | `attempt` / `max_retries` / `error_status` | `system/api_retry` | 瞬时失败重试 | 状态行文案（ai-spec §11 规则 25） |
   | `usage.requests[]` = `{in, read, create, out}` | `result.usage` | **每次 API 请求**的用量明细（顺序 = 请求顺序） | 前端**只落盘**（写进 `usage-*.jsonl` 的 `requests` 数组，与 DeepSeek 平台用量页逐行对账）；表盘口径不变（仍按每次提问累加）。**缺字段时写空数组**，`UsageRecord.requests` 为空则不写该键（旧记录兼容）。见 ai-spec §3.5「用量与对账」 |

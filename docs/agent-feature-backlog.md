@@ -18,7 +18,7 @@
 > | §0 差距总览 / §4 不是缺口 | §1.1 组 A（工具）**A14** / **§5 边界声明**（A3 / A5 / A8 / A9 已落地）；其余见 §4 设想区 |
 > | §1.2 组 B / §1.3 组 C | **A13 按需重估**（+ §4 设想区） |
 > | §2.1 组 A（子系统） | **已全部落地** —— A6 写文件内容级安全扫描于 2026-09-20 完成（A4 长期记忆与后台复盘、会话持久化与检索更早已完成，见 `ai-spec.md` §3.5） |
-> | §2.2 组 B | **A10 / A11**（A3 / A5 / A8 / A9 已落地） |
+> | §2.2 组 B | **A11**（A3 / A5 / A8 / A9 / A10 已落地） |
 > | §2.3 组 C | **A13** + §4 设想区 |
 > | §3 协议 / 接口层 | **A11**（其中的 A1 子代理框架已于 2026-09-20 落地） |
 > | §5 空转 UI / 失实文案 | **已全部修复**，条目已删 |
@@ -36,7 +36,6 @@
 
 | 级别 | 条目 | 为什么在这个位置 |
 |---|---|---|
-| **P2** | A10 自动权限分类器 | 减少询问频率。A9（权限 hooks）落地后，「谁能放行」已有用户脚本这条通道；这一条做的是**内置的分类器**，仍待做 |
 | **P2** | L1 插件市场（含 Live2D 桌宠） | **用户已定方向**，卡在三条硬约束（CSP / 资产 / 常驻开销） |
 | **P2** | L2 AI 人格 / 风格录入 | **用户已选「人格编辑器」**，改动集中在提示词装配 |
 | **P3** | A11 会话续接 / rewind | 现状靠 `set_history` 灌历史已够用，属体验增强 |
@@ -51,14 +50,6 @@
 ---
 
 ## 1. Agent 能力缺口
-
-### P2
-
-**A10. 自动权限分类器**
-
-- 做什么：自动判定「这条命令能不能不问」，减少审批卡频率。
-- 现状：只有**前端**白名单前缀 + `CMD_BLACKLIST`（`main.ts` 的 `classifyRequest()`）；agent 侧的 `bashClassifier` 类实现不存在。
-- 注意：任何「自动放行」都**不得取消**审批与工作区锁这两道硬边界（`ai-spec` §11 规则 14），只能改变**询问频率**。
 
 ### P3
 
@@ -231,4 +222,6 @@
 
 *2026-09-20 追加（同日第九批）：**A9（权限 hooks）已完成并从本文删除**。① **事件面砍到 8 个**：只做在 core-agent 里**真有落点**的 `SessionStart`（cfg 就绪后）/ `UserPromptSubmit`（进 `run_query` 前，**可拦整轮**）/ `PreToolUse`（**每一次**工具调用，含只读工具与子代理内部）/ `PermissionRequest`（只在「本来要弹卡」的那一刻，hook 可代答）/ `PostToolUse`（`run_one_tool()` 内、工具跑完之后）/ `PreCompact`（`compact_history()` 的三处调用点之前）/ `Stop`（成功收尾后）/ `SessionEnd`（stdin 关闭、退出前）。Claude Code 那套 19 类里的 `Notification` / `SubagentStop` / `TeammateIdle` 之类在 Lunac **没有对应节点**，一份都不空跑 —— 配了永不触发的事件比没有更糟。② **裁决权只到「等价白名单」为止**：hook 的 `allow` 只等于跳过审批卡，**静态安全分析命中（危险命令 / 写入内容里的凭据）仍强制弹卡**，工作区锁也照旧生效 —— 判据是 `hook_allow_needs_card()`，这是 §11 规则 14「任何一道闸门都不得为了少点一次同意而放宽」在 hooks 上的落点；`opaque`（判不定）刻意**不**强制弹卡，与前端「自动」档口径一致。③ **失败语义只认显式拒绝**：只有退出码 2 或 `{"decision":"deny"}` 才拦；**超时 / 崩溃 / 输出看不懂一律放行但可见**（`kind=error` 的 `system/hook_note` 到前端 + 一行 WARN 落到 agent 日志）—— 「以为装了保护、其实没跑」是最危险的状态，所以宁可放过也不能静默。④ **配置只有一份真相**：`config\hooks.json`（`enabled` 缺省为真；文件不存在 = 没配；设置面板的开关写的就是这个字段），**agent 侧按 mtime 热重载** ⇒ 改完**即时生效、不必重启 agent**（宿主因此**无条件**注入 `LUNAC_HOOKS_FILE`，连文件还不存在时也给 —— 否则用户在运行中新建配置文件就得等下次 spawn 才生效）；解析失败**保留上一份有效配置** + 落 WARN，语法错同时在设置面板那一行报出来。⑤ **顺手修掉三处真问题**：**(a)** `cmd /C` 前面用 `Command::arg` 会被 MSVC 引号规则把命令里的 `"` 转义成 `\"`，`cmd` 不认 ⇒ 形如 `type "C:\a b\x.json"` 的 hook 命令**整条失败**（实测：带引号时拿不到任何输出、去掉引号即正常）⇒ hooks 侧改用 `raw_arg` 原样拼命令行，**同一处陷阱在 `tools.rs` 的 `Bash` / `PowerShell` 上同样存在**（未在本批改动，已于同日第十批清理，见文末）；**(b)** 设置面板的「模型支持图片输入」开关**从未回读** `ai.json`（A8 的编辑没落盘）⇒ 面板每次都显示「关」，用户一按保存就把开着的功能静默关掉，本批补回；**(c)** `i18n.ts` 里 `agent.attachment_skipped` 有落盘 ⇒ 提示标题渲染成裸 key，本批补回。**实测**：`cargo test` core-agent **93 passed / 0 failed / 2 ignored**（其中 `hooks` 13 条，含退出码 2 / 非 0 / 超时 / 坏 JSON / matcher 不匹配 / deny 优先等语义）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` exit 0。**真机端到端 18 条断言全过**（假 Anthropic 端点抓请求体 + 真 hook 子进程 + 真 `Bash` 工具）：拦下 ⇒ 工具未执行 / 无审批卡 / 拒因以 `is_error` 回灌；放行 ⇒ 免卡且 `tool_result` 里出现 `exit code: 0`；**放行 + 危险命令 ⇒ 仍弹卡且 `analysis.dangerous` 非空**；`PostToolUse` 的 `additionalContext` ⇒ 第 2 次请求体出现 `[PostToolUse hook]`；`UserPromptSubmit` 拦下 ⇒ 端点**零请求** + `result.subtype=hook_blocked`；退出码 7 ⇒ 不拦（照常弹卡）且 `kind=error` 可见；`enabled:false` ⇒ 一条 hook 都不跑。另有一轮更省的复跑（`target\hooktest\e2e-mini.ps1`，**不联网**、不落 marker、纯 ASCII 断言，覆盖 `SessionStart` / `UserPromptSubmit` / `SessionEnd` / `enabled` 开关）**13 条断言全过**，可作为 `PreToolUse` 那几条缺 harness 时的最低成本回归。契约在 `ai-spec.md` §3.5「权限 hooks」、纪律在 §11 规则 61，前端字段登记在 `agent-ui-spec.md` §9，预检在 `code-rules.md` #23。**顺带记一笔**：`tools.rs` 的 `Bash` / `PowerShell` 仍用 `Command::arg` 拼 `cmd /C` 命令行（同一个引号陷阱），本批**未改** —— 留待单独一笔，避免与 hooks 混在一起回滚。当前未落地 **7 项**（A10–A16）。*
 
-*2026-09-20 追加（同日第十批）：**清理 `cmd /C` 的 `raw_arg` 陷阱**（A9 复查的副产品，不是新功能；**本条不做成待办，属于已完成的清账**）。判据一句话：**只要整条命令字符串是交给 `cmd /C` 执行的，就必须 `raw_arg`** —— `Command::arg` 按 MSVC 规则把 `"` 转义成 `\"`（命令含空格时必然触发），而 cmd 不认这个转义。按此判据全仓清了四处：① `hooks.rs`（第九批已修）；② `tools.rs` 的 `Bash` —— 修复前实测 `echo "a b"` 输出 `\"a b\"`，修复后正常，单测 `quoted_shell_arguments_survive_the_command_line` 钉住；③ 宿主 `mcp_server.rs` 的 `run_shell_with_timeout`（**用户 `tools\*.json` 的执行通道**，命令里带引号是常态）；④ 宿主 `kill_port`（dev server 5173 的端口清理）—— 这条**两处都错**：除 MSVC 转义（cmd 报「此时不应有 \"tokens=5\"」、**taskkill 一次都没跑到**）外，`for /f ('…')` 里的 `netstat -ano 2>nul` 还得写成 `2^>nul`（裸 `2>nul` 被外层 cmd 抢先解释，报「此时不应有 2>」）；**正向对照**：自建监听端口后跑修正版命令 `exit 0` 并取到该进程 PID，未转义版 `exit 1` 无输出（末尾 `do` 子句的 `2>nul` 则**不能**转义，转了会被当文本打进输出）。**`PowerShell` 刻意不改**：它的解析器认得 `\"`，实测 `Write-Output "a b"` 输出正确 —— 第九批「两边都中招」的说法按实测收敛为「只有 `Bash` 这一侧中招」，单测里一并断言防回退。**实测**：core-agent **94 passed / 0 failed / 2 ignored**、src-tauri **58 passed / 0 failed / 1 ignored**。纪律写进 `ai-spec.md` §11 规则 61 与 `code-rules.md` 预检 #23（含「外层 cmd 读 / 子 cmd 读」这条判据）。当前未落地 **7 项**（A10–A16）。*
+*2026-09-20 追加（同日第十批）：**清理 `cmd /C` 的 `raw_arg` 陷阱**（A9 复查的副产品，不是新功能；**本条不做成待办，属于已完成的清账**）。判据一句话：**只要整条命令字符串是交给 `cmd /C` 执行的，就必须 `raw_arg`** —— `Command::arg` 按 MSVC 规则把 `"` 转义成 `\"`（命令含空格时必然触发），而 cmd 不认这个转义。按此判据全仓清了四处：① `hooks.rs`（第九批已修）；② `tools.rs` 的 `Bash` —— 修复前实测 `echo "a b"` 输出 `\"a b\"`，修复后正常，单测 `quoted_shell_arguments_survive_the_command_line` 钉住；③ 宿主 `mcp_server.rs` 的 `run_shell_with_timeout`（**用户 `tools\*.json` 的执行通道**，命令里带引号是常态）；④ 宿主 `kill_port`（dev server 5173 的端口清理）—— 这条**两处都错**：除 MSVC 转义（cmd 报「此时不应有 \"tokens=5\"」、**taskkill 一次都没跑到**）外，`for /f ('…')` 里的 `netstat -ano 2>nul` 还得写成 `2^>nul`（裸 `2>nul` 被外层 cmd 抢先解释，报「此时不应有 2>」）；**正向对照**：自建监听端口后跑修正版命令 `exit 0` 并取到该进程 PID，未转义版 `exit 1` 无输出（末尾 `do` 子句的 `2>nul` 则**不能**转义，转了会被当文本打进输出）。**`PowerShell` 刻意不改**：它的解析器认得 `\"`，实测 `Write-Output "a b"` 输出正确 —— 第九批「两边都中招」的说法按实测收敛为「只有 `Bash` 这一侧中招」，单测里一并断言防回退。**实测**：core-agent **94 passed / 0 failed / 2 ignored**、src-tauri **58 passed / 0 failed / 1 ignored**。纪律写进 `ai-spec.md` §11 规则 61 与 `code-rules.md` 预检 #23（含「外层 cmd 读 / 子 cmd 读」这条判据）。当前未落地 **6 项**（A11–A16）。*
+
+*2026-09-20 追加（同日第十一批）：**A10（自动权限分类器 → 只读分类）已完成并从本文删除**。形态经裁决：**判据落在 agent 侧、结论随 `analysis` 下发、只改「白名单」档、保守判定**。① **解决的问题是真洞**：原先「白名单」档的自动放行靠前端一张 `BUILTIN_SAFE_PREFIXES` **前缀表**，而前缀是**字符串匹配**，看不见重定向与管道 ⇒ `echo hi > important.txt`、`cat a.txt >> b.txt` 会被「echo / cat 是安全前缀」自动放行，等于**零询问地写文件**。② **判据**：`bash_safety::is_provably_readonly`（与危险规则**同一套** `split_subcommands` / `command_word`，口径不分家），四条全过才为 `true` —— 单条命令（`;` `&` `|` 换行一律不算，保守档不逐段判定）/ 无输出重定向（`>` `>>` `>& file`；`2>&1` 这类 fd 复制先摘掉再判）/ 无包装器与命令替换 / 命令词（+ 子命令词）命中**正向白名单**。刻意**不含** `find`（`-delete`）/ `sort -o` / `uniq IN OUT` / `sed -i` / `awk` / `tee` / `xargs` 这些「看着只读、实则有写入开关」的。③ **只减询问、不加闸门**：`false` **不表示危险**，只表示「证不出来」⇒ 照常弹卡；手动档照问、自动档照放（三档语义不变），且 `dangerous` / `opaque` 非空的命令**一律**拿不到 `readonly:true`（纵深防御）。④ **前端删表**：`classifyRequest()` 改看 `analysis.readonly`，**缺字段按不放行处理**（只认显式 `true`，不回落本地前缀表）；档位提示文案由「白名单前缀自动放行」改为「只读命令自动放行」（×5 语言）。⑤ **实测**：`cargo test` core-agent **95 passed / 0 failed / 2 ignored**（新增 `readonly_classification_is_conservative`，13 组用例逐条钉住放行与不放行）、`tsc --noEmit` exit 0；**真机**（假端点 + 真 `agent.exe --permission-prompt-tool stdio`）：`git status` ⇒ `analysis.readonly=true`、`echo hi > out.txt` ⇒ `analysis.readonly=false`（连续命令那条由单测覆盖 —— harness 第三次起 stub 端口复用会卡住，属测试脚手架问题，已记在 `e2e-a10.ps1` 旁边）。契约在 `ai-spec.md` §3.5「只读分类」、纪律在 §11 规则 62，前端在 `agent-ui-spec.md` §4.2 / §9，预检在 `code-rules.md` #24。当前未落地 **6 项**（A11–A16）。*
