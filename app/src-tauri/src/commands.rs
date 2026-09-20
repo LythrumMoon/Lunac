@@ -533,6 +533,15 @@ fn start_cli_process(
         if thinking_mode == "off" { "off" } else { "on" }.into(),
     ));
 
+    // 权限 hooks（A9）→ agent.exe：**无条件给路径**（文件还不存在也给）。
+    // 「文件不在 = 没配 hooks」这个判据只有 agent 一处（它按 mtime 热重载同一份文件），
+    // 于是用户在设置面板新建/改 `enabled` 都能被立刻捕获 —— 若宿主只在「文件已存在」时
+    // 才注入，用户这次开的开关就得等下次 spawn agent 才生效（一类「开了没反应」的坑）。
+    envs.push((
+        "LUNAC_HOOKS_FILE",
+        crate::storage::hooks_config_path().to_string_lossy().to_string(),
+    ));
+
     crate::log::info(format!(
         "agent spawn: workdir={} args=[{}]",
         workdir.display(),
@@ -1147,6 +1156,82 @@ pub fn get_ai_config() -> serde_json::Value {
         // 图片输入开关（A8）：缺变量 = 关。前端据此决定要不要把图片附件发成 `image` 块。
         "vision": env::var("AI_VISION").map(|v| v.trim() == "1").unwrap_or(false),
     })
+}
+
+// ── 权限 hooks（A9，2026-09-20）────────────────────────────────────
+//
+// 用户脚本的挂载点（`PreToolUse` / `PostToolUse` / `UserPromptSubmit` 等 8 个事件，
+// 契约见 ai-spec §3.5「权限 hooks」）。宿主这一侧只做设置面板需要的最小面：
+// 读状态、写开关、打开配置文件 —— **不做任何 hook 判定**，那些全在 agent 侧。
+//
+// 两个口径：
+//  · **开关就是文件里的 `enabled` 字段**（缺省 `true`）。不另存一份前端状态：
+//    「面板上显示开着、agent 实际没跑」这种不一致一旦出现就极难查。
+//  · **agent 按 mtime 热重载**这个文件 ⇒ 改配置**即时生效、不必重启 agent**；
+//    所以宿主只在 spawn 时注入文件路径（`LUNAC_HOOKS_FILE`），不注入任何开关值。
+
+/// 解析 hooks.json。**容忍 UTF-8 BOM** —— 编辑器把 JSON 存成「UTF-8 带 BOM」是常事，
+/// 而 serde_json 见到 BOM 会判整份配置非法（agent 侧同样做了这个容忍，判据一致）。
+fn parse_hooks_json(text: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+}
+
+/// 读 hooks 配置状态（设置面板用）：路径 / 是否存在 / 是否启用 / 语法错误。
+#[tauri::command]
+pub fn get_hooks_config() -> serde_json::Value {
+    let path = crate::storage::hooks_config_path();
+    let text = crate::storage::load_hooks_text().ok().flatten();
+    let (enabled, error) = match text.as_deref() {
+        None => (false, None),
+        Some(t) => match parse_hooks_json(t) {
+            Ok(v) if v.is_object() => (
+                v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
+                None,
+            ),
+            Ok(_) => (false, Some("hooks.json 顶层必须是一个对象".to_string())),
+            Err(e) => (false, Some(format!("hooks.json 语法错误：{e}"))),
+        },
+    };
+    serde_json::json!({
+        "path": path.display().to_string(),
+        "exists": text.is_some(),
+        "enabled": enabled,
+        "error": error,
+    })
+}
+
+/// 开关 hooks（写 `hooks.json` 的 `enabled` 字段，**用户写的其它字段原样保留**）。
+#[tauri::command]
+pub fn set_hooks_enabled(enabled: bool) -> Result<String, String> {
+    let mut v = match crate::storage::load_hooks_text()? {
+        None => serde_json::json!({ "hooks": {} }),
+        Some(t) => match parse_hooks_json(&t) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => return Err("hooks.json 顶层必须是一个对象，请先修好它".into()),
+            // 语法坏掉时**不覆盖**：用户很可能正在编辑器里改这份文件，
+            // 按一下开关就把他写了一半的内容整段丢掉是最糟的处理。
+            Err(e) => return Err(format!("hooks.json 语法错误，已保留原文件：{e}")),
+        },
+    };
+    v["enabled"] = serde_json::json!(enabled);
+    let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    crate::storage::save_hooks_text(&format!("{text}\n"))?;
+    crate::log::info(format!("hooks 开关：enabled={enabled}"));
+    Ok(if enabled {
+        "hooks enabled".into()
+    } else {
+        "hooks disabled".into()
+    })
+}
+
+/// 确保 hooks.json 存在，返回它的路径（缺文件时落一份骨架）。
+///
+/// **打开交给前端**（设置面板本来就在用 `@tauri-apps/plugin-shell` 的 `open`，见
+/// 主题目录那行）：宿主不必为了「打开一个文件」再拉一次外部进程，
+/// 也避免 `Shell::open` 在新版里被标弃用。
+#[tauri::command]
+pub fn hooks_file_path() -> Result<String, String> {
+    Ok(crate::storage::ensure_hooks_file()?.display().to_string())
 }
 
 // ── AI Workspace ──────────────────────────────────────────────────
@@ -2006,8 +2091,6 @@ pub fn read_clipboard_backup_image() -> String {
 /// OCR entry still shows for those screenshots.
 #[cfg(target_os = "windows")]
 fn clipboard_png_to_file() -> Option<String> {
-    use std::path::PathBuf;
-
     #[link(name = "user32")]
     extern "system" {
         fn RegisterClipboardFormatW(lpszFormat: *const u16) -> u32;

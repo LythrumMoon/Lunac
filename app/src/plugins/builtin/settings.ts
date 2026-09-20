@@ -872,7 +872,7 @@ function belongsToOtherProvider(model: string, provider: string): boolean {
 /** AI 模型这一块的**内部内容**（不含 pane 外壳与分块标题）——
  *  由 buildAIPane 组装进「AI」分类。2026-09-19 批 9 起 AI 分类下有三个分块
  *  （AI 模型 / 技能 / 工具），每个分块用与「风格」相同的 .settings-group-title。 */
-function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): string {
+function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean, hooksEnabled: boolean, hooksError: string): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -996,6 +996,19 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
       </div>
       <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.ai_vision_hint")}</div>
       <div class="settings-row">
+        <span class="settings-label">${t("settings.hooks")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="settings-hooks" ${hooksEnabled ? "checked" : ""}>
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.hooks_hint")}</div>
+      <div class="settings-row">
+        <button type="button" class="settings-btn" id="settings-hooks-open">${t("settings.hooks_open")}</button>
+        <span class="settings-hint" id="settings-hooks-msg" style="font-size:0.7rem;color:var(--text-dim);margin-left:8px;"></span>
+      </div>
+      ${hooksError ? `<div class="settings-hint" style="font-size:0.7rem;color:var(--yellow);margin:2px 0 6px;">${esc(t("settings.hooks_invalid", { err: hooksError }))}</div>` : ""}
+      <div class="settings-row">
         <span class="settings-label">${t("settings.base_url")}</span>
         <input type="text" id="settings-baseurl" class="settings-input" autocomplete="off" value="${esc(baseUrl)}" placeholder="${esc(PROVIDER_PRESETS[provider]?.default_url || "https://api.openai.com")}">
       </div>
@@ -1035,13 +1048,13 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
  *  用户要求：「将 skills 和 tools 和 ai模型 分类到 ai 分类里，各个分块采用跟
  *  风格里的分块一样」—— 所以三块都用 .settings-group-title（与「风格」的
  *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。 */
-async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): Promise<string> {
+async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean, hooksEnabled: boolean, hooksError: string): Promise<string> {
   const [skillsHtml, toolsHtml] = await Promise.all([buildSkillsSection(), buildToolsSection()]);
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
-      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision)}
+      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision, hooksEnabled, hooksError)}
       <div class="settings-group-title">${t("settings.skills")}</div>
       ${skillsHtml}
       <div class="settings-group-title">${t("settings.group_tools")}</div>
@@ -2495,6 +2508,34 @@ export async function attachSettingsListeners(container: HTMLElement) {
     }
   }
 
+  // ── 权限 hooks（A9）───────────────────────────────────────────
+  // 开关写的是 config\hooks.json 的 `enabled` 字段（agent 侧按 mtime 热重载 ⇒
+  // 改完**即时生效、不需要重启 agent**）。失败必须**把开关拨回去**并把原因显示出来 ——
+  // 面板显示「已开」而实际没生效，是最难查的一类不一致。
+  const hooksToggle = container.querySelector("#settings-hooks") as HTMLInputElement | null;
+  const hooksMsg = container.querySelector("#settings-hooks-msg") as HTMLElement | null;
+  const hooksOpenBtn = container.querySelector("#settings-hooks-open") as HTMLButtonElement | null;
+  hooksToggle?.addEventListener("change", async () => {
+    const want = hooksToggle.checked;
+    try {
+      await invoke("set_hooks_enabled", { enabled: want });
+      if (hooksMsg) hooksMsg.textContent = "";
+    } catch (e) {
+      hooksToggle.checked = !want;
+      if (hooksMsg) hooksMsg.textContent = t("settings.hooks_failed", { err: String(e) });
+    }
+  });
+  hooksOpenBtn?.addEventListener("click", async () => {
+    try {
+      // 缺文件时后端先落一份骨架再返回路径；真正的「打开」交给前端 `open()`
+      // （与主题目录那行同一套做法，见文件顶部 import）。
+      const p = await invoke<string>("hooks_file_path");
+      await open(p);
+    } catch (e) {
+      if (hooksMsg) hooksMsg.textContent = t("settings.hooks_failed", { err: String(e) });
+    }
+  });
+
   // ── Search engine save ──────────────────────────────────────
   const saveSearchBtn = container.querySelector("#settings-save-search-btn") as HTMLButtonElement | null;
   const saveSearchMsg = container.querySelector("#settings-save-search-msg") as HTMLElement | null;
@@ -2998,6 +3039,9 @@ export const settingsPlugin: Plugin = {
     let searchKey = "";
     // 当前模型是否支持图片输入（A8）：跟着 ai.json 走，由用户在 AI 面板显式打开。
     let vision = false;
+    // 权限 hooks（A9）：开关 + 语法错误（都取自 config\hooks.json 这一份真相）。
+    let hooksEnabled = false;
+    let hooksError = "";
 
     try {
       hotkey = await invoke<string>("get_hotkey_combo");
@@ -3014,13 +3058,24 @@ export const settingsPlugin: Plugin = {
     } catch {}
 
     try {
-      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_provider: string; search_key: string }>("get_ai_config");
+      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_provider: string; search_key: string; vision?: boolean }>("get_ai_config");
       provider = aiCfg.provider || "";
       baseUrl = aiCfg.base_url || "";
       model = aiCfg.model || "";
       apiKey = aiCfg.api_key || "";
       searchProvider = aiCfg.search_provider || "";
       searchKey = aiCfg.search_key || "";
+      // 图片输入开关（A8）：**必须回读**，否则面板每次都显示「关」，
+      // 而用户一按保存就把这个开着的功能静默关掉了。
+      vision = !!aiCfg.vision;
+    } catch {}
+
+    // 权限 hooks（A9）：开关状态就是 config\hooks.json 的 `enabled` 字段
+    // （文件不存在 = 没配 = 关）。语法错误一并取回，在面板上直接报出来。
+    try {
+      const hk = await invoke<{ enabled?: boolean; error?: string | null }>("get_hooks_config");
+      hooksEnabled = !!hk.enabled;
+      hooksError = hk.error || "";
     } catch {}
 
     // 未配置供应商（环境缺 AI_PROVIDER）：用模型名反推；仍无则回退 openai
@@ -3031,7 +3086,7 @@ export const settingsPlugin: Plugin = {
 
     const generalPane = buildGeneralPane(hotkey, autoStart);
     const appearancePane = await buildAppearancePane();
-    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision);
+    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision, hooksEnabled, hooksError);
     const pluginsPane = await buildPluginsPane();
     const searchPane = await buildSearchPane();
 

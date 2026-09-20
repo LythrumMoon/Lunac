@@ -3083,6 +3083,11 @@ interface CliEventLine {
   /** system/attachment_note（图片附件，A8）：本轮**没能发出去**的附件及原因。
    *  只有真有失败项时才发这个事件（见 renderAttachmentNote）。 */
   skipped?: { path?: string; reason?: string }[];
+  /** system/hook_note（权限 hooks，A9）：用户脚本的裁决 / 输出 / 失败（见 renderHookNote）。
+   *  字段名是 `hook_event` 而不是 `event` —— `event` 已被 stream_event 占用（对象形状）。 */
+  hook_event?: string;
+  tool_name?: string;
+  items?: { kind?: string; text?: string; command?: string }[];
   request?: {
     subtype?: string;
     tool_name?: string;
@@ -4343,6 +4348,38 @@ function renderAttachmentNote(skipped: { path?: string; reason?: string }[]) {
   agentScroll();
 }
 
+/** hooks（A9）的提示行：用户脚本的**裁决 / 输出 / 失败**都走这里。
+ *
+ *  三种 kind 的可见性口径（与 agent 侧「只认显式拒绝、失败不拦但可见」配套）：
+ *   · `block` —— hook 拦下了这次工具调用 / 这轮提问（黄色 + 自动展开，必须看见）
+ *   · `error` —— hook 崩了 / 超时 / 输出看不懂（**它没有拦任何东西**，但用户必须知道
+ *     它没生效，否则「以为装了保护、其实没跑」是最危险的一种状态）
+ *   · `info` / `allow` —— 补充信息与放行说明（中性色，默认折叠）
+ *  正文每行 = `[kind] text — command`：一个事件挂多个 hook 时靠 command 才分得清是谁。 */
+function renderHookNote(data: { hook_event?: string; tool_name?: string; items?: { kind?: string; text?: string; command?: string }[] }) {
+  const items = Array.isArray(data.items) ? data.items : [];
+  if (items.length === 0) return;
+  const warn = items.some((i) => i.kind === "block" || i.kind === "error");
+  const host = agentView?.flow ?? resultsList;
+  const det = document.createElement("details");
+  det.className = warn ? "sys-note sys-note-warn" : "sys-note";
+  det.open = warn;
+  det.innerHTML = `<summary></summary><pre class="sys-note-body"></pre>`;
+  const sum = det.querySelector("summary");
+  if (sum) {
+    const tag = data.tool_name ? `${data.hook_event || "hook"} · ${data.tool_name}` : (data.hook_event || "hook");
+    sum.textContent = t("agent.hook_note", { event: tag, n: String(items.length) });
+  }
+  const body = det.querySelector<HTMLElement>(".sys-note-body");
+  if (body) {
+    body.textContent = items
+      .map((i) => `[${i.kind || "?"}] ${i.text || ""}${i.command ? ` — ${i.command}` : ""}`)
+      .join("\n");
+  }
+  host.appendChild(det);
+  agentScroll();
+}
+
 /** 权限卡里命令文本的**显示**归一化（纯排版，不改实际执行的命令）。
  *
  *  模型经常把命令写成「首行空白 + 后续行统一缩进」的多行串，而 `.approval-cmd`
@@ -4746,6 +4783,15 @@ listen<{ line: string }>("cli-output", (event) => {
     // 附件未发送的如实提示（A8）：agent 按路径读图失败 / 超限时才会来这一条
     else if (data.type === "system" && data.subtype === "attachment_note") {
       renderAttachmentNote(Array.isArray(data.skipped) ? data.skipped : []);
+    }
+    // 权限 hooks（A9）：用户脚本的裁决 / 输出 / 失败，全都如实摆出来
+    // （hook 崩了/超时不会拦任何东西，但必须让它**可见** —— 见 renderHookNote）
+    else if (data.type === "system" && data.subtype === "hook_note") {
+      renderHookNote({
+        hook_event: data.hook_event,
+        tool_name: data.tool_name,
+        items: Array.isArray(data.items) ? data.items : [],
+      });
     }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {

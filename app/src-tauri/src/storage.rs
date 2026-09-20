@@ -93,6 +93,52 @@ pub fn save_ai_config(cfg: &AiConfig) -> Result<(), String> {
     fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+// ── 权限 hooks（A9，2026-09-20）───────────────────────────────────
+//
+// 用户脚本的配置文件放在 `<exe 根>\config\hooks.json`，由 **agent 侧**读取
+// （core-agent 经 `LUNAC_HOOKS_FILE` 拿到路径，见 ai-spec §3.5「权限 hooks」）。
+// 宿主这里只做三件事：定位路径、给设置面板读状态（存在 / 启用 / 语法是否合法）、
+// 缺文件时落一份骨架并在编辑器里打开。
+//
+// **开关口径**：`enabled` 字段缺省为 `true`（文件存在本身就表示用户配了 hooks，
+// 与 Claude Code 一致）；设置面板的开关写的就是这个字段。文件不存在 = 没配 = 关。
+
+pub fn hooks_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("hooks.json")
+}
+
+/// 读 hooks.json 的原文；文件不存在返回 `Ok(None)`。
+pub fn load_hooks_text() -> Result<Option<String>, String> {
+    let path = hooks_config_path();
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读不出 {}：{e}", path.display())),
+    }
+}
+
+pub fn save_hooks_text(text: &str) -> Result<(), String> {
+    let path = hooks_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+}
+
+/// 缺文件时落一份**最小骨架**（`enabled: true` + 空的 hooks 表）。
+///
+/// 刻意**不预置示例脚本**：示例若是真命令，用户一开开关就会每次工具调用都跑一个
+/// 注定失败的进程（前端还满屏 error 提示）。格式说明交给设置面板的提示行与
+/// ai-spec §3.5 —— 那里有完整契约与可直接粘贴的样例。
+pub fn ensure_hooks_file() -> Result<PathBuf, String> {
+    let path = hooks_config_path();
+    if !path.exists() {
+        save_hooks_text("{\n  \"enabled\": true,\n  \"hooks\": {}\n}\n")?;
+    }
+    Ok(path)
+}
+
+
 // ── 旧数据整体迁移（%LOCALAPPDATA%\Lunac(-dev) → exe 根）──────────────
 // 迁移后会删除旧目录（用户决策）。幂等：仅当目标 ModuleData 尚未存在时才复制；
 // 若已存在则直接清理旧目录，避免每次启动重复搬移。
