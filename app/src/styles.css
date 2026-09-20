@@ -1823,7 +1823,10 @@ html, body {
   border-left: 2px solid var(--text-muted);
 }
 
-.turn-fold {
+/* `.turn-rollback`（A11）：回合页脚上的「回退到本轮」——实时对话里助手回复不是独立气泡
+   （它渲染在 agent-flow 里），回退入口就放在这里；形态与旁边的「展开/收起」按钮一致。 */
+.turn-fold,
+.turn-rollback {
   padding: 1px 6px;
   font-size: 0.66rem;
   color: var(--text-dim);
@@ -1832,7 +1835,8 @@ html, body {
   border-radius: 5px;
   cursor: pointer;
 }
-.turn-fold:hover {
+.turn-fold:hover,
+.turn-rollback:hover {
   color: var(--text);
   background: var(--surface-glass-hover);
 }
@@ -2359,8 +2363,9 @@ html, body {
   word-break: break-word;
 }
 
-/* ── Roll-back / Retry buttons on each user chat bubble (需求4) ──
-   回退 + 重试两按钮只在【用户提问气泡】显示（AI 回答气泡不挂）。
+/* ── Roll-back / Retry buttons on each chat bubble (需求4) ──
+   A11（2026-09-20）起：**复制**所有气泡都有；**回退**用户与助手气泡都有（任意消息都能当
+   回退点）；**重试**只有用户提问气泡有。已被上下文裁剪丢掉的老气泡只剩复制。
    图案为印象派 SVG（ROLLBACK_SVG / RETRY_SVG：残影+点彩）。 */
 .msg-actions {
   position: absolute;

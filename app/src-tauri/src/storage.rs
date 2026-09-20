@@ -563,6 +563,14 @@ pub struct UsageRecord {
     pub ts: u64,
     /// 产生这条记录的模型名（来自 agent 的 system/init）
     pub model: String,
+    /// 产生这条记录的 **agent 会话 id**（A11；来自 agent `system/init` 的 `session_id`）。
+    /// 语义是「**一次 agent 运行**」而非「一段对话」：换模型 / 换思考档 / 换工作区 /
+    /// 回退取消流式都会重启 agent 进程，也就换一个新 id。
+    /// 唯一用途是**归因** —— 让这条用量记录、stdout 的消息、agent 落盘日志三者能对上
+    /// 「哪些东西属于同一次运行」；对账口径本身仍按 `ts` + `model` 走。
+    /// 旧记录没有该字段，读时按空串（`serde(default)`），空值也不写回日志。
+    #[serde(rename = "sessionId", default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
     pub input: u64,
     pub output: u64,
     #[serde(rename = "cacheRead")]
@@ -840,6 +848,7 @@ mod tests {
         UsageRecord {
             ts: 1_700_000_000_000,
             model: "deepseek-flash".into(),
+            session_id: "sess_1_1700000000000".into(),
             input: 212,
             output: 3,
             cache_read,
@@ -888,8 +897,19 @@ mod tests {
         let line = serde_json::to_string(&rec(1536)).unwrap();
         assert_eq!(
             line,
-            r#"{"ts":1700000000000,"model":"deepseek-flash","input":212,"output":3,"cacheRead":1536,"cacheCreate":0,"elided":0,"dropped":0}"#
+            r#"{"ts":1700000000000,"model":"deepseek-flash","sessionId":"sess_1_1700000000000","input":212,"output":3,"cacheRead":1536,"cacheCreate":0,"elided":0,"dropped":0}"#
         );
+    }
+
+    /// A11：会话 id 的**向后兼容** —— 旧日志行没有该键，读时按空串；
+    /// 空值也不写回（没有会话 id 时不给日志添噪音）。
+    #[test]
+    fn usage_record_session_id_is_backward_compatible() {
+        let old = r#"{"ts":1,"model":"m","input":1,"output":1,"cacheRead":0,"cacheCreate":0}"#;
+        assert_eq!(serde_json::from_str::<UsageRecord>(old).unwrap().session_id, "");
+        let mut r = rec(0);
+        r.session_id = String::new();
+        assert!(!serde_json::to_string(&r).unwrap().contains("sessionId"));
     }
 
     /// 每次 API 请求一行（对账粒度）—— `in` 是关键字，必须映射成 `in` 而不是 `input`

@@ -824,6 +824,13 @@ interface ChatDoneInfo {
 let usageTotals = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
 /** 当前 agent 的模型名（来自 system/init，写进用量日志便于区分供应商/模型） */
 let agentModel = "";
+/** 当前 agent 的**会话 id**（A11；来自 `system/init` 的 `session_id`）。
+ *  语义是「**一次 agent 运行**」：agent 进程每次重启（换模型 / 换思考档 / 换工作区 /
+ *  回退时取消流式）都会给一个新 id。
+ *  它**不是**「一段对话」的 id —— 对话仍由 `chatHistory` + `chat.db` 决定，也不参与续接；
+ *  唯一用途是**归因**：把一条用量记录对齐到某一次运行，排查「两轮之间发生了什么」时
+ *  能拿它去 agent 的落盘日志里找同一批消息。 */
+let agentSessionId = "";
 /** 本次提问内 agent 报告的历史压缩次数（提问结束写进用量日志）。
  *  压缩会改写请求前缀 → 端点侧缓存作废，是命中率的**断裂型**失效来源；
  *  必须与「新内容天生没被上一轮缓存覆盖」的自然未命中分开看（ai-spec §11 规则 23）。 */
@@ -1202,14 +1209,16 @@ function renderChatLogHtml() {
   html += '</div>';
   resultsList.innerHTML = html;
   const log = document.getElementById("chat-log");
-  // 需求：复制按钮所有气泡都有；回退/重试按钮只出现在用户提问气泡。
+  // A11 起回退点不再只限用户提问：**任意消息**都能作为回退点（「保留到这里、丢掉其后」）。
+  // 用户气泡 = 复制 + 回退 + 重试；助手气泡 = 复制 + 回退（重试要重发的是用户那句话，
+  // 对助手气泡不成立）。按钮文案里写明「只回退对话、不还原磁盘上的文件」。
   log?.querySelectorAll<HTMLElement>(".chat-msg-user").forEach(msg => {
     const idx = Number(msg.dataset.idx);
-    attachMsgActions(msg, Number.isFinite(idx) ? idx : undefined);
+    attachMsgActions(msg, Number.isFinite(idx) ? idx : undefined, { retry: true });
   });
   log?.querySelectorAll<HTMLElement>(".chat-msg-assistant").forEach(msg => {
     const idx = Number(msg.dataset.idx);
-    attachMsgCopy(msg, Number.isFinite(idx) ? idx : undefined);
+    attachMsgActions(msg, Number.isFinite(idx) ? idx : undefined);
   });
   // Render LaTeX in restored content
   setTimeout(() => {
@@ -1217,6 +1226,29 @@ function renderChatLogHtml() {
     if (container) renderLatex(container as HTMLElement);
   }, 20);
   applyWindowSize();
+}
+
+/** 上下文裁剪之后，把**已渲染气泡**烘死的 `data-idx` 一起前移（A11 修的既有 bug）。
+ *
+ *  `pruneContext()` 每回合结束都会从**队首**丢掉旧消息，而气泡上的 `data-idx` 是「渲染
+ *  那一刻的 `chatHistory` 下标」，此后不再变 —— 丢 N 条之后，所有先前渲染的气泡都偏大 N。
+ *  回退按钮与「复制这条消息」都靠它定位（`copyMsgText` 会去取 `chatHistory[idx]` 的原文），
+ *  偏了就**切错 / 复制错**（此前没有这层换算，回退按钮在长对话里必然漂移）。
+ *
+ *  已被丢掉的气泡（新下标 < 0）摘掉回退 / 重试按钮：那些消息已不在会话里，回退过去只会
+ *  切到错误位置。**这一条是刻意不动 DOM 内容**的 —— 用户仍能看到当时的过程，但它不再是
+ *  一个合法回退点。 */
+function shiftRenderedMsgIdx(dropped: number) {
+  if (dropped <= 0) return;
+  const sel =
+    "#chat-log .chat-msg-user[data-idx], #chat-log .chat-msg-assistant[data-idx], #chat-log .turn-rollback[data-idx]";
+  document.querySelectorAll<HTMLElement>(sel).forEach(el => {
+    const next = Number(el.dataset.idx) - dropped;
+    el.dataset.idx = String(next);
+    if (next >= 0) return;
+    el.querySelectorAll(".msg-rollback, .msg-retry").forEach(b => b.remove());
+    if (el.classList.contains("turn-rollback")) el.remove();
+  });
 }
 
 // ── 过程快照：采集（回合结束）与回放（历史回顾）────────────────
@@ -1343,45 +1375,40 @@ async function copyMsgText(msg: HTMLElement, idx: number | undefined) {
   writeText(text.trim()).catch(() => {});
 }
 
-/** 在【任意气泡】上附加复制按钮（幂等，印象派 COPY_SVG）——用于 AI 回答气泡。 */
-function attachMsgCopy(msg: HTMLElement, idx: number | undefined) {
+/** 在【任意气泡】上附加动作按钮（幂等，印象派 SVG 图案）。
+ *
+ *  - **复制**：所有气泡都有；
+ *  - **回退**：只要这条消息**还在会话里**（`idx` 有效）就有 —— A11 起不限于用户提问，
+ *    助手回复同样是一个合法回退点（「保留这段回答、丢掉后面的」）；
+ *  - **重试**：只对用户提问成立（要重发的是用户那句话），由 `opts.retry` 控制。
+ *
+ *  `idx` 无效（undefined / 越界）时**只给复制按钮** —— 这条消息已经随上下文裁剪离开
+ *  会话（见 `shiftRenderedMsgIdx`），回退过去只会切错位置；复制会退化成「按气泡文本复制」。
+ *  回退**只动对话与 agent 上下文，不还原磁盘上的文件**（见 ai-spec §11 规则 64）。 */
+function attachMsgActions(msg: HTMLElement, idx: number | undefined, opts: { retry?: boolean } = {}) {
   if (msg.querySelector(".msg-actions")) return;
+  // 注意判据只到 `idx >= 0`：**新提问的气泡是「先挂按钮、后入历史」的**
+  //（`appendUserMsg(…, chatHistory.length)` 在 `startAgentChat` 的 `push` 之前），
+  // 拿 `idx < chatHistory.length` 当判据会让刚发出去的那条**没有回退按钮**。
+  // 余下的越界风险由 `rollbackChat()` 自己的 `!chatHistory[idx]` 早退兜住。
+  const valid = typeof idx === "number" && Number.isInteger(idx) && idx >= 0;
   const wrap = doc("div");
   wrap.className = "msg-actions";
-  const cp = doc("button");
-  cp.className = "msg-copy";
-  cp.title = t("chat.copy_msg");
-  cp.innerHTML = COPY_SVG;
-  cp.addEventListener("click", () => copyMsgText(msg, idx));
-  wrap.appendChild(cp);
-  msg.appendChild(wrap);
-}
-
-/** 在【用户提问气泡】上附加复制 + 回退 + 重试三个按钮（幂等，印象派 SVG 图案）。
- *  需求：回退/重试只出现在用户提问的气泡里；复制按钮所有气泡都有。 */
-function attachMsgActions(msg: HTMLElement, idx: number | undefined) {
-  if (idx === undefined || idx < 0) return;
-  if (msg.querySelector(".msg-actions")) return;
-  const wrap = doc("div");
-  wrap.className = "msg-actions";
-  const cp = doc("button");
-  cp.className = "msg-copy";
-  cp.title = t("chat.copy_msg");
-  cp.innerHTML = COPY_SVG;
-  cp.addEventListener("click", () => copyMsgText(msg, idx));
-  const rb = doc("button");
-  rb.className = "msg-rollback";
-  rb.title = t("chat.rollback");
-  rb.innerHTML = ROLLBACK_SVG;
-  rb.addEventListener("click", () => rollbackChat(idx));
-  const rt = doc("button");
-  rt.className = "msg-retry";
-  rt.title = t("chat.retry");
-  rt.innerHTML = RETRY_SVG;
-  rt.addEventListener("click", () => retryChat(idx));
-  wrap.appendChild(cp);
-  wrap.appendChild(rb);
-  wrap.appendChild(rt);
+  const mk = (cls: string, title: string, svg: string, onClick: () => void) => {
+    const b = doc("button");
+    b.className = cls;
+    b.title = title;
+    b.innerHTML = svg;
+    b.addEventListener("click", onClick);
+    wrap.appendChild(b);
+  };
+  mk("msg-copy", t("chat.copy_msg"), COPY_SVG, () => copyMsgText(msg, idx));
+  if (valid) {
+    mk("msg-rollback", t("chat.rollback"), ROLLBACK_SVG, () => rollbackChat(idx as number));
+  }
+  if (valid && opts.retry) {
+    mk("msg-retry", t("chat.retry"), RETRY_SVG, () => retryChat(idx as number));
+  }
   msg.appendChild(wrap);
 }
 
@@ -1435,11 +1462,18 @@ const COPY_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" st
   <circle cx="18" cy="18" r="0.4" fill="currentColor" stroke="none" opacity="0.45"/>
 </svg>`;
 
-/** Roll back the conversation to message `idx` (inclusive): strips all later
- *  messages, persists the trimmed session, syncs the trimmed history back to
- *  the agent's own context and re-renders. A full snapshot is backed up to
- *  localStorage first so the operation is reversible (no data loss).
- *  idx=-1 表示回退到空对话（重试首条消息用）。 */
+/** 回退对话到消息 `idx`（**闭区间**，即保留这条）：丢掉其后的全部消息、把裁剪后的会话存盘、
+ *  把保留下来的历史灌回 agent 上下文，然后整块重绘。`idx = -1` 表示回退到空对话（重试首条消息用）。
+ *
+ *  **A11（2026-09-20）**——回退点从「用户轮」扩到**任意消息**（助手回复也能当回退点），
+ *  并把纪律写死在这里：
+ *  - **只回退对话与 agent 上下文**：磁盘上 agent 已经改动的文件**一律不动**（没有文件
+ *    内容历史快照，也没有 `fileHistory`）。界面文案必须如实说明这一点。
+ *  - **不可撤销**：这里会立刻把裁剪后的会话写回 `chat.db`（全删全插），被丢掉的那段
+ *    没有第二份 —— 旧实现往 localStorage 塞过一份 `lunac-rollback-snapshots`，但**全仓
+ *    没有读取方**（纯死代码 + 白占配额），A11 一并删掉，注释随之改成实话。
+ *  - 重绘后的气泡下标由 `renderChatLogHtml()` 重新烘焙，`shiftRenderedMsgIdx` 的存量
+ *    偏移随之归零。 */
 async function rollbackChat(idx: number) {
   if (idx < -1 || (idx >= 0 && !chatHistory[idx])) return;
   // 必须在下面把 isStreaming 清零**之前**记住：第 4 步要靠它决定「要不要先取消这次运行」。
@@ -1453,18 +1487,11 @@ async function rollbackChat(idx: number) {
     agentView = null;
     agentTurn = null;
   }
-  // 1) Backup full snapshot (无数据丢失)
-  try {
-    const snaps: { ts: number; sessionId: string | null; messages: { role: string; content: string }[] }[] =
-      JSON.parse(localStorage.getItem("lunac-rollback-snapshots") || "[]");
-    snaps.unshift({ ts: Date.now(), sessionId: currentSessionId, messages: chatHistory.map(m => ({ ...m })) });
-    localStorage.setItem("lunac-rollback-snapshots", JSON.stringify(snaps.slice(0, 50)));
-  } catch {}
-  // 2) Trim to the roll-back node (inclusive)
+  // 1) Trim to the roll-back node (inclusive)
   chatHistory = chatHistory.slice(0, idx + 1);
-  // 3) Persist the trimmed session
+  // 2) Persist the trimmed session
   try { await saveCurrentSession(); } catch {}
-  // 4) 让 agent 的上下文与界面保持一致（2026-09-17 改）。
+  // 3) 让 agent 的上下文与界面保持一致（2026-09-17 改）。
   //    旧实现是 `stop_cli` + `start_cli`：注释说为了让下一轮看不到被剪掉的消息，
   //    但它连**保留下来的上文一起清空了** —— 用户表现为「回退后引用不到上文」。
   //    现在改为把保留下来的历史整体灌回 agent（协议 `set_history`）：只丢工具调用
@@ -1478,7 +1505,7 @@ async function rollbackChat(idx: number) {
     try { await invoke("start_cli"); } catch {}
   }
   queueAgentHistory(chatHistory);
-  // 5) Re-render
+  // 4) Re-render
   renderChatLogHtml();
   // 「改动过的文件」跟着过程快照重建（`renderChatLogHtml()` 会重建 #chat-log，必须排在它之后）。
   // 注：`sessionSteps` 本身不随回退裁剪（既有行为），所以这里通常与回退前一致 ——
@@ -2457,6 +2484,8 @@ function appendUsageLog(info: ChatDoneInfo) {
     record: {
       ts: now.getTime(),
       model: agentModel,
+      // 归因用（A11）：同一条记录属于哪一次 agent 运行；旧 agent 没有这个字段 → 空串
+      sessionId: agentSessionId,
       input: info.input_tokens,
       output: info.output_tokens,
       cacheRead: info.cache_read_input_tokens ?? 0,
@@ -3068,6 +3097,9 @@ listen("lunac-esc-cancel-rec", () => {
 interface CliEventLine {
   type: string;
   subtype?: string;
+  /** `system/init` 里的**会话 id**（A11）：语义是「一次 agent 运行」，
+   *  只用于归因（随用量落盘 / 与 agent 落盘日志对齐），不影响对话本身。 */
+  session_id?: string;
   attempt?: number;
   max_retries?: number;
   error_status?: number;
@@ -4761,6 +4793,8 @@ listen<{ line: string }>("cli-output", (event) => {
       // 各家单价差十倍，不区分模型算出来的钱没有意义）。agent 每轮查询都会带这个字段，
       // 这里是它唯一的来源（`get_ai_config` 里的模型名只是「配置值」，可能与实际不同）。
       if (typeof data.model === "string" && data.model) agentModel = data.model;
+      // 同处记下本轮会话 id（A11）：agent 进程重启即换新值，随用量一起落盘做**归因**。
+      if (typeof data.session_id === "string" && data.session_id) agentSessionId = data.session_id;
       if (agentState === "starting") {
         agentTransition("idle");
         updateAgentStatus("ready");
@@ -6021,6 +6055,9 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     agentView = null;
     agentTurn = null;
 
+    /** 本轮助手消息在 `chatHistory` 里的下标（回合页脚的回退点，A11）；没有助手消息时 -1。
+     *  必须在下面的裁剪**之后**算：裁剪会把下标整体前移（见 `shiftRenderedMsgIdx`）。 */
+    let assistantIdx = -1;
     if (finalText) {
       chatHistory.push({ role: "assistant", content: finalText });
       humanizeBtn.style.display = "flex";
@@ -6037,7 +6074,10 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     }
 
     // Prune memory: cap chatHistory to last N turns (Pi: transformContext)
+    const beforePrune = chatHistory.length;
     chatHistory = pruneContext(chatHistory);
+    shiftRenderedMsgIdx(beforePrune - chatHistory.length);
+    if (finalText) assistantIdx = chatHistory.length - 1;
 
     // Turn footer: tool summary (Pi: turn_end reporting)
     // 回合汇总 + 「展开过程」（参照 Trae 的对话流节点自动折叠，见 agent-ui-spec §3.5）
@@ -6057,6 +6097,24 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
             })
           : t("agent.turn_elapsed", { dur });
       footer.appendChild(label);
+
+      // A11：助手回复也是一个合法回退点（「保留这一段回答、丢掉后面的」）。实时对话里
+      // 助手回复不是独立气泡（它渲染在 agent-flow 里），所以把入口放在回合页脚 ——
+      // 与历史重绘后的助手气泡同义。`data-idx` 让它跟着上下文裁剪一起前移
+      // （见 `shiftRenderedMsgIdx`；被裁掉时整颗按钮自己摘掉）。
+      if (assistantIdx >= 0) {
+        const rb = doc("button");
+        rb.className = "turn-rollback";
+        rb.setAttribute("type", "button");
+        rb.dataset.idx = String(assistantIdx);
+        rb.title = t("chat.rollback");
+        rb.textContent = t("chat.rollback_turn");
+        rb.addEventListener("click", () => {
+          const i = Number(rb.dataset.idx);
+          if (Number.isFinite(i) && i >= 0) rollbackChat(i);
+        });
+        footer.appendChild(rb);
+      }
 
       // 过程快照：把本轮的过程块抽成可持久化的步骤（历史回顾时展示「查看过程」）
       recordTurnSteps(flowEl);
@@ -6201,7 +6259,7 @@ function appendUserMsg(text: string, idx?: number) {
   if (idx !== undefined) div.dataset.idx = String(idx);
   div.textContent = text;
   log.appendChild(div);
-  attachMsgActions(div, idx);
+  attachMsgActions(div, idx, { retry: true });
   resultsList.scrollTop = resultsList.scrollHeight;
 }
 

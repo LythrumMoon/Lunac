@@ -107,8 +107,9 @@ const TOOL_BUDGET_HINT: &str =
 //
 // 五条硬约束（backlog A1，不得放宽）：
 //   ① **独立上下文**：子代理用自己的 `history`，与主对话零共享；
-//   ② **结果可归因**：回灌文本与事件都带 `task_id`。Lunac 的 `session_id` 恒为
-//      `""`，所以 task id 只能是**进程内存态**计数器（`TASK_SEQ`）；
+//   ② **结果可归因**：回灌文本与事件都带 `task_id`。它仍是**进程内存态**计数器
+//      （`TASK_SEQ`）—— 因为它会出现在给模型看的回灌文本里，短才好读；跨进程的唯一性
+//      由 `session_id()`（A11 起是真值，见下）在 `system/init` / `result` 与启动日志里提供；
 //   ③ **并发 = 花钱**：三重闸门 —— 串行执行（`tools::parallel_safe("Agent")` 为
 //      false）+ 轮次上限 + token 预算封顶；
 //   ④ **进度回前端**：`task_started` / `task_progress` / `task_done`；
@@ -139,7 +140,8 @@ nothing but that report -- no tool output, no intermediate reasoning.
 - The report must be self-contained and concrete: answer the question, cite the exact \
 file paths / line ranges / commands you relied on, and flag anything you could not verify.
 - Do not ask the user questions; you have no interactive channel.";
-/// 进程内存态的 task 序号 —— `session_id` 恒为 `""`，任务归因只能靠它（约束②）
+/// 进程内存态的 task 序号 —— 它要出现在给模型看的回灌文本里，短才好读；
+/// 跨进程的唯一性由 `session_id()` 补上（约束②）
 static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── 后台复盘 fork（A4：长期记忆的**触发点**）──────────────────────
@@ -297,7 +299,7 @@ const TASK_SNAPSHOT_HEADER: &str =
 //      且被丢的内容少于 `SUMMARY_MIN_INPUT_CHARS` 时**直接跳过**（不值得为一点点内容付费）；
 //   ② 改写前缀 ⇒ 缓存整段作废 ⇒ 触发频次要尽量低。「宁可压得晚也不要压得勤」：
 //      它只挂在本来就必然会 drain 的那两档上，**不额外制造压缩时机**；
-//   ③ 不引 session 分裂（Lunac 的 `session_id` 恒为 `""`）。
+//   ③ 不引 session 分裂（摘要请求与主对话用**同一个** `session_id`，见 `session_id()`）。
 //
 /// 开关：`0` / `false` / `off` / `no` 关闭。**默认开**（只在丢弃档触发，本身已很稀有）。
 const SUMMARY_COMPACT_ENV: &str = "LUNAC_SUMMARY_COMPACT";
@@ -1246,13 +1248,39 @@ fn emit_stream_event(event: Value) {
     emit(json!({ "type": "stream_event", "event": event }));
 }
 
+/// 本进程的**会话 id**（A11，2026-09-20）：进程启动时生成一次，此后全程不变。
+///
+/// 形态 `sess_<pid>_<启动时刻 epoch 毫秒>`：进程内唯一、可读、**不引 chrono / uuid**。
+/// **它的语义是「一次 agent 运行」**，不是「一段对话」：宿主重启 agent（换模型 / 换思考档 /
+/// 换工作区 / 回退时取消流式……）就是新会话。历史仍由前端经 `set_history` 灌进来
+/// （§11 规则 30）—— 这个 id 不改那套机制，它只负责**归因**：stdout 的每条消息、agent 落盘
+/// 日志、前端的用量记录三者从此能对上「哪些东西属于同一次 agent 运行」。
+///
+/// 为什么要有个 id 而不是继续用 `""`：`""` 让「本轮属于哪次运行」在日志里无法区分 ——
+/// 排查「两轮之间发生了什么」时只能靠时间戳猜。
+///
+/// **覆盖范围（别误读）**：带 session 归因的是 `system/init`、`result`（成功与出错两条）、
+/// 权限 hook 的 payload 与启动日志行。`task_id`（子代理 / 技能）**仍是**进程内短计数
+/// `task-1` / `skill-1` —— 它会出现在给模型看的回灌文本里，短才好读（见约束②），
+/// 所以不往里塞 session 前缀。
+fn session_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("sess_{}_{}", std::process::id(), ms)
+    })
+}
+
 /// system/init —— 前端据此把 agentState 从 starting 推进到 idle。
 /// 真实 CLI 每轮查询都会发一次，这里保持一致；`tools` 上报本轮可用工具名。
 fn emit_init(model: &str, tool_names: &[String]) {
     emit(json!({
         "type": "system",
         "subtype": "init",
-        "session_id": "",
+        "session_id": session_id(),
         "model": model,
         "tools": tool_names,
     }));
@@ -1501,7 +1529,7 @@ fn report_hook_run(event: &str, tool: Option<&str>, run: &hooks::Run) {
 /// 工具类事件的 payload（与 Claude Code 同形：`tool_name` / `tool_input` / `tool_use_id`）。
 fn hook_tool_payload(event: &str, cwd: &Path, tool: &str, id: &str, input: &Value) -> Value {
     json!({
-        "session_id": "",
+        "session_id": session_id(),
         "hook_event_name": event,
         "cwd": cwd.display().to_string(),
         "tool_name": tool,
@@ -1551,7 +1579,7 @@ fn fire_plain_hook(event: &str, cwd: &Path, payload: Value) -> hooks::Run {
         return hooks::Run::default();
     }
     let mut payload = payload;
-    payload["session_id"] = json!("");
+    payload["session_id"] = json!(session_id());
     payload["hook_event_name"] = json!(event);
     payload["cwd"] = json!(cwd.display().to_string());
     let run = hooks::fire(&h, event, &payload);
@@ -1850,7 +1878,8 @@ fn main() {
     }
 
     eprintln!(
-        "[agent] P1–P4 就绪 cwd={} 工具=[{}]{}{}",
+        "[agent] P1–P4 就绪 session={} cwd={} 工具=[{}]{}{}",
+        session_id(),
         tools_ctx.cwd.display(),
         tool_names.join(","),
         if tools_ctx.read_only { " 只读模式" } else { "" },
@@ -1875,7 +1904,7 @@ fn main() {
                 "is_error": true,
                 "num_turns": 0,
                 "result": e,
-                "session_id": "",
+                "session_id": session_id(),
             }));
             std::process::exit(1);
         }
@@ -1966,7 +1995,7 @@ fn main() {
                         "duration_ms": 0,
                         "num_turns": 0,
                         "result": format!("被 UserPromptSubmit hook 拦下：{reason}"),
-                        "session_id": "",
+                        "session_id": session_id(),
                         "total_cost_usd": 0.0,
                     }));
                     continue;
@@ -4081,7 +4110,7 @@ fn run_query(
         "duration_ms": started.elapsed().as_millis() as u64,
         "num_turns": turns,
         "result": final_text,
-        "session_id": "",
+        "session_id": session_id(),
         "total_cost_usd": 0.0,
         "usage": {
             "input_tokens": in_tokens,
@@ -4118,7 +4147,7 @@ fn finish_error(
         "duration_ms": started.elapsed().as_millis() as u64,
         "num_turns": turns,
         "result": msg,
-        "session_id": "",
+        "session_id": session_id(),
         "total_cost_usd": 0.0,
     }));
 }
@@ -4137,6 +4166,23 @@ mod tests {
             locked: false,
             plan_phase: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 会话 id（A11）：形态 `sess_<pid>_<毫秒>`，且**同进程内恒定**。
+    ///
+    /// 恒定这件事是硬要求：它要能和前端用量记录、agent 落盘日志对上「同一次运行」——
+    /// 若每次取值都新生成（比如误用 `now()` 当场拼），那这些记录就永远对不上，
+    /// 比用 `""` 还糟（看起来有值、实际无意义）。
+    #[test]
+    fn session_id_is_real_and_stable() {
+        let id = session_id();
+        assert!(id.starts_with("sess_"), "{id}");
+        let rest = id.trim_start_matches("sess_");
+        let (pid, ms) = rest.split_once('_').expect("形态必须是 sess_<pid>_<毫秒>");
+        assert_eq!(pid.parse::<u32>().unwrap(), std::process::id());
+        assert!(ms.parse::<u128>().unwrap() > 1_600_000_000_000, "毫秒时间戳不合理：{ms}");
+        // 第二次取值必须逐字节相同
+        assert_eq!(id, session_id());
     }
 
     /// 系统提示词的**前缀缓存不变量**（2026-09-17 方案 B 的守门测试）。
