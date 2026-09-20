@@ -524,6 +524,46 @@ pub fn memo_save_image(id: String, index: usize, data_url: String) -> Result<Str
     Ok(file.to_string_lossy().to_string())
 }
 
+// ── 计划文档（ModuleData\plans\<时间戳>.md，2026-09-20 A7）───────────
+//
+// 计划模式里**被用户批准**的那份计划正文留档。为什么落盘：
+//   · 它是「用户看过并点了批准」的产物 —— 对话滚过去之后还得能回看 / 照着执行；
+//   · 与 tool-outputs 那种「过程垃圾」不同，这份东西的价值不随时间衰减。
+// 文件名的本地时间戳由**前端**给（同 append_usage_log）：Rust 侧没有 chrono，
+// 不为一句时区换算引入新依赖（见 log.rs 的说明）。
+
+/// 计划文档目录：<exe_dir>\ModuleData\plans
+pub fn plans_dir() -> PathBuf {
+    module_data_dir().join("plans")
+}
+
+/// 只接受严格的 `YYYY-MM-DD_HHMMSS` —— 文件名来自前端，必须挡住路径拼串
+/// （`..` / 分隔符 / 绝对路径都进不来）。
+fn plan_path(stamp: &str) -> Result<PathBuf, String> {
+    let b = stamp.as_bytes();
+    let shape_ok = b.len() == 17 && b[4] == b'-' && b[7] == b'-' && b[10] == b'_';
+    let digits_ok = shape_ok
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10) || c.is_ascii_digit());
+    if !digits_ok {
+        return Err(format!("invalid timestamp: {stamp}"));
+    }
+    Ok(plans_dir().join(format!("{stamp}.md")))
+}
+
+/// 保存一份被批准的计划（A7）。返回落盘的绝对路径，前端用它给用户一句「已存到 …」。
+#[tauri::command]
+pub fn save_plan_md(stamp: String, plan: String) -> Result<String, String> {
+    if plan.trim().is_empty() {
+        return Err("plan is empty".into());
+    }
+    let path = plan_path(&stamp)?;
+    fs::create_dir_all(plans_dir()).map_err(|e| e.to_string())?;
+    fs::write(&path, &plan).map_err(|e| format!("Write error: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +590,27 @@ mod tests {
         }
         assert!(usage_log_path("2026-09-12").is_ok());
         assert!(usage_log_path("1970-01-01").is_ok());
+    }
+
+    /// 计划文件名同样来自前端（本地时间由它算）—— 必须挡住跨目录拼串、
+    /// 以及「只有日期没有时刻」这种会让同一天多份计划互相覆盖的形态。
+    #[test]
+    fn plan_path_only_accepts_a_local_timestamp() {
+        for bad in [
+            "",
+            "2026-09-20",              // 缺时刻 ⇒ 同一天批准两次会互相覆盖
+            "2026-09-20_14301",        // 秒不足两位
+            "2026-09-20_143012.md",    // 扩展名由后端拼，前端不许带
+            "2026-09-20 143012",       // 空格（前端顺手用 toLocaleString 就会长这样）
+            "20260920_143012",
+            "../escape",
+            "2026-09-20_143012/../x",
+        ] {
+            assert!(plan_path(bad).is_err(), "should reject `{bad}`");
+        }
+        let p = plan_path("2026-09-20_143012").unwrap();
+        assert_eq!(p.file_name().unwrap(), "2026-09-20_143012.md");
+        assert!(p.parent().unwrap().ends_with("plans"), "落点必须是 plans\\ 下");
     }
 
     /// 字段名是前端 `read_usage_log` 的消费契约（cacheRead/cacheCreate 驼峰；

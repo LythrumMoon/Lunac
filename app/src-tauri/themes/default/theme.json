@@ -9,7 +9,6 @@
     "text_dim": "#b2a9a3",
     "text_muted": "#837a78",
     "border_glass": "rgba(232, 216, 202, 0.10)",
-    "surface": "#1c1a20",
     "radius_search": "14px",
     "radius_results": "14px",
     "pattern_opacity": 0.18

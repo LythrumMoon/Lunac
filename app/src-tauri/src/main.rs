@@ -436,6 +436,7 @@ fn main() {
             storage::load_clipboard_history,
             storage::append_usage_log,
             storage::read_usage_log,
+            storage::save_plan_md,
             storage::memo_save_entries,
             storage::memo_load_entries,
             storage::memo_save_image,
