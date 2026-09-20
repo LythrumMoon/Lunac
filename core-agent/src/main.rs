@@ -20,6 +20,9 @@
 //   stdin  每行一条 JSON
 //            {"type":"user","session_id":"","message":{"role":"user",
 //             "content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}
+//            content 里可再加图片块（A8）：{"type":"image","source":{"type":"file",
+//             "path":"C:\\…\\a.png"}} —— 只传路径，字节由本进程读出来转 base64
+//             （media_type 由魔术字节判定，发送方不必给）
 //            {"type":"control_response","response":{"subtype":"success",
 //             "request_id":"…","response":{"behavior":"allow"|"deny",…}}}
 //   stdout 每行一条 JSON（非 JSON 行会被前端忽略）
@@ -42,7 +45,10 @@
 //      系统提示词列出清单，模型调 Skill 工具取正文（实现见 skills.rs）
 //   ✅ 长期记忆 + 每 N 轮的后台复盘 fork（A4，2026-09-20）：`Remember` 工具 + 启动时
 //      冻结快照注入，见本文件「长期记忆」与「后台复盘 fork」两节
-//   ❌ 技能 fork / remote 模式
+//   ✅ 技能 fork / 自带资源（A5，2026-09-20）：`context: fork` 的技能派子代理执行，
+//      技能目录内的脚本与资源随 Skill 返回附上（见 skills.rs）；remote 模式不移植
+//   ✅ 图片附件（A8，2026-09-20）：user 消息里的 `image` 块按路径读字节转 base64 块，
+//      见本文件「图片附件」一节；开关与来源在宿主 / 前端，PDF 仍走路径文本
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
 
@@ -55,6 +61,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 mod bash_safety;
@@ -1796,14 +1803,22 @@ fn main() {
         collect_review(&mut pending_review);
         match msg.get("type").and_then(Value::as_str) {
             Some("user") => {
-                let prompt = extract_user_text(&msg);
-                if prompt.trim().is_empty() {
+                let images = extract_user_images(&msg);
+                let mut prompt = extract_user_text(&msg);
+                if prompt.trim().is_empty() && images.is_empty() {
                     continue;
+                }
+                // 纯图片提问（一个字都没写）：补一句最小文本，保证 history 仍以 user
+                // 文本消息开头（不变量见 §11 规则 18 ①）。前端当前总会带上
+                // `[Attached files]` 包装文本，这条是给别的调用方兜底。
+                if prompt.trim().is_empty() {
+                    prompt = "(the user attached image(s) with no text)".to_string();
                 }
                 run_query(
                     &cfg,
                     &mut history,
                     &prompt,
+                    &images,
                     &tools_ctx,
                     &tool_defs,
                     &tool_names,
@@ -1926,6 +1941,130 @@ fn extract_user_text(msg: &Value) -> String {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
     }
+}
+
+// ── 图片附件（A8，2026-09-20）────────────────────────────────────
+//
+// stdin 的 user 消息里可以带 `{"type":"image","source":{"type":"file","path":"…"}}`
+// 块 —— **只传路径、不传字节**：
+//   · 前端三种来源（粘贴 / 拖拽 / 文件对话框）本来就已经落成路径，不必再读一遍文件；
+//   · 几 MB 的 base64 不必过 IPC 管道，也不占前端的字符串内存。
+// 字节由这里按路径读出来、转成端点要的 base64 块（契约见 ai-spec §3.5「图片附件」）。
+//
+// **开关在前端**（设置面板「模型支持图片输入」，落在 `config\ai.json`）：发给不支持
+// 视觉的端点（如 DeepSeek 官方端点）会 400 ⇒ 默认关、由用户显式打开。agent 侧因此
+// 不做二次判定：收到就发，只有「读不出来」才如实上报（`system/attachment_note`）。
+//
+/// 一条消息里的图片张数上限（端点侧另有总量限制，这里先卡住明显失控的情况）
+const MAX_IMAGE_FILES: usize = 10;
+/// 单张图片的原始字节上限。端点的 5 MB 通常按 base64 后算，而 base64 膨胀约 4/3
+/// ⇒ 原始字节卡在 3.5 MB 以内才不会越线。
+const MAX_IMAGE_BYTES: u64 = 3_500_000;
+
+/// 按**魔术字节**判图片类型（不信扩展名：改过名的文件、剪贴板落盘的 `.png` 都可能
+/// 是别的东西）。只认端点支持的四种 —— 其余（BMP / TIFF / ICO …）宁可退回「路径文本」
+/// 那条老路，也不发一个必然被端点拒的块。
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// 一条 `image` 块里声明的路径（报错时用来指认是哪张图）。
+fn image_src_path(block: &Value) -> String {
+    block
+        .pointer("/source/path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// 取出消息里的图片块（原样，未解析）—— 与 `extract_user_text` 读同一份 `content`。
+fn extract_user_images(msg: &Value) -> Vec<Value> {
+    msg.pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把一条 `image` 块（`source.type = "file"`）变成端点要的 base64 块。
+///
+/// 刻意**不检查工作区锁 / 只读档**：路径来自**用户显式选中的附件**，不是模型自己找
+/// 出来的（模型的 `Read` 照旧受锁约束）—— 而剪贴板图片本来就落在 `%TEMP%`，套锁会让
+/// 最主要的那条用法直接失效（见 ai-spec §11 规则 60）。
+fn load_image_block(block: &Value) -> Result<Value, String> {
+    let src = block.get("source").ok_or("image block has no source")?;
+    if src.get("type").and_then(Value::as_str) != Some("file") {
+        return Err("unsupported source (only type=file is accepted)".into());
+    }
+    let path = image_src_path(block);
+    if path.is_empty() {
+        return Err("empty path".into());
+    }
+    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "{} KB exceeds the {} KB per-image limit",
+            meta.len() / 1024,
+            MAX_IMAGE_BYTES / 1024
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("read failed: {e}"))?;
+    let media =
+        image_media_type(&bytes).ok_or("not a PNG / JPEG / GIF / WebP (checked by magic bytes)")?;
+    Ok(json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media,
+            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        },
+    }))
+}
+
+/// 把消息里的图片块批量解析成端点块。
+///
+/// 返回 `(可用块, 未能发出的说明)`。**失败的那些不静默丢弃** —— 调用方会把它们汇总成
+/// `system/attachment_note` 如实告诉用户「这张图没发出去、为什么」，否则用户只看到
+/// 「模型说它看不到图」而毫无线索。原顺序保持（端点侧图文顺序有语义）。
+fn collect_image_blocks(raw: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let mut blocks = Vec::new();
+    let mut notes = Vec::new();
+    for (i, b) in raw.iter().enumerate() {
+        let path = image_src_path(b);
+        if i >= MAX_IMAGE_FILES {
+            notes.push(json!({
+                "path": path,
+                "reason": format!("more than {MAX_IMAGE_FILES} images in one message"),
+            }));
+            continue;
+        }
+        match load_image_block(b) {
+            Ok(block) => blocks.push(block),
+            Err(reason) => notes.push(json!({ "path": path, "reason": reason })),
+        }
+    }
+    (blocks, notes)
 }
 
 // ── 单轮查询（含工具循环）────────────────────────────────────────
@@ -2932,6 +3071,7 @@ fn run_query(
     cfg: &Cfg,
     history: &mut Vec<Value>,
     prompt: &str,
+    raw_images: &[Value],
     tctx: &tools::Ctx,
     tool_defs: &[Value],
     tool_names: &[String],
@@ -2943,6 +3083,37 @@ fn run_query(
 ) {
     let started = Instant::now();
     emit_init(&cfg.model, tool_names);
+
+    // 图片附件（A8）：先按路径解析成 base64 块，再在 init 之后**如实上报**没能发出的那些
+    // （放在 init 之后是因为前端的状态机要由 init 推进到本轮，提示行才有地方落）。
+    let (image_blocks, image_notes) = collect_image_blocks(raw_images);
+    if !image_notes.is_empty() {
+        for n in &image_notes {
+            log::warn(format!(
+                "附件未随本轮发送: {}（{}）",
+                n.get("path").and_then(Value::as_str).unwrap_or("?"),
+                n.get("reason").and_then(Value::as_str).unwrap_or("?"),
+            ));
+        }
+        emit(json!({ "type": "system", "subtype": "attachment_note", "skipped": image_notes }));
+    }
+    if !image_blocks.is_empty() {
+        let b64_kb: usize = image_blocks
+            .iter()
+            .map(|b| {
+                b.pointer("/source/data")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0)
+            })
+            .sum::<usize>()
+            .div_ceil(1024);
+        log::info(format!(
+            "图片附件 {} 张（base64 合计约 {} KB）随本轮提问发出",
+            image_blocks.len(),
+            b64_kb
+        ));
+    }
 
     // 单条输入过长就直接截断：一次粘贴可能把整个上下文窗口顶爆，
     // 与其让端点 400 不如先留个明确的截断标记。
@@ -2961,9 +3132,13 @@ fn run_query(
     // 回滚锚点：本轮压入的所有消息（user / assistant / tool_result）都在其后。
     // 压缩会丢掉历史开头的消息，锚点需同步左移（见 compact_history 的返回值）。
     let mut base = history.len();
+    // 文本在前、图片按原顺序在后（端点侧图文顺序有语义；且 history 第一条**必须**是
+    // 文本块 —— 前缀缓存与前端的标题推导都吃这条不变量，见 §11 规则 18 ①）。
+    let mut user_content: Vec<Value> = vec![json!({ "type": "text", "text": prompt })];
+    user_content.extend(image_blocks);
     history.push(json!({
         "role": "user",
-        "content": [{ "type": "text", "text": prompt }],
+        "content": user_content,
     }));
 
     let budget = max_context_tokens();
@@ -4590,5 +4765,74 @@ mod tests {
             }
         }
         assert!(plan_tool_batches(&[]).is_empty());
+    }
+
+    /// 图片附件（A8）：**只认魔术字节**、按路径读字节转 base64、失败与超限都如实上报。
+    #[test]
+    fn image_blocks_are_resolved_by_path_and_limited() {
+        // 类型判定只看字节，不看扩展名
+        assert_eq!(
+            image_media_type(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]),
+            Some("image/png")
+        );
+        assert_eq!(image_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(image_media_type(b"GIF89a....."), Some("image/gif"));
+        assert_eq!(
+            image_media_type(b"RIFF____WEBPVP8 "),
+            Some("image/webp"),
+            "WebP 要同时看 RIFF 与 WEBP 两处"
+        );
+        assert_eq!(image_media_type(b"BM......"), None, "BMP 不该被放行");
+        assert_eq!(image_media_type(b"II*\0"), None, "TIFF 不该被放行");
+        assert_eq!(image_media_type(b"not an image"), None);
+
+        let dir = std::env::temp_dir().join(format!("lunac-img-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        let png = dir.join("real.png");
+        std::fs::write(&png, &png_bytes).unwrap();
+        let liar = dir.join("liar.png"); // 扩展名是 png，内容不是
+        std::fs::write(&liar, b"not an image").unwrap();
+
+        let block = |path: String| json!({ "type": "image", "source": { "type": "file", "path": path } });
+        let raw = vec![
+            block(png.to_string_lossy().to_string()),
+            block(liar.to_string_lossy().to_string()),
+            block(dir.join("missing.png").to_string_lossy().to_string()),
+            block(dir.to_string_lossy().to_string()), // 目录
+            json!({ "type": "image", "source": { "type": "url", "url": "https://x/y.png" } }),
+        ];
+        let (blocks, notes) = collect_image_blocks(&raw);
+
+        assert_eq!(blocks.len(), 1, "五条里只有那张真 PNG 能过");
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(blocks[0]["source"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, png_bytes, "base64 必须能原样还原字节");
+
+        assert_eq!(notes.len(), 4, "四种失败各自成一条说明（不静默丢）");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.get("reason").and_then(Value::as_str).is_some_and(|r| !r.is_empty())),
+            "每条说明都要有非空 reason"
+        );
+
+        // 张数上限：超出的进说明，已收下的顺序不变
+        let many: Vec<Value> = (0..MAX_IMAGE_FILES + 2)
+            .map(|_| block(png.to_string_lossy().to_string()))
+            .collect();
+        let (blocks, notes) = collect_image_blocks(&many);
+        assert_eq!(blocks.len(), MAX_IMAGE_FILES);
+        assert_eq!(notes.len(), 2);
+        assert!(
+            notes[0]["reason"].as_str().unwrap_or_default().contains("more than"),
+            "超出上限的说明要写清是张数问题"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
