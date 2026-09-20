@@ -56,7 +56,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | **执行** | 只读工具并行：一轮里**连续的**只读调用合成一批并发（上限 4），写类/命令/MCP 串行 | `tools::parallel_safe` + `plan_tool_batches`；结果按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序；见 ai-spec §3.5「只读工具并行」与 §11 规则 28 |
 | **P3** | MCP 工具桥 | 把 `<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 接进请求体；**读侧**（A3）另有两件条件注册的 `resources` 工具，让模型能看到用户工具的 `handler` |
 | **P4** | 技能（渐进披露；**inline + fork 两种执行模式**；可自带脚本 / 资源） | `LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`；提示词只列 `key: 描述`，模型调 `Skill` 取正文（inline）或由子代理执行后回报告（`context: fork`）。目录里**除 `SKILL.md` 之外的文件**在扫描时登记、**调用时**附在返回里（相对路径 + 深度 ≤ 3 / ≤ 40 条，**不进提示词**，见 ai-spec §3.5「P4」与 §11 规则 57） |
-| **会话** | 历史持久化 / 恢复 / 回退到某个用户轮 | `ModuleData\history\chat.db`（SQLite + FTS5，含专供 CJK 的 `trigram` 索引表）；`set_history` 协议把历史灌回 agent 上下文（见 ai-spec §11 规则 30） |
+| **会话** | 历史持久化 / 恢复 / **回退到任意消息**（A11）；`session_id` 是真值（`sess_<pid>_<毫秒>`，一次 agent 运行一个 id） | `ModuleData\history\chat.db`（SQLite + FTS5，含专供 CJK 的 `trigram` 索引表）；`set_history` 协议把历史灌回 agent 上下文（见 ai-spec §11 规则 30）；回退**只动对话、不还原磁盘文件**，且 `data-idx` 要跟着上下文裁剪前移（见 §11 规则 64） |
 | **UI** | AI 对话面板（思考省略 / 命令卡片 / 回合折叠 / 运行方式三档 / 用量面板 / 被改动文件路径追踪） | 规范见 [agent-ui-spec.md](./agent-ui-spec.md) |
 | **成本** | 本地成本面板（A12）：按天 + **按模型**汇总用量，乘 `config\pricing.json` 里的单价算出金额 | 汇总在宿主（`storage::read_usage_range`）、金额在前端（价格表用户可改，改完即时重算）；「更新价格」由 agent 抓官方定价页写**候选文件**、用户在面板上确认才覆盖。契约见 ai-spec §3.5「定价表与成本面板」与 §11 规则 63 |
 | 运维 | 落盘日志（两进程各写 `temp\logs\{agent,lunac}-YYYY-MM-DD.log`，含每次工具调用与耗时） | ai-spec §11 规则 20 |

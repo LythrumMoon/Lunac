@@ -18,9 +18,9 @@
 > | §0 差距总览 / §4 不是缺口 | §1.1 组 A（工具）**A14** / **§5 边界声明**（A3 / A5 / A8 / A9 已落地）；其余见 §4 设想区 |
 > | §1.2 组 B / §1.3 组 C | **A13 按需重估**（+ §4 设想区） |
 > | §2.1 组 A（子系统） | **已全部落地** —— A6 写文件内容级安全扫描于 2026-09-20 完成（A4 长期记忆与后台复盘、会话持久化与检索更早已完成，见 `ai-spec.md` §3.5） |
-> | §2.2 组 B | **A11**（A3 / A5 / A8 / A9 / A10 已落地） |
+> | §2.2 组 B | **已全部落地** —— A11（会话 id 与 rewind）于 2026-09-20 完成，见 `ai-spec.md` §3.5「会话 id 与 rewind」/ §11 规则 64（A3 / A5 / A8 / A9 / A10 更早已落地） |
 > | §2.3 组 C | **A13** + §4 设想区 |
-> | §3 协议 / 接口层 | **A11**（其中的 A1 子代理框架已于 2026-09-20 落地） |
+> | §3 协议 / 接口层 | **已全部落地** —— A11 于 2026-09-20 补齐 `session_id` 真值与任意消息回退（其中的 A1 子代理框架更早已落地） |
 > | §5 空转 UI / 失实文案 | **已全部修复**，条目已删 |
 > | §6 建议实施顺序 | 本文 **「优先级总表」** |
 > | §8.1 被改动文件路径追踪 | **已完成** ⇒ 结论在 `ai-spec.md` §11 规则 32 |
@@ -38,7 +38,6 @@
 |---|---|---|
 | **P2** | L1 插件市场（含 Live2D 桌宠） | **用户已定方向**，卡在三条硬约束（CSP / 资产 / 常驻开销） |
 | **P2** | L2 AI 人格 / 风格录入 | **用户已选「人格编辑器」**，改动集中在提示词装配 |
-| **P3** | A11 会话续接 / rewind | 现状靠 `set_history` 灌历史已够用，属体验增强 |
 | **P3** | A13 记忆目录 / 斜杠命令 / 剩余工具 | 按需重估，见各项 |
 | **P3** | A14 多任务并行 | 依赖**已落地**的子代理（原 A1）+ 前端分栏 UI，排在功能项之后 |
 | **P3** | A15 压缩策略的成本模型 | 命中价是 miss 价的 1/50 ⇒ 就地瘦身多数净亏，水位需重估 |
@@ -51,11 +50,6 @@
 ## 1. Agent 能力缺口
 
 ### P3
-
-**A11. 会话续接与 rewind**
-
-- 现状（别误读）：`session_id` **恒为 `""`**（`main.rs` 四处硬编码），且无 `--resume` / `--continue`。但**「续接」在行为上是存在的** —— 靠 `set_history` 协议由前端把整段历史灌回 agent 上下文（`main.rs` ↔ `main.ts` `queueAgentHistory()`）。所以缺的是「由 agent 侧自持会话 id」这一形态，不是「无法续接」。
-- rewind 现状：只有「按消息索引回退到某个**用户轮**」（`rollbackChat()` + `.msg-rollback`，按钮只挂在用户提问气泡上）；**不能回到助手回复 / 工具调用中途**，也没有**文件内容历史快照**（全仓无 `fileHistory`）。
 
 **A13. 按需重估的剩余项**（不做只因为优先级，不是因为没价值）
 
@@ -76,7 +70,7 @@
 
 - 目标：一次对话里互不依赖的多个任务并发跑，而不是严格的一问一答。
 - 现状（别与「只读工具并行」混淆）：**只读工具并行已经做了** —— 一轮里**连续的**只读调用合成一批并发（上限 4），写类 / 命令 / MCP 串行，结果按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序。那是「同一次 API 响应里的多个工具调用」；**模型请求本身仍然串行**。
-- 硬约束：① 每个任务须有**独立的消息数组与独立工具环境**；② 结果回灌必须**能归因到任务**（Lunac 的 `session_id` 恒为 `""`，得先补内存态 task id）；③ 并发 = 花钱 ⇒ 并发上限 + 预算封顶；④ 前端要能把多任务的流式输出**分栏 / 分组**，否则用户看到的是交织成一团乱的流。
+- 硬约束：① 每个任务须有**独立的消息数组与独立工具环境**；② 结果回灌必须**能归因到任务**（子代理的短计数 `task-N` 已落地；跨运行的归因由 `session_id` 提供 —— A11 已把它改成真值，见 `ai-spec.md` §11 规则 64）；③ 并发 = 花钱 ⇒ 并发上限 + 预算封顶；④ 前端要能把多任务的流式输出**分栏 / 分组**，否则用户看到的是交织成一团乱的流。
 - 依赖：子代理框架（**已落地**，见 `ai-spec.md` §3.5「子代理」）+ 前端分栏 UI。区别：本项要的是**多个子代理同时跑**（`Agent` 现在是**串行**的，且 `parallel_safe` 为 `false`），所以不是「有了 `Agent` 就自动有了 A14」。
 
 **A15. 压缩策略的成本模型重估（就地瘦身多数情况净亏）**
@@ -167,7 +161,7 @@
 - **不覆盖一**：`core-agent/src/` 里的实现细节级能力（如各工具的解析细节、日志格式），按子系统归并。
 - **不覆盖二**：旧 CLI 终端渲染组件（`core/tools/**/UI.tsx`）随 Ink TUI 一并排除。
 - **不覆盖三**：Lunac 与旧 CLI **都有**的能力不再列出（例如前端依赖的 stdout 契约 `system/init` / `stream_event` / `assistant` / `user/tool_result` / `control_request` / `result` **全部已提供**；`--disallowedTools` 链路已通；思考开关跨模型自适应是**超集**——只有开 / 关两档，不要按「多档更深」扩）。
-- **口径提醒**：`session_id` 恒为 `""`、`total_cost_usd` / `num_turns` / `duration_ms` 前端零引用、`stop_reason` 未提供 —— 这几项**当前无影响**，不列为待办，改动前先确认有消费者。
+- **口径提醒**：`session_id` 自 A11（2026-09-20）起是**真值**并已接上消费者（前端随用量落盘做归因，见 `ai-spec.md` §11 规则 64）；`total_cost_usd` / `num_turns` / `duration_ms` 仍**前端零引用**、`stop_reason` 未提供 —— 这几项**当前无影响**，不列为待办，改动前先确认有消费者。
 
 ---
 
@@ -221,3 +215,5 @@
 *2026-09-20 追加（同日第十一批）：**A10（自动权限分类器 → 只读分类）已完成并从本文删除**。形态经裁决：**判据落在 agent 侧、结论随 `analysis` 下发、只改「白名单」档、保守判定**。① **解决的问题是真洞**：原先「白名单」档的自动放行靠前端一张 `BUILTIN_SAFE_PREFIXES` **前缀表**，而前缀是**字符串匹配**，看不见重定向与管道 ⇒ `echo hi > important.txt`、`cat a.txt >> b.txt` 会被「echo / cat 是安全前缀」自动放行，等于**零询问地写文件**。② **判据**：`bash_safety::is_provably_readonly`（与危险规则**同一套** `split_subcommands` / `command_word`，口径不分家），四条全过才为 `true` —— 单条命令（`;` `&` `|` 换行一律不算，保守档不逐段判定）/ 无输出重定向（`>` `>>` `>& file`；`2>&1` 这类 fd 复制先摘掉再判）/ 无包装器与命令替换 / 命令词（+ 子命令词）命中**正向白名单**。刻意**不含** `find`（`-delete`）/ `sort -o` / `uniq IN OUT` / `sed -i` / `awk` / `tee` / `xargs` 这些「看着只读、实则有写入开关」的。③ **只减询问、不加闸门**：`false` **不表示危险**，只表示「证不出来」⇒ 照常弹卡；手动档照问、自动档照放（三档语义不变），且 `dangerous` / `opaque` 非空的命令**一律**拿不到 `readonly:true`（纵深防御）。④ **前端删表**：`classifyRequest()` 改看 `analysis.readonly`，**缺字段按不放行处理**（只认显式 `true`，不回落本地前缀表）；档位提示文案由「白名单前缀自动放行」改为「只读命令自动放行」（×5 语言）。⑤ **实测**：`cargo test` core-agent **95 passed / 0 failed / 2 ignored**（新增 `readonly_classification_is_conservative`，13 组用例逐条钉住放行与不放行）、`tsc --noEmit` exit 0；**真机**（假端点 + 真 `agent.exe --permission-prompt-tool stdio`）：`git status` ⇒ `analysis.readonly=true`、`echo hi > out.txt` ⇒ `analysis.readonly=false`（连续命令那条由单测覆盖 —— harness 第三次起 stub 端口复用会卡住，属测试脚手架问题，已记在 `e2e-a10.ps1` 旁边）。契约在 `ai-spec.md` §3.5「只读分类」、纪律在 §11 规则 62，前端在 `agent-ui-spec.md` §4.2 / §9，预检在 `code-rules.md` #24。当前未落地 **6 项**（A11–A16）。*
 
 *2026-09-20 追加（同日第十二批）：**A12（本地成本面板）已完成并从本文删除**。① **价格不写进代码**是这次的定盘星：各家单价差十倍、官方还会调价，写死一个数字等于把错误金额当事实展示（用户是拿它对账的）⇒ 价格落**用户可编辑**的 `config\pricing.json`，单位**元 / 百万 token**，四类分开计价（`input` / `cache_read` / `cache_write` / `output`，字段名与用量日志一一对应），每条可带 `source_url` / `updated_at`；**刻意不预置任何价格数字**（没逐项核对过官方定价页，凭空填一行「看着很像」的数比留空糟得多）。② **算钱必须按「能拿到单价的最小粒度」分组** ⇒ 宿主新增 `read_usage_range(dates)`，一次读多天并汇总成 `UsageDay{date,turns,input,output,cacheRead,cacheCreate,models[]}`（**先按天、再按模型**；只按天合计会把两种模型的 token 混着乘一个单价）；金额在前端算（价格表用户随时会改，改完即时重算，不必再跑 IPC），**没价格的模型只标「未定价」+ 单列黄色提示、总额前缀 `≥`，绝不当 0 计**。③ **「更新价格」= agent 抓 + 面板预览确认**：面板自己没有网络也没有模型 ⇒ 注入提示词让 agent 用 `WebSearch` / `WebFetch` 查官方定价页、再用 `Write` 落**候选文件**；候选文件刻意落在 **agent 的工作目录**（`lunac-pricing.pending.json`）而**不是 `config\`** —— 配了工作区时 agent 的文件工具被硬锁在工作区内（`tools::guard()` 越界直接拒、连审批卡都没有）⇒ 写 `config\` 必然失败（**真机实测坐实**，见下）；面板列出「旧值 → 新值 / 新增 / 确认后失去价格」，用户点确认才 `commit_pricing_pending`（**先校验后覆盖**，校验不过**一个字都不写**；缺字段也算非法 —— 金额会悄悄少算一块）。④ **顺手修掉一个真 bug**：用量日志的 `model` **一直是空串** —— 前端 `let agentModel = ""` 声明了却**从未赋值**（注释还写着「来自 system/init」）⇒ 历史记录全都没有模型名。而**分模型计价正是这个面板成立的前提** ⇒ 在 `system/init` 分支补上赋值（`if (typeof data.model === "string" && data.model) agentModel = data.model`），历史空名记录在面板上显示 `—` 并计入「未定价」（如实，不猜）。⑤ **面板落位**：设置 · AI 分区的**第四块**「用量与成本」（`.settings-group-title` 3 → 4 个，回归清单已同步）：价格表状态 + 打开 / 更新两个按钮 + 候选项预览卡（`.cost-pending`）+ 汇总行 + 按天表格（新的在上），未定价单列提示；37 条 i18n key ×5 语言（含那段给 agent 的抓取提示词，**它是用户可见的一问**，同样不许硬编码中文）。⑥ **实测**：`cargo test` src-tauri **60 passed / 0 failed / 1 ignored**（新增 `usage_range_groups_by_day_and_model`（含空天跳过、驼峰字段名）与 `pricing_candidate_is_validated_before_commit`（6 组非法样本 / 拒绝时正式文件一字未改 / 确认后盖日期并删候选 / 缺候选报错））、core-agent **95 passed / 0 failed / 2 ignored**（未改动，回归通过）、`tsc --noEmit` exit 0；**真实日志**跑一次 `read_usage_range`（`usage-2026-09-17` / `-09-18` 两天：按天分片、四类 token 汇总与分模型分组均正确）；**真机端到端**（`core-agent\target\hooktest\e2e-a12.ps1`，假 Anthropic 端点 + 真 `agent.exe` + 工作区锁开：**5 条断言全过**）—— 写**工作目录内**的候选文件成功（按 JSON 读回 `input=2`），写**工作目录外**被拒（`Access denied: … outside the workspace`）⇒ 候选文件放工作目录的理由由实测坐实。契约在 `ai-spec.md` §3.5「定价表与成本面板」、纪律在 §11 规则 63，UI 在 `agent-ui-spec.md` §9（含设置面板第四块）与 §8 回归清单，预检在 `code-rules.md` #25。当前未落地 **5 项**（A11 / A13–A16）。*
+
+*2026-09-20 追加（同日第十三批）：**A11（会话 id 与 rewind）已完成并从本文删除**。形态经用户裁决：**只补真实 `session_id` + rewind 扩到任意消息 + 不动磁盘文件**。① **`session_id` 从恒为 `""` 改成真值**：agent 侧 `session_id()`（`OnceLock` 惰性生成一次，形态 `sess_<pid>_<启动时刻 epoch 毫秒>`，**不引 chrono / uuid**），**7 处 JSON 字段**不再硬编码空串 —— `system/init`、成功 `result`、`finish_error` 的 `result`、启动期错误的 `result`、`hook_blocked` 的 `result`、`hook_tool_payload`、`fire_plain_hook`；**另有 1 行启动日志** `[agent] P1–P4 就绪 session=…`。它的语义是**一次 agent 运行**（不是一段对话）：宿主每次重启 agent（换模型 / 换思考档 / 换工作区 / 回退取消流式）就是新 id —— 上下文仍由 `set_history` 灌（规则 30），它**只做归因**（stdout、agent 落盘日志、前端用量记录三者从此对得上）。刻意**不把 session 塞进 `task_id`**（那要进模型可见的回灌文本，短才好读 —— 规则 54 约束② 原写「`session_id` 恒为 `""` 所以只能靠计数器归因」，本轮一并收敛为「跨运行归因靠 session、进程内归因靠计数器」）。② **前端接上消费者**：`system/init` 分支与 `model` 同一处记下 `agentSessionId`（`agentModel` 上一批才补过赋值，两处是同一类漏洞），随每次提问写进 `usage-*.jsonl` 的 `sessionId`（`UsageRecord` 加 `#[serde(rename="sessionId", default, skip_serializing_if="String::is_empty")]` —— 旧记录读成空串、空值不写键，**对账口径仍是 `ts` + `model`**）；**界面刻意不显示它**（它是排查用的归因标签，不是用户要看的状态）。③ **回退点从「用户轮」扩到任意消息**：`attachMsgActions` 重构为「复制所有气泡都有 / 回退只要消息还在会话里 / 重试只对用户提问成立」，助手气泡因此也挂回退按钮；实时对话里助手回复不是独立气泡（它渲染在 `agent-flow` 里），入口放在**回合页脚**（`.turn-rollback`，与旁边的「展开/收起」同族样式）。**仍不做**文件内容历史快照 —— 回退**只动对话与 agent 上下文**，按钮 title 与回退后的状态行都如实写明「磁盘上已改动的文件不会还原」。④ **顺手修掉一个既有真 bug（长对话必然踩）**：气泡上的 `data-idx` 是**渲染那一刻**的下标，而 `pruneContext()` 每回合从**队首**丢消息（12 轮上限）⇒ 丢 N 条后所有先前渲染的气泡都偏大 N，**回退会切错消息**、**复制会复制错**（`copyMsgText` 去取 `chatHistory[idx]` 的原文）。落地 `shiftRenderedMsgIdx(dropped)`：裁剪后把已渲染气泡 / 回合回退按钮的下标一起前移，并把**已被裁掉**的气泡（新下标 < 0）的回退 / 重试按钮摘掉（那消息已不在会话里，复制退化成按气泡文本复制）。⑤ **删掉一处「撒谎的死代码」**：`rollbackChat` 原先把整段历史快照写进 `localStorage` 的 `lunac-rollback-snapshots` 并注释「so the operation is reversible (no data loss)」，而**全仓没有读取方**（纯占配额）—— 删除，注释改成实话（回退**不可撤销**：裁剪后的会话立刻全删全插写回 `chat.db`）。⑥ **实测**：`cargo test` core-agent **96 passed / 0 failed / 2 ignored**（新增 `session_id_is_real_and_stable`）、src-tauri **61 passed / 0 failed / 1 ignored**（新增 `usage_record_session_id_is_backward_compatible`，并把 `usage_record_json_shape` 的逐字节断言更新为含 `sessionId`）、`tsc --noEmit` exit 0、`npm run build` 通过；**真机端到端**（`core-agent\target\hooktest\e2e-a11.ps1`，假 Anthropic 端点 + 真 `agent.exe`：**6 条断言全过**）—— `system/init` 的 id 形态合法、**pid 段 = 本次进程 pid**、毫秒段是可信时间戳、`result` 行同一 id、stderr 启动行同一 id、stdout 里**没有** `"session_id":""`（旧行为）。契约在 `ai-spec.md` §3.5「会话 id 与 rewind」、纪律在 §11 规则 64（六条不得回退），UI 在 `agent-ui-spec.md` §2 对照表 / §9（字段登记）与 §8 回归清单，预检在 `code-rules.md` #27（新增：DOM 里的下标必须跟着数据裁剪前移；回退类能力只承诺做得到的）。当前未落地 **4 项**（A13–A16）。*

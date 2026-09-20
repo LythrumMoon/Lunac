@@ -62,7 +62,7 @@
 | 高危命令拦截 | **采用**（已有 `CMD_BLACKLIST`） | 补「拦截原因」在卡片上的可读展示 |
 | 代码变更接受/拒绝 + DiffView | **暂不做**（评估项） | 需要后端回传 diff 或前端重算，改动面大于阶段 1/2 ⇒ 登记为 [backlog](./agent-feature-backlog.md) **U1** |
 | 会话 Fork / 分享 | **不做** | Lunac 是本地单机工具，分享链路与产品定位不符；Fork 收益低 |
-| 恢复到 N 回合前 | **已有**（`.msg-rollback`） | 保持现状，不扩 |
+| 回退到任意消息 | **已扩（A11，2026-09-20）** | 原决策是「已有，保持现状，不扩」（只到**用户轮**）。用户 2026-09-20 明确改为**扩到任意消息**：助手气泡也能当回退点、实时回合在页脚（`.turn-rollback`）给入口、被上下文裁剪丢掉的老气泡只留复制。**仍不做**文件内容快照 —— 回退只动对话与 agent 上下文，界面文案如实写明「磁盘上已改动的文件不会还原」（ai-spec §11 规则 64） |
 | 多轮缩略导航 | **P2** | 与现有历史抽屉职责重叠，先做抽屉增强 |
 | 语音输入 / 优化输入内容 | **不做** | 需要云端能力或额外模型调用 |
 | 文件/图片上下文 | **已有** | 搜索栏气泡 + 聊天输入栏复用，保持现状 |
@@ -351,6 +351,7 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 - [ ] **中性叠加 / 凹陷层全部走 token**（ai-spec §11 规则 48，2026-09-19 批 6）：`rgba(255, 255, 255, α)` → `rgba(var(--ink-rgb), α)`、`rgba(0, 0, 0, α)` → `rgba(0, 0, 0, calc(α * var(--shade-scale)))`，两类的剩余出现次数必须为 0（例外只允许三处：取色器相关的彩虹/黑白渐变与 `.ap-sv-cursor` 描边、语义红绿、`--glass-sheen-image` 的玻璃反光白高光）。实测口径：主色换成**浅色**（如 `#ffffff`）后，`--ink-rgb` 必须变 `0, 0, 0`、`--shade-scale` 变 `0.35`，且各 hover 底色仍然可见（不能「白叠白」等于没画）。
 - [ ] **插件/面板/菜单/抽屉/下拉的底色不得硬编码**（ai-spec §11 规则 48）：`#chat-more-menu`（更多设置菜单）、`#chat-drawer`（历史记录抽屉）、`.custom-select-dropdown`（AI 模型下拉）必须走 `var(--surface-glass)`；全工程不得再出现 `rgba(28, 26, 32` / `rgba(24,24,37` / `#1c1a20` 这类常量底色。实测口径：换主色后这三块的 `background-color` 必须跟着变。
 - [ ] **顶层插件面板不自加压暗**（ai-spec §11 规则 48 末条）：OCR 的 `.ocr-image-panel` / `.ocr-text-panel` 必须 `background: transparent`（与 memo 的 `.plugin-result` 一致，实测同为 `rgba(0,0,0,0)`），左右分栏靠 `border-right`；`rgba(0, 0, 0, calc(α * var(--shade-scale)))` 只允许出现在**嵌套**的次级块（输入框 / 工具卡 / 弹层 / 遮罩）上。
+- [ ] **回退按钮的位置与边界**（ai-spec §11 规则 64，2026-09-20 A11）：用户气泡 = 复制 + 回退 + 重试；**助手气泡 = 复制 + 回退**（任意消息都是合法回退点）；实时对话里助手回复不是独立气泡，入口在 `.turn-footer` 里的 `.turn-rollback`。回退文案（`.msg-rollback` 的 title 与回退后的状态行）**必须**写明「只回退对话，磁盘上已改动的文件不会还原」。**被 `pruneContext` 裁剪掉的老气泡只剩复制**（`shiftRenderedMsgIdx` 摘掉回退 / 重试）。回归口径：连问 13 轮以上让裁剪真的发生，点**最早那条仍有回退按钮**的气泡 → 重绘后的气泡数必须与保留的历史条数相等（不偏不差；此前 `data-idx` 不随裁剪前移，会切错消息）。
 - [ ] **控件文案里没有 emoji**（ai-spec §11 规则 49 + `icon-style.md` §4.1，2026-09-19 批 8）：按钮标签 / 状态行 / 占位提示一律「纯文字」或「线性 SVG + 文字」，不得出现 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ …` / `⏳ …` / `✅ …` / `❌ …`。**允许保留**：列表项 / 条目图标（`.clip-item-icon` 📁📋、`.history-item-icon` 💬、`.file-chip-icon` 📦📎、`plugin.icon`、`item.icon`、TODO 头 📋、tool-editor 🔧、web-search 引擎图标）与单色状态符号（`✓ ✗ ⚠ ✔ ◐ ○ ✕ ×`）。回归口径：对插件面板做一次「叶子节点 textContent 命中 emoji 正则」扫描，计数应为 0（列表项图标节点除外）。
 - [ ] **设置侧栏五项 + 分类归属正确**（ai-spec §11 规则 50）：侧栏**恰好**「常规 / 风格 / AI / 搜索 / 插件」五项（无独立「技能扩展」）；`#sp-ai` 内 `.settings-group-title` 恰好 4 个（AI 模型 / 技能 (Skill Store) / 工具 (MCP) / 用量与成本 —— 第四块 2026-09-20 由 A12 加入），且 `#settings-save-ai-btn` / `#settings-skill-install-url-btn` / `#settings-tool-url` / `#settings-open-tools` 全部落在 `#sp-ai` 作用域内；`#sp-plugins` 内是插件总览（`.settings-plugin-item` 数量 == `pluginRegistry.getAll().length`，每行「打开」按钮），且 `#settings-tool-url` **不在** `#sp-plugins` 内（tools 与插件必须分开）。
 - [ ] **插件名/描述已本地化**（ai-spec §11 规则 50）：结果区插件行、右键「运行 X」、详细搜索 commands 行、插件总览四处都走 `pluginName()` / `pluginDesc()`；把语言切到 `zh-CN` 后这些位置**不得出现英文常量**（`Custom Launch` / `Web Search` / `Search the web with your default browser`…）。新增插件必须同时补 `plugin.<id>` 与 `plugin.<id>.desc` 五语言。
@@ -381,6 +382,7 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   | `attempt` / `max_retries` / `error_status` | `system/api_retry` | 瞬时失败重试 | 状态行文案（ai-spec §11 规则 25） |
   | `usage.requests[]` = `{in, read, create, out}` | `result.usage` | **每次 API 请求**的用量明细（顺序 = 请求顺序） | 前端**只落盘**（写进 `usage-*.jsonl` 的 `requests` 数组，与 DeepSeek 平台用量页逐行对账）；表盘口径不变（仍按每次提问累加）。**缺字段时写空数组**，`UsageRecord.requests` 为空则不写该键（旧记录兼容）。见 ai-spec §3.5「用量与对账」 |
   | `state`（`on` / `off`）+ `reason` | `system/plan_mode` | **计划相位**的广播（A7）：模型调 `EnterPlanMode` ⇒ `on`（`reason` = 模型给用户的一句话）；`ExitPlanMode` **被批准** ⇒ `off`。ai-spec §3.5「计划模式闭环」/ §11 规则 59 | 单例横幅 `.plan-mode-note`：`on` 时 `--yellow`，`off` 落回中性色；**agent 重启（`cli-status: starting`）要清掉** —— 相位是进程内状态，随进程消失。**不许**由前端拿工具调用自己推断状态 |
+  | `session_id` | `system/init`（同一个值也出现在 `result` 与 hook payload 上） | 本次 **agent 运行** 的 id（A11）：`sess_<pid>_<启动时刻 epoch 毫秒>`，进程内恒定。语义是「一次运行」而非「一段对话」。ai-spec §3.5「会话 id 与 rewind」/ §11 规则 64 | 在 `system/init` 分支与 `model` 同一处记下（`agentSessionId`），随每次提问的用量写进 `usage-*.jsonl` 的 `sessionId` —— **只做归因**（对上 agent 落盘日志与 stdout），**界面不显示**。缺字段（旧 agent）⇒ 空串，写用量时不写该键 |
 
 - **计划卡不新增字段**（A7）：`ExitPlanMode` 复用既有的 `can_use_tool` 通道，整份计划就在 `request.input.plan` 里 —— 卡片按 §3.6 的骨架渲染，正文用 `textContent` 原样铺开（**不做 markdown 渲染、不用 `innerHTML`**：那是模型生成的任意文本）。批准时前端另调 `save_plan_md(stamp, plan)` 落档 `ModuleData\plans\`（失败只提示，不挡执行）。
 - **图片附件走 stdin 的 `image` 块，不动 stdout 契约**（A8）：前端只多传一个 `{"type":"image","source":{"type":"file","path":"…"}}` 内容块（契约见 ai-spec §3.5「图片附件」/ §11 规则 60）；agent 回报的是下面这条 **`system/attachment_note`**，前端渲染成一条黄色 `.sys-note-warn`（i18n `agent.attachment_skipped`，正文逐条「路径 — 原因」）。**没有事件 = 全部发出去了**，不需要画任何东西；`skipped` 为空数组时按无事件处理。
