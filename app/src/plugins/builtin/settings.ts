@@ -1049,7 +1049,7 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
  *  风格里的分块一样」—— 所以三块都用 .settings-group-title（与「风格」的
  *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。 */
 async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean, hooksEnabled: boolean, hooksError: string): Promise<string> {
-  const [skillsHtml, toolsHtml] = await Promise.all([buildSkillsSection(), buildToolsSection()]);
+  const [skillsHtml, toolsHtml, costHtml] = await Promise.all([buildSkillsSection(), buildToolsSection(), buildUsageCostSection()]);
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
@@ -1059,7 +1059,365 @@ async function buildAIPane(provider: string, baseUrl: string, model: string, api
       ${skillsHtml}
       <div class="settings-group-title">${t("settings.group_tools")}</div>
       ${toolsHtml}
+      <div class="settings-group-title">${t("settings.cost_title")}</div>
+      ${costHtml}
     </div>`;
+}
+
+// ── 用量与成本（A12）──────────────────────────────────────────────
+//
+// 面板只做三件事：把**本地用量日志**按天汇总、按 `config\pricing.json` 里的单价算钱、
+// 以及**确认 agent 抓回来的候选价格**。三条纪律：
+//  ① 价格不写进代码。各家单价差十倍、官方还会调价，写死一个数字等于把错误金额当事实
+//     展示；价格表是用户可编辑的文件，面板只读它。
+//  ② 「更新价格」不由面板自己抓（它没有网络能力也没有模型），而是把任务交给 agent；
+//     agent 只能写**候选文件**，面板上列出「旧值 → 新值」，用户点确认才覆盖正式价格。
+//  ③ 金额一律在前端算：价格表是用户随时会改的，改完即时重算，不必再跑一趟 IPC。
+
+/** 汇总区间（天）。日志按天分片，这里是 30 个文件、一次 IPC 读完（`read_usage_range`）。 */
+const COST_RANGE_DAYS = 30;
+
+interface UsageModelTotals {
+  model: string;
+  turns: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+}
+interface UsageDay {
+  date: string;
+  turns: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+  models: UsageModelTotals[];
+}
+interface PricingEntry {
+  input?: number;
+  cache_read?: number;
+  cache_write?: number;
+  output?: number;
+  source_url?: string;
+  updated_at?: string;
+}
+interface PricingFile {
+  updated_at?: string;
+  models?: Record<string, PricingEntry>;
+}
+interface PricingState {
+  path: string;
+  text: string;
+  pendingPath: string;
+  pendingText: string;
+}
+
+/** 本地日期 `YYYY-MM-DD`（与 main.ts 的用量日志分片键同一套口径） */
+function costDateKey(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 近 n 天的本地日期，升序（宿主按同样的顺序读回来） */
+function lastNDates(n: number): string[] {
+  const today = new Date();
+  const out: string[] = [];
+  for (let i = n - 1; i >= 0; i--) {
+    out.push(costDateKey(new Date(today.getFullYear(), today.getMonth(), today.getDate() - i)));
+  }
+  return out;
+}
+
+function parsePricing(text: string): PricingFile | null {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return null;
+  try {
+    const v = JSON.parse(trimmed) as PricingFile;
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null; // 语法坏 = 没有价格（面板按「未定价」处理，不去猜）
+  }
+}
+
+function priceOf(pricing: PricingFile | null, model: string): PricingEntry | null {
+  const e = pricing?.models?.[model];
+  return e && typeof e === "object" ? e : null;
+}
+
+/** 一天的金额。**必须逐模型算**：一天里换过模型的话，只按天合计就把两个模型的量
+ *  混在一起了（单价差十倍）。`exact=false` 表示这天有模型没价格，金额只是已知部分 ——
+ *  面板要如实标出来，不要假装它是个准确值。 */
+function dayCost(day: UsageDay, pricing: PricingFile | null): { amount: number; exact: boolean } {
+  let amount = 0;
+  let exact = true;
+  for (const m of day.models) {
+    const p = priceOf(pricing, m.model);
+    if (!p) {
+      exact = false;
+      continue;
+    }
+    amount += (
+      (m.input || 0) * (p.input || 0)
+      + (m.cacheRead || 0) * (p.cache_read || 0)
+      + (m.cacheCreate || 0) * (p.cache_write || 0)
+      + (m.output || 0) * (p.output || 0)
+    ) / 1e6;
+  }
+  return { amount, exact };
+}
+
+/** 金额显示：单价是「元 / 百万 token」，单次提问常常只有几厘 —— 太小就多给两位小数，
+ *  否则一律显示 0.00，等于把「花了很少」和「没花钱」显示成同一个样子。 */
+function fmtMoney(v: number): string {
+  if (!(v > 0)) return "0.00";
+  return v < 0.01 ? v.toFixed(4) : v.toFixed(2);
+}
+
+/** token 数显示（表格里用 k / M 缩写，与主界面表盘同风格） */
+function fmtTokenCount(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+  return String(n);
+}
+
+/** 模型名显示：早期用量日志的模型名是空的（前端当时没记），显示成 `—` 而不是空单元格
+ *  —— 空名字看起来像渲染坏了，而它确实会被算进「未定价」。 */
+function modelLabel(model: string): string {
+  return model ? model : "—";
+}
+
+/** 「旧值 → 新值」逐行列出候选价格。**只列变化的**（没变的模型不占版面），
+ *  另外单列「新增」与「确认后失去价格」两类 —— 后者是整体覆盖的必然结果，
+ *  不写出来用户会以为旧价格还在。 */
+function pricingPreviewRows(current: PricingFile | null, next: PricingFile): string {
+  const fields: { key: keyof PricingEntry; label: string }[] = [
+    { key: "input", label: t("settings.cost_col_input") },
+    { key: "cache_read", label: t("settings.cost_col_hit") },
+    { key: "cache_write", label: t("settings.cost_col_write") },
+    { key: "output", label: t("settings.cost_col_output") },
+  ];
+  const num = (e: PricingEntry | null, k: keyof PricingEntry): number | null =>
+    e && typeof e[k] === "number" ? (e[k] as number) : null;
+
+  const rows: string[] = [];
+  const nextModels = next.models || {};
+  const curModels = current?.models || {};
+
+  for (const [model, entry] of Object.entries(nextModels)) {
+    const old = curModels[model] ?? null;
+    const parts: string[] = [];
+    if (!old) {
+      for (const f of fields) {
+        const v = num(entry, f.key);
+        if (v !== null) parts.push(`${f.label} ${v}`);
+      }
+    } else {
+      for (const f of fields) {
+        const a = num(old, f.key);
+        const b = num(entry, f.key);
+        if (a === null || b === null || a === b) continue;
+        parts.push(`${f.label} ${a} → ${b}`);
+      }
+    }
+    const badge = old ? "" : ` <span class="cost-new">${t("settings.cost_pending_added")}</span>`;
+    const src = entry.source_url ? `<div class="cost-src">${esc(entry.source_url)}</div>` : "";
+    const cell = parts.length
+      ? esc(parts.join(" · "))
+      : `<span class="cost-src">—</span>`;
+    rows.push(`<tr><td>${esc(modelLabel(model))}${badge}${src}</td><td>${cell}</td></tr>`);
+  }
+  for (const model of Object.keys(curModels)) {
+    if (!(model in nextModels)) {
+      rows.push(
+        `<tr><td>${esc(modelLabel(model))}</td><td><span class="cost-warn">${t("settings.cost_pending_removed")}</span></td></tr>`
+      );
+    }
+  }
+  return rows.join("");
+}
+
+/** 「用量与成本」分块（内层容器在确认 / 放弃后会整体重渲染，见 wireUsageCost） */
+async function buildUsageCostSection(): Promise<string> {
+  return `<div id="settings-usage-cost">${await renderUsageCostBody()}</div>`;
+}
+
+async function renderUsageCostBody(): Promise<string> {
+  let state: PricingState | null = null;
+  try {
+    state = await invoke<PricingState>("get_pricing_state");
+  } catch {}
+  let days: UsageDay[] = [];
+  try {
+    days = await invoke<UsageDay[]>("read_usage_range", { dates: lastNDates(COST_RANGE_DAYS) });
+  } catch {}
+
+  const pricing = state ? parsePricing(state.text) : null;
+  const pending = state ? parsePricing(state.pendingText) : null;
+  const models = pricing?.models || {};
+  const hasPrices = Object.keys(models).length > 0;
+
+  const totals = { turns: 0, input: 0, hit: 0, write: 0, output: 0, amount: 0, exact: true };
+  const unpriced = new Set<string>();
+  for (const d of days) {
+    totals.turns += d.turns;
+    totals.input += d.input;
+    totals.hit += d.cacheRead;
+    totals.write += d.cacheCreate;
+    totals.output += d.output;
+    const c = dayCost(d, pricing);
+    totals.amount += c.amount;
+    if (!c.exact) totals.exact = false;
+    for (const m of d.models) if (!priceOf(pricing, m.model)) unpriced.add(m.model);
+  }
+  const hitRate = totals.hit + totals.input > 0
+    ? Math.round((totals.hit / (totals.hit + totals.input)) * 100)
+    : 0;
+
+  const summary = days.length === 0
+    ? `<div class="settings-hint">${t("settings.cost_no_usage", { days: String(COST_RANGE_DAYS) })}</div>`
+    : `<div class="cost-summary">${t("settings.cost_summary", {
+        days: String(COST_RANGE_DAYS),
+        turns: String(totals.turns),
+        input: fmtTokenCount(totals.input),
+        hit: fmtTokenCount(totals.hit),
+        write: fmtTokenCount(totals.write),
+        output: fmtTokenCount(totals.output),
+        rate: String(hitRate),
+        cost: hasPrices ? `${totals.exact ? "" : "≥ "}¥${fmtMoney(totals.amount)}` : "—",
+      })}</div>`;
+
+  const unpricedNote = unpriced.size > 0
+    ? `<div class="settings-hint cost-warn">${esc(t("settings.cost_unpriced", { models: [...unpriced].map(modelLabel).join(", ") }))}</div>`
+    : "";
+
+  const head = `<tr>${[
+    "settings.cost_col_date",
+    "settings.cost_col_turns",
+    "settings.cost_col_input",
+    "settings.cost_col_hit",
+    "settings.cost_col_write",
+    "settings.cost_col_output",
+    "settings.cost_col_amount",
+  ].map(k => `<th>${t(k)}</th>`).join("")}</tr>`;
+
+  // 新的在上：看用量几乎总是先看最近几天
+  const body = days.slice().reverse().map(d => {
+    const c = dayCost(d, pricing);
+    const amount = !hasPrices ? "—" : `${c.exact ? "" : "≥ "}¥${fmtMoney(c.amount)}`;
+    return `<tr><td>${d.date}</td><td>${d.turns}</td><td>${fmtTokenCount(d.input)}</td>` +
+      `<td>${fmtTokenCount(d.cacheRead)}</td><td>${fmtTokenCount(d.cacheCreate)}</td>` +
+      `<td>${fmtTokenCount(d.output)}</td><td>${amount}</td></tr>`;
+  }).join("");
+
+  const status = hasPrices
+    ? t("settings.cost_updated_at", { date: pricing?.updated_at || "—" })
+    : t("settings.cost_empty");
+
+  const pendingBlock = pending ? `
+    <div class="cost-pending">
+      <div class="cost-pending-title">${t("settings.cost_pending_title")}</div>
+      <table class="cost-table"><tbody>${pricingPreviewRows(pricing, pending)}</tbody></table>
+      <div class="settings-row">
+        <button type="button" class="settings-btn" id="settings-cost-confirm">${t("settings.cost_confirm")}</button>
+        <button type="button" class="settings-btn" id="settings-cost-discard">${t("settings.cost_discard")}</button>
+      </div>
+      <div class="settings-hint">${esc(t("settings.cost_pending_hint", { path: state?.pendingPath || "" }))}</div>
+    </div>` : "";
+
+  return `
+    <div class="settings-row">
+      <button type="button" class="settings-btn" id="settings-cost-open">${t("settings.cost_open")}</button>
+      <button type="button" class="settings-btn" id="settings-cost-update">${t("settings.cost_update")}</button>
+      <span class="settings-hint" id="settings-cost-msg" style="margin-left:8px;"></span>
+    </div>
+    <div class="settings-hint" title="${esc(state?.path || "")}">${esc(status)}</div>
+    <div class="settings-hint">${esc(t("settings.cost_hint"))}</div>
+    ${pendingBlock}
+    ${summary}
+    ${unpricedNote}
+    ${days.length > 0 ? `<table class="cost-table"><thead>${head}</thead><tbody>${body}</tbody></table>` : ""}`;
+}
+
+/** 绑定「用量与成本」分块里的按钮。分块内部重渲染之后**必须再调一次**
+ *  （旧节点已被替换，原来绑的监听器随之失效）。 */
+function wireUsageCost(container: HTMLElement): void {
+  const openBtn = container.querySelector("#settings-cost-open") as HTMLButtonElement | null;
+  const updateBtn = container.querySelector("#settings-cost-update") as HTMLButtonElement | null;
+  // 提示文字每次现查节点：重渲染会把 `#settings-cost-msg` 整个换掉
+  const showMsg = (text: string) => {
+    const el = container.querySelector("#settings-cost-msg") as HTMLElement | null;
+    if (el) el.textContent = text;
+  };
+  const refresh = async () => {
+    const box = container.querySelector("#settings-usage-cost") as HTMLElement | null;
+    if (!box) return;
+    box.innerHTML = await renderUsageCostBody();
+    wireUsageCost(container);
+  };
+
+  openBtn?.addEventListener("click", async () => {
+    try {
+      // 缺文件时后端先落一份空骨架再返回路径；真正的「打开」交给前端 `open()`
+      await open(await invoke<string>("pricing_file_path"));
+    } catch (e) {
+      showMsg(t("settings.cost_failed", { err: String(e) }));
+    }
+  });
+
+  updateBtn?.addEventListener("click", async () => {
+    try {
+      // 「只读」档位下 agent 连 Write 都过不去（见 tools::write_blocked）——
+      // 与其发一条注定失败的提示词，不如在这里说清楚为什么
+      if ((localStorage.getItem("lunac-security-profile") || "project") === "safe") {
+        showMsg(t("settings.cost_safe_mode"));
+        return;
+      }
+      const st = await invoke<PricingState>("get_pricing_state");
+      // 要让 agent 查的模型 = 有用量记录的模型 + 当前配置的模型（还没用过就也该有价格）
+      const wanted = new Set<string>();
+      const days = await invoke<UsageDay[]>("read_usage_range", { dates: lastNDates(COST_RANGE_DAYS) });
+      for (const d of days) for (const m of d.models) wanted.add(m.model);
+      try {
+        const cfg = await invoke<{ model?: string }>("get_ai_config");
+        if (cfg?.model) wanted.add(cfg.model);
+      } catch {}
+      if (wanted.size === 0) {
+        // 一个模型名都报不出来（没用量记录、也没配模型）→ 发出去只会让 agent 空转
+        showMsg(t("settings.cost_no_usage", { days: String(COST_RANGE_DAYS) }));
+        return;
+      }
+      const prompt = t("settings.cost_fetch_prompt", {
+        models: [...wanted].map(m => `- ${m}`).join("\n"),
+        path: st.pendingPath,
+      });
+      // 设置面板不能自己发消息（那要动结果区状态，是主界面的职责）—— 走 main.ts 的桥
+      await (window as any).__lunac_agent_task?.(prompt);
+      showMsg(t("settings.cost_sent"));
+    } catch (e) {
+      showMsg(t("settings.cost_failed", { err: String(e) }));
+    }
+  });
+
+  container.querySelector("#settings-cost-confirm")?.addEventListener("click", async () => {
+    try {
+      await invoke("commit_pricing_pending", { today: costDateKey(new Date()) });
+      await refresh();
+      showMsg(t("settings.cost_committed"));
+    } catch (e) {
+      showMsg(t("settings.cost_failed", { err: String(e) }));
+    }
+  });
+
+  container.querySelector("#settings-cost-discard")?.addEventListener("click", async () => {
+    try {
+      await invoke("discard_pricing_pending");
+      await refresh();
+      showMsg(t("settings.cost_discarded"));
+    } catch (e) {
+      showMsg(t("settings.cost_failed", { err: String(e) }));
+    }
+  });
 }
 
 // ── Skill Store (技能扩展) ─────────────────────────────────────
@@ -1448,6 +1806,60 @@ export async function attachSettingsListeners(container: HTMLElement) {
         background: rgba(var(--ink-rgb), 0.12);
         color: var(--text);
       }
+      /* ── 用量与成本（A12）────────────────────────────────────────
+         数字一律右对齐、用等宽字体：金额与 token 是拿来逐行比对的，
+         比例字体下位数对不齐就看不出「哪天异常」。 */
+      .cost-summary {
+        padding: 2px 0 8px;
+        font-size: 0.72rem;
+        line-height: 1.5;
+        color: var(--text);
+      }
+      .cost-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.7rem;
+        font-variant-numeric: tabular-nums;
+      }
+      .cost-table th {
+        text-align: right;
+        font-weight: 400;
+        padding: 3px 4px;
+        color: var(--text-dim);
+        border-bottom: 1px solid var(--border-glass);
+      }
+      .cost-table td {
+        text-align: right;
+        padding: 3px 4px;
+        color: var(--text-dim);
+      }
+      .cost-table th:first-child,
+      .cost-table td:first-child {
+        text-align: left;
+        color: var(--text);
+      }
+      /* 待确认的候选价格：与正式价格**在视觉上分开**，避免用户以为已经写进去了 */
+      .cost-pending {
+        margin: 4px 0 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--accent-border);
+        border-radius: 8px;
+        background: var(--accent-bg);
+      }
+      .cost-pending-title {
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--text);
+        margin-bottom: 4px;
+      }
+      .cost-src {
+        font-size: 0.62rem;
+        color: var(--text-dim);
+        opacity: 0.75;
+        word-break: break-all;
+      }
+      .cost-new { color: var(--accent); font-size: 0.62rem; }
+      .cost-warn { color: var(--yellow); }
       .settings-select {
         flex: 1;
         max-width: 220px;
@@ -2570,6 +2982,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
       if (id) (window as any).__lunac_open_plugin?.(id);
     });
   });
+
+  // ── 用量与成本（A12）─────────────────────────────────────────
+  // 分块自己会重渲染（确认 / 放弃候选价格之后），所以绑定的入口是个函数，
+  // 重渲染完它会再调自己一次。
+  wireUsageCost(container);
 
   // ── AI 安全档位（文件边界）─────────────────────────────────────
   // 单独一个下拉，不跟 provider/model 那条保存链路混：切换立即生效（会重启 agent）。

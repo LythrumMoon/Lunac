@@ -13,7 +13,9 @@
 //     模型写的临时/草稿文件落在这里 —— 以前回退用户主目录，会堆到 C:\Users\<名> 根下，
 //     见 commands.rs 的 default_work_dir() 与 ai-spec §11 规则 34）
 //   - <exe_dir>\temp\logs、<exe_dir>\temp\tool-outputs（落盘日志与超长工具输出，见 log.rs）
-//   - <exe_dir>\skills、<exe_dir>\tools、<exe_dir>\config、<exe_dir>\paddle-ocr
+//   - <exe_dir>\skills、<exe_dir>\tools、<exe_dir>\paddle-ocr
+//   - <exe_dir>\config（ai.json 凭据 / hotkey.json 热键 / hooks.json 权限 hooks /
+//     pricing.json 定价表 —— 都是「应用配置」，业务数据才进 ModuleData）
 // 旧版本数据曾放在 %LOCALAPPDATA%\Lunac(-dev)，首次启动由
 // migrate_legacy_localappdata() 整体搬移后删除。
 
@@ -136,6 +138,140 @@ pub fn ensure_hooks_file() -> Result<PathBuf, String> {
         save_hooks_text("{\n  \"enabled\": true,\n  \"hooks\": {}\n}\n")?;
     }
     Ok(path)
+}
+
+// ── 定价表（`config\pricing.json`，A12）────────────────────────────
+//
+// 成本面板要显示「花了多少钱」，但**价格不能写进代码**：各家单价差十倍以上、官方
+// 还会调价，写死一个数字等于把错误金额当事实展示（用户拿它对账时会得出错误结论）。
+// 所以价格是**用户可编辑的配置文件**；面板上的「更新价格」按钮由 agent 去抓官方
+// 定价页来填 —— 但结果**只在面板上预览（旧值 → 新值），用户点确认才落盘**。
+//
+// **单位：元 / 百万 token**，四类分别计价，字段名与 usage 日志的四类 token 一一对应：
+//   `input`       未命中缓存的输入（miss）
+//   `cache_read`  命中缓存的输入（hit）
+//   `cache_write` 缓存写入
+//   `output`      输出
+// 每条另带 `source_url` / `updated_at`，面板上显示「这个数字是从哪来的、什么时候取的」
+// —— 价格是会过期的数据，必须能回答「它是哪来的」。
+
+pub fn pricing_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("pricing.json")
+}
+
+/// 读 pricing.json 的原文；文件不存在返回 `Ok(None)`。
+pub fn load_pricing_text() -> Result<Option<String>, String> {
+    let path = pricing_config_path();
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读不出 {}：{e}", path.display())),
+    }
+}
+
+pub fn save_pricing_text(text: &str) -> Result<(), String> {
+    let path = pricing_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+}
+
+/// 缺文件时落一份**空骨架**（`models` 为空表）。
+///
+/// 刻意**不预置任何价格数字**：本仓没有逐项核对过各家官方定价页，凭空填一行
+/// 「看起来很像」的数会被用户当成事实拿去对账 —— 那比留空更糟。空表时面板显示
+/// 「未设置价格」并引导点「更新价格」；填过价格的模型才参与金额计算。
+pub fn ensure_pricing_file() -> Result<PathBuf, String> {
+    let path = pricing_config_path();
+    if !path.exists() {
+        save_pricing_text("{\n  \"updated_at\": \"\",\n  \"models\": {}\n}\n")?;
+    }
+    Ok(path)
+}
+
+/// 候选价格文件：agent 抓完官方定价页只能写这里，**不能直接改 `pricing.json`** ——
+/// 用户在面板上看完「旧值 → 新值」并点确认之后，宿主才覆盖正式文件（A12 的预览确认）。
+///
+/// **为什么落在 agent 的工作目录**（而不是 `config\`）：配了工作区时 agent 的文件工具
+/// 被**硬锁**在工作区内（core-agent `tools::guard()`，越界直接拒绝、连审批卡都没有），
+/// 写 `config\` 必然失败；放在工作目录里则无论锁不锁都写得进去。文件名固定且醒目，
+/// 确认或放弃后立即删除。
+pub fn pricing_pending_path(workdir: &Path) -> PathBuf {
+    workdir.join("lunac-pricing.pending.json")
+}
+
+/// 读候选价格原文；文件不存在返回 `Ok(None)`。
+pub fn load_pricing_pending_text(workdir: &Path) -> Result<Option<String>, String> {
+    let path = pricing_pending_path(workdir);
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读不出 {}：{e}", path.display())),
+    }
+}
+
+/// 删除候选价格文件（不存在视为已删除）。
+pub fn clear_pricing_pending(workdir: &Path) -> Result<(), String> {
+    let path = pricing_pending_path(workdir);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("删不掉 {}：{e}", path.display())),
+    }
+}
+
+/// 校验一份定价表文本 —— **用户手写的文件与 agent 抓来的候选走同一处**。
+///
+/// 底线只有三条：顶层是对象 / `models` 是对象 / 每个模型的四类价格都存在且是**非负数字**。
+/// 之所以连「缺字段」也算错：少一个字段在面板上的表现是「这个模型的金额悄悄少算一块」，
+/// 比当场判非法难查得多。未知字段一律忽略（用户想加注释字段随他）。
+pub fn validate_pricing_text(text: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("语法错误：{e}"))?;
+    let obj = v.as_object().ok_or("顶层必须是一个对象")?;
+    let models = match obj.get("models") {
+        // 允许「只有 updated_at、还没有任何价格」的过渡态（骨架就是这样）
+        None => return Ok(()),
+        Some(m) => m.as_object().ok_or("`models` 必须是一个对象")?,
+    };
+    for (name, entry) in models {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| format!("模型 `{name}` 的值必须是一个对象"))?;
+        for field in ["input", "cache_read", "cache_write", "output"] {
+            let num = entry
+                .get(field)
+                .ok_or_else(|| format!("模型 `{name}` 缺少 `{field}`"))?
+                .as_f64()
+                .ok_or_else(|| format!("模型 `{name}` 的 `{field}` 必须是数字"))?;
+            if !num.is_finite() || num < 0.0 {
+                return Err(format!("模型 `{name}` 的 `{field}` 必须是非负数字"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把候选价格落成正式的 `pricing.json`：**先校验、后覆盖**，成功后删掉候选文件。
+///
+/// `today` 由前端给（`YYYY-MM-DD`，本地日期，与用量日志同一套口径 —— Rust 侧没有
+/// chrono）。顶层 `updated_at` 由宿主在落盘这一刻盖上：它表示「这份文件什么时候写进去的」，
+/// **不是**「官方什么时候调的价」；后者只能靠每个模型的 `source_url` 让用户自己核。
+pub fn commit_pricing_pending(workdir: &Path, today: &str) -> Result<PathBuf, String> {
+    let pending = pricing_pending_path(workdir);
+    let text = fs::read_to_string(&pending)
+        .map_err(|e| format!("读不出待确认价格 {}：{e}", pending.display()))?;
+    // 校验不过就**一个字都不写**：半坏的定价表会让面板显示错误的金额
+    validate_pricing_text(&text).map_err(|e| format!("待确认价格不合法（原文件未改动）：{e}"))?;
+    validate_iso_date(today)?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())?;
+    v["updated_at"] = serde_json::json!(today);
+    let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    save_pricing_text(&format!("{out}\n"))?;
+    clear_pricing_pending(workdir)?;
+    Ok(pricing_config_path())
 }
 
 
@@ -453,8 +589,8 @@ fn usage_dir() -> PathBuf {
     module_data_dir().join("usage")
 }
 
-/// 只接受严格的 `YYYY-MM-DD` —— 文件名来自前端，必须挡住路径拼串
-fn usage_log_path(date: &str) -> Result<PathBuf, String> {
+/// 只接受严格的 `YYYY-MM-DD`（日期一律来自前端，必须挡住路径拼串）
+fn validate_iso_date(date: &str) -> Result<(), String> {
     let b = date.as_bytes();
     let ok = b.len() == 10
         && b[4] == b'-'
@@ -465,6 +601,12 @@ fn usage_log_path(date: &str) -> Result<PathBuf, String> {
     if !ok {
         return Err(format!("invalid date: {date}"));
     }
+    Ok(())
+}
+
+/// 只接受严格的 `YYYY-MM-DD` —— 文件名来自前端，必须挡住路径拼串
+fn usage_log_path(date: &str) -> Result<PathBuf, String> {
+    validate_iso_date(date)?;
     Ok(usage_dir().join(format!("usage-{date}.jsonl")))
 }
 
@@ -494,6 +636,81 @@ pub fn read_usage_log(date: String) -> Result<Vec<UsageRecord>, String> {
         .lines()
         .filter_map(|l| serde_json::from_str::<UsageRecord>(l).ok())
         .collect())
+}
+
+// ── 按天用量汇总（成本面板用，A12）──────────────────────────────
+//
+// 金额 = 各模型四类 token × 各自单价，所以汇总**必须分模型**：一天里换过模型的话，
+// 只按天合计就把两个模型的量混在一起了（单价还差十倍），算出来的钱没有意义。
+
+/// 某个模型在一天里的合计（决定用哪一档单价）
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct UsageModelTotals {
+    pub model: String,
+    /// 提问次数（一行日志 = 一次提问，含提问内所有工具往返）
+    pub turns: u64,
+    pub input: u64,
+    pub output: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    #[serde(rename = "cacheCreate")]
+    pub cache_create: u64,
+}
+
+/// 一天的合计（面板「按天表格」的一行）
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct UsageDay {
+    pub date: String,
+    pub turns: u64,
+    pub input: u64,
+    pub output: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    #[serde(rename = "cacheCreate")]
+    pub cache_create: u64,
+    /// 这一天用到的模型（按模型名升序）；金额按这里的每一项分别计价
+    pub models: Vec<UsageModelTotals>,
+}
+
+/// 读**多天**用量并汇总成「按天 + 按模型」的形状（A12 成本面板）。
+///
+/// 日期一律由前端给（与 `append_usage_log` 同一套：Rust 侧没有 chrono），**升序**返回；
+/// 没有任何记录的天不返回（面板不显示全零行）。汇总放在宿主而不是让前端逐天 IPC：
+/// 30 天就是 30 次跨进程调用，这里一次读完。
+#[tauri::command]
+pub fn read_usage_range(dates: Vec<String>) -> Result<Vec<UsageDay>, String> {
+    let mut days = Vec::new();
+    for date in dates {
+        let records = read_usage_log(date.clone())?;
+        if records.is_empty() {
+            continue;
+        }
+        let mut day = UsageDay {
+            date,
+            ..Default::default()
+        };
+        let mut by_model: std::collections::BTreeMap<String, UsageModelTotals> =
+            std::collections::BTreeMap::new();
+        for r in records {
+            day.turns += 1;
+            day.input += r.input;
+            day.output += r.output;
+            day.cache_read += r.cache_read;
+            day.cache_create += r.cache_create;
+            let m = by_model.entry(r.model.clone()).or_insert_with(|| UsageModelTotals {
+                model: r.model.clone(),
+                ..Default::default()
+            });
+            m.turns += 1;
+            m.input += r.input;
+            m.output += r.output;
+            m.cache_read += r.cache_read;
+            m.cache_create += r.cache_create;
+        }
+        day.models = by_model.into_values().collect();
+        days.push(day);
+    }
+    Ok(days)
 }
 
 // ── 备忘录（ModuleData\memo\memo.json）──────────────────────────
@@ -710,5 +927,106 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         assert!(read_usage_log("1970-01-02".into()).unwrap().is_empty());
+    }
+
+    /// 成本面板的汇总**必须分模型**：一天里换过模型的话，只按天合计就把两个模型
+    /// 的量混在一起了（单价差十倍），算出来的钱没有意义（A12）。
+    #[test]
+    fn usage_range_groups_by_day_and_model() {
+        let d1 = "1970-01-03";
+        let d2 = "1970-01-04";
+        for d in [d1, d2, "1970-01-05"] {
+            let _ = fs::remove_file(usage_log_path(d).unwrap());
+        }
+        append_usage_log(d1.into(), rec(1536)).unwrap();
+        let mut other = rec(0);
+        other.model = "gpt-4o".into();
+        other.input = 100;
+        other.output = 7;
+        append_usage_log(d1.into(), other).unwrap();
+        append_usage_log(d2.into(), rec(7000)).unwrap();
+
+        // 中间夹一天没记录 → 不返回（面板不显示全零行）
+        let days = read_usage_range(vec![
+            d1.into(),
+            "1970-01-05".into(),
+            d2.into(),
+        ])
+        .unwrap();
+        assert_eq!(days.len(), 2, "空天必须被跳过：{days:?}");
+
+        let day1 = &days[0];
+        assert_eq!(day1.date, d1);
+        assert_eq!(day1.turns, 2);
+        assert_eq!(day1.input, 212 + 100);
+        assert_eq!(day1.output, 3 + 7);
+        assert_eq!(day1.cache_read, 1536);
+        let models: Vec<&str> = day1.models.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(models, vec!["deepseek-flash", "gpt-4o"], "按模型分组");
+        assert_eq!(day1.models[1].input, 100);
+        assert_eq!(day1.models[0].cache_read, 1536);
+
+        assert_eq!(days[1].turns, 1);
+        assert_eq!(days[1].cache_read, 7000);
+
+        // 字段名是前端消费契约（驼峰）
+        let json = serde_json::to_string(day1).unwrap();
+        assert!(json.contains(r#""cacheRead":1536"#), "{json}");
+        assert!(json.contains(r#""cacheCreate":0"#), "{json}");
+
+        for d in [d1, d2] {
+            let _ = fs::remove_file(usage_log_path(d).unwrap());
+        }
+    }
+
+    /// 定价表与「候选 → 确认」的落盘纪律（A12）：
+    /// ① 校验基线是「四类价格齐全且非负」；② 候选不合法时**一个字都不写**；
+    /// ③ 确认时才覆盖正式文件，并盖上落盘日期、删掉候选。
+    #[test]
+    fn pricing_candidate_is_validated_before_commit() {
+        let workdir = lunac_root_dir().join("temp").join("pricing-test");
+        fs::create_dir_all(&workdir).unwrap();
+        let pending = pricing_pending_path(&workdir);
+        let official = pricing_config_path();
+
+        // ① 基线：缺字段 / 非数字 / 负数 / 顶层不是对象 / 语法坏 一律判非法
+        for bad in [
+            "[]",
+            "{",
+            r#"{"models": []}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": "8"}}}"#,
+            r#"{"models": {"m": {"input": -1, "cache_read": 0, "cache_write": 0, "output": 8}}}"#,
+        ] {
+            assert!(validate_pricing_text(bad).is_err(), "should reject `{bad}`");
+        }
+        let good = r#"{"models": {"m": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8,
+            "source_url": "https://example.com/pricing", "updated_at": "1970-01-01"}}}"#;
+        assert!(validate_pricing_text(good).is_ok());
+        // 空骨架（还没有任何价格）算合法
+        assert!(validate_pricing_text("{\"updated_at\": \"\", \"models\": {}}").is_ok());
+
+        // ② 语法坏的候选 → 拒绝，且正式文件**一字未改**
+        save_pricing_text("{\n  \"updated_at\": \"1970-01-01\",\n  \"models\": {}\n}\n").unwrap();
+        let before = load_pricing_text().unwrap();
+        fs::write(&pending, "{ broken").unwrap();
+        assert!(commit_pricing_pending(&workdir, "1970-01-01").is_err());
+        assert_eq!(before, load_pricing_text().unwrap(), "拒绝时不该写正式文件");
+
+        // ③ 合法候选 → 覆盖 + 盖日期 + 删候选
+        fs::write(&pending, good).unwrap();
+        let written = commit_pricing_pending(&workdir, "1970-01-02").unwrap();
+        assert_eq!(written, official);
+        assert!(!pending.exists(), "确认后必须删掉候选文件");
+        let after = load_pricing_text().unwrap().unwrap();
+        assert!(after.contains(r#""updated_at": "1970-01-02""#), "{after}");
+        assert!(after.contains("https://example.com/pricing"), "{after}");
+        assert!(validate_pricing_text(&after).is_ok());
+
+        // 缺候选文件时也不该假装成功
+        assert!(commit_pricing_pending(&workdir, "1970-01-02").is_err());
+
+        let _ = fs::remove_file(&official);
+        let _ = fs::remove_dir_all(&workdir);
     }
 }

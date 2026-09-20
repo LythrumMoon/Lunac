@@ -426,15 +426,10 @@ fn start_cli_process(
     // When a workspace IS configured, LUNAC_WORKSPACE_LOCKED=1 is passed to
     // the CLI so file reads/writes OUTSIDE the workspace are denied outright
     // (instead of the default "ask" for the whole-system mode).
-    let (workdir, workspace_locked) = {
-        let ws = state.workspace.lock().map(|g| g.clone()).unwrap_or_default();
-        let ws = ws.trim().to_string();
-        if ws.is_empty() {
-            (default_work_dir(), false)
-        } else {
-            (std::path::PathBuf::from(ws), true)
-        }
-    };
+    // 判据与 `effective_workdir()` / `workspace_is_locked()` 共用一处（候选价格文件也
+    // 必须落在同一个目录里，见 §A12 的注释）—— 两处漂移会让面板永远看不见候选价格。
+    let workspace_locked = workspace_is_locked(state);
+    let workdir = effective_workdir(state);
 
     let agent_exe = core_dir.join(AGENT_EXE);
     if !agent_exe.exists() {
@@ -1233,6 +1228,78 @@ pub fn set_hooks_enabled(enabled: bool) -> Result<String, String> {
 pub fn hooks_file_path() -> Result<String, String> {
     Ok(crate::storage::ensure_hooks_file()?.display().to_string())
 }
+
+// ── 定价表与用量成本（A12）────────────────────────────────────────
+//
+// 价格**不写进代码**（各家单价差十倍、官方还会调价），落 `config\pricing.json`
+// 由用户可编辑；面板上的「更新价格」让 agent 去抓官方定价页，但结果**只写成候选文件、
+// 由用户在面板上预览（旧值 → 新值）后确认才覆盖**（见 storage.rs 的定价表注释）。
+// 宿主在这里只做四件事：读状态、校验、落盘、按天汇总用量 —— 金额一律由前端算，
+// 因为价格表是用户可改的，重算不该再跑一趟 IPC。
+
+/// agent 实际的工作目录 —— 与 `start_cli_process` **必须同一套判据**：
+/// 配了工作区就用它，否则用 `default_work_dir()`。两处一旦漂移，候选价格文件就会被
+/// 写到一个宿主不看的目录里（面板永远显示「没有候选」）。
+fn effective_workdir(state: &AppState) -> std::path::PathBuf {
+    let ws = state.workspace.lock().map(|g| g.clone()).unwrap_or_default();
+    let ws = ws.trim().to_string();
+    if ws.is_empty() {
+        default_work_dir()
+    } else {
+        std::path::PathBuf::from(ws)
+    }
+}
+
+/// 配了工作区 ⇒ 给 agent 设工作区锁（越界读写直接拒，见 core-agent `tools::guard()`）
+fn workspace_is_locked(state: &AppState) -> bool {
+    !state
+        .workspace
+        .lock()
+        .map(|g| g.trim().to_string())
+        .unwrap_or_default()
+        .is_empty()
+}
+
+/// 定价表状态（设置面板用）：正式文件与候选文件的路径 / 原文。
+///
+/// **原文交给前端解析**：面板要展示「哪个模型、哪个字段从多少变成多少」，
+/// 让宿主再序列化一份结构化数据只是把同一套 schema 写两遍（早晚漂移）。
+#[tauri::command]
+pub fn get_pricing_state(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let workdir = effective_workdir(&state);
+    Ok(serde_json::json!({
+        "path": crate::storage::pricing_config_path().display().to_string(),
+        "text": crate::storage::load_pricing_text()?.unwrap_or_default(),
+        "pendingPath": crate::storage::pricing_pending_path(&workdir).display().to_string(),
+        "pendingText": crate::storage::load_pricing_pending_text(&workdir)?.unwrap_or_default(),
+    }))
+}
+
+/// 确保 `pricing.json` 存在（缺文件时落一份**不含任何价格数字**的空骨架）并返回路径，
+/// 供面板的「打开 pricing.json」按钮交给前端 `open()`。
+#[tauri::command]
+pub fn pricing_file_path() -> Result<String, String> {
+    Ok(crate::storage::ensure_pricing_file()?.display().to_string())
+}
+
+/// 确认候选价格：校验通过才覆盖 `pricing.json`（顺带删掉候选文件）。
+/// `today` 由前端给（本地日期，`YYYY-MM-DD`），宿主在落盘这一刻盖上顶层 `updated_at`。
+#[tauri::command]
+pub fn commit_pricing_pending(
+    today: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let path = crate::storage::commit_pricing_pending(&effective_workdir(&state), &today)?;
+    crate::log::info(format!("pricing.json 已更新：{}", path.display()));
+    Ok(path.display().to_string())
+}
+
+/// 放弃候选价格（用户点了「放弃」）—— 只删候选文件，正式文件不动。
+#[tauri::command]
+pub fn discard_pricing_pending(state: State<'_, AppState>) -> Result<(), String> {
+    crate::storage::clear_pricing_pending(&effective_workdir(&state))
+}
+
 
 // ── AI Workspace ──────────────────────────────────────────────────
 // Simple mode removed (2026-08-04): the app runs Agent (agent.exe) only.

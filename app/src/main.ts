@@ -4757,6 +4757,10 @@ listen<{ line: string }>("cli-output", (event) => {
     // only; cliReady is set by cli-status("stdout") which arrives first
     // (stdin pipe is open, CLI buffers messages until fully initialized).
     else if (data.type === "system" && data.subtype === "init") {
+      // 记下本轮真正生效的模型名 —— 用量日志靠它**分模型**计价（A12 成本面板：
+      // 各家单价差十倍，不区分模型算出来的钱没有意义）。agent 每轮查询都会带这个字段，
+      // 这里是它唯一的来源（`get_ai_config` 里的模型名只是「配置值」，可能与实际不同）。
+      if (typeof data.model === "string" && data.model) agentModel = data.model;
       if (agentState === "starting") {
         agentTransition("idle");
         updateAgentStatus("ready");
@@ -6305,6 +6309,14 @@ async function startAIChat(query: string, files?: string[]) {
   if (pluginActive) { await closePluginView(); await new Promise(r => setTimeout(r, 50)); }
   const p = pluginRegistry.getAll().find(pl => pl.id === id);
   if (p) { resultsContainer.classList.remove("hidden"); searchBar.classList.add("has-results"); await executePlugin(p); }
+};
+// 设置 → 用量与成本：「更新价格」把抓取任务交给 agent（A12）。
+// 设置面板自己不能发消息（那要动结果区 / 搜索栏状态，是主界面的职责），所以走桥：
+// 先关掉设置视图，再把这段提示词当一次普通提问发出去 —— 抓取过程与结果都摆在对话流里，
+// 用户能看着 agent 干活（与 __lunac_open_plugin 同一套做法）。
+(window as any).__lunac_agent_task = async (prompt: string) => {
+  if (pluginActive) { await closePluginView(); await new Promise(r => setTimeout(r, 50)); }
+  await startAIChat(prompt);
 };
 // 插件图标出口（主题包优先）—— 插件总览必须与结果区用同一套图标，
 // 否则会出现「结果区线稿 SVG / 设置面板 emoji」两套。
