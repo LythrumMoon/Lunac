@@ -1364,6 +1364,9 @@ fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
             request["analysis"] = json!({
                 "dangerous": report.dangerous,
                 "opaque": report.opaque,
+                // A10：**可证只读**结论。前端的「白名单」档据此自动放行（取代原先那个
+                // 看不见重定向/管道的前缀表）。false 只表示「不给自动放行」，仍然弹卡。
+                "readonly": report.readonly,
             });
         }
     }
