@@ -1806,6 +1806,7 @@ html, body {
 .agent-flow.flow-folded .tool-card,
 .agent-flow.flow-folded .tool-row,
 .agent-flow.flow-folded .todo-panel,
+.agent-flow.flow-folded .subtask-panel,
 .agent-flow.flow-folded .sys-note {
   display: none;
 }
@@ -2018,6 +2019,65 @@ html, body {
   color: var(--text-dim);
   font-size: 11px;
   line-height: 1.4;
+}
+
+/* ── A14 子任务分组面板 ────────────────────────────────────────── */
+/* 一轮里并发的每个子代理一行，随事件就地更新（子代理不流式，这是它在 UI 上的唯一落点）。
+   刻意**不给** max-height / overflow-y：新增一层滚动条、以及限制结果区高度都是本项目
+   明令禁止的（agent-ui-spec §0 规则 1 / ai-spec §11 规则 44）—— 面板跟内容长，
+   滚动交给外层结果区。 */
+.subtask-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  border-left: 2px solid rgba(var(--ink-rgb), 0.16);
+}
+.subtask-panel .subtask-head {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.subtask-panel .subtask-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.subtask-panel .subtask-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.subtask-panel .subtask-id {
+  flex-shrink: 0;
+  color: var(--blue);
+  font-size: 11px;
+}
+.subtask-panel .subtask-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.subtask-panel .subtask-state {
+  flex-shrink: 0;
+  font-size: 11px;
+  opacity: 0.85;
+}
+.subtask-panel .subtask-row.running .subtask-id { color: var(--yellow); }
+.subtask-panel .subtask-row.done .subtask-state { color: var(--green); }
+.subtask-panel .subtask-row.failed .subtask-state { color: var(--red); }
+
+/* 审批行上的子任务归属标（A14，纯文字 —— 页面不插装饰 emoji） */
+.approval-title .approval-task-tag {
+  margin-right: 6px;
+  color: var(--blue);
+  font-size: 11px;
 }
 
 /* ── Consolidated permission batch card ────────────────────────── */

@@ -406,23 +406,33 @@ pub fn run(skills: &[Skill], input: &Value) -> Result<String, String> {
     ))
 }
 
+/// 测试夹具：造一条最小 `Skill`。`content` 走**真实的 frontmatter 解析路径**
+/// （与 `load()` 同源），免得夹具与生产解析各说各话。
+///
+/// 放在 `mod tests` **外面**是为了让 `main.rs` 的批切分单测也能造技能 ——
+/// `Skill` 的字段是私有的，只有本文件能构造（`context: fork` 的判定单测需要它）。
+#[cfg(test)]
+pub(crate) fn test_skill(key: &str, content: &str) -> Skill {
+    let fm = parse_frontmatter(content);
+    Skill {
+        name: if fm.name.is_empty() { key.to_string() } else { fm.name },
+        key: key.to_string(),
+        description: fm.description,
+        fork: fm.fork,
+        allowed_tools: fm.allowed_tools,
+        resources: Vec::new(),
+        resources_capped: false,
+        content: content.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// 造一条技能（`load()` 的解析路径 + 目录名当 key，只是省掉磁盘）
     fn skill(key: &str, content: &str) -> Skill {
-        let fm = parse_frontmatter(content);
-        Skill {
-            name: if fm.name.is_empty() { key.to_string() } else { fm.name },
-            key: key.to_string(),
-            description: fm.description,
-            fork: fm.fork,
-            allowed_tools: fm.allowed_tools,
-            resources: Vec::new(),
-            resources_capped: false,
-            content: content.to_string(),
-        }
+        test_skill(key, content)
     }
 
     /// 真实临时技能目录 —— `collect_resources()` 是唯一走磁盘的部分，没法用内存糊过去。

@@ -219,6 +219,13 @@ this reply except the log.";
 /// 同一批只读工具的最大并发数。本地读取是毫秒级，4 够用；再加高只会先撞上
 /// 端点/搜索源的限流与磁盘争用（见 `plan_tool_batches`）。
 const TOOL_PARALLELISM: usize = 4;
+/// 同一批**子代理**（`Agent` / fork 技能）的最大并发数（A14，2026-09-20）。
+///
+/// 与 `TOOL_PARALLELISM` **刻意不同值**，理由完全不同：只读批受限于本地 IO，
+/// 子代理批受限于**钱与端点**。每个子代理的预算是 `SUBAGENT_BUDGET_TOKENS`（30 万），
+/// 3 个同时跑就是最坏 90 万 token 一起烧；再往上加，一次对话的花费会变成猜不到的量级。
+/// 3 也是「模型一轮里真能拆出的互不依赖任务数」的常见上限 —— 再多它自己就该分批。
+const SUBAGENT_PARALLELISM: usize = 3;
 /// 审批等待上限：超时按拒绝处理，并通知前端撤掉卡片（避免 UI 丢了以后永久挂住）
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
@@ -1358,7 +1365,17 @@ fn written_payload<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
 
 /// 只登记 + 发请求，不阻塞 —— 一批工具先全部发出，前端才能把连续
 /// Bash 合并成一行（`findLastBashGroup`）再让用户一次性决定。
-fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
+///
+/// `task_id`（A14）：**来自子代理内部**的审批要标明归属（`task-1` / `skill-2` …），
+/// 主循环自己发起的调用传 `None` —— 那时不写该键，前端按普通卡渲染。
+/// 理由：A14 起一轮里可能有**多个子代理同时**在等审批，前端拿到一串卡片若不带归属，
+/// 用户点「全部允许」就分不清自己放行了谁的命令；批量卡也才有按任务分行/分组的依据。
+fn open_approval(
+    tool_name: &str,
+    tool_use_id: &str,
+    input: &Value,
+    task_id: Option<&str>,
+) -> Pending {
     let request_id = next_request_id();
     let (tx, rx) = mpsc::channel::<Value>();
     if let Ok(mut reg) = pending_approvals().lock() {
@@ -1376,6 +1393,10 @@ fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
         "input": input,
         "tool_use_id": tool_use_id,
     });
+    // 子代理内部的审批：标明属于哪个子任务（主循环的调用没有这一项）
+    if let Some(tid) = task_id {
+        request["task_id"] = json!(tid);
+    }
     // 命令类工具附上**执行侧**的静态安全分析（见 bash_safety.rs）：
     // 前端只拿到命令字符串，正则挡不住引号拼接 / 包装器 / 变量 / 串联的后半段。
     // 这里只**上报判定**、不代替前端决策 —— 前端仍是「自动放行 / 弹审批」的唯一决策点。
@@ -2535,7 +2556,10 @@ fn run_subagent(
                                 Some(format!("Denied by PermissionRequest hook: {r}"))
                             }
                             HookGate::Allow if !hook_allow_needs_card(name, input) => None,
-                            _ => match await_approval(open_approval(name, id, input), input) {
+                            _ => match await_approval(
+                                open_approval(name, id, input, Some(task_id)),
+                                input,
+                            ) {
                                 Decision::Allow(_) => None,
                                 Decision::Deny(msg, _) => Some(msg),
                             },
@@ -3225,25 +3249,118 @@ fn run_one_tool(
     (text, is_error)
 }
 
-/// 把一轮的工具调用切成执行批：**连续的**只读调用合成一批（批内并行，见
-/// `tools::parallel_safe`），其余各自成批（串行）。返回 `(是否并行, 下标区间)`，
-/// 区间按原顺序无缝覆盖全部调用。
+/// 跑一个「自己发 API 请求」的调用（`Agent` / fork 技能），返回 `(tool_result 文本, is_error)`。
 ///
-/// **为什么必须是「连续」段**：只读批绝不允许跨越写类调用 —— 否则
-/// 「写 A → 读 A」会被重排成「读 A（旧内容）→ 写 A」，错得无声无息。
-/// 单元素的只读段不标并行：省一次线程 spawn，行为与串行完全一致。
-fn plan_tool_batches(calls: &[(String, String, Value)]) -> Vec<(bool, std::ops::Range<usize>)> {
+/// 存在的理由：串行批与子代理并行批**必须走同一条实现**。此前这段 `if forked { … } else
+/// if Agent { … }` 长在批循环里，A14 要再写一遍并发版 —— 两处各判一次「哪个是 fork」，
+/// 迟早一边改一边忘。现在判定收口到 `subagent_call()`、执行收口到这里。
+fn run_subagent_call(
+    cfg: &Cfg,
+    tctx: &tools::Ctx,
+    subagent_defs: &[Value],
+    skill_list: &[skills::Skill],
+    subagent_system: &str,
+    ask_permission: bool,
+    kind: SubagentCall<'_>,
+    input: &Value,
+    denied: Option<&str>,
+) -> (String, bool) {
+    match kind {
+        SubagentCall::Fork(sk) => run_forked_skill(
+            cfg,
+            tctx,
+            subagent_defs,
+            skill_list,
+            subagent_system,
+            ask_permission,
+            sk,
+            input,
+            denied,
+        ),
+        SubagentCall::Agent => run_agent_tool(
+            cfg,
+            tctx,
+            subagent_defs,
+            skill_list,
+            subagent_system,
+            ask_permission,
+            input,
+            denied,
+        ),
+    }
+}
+
+/// 一批工具调用的执行方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchKind {
+    /// 一个一个来（写类 / 命令 / MCP / 单个调用）。顺序即语义，不能重排。
+    Serial,
+    /// 批内并行 —— **只读工具**（`tools::parallel_safe` 白名单）。
+    ReadOnly,
+    /// 批内并行 —— **子代理**（`Agent` / fork 技能，A14）：各自发自己的 API 请求、
+    /// 跑独立工具循环。并发上限 `SUBAGENT_PARALLELISM`（比只读批低得多，见常量注释）。
+    Subagent,
+}
+
+/// 一次调用的「自己发 API 请求」归属：`Agent` 与 fork 技能是**同一族**
+/// （都要 `cfg` + 独立循环），所以判定与执行都必须走同一份结论 —— 各判各的必然漂移。
+#[derive(Clone, Copy)]
+enum SubagentCall<'a> {
+    Agent,
+    Fork(&'a skills::Skill),
+}
+
+/// 判定一次调用是不是子代理，并**解析出**它的形态（`None` = 普通工具调用）。
+///
+/// `Skill` 只有 **fork 模式**才算（`context: fork` 会派能写文件、能跑命令的子代理）；
+/// inline 技能只是把 md 正文交回主循环，与 `Read` 同级 ⇒ 走普通通道。
+/// 判据来源与 `needs_approval_with()` 一致 —— 都是「看入参里指向哪个技能」。
+fn subagent_call<'a>(
+    name: &str,
+    input: &Value,
+    skills: &'a [skills::Skill],
+) -> Option<SubagentCall<'a>> {
+    if name == "Agent" {
+        return Some(SubagentCall::Agent);
+    }
+    if name == "Skill" {
+        let want = input.get("skill").and_then(Value::as_str).unwrap_or("");
+        return skills::find(skills, want).filter(|s| s.fork).map(SubagentCall::Fork);
+    }
+    None
+}
+
+/// 把一轮的工具调用切成执行批：**连续的**只读调用 / **连续的**子代理调用各自合成一批
+/// （批内并行），其余各自成批（串行）。返回 `(批类型, 下标区间)`，区间按原顺序无缝覆盖全部调用。
+///
+/// **为什么必须是「连续」段**：批内会被重排，所以绝不允许跨越写类调用 —— 否则
+/// 「写 A → 读 A」会被重排成「读 A（旧内容）→ 写 A」，错得无声无息。子代理同理由：
+/// 它可能写文件（`Agent` 有 `Write` / `Bash`），与前后调用之间存在真实的先后依赖。
+/// 单元素段不标并行：省一次线程 spawn，行为与串行完全一致。
+///
+/// `subagents[i]` = 第 i 个调用解析出的子代理形态（`subagent_call()` 的结论，**只算一次**）：
+/// 判定与执行共用它，避免「规划说是串行、执行却走了另一条分支」这类漂移。
+fn plan_tool_batches(
+    calls: &[(String, String, Value)],
+    subagents: &[Option<SubagentCall<'_>>],
+) -> Vec<(BatchKind, std::ops::Range<usize>)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < calls.len() {
-        if tools::parallel_safe(&calls[i].1) {
+        if subagents[i].is_some() {
             let start = i;
-            while i < calls.len() && tools::parallel_safe(&calls[i].1) {
+            while i < calls.len() && subagents[i].is_some() {
                 i += 1;
             }
-            out.push((i - start > 1, start..i));
+            out.push((if i - start > 1 { BatchKind::Subagent } else { BatchKind::Serial }, start..i));
+        } else if tools::parallel_safe(&calls[i].1) {
+            let start = i;
+            while i < calls.len() && subagents[i].is_none() && tools::parallel_safe(&calls[i].1) {
+                i += 1;
+            }
+            out.push((if i - start > 1 { BatchKind::ReadOnly } else { BatchKind::Serial }, start..i));
         } else {
-            out.push((false, i..i + 1));
+            out.push((BatchKind::Serial, i..i + 1));
             i += 1;
         }
     }
@@ -3913,7 +4030,7 @@ fn run_query(
                                 denied = Some(format!("Denied by PermissionRequest hook: {r}"))
                             }
                             HookGate::Allow if !hook_allow_needs_card(name, input) => {}
-                            _ => pending = Some(open_approval(name, id, input)),
+                            _ => pending = Some(open_approval(name, id, input, None)),
                         }
                     }
                 }
@@ -3944,116 +4061,198 @@ fn run_query(
             denieds.push(denied);
         }
 
-        // 按批执行：**连续的**只读调用并行（上限 TOOL_PARALLELISM），其余串行。
+        // 按批执行：**连续的**只读调用 / **连续的**子代理调用各自并行（上限分别是
+        // `TOOL_PARALLELISM` / `SUBAGENT_PARALLELISM`），其余串行。
         // 结果一律按下标回填 ⇒ 回灌顺序恒等于 tool_use 的原顺序。
+        //
+        // 「谁是自己发 API 请求的那种调用」**只判定一次**（`subagent_call()`），规划与执行
+        // 共用这份结论 —— 此前判定散在批循环里，A14 再加一处并发分支就会出现
+        // 「规划按串行、执行按并行」的漂移。
+        let subagent_kinds: Vec<Option<SubagentCall<'_>>> = calls
+            .iter()
+            .map(|(_id, name, input)| subagent_call(name, input, skill_list))
+            .collect();
         let mut slots: Vec<Option<(String, bool)>> = vec![None; calls.len()];
-        for (parallel, range) in plan_tool_batches(&calls) {
-            if !parallel {
-                let i = range.start;
-                // `Agent` 特判：它要**发自己的 API 请求**并跑独立循环，因此需要 `cfg`，
-                // 而 `dispatch_tool` 拿不到 —— 只能在这一层接。它也**不接 MCP 桥**
-                // （桥是 `&mut` 单线程 stdio 通道，主循环还持有它；子代理的工具集里
-                // 因此已经剔掉了 `mcp__*` 与 `SessionSearch`，见 `subagent_tool_defs`）。
-                //
-                // `Skill` 的 **fork 模式同族**（2026-09-20 A5）：它同样要发 API、跑独立
-                // 循环，所以只能在这里接。**inline 技能不走这条路** —— 它只是把 md 正文
-                // 交回主循环（与 `Read` 同级），照常落进下面的 `run_one_tool`。
-                let forked = if calls[i].1 == "Skill" {
-                    let want = run_inputs[i]
-                        .get("skill")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    skills::find(skill_list, want).filter(|s| s.fork)
-                } else {
-                    None
-                };
-                slots[i] = Some(if let Some(sk) = forked {
-                    run_forked_skill(
-                        cfg,
-                        tctx,
-                        &subagent_defs,
-                        skill_list,
-                        subagent_system,
-                        ask_permission,
-                        sk,
-                        &run_inputs[i],
-                        denieds[i].as_deref(),
-                    )
-                } else if calls[i].1 == "Agent" {
-                    run_agent_tool(
-                        cfg,
-                        tctx,
-                        &subagent_defs,
-                        skill_list,
-                        subagent_system,
-                        ask_permission,
-                        &run_inputs[i],
-                        denieds[i].as_deref(),
-                    )
-                } else {
-                    run_one_tool(
-                        tctx,
-                        mcp_bridge.as_deref_mut(),
-                        skill_list,
-                        &calls[i].0,
-                        &calls[i].1,
-                        &run_inputs[i],
-                        denieds[i].as_deref(),
-                    )
-                });
+        for (kind, range) in plan_tool_batches(&calls, &subagent_kinds) {
+            if kind == BatchKind::Subagent {
+                // ── 子代理并行批（A14）──
+                // 每个子代理一条线程、**各自一份 `Cfg`**：`Cfg` 里有 `Cell`（思考形态、
+                // 实测体积缓存）⇒ 不是 `Sync`，`&Cfg` 过不了线程边界。用给后台复盘准备的
+                // `detached()`；它复制的是**当前已跑通并缓存**的思考形态，所以子代理不会
+                // 退回到一个端点不认的形态（同 `run_subagent` 的既有做法）。
+                // 必须在 spawn **之前**建好 —— 建 client 要 `&Cfg`，而它只活在主线程上。
+                let mut jobs: Vec<(usize, Cfg, SubagentCall<'_>)> = Vec::with_capacity(range.len());
+                let mut spawn_err: Option<String> = None;
+                for i in range.clone() {
+                    match cfg.detached() {
+                        Ok(c) => jobs.push((i, c, subagent_kinds[i].expect("并行批内必有形态"))),
+                        Err(e) => {
+                            spawn_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = spawn_err {
+                    // 建不出 http client（极罕见）⇒ 这一批**退回串行**用主 cfg 跑完：
+                    // 宁可慢，也不能把调用静默丢成空结果。
+                    log::warn(format!("子代理并行批准备失败（{e}），退回串行执行"));
+                    for i in range.clone() {
+                        slots[i] = Some(run_subagent_call(
+                            cfg,
+                            tctx,
+                            &subagent_defs,
+                            skill_list,
+                            subagent_system,
+                            ask_permission,
+                            subagent_kinds[i].expect("并行批内必有形态"),
+                            &run_inputs[i],
+                            denieds[i].as_deref(),
+                        ));
+                    }
+                    continue;
+                }
+                // 引用是 Copy，`move` 闭包拷进去的是引用本身（不会把 `subagent_defs`
+                // 整个移走 —— 后面几批还要用）。
+                let (defs_ref, skills_ref, sys_ref, inputs_ref, denieds_ref): (
+                    &[Value],
+                    &[skills::Skill],
+                    &str,
+                    &Vec<Value>,
+                    &Vec<Option<String>>,
+                ) = (&subagent_defs, skill_list, subagent_system, &run_inputs, &denieds);
+                log::info(format!(
+                    "子代理并行批 {} 条（并发上限 {SUBAGENT_PARALLELISM}）: {}",
+                    range.len(),
+                    range
+                        .clone()
+                        .map(|i| calls[i].1.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                let mut jobs = jobs.into_iter();
+                loop {
+                    let chunk: Vec<(usize, Cfg, SubagentCall<'_>)> =
+                        jobs.by_ref().take(SUBAGENT_PARALLELISM).collect();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let done: Vec<(usize, String, bool)> = thread::scope(|s| {
+                        let handles: Vec<_> = chunk
+                            .into_iter()
+                            .map(|(i, my_cfg, k)| {
+                                (
+                                    i,
+                                    s.spawn(move || {
+                                        let (text, is_error) = run_subagent_call(
+                                            &my_cfg,
+                                            tctx,
+                                            defs_ref,
+                                            skills_ref,
+                                            sys_ref,
+                                            ask_permission,
+                                            k,
+                                            &inputs_ref[i],
+                                            denieds_ref[i].as_deref(),
+                                        );
+                                        (i, text, is_error)
+                                    }),
+                                )
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|(i, h)| {
+                                h.join().unwrap_or_else(|_| {
+                                    (i, "Error: subagent worker panicked".into(), true)
+                                })
+                            })
+                            .collect()
+                    });
+                    // 回填仍按下标 ⇒ 报告回灌顺序恒等于 tool_use 原顺序（与只读批同一条纪律）
+                    for (i, text, is_error) in done {
+                        slots[i] = Some((text, is_error));
+                    }
+                }
                 continue;
             }
-            // 只读批里只可能出现内置工具（白名单见 tools::parallel_safe）⇒ 不需要
-            // MCP 桥，也就绕开了 `&mut Bridge` 无法跨线程共享的问题。
-            // 并发上限靠**分块 + 块内 join** 实现，不引信号量。
-            // 先把三个只读切片取成 `&`（引用是 Copy，`move` 闭包拷进去的是引用
-            // 本身，不会把 `calls` 整个移走 —— 后面还要用它组装回灌结果）。
-            let (calls_ref, inputs_ref, denieds_ref) = (&calls, &run_inputs, &denieds);
-            log::info(format!(
-                "只读工具并行批 {} 条（并发上限 {TOOL_PARALLELISM}）: {}",
-                range.len(),
-                range
-                    .clone()
-                    .map(|i| calls[i].1.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            let mut start = range.start;
-            while start < range.end {
-                let end = (start + TOOL_PARALLELISM).min(range.end);
-                let done: Vec<(usize, String, bool)> = thread::scope(|s| {
-                    let handles: Vec<_> = (start..end)
-                        .map(|i| {
-                            (
-                                i,
-                                s.spawn(move || {
-                                    let (text, is_error) = run_one_tool(
-                                        tctx,
-                                        None,
-                                        skill_list,
-                                        &calls_ref[i].0,
-                                        &calls_ref[i].1,
-                                        &inputs_ref[i],
-                                        denieds_ref[i].as_deref(),
-                                    );
-                                    (i, text, is_error)
-                                }),
-                            )
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|(i, h)| {
-                            h.join()
-                                .unwrap_or_else(|_| (i, "Error: tool worker panicked".into(), true))
-                        })
-                        .collect()
-                });
-                for (i, text, is_error) in done {
-                    slots[i] = Some((text, is_error));
+            if kind == BatchKind::ReadOnly {
+                // 只读批里只可能出现内置工具（白名单见 tools::parallel_safe）⇒ 不需要
+                // MCP 桥，也就绕开了 `&mut Bridge` 无法跨线程共享的问题。
+                // 并发上限靠**分块 + 块内 join** 实现，不引信号量。
+                // 先把三个只读切片取成 `&`（引用是 Copy，`move` 闭包拷进去的是引用
+                // 本身，不会把 `calls` 整个移走 —— 后面还要用它组装回灌结果）。
+                let (calls_ref, inputs_ref, denieds_ref) = (&calls, &run_inputs, &denieds);
+                log::info(format!(
+                    "只读工具并行批 {} 条（并发上限 {TOOL_PARALLELISM}）: {}",
+                    range.len(),
+                    range
+                        .clone()
+                        .map(|i| calls[i].1.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                let mut start = range.start;
+                while start < range.end {
+                    let end = (start + TOOL_PARALLELISM).min(range.end);
+                    let done: Vec<(usize, String, bool)> = thread::scope(|s| {
+                        let handles: Vec<_> = (start..end)
+                            .map(|i| {
+                                (
+                                    i,
+                                    s.spawn(move || {
+                                        let (text, is_error) = run_one_tool(
+                                            tctx,
+                                            None,
+                                            skill_list,
+                                            &calls_ref[i].0,
+                                            &calls_ref[i].1,
+                                            &inputs_ref[i],
+                                            denieds_ref[i].as_deref(),
+                                        );
+                                        (i, text, is_error)
+                                    }),
+                                )
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|(i, h)| {
+                                h.join()
+                                    .unwrap_or_else(|_| (i, "Error: tool worker panicked".into(), true))
+                            })
+                            .collect()
+                    });
+                    for (i, text, is_error) in done {
+                        slots[i] = Some((text, is_error));
+                    }
+                    start = end;
                 }
-                start = end;
+                continue;
             }
+            // ── 串行批 ──
+            let i = range.start;
+            slots[i] = Some(match subagent_kinds[i] {
+                Some(k) => run_subagent_call(
+                    cfg,
+                    tctx,
+                    &subagent_defs,
+                    skill_list,
+                    subagent_system,
+                    ask_permission,
+                    k,
+                    &run_inputs[i],
+                    denieds[i].as_deref(),
+                ),
+                None => run_one_tool(
+                    tctx,
+                    mcp_bridge.as_deref_mut(),
+                    skill_list,
+                    &calls[i].0,
+                    &calls[i].1,
+                    &run_inputs[i],
+                    denieds[i].as_deref(),
+                ),
+            });
         }
 
         let results: Vec<Value> = calls
@@ -5009,6 +5208,19 @@ mod tests {
         ("id".into(), name.into(), json!({}))
     }
 
+    /// 技能调用（`Skill` 的入参指向哪个技能决定它是不是子代理）
+    fn skill_call(key: &str) -> (String, String, Value) {
+        ("id".into(), "Skill".into(), json!({ "skill": key }))
+    }
+
+    /// 把一轮调用解析成 `plan_tool_batches()` 要的 `subagents` 切片（判定只算一次）
+    fn subagents<'a>(
+        calls: &[(String, String, Value)],
+        skills: &'a [skills::Skill],
+    ) -> Vec<Option<SubagentCall<'a>>> {
+        calls.iter().map(|(_, n, i)| subagent_call(n, i, skills)).collect()
+    }
+
     /// 批次切分：区间无缝覆盖全部调用，且**只读批绝不跨越写类调用**
     #[test]
     fn batches_never_span_a_writing_call() {
@@ -5019,7 +5231,8 @@ mod tests {
             call("Read"),
             call("Glob"),
         ];
-        let batches = plan_tool_batches(&calls);
+        let none = subagents(&calls, &[]);
+        let batches = plan_tool_batches(&calls, &none);
 
         // 区间必须无缝覆盖 [0, len)
         assert_eq!(batches[0].1.start, 0);
@@ -5029,12 +5242,9 @@ mod tests {
         }
 
         assert_eq!(batches.len(), 3);
-        assert!(batches[0].0, "Read+Grep 连续只读 → 并行批");
-        assert_eq!(batches[0].1, 0..2);
-        assert!(!batches[1].0, "Write 必须独占一批");
-        assert_eq!(batches[1].1, 2..3);
-        assert!(batches[2].0);
-        assert_eq!(batches[2].1, 3..5);
+        assert_eq!(batches[0], (BatchKind::ReadOnly, 0..2), "Read+Grep 连续只读 → 并行批");
+        assert_eq!(batches[1], (BatchKind::Serial, 2..3), "Write 必须独占一批");
+        assert_eq!(batches[2], (BatchKind::ReadOnly, 3..5));
     }
 
     /// 单元素的只读段不标并行（省一次线程 spawn，行为与串行完全一致）
@@ -5045,11 +5255,75 @@ mod tests {
             vec![call("Bash"), call("Read")],
             vec![call("Read"), call("Bash")],
         ] {
-            for (parallel, _) in plan_tool_batches(&calls) {
-                assert!(!parallel, "批内只有一个只读调用时不该标并行");
+            let none = subagents(&calls, &[]);
+            for (kind, _) in plan_tool_batches(&calls, &none) {
+                assert_eq!(kind, BatchKind::Serial, "批内只有一个只读调用时不该标并行");
             }
         }
-        assert!(plan_tool_batches(&[]).is_empty());
+        assert!(plan_tool_batches(&[], &[]).is_empty());
+    }
+
+    /// `Agent` 与 fork 技能是**同一族**（都要 `cfg` + 独立工具循环），
+    /// 所以连续的它们合成**同一个** `Subagent` 批；inline 技能不是子代理。
+    #[test]
+    fn consecutive_subagents_form_one_parallel_batch() {
+        let skills = vec![
+            skills::test_skill("forked", "---\nname: forked\ncontext: fork\n---\nbody"),
+            skills::test_skill("inline", "---\nname: inline\n---\nbody"),
+        ];
+
+        // 两个 Agent 相邻 ⇒ 一个 Subagent 批
+        let calls = vec![call("Agent"), call("Agent")];
+        let subs = subagents(&calls, &skills);
+        assert_eq!(plan_tool_batches(&calls, &subs), vec![(BatchKind::Subagent, 0..2)]);
+
+        // fork 技能与 Agent 同类，相邻也是同一批（三种写法混着来）
+        let calls = vec![call("Agent"), skill_call("forked"), skill_call("forked")];
+        let subs = subagents(&calls, &skills);
+        assert_eq!(plan_tool_batches(&calls, &subs), vec![(BatchKind::Subagent, 0..3)]);
+
+        // inline 技能与 Read 同级 ⇒ 不是子代理；未知技能回落普通通道（由 Skill 自己报错）
+        let calls = vec![skill_call("inline"), skill_call("nope")];
+        let subs = subagents(&calls, &skills);
+        assert!(subs.iter().all(Option::is_none), "inline / 未知技能不得当子代理");
+    }
+
+    /// 单个子代理不标并行（与只读批同一条不变量：单元素段省掉线程 spawn）
+    #[test]
+    fn single_subagent_is_not_marked_parallel() {
+        let calls = vec![call("Agent")];
+        let subs = subagents(&calls, &[]);
+        assert_eq!(plan_tool_batches(&calls, &subs), vec![(BatchKind::Serial, 0..1)]);
+    }
+
+    /// 子代理可能写文件 / 跑命令 ⇒ 与前后调用之间存在**真实的先后依赖**，
+    /// 子代理批与只读批都必须被别的调用打断，谁也不许跨过去重排。
+    #[test]
+    fn subagent_batches_break_on_either_side() {
+        let skills = vec![skills::test_skill("f", "---\nname: f\ncontext: fork\n---\nbody")];
+        // Agent, Read, Agent, fork ⇒ 两个单元素串行批 + 末尾的子代理批
+        let calls = vec![call("Agent"), call("Read"), call("Agent"), skill_call("f")];
+        let subs = subagents(&calls, &skills);
+        assert_eq!(
+            plan_tool_batches(&calls, &subs),
+            vec![
+                (BatchKind::Serial, 0..1),
+                (BatchKind::Serial, 1..2),
+                (BatchKind::Subagent, 2..4),
+            ]
+        );
+
+        // 反过来：只读批也不许跨过中间的 Agent
+        let calls = vec![call("Read"), call("Grep"), call("Agent"), call("Read"), call("Glob")];
+        let subs = subagents(&calls, &skills);
+        assert_eq!(
+            plan_tool_batches(&calls, &subs),
+            vec![
+                (BatchKind::ReadOnly, 0..2),
+                (BatchKind::Serial, 2..3),
+                (BatchKind::ReadOnly, 3..5),
+            ]
+        );
     }
 
     /// 图片附件（A8）：**只认魔术字节**、按路径读字节转 base64、失败与超限都如实上报。

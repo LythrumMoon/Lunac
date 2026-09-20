@@ -3128,7 +3128,19 @@ interface CliEventLine {
     /** agent 附上的**执行侧**静态安全分析 —— 见 docs/ai-spec.md §3.5。
      *  缺字段时回落到本文件自己的正则（兼容旧 agent 与非命令类工具）。 */
     analysis?: AgentAnalysis;
+    /** A14：这条审批来自哪个子任务（`task-1` / `skill-2` …）。主循环自己发起的调用
+     *  **不写该键** —— 缺字段就是「不属于任何子任务」，前端按普通卡渲染。 */
+    task_id?: string;
   };
+  /** system/task_started|task_progress|task_done（子代理事件，A14）：`task_id` 归组，
+   *  `description` 只在 started 上、`tool`/`round` 只在 progress 上、`ok`/`ms` 只在 done 上。
+   *  后台复盘 fork 刻意不发这三个事件。 */
+  task_id?: string;
+  description?: string;
+  tool?: string;
+  round?: number;
+  ok?: boolean;
+  ms?: number;
   event?: {
     type: string;
     delta?: { type: string; text?: string; thinking?: string; partial_json?: string };
@@ -3240,6 +3252,28 @@ interface AgentView {
   openCard: AgentToolCard | null;
   /** 思考正文，折叠时从 DOM 摘下来，展开时再填回（避免长思考常驻 DOM） */
   thinkText: string;
+  /** A14：本轮派出去的子任务（按 `task_id`）—— 数据面，面板只是它的视图 */
+  subtasks: Map<string, AgentSubtask>;
+  /** A14：「子任务」分组面板（惰性建，见 `agentSubtaskPanel()`）；随 flow 一起销毁 */
+  taskPanel: HTMLElement | null;
+}
+
+/** 一个并行子任务的实时状态（A14）。
+ *
+ *  数据来源只有 `system/task_started|task_progress|task_done` 三个事件 —— 子代理**非流式**
+ *  （`run_subagent` 固定 `stream: false`），它的思考与工具过程**不进** stdout，所以这里
+ *  没有正文可渲染，只有「第几轮、在跑哪个工具、跑完没」。 */
+interface AgentSubtask {
+  id: string;              // `task-1` / `skill-2`（进程内短计数，见 ai-spec §3.5）
+  desc: string;            // `task_started` 的 description
+  tool: string;            // 最近一条 `task_progress` 的工具名（空 = 还没跑工具）
+  round: number;
+  done: boolean;
+  /** `task_done` 的 `ok`（done 为真时才有意义） */
+  ok?: boolean;
+  /** `task_done` 的 `ms` */
+  ms?: number;
+  el: HTMLElement;         // 面板里的那一行
 }
 let agentView: AgentView | null = null;
 
@@ -3251,6 +3285,103 @@ function formatDuration(ms: number): string {
 
 function agentScroll() {
   autoScrollIfNearBottom();
+}
+
+// ── A14 子任务分组面板 ────────────────────────────────────────────
+// 一轮里可以并发派多个子代理（上限 3），每个子代理**不流式**、只发三个事件。
+// 这里把事件按 `task_id` 归组，在同一块面板里每个子任务一行、就地更新 —— 不用左右分栏
+// （会新增第二层滚动条，且要动总体视窗，两条都是项目明令禁止的；见 agent-ui-spec §0）。
+// 面板**惰性创建**：没派子代理的回合，DOM 里连这个容器都没有。
+
+/** 取（必要时建）本轮的子任务面板。位置固定在 flow 末尾 —— 它是「正在发生的事」，
+ *  与按到达顺序追加的思考 / 工具块不同，需要随事件原地更新。 */
+function agentSubtaskPanel(v: AgentView): HTMLElement {
+  if (v.taskPanel?.isConnected) return v.taskPanel;
+  const panel = doc("div");
+  panel.className = "subtask-panel";
+  panel.innerHTML = `<div class="subtask-head"></div><div class="subtask-body"></div>`;
+  v.flow.appendChild(panel);
+  v.taskPanel = panel;
+  return panel;
+}
+
+/** 表头：`子任务（已完成/总数）` —— 并行数就在状态行里报，这里不重复。 */
+function renderSubtaskHeader(v: AgentView) {
+  const head = v.taskPanel?.querySelector(".subtask-head");
+  if (!head) return;
+  const all = [...v.subtasks.values()];
+  head.textContent = t("agent.subtask_panel", {
+    done: String(all.filter((s) => s.done).length),
+    total: String(all.length),
+  });
+}
+
+/** 画一行（`task_started` / `task_progress` / `task_done` 都汇到这里，避免三处各画一遍）。 */
+function renderSubtaskRow(s: AgentSubtask) {
+  const pick = (sel: string) => s.el.querySelector<HTMLElement>(sel);
+  const idEl = pick(".subtask-id");
+  if (idEl) idEl.textContent = s.id;
+  const descEl = pick(".subtask-desc");
+  if (descEl) descEl.textContent = s.desc;
+  const stateEl = pick(".subtask-state");
+  if (!stateEl) return;
+  if (s.done) {
+    // 单色状态符号（icon-style.md §4 允许），不是装饰 emoji
+    const mark = s.ok === false ? "✗" : "✓";
+    stateEl.textContent = s.ms === undefined ? mark : `${mark} ${formatDuration(s.ms)}`;
+  } else {
+    stateEl.textContent = s.tool
+      ? t("agent.tool", { tool: s.tool }) + (s.round > 1 ? ` · ${s.round}` : "")
+      : t("agent.subtask_running");
+  }
+}
+
+/** 三个 `task_*` 事件的唯一入口。
+ *
+ *  `task_done` 必须回填状态行：主循环此刻还在跑（要读子代理的报告再继续），所以落到
+ *  「工作中」而不是「就绪」；**还有别的子任务在跑时只更新并行数**，不能提前说「工作中」
+ *  （那会让用户以为剩下的子任务也结束了）。 */
+function agentSubtaskEvent(data: CliEventLine) {
+  const v = agentView;
+  const id = typeof data.task_id === "string" ? data.task_id : "";
+  if (!v || !id) return;
+  const subtype = data.subtype ?? "";
+  let sub = v.subtasks.get(id);
+  if (!sub) {
+    // 没有 `task_started` 的 `task_done`（不该发生）：不凭空造一行出来
+    if (subtype === "task_done") return;
+    const el = doc("div");
+    el.className = "subtask-row running";
+    el.innerHTML =
+      `<span class="subtask-id"></span><span class="subtask-desc"></span>` +
+      `<span class="subtask-state"></span>`;
+    agentSubtaskPanel(v).querySelector(".subtask-body")!.appendChild(el);
+    sub = { id, desc: "", tool: "", round: 0, done: false, el };
+    v.subtasks.set(id, sub);
+  }
+  if (subtype === "task_started") {
+    sub.desc = typeof data.description === "string" ? data.description : "";
+  } else if (subtype === "task_progress") {
+    sub.tool = typeof data.tool === "string" ? data.tool : "";
+    sub.round = typeof data.round === "number" ? data.round : 0;
+  } else {
+    sub.done = true;
+    sub.ok = data.ok !== false;
+    sub.ms = typeof data.ms === "number" ? data.ms : undefined;
+    sub.el.classList.remove("running");
+    sub.el.classList.add(sub.ok ? "done" : "failed");
+  }
+  renderSubtaskRow(sub);
+  renderSubtaskHeader(v);
+
+  const running = [...v.subtasks.values()].filter((s) => !s.done).length;
+  statusText.textContent =
+    running > 1
+      ? t("agent.subtask_parallel", { count: String(running) })
+      : running === 1
+        ? t("agent.subtask")
+        : t("agent.working");
+  agentScroll();
 }
 
 // ── AI 对话：思考块 + 命令卡片（2026-09，参照 Trae 侧栏，见 docs/agent-ui-spec.md）──
@@ -4158,6 +4289,9 @@ interface CmdGroupItem extends HTMLElement {
   /** 写入内容里扫出的疑似凭据（`规则 (line N)`）→ 不留「始终允许」，正文里显式列出 */
   _groupSecrets?: string[] | null;
   _groupInput?: unknown;
+  /** A14：这一行来自哪个子任务（`task-1` / `skill-2` …）；主循环自己的调用为 undefined。
+   *  它同时是**合并的边界** —— 见 `findLastCmdGroup()`。 */
+  _groupTaskId?: string;
   _isCmdGroup: boolean;
   _finish: (allow: boolean, always?: boolean) => void;
   /** AskUserQuestion 专用：把当前选中的选项组装成 updatedInput 交给 agent */
@@ -4170,11 +4304,17 @@ interface CmdGroupItem extends HTMLElement {
  *
  *  命令类工具（`Bash` / `PowerShell`）视作**同一族** —— 用户要求「短时间内不同类型的
  *  命令也合并进同一次权限运行」，所以这里不再按工具名区分：只要上一行还是**未被应答**
- *  的命令组，新命令就并进去（跨轮是并不了的：下一轮的命令要等上一轮的执行结果才产生）。 */
-function findLastCmdGroup(): CmdGroupItem | null {
+ *  的命令组，新命令就并进去（跨轮是并不了的：下一轮的命令要等上一轮的执行结果才产生）。
+ *
+ *  **A14：合并不许跨子任务。** 两个子代理各自的命令并进同一行，会让「允许」一次放行两个
+ *  任务的命令，而标注只能显示其中一个 —— 用户就分不清自己批了谁。要求 `taskId` 相等
+ *  （`undefined` = 主循环自己的调用，也只与主循环的合并）。
+ *  注意这里用 `!==` 判等：`undefined` 与 `undefined` 必须算「同一个来源」。 */
+function findLastCmdGroup(taskId?: string): CmdGroupItem | null {
   let last: CmdGroupItem | null = null;
   for (const [, item] of pendingPermissionCards) {
     const it = item as CmdGroupItem;
+    if (it._groupTaskId !== taskId) continue;
     if (it._isCmdGroup && !it.classList.contains("answered")) {
       last = it;
     }
@@ -4187,6 +4327,10 @@ function findLastCmdGroup(): CmdGroupItem | null {
 function renderGroupTitle(item: CmdGroupItem) {
   const el = item.querySelector(".approval-title");
   if (!el) return;
+  // A14：子代理内部的审批标明归属 —— 多个子代理并发时用户才分得清自己放行的是谁的命令
+  const taskHtml = item._groupTaskId
+    ? `<span class="approval-task-tag">${esc(item._groupTaskId)}</span>`
+    : "";
   const dangerHtml = item._groupDanger
     ? `<span class="approval-danger-inline" title="${esc(t("agent.static_danger", { labels: item._groupDangerLabels.join("、") }))}">⛔</span>`
     : "";
@@ -4198,7 +4342,7 @@ function renderGroupTitle(item: CmdGroupItem) {
   const secretHtml = item._groupSecrets?.length
     ? `<span class="approval-warn-inline" title="${esc(t("agent.static_secrets", { hits: item._groupSecrets.join("、") }))}">🔑</span>`
     : "";
-  el.innerHTML = `${dangerHtml}${opaqueHtml}${secretHtml}<b>${esc(item._groupToolNames.join(" + "))}</b>`;
+  el.innerHTML = `${taskHtml}${dangerHtml}${opaqueHtml}${secretHtml}<b>${esc(item._groupToolNames.join(" + "))}</b>`;
 }
 
 /** AskUserQuestion 的选项界面：单选用互斥高亮、多选可叠加；选中结果写进
@@ -4510,6 +4654,7 @@ function showPermissionCard(
   input: unknown,
   toolUseId?: string,
   analysis?: AgentAnalysis,
+  taskId?: string,
 ) {
   pendingPermissionCards.get(requestId)?.remove();
   const host = agentView?.flow ?? resultsList; // inline, in arrival order
@@ -4524,7 +4669,8 @@ function showPermissionCard(
     respondPermission(requestId, true, toolUseId);
     const row = document.createElement("div");
     row.className = "tool-row auto-approved";
-    row.textContent = `✓ 自动允许: ${toolName}${cls.bashCmd ? " · " + cls.bashCmd.slice(0, 80) : ""}`;
+    // A14：自动放行也要能看出这条属于哪个子任务（多个子代理并发时尤其）
+    row.textContent = `${taskId ? `[${taskId}] ` : ""}✓ 自动允许: ${toolName}${cls.bashCmd ? " · " + cls.bashCmd.slice(0, 80) : ""}`;
     host.appendChild(row);
     agentScroll();
     return;
@@ -4568,7 +4714,7 @@ function showPermissionCard(
   // ── Continuous-command merge: fold a follow-up command into the last open
   // Bash/PowerShell approval row instead of a new one ───────────────────
   if (cls.bashCmd && !cls.auto && isMergeableCommand(cls.bashCmd)) {
-    const last = findLastCmdGroup();
+    const last = findLastCmdGroup(taskId);
     if (last && last._groupIds.length < MAX_CMD_GROUP) {
       last._groupIds.push(requestId);
       last._groupCmds.push(cls.bashCmd);
@@ -4596,6 +4742,7 @@ function showPermissionCard(
   const item = document.createElement("div") as unknown as CmdGroupItem;
   item.className = "approval-item" + (cls.danger ? " danger" : "");
   item._groupIds = [requestId];
+  item._groupTaskId = taskId;
   item._groupCmds = cls.bashCmd ? [cls.bashCmd] : [];
   item._groupToolUseIds = [toolUseId ?? ""];
   item._groupToolNames = [toolName];
@@ -4845,6 +4992,8 @@ listen<{ line: string }>("cli-output", (event) => {
         data.request.input,
         data.request.tool_use_id,
         data.request.analysis,
+        // A14：子代理内部的审批带归属（主循环自己的调用没有这个字段 ⇒ undefined）
+        data.request.task_id,
       );
     }
     // CLI cancelled a pending request (hook decided first / query aborted)
@@ -4852,16 +5001,16 @@ listen<{ line: string }>("cli-output", (event) => {
       removePermissionCard(data.request_id);
       if (agentState === "approval") agentTransition("running");
     }
-    // Subagent / task progress — surface instead of silent waiting
-    else if (data.type === "system" && (data.subtype === "task_started" || data.subtype === "task_progress")) {
-    statusText.textContent = t("agent.subtask");
-    }
-    // 子任务收尾：`Agent` 工具与 **fork 技能**（A5）都会发，且都发在工具结果回灌之前 ——
-    // 这里不回填的话状态栏会一直停在「子任务执行中」，直到模型下一轮开口才被覆盖。
-    // 此刻主循环还在跑（要读子代理的报告再继续），所以落到「工作中」而不是「就绪」。
-    // 后台复盘 fork 不发这一对事件（它是无人值守的），因此不会被这里误改成「工作中」。
-    else if (data.type === "system" && data.subtype === "task_done") {
-      statusText.textContent = t("agent.working");
+    // Subagent / task progress — surface instead of silent waiting.
+    // A14：一轮里可能有多个子任务并发，三个事件全部交给 `agentSubtaskEvent` 按 `task_id`
+    // 归组（面板每行一个子任务 + 状态行报并行数）。
+    else if (
+      data.type === "system" &&
+      (data.subtype === "task_started" ||
+        data.subtype === "task_progress" ||
+        data.subtype === "task_done")
+    ) {
+      agentSubtaskEvent(data);
     }
     // Whole assistant message: block fallback (only when no partial stream
     // events arrived, to avoid double rendering) + tool_use status
@@ -6039,6 +6188,8 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     toolCards: new Map<string, AgentToolCard>(),
     openCard: null,
     thinkText: "",
+    subtasks: new Map<string, AgentSubtask>(),
+    taskPanel: null,
   };
 
   cliDoneCallback = (info?: ChatDoneInfo) => {
@@ -6121,7 +6272,7 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
 
       // 只有这一轮真的产生了「过程」才给折叠按钮
       const processEls = flowEl.querySelectorAll(
-        ".think-block, .tool-card, .tool-row, .todo-panel, .sys-note",
+        ".think-block, .tool-card, .tool-row, .todo-panel, .subtask-panel, .sys-note",
       );
       if (processEls.length > 0) {
         const foldBtn = doc("button");

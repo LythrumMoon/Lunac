@@ -381,7 +381,11 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 investigate something without derailing your current line of work. \
                 The subagent cannot see this conversation and cannot ask the user questions, \
                 so `prompt` must be completely self-contained. It can read and modify files, \
-                so make the task description precise. It cannot launch further subagents.",
+                so make the task description precise. It cannot launch further subagents. \
+                Several Agent calls issued in the SAME message run CONCURRENTLY (up to 3 at \
+                a time), so when you have independent tasks, dispatch them together in one \
+                message rather than one at a time; reports come back in the order you issued \
+                the calls.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -2334,13 +2338,17 @@ mod tests {
         assert!(why.contains("settings"), "两档叠加时应报只读档，实际是：{why}");
     }
 
-    /// `Agent` 的审批 / 并行 / 只读三条口径（A1 约束③）：
-    /// 要问（派生的是能写文件的代理）、必须串行（并发派子代理 = 并发花钱 + 争抢文件）、
-    /// 只读档不放行。
+    /// `Agent` 的审批 / 并行 / 只读三条口径（A1 约束③；**A14 起「并行」一条已改**）：
+    /// 要问（派生的是能写文件的代理）、**不进只读并行白名单**、只读档不放行。
+    ///
+    /// 关于第二条：A14 让「同一轮里的多个子代理」并发跑（上限 `SUBAGENT_PARALLELISM = 3`），
+    /// 但那条路走的是 main.rs 的 `BatchKind::Subagent`（每线程一份 `detached` 的 `Cfg`），
+    /// **刻意不并入 `parallel_safe` 这张只读白名单** —— 白名单里全是「不写盘、不发请求」的
+    /// 纯读工具，而子代理两样都干。合进去会让「只读批」这个前提失效。
     #[test]
     fn agent_is_gated_and_serial() {
         assert!(needs_approval("Agent"), "派子代理这个决定要用户确认");
-        assert!(!parallel_safe("Agent"), "子代理必须串行执行");
+        assert!(!parallel_safe("Agent"), "子代理不走只读并行白名单（并发另有 BatchKind::Subagent）");
         assert!(!gated_in_read_only("Agent"), "只读档不放行 Agent");
     }
 
@@ -2447,7 +2455,9 @@ mod tests {
             "Bash",
             "PowerShell",
             "AskUserQuestion",
-            // 技能按最坏模式算：fork 会派生能写文件、发 API 的子代理（A5）
+            // 技能按最坏模式算：fork 会派生能写文件、发 API 的子代理（A5）。
+            // A14 的「多子代理并发」同样**不从这里放行** —— 它按入参解析出 fork（见
+            // main.rs 的 `subagent_call()`），走 `BatchKind::Subagent` 那条专用批。
             "Skill",
             "mcp__fetch", // MCP 工具名带前缀，副作用未知且共用一条通道
             "Unknown",

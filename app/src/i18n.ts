@@ -799,6 +799,28 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "Agent 하위 작업 실행 중...",
     "en": "Agent subtask running...",
   },
+  // A14 多任务并行：状态行报并行数、面板表头、行内状态
+  "agent.subtask_parallel": {
+    "zh-CN": "Agent 并行执行 {count} 个子任务...",
+    "zh-TW": "Agent 並行執行 {count} 個子任務...",
+    "ja": "Agent が {count} 個のサブタスクを並行実行中...",
+    "ko": "Agent가 하위 작업 {count}개를 병렬 실행 중...",
+    "en": "Agent running {count} subtasks in parallel...",
+  },
+  "agent.subtask_panel": {
+    "zh-CN": "子任务（{done}/{total}）",
+    "zh-TW": "子任務（{done}/{total}）",
+    "ja": "サブタスク（{done}/{total}）",
+    "ko": "하위 작업 ({done}/{total})",
+    "en": "Subtasks ({done}/{total})",
+  },
+  "agent.subtask_running": {
+    "zh-CN": "运行中",
+    "zh-TW": "執行中",
+    "ja": "実行中",
+    "ko": "실행 중",
+    "en": "Running",
+  },
   // 命令静态安全分析（agent 随 can_use_tool 上报 analysis 字段，见 ai-spec §3.5）
   "agent.static_danger": {
     "zh-CN": "危险命令（{labels}）— 不可加入白名单，请谨慎确认",
