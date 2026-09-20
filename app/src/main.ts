@@ -491,9 +491,6 @@ function applyWindowSize() {
   // 且模块初始化时这一次调用会把启动状态（简洁搜索 = main）无条件告诉 Rust，
   // 修掉「WebView 重载后 Rust 还停在 detail、Esc 再也不隐藏窗口」这类错位。
   syncUiMode();
-  // 外观：「跟随系统」模式下唤起时顺手取一次系统强调色（用户很可能正是刚在
-  // Windows 设置里改完颜色才切回来）。非系统模式走一次空转判断，成本可忽略。
-  if (appearance.colorMode === "system") void refreshSystemTheme();
 }
 
 // ── File chips management ──────────────────────────────────────
@@ -1524,7 +1521,6 @@ async function showChatHistory() {
     html += `
       <div class="history-item" data-sid="${s.id}">
         <div class="history-item-header">
-          <span class="history-item-icon">💬</span>
           <div class="history-item-info">
             <div class="history-item-title">${esc(cleanTitle)}</div>
             <div class="history-item-meta">${t("chat.messages", { count: String(s.messages.length) })}</div>
@@ -2167,6 +2163,11 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   // 已存的记忆（那是 `LUNAC_MEMORY` 管的事）。
   { name: "Remember" },
   { name: "Skill" },
+  // 计划相位（2026-09-20，A7）：这两件都不碰本机 —— 进入只改 agent 进程内的一个标志，
+  // 退出只是把计划交出来给用户裁决。列出来是给用户一个「别让模型自作主张先出计划」的开关
+  // （禁掉后模型只能直接动手，或在正文里讲计划）。
+  { name: "EnterPlanMode" },
+  { name: "ExitPlanMode" },
 ];
 
 function loadCustomBlacklist(): string[] {
@@ -2329,7 +2330,6 @@ function renderDrawerHistory(sessions: ChatSession[]) {
     // 需求：标题严格居中、不显示时间，meta 仅保留消息条数。
     item.innerHTML = `
       <div class="history-item-header">
-        <span class="history-item-icon">💬</span>
         <div class="history-item-info">
           <div class="history-item-title">${esc(preview)}</div>
           <div class="history-item-meta">${t("chat.msgs", { count: String(msgCount) })}</div>
@@ -2432,6 +2432,14 @@ function updateTokenDashboard() {
 function localDateKey(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** `YYYY-MM-DD_HHMMSS`（本地时区）—— 计划文档（A7）的文件名分片键。
+ *  **必须带时刻**：只到天的话，同一天批准两份计划会互相覆盖；
+ *  形状由 Rust 侧 `storage::plan_path()` 严格校验（前端给的文件名一律不可信）。 */
+function localStamp(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${localDateKey(d)}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
 /** 把一次提问的用量追加进本地日志（只追加，失败不影响对话） */
@@ -3061,18 +3069,18 @@ interface CliEventLine {
   /** system/context_compacted 的压缩计数（见 usageTotals / ai-spec §11 规则 23） */
   elided?: number;
   dropped?: number;
+  /** system/plan_mode（计划相位，A7）：`on` = 进入 / `off` = 已批准解除；
+   *  `reason` 只有进入时才有（模型给用户的一句话说明）。 */
+  state?: string;
+  reason?: string;
   request?: {
     subtype?: string;
     tool_name?: string;
     input?: Record<string, unknown>;
     tool_use_id?: string;
-    /** 命令类工具（Bash / PowerShell）的**执行侧**静态安全分析，由 agent 附上 ——
-     *  见 docs/ai-spec.md §3.5「命令静态安全分析」。
-     *  · `dangerous` 非空 → 任何档位都必须人工确认，且不给「始终允许」
-     *  · `opaque`    非空 → 含无法静态判定的成分（变量 / 编码执行 / 间接执行器），
-     *                      **不得自动放行**（fail-closed）
+    /** agent 附上的**执行侧**静态安全分析 —— 见 docs/ai-spec.md §3.5。
      *  缺字段时回落到本文件自己的正则（兼容旧 agent 与非命令类工具）。 */
-    analysis?: { dangerous?: string[]; opaque?: string[] };
+    analysis?: AgentAnalysis;
   };
   event?: {
     type: string;
@@ -3929,6 +3937,20 @@ interface RequestClass {
   danger: string | null;
   opaque: string | null;
   bashCmd: string | null;
+  /** 写入内容里扫出的疑似凭据（`规则 (line N)`）—— 见下面的 ③。空 / 缺省 = 没扫到 */
+  secrets?: string[];
+}
+
+/** agent 随 `can_use_tool` 附上的**执行侧**静态安全分析（见 docs/ai-spec.md §3.5）。
+ *  · `dangerous` 非空 → 任何档位都必须人工确认，且不给「始终允许」（危险命令）
+ *  · `opaque`    非空 → 含无法静态判定的成分（变量 / 编码执行 / 间接执行器），
+ *                      **不得自动放行**（fail-closed）
+ *  · `secrets`   非空 → 写入内容（`Write` 的 content / `Edit` 的 new_string）里扫出
+ *                      疑似凭据，同样「必须人看」：不自动放行、也不给「始终允许」 */
+interface AgentAnalysis {
+  dangerous?: string[];
+  opaque?: string[];
+  secrets?: Array<{ rule?: string; line?: number }>;
 }
 
 /** Classify a permission request: auto-allow (safe/whitelisted), danger
@@ -3936,7 +3958,7 @@ interface RequestClass {
 function classifyRequest(
   toolName: string,
   input: unknown,
-  analysis?: { dangerous?: string[]; opaque?: string[] },
+  analysis?: AgentAnalysis,
 ): RequestClass {
   const inp = input as Record<string, unknown> | undefined;
   const bashCmd =
@@ -3963,6 +3985,20 @@ function classifyRequest(
   //    **危险命令（①）不在此列**：它有正面的破坏性证据，任何档位都要人确认。
   if (agentOpaque.length && getRunMode() !== "auto") {
     return { auto: false, danger: null, opaque: agentOpaque.join("、"), bashCmd };
+  }
+  // ③ 写入内容里扫出疑似凭据 / 密钥（`Write` / `Edit`，实现在
+  //    core-agent/src/content_safety.rs）→ 与 ① 同样是「必须人看」：不自动放行、
+  //    任何档位都弹卡、也不给「始终允许」（写类工具的「始终允许」= 以后所有
+  //    `Write` 都免问，命中过凭据的那次之后更不该开口子）。
+  //    **不并进 ① 的 danger**：① 的文案是「危险命令」，与「正常代码里混进了一把
+  //    key」是两回事，混用会让用户看不懂到底在问什么。
+  //    **不比 ② 更严也不更松**：② 在自动档放行是因为它只是「判不出来」（无证据），
+  //    这里是**看见了正面证据**，所以自动档也拦。
+  const secrets = (analysis?.secrets ?? [])
+    .filter((h) => h?.rule)
+    .map((h) => `${h.rule} (line ${h.line ?? "?"})`);
+  if (secrets.length) {
+    return { auto: false, danger: null, opaque: null, bashCmd, secrets };
   }
 
   if (bashCmd) {
@@ -3991,6 +4027,11 @@ function classifyRequest(
   // "No answer was collected"）。
   if (toolName === "AskUserQuestion") return { auto: false, danger: null, opaque: null, bashCmd: null };
 
+  // ExitPlanMode（A7）**同理且更硬**：它的「允许」= 放行写类工具 + 让模型开始动手，
+  // 自动放行等于「计划没人读过就开工」—— 那正是这张卡要防的事。
+  // 与 AskUserQuestion 一样，**白名单也免疫**（不在下面 `wl.tools.includes` 那条路上）。
+  if (toolName === "ExitPlanMode") return { auto: false, danger: null, opaque: null, bashCmd: null };
+
   // 非命令类工具同样受运行方式约束（写类四件走这里）
   const mode = getRunMode();
   if (mode === "auto") return { auto: true, danger: null, opaque: null, bashCmd: null };
@@ -4004,6 +4045,7 @@ function respondPermission(
   allow: boolean,
   toolUseId?: string,
   updatedInput?: Record<string, unknown>,
+  denyMessage?: string,
 ) {
   // 批准那一刻重新计时：用户在审批卡上犹豫的时间不该算进卡片的「耗时」
   if (allow && toolUseId) {
@@ -4016,7 +4058,14 @@ function respondPermission(
   // （agent 侧只有「非空对象才覆盖」，所以答案必须挂在对象里，不能是空 {}）。
   const inner = allow
     ? { behavior: "allow", updatedInput: updatedInput ?? {}, toolUseID: toolUseId }
-    : { behavior: "deny", message: "User denied this action in Lunac", interrupt: false, toolUseID: toolUseId };
+    : {
+        behavior: "deny",
+        // 各卡片可以给一句**更贴上下文**的拒因（计划卡用它说明「仍在计划模式」）；
+        // 缺省那句是通用兜底（agent 侧拿到什么就原样回灌给模型）。
+        message: denyMessage ?? "User denied this action in Lunac",
+        interrupt: false,
+        toolUseID: toolUseId,
+      };
   const msg = JSON.stringify({
     type: "control_response",
     response: { subtype: "success", request_id: requestId, response: inner },
@@ -4057,6 +4106,8 @@ interface CmdGroupItem extends HTMLElement {
   _groupOpaque?: boolean;
   /** 组内的不透明原因（去重）—— 标题 tooltip 用 */
   _groupOpaqueLabels: string[];
+  /** 写入内容里扫出的疑似凭据（`规则 (line N)`）→ 不留「始终允许」，正文里显式列出 */
+  _groupSecrets?: string[] | null;
   _groupInput?: unknown;
   _isCmdGroup: boolean;
   _finish: (allow: boolean, always?: boolean) => void;
@@ -4094,7 +4145,11 @@ function renderGroupTitle(item: CmdGroupItem) {
   const opaqueHtml = item._groupOpaque
     ? `<span class="approval-warn-inline" title="${esc(t("agent.static_opaque", { reasons: item._groupOpaqueLabels.join("、") }))}">⚠</span>`
     : "";
-  el.innerHTML = `${dangerHtml}${opaqueHtml}<b>${esc(item._groupToolNames.join(" + "))}</b>`;
+  // 写入内容里扫出疑似凭据 → 与 ⚠ 分开展示：那个是「判不出来」，这个是「看见了东西」
+  const secretHtml = item._groupSecrets?.length
+    ? `<span class="approval-warn-inline" title="${esc(t("agent.static_secrets", { hits: item._groupSecrets.join("、") }))}">🔑</span>`
+    : "";
+  el.innerHTML = `${dangerHtml}${opaqueHtml}${secretHtml}<b>${esc(item._groupToolNames.join(" + "))}</b>`;
 }
 
 /** AskUserQuestion 的选项界面：单选用互斥高亮、多选可叠加；选中结果写进
@@ -4179,6 +4234,81 @@ function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupIte
   item._resolveNote = (allow) => (allow ? "已提交答案" : "已拒绝提问");
 }
 
+/** 计划卡（A7）：`ExitPlanMode` 的入参 `plan` 就是整份计划，原样铺在卡里给用户读。
+ *
+ *  不引 markdown 渲染器 —— 全应用的对话正文都是「转义 + `pre-wrap`」（见 `esc` 与
+ *  `.agent-text` 的样式）。计划里那几个 `#` / `-` 用原文反倒更可信：用户看到的就是
+ *  模型交出来的那一份，没有任何中间层可能改动它。
+ *
+ *  用 `textContent` 而不是 `innerHTML`：计划是**模型生成的任意文本**，既不该被当成
+ *  HTML 解析，也不该给它任何注入的机会。 */
+function renderPlanCard(host: HTMLElement, input: unknown) {
+  const inp = (input ?? {}) as Record<string, unknown>;
+  const plan = typeof inp.plan === "string" ? inp.plan : "";
+  const lines = plan.trim() ? plan.trim().split("\n").length : 0;
+
+  const meta = document.createElement("div");
+  meta.className = "approval-plan-meta";
+  meta.textContent = t("agent.plan_meta", { lines: String(lines) });
+  host.appendChild(meta);
+
+  const box = document.createElement("div");
+  box.className = "approval-plan";
+  box.textContent = plan;
+  host.appendChild(box);
+}
+
+/** 批准后把计划留档到 `ModuleData\plans\<本地时间戳>.md`（A7）。
+ *
+ *  **落盘不是执行的前置**：agent 那边已经拿到批准、开始干活了，这里只负责留一份
+ *  「用户看过并批准过」的副本 —— 所以失败只提示，绝不反过来拦住执行。 */
+async function persistApprovedPlan(plan: string, host: HTMLElement) {
+  const row = document.createElement("div");
+  row.className = "tool-row plan-saved";
+  try {
+    const path = await invoke<string>("save_plan_md", { stamp: localStamp(new Date()), plan });
+    row.textContent = t("agent.plan_saved", { path });
+  } catch (err) {
+    row.textContent = t("agent.plan_save_failed", { err: String(err) });
+    row.classList.add("failed");
+    console.warn("[plan] save_plan_md failed", err);
+  }
+  host.appendChild(row);
+  agentScroll();
+}
+
+/** 计划相位横幅（A7）：**单例节点**，进 / 出都复用它。
+ *
+ *  为什么是单例：一个会话里可能反复进出（出计划 → 用户拒绝 → 改完再出），每次都插一条
+ *  会把对话流冲得乱七八糟；而且「现在到底在不在计划模式」本来就只该有一个答案。
+ *  状态**只跟着 agent 的广播走**（system/plan_mode）—— 前端不拿「模型调过哪些工具」自己
+ *  推断：那要在「调了工具」与「用户批准了没有」之间做二次判断，很容易和 agent 里那个
+ *  真正的标志脱节。 */
+let planModeNotice: HTMLElement | null = null;
+
+function renderPlanModeNotice(state: string, reason: string) {
+  const host = agentView?.flow ?? resultsList;
+  if (!planModeNotice || !planModeNotice.isConnected) {
+    planModeNotice = document.createElement("div");
+    planModeNotice.className = "plan-mode-note";
+    planModeNotice.innerHTML = `<span class="plan-mode-dot"></span><span class="plan-mode-text"></span>`;
+    host.appendChild(planModeNotice);
+  }
+  const on = state === "on";
+  planModeNotice.classList.toggle("on", on);
+  const label = on ? t("agent.plan_mode_on") : t("agent.plan_mode_off");
+  const textEl = planModeNotice.querySelector(".plan-mode-text");
+  if (textEl) textEl.textContent = reason ? `${label} · ${reason}` : label;
+  agentScroll();
+}
+
+/** agent 进程重启 = `plan_phase` 归零（它是进程内状态，不落盘），横幅必须跟着消失 ——
+ *  否则界面会一直挂着一条「计划模式中」，而新进程里写类工具其实是放行的。 */
+function clearPlanModeNotice() {
+  planModeNotice?.remove();
+  planModeNotice = null;
+}
+
 /** 权限卡里命令文本的**显示**归一化（纯排版，不改实际执行的命令）。
  *
  *  模型经常把命令写成「首行空白 + 后续行统一缩进」的多行串，而 `.approval-cmd`
@@ -4201,7 +4331,8 @@ function normalizeCmdForDisplay(cmd: string): string {
 function renderCmdGroupBody(item: CmdGroupItem) {
   // 危险 / 判不出来的命令不留「始终允许」—— 合并进来的**后续**命令可能才是危险的那条，
   // 而按钮是在第一条命令时就画好的，所以在这里兜一次（每次合并都会走到）。
-  if (item._groupDanger || item._groupOpaque) {
+  // 「写入内容含凭据」同理不留（写类工具的「始终允许」= 以后所有 `Write` 都免问）。
+  if (item._groupDanger || item._groupOpaque || item._groupSecrets?.length) {
     item.querySelector(".approval-always")?.remove();
   }
   const bodyEl = item.querySelector(".approval-body") as HTMLElement | null;
@@ -4237,7 +4368,14 @@ function renderCmdGroupBody(item: CmdGroupItem) {
     } catch {
       preview = String(item._groupInput ?? "");
     }
-    bodyEl.innerHTML = `<div class="approval-input compact" title="${esc(preview)}">${esc(preview)}</div>`;
+    // 写入内容里扫出疑似凭据 → 显式列在正文里。**不能只放标题 tooltip**：
+    // 这一档的全部价值就是「用户扫一眼卡片时能看见」，藏进 hover 等于没做。
+    const secretHtml = item._groupSecrets?.length
+      ? `<div class="approval-secret-warn">${esc(
+          t("agent.static_secrets_body", { hits: item._groupSecrets.join("、") }),
+        )}</div>`
+      : "";
+    bodyEl.innerHTML = `${secretHtml}<div class="approval-input compact" title="${esc(preview)}">${esc(preview)}</div>`;
   }
 }
 
@@ -4266,11 +4404,15 @@ function showPermissionCard(
   toolName: string,
   input: unknown,
   toolUseId?: string,
-  analysis?: { dangerous?: string[]; opaque?: string[] },
+  analysis?: AgentAnalysis,
 ) {
   pendingPermissionCards.get(requestId)?.remove();
   const host = agentView?.flow ?? resultsList; // inline, in arrival order
   const cls = classifyRequest(toolName, input, analysis);
+  // 计划卡（A7）：走的是与 AskUserQuestion 同一条通道 —— 审批卡 + `updatedInput`，
+  // 不新增任何协议字段（见 agent-ui-spec §9 的字段登记原则）。
+  // 声明在这里（而不是画正文那一段）：批量卡要不要放宽高度上限，取决于这一批里有没有它。
+  const isPlan = toolName === "ExitPlanMode";
 
   // Whitelisted / built-in safe → auto-approve, show a one-line notice
   if (cls.auto) {
@@ -4314,6 +4456,9 @@ function showPermissionCard(
     });
   }
   const body = permissionBatchCard.querySelector(".approval-batch-body")!;
+  // 计划卡要读几十行正文：把**外层**那个滚动容器的高度上限放宽（见 styles.css 的
+  // `has-plan`）—— 不给计划框自己加第二层滚动条（嵌套双滚动是本项目明确禁掉的）。
+  if (isPlan) permissionBatchCard.classList.add("has-plan");
 
   // ── Continuous-command merge: fold a follow-up command into the last open
   // Bash/PowerShell approval row instead of a new one ───────────────────
@@ -4353,13 +4498,22 @@ function showPermissionCard(
   item._groupDangerLabels = cls.danger ? [cls.danger] : [];
   item._groupOpaque = !!cls.opaque;
   item._groupOpaqueLabels = cls.opaque ? [cls.opaque] : [];
+  item._groupSecrets = cls.secrets ?? null;
   item._groupInput = input;
   item._isCmdGroup = cls.bashCmd !== null;
 
-  // 危险命令永不提供「始终允许」；解释器前缀、以及「判不出来」的命令同样不给 ——
-  // 白名单是**前缀匹配**，放进去等于把「以后任何 `powershell …` / `del …`」全自动放行。
+  // 危险命令永不提供「始终允许」；解释器前缀、「判不出来」的命令、以及「写入内容
+  // 里扫出凭据」同样不给 —— 前两者的白名单是**前缀匹配**，放进去等于把「以后任何
+  // `powershell …` / `del …`」全自动放行；后者更直接：`Write` 进了白名单 =
+  // 以后所有写文件都免问，那正是这条扫描想防的。
+  // 计划卡同样不给（A7）：把 `ExitPlanMode` 白名单化 = 以后**每一份计划都自动批准**，
+  // 那等于把整个计划模式关掉。
   const alwaysBtn =
-    cls.danger || cls.opaque || (cls.bashCmd !== null && !canWhitelistCmd(cls.bashCmd))
+    cls.danger ||
+    cls.opaque ||
+    cls.secrets?.length ||
+    isPlan ||
+    (cls.bashCmd !== null && !canWhitelistCmd(cls.bashCmd))
       ? ""
       : `<button class="approval-btn approval-always">始终允许</button>`;
   // AskUserQuestion 的「允许」其实是「提交答案」，且不能白名单化
@@ -4369,14 +4523,22 @@ function showPermissionCard(
     <div class="approval-title"></div>
     <div class="approval-body"></div>
     <div class="approval-actions">
-      <button class="approval-btn approval-allow">${isAsk ? "提交" : "允许"}</button>
-      ${isAsk ? "" : alwaysBtn}
+      <button class="approval-btn approval-allow">${isAsk ? "提交" : isPlan ? t("agent.plan_approve") : "允许"}</button>
+      ${isAsk || isPlan ? "" : alwaysBtn}
       <button class="approval-btn approval-deny">拒绝</button>
     </div>`;
   renderGroupTitle(item);
+  // 计划卡的标题不走 `renderGroupTitle`（那个拼的是工具名 + 参数摘要）——
+  // 用户要看到的是「这是一份待批准的计划」，而不是「ExitPlanMode」。
+  if (isPlan) {
+    const titleEl = item.querySelector(".approval-title");
+    if (titleEl) titleEl.innerHTML = `<b>${esc(t("agent.plan_title"))}</b>`;
+  }
   body.appendChild(item);
   if (isAsk) {
     renderAskQuestions(item.querySelector(".approval-body")!, input, item);
+  } else if (isPlan) {
+    renderPlanCard(item.querySelector(".approval-body")!, input);
   } else {
     renderCmdGroupBody(item);
   }
@@ -4403,9 +4565,22 @@ function showPermissionCard(
     ids.forEach((rid, i) => {
       // AskUserQuestion：用户选中的选项要随 allow 一起带回去（覆盖原参数）
       const updated = allow ? item._buildUpdatedInput?.() : undefined;
-      respondPermission(rid, allow, item._groupToolUseIds[i] || undefined, updated);
+      // 计划卡被拒 → 给模型的**专用**拒因（见 i18n 的 agent.plan_deny_msg）：
+      // 通用那句「User denied」不会告诉它「仍在计划模式」，它会以为可以接着动手，
+      // 然后每个写类调用都撞一次 `write_blocked`。
+      const denyMsg = isPlan && !allow ? t("agent.plan_deny_msg") : undefined;
+      respondPermission(rid, allow, item._groupToolUseIds[i] || undefined, updated, denyMsg);
       pendingPermissionCards.delete(rid);
     });
+    // 批准的计划留档（A7）：异步、失败不影响执行，见 persistApprovedPlan。
+    // 落点用 `host`（对话流）而**不是** `item.parentElement`（审批卡正文）——
+    // 卡在回答后会整个移除，留在卡里的提示会跟着一起消失。
+    if (allow && isPlan) {
+      const approved = ((item._groupInput ?? {}) as Record<string, unknown>).plan;
+      if (typeof approved === "string" && approved.trim()) {
+        void persistApprovedPlan(approved, host);
+      }
+    }
     item.querySelector(".approval-actions")?.remove();
     const note = document.createElement("div");
     note.className = `approval-note ${allow ? "ok" : "no"}`;
@@ -4529,6 +4704,11 @@ listen<{ line: string }>("cli-output", (event) => {
       liveCompaction.dropped += dropped;
       statusText.textContent = t("agent.compacted", { elided: String(elided), dropped: String(dropped) });
     }
+    // 计划相位（A7）：模型调 `EnterPlanMode` / 用户批准 `ExitPlanMode` 时由 agent 广播。
+    // 前端**只镜像**这个状态，不自己推断（理由见 renderPlanModeNotice）。
+    else if (data.type === "system" && data.subtype === "plan_mode") {
+      renderPlanModeNotice(String(data.state ?? ""), String(data.reason ?? ""));
+    }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {
       // 空闲时收到的审批来自**后台复盘 fork**（A4）：它按轮次门槛在**提问之间**跑，
@@ -4551,6 +4731,13 @@ listen<{ line: string }>("cli-output", (event) => {
     // Subagent / task progress — surface instead of silent waiting
     else if (data.type === "system" && (data.subtype === "task_started" || data.subtype === "task_progress")) {
     statusText.textContent = t("agent.subtask");
+    }
+    // 子任务收尾：`Agent` 工具与 **fork 技能**（A5）都会发，且都发在工具结果回灌之前 ——
+    // 这里不回填的话状态栏会一直停在「子任务执行中」，直到模型下一轮开口才被覆盖。
+    // 此刻主循环还在跑（要读子代理的报告再继续），所以落到「工作中」而不是「就绪」。
+    // 后台复盘 fork 不发这一对事件（它是无人值守的），因此不会被这里误改成「工作中」。
+    else if (data.type === "system" && data.subtype === "task_done") {
+      statusText.textContent = t("agent.working");
     }
     // Whole assistant message: block fallback (only when no partial stream
     // events arrived, to avoid double rendering) + tool_use status
@@ -6410,7 +6597,6 @@ interface ThemeInfo {
   builtin: boolean;
   resolved: ThemeAssets;
 }
-interface SystemTheme { accent: string; dark: boolean; source: string }
 
 interface Appearance {
   bgImage: string | null;   // 自定义背景图（已 convertFileSrc 的 asset URL）
@@ -6418,29 +6604,63 @@ interface Appearance {
   bgSaturate: number;       // 背景饱和度 %
   bgOpacity: number;        // 背景不透明度 0~1
   sheen: number;            // 玻璃反光强度 0~1
-  surfaceAlpha: number;     // 玻璃底色 alpha
-  tintBase: boolean;        // 底色/文字/边框是否跟随主题色派生（false = 用 :root 原配色）
-  colorMode: "custom" | "system";
-  customAccent: string;     // #rrggbb
+  surfaceAlpha: number;     // 玻璃底色 alpha（界面上叫「底色透明度」，2026-09-20 起归入「底色自定义」）
+  /** **「恢复默认主题」**（界面文案；字段名沿用历史的 `tintBase`，改名要动 localStorage
+   *  迁移、收益只有可读性）。**默认 false**：
+   *  false = 底色 / 按钮线条 / 按钮背景**全部采用用户自定义值**；
+   *  true = **回到一开始保存的那套默认主题配色** —— 上面三项的**颜色**不生效，走
+   *  `themes/default` + `DEFAULT_ACCENT` 派生的值。
+   *  **四项例外（照常生效、照常可调）**：底色透明度、按钮线条透明度、按钮背景透明度
+   *  （用户 2026-09-20 「除透明度外都不可调」），以及**文字明度**（同日后续明确
+   *  「文字明度不锁定」）。
+   *  沿革：`底色跟随主题色` → `主题色代替底色`（2026-09-20）→ **`恢复默认主题`**（同日，
+   *  开关移出「底色自定义」、摆到「主题颜色」最顶上）。 */
+  tintBase: boolean;
+  /** 底色 #rrggbb。**空串 = 用户没动过** ⇒ 仍按主题色自动派生（「没动过就自动派生」那一档）。
+   *  取色器色板与「底色饱和度 / 底色明度」两个滑块**共用这一份 HSV**：滑块写的就是色板
+   *  的两轴（不再是「微调偏移」，2026-09-20 用户改定）。 */
+  baseColor: string;
+  /** 按钮线条 #rrggbb。**空串 = 跟随主题色**（默认）⇒ `--btn-line-*` 回落到 :root 的 accent 配方。 */
+  btnLineColor: string;
+  btnLineAlpha: number;     // 按钮线条透明度 0~1（只作用于「线条」，默认 0.32 == 原 --accent-border）
+  /** 按钮背景 #rrggbb。**空串 = 跟随主题色**（默认）⇒ 回落 `--accent-bg` 的配方。
+   *  2026-09-20 新增：按钮背景不再跟底色，自己一条。 */
+  btnBgColor: string;
+  btnBgAlpha: number;       // 按钮背景透明度 0~1（默认 0.14 == 原 --accent-bg 的 α）
+  /** 文字明度偏移 ±100。0 = 按主题色派生的原值（逐像素不变）。
+   *  **不受「恢复默认主题」管辖**（用户 2026-09-20 明确「文字明度不锁定」）——
+   *  它是明度偏移、不是配色本身，开关开着也照常生效。 */
+  textLight: number;
   themeId: string;          // "default" = 不套主题包
 }
 
 const APPEARANCE_KEY = "lunac-appearance";
+/** 外观配置的一次性迁移标记（2026-09-20 新增，配合 `tintBase` 默认值反转）。
+ *  用独立键而不是配置内的字段：配置对象每次 `persistAppearance()` 都会整份重写，
+ *  放里面的标记会与「是否真的迁移过」脱钩。 */
+const APPEARANCE_MIGRATED_KEY = "lunac-appearance-migrated";
+/** 兜底主题色：主题包没声明（或声明了非法值）时用它 —— 也就是原 `customAccent` 的默认值。
+ *  **主题色本身已没有用户入口**（2026-09-20 用户要求「去除主题色取色」，字段一并删除），
+ *  唯一来源是主题包的 `tokens.accent`；这里是磁盘读不到 / 主题损坏时的最后一道。 */
+const DEFAULT_ACCENT = "#c0a0a0";
 const APPEARANCE_DEFAULTS: Appearance = {
   bgImage: null, bgBlur: 4, bgSaturate: 92, bgOpacity: 0.5,
-  sheen: 0, surfaceAlpha: 0.88, tintBase: true,
-  colorMode: "custom", customAccent: "#c0a0a0", themeId: "default",
+  sheen: 0, surfaceAlpha: 0.88, tintBase: false, themeId: "default",
+  // 三个「空串 = 跟随主题」的默认值：**这是默认外观逐像素不变的关键** ——
+  // 空串时 main.ts 会把内联变量清掉，回落到 :root 里那几行 `var(--accent-*)`。
+  baseColor: "", btnLineColor: "", btnLineAlpha: 0.32,
+  btnBgColor: "", btnBgAlpha: 0.14, textLight: 0,
 };
 /** 各数值的合法区间：滑块的 min/max 只是 UI 提示，手工改 localStorage 或旧版本
  *  残留都可能给出越界值（`bgOpacity: 5` 会让背景变成纯色块直接盖住面板）。 */
 const APPEARANCE_RANGE: Record<string, [number, number]> = {
   bgBlur: [0, 40], bgSaturate: [0, 200], bgOpacity: [0, 1], sheen: [0, 1], surfaceAlpha: [0.3, 1],
+  btnLineAlpha: [0, 1], btnBgAlpha: [0, 1], textLight: [-100, 100],
 };
 
 let appearance: Appearance = { ...APPEARANCE_DEFAULTS };
 /** 主题包缓存：id → ThemeInfo。`list_themes` 只在启动与「打开设置」时拉一次。 */
 const themeInfos = new Map<string, ThemeInfo>();
-let systemTheme: SystemTheme = { accent: "", dark: true, source: "fallback" };
 
 function clampAppearance(a: Appearance): Appearance {
   const out = { ...a };
@@ -6448,8 +6668,16 @@ function clampAppearance(a: Appearance): Appearance {
     const v = Number((out as any)[k]);
     (out as any)[k] = Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : (APPEARANCE_DEFAULTS as any)[k];
   }
-  if (out.colorMode !== "system") out.colorMode = "custom";
-  if (!/^#[0-9a-fA-F]{6}$/.test(out.customAccent)) out.customAccent = APPEARANCE_DEFAULTS.customAccent;
+  // 三个颜色字段。它们额外允许**空串这个哨兵值**（= 跟随主题）—— 空串不是坏数据，
+  // 不能当非法值回落到默认 hex，否则「没动过取色器」就会被写成 #c0a0a0，
+  // 主题色一改而按钮线条不动。
+  const hexOr = (v: unknown, allowEmpty: boolean): string | null => {
+    if (allowEmpty && v === "") return "";
+    return typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v) ? v : null;
+  };
+  out.baseColor = hexOr(out.baseColor, true) ?? APPEARANCE_DEFAULTS.baseColor;
+  out.btnLineColor = hexOr(out.btnLineColor, true) ?? APPEARANCE_DEFAULTS.btnLineColor;
+  out.btnBgColor = hexOr(out.btnBgColor, true) ?? APPEARANCE_DEFAULTS.btnBgColor;
   if (typeof out.themeId !== "string" || !out.themeId) out.themeId = "default";
   if (out.bgImage !== null && typeof out.bgImage !== "string") out.bgImage = null;
   // tintBase 只接受真布尔
@@ -6469,11 +6697,50 @@ function loadAppearance(): Appearance {
       if (legacy) { merged.bgImage = legacy; localStorage.removeItem("lunac-bg-image"); }
     } catch { /* localStorage 不可用则保持无背景 */ }
   }
+  // 一次性迁移（2026-09-20）：「主题色代替底色」（今称「恢复默认主题」）的默认值由
+  // **true 改成 false**。此刻磁盘上存着的 `true` 是**上一版默认值自己写下去的**，
+  // 几乎都不是用户的选择，留着它会让「新默认值」对老配置完全失效（表现：底色组 /
+  // 按钮组一进去就是灰的）。
+  // 因此清一次、让它走新默认值；标记独立存放，保证**只清一次** —— 否则用户以后真的
+  // 打开这个开关，重启又会被清掉。
+  try {
+    if (!localStorage.getItem(APPEARANCE_MIGRATED_KEY)) {
+      delete (merged as Partial<Appearance>).tintBase;
+      localStorage.setItem(APPEARANCE_MIGRATED_KEY, "1");
+    }
+  } catch { /* localStorage 不可用则按新默认值 */ }
   return clampAppearance(merged);
 }
 
 function persistAppearance() {
   try { localStorage.setItem(APPEARANCE_KEY, JSON.stringify(appearance)); } catch { /* 配额/隐私模式 */ }
+}
+
+/** 当前生效的**主题色**。2026-09-20 起唯一来源是主题包的 `tokens.accent`
+ *  （用户明确要求「去除主题色取色」，`Appearance.customAccent` 一并删除）：
+ *  默认主题 = `themes/default/theme.json` 的 `#c0a0a0`，官方主题 = 它自己声明的那个。
+ *  磁盘读不到主题包 / 主题损坏时回落 `DEFAULT_ACCENT`。 */
+function themeAccent(): string {
+  const a = themeInfos.get(appearance.themeId)?.manifest.tokens.accent;
+  return typeof a === "string" && /^#[0-9a-fA-F]{6}$/.test(a) ? a : DEFAULT_ACCENT;
+}
+
+/** 当前主题包显式声明的底色（`tokens.surface`）。返回 `"r, g, b"` 或 null。
+ *  **这是「主题全面代替底色」的落点**：声明了就以主题包为准（⑤ 步派生时让位），
+ *  默认主题已于 2026-09-20 去掉这个 token（用户要求「去除默认主题对底色的影响」）。 */
+function themeSurface(): string | null {
+  const s = themeInfos.get(appearance.themeId)?.manifest.tokens.surface;
+  return s ? toRgbTriplet(s) : null;
+}
+
+/** 把 `hsl(h, s%, l%)` 的 l 挪 delta 个百分点（夹到 0~100）。
+ *  只认 `derivePalette()` 产出的那种纯灰阶形式；不匹配就原样返回 —— 于是
+ *  delta === 0 时**必然逐字节不变**（「文字明度」滑块归零 = 完全复原）。 */
+function shiftHslLightness(v: string, delta: number): string {
+  const m = /^hsl\(0, 0%, (-?\d+)%\)$/.exec(v);
+  if (!m) return v;
+  const l = Math.min(100, Math.max(0, Number(m[1]) + delta));
+  return `hsl(0, 0%, ${l}%)`;
 }
 
 // ── 颜色工具 ─────────────────────────────────────────────────────
@@ -6553,7 +6820,7 @@ function relativeLuminance(hex: string): number | null {
  *  ② 文字明暗**只跟随主色的明暗、方向相反**：主色很亮 → 文字黑；主色很暗 → 文字白。
  *  ③ 底色明度与文字**同步反向**走，否则「亮主色 + 黑字」会落在深底上（不可读）。
  *
- *  转折点 = `APPEARANCE_DEFAULTS.customAccent`（#c0a0a0）的相对亮度：bright=0 时的
+ *  转折点 = `DEFAULT_ACCENT`（#c0a0a0）的相对亮度：bright=0 时的
  *  取值逐项等于改造前那套原配色（底色 `28,26,32`、文字近 `#eae2da`），**默认外观因此
  *  不受影响**；主色越亮越往「浅底 + 黑字」走（最亮：底色 83% / 文字 9%）。
  *  中段用 `t = (bright−0.5)×2` 做**过渡带**：亮度落在 0~0.5 区间的颜色一律按深色主题
@@ -6562,7 +6829,7 @@ function derivePalette(accentHex: string): Record<string, string> | null {
   const c = hexToRgb(accentHex);
   const lum = relativeLuminance(accentHex);
   if (!c || lum == null) return null;
-  const anchor = relativeLuminance(APPEARANCE_DEFAULTS.customAccent) ?? 0.42;
+  const anchor = relativeLuminance(DEFAULT_ACCENT) ?? 0.42;
   const raw = Math.min(1, Math.max(0, (lum - anchor) / Math.max(0.05, 1 - anchor)));
   const t = Math.min(1, Math.max(0, (raw - 0.5) * 2));   // 过渡带：0~0.5 一律深色主题
   const { h, s } = rgbToHsl(c.r, c.g, c.b);
@@ -6590,6 +6857,48 @@ function derivePalette(accentHex: string): Record<string, string> | null {
     // 浅色主题 0.35（亮底上同样的黑会脏得多）。
     "--shade-scale": inkLight ? "1" : "0.35",
   };
+}
+
+/** 用户自定义色的最终值。取色器写进来的 hex 就是最终色 ——
+ *  **饱和度 / 明度滑块与色板共用同一份 HSV**（2026-09-20 用户改定，取代早先的
+ *  「滑块是微调偏移」），所以这里不再做任何偏移运算，只把 hex 摊成 CSS 要的两种形状：
+ *    · `triplet` 喂 `--surface-rgb` / `--btn-line-rgb` 这类 `rgba(var(--x), α)`；
+ *    · `hoverTriplet` = 常态 +20/通道（与主题包 surface 的 hover 同一条口径）。 */
+function resolveCustomColor(hex: string)
+  : { hex: string; triplet: string; hoverTriplet: string } | null {
+  const c = hexToRgb(hex);
+  if (!c) return null;
+  return {
+    hex: toHex(c.r, c.g, c.b),
+    triplet: `${c.r}, ${c.g}, ${c.b}`,
+    hoverTriplet: [c.r, c.g, c.b].map(v => Math.min(255, v + 20)).join(", "),
+  };
+}
+
+/** 「反差四件套」的取值（分类区域 / 文本框 / 取色器框格 / 结果区选中项）。
+ *
+ *  做法：**把底色当成主色，跑一遍同一条派生纪律**。为什么不另写一套阈值 —— 四处的
+ *  用量都是 3%~14% 的淡洗，明暗方向必须与文字那一套一致；两套各自的「亮 / 暗」分界线
+ *  一旦不同，就会出现「底色偏亮时文字是白、反差却是黑」这种自相矛盾的结果。
+ *
+ *  取的是 `derivePalette` 的 ink（白或黑）而**不是底色本身**：这四处要的是「与底色相反
+ *  的一层」，底色已经很暗时再叠一层更暗等于没画。 */
+function contrastFor(hex: string) {
+  const pal = derivePalette(hex);
+  if (!pal) return null;
+  return {
+    rgb: pal["--ink-rgb"],
+    inkRgb: pal["--ink-rgb"],
+    // 凹陷层强度统一 0.35，不取 derivePalette 给的 1 —— 白洗叠在暗底上比黑洗叠在暗底上
+    // 抢眼得多，用 1 会过冲（25% 白 ≈ 一块灰斑）。0.35 与「浅色主题」那一档同值，两个方向手感一致。
+    shadeScale: "0.35",
+    borderGlass: pal["--border-glass"],
+  };
+}
+
+/** 底色的最终值。`baseColor` 是空串 ⇒ 用户没动过 ⇒ null（调用方回落主题派生）。 */
+function resolveBaseOverride(): { hex: string; triplet: string; hoverTriplet: string } | null {
+  return appearance.baseColor ? resolveCustomColor(appearance.baseColor) : null;
 }
 
 /** 写一个 CSS 变量；值为空串时**删除**该内联变量（回落到 :root 的默认值）。
@@ -6649,10 +6958,11 @@ function applyAppearance() {
   // 反光滑块 0~1 → 高光 alpha 0~0.22（再亮就成「一块白斑」而不是玻璃反光）
   setVar("--glass-sheen-alpha", String(Math.round(appearance.sheen * 22) / 100));
 
-  // ③ 主题色：跟随系统 → 用系统强调色（读不到则退回自定义色，不能变成无色）。
-  const accent = appearance.colorMode === "system"
-    ? (systemTheme.accent || appearance.customAccent)
-    : appearance.customAccent;
+  // ③ 主题色：**唯一来源是主题包**（2026-09-20 用户要求「去除主题色取色」，设置里的
+  //    取色器与 `Appearance.customAccent` 字段一并删除）。原先的「取色方式」（自定义 /
+  //    跟随 Windows）连同整条跟随系统链路也已下线 —— Rust 的 `get_system_theme` 命令保留
+  //    （那里带着 AccentColor 字节序的实测证据与单测），但前端不再有入口。
+  const accent = themeAccent();
   applyAccent(accent);
 
   // ④ 主题包（设计稿层）：形状 / 花纹 / 颜色 / 玻璃底色。
@@ -6666,20 +6976,74 @@ function applyAppearance() {
   setVar("--text-dim", tk?.text_dim ?? "");
   setVar("--text-muted", tk?.text_muted ?? "");
   setVar("--border-glass", tk?.border_glass ?? "");
-  const surface = tk?.surface ? toRgbTriplet(tk.surface) : null;
+  // 底色：**「主题全面代替底色」的落点**。主题包声明了 surface 就以它为准，⑤ 步让位；
+  // 默认主题已于 2026-09-20 去掉这个 token（用户要求「去除默认主题对底色的影响」），
+  // 于是默认主题下这条恒为空、底色完全由派生 / 用户自定义决定。
+  const surface = themeSurface();
   setVar("--surface-rgb", surface ?? "");
   // hover 底色 = 常态 +20/通道（原配色 28,26,32 → 48,44,54 正好是这个关系）
   setVar("--surface-rgb-hover", surface
     ? surface.split(",").map(s => String(Number(s.trim()) + 20)).join(", ")
     : "");
 
-  // ⑤ 整套配色跟随主色（`tintBase`）：底色/边框/文字按主色的**明暗**派生。
-  //    排在主题之后是刻意的：这是用户显式打开的开关，应当压过主题包里钉死的颜色。
-  //    关掉时不需要额外清理 —— ④ 已经把这几项清成「主题值或空」。
-  if (appearance.tintBase) {
-    const pal = derivePalette(accent);
-    if (pal) for (const [k, v] of Object.entries(pal)) setVar(k, v);
+  // ⑤ 整套配色派生。四种情况（用户 2026-09-20 四次定稿，本轮把开关改名为
+  //    「恢复默认主题」并调整失效范围）：
+  //    · 「恢复默认主题」**关着（默认）** → 底色 / 按钮色 / 文字明度**全部可生效**：
+  //      没动过底色（baseColor 空串）就仍按主题派生、动过就用用户的值；
+  //      主题包声明了 surface 时以它为准；
+  //    · 开关开着 → 回到**默认主题**那套配色：底色与按钮颜色全部不生效
+  //      （⑤ 的 baseOv 与 ⑤c/⑤d 的 colorsOn 一起归零）；
+  //    · **三个透明度不受管辖**（底色 / 按钮线条 / 按钮背景）：用户要求
+  //      「开恢复默认主题时除透明度以外的选项都不可调」⇒ 那三项任何状态下都生效，
+  //      见 ② 步的 `--surface-alpha` 与 ⑤c/⑤d 的两个 α；
+  //    · **文字明度也不受管辖**（用户随后明确「文字明度不锁定」）：它是明度偏移、
+  //      不是配色本身 ⇒ `textLight` 照常生效，开关开着也照常可调；
+  //    · 文字那一套的**颜色**照旧按主题色派生（用户要求「文字的颜色改变方式不动」）。
+  const baseOv = appearance.tintBase ? null : resolveBaseOverride();
+  const textDelta = appearance.textLight;
+  const pal = derivePalette(accent);
+  if (pal) {
+    for (const [k, v] of Object.entries(pal)) {
+      // 底色已由「用户自定义」或「主题包 surface」定下 ⇒ 派生值让位
+      if ((baseOv || surface) && (k === "--surface-rgb" || k === "--surface-rgb-hover")) continue;
+      if (textDelta !== 0 && (k === "--text" || k === "--text-dim" || k === "--text-muted")) {
+        setVar(k, shiftHslLightness(v, textDelta));
+        continue;
+      }
+      setVar(k, v);
+    }
   }
+  if (baseOv) {
+    setVar("--surface-rgb", baseOv.triplet);
+    setVar("--surface-rgb-hover", baseOv.hoverTriplet);
+  }
+  // ⑤b 「反差四件套」（分类区域 / 文本框 / 取色器框格 / 结果区选中项）：底色暗 ⇒ 这四处
+  //     亮、底色亮 ⇒ 这四处暗。见 styles.css `:root` 的 --ctx-* 注释与 ai-spec 规则 45。
+  //     没有自定义底色（或开关开着）时**清空**内联值 ⇒ 回落 `:root`，与改造前逐像素一致。
+  const ctx = baseOv ? contrastFor(appearance.baseColor) : null;
+  setVar("--ctx-rgb", ctx ? ctx.rgb : "");
+  setVar("--ctx-ink-rgb", ctx ? ctx.inkRgb : "");
+  setVar("--ctx-shade-rgb", ctx ? ctx.inkRgb : "");
+  setVar("--ctx-shade-scale", ctx ? ctx.shadeScale : "");
+  setVar("--ctx-border-glass", ctx ? ctx.borderGlass : "");
+  // ⑤c 按钮线条（设置 → 风格 ·「按钮自定义」）：只写这两个变量，消费方（切换开关 +
+  //     若干图标按钮的描边）各自按 α 配方取值。
+  //     **颜色**受「恢复默认主题」管辖：开关开着时清掉内联值、回落 `:root` 里的主题配方
+  //     （默认配置下这个颜色本来就是空串，所以默认态逐像素不变）。
+  //     **透明度不受管辖** —— 用户明确要求开关开着时这三项仍可调（2026-09-20 二次定稿）。
+  const colorsOn = !appearance.tintBase;
+  const line = colorsOn && appearance.btnLineColor ? resolveCustomColor(appearance.btnLineColor) : null;
+  setVar("--btn-line-rgb", line ? line.triplet : "");
+  setVar("--btn-line-alpha", String(appearance.btnLineAlpha));
+  // ⑤d 按钮背景（2026-09-20 新增，用户要求「按钮背景底色也要能自定义、不再跟底色」）：
+  //     作用对象 = 发送 / 停止 / 新建对话 / 更多设置 / 历史记录 / 添加文件 六个按钮的
+  //     `background`。btnBgColor 空串 ⇒ 清掉 ⇒ 回落 `--accent-bg` 的配方（逐像素不变）。
+  const btnBg = colorsOn && appearance.btnBgColor ? resolveCustomColor(appearance.btnBgColor) : null;
+  setVar("--btn-bg-rgb", btnBg ? btnBg.triplet : "");
+  setVar("--btn-bg-alpha", String(appearance.btnBgAlpha));
+  // 注意 `--surface-alpha`（底色透明度）在 ② 步**无条件**写：它是玻璃质感、不随底色颜色
+  // 变化，且历史上属于「背景」组、老配置里可能是非默认值 —— 归进那个开关的失效范围
+  // 会把老用户的透明度静默改回 0.88。见 ai-spec 规则 45「失效范围」那一段。
 
   // ⑥ 主题图标表（`pluginIconSvg` 从这里取；换主题必须重建，否则残留上一个主题的图标）
   themeIconUrls.clear();
@@ -6711,16 +7075,6 @@ async function loadThemes(force = false): Promise<ThemeInfo[]> {
   return [...themeInfos.values()];
 }
 
-/** 启动/唤出时刷新系统主题（只在「跟随系统」模式下才用到）。 */
-async function refreshSystemTheme() {
-  try {
-    const t = await invoke<SystemTheme>("get_system_theme");
-    if (t && t.accent === systemTheme.accent && t.dark === systemTheme.dark) return; // 没变不动
-    systemTheme = t ?? systemTheme;
-    if (appearance.colorMode === "system") applyAppearance();
-  } catch { /* 读不到就保持上一次的值 */ }
-}
-
 /** 设置面板的对外接口。**必须挂在 window 上**：settings 是独立插件模块，
  *  与 main.ts 是单向依赖（main.ts 引插件注册表，插件不能反向 import main.ts，
  *  否则循环）。这是既有约定（原 `__lunac_apply_bg` 同一套）。 */
@@ -6730,23 +7084,31 @@ async function refreshSystemTheme() {
    *  否则刚换的图标要等下次搜索才出现（插件态下 refreshSearchResults 自身会早退）。 */
   set: (patch: Partial<Appearance>) => {
     const prevTheme = appearance.themeId;
-    const merged: Appearance = { ...appearance, ...patch };
-    // 选主题 = **套用它整套预设（含主色）**：主题包声明了 accent 就写进 customAccent。
-    // 这样主色在界面上是可见、可继续微调的，也就不需要一条「主题色 vs 用户色」的
-    // 优先级裁决 —— 那种裁决会让用户改完色不知道为什么没生效。
-    if (patch.themeId !== undefined && patch.themeId !== prevTheme) {
-      const themeAccent = themeInfos.get(patch.themeId)?.manifest.tokens.accent;
-      if (themeAccent) merged.customAccent = themeAccent; // clampAppearance 会校验 hex
-    }
-    appearance = clampAppearance(merged);
+    // 选主题不再需要「顺手写主色」那一段 —— 主题色已**只**由主题包提供，
+    // 没有用户侧的第二份值可写（2026-09-20 删 `customAccent`）。
+    appearance = clampAppearance({ ...appearance, ...patch });
     persistAppearance();
     applyAppearance();
     // 换主题要重画结果列表（主题图标）；染色/滑块不必（不产生新 DOM）。
     if (patch.themeId !== undefined && patch.themeId !== prevTheme) refreshSearchResults();
   },
   themes: (force?: boolean): Promise<ThemeInfo[]> => loadThemes(force),
-  systemTheme: (): SystemTheme => ({ ...systemTheme }),
-  refreshSystemTheme: (): Promise<void> => refreshSystemTheme(),
+  /** 「跟随态」下三个取色器该显示什么色：底色 = 当前生效的表面色（主题包 surface 优先，
+   *  否则派生），按钮线条 / 按钮背景 = 当前主题色。设置面板只拿它做**初始显示**、不落盘 ——
+   *  派生逻辑只有这一份，面板复制一份必然漂移。 */
+  resolvedSwatches: (): { base: string; btnLine: string; btnBg: string } => {
+    const accent = themeAccent();
+    let base = accent;
+    const surf = themeSurface();
+    if (surf) {
+      const parts = surf.split(",").map(s => Number(s.trim()));
+      if (parts.length === 3 && parts.every(Number.isFinite)) base = toHex(parts[0], parts[1], parts[2]);
+    } else {
+      const parts = (derivePalette(accent)?.["--surface-rgb"] ?? "").split(",").map(s => Number(s.trim()));
+      if (parts.length === 3 && parts.every(Number.isFinite)) base = toHex(parts[0], parts[1], parts[2]);
+    }
+    return { base, btnLine: accent, btnBg: accent };
+  },
   themesDir: (): Promise<string> => invoke<string>("themes_dir"),
   /** 选择背景图（设置面板只管选文件，落配置与应用都走这里，避免两处实现漂移）。 */
   pickBgImage: async (): Promise<boolean> => {
@@ -6775,18 +7137,8 @@ appearance = loadAppearance();
 applyAppearance();
 void (async () => {
   await loadThemes(true);
-  // **无条件**取一次系统色：设置面板要显示「当前系统色」，而且用户切到「跟随系统」
-  // 的那一刻必须已经有值 —— 只在系统模式下才取，会出现「切了模式却不生效、要点
-  // 一次刷新才对」（浏览器实测踩到）。成本是两次注册表读，可忽略。
-  await refreshSystemTheme();
   applyAppearance();
 })();
-// 「跟随系统」的轮询：15s 一次，非系统模式直接跳过（两次注册表读，成本可忽略）。
-// 为什么不做成消息驱动（WM_DWMCOLORIZATIONCOLORCHANGED）：那要动 hotkey.rs 的
-// WndProc 子类化，收益只是「变色后 15s 内察觉」→ 不值得；真要即时可后续加。
-window.setInterval(() => {
-  if (appearance.colorMode === "system") void refreshSystemTheme();
-}, 15000);
 
 // ── Drag & drop files onto search bar / chat bar ────────────────
 

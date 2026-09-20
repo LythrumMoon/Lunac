@@ -71,6 +71,31 @@
      两者都由 main.ts 的 `derivePalette()` 按主色明暗写出。 */
   --ink-rgb: 255, 255, 255;
   --shade-scale: 1;
+  /* ── 「反差四件套」的上下文 token（2026-09-20 新增）────────────────
+     「恢复默认主题」（字段 `tintBase`）**关掉**时由 main.ts 覆盖这四个，用来表达
+     「底色暗 ⇒ 这四处亮一档、底色亮 ⇒ 这四处暗一档」。消费方只有四处：
+     ① 风格里的分类区域 `.settings-group-title` ② 文本框 ③ 取色器的框格
+     ④ 结果区当前选中项（清单见 ai-spec 规则 45）。
+     默认值 = 各自跟随主色派生的那一项 ⇒ 开关开着时逐像素等于改造前。 */
+  --ctx-rgb: var(--accent-rgb);
+  --ctx-ink-rgb: var(--ink-rgb);
+  --ctx-shade-rgb: 0, 0, 0;
+  --ctx-shade-scale: var(--shade-scale);
+  --ctx-border-glass: var(--border-glass);
+  /* ── 按钮线条（2026-09-20，设置 → 风格 ·「按钮自定义」）────────────
+     只管「线条 / 描边」：切换开关的轨道与描边 + 新建对话 / 更多设置 / 历史记录 /
+     发送按钮的边框；按钮的**底色与图标仍跟随主题色**。
+     默认 = 主题色 + 0.32，正是 `--accent-border` 的配方 ⇒ 不动控件时逐像素不变。 */
+  --btn-line-rgb: var(--accent-rgb);
+  --btn-line-alpha: 0.32;
+  /* ── 按钮背景（2026-09-20，同属「按钮自定义」）────────────────────
+     作用对象 = 发送 / 停止 / 新建对话 / 更多设置 / 历史记录 / 添加文件 六个按钮的
+     `background`。用户要求「按钮背景底色也要能自定义、而不是跟随上方的底色」——
+     所以它自己一条，**不跟 --surface-rgb（底色）**，默认也不跟 —— 默认值就是
+     原 `--accent-bg` 的配方（主题色 + 0.14）⇒ 不动控件时逐像素不变。
+     hover / 打开态按同一基色抬 α，见各按钮规则。 */
+  --btn-bg-rgb: var(--accent-rgb);
+  --btn-bg-alpha: 0.14;
   /* 玻璃反光（设置 → 风格 · 背景 · 反光）：一道从左上打到右下的高光斜带，
      模拟钢化玻璃的镜面反射。默认 alpha 0 = **完全不可见**，与改造前一致。
      为什么用 background-image 而不是再加一层 ::after：`#results-container` 的
@@ -380,8 +405,8 @@ html, body {
   align-items: center;
   gap: 4px;
   padding: 3px 10px;
-  background: rgba(157, 180, 172, 0.1);
-  border: 1px solid rgba(157, 180, 172, 0.25);
+  background: rgba(var(--accent-rgb), 0.1);
+  border: 1px solid rgba(var(--accent-rgb), 0.25);
   border-radius: 12px;
   font-size: 0.72rem;
   color: var(--text);
@@ -391,7 +416,7 @@ html, body {
 }
 
 .file-chip:hover {
-  background: rgba(157, 180, 172, 0.18);
+  background: rgba(var(--accent-rgb), 0.18);
 }
 
 .file-chip-icon {
@@ -447,8 +472,8 @@ html, body {
 }
 .file-chip-more-btn {
   padding: 3px 10px;
-  background: rgba(157, 180, 172, 0.12);
-  border: 1px dashed rgba(157, 180, 172, 0.4);
+  background: rgba(var(--accent-rgb), 0.12);
+  border: 1px dashed rgba(var(--accent-rgb), 0.4);
   border-radius: 12px;
   font-size: 0.72rem;
   color: var(--text);
@@ -456,7 +481,7 @@ html, body {
   transition: background 0.1s;
 }
 .file-chip-more-btn:hover {
-  background: rgba(157, 180, 172, 0.24);
+  background: rgba(var(--accent-rgb), 0.24);
 }
 .file-chip-more-clear {
   padding: 3px 10px;
@@ -477,14 +502,14 @@ html, body {
   gap: 4px;
   margin: 2px 0 2px 8px;
   padding-left: 10px;
-  border-left: 1px dashed rgba(157, 180, 172, 0.35);
+  border-left: 1px dashed rgba(var(--accent-rgb), 0.35);
 }
 
 /* ── Drag-over highlight ──────────────────────────────────── */
 #search-bar.drag-over,
 #chat-input-bar.drag-over {
-  border-color: rgba(157, 180, 172, 0.6) !important;
-  box-shadow: 0 0 12px rgba(157, 180, 172, 0.2) !important;
+  border-color: rgba(var(--accent-rgb), 0.6) !important;
+  box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.2) !important;
 }
 
 /* ── Plugin bar (replaces input when plugin active) ──────────── */
@@ -844,16 +869,24 @@ html, body {
   display: none;
 }
 
+/* 【示例 1 · item 6】「绿色当强调色用」→ 改为跟随主题色。
+   位置：AI 输入栏的「添加文件」按钮（#chat-add-file-btn）。
+   判据（ai-spec 规则 45/48）：这个绿表达的是「可点的动作」还是「状态」？
+   这里是动作按钮 ⇒ 走 accent 系（底色 --accent-bg / 边框 --accent-border / 图标 --accent，
+   图标走内联 SVG 的 currentColor，按规则 45 允许保留 --accent）。
+   ⚠ 批量替换时**不要**把语义绿一起换掉：`.tool-row.auto-approved` / `.tool-row.tool-ok` /
+   `.approval-allow` / `.tool-refusal-allow` / `.agent-status.ready` / `.memo-save-edit` 那些
+   表达「成功/放行/有效」，按规范必须保持固定。 */
 #chat-add-file-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 28px;
   height: 28px;
-  background: rgba(157, 180, 172, 0.1);
-  border: 1px solid rgba(157, 180, 172, 0.25);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 6px;
-  color: var(--green);
+  color: rgb(var(--btn-line-rgb));
   cursor: pointer;
   font-size: 1.1rem;
   font-weight: 600;
@@ -862,13 +895,14 @@ html, body {
   transition: background 0.1s;
 }
 #chat-add-file-btn:hover {
-  background: rgba(157, 180, 172, 0.2);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
 #chat-input {
   flex: 1;
-  background: rgba(var(--ink-rgb), 0.04);
-  border: 1px solid var(--border-glass);
+  /* ② 文本框 —— 走「反差四件套」（见 :root 的 --ctx-* 注释） */
+  background: rgba(var(--ctx-ink-rgb), 0.04);
+  border: 1px solid var(--ctx-border-glass);
   border-radius: 8px;
   padding: 6px 10px;
   color: var(--text);
@@ -913,34 +947,47 @@ html, body {
   color: var(--text);
   background: rgba(var(--ink-rgb), 0.05);
 }
-#chat-send-btn {
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
-  color: var(--accent);
+/* 【示例 2 · item 3】图标动作按钮并入「发送按钮」那一套（底色 + 边框 + 图标色）。
+   位置：AI 输入栏的「历史记录」按钮（#chat-history-btn）—— 它此前在上面那组里是
+   `border: none` + `--text-dim` 中性色，与紧邻的发送按钮明显不是一套。
+   为什么不改「更多设置」#chat-more-btn：它是有开合状态的菜单入口（`.open` 态），
+   先留着等你看过这个示例再决定要不要统一。 */
+/* 【item 3 · 示例 2】发送 / 历史记录按钮 —— 与「按钮自定义」两组 token 同源：
+   底色 rgba(--btn-bg-*) / 描边 rgba(--btn-line-*, α) / **图标 rgb(--btn-line-*)**。
+   2026-09-20 图标由 `color: var(--accent)` 改成跟**按钮线条**（用户要求「历史记录等等的
+   icon 颜色应该跟随按钮线条」）。用**全不透明**的 rgb(...)：默认下
+   rgb(var(--btn-line-rgb)) == rgb(var(--accent-rgb)) == #c0a0a0，**逐像素不变**。 */
+#chat-send-btn,
+#chat-history-btn {
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  color: rgb(var(--btn-line-rgb));
   opacity: 1;
 }
-#chat-send-btn:hover {
-  background: rgba(var(--accent-rgb), 0.2);
+#chat-send-btn:hover,
+#chat-history-btn:hover {
+  color: rgb(var(--btn-line-rgb));
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
-/* Stop button — same accent theme as send button */
+/* Stop button — same accent theme as send button（含线条：它占的就是发送按钮那一格） */
 #chat-stop-btn {
   display: none;
   align-items: center;
   justify-content: center;
   width: 30px;
   height: 30px;
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 6px;
-  color: var(--accent);
+  color: rgb(var(--btn-line-rgb));
   cursor: pointer;
   opacity: 1;
   flex-shrink: 0;
   transition: opacity 0.15s, color 0.15s, background 0.15s;
 }
 #chat-stop-btn:hover {
-  background: rgba(var(--accent-rgb), 0.2);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
 /* ── Humanize button — same style as other chat row buttons ──── */
@@ -1103,9 +1150,10 @@ html, body {
   transition: background 0.08s;
 }
 
+/* ④ 结果区当前选中项 —— 走「反差四件套」（见 :root 的 --ctx-* 注释）。 */
 .result-item:hover,
 .result-item.selected {
-  background: rgba(var(--accent-rgb), 0.1);
+  background: rgba(var(--ctx-rgb), 0.1);
 }
 
 .result-item-icon {
@@ -1248,16 +1296,16 @@ html, body {
   align-items: center;
   gap: 5px;
   padding: 4px 10px;
-  background: rgba(157, 180, 172, 0.12);
-  border: 1px solid rgba(157, 180, 172, 0.3);
+  background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
   border-radius: 8px;
-  color: var(--green);
+  color: var(--text);
   font-size: 0.74rem;
   cursor: pointer;
   transition: background 0.12s;
 }
 .ql-add-btn:hover {
-  background: rgba(157, 180, 172, 0.24);
+  background: rgba(var(--accent-rgb), 0.24);
 }
 .ql-empty {
   padding: 14px 4px;
@@ -2055,6 +2103,96 @@ html, body {
   margin-right: 4px;
 }
 
+/* 「写入内容疑似含凭据」的**正文明细行**（`Write` / `Edit`，扫描实现在
+   core-agent/src/content_safety.rs）。必须可见地列在正文里，不能只塞标题 tooltip：
+   这一档的全部价值就是「用户扫一眼卡片时能看见」，藏进 hover 等于没做。
+   沿用 --yellow：与「无法静态判定」同色系 —— 都是「要人看一眼」，不是「已确认危险」。
+   正文宽度不定（明细行可以很长），所以放开断行，不让它把卡片撑宽。 */
+.approval-batch-card .approval-secret-warn {
+  color: var(--yellow);
+  font-size: 10.5px;
+  line-height: 1.45;
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+/* ── 计划模式（原 backlog A7，2026-09-20）─────────────────────────
+   两件东西：① 批准前的计划卡正文；② 对话流里那条单例状态横幅。
+   卡片本身沿用 `.approval-*` 的既有骨架（标题 / 正文 / 按钮行），这里只加正文样式。 */
+
+/* 计划卡正文：**原样铺开模型交出来的 markdown 源码**（不做 markdown 渲染，
+   理由见 main.ts 的 renderPlanCard）。用正常正文字体而不是等宽 —— 计划是给人读的
+   段落，不是命令；`pre-wrap` 保住它的换行与缩进。 */
+.approval-batch-card .approval-plan {
+  /* 上层 `.approval-batch-body` 是唯一滚动容器（见 has-plan 那段注释），
+     所以这里只给 min-height: 0、**不给自己加限高与滚动**。 */
+  min-height: 0;
+  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.approval-batch-card .approval-plan-meta {
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1.45;
+  margin-bottom: 5px;
+}
+
+/* 计划比普通审批卡需要更长的阅读窗口（几十行是常态）—— 放宽**外层**上限，
+   而不是给正文再加一层滚动条（嵌套双滚动条见上面 `.approval-cmd-box` 的教训）。
+   只在这一批里真的出现计划卡时才加：普通命令审批仍然保持 380px。 */
+.approval-batch-card.has-plan .approval-batch-body {
+  max-height: 62vh;
+}
+
+/* 对话流里的计划相位横幅（单例节点，进 / 出复用同一个）。
+   `on` = 计划相位中（--yellow：与审批卡同色系，提醒「现在不是正常干活状态」）；
+   解除后落回中性色 —— 它变成一条历史记录，不该继续抢注意力。 */
+.plan-mode-note {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 6px 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.plan-mode-note .plan-mode-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transform: translateY(-1px);
+}
+.plan-mode-note.on {
+  color: var(--yellow);
+}
+.plan-mode-note.on .plan-mode-dot {
+  background: var(--yellow);
+}
+.plan-mode-note .plan-mode-text {
+  overflow-wrap: anywhere;
+}
+
+/* 批准后的留档提示（「计划已保存：…」）—— 与自动放行那行同族，只是不带语义绿。 */
+.tool-row.plan-saved {
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.tool-row.plan-saved.failed {
+  color: var(--yellow);
+}
+
 /* ── Command-group rows (Trae-style merged approvals) ──────────── */
 /* 命令区必须完整可见、可选可复制，滚动交给外层容器。 */
 .approval-batch-card .approval-cmd-box {
@@ -2316,15 +2454,6 @@ html, body {
   border-color: rgba(var(--accent-rgb), 0.2);
 }
 
-.history-item-icon {
-  position: absolute;
-  left: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 0.85rem;
-  flex-shrink: 0;
-}
-
 .history-item-info {
   flex: 0 1 auto;
   min-width: 0;
@@ -2481,17 +2610,17 @@ html, body {
   justify-content: center;
   width: 28px;
   height: 28px;
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 6px;
-  color: var(--accent);
+  color: rgb(var(--btn-line-rgb));
   cursor: pointer;
   flex-shrink: 0;
   opacity: 1;
   transition: background 0.15s;
 }
 #chat-new-btn:hover {
-  background: rgba(var(--accent-rgb), 0.2);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
 /* ── 「更多」菜单：思考 / 运行方式 / 工作区 / 工具黑名单（2026-09）──
@@ -2501,24 +2630,28 @@ html, body {
   position: relative;
   flex-shrink: 0;
 }
+/* 【item 3 · 批量】「更多设置」并入同一套（原先是 `--ink-rgb` 弱底 + `--border-glass` 弱边 +
+   `--text-dim`，在发送/历史/新建三个同排按钮旁边明显不是一族）。
+   `.open` 比 hover 再实一档 —— 它是菜单入口，「菜单正开着」要看得出来。 */
 #chat-more-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 28px;
   height: 28px;
-  background: rgba(var(--ink-rgb), 0.05);
-  border: 1px solid var(--border-glass);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 8px;
-  color: var(--text-dim);
+  color: rgb(var(--btn-line-rgb));
   cursor: pointer;
   flex-shrink: 0;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-#chat-more-btn:hover,
+#chat-more-btn:hover {
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
+}
 #chat-more-btn.open {
-  background: rgba(var(--ink-rgb), 0.12);
-  color: var(--text);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.14));
 }
 #chat-more-menu {
   position: absolute;

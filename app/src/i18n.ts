@@ -807,6 +807,99 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "⚠ 정적으로 판단할 수 없는 내용이 포함됨({reasons}) — 자동 허용되지 않습니다. 직접 확인하세요",
     "en": "⚠ Command contains statically unresolvable content ({reasons}) — will not be auto-approved",
   },
+  // 写入内容（`Write` 的 content / `Edit` 的 new_string）的凭据扫描（原 backlog A6，
+  // 实现见 core-agent/src/content_safety.rs）。`{hits}` 形如
+  // `AWS access key (line 3)、private key block (line 9)`。
+  "agent.static_secrets": {
+    "zh-CN": "写入内容疑似含凭据 / 密钥（{hits}）— 不会自动放行，请确认后再允许",
+    "zh-TW": "寫入內容疑似含憑證 / 金鑰（{hits}）— 不會自動放行，請確認後再允許",
+    "ja": "書き込み内容に認証情報が含まれる可能性（{hits}）— 自動許可されません。確認してから許可してください",
+    "ko": "작성 내용에 자격 증명이 포함된 것으로 보임({hits}) — 자동 허용되지 않습니다. 확인 후 허용하세요",
+    "en": "Content appears to contain credentials ({hits}) — will not be auto-approved, review before allowing",
+  },
+  // 同上的**正文明细行**：标题那个是 tooltip（要 hover），这一行才是「扫一眼就看见」
+  "agent.static_secrets_body": {
+    "zh-CN": "🔑 疑似凭据：{hits}",
+    "zh-TW": "🔑 疑似憑證：{hits}",
+    "ja": "🔑 認証情報の可能性：{hits}",
+    "ko": "🔑 의심되는 자격 증명: {hits}",
+    "en": "🔑 Possible credentials: {hits}",
+  },
+  // ── 计划模式（原 backlog A7，2026-09-20）──────────────────────
+  // agent 侧：`EnterPlanMode` 改 `Ctx.plan_phase` + 发 system/plan_mode；
+  // `ExitPlanMode` 的整份计划就在 tool input 的 `plan` 字段里，卡片直接铺开给用户读。
+  "agent.plan_title": {
+    "zh-CN": "实现计划（待批准）",
+    "zh-TW": "實作計畫（待批准）",
+    "ja": "実装計画（承認待ち）",
+    "ko": "구현 계획(승인 대기)",
+    "en": "Implementation plan (pending approval)",
+  },
+  "agent.plan_meta": {
+    "zh-CN": "共 {lines} 行 · 批准后写类工具恢复，模型开始按它执行",
+    "zh-TW": "共 {lines} 行 · 批准後寫入類工具恢復，模型開始依它執行",
+    "ja": "全 {lines} 行 · 承認すると書き込み系ツールが復帰し、この計画どおりに実行します",
+    "ko": "총 {lines}행 · 승인하면 쓰기 계열 도구가 복구되고 이 계획대로 실행합니다",
+    "en": "{lines} lines · approving re-enables write tools and starts execution",
+  },
+  "agent.plan_approve": {
+    "zh-CN": "批准计划",
+    "zh-TW": "批准計畫",
+    "ja": "計画を承認",
+    "ko": "계획 승인",
+    "en": "Approve plan",
+  },
+  "agent.plan_approved_note": {
+    "zh-CN": "计划已批准，开始执行",
+    "zh-TW": "計畫已批准，開始執行",
+    "ja": "計画を承認しました。実行を開始します",
+    "ko": "계획이 승인되어 실행을 시작합니다",
+    "en": "Plan approved — starting execution",
+  },
+  "agent.plan_rejected_note": {
+    "zh-CN": "计划被拒绝，仍在计划模式（模型会改完再提交）",
+    "zh-TW": "計畫被拒絕，仍在計畫模式（模型會修改後再提交）",
+    "ja": "計画は却下されました。プランモードのままです（修正後に再提出します）",
+    "ko": "계획이 거부되었습니다. 플랜 모드가 유지됩니다(수정 후 다시 제출)",
+    "en": "Plan rejected — still in plan mode (the agent will revise and resubmit)",
+  },
+  // 拒绝时回灌给模型的话：**必须说清「仍在计划模式」**，否则它会以为可以直接动手 ——
+  // 那时候每个 `Write` 都会撞上 `write_blocked`，白烧一轮往返。
+  "agent.plan_deny_msg": {
+    "zh-CN": "用户拒绝了这份计划：你仍在计划模式，不要执行任何改动；按用户意见修改计划后再调用一次 ExitPlanMode。",
+    "zh-TW": "使用者拒絕了這份計畫：你仍在計畫模式，請勿執行任何變更；依使用者意見修改計畫後再呼叫一次 ExitPlanMode。",
+    "ja": "ユーザーがこの計画を却下しました：プランモードのままです。いかなる変更も実行せず、指摘に沿って計画を修正し、再度 ExitPlanMode を呼んでください。",
+    "ko": "사용자가 이 계획을 거부했습니다: 여전히 플랜 모드입니다. 어떤 변경도 실행하지 말고, 의견에 맞게 계획을 수정한 뒤 ExitPlanMode를 다시 호출하세요.",
+    "en": "The user rejected this plan. You are still in plan mode — do not make any change. Revise the plan per their feedback and call ExitPlanMode again.",
+  },
+  "agent.plan_saved": {
+    "zh-CN": "计划已保存：{path}",
+    "zh-TW": "計畫已儲存：{path}",
+    "ja": "計画を保存しました：{path}",
+    "ko": "계획을 저장했습니다: {path}",
+    "en": "Plan saved: {path}",
+  },
+  "agent.plan_save_failed": {
+    "zh-CN": "计划已批准，但留档失败：{err}",
+    "zh-TW": "計畫已批准，但存檔失敗：{err}",
+    "ja": "計画は承認されましたが、保存に失敗しました：{err}",
+    "ko": "계획은 승인되었지만 저장에 실패했습니다: {err}",
+    "en": "Plan approved, but saving it failed: {err}",
+  },
+  "agent.plan_mode_on": {
+    "zh-CN": "计划模式：只读，模型会先给出计划再动手",
+    "zh-TW": "計畫模式：唯讀，模型會先提出計畫再動手",
+    "ja": "プランモード：読み取り専用。まず計画を提示します",
+    "ko": "플랜 모드: 읽기 전용, 먼저 계획을 제시합니다",
+    "en": "Plan mode: read-only until you approve a plan",
+  },
+  "agent.plan_mode_off": {
+    "zh-CN": "计划已批准，写权限恢复",
+    "zh-TW": "計畫已批准，寫入權限恢復",
+    "ja": "計画が承認され、書き込み権限が復帰しました",
+    "ko": "계획이 승인되어 쓰기 권한이 복구되었습니다",
+    "en": "Plan approved — write access restored",
+  },
   // 上下文压缩提示（agent 发 system/context_compacted）
   "agent.compacted": {
     "zh-CN": "上下文已压缩（瘦身 {elided} · 丢弃 {dropped}）",
@@ -1680,13 +1773,6 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "배경 불투명도",
     "en": "Background opacity",
   },
-  "settings.appearance_bg_surface": {
-    "zh-CN": "界面玻璃透明度",
-    "zh-TW": "介面玻璃透明度",
-    "ja": "パネルの不透明度",
-    "ko": "패널 유리 투명도",
-    "en": "Panel glass opacity",
-  },
   "settings.appearance_color_section": {
     "zh-CN": "主题颜色",
     "zh-TW": "主題顏色",
@@ -1694,61 +1780,177 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "테마 색상",
     "en": "Accent color",
   },
-  "settings.appearance_color_mode": {
-    "zh-CN": "取色方式",
-    "zh-TW": "取色方式",
-    "ja": "色の決め方",
-    "ko": "색상 방식",
-    "en": "Color source",
+  /* 2026-09-20：主题色取色器已删除（主题色只由主题包提供），原
+     `appearance_color_picker` 随之删除。 */
+  "settings.appearance_eyedropper": {
+    "zh-CN": "从电脑取色",
+    "zh-TW": "從電腦取色",
+    "ja": "画面から色を取得",
+    "ko": "화면에서 색 추출",
+    "en": "Pick from screen",
   },
-  "settings.appearance_color_custom": {
-    "zh-CN": "自定义",
-    "zh-TW": "自訂",
-    "ja": "カスタム",
-    "ko": "사용자 지정",
-    "en": "Custom",
+  /* ── 底色自定义（2026-09-20）────────────────────────────────────
+     形态照抄背景那组的「自定义」：一个按钮 → 展开一块面板。
+     面板内容 = 底色取色器 + 底色透明度（原「界面玻璃透明度」，从背景区迁来）
+     + 饱和度 / 明度。**「恢复默认主题」开关已移到「主题颜色」最顶上**。 */
+  "settings.appearance_base_custom": {
+    "zh-CN": "底色自定义",
+    "zh-TW": "底色自訂",
+    "ja": "背景色をカスタマイズ",
+    "ko": "배경색 사용자 지정",
+    "en": "Custom base color",
   },
-  "settings.appearance_color_system": {
-    "zh-CN": "跟随 Windows",
-    "zh-TW": "跟隨 Windows",
-    "ja": "Windows に合わせる",
-    "ko": "Windows 따르기",
-    "en": "Follow Windows",
+  "settings.appearance_base_picker": {
+    "zh-CN": "底色",
+    "zh-TW": "底色",
+    "ja": "背景色",
+    "ko": "배경색",
+    "en": "Base color",
   },
-  "settings.appearance_color_picker": {
-    "zh-CN": "取色器",
-    "zh-TW": "取色器",
-    "ja": "カラーピッカー",
-    "ko": "색상 선택기",
-    "en": "Color picker",
+  /* ── 「恢复默认主题」（2026-09-20 二次定稿）──────────────────────
+     原名「主题色代替底色」。用户要求：① 开关**离开「底色自定义」面板**、摆到
+     「主题颜色」整块**最顶上**；② 改名「恢复默认主题」= 回到一开始保存的那套默认
+     主题配色；③ 开启时**除三个透明度外全部不可调**（底色 / 按钮线条 / 按钮背景 /
+     文字明度都不生效），所以开启后另外给一行 note 说明还能调什么。 */
+  "settings.appearance_restore_theme": {
+    "zh-CN": "恢复默认主题",
+    "zh-TW": "還原預設主題",
+    "ja": "デフォルトテーマに戻す",
+    "ko": "기본 테마로 복원",
+    "en": "Restore default theme",
   },
-  "settings.appearance_tint_base": {
-    "zh-CN": "底色跟随主题色",
-    "zh-TW": "底色跟隨主題色",
-    "ja": "背景色をテーマカラーに合わせる",
-    "ko": "배경색을 테마 색으로",
-    "en": "Tint base with accent",
+  "settings.appearance_restore_hint": {
+    "zh-CN": "开启后回到 Lunac 一开始保存的默认主题配色：底色与按钮颜色全部不生效，三个透明度与文字明度仍可调",
+    "zh-TW": "開啟後回到 Lunac 最初儲存的預設主題配色：底色與按鈕顏色全部不生效，三個透明度與文字明度仍可調",
+    "ja": "オンにすると Lunac が最初に保存した既定テーマの配色に戻ります。背景色とボタンの色は無効になり、3 つの不透明度と文字の明度は調整できます",
+    "ko": "켜면 Lunac이 처음 저장한 기본 테마 색상으로 돌아갑니다. 배경색과 버튼 색은 적용되지 않고 세 가지 불투명도와 글자 명도는 조정할 수 있습니다",
+    "en": "Restores the default theme colors saved by Lunac: base and button colors stop applying — the three opacity sliders and text lightness stay adjustable",
   },
-  "settings.appearance_color_system_current": {
-    "zh-CN": "当前系统色",
-    "zh-TW": "目前系統色",
-    "ja": "現在のシステム色",
-    "ko": "현재 시스템 색",
-    "en": "Current system color",
+  "settings.appearance_restore_note": {
+    "zh-CN": "已恢复默认主题。除三个透明度与文字明度外，其余选项暂不可调。",
+    "zh-TW": "已還原預設主題。除三個透明度與文字明度外，其餘選項暫不可調。",
+    "ja": "既定テーマに戻しました。3 つの不透明度と文字の明度以外は調整できません。",
+    "ko": "기본 테마로 복원했습니다. 세 가지 불투명도와 글자 명도 외에는 조정할 수 없습니다.",
+    "en": "Default theme restored. Except for the three opacity sliders and text lightness, the other options are locked.",
   },
-  "settings.appearance_color_system_refresh": {
-    "zh-CN": "刷新",
-    "zh-TW": "重新整理",
-    "ja": "更新",
-    "ko": "새로 고침",
-    "en": "Refresh",
+  "settings.appearance_base_alpha": {
+    "zh-CN": "底色透明度",
+    "zh-TW": "底色透明度",
+    "ja": "背景色の不透明度",
+    "ko": "배경색 불투명도",
+    "en": "Base opacity",
   },
-  "settings.appearance_color_system_unavailable": {
-    "zh-CN": "读不到系统强调色",
-    "zh-TW": "讀不到系統強調色",
-    "ja": "システムのアクセントカラーを取得できません",
-    "ko": "시스템 강조 색을 읽을 수 없음",
-    "en": "System accent color unavailable",
+  "settings.appearance_base_saturate": {
+    "zh-CN": "底色饱和度",
+    "zh-TW": "底色飽和度",
+    "ja": "背景色の彩度",
+    "ko": "배경색 채도",
+    "en": "Base saturation",
+  },
+  "settings.appearance_base_light": {
+    "zh-CN": "底色明度",
+    "zh-TW": "底色明度",
+    "ja": "背景色の明度",
+    "ko": "배경색 명도",
+    "en": "Base lightness",
+  },
+  /* ── 按钮自定义（2026-09-20）────────────────────────────────────
+     线条 = 项目内所有切换开关 + 新建对话 / 更多设置 / 历史记录 / 发送 / 停止 /
+     添加文件 六个按钮的边框；背景 = 同样这六个按钮的底色。
+     **按钮背景不再跟底色**，它自己一条（见 ai-spec 规则 45）。 */
+  "settings.appearance_btn_label": {
+    "zh-CN": "按钮颜色",
+    "zh-TW": "按鈕顏色",
+    "ja": "ボタンの色",
+    "ko": "버튼 색상",
+    "en": "Button colors",
+  },
+  "settings.appearance_btn_custom": {
+    "zh-CN": "按钮自定义",
+    "zh-TW": "按鈕自訂",
+    "ja": "ボタンをカスタマイズ",
+    "ko": "버튼 사용자 지정",
+    "en": "Custom buttons",
+  },
+  "settings.appearance_btnline_picker": {
+    "zh-CN": "按钮线条",
+    "zh-TW": "按鈕線條",
+    "ja": "ボタンの線",
+    "ko": "버튼 선",
+    "en": "Button lines",
+  },
+  "settings.appearance_btnline_alpha": {
+    "zh-CN": "线条透明度",
+    "zh-TW": "線條透明度",
+    "ja": "線の不透明度",
+    "ko": "선 불투명도",
+    "en": "Line opacity",
+  },
+  "settings.appearance_btnline_saturate": {
+    "zh-CN": "线条饱和度",
+    "zh-TW": "線條飽和度",
+    "ja": "線の彩度",
+    "ko": "선 채도",
+    "en": "Line saturation",
+  },
+  "settings.appearance_btnline_light": {
+    "zh-CN": "线条明度",
+    "zh-TW": "線條明度",
+    "ja": "線の明度",
+    "ko": "선 명도",
+    "en": "Line lightness",
+  },
+  "settings.appearance_btnbg_picker": {
+    "zh-CN": "按钮背景",
+    "zh-TW": "按鈕背景",
+    "ja": "ボタン背景",
+    "ko": "버튼 배경",
+    "en": "Button background",
+  },
+  "settings.appearance_btnbg_alpha": {
+    "zh-CN": "背景透明度",
+    "zh-TW": "背景透明度",
+    "ja": "背景の不透明度",
+    "ko": "배경 불투명도",
+    "en": "Background opacity",
+  },
+  "settings.appearance_btnbg_saturate": {
+    "zh-CN": "背景饱和度",
+    "zh-TW": "背景飽和度",
+    "ja": "背景の彩度",
+    "ko": "배경 채도",
+    "en": "Background saturation",
+  },
+  "settings.appearance_btnbg_light": {
+    "zh-CN": "背景明度",
+    "zh-TW": "背景明度",
+    "ja": "背景の明度",
+    "ko": "배경 명도",
+    "en": "Background lightness",
+  },
+  /* ── 文字自定义（2026-09-20）────────────────────────────────────
+     只调三档文字（主 / 次 / 弱）的明度偏移。**不受「恢复默认主题」管辖** ——
+     它是明度偏移而不是配色本身，用户 2026-09-20 明确「文字明度不锁定」。 */
+  "settings.appearance_text_label": {
+    "zh-CN": "文字",
+    "zh-TW": "文字",
+    "ja": "テキスト",
+    "ko": "텍스트",
+    "en": "Text",
+  },
+  "settings.appearance_text_custom": {
+    "zh-CN": "文字自定义",
+    "zh-TW": "文字自訂",
+    "ja": "テキストをカスタマイズ",
+    "ko": "텍스트 사용자 지정",
+    "en": "Custom text",
+  },
+  "settings.appearance_text_light": {
+    "zh-CN": "文字明度",
+    "zh-TW": "文字明度",
+    "ja": "テキストの明度",
+    "ko": "텍스트 명도",
+    "en": "Text lightness",
   },
   "settings.appearance_theme_section": {
     "zh-CN": "主题包",

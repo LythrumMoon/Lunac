@@ -1,8 +1,12 @@
 // Keep track of the last active settings category across open/close cycles
 let activeSettingsCategory = "general";
-// 「背景 → 自定义」那组拉条的展开状态：跨「关掉设置再打开」保留（否则每次进来都要
-// 再点一次「自定义」才看得到滑块，用户会以为设置在跳）。
+// 四组「自定义」拉条的展开状态：跨「关掉设置再打开」保留（否则每次进来都要再点一次
+// 「自定义」才看得到滑块，用户会以为设置在跳）。
 let bgSlidersOpen = false;
+/** 底色 / 按钮 / 文字（2026-09-20 新增的后两组，形态与背景那组一致）。 */
+let basePanelOpen = false;
+let btnPanelOpen = false;
+let textPanelOpen = false;
 
 // Unlisten functions for hotkey recording events — cleaned up on re-attach to avoid memory leaks
 let _clickOutsideHandler: ((e: Event) => void) | null = null;
@@ -133,10 +137,21 @@ interface AppearanceConfig {
   bgSaturate: number;
   bgOpacity: number;
   sheen: number;
+  /** 界面上的「底色透明度」（原「界面玻璃透明度」）。2026-09-20 从背景区迁进「底色自定义」。 */
   surfaceAlpha: number;
+  /** **「恢复默认主题」**。**默认 false**（开 = 底色 / 按钮线条 / 按钮背景的颜色
+   *  全部不生效，回到默认主题配色；三个透明度与文字明度仍可调且生效）。字段名沿用 `tintBase`。 */
   tintBase: boolean;
-  colorMode: "custom" | "system";
-  customAccent: string;
+  /** 空串 = 还没动过底色 ⇒ 仍按主题自动派生（取色器显示派生出来的那个色）。 */
+  baseColor: string;
+  /** 空串 = 跟随主题色（默认）。 */
+  btnLineColor: string;
+  btnLineAlpha: number;
+  /** 按钮背景色。空串 = 跟随主题色（默认）。2026-09-20 新增，不再跟底色。 */
+  btnBgColor: string;
+  btnBgAlpha: number;
+  /** 文字明度偏移 ±100（0 = 派生原值）。 */
+  textLight: number;
   themeId: string;
 }
 interface AppearanceThemeInfo {
@@ -147,8 +162,10 @@ interface AppearanceBridge {
   get(): AppearanceConfig;
   set(patch: Partial<AppearanceConfig>): void;
   themes(force?: boolean): Promise<AppearanceThemeInfo[]>;
-  systemTheme(): { accent: string; dark: boolean; source: string };
-  refreshSystemTheme(): Promise<void>;
+  /** 「跟随态」下三个取色器该显示什么色（底色 = 主题包 surface 或派生的表面色，
+   *  按钮线条 / 按钮背景 = 主题色）。只用于取色器的**初始显示**，不落盘 ——
+   *  面板不自己复制一份派生逻辑（否则必然漂移）。 */
+  resolvedSwatches(): { base: string; btnLine: string; btnBg: string };
   themesDir(): Promise<string>;
   pickBgImage(): Promise<boolean>;
 }
@@ -169,7 +186,7 @@ function appearanceBridge(): AppearanceBridge | null {
 // 现在的形态 = 一个色块按钮 → 展开**一个**面板：色相条 + 饱和度/明度方块 + hex 输入
 // + 预设色板。全部用项目自己的 token 画（--border-glass / --text-dim / --accent）。
 
-/** 取色器的 HTML。`id` 是前缀，便于在同一页挂两个实例（主色 / 背景纯色）。 */
+/** 取色器的 HTML。`id` 是前缀，便于在同一页挂多个实例（底色 / 按钮线条 / 按钮背景）。 */
 function colorPickerHtml(id: string, hex: string): string {
   const presets = ["#c0a0a0", "#3a7bd5", "#5b9a68", "#c9a227", "#c05555", "#8e6fc0", "#3f9a9a", "#d07aa0"];
   return `
@@ -179,6 +196,12 @@ function colorPickerHtml(id: string, hex: string): string {
              放在色块之后永远差一个色块+间距的宽度。 -->
         <input type="text" class="ap-hex" id="${id}-hex" value="${esc(hex)}" spellcheck="false" maxlength="7">
         <button type="button" class="ap-swatch-btn" id="${id}-swatch"></button>
+        <!-- 「从电脑中取色」（2026-09-20 用户要求）：走 Chromium 的 EyeDropper API，
+             可以在**屏幕任意位置**吸一个像素。不支持该 API 时由 JS 把它隐藏（WebView2
+             基于 Chromium，正常可用；老内核才没有）。图标是内联 SVG，走 currentColor。 -->
+        <button type="button" class="ap-picker-toggle ap-eyedropper" id="${id}-pick" title="${esc(t("settings.appearance_eyedropper"))}">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.8.8a2 2 0 0 1 0 2.8l-1.4 1.4a2 2 0 0 1-2.8 0l-6-6a2 2 0 0 1 0-2.8l1.4-1.4a2 2 0 0 1 2.8 0Z"/></svg>
+        </button>
         <button type="button" class="ap-picker-toggle" id="${id}-toggle">▾</button>
       </div>
       <div class="ap-pick-panel hidden" id="${id}-panel">
@@ -223,11 +246,17 @@ function hexToHsv(hex: string): { h: number; s: number; v: number } | null {
   return rgbToHsv((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
 }
 
+/** 取色器实例的把手：`apply()` 只重画界面、**不 commit** —— 供外部控件（与色板
+ *  同一组值的「饱和度 / 明度」滑块）把新颜色同步过来用。 */
+interface ColorPickerHandle {
+  apply(hex: string): void;
+}
+
 /** 挂载一个取色器实例。`onCommit` 只在用户真的动了控件时调用（初始化不调）——
  *  否则每打开一次设置就把 HSV 往返的舍入误差写一次配置。 */
 function mountColorPicker(
   container: HTMLElement, id: string, initialHex: string, onCommit: (hex: string) => void,
-): void {
+): ColorPickerHandle {
   const pick = <T extends HTMLElement>(suffix: string) => container.querySelector(`#${id}-${suffix}`) as T | null;
   const panel = pick("panel");
   const swatch = pick("swatch");
@@ -264,6 +293,22 @@ function mountColorPicker(
   };
   pick("toggle")?.addEventListener("click", () => setOpen(!open));
   swatch?.addEventListener("click", () => setOpen(!open));
+
+  // 「从电脑中取色」：Chromium 自带的 EyeDropper，能在屏幕任意位置吸一个像素并回传
+  // `sRGBHex`。**不支持就整条隐藏**（而不是留一个点了没反应的按钮）。用户按 Esc 取消时
+  // `open()` 会 reject，那是正常操作、不是错误，静默即可。
+  const eyeBtn = pick("pick");
+  const EyeDropperCtor = (window as unknown as { EyeDropper?: new () => { open(): Promise<{ sRGBHex?: string }> } }).EyeDropper;
+  if (eyeBtn) {
+    if (typeof EyeDropperCtor !== "function") eyeBtn.classList.add("hidden");
+    else eyeBtn.addEventListener("click", async () => {
+      try {
+        const res = await new EyeDropperCtor().open();
+        const got = typeof res?.sRGBHex === "string" ? res.sRGBHex.trim().toLowerCase() : "";
+        if (/^#[0-9a-f]{6}$/.test(got)) paint(true, got);
+      } catch { /* 用户取消取色 */ }
+    });
+  }
 
   // 饱和度/明度方块：x = 饱和度，y = 明度（上亮下暗）
   const dragSv = (e: PointerEvent) => {
@@ -318,6 +363,11 @@ function mountColorPicker(
     const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-color]");
     if (btn?.dataset.color) paint(true, btn.dataset.color);
   });
+
+  return {
+    // 外部控件把颜色同步进来：只重画（hex 会被原样写回输入框与色块），不 commit
+    apply: (hex: string) => paint(false, hex),
+  };
 }
 
 /** 外观滑块行。`data-ap` = 配置字段名 —— 事件绑定走**一个**委托监听，
@@ -335,10 +385,30 @@ function appearanceSliderRow(
     </div>`;
 }
 
+/** 「与色板同一组值」的滑块行（饱和度 / 明度）。
+ *
+ *  它**不是** `data-ap`：值不直接落配置，而是经由所属取色器换算成 hex 再落
+ *  `<slot>Color`。`data-color` 指出属于哪个取色器实例（base / btnline / btnbg），
+ *  `data-axis` 指出是色板的哪一轴（sat / val）—— 这两个属性就是「双向联动」的接线点：
+ *  拖色板 → `syncAxes()` 回写这里的 value 与读数；拖这里 → `hsvToHex()` 写回色板。 */
+function colorAxisRow(labelKey: string, colorSlot: string, axis: "sat" | "val", value: number): string {
+  const v = Math.round(value);
+  return `
+    <div class="settings-row">
+      <span class="settings-label">${t(labelKey)}</span>
+      <div class="ap-slider">
+        <input type="range" data-axis="${axis}" data-color="${colorSlot}" min="0" max="100" step="1" value="${v}">
+        <span class="ap-slider-val" data-axis-val="${colorSlot}-${axis}">${v}</span>
+      </div>
+    </div>`;
+}
+
 /** 滑块的数值文案格式（与 APPEARANCE_RANGE 的字段一一对应）。 */
 function formatAppearanceValue(field: string, v: number): string {
   if (field === "bgBlur") return `${Math.round(v)}px`;
   if (field === "bgSaturate") return `${Math.round(v)}%`;
+  // 文字明度是「偏移格数」：带正负号比 -12.00 好读
+  if (field === "textLight") return (v > 0 ? "+" : "") + Math.round(v);
   return v.toFixed(2);
 }
 
@@ -346,19 +416,33 @@ async function buildAppearancePane(): Promise<string> {
   const ap = appearanceBridge();
   const cfg: AppearanceConfig = ap?.get() ?? {
     bgImage: null, bgBlur: 4, bgSaturate: 92, bgOpacity: 0.5,
-    sheen: 0, surfaceAlpha: 0.88, tintBase: true,
-    colorMode: "custom", customAccent: "#c0a0a0", themeId: "default",
+    sheen: 0, surfaceAlpha: 0.88, tintBase: false,
+    baseColor: "", btnLineColor: "", btnLineAlpha: 0.32,
+    btnBgColor: "", btnBgAlpha: 0.14, textLight: 0,
+    themeId: "default",
   };
   let themes: AppearanceThemeInfo[] = [];
   try { themes = (await ap?.themes()) ?? []; } catch { /* 主题包读不到 → 只留默认项 */ }
-  const sys = ap?.systemTheme() ?? { accent: "", dark: true, source: "fallback" };
-  const sysAccent = sys.accent || cfg.customAccent;
+  // 三个取色器在「跟随态」（对应字段是空串）下显示什么色，由 main.ts 算好给过来 ——
+  // 面板不复制那份派生逻辑（复制必然漂移）。见 AppearanceBridge.resolvedSwatches。
+  const sw = ap?.resolvedSwatches() ?? { base: "#c0a0a0", btnLine: "#c0a0a0", btnBg: "#c0a0a0" };
+  const shown = {
+    base: cfg.baseColor || sw.base,
+    btnline: cfg.btnLineColor || sw.btnLine,
+    btnbg: cfg.btnBgColor || sw.btnBg,
+  };
+  // 三对「饱和度 / 明度」滑块的初值 = 上面那个色的 HSV 两轴（**与色板同一组值**）。
+  const axis = (slot: "base" | "btnline" | "btnbg") => hexToHsv(shown[slot]) ?? { h: 0, s: 0, v: 0 };
   // 背景来源标注：已设置图片 / 未设置
   const bgLabel = cfg.bgImage ? t("settings.appearance_bg_set") : t("settings.appearance_bg_none");
   // 只有内置的「默认」主题允许自定义主题色与背景图片（2026-09-19 批 5 任务 1）：
   // 主题包的意义就是「一整套定好的外观」，放开这两项会让它被改得不像自己。
   // 「自定义」那五个拉条是**窗口玻璃质感**、与配色无关，任何主题下都保留。
   const locked = cfg.themeId !== "default";
+  /** 「恢复默认主题」开启时要锁住的块。`data-tint-lock` 是**统一切换锚点**（JS 一句
+   *  `querySelectorAll` 覆盖全部，加新项不会漏）；初始 `locked` class 写死在 HTML 里，
+   *  免得 attach 之前闪一帧「可编辑」。 */
+  const tl = () => `class="ap-locked-group${cfg.tintBase ? " locked" : ""}" data-tint-lock="1"`;
 
   const themeButtons = themes.map(th => {
     const id = th.manifest.id;
@@ -384,13 +468,14 @@ async function buildAppearancePane(): Promise<string> {
           <button type="button" class="settings-btn" id="ap-bg-clear">${t("settings.appearance_bg_clear")}</button>
         </div>
       </div>
-      <!-- 「自定义」展开的就是这一块：五个拉条（毛玻璃化 / 饱和度 / 背景透明度 / 反光 / 界面玻璃透明度） -->
+      <!-- 「自定义」展开的就是这一块：四个拉条（毛玻璃化 / 饱和度 / 背景透明度 / 反光）。
+           原第五个「界面玻璃透明度」已于 2026-09-20 迁进「主题颜色 → 底色自定义」，
+           并改名为「底色透明度」（它就是玻璃底色的 alpha，属于配色而不是背景图）。 -->
       <div id="ap-bg-sliders" class="ap-sliders-panel${bgSlidersOpen ? "" : " hidden"}">
         ${appearanceSliderRow("settings.appearance_bg_blur", "bgBlur", 0, 40, 1, cfg.bgBlur, v => formatAppearanceValue("bgBlur", v))}
         ${appearanceSliderRow("settings.appearance_bg_saturate", "bgSaturate", 0, 200, 1, cfg.bgSaturate, v => formatAppearanceValue("bgSaturate", v))}
         ${appearanceSliderRow("settings.appearance_bg_opacity", "bgOpacity", 0, 1, 0.01, cfg.bgOpacity, v => formatAppearanceValue("bgOpacity", v))}
         ${appearanceSliderRow("settings.appearance_bg_sheen", "sheen", 0, 1, 0.01, cfg.sheen, v => formatAppearanceValue("sheen", v))}
-        ${appearanceSliderRow("settings.appearance_bg_surface", "surfaceAlpha", 0.3, 1, 0.01, cfg.surfaceAlpha, v => formatAppearanceValue("surfaceAlpha", v))}
       </div>
 
       <div class="settings-group-title">${t("settings.appearance_color_section")}</div>
@@ -399,35 +484,102 @@ async function buildAppearancePane(): Promise<string> {
            只是被主题锁了」，隐藏会被当成 bug。 -->
       <div id="ap-lock-note" class="ap-lock-note${locked ? "" : " hidden"}">${t("settings.appearance_theme_locked")}</div>
       <div id="ap-color-group" class="ap-locked-group${locked ? " locked" : ""}">
+      <!-- 主题色取色器已删除（2026-09-20，用户要求「去除主题色取色」，字段一并删除）：
+           主题色现在**只**由上面选中的主题包提供（它的 tokens.accent），没有用户侧入口。 -->
+
+      <!-- ── ① 恢复默认主题（2026-09-20 二次定稿，用户指定摆在「主题颜色」最顶上）
+           语义 = 回到**一开始保存的那套默认主题配色**（themes/default + DEFAULT_ACCENT
+           派生的底色、:root 里的按钮配方）：底色 / 按钮线条 / 按钮背景的**颜色**
+           全部不生效，走主题自己的值。
+           例外（留在锁外、且值仍然生效）= **三个透明度**（底色 / 按钮线条 / 按钮背景）
+           + **文字明度**：用户先要求「开恢复默认主题时除透明度以外的选项都不可调」，
+           随后又明确「文字明度不锁定」。
+           原名「主题色代替底色」，本轮改名并调整失效范围（见 ai-spec 规则 45/46）。
+           注意：这段是**模板字符串内部**，注释里写不得反引号（见 code-rules 预检 #15）。 -->
       <div class="settings-row">
-        <span class="settings-label">${t("settings.appearance_color_mode")}</span>
-        <div class="ap-seg">
-          <button type="button" class="ap-seg-btn${cfg.colorMode === "custom" ? " active" : ""}" data-color-mode="custom">${t("settings.appearance_color_custom")}</button>
-          <button type="button" class="ap-seg-btn${cfg.colorMode === "system" ? " active" : ""}" data-color-mode="system">${t("settings.appearance_color_system")}</button>
+        <span class="settings-label" title="${esc(t("settings.appearance_restore_hint"))}">${t("settings.appearance_restore_theme")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="ap-tint-base" ${cfg.tintBase ? "checked" : ""}>
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+      <div id="ap-restore-note" class="ap-lock-note${cfg.tintBase ? "" : " hidden"}">${t("settings.appearance_restore_note")}</div>
+
+      <!-- ── ② 底色自定义（2026-09-20）──────────────────────────────────
+           形态照抄背景那组的「自定义」：一个按钮 → 展开一块面板（展开态跨开关保留）。
+           面板里：底色取色器 → 底色透明度 → 底色饱和度 / 底色明度。
+           **饱和度 / 明度与色板同一组值（双向联动）**；「恢复默认主题」开启时取色器与
+           两个轴滑块禁用，只有中间的透明度滑块留在锁外。 -->
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_base_picker")}</span>
+        <div class="settings-bg-actions">
+          <button type="button" class="settings-btn ap-bg-custom" id="ap-base-custom">${t("settings.appearance_base_custom")}<span class="ap-toggle-caret" id="ap-base-caret">▾</span></button>
         </div>
       </div>
-      <div id="ap-color-custom" class="ap-color-body${cfg.colorMode === "system" ? " hidden" : ""}">
-        <div class="settings-row ap-row-block">
-          <span class="settings-label">${t("settings.appearance_color_picker")}</span>
-          ${colorPickerHtml("ap-accent", cfg.customAccent)}
-        </div>
-        <div class="settings-row">
-          <span class="settings-label">${t("settings.appearance_tint_base")}</span>
-          <label class="settings-toggle">
-            <input type="checkbox" id="ap-tint-base" ${cfg.tintBase ? "checked" : ""}>
-            <span class="settings-toggle-slider"></span>
-          </label>
-        </div>
-      </div>
-      <div id="ap-color-system" class="ap-color-body${cfg.colorMode === "system" ? "" : " hidden"}">
-        <div class="settings-row">
-          <span class="settings-label">${t("settings.appearance_color_system_current")}</span>
-          <div class="settings-bg-actions">
-            <span class="ap-swatch" id="ap-sys-swatch" style="background:${esc(sysAccent)}"></span>
-            <span class="ap-sys-label" id="ap-sys-label">${esc(sys.accent ? sys.accent : t("settings.appearance_color_system_unavailable"))}</span>
-            <button type="button" class="settings-btn" id="ap-sys-refresh">${t("settings.appearance_color_system_refresh")}</button>
+      <!-- id 用 -sliders 而不是 -panel：colorPickerHtml() 内部会生成 #ap-base-panel
+           （取色器自己的展开面板），同名会让 pick() 取到错的那个。 -->
+      <div id="ap-base-sliders" class="ap-sliders-panel${basePanelOpen ? "" : " hidden"}">
+        <div id="ap-base-picker" ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_base_picker")}</span>
+            ${colorPickerHtml("ap-base", shown.base)}
           </div>
         </div>
+        ${appearanceSliderRow("settings.appearance_base_alpha", "surfaceAlpha", 0.3, 1, 0.01, cfg.surfaceAlpha, v => formatAppearanceValue("surfaceAlpha", v))}
+        <div id="ap-base-axes" ${tl()}>
+          ${colorAxisRow("settings.appearance_base_saturate", "base", "sat", axis("base").s * 100)}
+          ${colorAxisRow("settings.appearance_base_light", "base", "val", axis("base").v * 100)}
+        </div>
+      </div>
+
+      <!-- ── ③ 按钮自定义（2026-09-20）──────────────────────────────────
+           线条 = 项目内所有切换开关 + 新建对话 / 更多设置 / 历史记录 / 发送 / 停止 /
+           添加文件 六个按钮的边框；背景 = 同样这六个按钮的底色。
+           **按钮背景不再跟底色**（用户要求）—— 它自己一条 --btn-bg-*，与上方底色无关。
+           两组各自「取色器 + 透明度 + 饱和度/明度」，其中**两个透明度滑块留在锁外**。 -->
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_btn_label")}</span>
+        <div class="settings-bg-actions">
+          <button type="button" class="settings-btn ap-bg-custom" id="ap-btn-custom">${t("settings.appearance_btn_custom")}<span class="ap-toggle-caret" id="ap-btn-caret">▾</span></button>
+        </div>
+      </div>
+      <div id="ap-btn-sliders" class="ap-sliders-panel${btnPanelOpen ? "" : " hidden"}">
+        <div id="ap-btn-line-picker" ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_btnline_picker")}</span>
+            ${colorPickerHtml("ap-btnline", shown.btnline)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_btnline_alpha", "btnLineAlpha", 0, 1, 0.01, cfg.btnLineAlpha, v => formatAppearanceValue("btnLineAlpha", v))}
+        <div id="ap-btn-line-axes" ${tl()}>
+          ${colorAxisRow("settings.appearance_btnline_saturate", "btnline", "sat", axis("btnline").s * 100)}
+          ${colorAxisRow("settings.appearance_btnline_light", "btnline", "val", axis("btnline").v * 100)}
+        </div>
+        <div id="ap-btn-bg-picker" ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_btnbg_picker")}</span>
+            ${colorPickerHtml("ap-btnbg", shown.btnbg)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_btnbg_alpha", "btnBgAlpha", 0, 1, 0.01, cfg.btnBgAlpha, v => formatAppearanceValue("btnBgAlpha", v))}
+        <div id="ap-btn-bg-axes" ${tl()}>
+          ${colorAxisRow("settings.appearance_btnbg_saturate", "btnbg", "sat", axis("btnbg").s * 100)}
+          ${colorAxisRow("settings.appearance_btnbg_light", "btnbg", "val", axis("btnbg").v * 100)}
+        </div>
+      </div>
+
+      <!-- ── ④ 文字自定义（2026-09-20）：**只调三档文字的明度**（主 / 次 / 弱一起挪）。
+           它是「偏移量」而不是绝对值 —— 0 = 主题派生原值（逐像素不变）。
+           **不在「恢复默认主题」的锁定范围内**（2026-09-20 四次定稿，用户明确要求
+           「文字明度不锁定」）：它是明度偏移、不是配色本身，开着开关也照常可调可生效。 -->
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_text_label")}</span>
+        <div class="settings-bg-actions">
+          <button type="button" class="settings-btn ap-bg-custom" id="ap-text-custom">${t("settings.appearance_text_custom")}<span class="ap-toggle-caret" id="ap-text-caret">▾</span></button>
+        </div>
+      </div>
+      <div id="ap-text-sliders" class="ap-sliders-panel${textPanelOpen ? "" : " hidden"}">
+        ${appearanceSliderRow("settings.appearance_text_light", "textLight", -100, 100, 1, cfg.textLight, v => formatAppearanceValue("textLight", v))}
       </div>
       </div>
 
@@ -482,43 +634,97 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
     syncBgRow();
   });
 
-  // ── 主题色：**唯一**取色入口（方块 + 色相条 + hex + 预设）──
-  // 原来的「色轮 + 饱和度/明度滑块 + <input type=color>」三件套已删除：它们与取色器
-  // 表达同一组自由度，并存只会互相打架（用户明确要求只留取色器，且界面要对齐主题）。
-  mountColorPicker(container, "ap-accent", cfg.customAccent, (hex) => {
-    ap.set({ customAccent: hex });
+  // ── 三个取色器 + 各自的「饱和度 / 明度」滑块：**同一组值、双向联动**（2026-09-20 用户改定）
+  // 每个 slot 的当前颜色只留一份（`colors[slot].hex`），两条输入路径都写它：
+  //   · 取色器（色板 / 色相条 / hex / 预设 / 屏幕取色）→ commit → `syncAxes()` 回写滑块；
+  //   · 滑块 → `hsvToHex()` 算出新色 → `handle.apply()` 回写色板（**不 commit**，防回环）。
+  // 「跟随态」（字段是空串）下起点是 main.ts 给的派生色；用户一动就写成真 hex，
+  // 从此以用户的为准（用户选的那一档：「没动过就自动派生」）。
+  // **主题色取色器已删除**：主题色只由主题包提供，所以这里只剩底色 / 按钮线条 / 按钮背景三个。
+  const sw = ap.resolvedSwatches();
+  const colors: Record<string, { id: string; hex: string; set: (hex: string) => void }> = {
+    base: { id: "ap-base", hex: cfg.baseColor || sw.base, set: (hex) => ap.set({ baseColor: hex }) },
+    btnline: { id: "ap-btnline", hex: cfg.btnLineColor || sw.btnLine, set: (hex) => ap.set({ btnLineColor: hex }) },
+    btnbg: { id: "ap-btnbg", hex: cfg.btnBgColor || sw.btnBg, set: (hex) => ap.set({ btnBgColor: hex }) },
+  };
+  const syncAxes = (slot: string) => {
+    const hsv = hexToHsv(colors[slot].hex);
+    if (!hsv) return;
+    for (const k of ["sat", "val"] as const) {
+      const v = Math.round((k === "sat" ? hsv.s : hsv.v) * 100);
+      const el = pick<HTMLInputElement>(`input[data-color="${slot}"][data-axis="${k}"]`);
+      if (el) el.value = String(v);
+      const out = container.querySelector(`[data-axis-val="${slot}-${k}"]`);
+      if (out) out.textContent = String(v);
+    }
+  };
+  const handles: Record<string, ColorPickerHandle> = {};
+  for (const slot of Object.keys(colors)) {
+    const c = colors[slot];
+    handles[slot] = mountColorPicker(container, c.id, c.hex, (hex) => {
+      c.hex = hex;
+      c.set(hex);
+      syncAxes(slot);
+    });
+  }
+  // 拖「饱和度 / 明度」滑块 = 直接改色板的**那一轴**（不是微调偏移）——
+  // 所以色相从当前色现取，只替换被拖动的那一轴。写完之后滑块与色板必然一致，
+  // 不存在「两组值互相打架」（那正是 2026-09-19 删掉色轮那三件套的理由）。
+  container.querySelectorAll<HTMLInputElement>('input[type="range"][data-axis]').forEach(el => {
+    el.addEventListener("input", () => {
+      const slot = el.dataset.color ?? "";
+      const c = colors[slot];
+      if (!c) return;
+      const hsv = hexToHsv(c.hex);
+      if (!hsv) return;
+      const nv = Number(el.value) / 100;
+      const next = hsvToHex(hsv.h, el.dataset.axis === "sat" ? nv : hsv.s,
+        el.dataset.axis === "val" ? nv : hsv.v);
+      c.hex = next;
+      c.set(next);
+      handles[slot].apply(next);
+      syncAxes(slot);
+    });
   });
 
-  // ── 底色跟随主色：开 = 由主色派生整套底色/边框/文字；关 = 用 :root 原配色 ──
+  /** 「恢复默认主题」开着 ⇒ **锁住三组配色，放开三个透明度 + 文字明度**（2026-09-20 四次定稿）。
+   *
+   *  锁住的是：三个取色器 + 三对「饱和度 / 明度」滑块；**留在锁外**的是
+   *  底色透明度 / 按钮线条透明度 / 按钮背景透明度（用户要求「除透明度外都不可调」）
+   *  以及**文字明度**（用户随后明确「文字明度不锁定」）。
+   *  锚点统一是 `data-tint-lock`（见 `tl()`），所以加新项只要标一下属性，不会漏。
+   *  用 `.locked`（遮点击 + 降透明度，同「主题锁」那套）而不是 `disabled`：
+   *  自绘取色器不认 disabled（ai-spec 规则 46 已登记过这条教训）。 */
+  const syncTintLock = (on: boolean) => {
+    container.querySelectorAll<HTMLElement>("[data-tint-lock]").forEach(el =>
+      el.classList.toggle("locked", on));
+    pick("#ap-restore-note")?.classList.toggle("hidden", !on);
+  };
   const tintToggle = pick<HTMLInputElement>("#ap-tint-base");
   tintToggle?.addEventListener("change", () => {
     ap.set({ tintBase: !!tintToggle.checked });
+    syncTintLock(!!tintToggle.checked);
   });
 
-  // ── 跟随系统 / 自定义：切模式只重画显隐与选中态 ──
-  const sysSwatch = pick("#ap-sys-swatch");
-  const sysLabel = pick("#ap-sys-label");
-  /** 把「当前系统色」这一行刷成最新。切到跟随模式时**必须**调它：不调则 `--accent`
-   *  还停在上一个自定义色，用户看到的是「切了没反应，要再点一次刷新才对」
-   *  （浏览器实测踩到）。 */
-  const syncSystemRow = async () => {
-    await ap.refreshSystemTheme();
-    const sys = ap.systemTheme();
-    if (sysSwatch) sysSwatch.style.background = sys.accent || cfg.customAccent;
-    if (sysLabel) sysLabel.textContent = sys.accent || t("settings.appearance_color_system_unavailable");
-  };
-  container.querySelectorAll<HTMLElement>("[data-color-mode]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const mode = btn.dataset.colorMode as "custom" | "system";
-      ap.set({ colorMode: mode });
-      container.querySelectorAll<HTMLElement>("[data-color-mode]").forEach(b =>
-        b.classList.toggle("active", b.dataset.colorMode === mode));
-      pick("#ap-color-custom")?.classList.toggle("hidden", mode === "system");
-      pick("#ap-color-system")?.classList.toggle("hidden", mode !== "system");
-      if (mode === "system") void syncSystemRow();
+  // ── 四组「自定义」的展开与收起（形态同背景那组）──
+  const bindPanel = (
+    btnSel: string, panelSel: string, caretSel: string,
+    get: () => boolean, set: (v: boolean) => void,
+  ) => {
+    pick(btnSel)?.addEventListener("click", () => {
+      const next = !get();
+      set(next);
+      pick(panelSel)?.classList.toggle("hidden", !next);
+      const caret = pick(caretSel);
+      if (caret) caret.textContent = next ? "▴" : "▾";
     });
-  });
-  pick("#ap-sys-refresh")?.addEventListener("click", () => { void syncSystemRow(); });
+  };
+  bindPanel("#ap-base-custom", "#ap-base-sliders", "#ap-base-caret",
+    () => basePanelOpen, v => { basePanelOpen = v; });
+  bindPanel("#ap-btn-custom", "#ap-btn-sliders", "#ap-btn-caret",
+    () => btnPanelOpen, v => { btnPanelOpen = v; });
+  bindPanel("#ap-text-custom", "#ap-text-sliders", "#ap-text-caret",
+    () => textPanelOpen, v => { textPanelOpen = v; });
 
   // ── 主题包：单选。`main.ts` 的 set() 会在 themeId 变化时重画结果列表（图标）──
   // 同步「主题锁」：只有默认主题允许改主题色与背景图片（见 buildAppearancePane）。
@@ -1195,8 +1401,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
         box-sizing: border-box;
         padding: 5px 8px;
         font-size: 0.73rem;
-        background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
-        border: 1px solid var(--border-glass);
+        /* ② 文本框 —— 凹陷层走 --ctx-shade-rgb / --ctx-shade-scale：
+           底色暗 ⇒ 白洗（比底色亮）、底色亮 ⇒ 黑洗（比底色暗）。ON 时它就是原来的
+           rgba(0, 0, 0, 0.25 * shade)。 */
+        background: rgba(var(--ctx-shade-rgb), calc(0.25 * var(--ctx-shade-scale)));
+        border: 1px solid var(--ctx-border-glass);
         border-radius: 6px;
         color: var(--text);
         outline: none;
@@ -1261,11 +1470,16 @@ export async function attachSettingsListeners(container: HTMLElement) {
         flex-shrink: 0;
       }
       .settings-toggle input { display: none; }
+      /* ⑤ 切换开关（项目内所有开关都吃这一条）—— 轨道与描边走「按钮自定义」。
+         轨道底的 alpha 取线条 alpha 的固定比例（关 0.31 / 开 0.44）：这样拖
+         「线条透明度」时开关的三层（描边 / 开启底 / 关闭底）同步缩放，不会只剩描边动。
+         默认 alpha 0.32 ⇒ 关闭底 0.0992≈改造前的 0.1、开启底 0.1408≈0.14，肉眼无差。
+         圆点**不动**：它是填充不是线条，仍跟随主题色（用户 2026-09-20：只管线条/描边）。 */
       .settings-toggle-slider {
         position: absolute;
         cursor: pointer;
         top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(var(--ink-rgb), 0.1);
+        background: rgba(var(--btn-line-rgb), calc(var(--btn-line-alpha) * 0.31));
         border-radius: 20px;
         transition: background 0.2s;
       }
@@ -1279,8 +1493,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
         transition: transform 0.2s, background 0.2s;
       }
       .settings-toggle input:checked + .settings-toggle-slider {
-        background: var(--accent-bg);
-        border: 1px solid var(--accent-border);
+        background: rgba(var(--btn-line-rgb), calc(var(--btn-line-alpha) * 0.44));
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
       }
       .settings-toggle input:checked + .settings-toggle-slider::before {
         transform: translateX(16px);
@@ -1421,8 +1635,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 5px 8px;
         font-size: 0.73rem;
         font-family: inherit;
-        background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
-        border: 1px solid var(--border-glass);
+        /* ② 文本框（下拉的收合面）—— 与 .settings-input 同一条凹陷层口径 */
+        background: rgba(var(--ctx-shade-rgb), calc(0.25 * var(--ctx-shade-scale)));
+        border: 1px solid var(--ctx-border-glass);
         border-radius: 6px;
         color: var(--text);
         cursor: pointer;
@@ -1576,14 +1791,16 @@ export async function attachSettingsListeners(container: HTMLElement) {
          三者都用上（放大 + 600 字重 + 左侧 accent 竖条 + 淡底框），
          这样「背景 / 主题颜色 / 主题包」在长面板里一眼能找到。
          去掉了 text-transform: uppercase（中文无大小写，纯属噪声）。 */
+      /* ① 风格里的分类区域 —— 走「反差四件套」（见 styles.css 的 :root 里 --ctx-* 注释）。
+         开关开着时 --ctx-rgb == --accent-rgb，与改造前逐像素一致。 */
       .settings-group-title {
         margin: 18px 0 8px;
         padding: 5px 10px;
         font-size: 0.84rem;
         font-weight: 600;
         color: var(--text);
-        background: var(--accent-bg);
-        border-left: 3px solid var(--accent);
+        background: rgba(var(--ctx-rgb), 0.14);
+        border-left: 3px solid rgb(var(--ctx-rgb));
         border-radius: 4px;
       }
       .settings-group-title:first-of-type { margin-top: 6px; }
@@ -1601,21 +1818,18 @@ export async function attachSettingsListeners(container: HTMLElement) {
          整宽后 hex 输入区自然与同面板其它行的左端点对齐。 */
       .ap-row-block { flex-direction: column; align-items: stretch; gap: 6px; }
       .ap-slider { display: flex; align-items: center; gap: 8px; flex: 1; justify-content: flex-end; }
-      .ap-slider input[type="range"] { width: 140px; accent-color: var(--accent); cursor: pointer; }
+      /* 滑块（拉条）的颜色 = **按钮线条**（2026-09-20 用户要求「按钮也应该包括拉条的颜色」）：
+         滑块轨道本身就是一条「线」，与六个按钮的边框、切换开关的轨道同源。
+         用**全不透明**的 rgb(...) 而不是带 α 的 rgba(...)：① accent-color 带 α 会把
+         轨道与圆点洗淡成看不清；② 默认值下 rgb(var(--btn-line-rgb)) == rgb(var(--accent-rgb))
+         == 改造前的 var(--accent)，**逐像素不变**（带 0.32 的 α 就不成立了）。
+         主题包锁定 / 「恢复默认主题」开着时 --btn-line-rgb 的内联值被清掉 ⇒ 回落主题色。 */
+      .ap-slider input[type="range"] { width: 140px; accent-color: rgb(var(--btn-line-rgb)); cursor: pointer; }
       .ap-slider-val {
         font-size: 0.7rem; color: var(--text-dim);
         min-width: 48px; text-align: right; font-variant-numeric: tabular-nums;
       }
       .ap-bg-name { font-size: 0.7rem; color: var(--text-dim); margin-right: 8px; }
-      .ap-seg { display: flex; border: 1px solid var(--border-glass); border-radius: 6px; overflow: hidden; }
-      .ap-seg-btn {
-        padding: 4px 10px; font-size: 0.7rem;
-        background: none; border: none; color: var(--text-dim); cursor: pointer;
-      }
-      /* 选中态：底色用主色、**文字保持中性**（--text 是由主色明暗派生的灰阶，
-         见 ai-spec 规则 45）—— 用户明确要求「选定的『自定义』这几个字不该有颜色」。
-         选中与否由背景/边框表达即可，文字再上色就与「文字不带色相」那条规则打架。 */
-      .ap-seg-btn.active { background: var(--accent-bg); color: var(--text); }
       /* 主题锁：非默认主题下灰掉「主题颜色」整块（见 buildAppearancePane 的 locked）。
          用 opacity + pointer-events 而不是给每个控件加 disabled 属性 —— 这块里
          有十几个控件（分段按钮 / 取色器 / hex 框 / 色相条 / 预设 / 开关），逐个加
@@ -1627,7 +1841,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       .ap-lock-note.hidden { display: none; }
       .settings-btn:disabled { opacity: 0.42; cursor: not-allowed; }
-      .ap-color-body.hidden { display: none; }
       /* ── 应用内取色器（与界面同一套 token，不用系统取色对话框）────
          为什么自己做：input[type=color] 弹出的是 Windows 原生对话框，
          在 WebView2 里样式一个像素都改不了，与暗色玻璃界面完全脱节。 */
@@ -1635,35 +1848,42 @@ export async function attachSettingsListeners(container: HTMLElement) {
          总高约 110~120px。原来是挤在行右侧的 26px 宽窄条，色盘根本没法用。 */
       .ap-picker { display: flex; flex-direction: column; gap: 5px; width: 100%; }
       .ap-picker-head { display: flex; align-items: center; gap: 6px; }
+      /* ③ 取色器的框格（色块 / 展开面板 / 饱和度-明度框 / 色相条 / 预设色块 / 收合按钮）
+         —— 描边一律走 --ctx-border-glass，底色暗则偏白、底色亮则偏黑，保证框看得见。
+         注意：饱和度-明度框的**渐变本身**（linear-gradient 的黑/白）不许动，见 ai-spec 规则 48。 */
       .ap-swatch-btn {
         width: 34px; height: 26px; padding: 0; cursor: pointer;
-        border: 1px solid var(--border-glass); border-radius: 6px;
+        border: 1px solid var(--ctx-border-glass); border-radius: 6px;
       }
+      /* ② 文本框 —— 走「反差四件套」。底色暗 ⇒ --ctx-ink-rgb 是白（比底色亮一档），
+         底色亮 ⇒ 是黑（比底色暗一档）；边框同理走 --ctx-border-glass。 */
       .ap-hex {
         width: 96px; padding: 4px 8px; font-size: 0.74rem;
         font-family: ui-monospace, Consolas, monospace;
-        background: rgba(var(--ink-rgb), 0.04); color: var(--text);
-        border: 1px solid var(--border-glass); border-radius: 5px;
+        background: rgba(var(--ctx-ink-rgb), 0.04); color: var(--text);
+        border: 1px solid var(--ctx-border-glass); border-radius: 5px;
       }
       /* 展开/收起按钮：圆角正方形（用户要求「调大调成圆框正方形」） */
       .ap-picker-toggle {
         width: 30px; height: 30px; padding: 0; cursor: pointer;
         display: inline-flex; align-items: center; justify-content: center;
         font-size: 0.8rem; line-height: 1;
-        background: none; border: 1px solid var(--border-glass);
+        background: none; border: 1px solid var(--ctx-border-glass);
         border-radius: 8px; color: var(--text-dim);
       }
       .ap-picker-toggle:hover { border-color: var(--accent-border); color: var(--accent); }
       .ap-pick-panel {
         display: flex; flex-direction: column; gap: 4px; padding: 6px;
-        border: 1px solid var(--border-glass); border-radius: 8px;
-        background: rgba(var(--ink-rgb), 0.03);
+        border: 1px solid var(--ctx-border-glass); border-radius: 8px;
+        background: rgba(var(--ctx-ink-rgb), 0.03);
       }
       .ap-pick-panel.hidden { display: none; }
-      /* 饱和度/明度面板：宽而扁（整宽 × 40px）—— 用户要的是「宽度调宽、高度调低」 */
+      /* 饱和度/明度面板：整宽 × **80px**（2026-09-20 按用户要求由 40px 调高）。
+         它与同组的「饱和度 / 明度」两个滑块是**同一组值**（x = 饱和度、y = 明度），
+         所以高度直接决定拖拽精度 —— 40px 时竖直方向只有几十个可分辨位置。 */
       .ap-sv {
-        position: relative; width: 100%; height: 40px; cursor: crosshair; touch-action: none;
-        border-radius: 6px; border: 1px solid var(--border-glass);
+        position: relative; width: 100%; height: 80px; cursor: crosshair; touch-action: none;
+        border-radius: 6px; border: 1px solid var(--ctx-border-glass);
         background-image:
           linear-gradient(to top, #000, rgba(0,0,0,0)),
           linear-gradient(to right, #fff, rgba(255,255,255,0));
@@ -1677,7 +1897,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
       /* 色相条：0° 在最左（红），与 TS 侧的 x/宽度 → 0~360 口径必须一致 */
       .ap-hue {
         position: relative; height: 14px; border-radius: 7px; cursor: pointer; touch-action: none;
-        border: 1px solid var(--border-glass);
+        border: 1px solid var(--ctx-border-glass);
         background: linear-gradient(to right,
           hsl(0 100% 50%), hsl(60 100% 50%), hsl(120 100% 50%), hsl(180 100% 50%),
           hsl(240 100% 50%), hsl(300 100% 50%), hsl(360 100% 50%));
@@ -1686,15 +1906,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
       .ap-presets { display: flex; gap: 5px; flex-wrap: wrap; }
       .ap-preset {
         width: 18px; height: 18px; padding: 0; cursor: pointer;
-        border-radius: 4px; border: 1px solid var(--border-glass);
-      }
-      .ap-swatch {
-        display: inline-block; width: 16px; height: 16px; border-radius: 4px;
-        border: 1px solid var(--border-glass);
-      }
-      .ap-sys-label {
-        font-size: 0.7rem; color: var(--text-dim); margin-right: 8px;
-        font-variant-numeric: tabular-nums;
+        border-radius: 4px; border: 1px solid var(--ctx-border-glass);
       }
       .ap-themes { display: flex; flex-wrap: wrap; gap: 6px; }
       .ap-theme {
