@@ -875,11 +875,20 @@ fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
     let command = str_arg(input, "command")?;
     let timeout = timeout_arg(input);
 
-    let mut cmd = if cfg!(windows) {
+    // 必须用 `raw_arg` 原样拼命令行：`Command::arg` 会按 MSVC 的引号规则把命令里的
+    // `"` 转义成 `\"`（命令含空格时必然触发），而 `cmd /C` 的引号语义是 cmd **自己**
+    // 解释的、不认这个转义 ⇒ 反斜杠原样进了结果（实测 `echo "a b"` 输出 `\"a b\"`，
+    // 拿引号包参数的真实命令如 `git commit -m "..."` 会整条变形）。
+    // 同一坑在 A9 的 hooks 上踩过一次，见 `hooks.rs` 的 `run_one`。
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(&command);
+        c.raw_arg("/C").raw_arg(&command);
         c
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
         let mut c = Command::new("sh");
         c.arg("-c").arg(&command);
         c
@@ -899,6 +908,11 @@ fn powershell(ctx: &Ctx, input: &Value) -> Result<String, String> {
     // 前缀的两行是编码兜底：重定向到管道时 PowerShell 5.1 按控制台的
     // ANSI 码页输出（中文 Windows = GBK），而我们把管道当 UTF-8 解码，
     // 不切 UTF-8 的话中文输出会整片变成替换字符。
+    //
+    // **这里刻意用 `arg` 而不是 `raw_arg`**：与 `Bash` 的 `cmd /C` 不同，
+    // `powershell.exe` 的解析器认得 MSVC 那套 `\"` 转义（`Write-Output "a b"`
+    // 实测输出正确），改成 raw_arg 反而要自己拼整条命令行、徒增风险。
+    // 断言见单测 `quoted_shell_arguments_survive_the_command_line`。
     let mut cmd = Command::new("powershell");
     cmd.arg("-NoProfile")
         .arg("-NonInteractive")
@@ -2200,6 +2214,34 @@ mod tests {
             locked: false,
             plan_phase: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Windows 下 `Bash` **必须用 `raw_arg` 原样拼命令行**。
+    ///
+    /// `Command::arg` 会按 MSVC 的引号规则把参数里的 `"` 转义成 `\"`，而 `cmd /C`
+    /// 的引号语义是 `cmd` 自己解释的、**不认这个转义** ⇒ 命令含空格 + 引号时整条变形
+    /// （`echo "a b"` 会原样吐出 `\"a b\"`，多一层的反斜杠直接进了结果）。
+    /// 这是 A9 在 hooks 上踩到的坑，复查后确认 `Bash` 同样中招。
+    ///
+    /// **`PowerShell` 实测不受影响**（它的解析器认 `\"`）—— 所以那边刻意**不**改成
+    /// `raw_arg`：改它就得自己重新拼一遍完整命令行，白白引入新风险。这条断言一并钉住，
+    /// 防止以后有人为了「两处写法一致」把它改坏。
+    #[cfg(windows)]
+    #[test]
+    fn quoted_shell_arguments_survive_the_command_line() {
+        let ctx = test_ctx();
+
+        let out = bash(&ctx, &json!({ "command": "echo \"a b\"" })).expect("Bash 应当能跑");
+        assert!(out.contains("a b"), "Bash 的引号参数被改写：{out}");
+        assert!(!out.contains("\\\""), "Bash 的输出里出现了 MSVC 转义痕迹：{out}");
+
+        let out = powershell(&ctx, &json!({ "command": "Write-Output \"a b\"" }))
+            .expect("PowerShell 应当能跑");
+        assert!(out.contains("a b"), "PowerShell 的引号参数被改写：{out}");
+        assert!(
+            !out.contains("\\\""),
+            "PowerShell 的输出里出现了 MSVC 转义痕迹：{out}"
+        );
     }
 
     /// `Agent`（A1 子代理）必须注册进内置工具表，且能被 `--disallowedTools` 正常裁掉。

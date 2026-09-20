@@ -79,14 +79,22 @@ fn kill_port(port: u16) {
     #[cfg(target_os = "windows")]
     let cmd = {
         use std::os::windows::process::CommandExt;
+        // 这条命令有两处非改不可，都是实测出来的（端口 59999 / 自建监听端口两轮对照）：
+        // ① **必须 `raw_arg`**：命令里既有空格又有引号（`"tokens=5"`、`":端口"`），
+        //    `Command::arg` 会按 MSVC 规则把 `"` 转义成 `\"`，cmd 不认 —— 报
+        //    「此时不应有 \"tokens=5\"」并整条退出，taskkill 一次都没跑到。
+        // ② **`for /f ('…')` 里的重定向必须写成 `2^>nul`**：写在单引号命令里的裸
+        //    `2>nul` 是给外层 cmd 解释的，cmd 直接报「此时不应有 2>」；
+        //    转义后被剥成 `2>nul` 才由那层子 cmd 正确执行（实测转义后 exit 0 且
+        //    取到了监听进程的 PID）。末尾那个 `2>nul` 属于 `do` 子句，**不要**转义
+        //    —— 转义会把 `2>nul` 当普通文本打进输出（实测 `FOUND 8896 2>nul`）。
+        let line = format!(
+            "for /f \"tokens=5\" %a in ('netstat -ano 2^>nul ^| findstr \":{}\" ^| findstr LISTENING') do taskkill /F /PID %a 2>nul",
+            port
+        );
         StdCommand::new("cmd")
-            .args(&[
-                "/c",
-                &format!(
-                    "for /f \"tokens=5\" %a in ('netstat -ano 2>nul ^| findstr \":{}\" ^| findstr LISTENING') do taskkill /F /PID %a 2>nul",
-                    port
-                ),
-            ])
+            .raw_arg("/c")
+            .raw_arg(line)
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output()
     };

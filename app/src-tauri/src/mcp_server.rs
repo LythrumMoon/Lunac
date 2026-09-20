@@ -347,17 +347,21 @@ fn resolve_template(template: &str, params: &Value) -> String {
 /// (piped buffers would otherwise deadlock), and on timeout the child is
 /// killed and an error is returned.
 fn run_shell_with_timeout(command: &str, timeout_secs: u64) -> Result<String, String> {
-    let mut c = if cfg!(target_os = "windows") {
+    // 必须 `raw_arg` 原样拼命令行：`command` 来自用户的工具定义（`tools\*.json`），
+    // 里面带引号 + 空格是常态（如 `python "C:\my tools\x.py" --arg "a b"`），
+    // 而 `Command::arg` 会按 MSVC 规则把 `"` 转义成 `\"` —— cmd 不认这个转义，
+    // 命令会整条失败（实测见 main.rs `kill_port`：cmd 报「此时不应有 \"tokens=5\"」）。
+    #[cfg(target_os = "windows")]
+    let mut c = {
+        use std::os::windows::process::CommandExt;
         let mut c = StdCommand::new("cmd");
-        c.args(["/c", command]);
-        #[cfg(target_os = "windows")]
-        {
-            // CREATE_NO_WINDOW — GUI 进程（release）下不设置会弹出 cmd 窗口
-            use std::os::windows::process::CommandExt;
-            c.creation_flags(0x0800_0000);
-        }
+        c.raw_arg("/c").raw_arg(command);
+        // CREATE_NO_WINDOW — GUI 进程（release）下不设置会弹出 cmd 窗口
+        c.creation_flags(0x0800_0000);
         c
-    } else {
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut c = {
         let mut c = StdCommand::new("sh");
         c.args(["-c", command]);
         c
