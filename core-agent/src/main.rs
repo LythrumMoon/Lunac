@@ -50,14 +50,15 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
 mod bash_safety;
+mod content_safety;
 mod log;
 mod mcp;
 mod skills;
@@ -1309,6 +1310,16 @@ struct Pending {
     rx: mpsc::Receiver<Value>,
 }
 
+/// 从写入类工具的入参里取出**将被写进磁盘的文本**（审批卡的凭据扫描用它）。
+///
+/// `Write` 取 `content`；`Edit` 取 `new_string` —— **不取 `old_string`**：那是要被删掉的
+/// 内容，扫它会把「正在清理凭据」的操作也标成可疑，正好反了。
+/// 返回 `None` = 入参缺字段（工具执行时会自己报参数错误，这里不重复判定）。
+fn written_payload<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
+    let key = if tool_name == "Edit" { "new_string" } else { "content" };
+    input.get(key).and_then(Value::as_str)
+}
+
 /// 只登记 + 发请求，不阻塞 —— 一批工具先全部发出，前端才能把连续
 /// Bash 合并成一行（`findLastBashGroup`）再让用户一次性决定。
 fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
@@ -1346,6 +1357,19 @@ fn open_approval(tool_name: &str, tool_use_id: &str, input: &Value) -> Pending {
                 "dangerous": report.dangerous,
                 "opaque": report.opaque,
             });
+        }
+    }
+    // 写入类工具附上**写入内容**的静态安全分析（2026-09-20，原 backlog A6；见 content_safety.rs）。
+    // 只做「凭据 / 密钥泄漏」这一类 —— 审批卡是用户唯一能看见内容的地方，
+    // 把可疑点抽出来显式标出，否则「扫一眼就点允许」等于没有审批。
+    // 前端把它当「必须人看一档」处理：不自动放行、也不给「始终允许」。
+    if matches!(tool_name, "Write" | "Edit") {
+        if let Some(text) = written_payload(tool_name, input) {
+            let report = content_safety::analyze(text);
+            if !report.is_clean() {
+                log::warn(format!("写入内容静态分析 {tool_name}: {}", report.summary()));
+            }
+            request["analysis"] = json!({ "secrets": report.json_hits() });
         }
     }
     emit(json!({
@@ -1506,6 +1530,9 @@ fn main() {
         read_only: cli.permission_mode == "plan",
         locked: std::env::var("LUNAC_WORKSPACE_LOCKED").ok().as_deref() == Some("1")
             && !cli.skip_permissions,
+        // 计划相位（A7）：**进程内**的状态，起手恒为「不在计划相位」——
+        // 只读档是另一回事（那是用户档位，见 `read_only` 的注释）。
+        plan_phase: Arc::new(AtomicBool::new(false)),
     };
 
     // P3 MCP 工具桥：把 <exe 根>\tools\*.json 的用户工具接进工具池。
@@ -1786,12 +1813,14 @@ fn main() {
                     &system_prompt,
                     &subagent_system,
                 );
-                // 复盘的三个前置：① 到轮次门槛；② 不是只读（plan）档（复盘要写记忆与
-                // 技能，只读档下 `run_subagent` 会直接拒）；③ 上一轮那次已经收干净。
+                // 复盘的三个前置：① 到轮次门槛；② 不是只读（plan）档、也不在计划相位
+                // （复盘的唯一产品就是一条 `Remember` 写入，那两档下 `write_blocked` 会
+                // 直接拒 ⇒ 派出去也是白烧一次 API）；③ 上一轮那次已经收干净。
                 // 「当前记忆」在主线程读（那条桥归主线程）—— 复盘靠它避免重复写。
                 questions += 1;
                 if pending_review.is_none()
                     && !tools_ctx.read_only
+                    && !tools_ctx.plan_phase.load(Ordering::Relaxed)
                     && should_review(questions, review_setup.interval)
                 {
                     let memory = fetch_memory(mcp_bridge.as_mut()).unwrap_or_default();
@@ -2036,9 +2065,11 @@ fn run_subagent(
     let task_id = spec.task_id;
     let max_rounds = spec.max_rounds;
     let budget_tokens = spec.budget_tokens;
-    // plan（只读）档直接拒绝：子代理会写文件（约束③的前置 —— 见 tools::run 的只读拦截）
-    if tctx.read_only {
-        return Err("Agent is disabled in read-only (plan) mode".into());
+    // 写类档位直接拒绝（只读档 / 计划相位）：子代理会写文件、跑命令 —— 它靠这个干活。
+    // 派生出去的子代理**共享同一份 `plan_phase`**（`Arc`），所以这里拒的是「派出去」
+    // 这个动作本身；它内部的每次写操作各自也还会再被拦一次（`tools::run` 那一层）。
+    if let Some(why) = tools::write_blocked(tctx, "Agent") {
+        return Err(why);
     }
     let mut history: Vec<Value> = vec![json!({
         "role": "user",
@@ -2266,6 +2297,155 @@ fn run_agent_tool(
         Err(e) => {
             log::warn(format!("子代理 {task_id} 失败（{ms}ms）: {e}"));
             (format!("[{task_id}] subagent failed: {e}"), true)
+        }
+    }
+}
+
+// ── fork 技能的实现（A5，2026-09-20）────────────────────────────────
+//
+// 技能有两种模式（frontmatter 的 `context: fork`）：inline 把正文注入主对话让主循环照做，
+// fork 则**派一个子代理去执行**、只把报告带回来。判据与执行路径都抄旧 CLI
+// （`core/skills/loadSkillsDir.ts` 的 `executionContext`、`core/tools/SkillTool/SkillTool.ts`
+// 的 `executeForkedSkill()`）。
+
+/// fork 技能能不能跑。
+///
+/// **只读档 / 计划相位一律拒绝** —— 与 `Agent` 同理，而且理由更强：技能正文是**用户装的**、
+/// 里面可以写任意 `Bash`，放它出去等于把「只读」这个承诺交给第三方的 md 文件去守。
+/// （inline 技能不看这道闸：它只把 md 正文交回主循环，与 `Read` 同级。）
+fn fork_skill_allows(tctx: &tools::Ctx) -> Result<(), String> {
+    match tools::write_blocked(tctx, "fork skills") {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// 按 `allowed-tools` 从子代理工具集里挑出这次 fork 能用的工具。
+///
+/// **只在传入的 `subagent_defs` 里挑**，所以技能无法借白名单把 `Agent` / 走桥的 /
+/// `mcp__*` 弄进来 —— 那三类已被 `subagent_tool_defs()` 剔除，**判据只有一处**。
+/// 白名单为空 = 不限制；非空但一个都没匹配上 = **一件也不给**（fail-closed：白名单写错时
+/// 宁可让子代理只靠推理，也不能悄悄放开成全集）。
+fn fork_skill_tools(skill: &skills::Skill, subagent_defs: &[Value]) -> Vec<Value> {
+    if skill.allowed_tools.is_empty() {
+        return subagent_defs.to_vec();
+    }
+    subagent_defs
+        .iter()
+        .filter(|d| {
+            let n = d.get("name").and_then(Value::as_str).unwrap_or("");
+            skill.allowed_tools.iter().any(|w| w == n)
+        })
+        .cloned()
+        .collect()
+}
+
+/// `Skill` 工具的 **fork 特判**：派子代理执行技能，返回它的报告。
+///
+/// 与 `run_agent_tool` 共用 `run_subagent()` + `ForkSpec` —— 这正是 A4 当初把八个差异收进
+/// 结构体的回报：第三个调用方只多出「工具集来自技能自己」这一项。四点差异：
+///   · 工具集 = `fork_skill_tools()`（技能 frontmatter 的 `allowed-tools`）；
+///   · 任务 = **技能正文**（`$ARGUMENTS` 已替换），前置一句「照它做完并报告」；
+///   · `emit_progress = true`：这是**用户/模型主动发起**的，进度必须回前端。
+///     与 A4 的后台复盘相反 —— 那个是无人值守，发进度会让状态栏停在错的文案上；
+///   · `ask_permission` 随前端运行方式：技能里写 `Bash` / `Write` 时，子代理内部**逐次**
+///     再走 `can_use_tool`，**不是「批了技能就等于批了它要做的一切」**（同 `Agent`）。
+fn run_forked_skill(
+    cfg: &Cfg,
+    tctx: &tools::Ctx,
+    subagent_defs: &[Value],
+    skill_list: &[skills::Skill],
+    subagent_system: &str,
+    ask_permission: bool,
+    skill: &skills::Skill,
+    input: &Value,
+    denied: Option<&str>,
+) -> (String, bool) {
+    if let Some(msg) = denied {
+        return (format!("User denied this tool call: {msg}"), true);
+    }
+    if let Err(e) = fork_skill_allows(tctx) {
+        return (format!("[{e}]"), true);
+    }
+
+    let args = input.get("args").and_then(Value::as_str).unwrap_or("");
+    // 子代理看不到主对话，也看不到主对话里那份技能清单 —— 自带的脚本 / 参考资料必须
+    // 跟着任务说明一起给它，否则「技能写了要用 scripts/x.py」它只会去猜路径。
+    let task = format!("{}{}", skills::instruction(skill, args), skills::resources_note(skill));
+    let defs = fork_skill_tools(skill, subagent_defs);
+    if !skill.allowed_tools.is_empty() && defs.is_empty() {
+        log::warn(format!(
+            "fork 技能 {} 的 allowed-tools（{}）在内置工具里一个都没匹配上 —— 子代理将无工具可用",
+            skill.key,
+            skill.allowed_tools.join(", ")
+        ));
+    }
+
+    let task_id = format!("skill-{}", TASK_SEQ.fetch_add(1, Ordering::Relaxed) + 1);
+    emit(json!({
+        "type": "system", "subtype": "task_started",
+        "task_id": task_id, "description": skill.key,
+    }));
+    log::info(format!(
+        "fork 技能 {} 启动（工具 {} 件：{}）",
+        skill.key,
+        defs.len(),
+        defs.iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+
+    let started = Instant::now();
+    let out = run_subagent(
+        cfg,
+        tctx,
+        &ForkSpec {
+            task_id: &task_id,
+            system: subagent_system,
+            defs: &defs,
+            // 子代理能读**其它技能**（组合很自然）；fork 技能的递归由 `skills::run()`
+            // 的 fork 守卫挡住 —— 那里会明确回「不能在 inline 路径加载」。
+            skills: skill_list,
+            ask_permission,
+            max_rounds: MAX_SUBAGENT_ROUNDS,
+            budget_tokens: SUBAGENT_BUDGET_TOKENS,
+            emit_progress: true,
+        },
+        None,
+        &format!("Execute this skill end to end, then report the result.\n\n{task}"),
+    );
+    emit(json!({
+        "type": "system", "subtype": "task_done",
+        "task_id": task_id, "ok": out.is_ok(),
+        "ms": started.elapsed().as_millis() as u64,
+    }));
+    let ms = started.elapsed().as_millis();
+    match out {
+        Ok(text) => {
+            log::info(format!(
+                "fork 技能 {} 完成（{ms}ms，报告 {} 字）",
+                skill.key,
+                text.chars().count()
+            ));
+            let clipped = crate::log::truncate_chars(&text, SUBAGENT_REPORT_CHARS);
+            // 措辞要**与 inline 明确区分**：inline 回的是「照着做的指令」，
+            // 这里回的是「已经做完了，这是结果」。含糊的话模型会把报告当指令再执行一遍。
+            (
+                format!(
+                    "Skill \"{}\" ran in sub-agent [{task_id}] — the work is DONE; \
+                     this is its report:\n\n{clipped}",
+                    skill.key
+                ),
+                false,
+            )
+        }
+        Err(e) => {
+            log::warn(format!("fork 技能 {} 失败（{ms}ms）: {e}", skill.key));
+            (
+                format!("Skill \"{}\" failed in sub-agent [{task_id}]: {e}", skill.key),
+                true,
+            )
         }
     }
 }
@@ -2510,6 +2690,24 @@ fn collect_review(
     true
 }
 
+// ── 计划相位（A7）：两件工具的**回执**（给模型看）──────────────────
+//
+// 为什么这两件工具的状态机写在 `main.rs` 而不是 `tools.rs`：状态本身在 `tools::Ctx`
+// 里（这样写类判据只收口一次，见 `tools::write_blocked`），但**进 / 出的时机与
+// 「通知前端」是主循环的事** —— `tools.rs` 是纯工具实现层，拿不到 `emit`。
+//
+// 免责声明给模型的那一段（「计划格式」）只在 schema 描述里写了一次，这里不重复
+// 抄一遍格式要求：重复的格式说明会在上下文里出现两份，改一份忘一份。
+const PLAN_MODE_ON_NOTE: &str = "Plan mode is ON — this lasts until the user approves a plan. \
+Read-class tools still work; every write-class tool (Write / Edit / Bash / PowerShell / Agent / \
+MCP tools) is REFUSED until then. Gather what you need with Read / Glob / Grep, then present the \
+COMPLETE plan with ExitPlanMode.";
+
+const PLAN_MODE_OFF_NOTE: &str = "The user approved your plan. Plan mode is OFF — write-class \
+tools work again. Execute the plan task by task in the order you wrote it, and keep the user \
+posted with TodoWrite. If reality contradicts the plan (a file is not where you expected), say \
+so instead of improvising silently.";
+
 fn dispatch_tool(
     tctx: &tools::Ctx,
     mcp_bridge: Option<&mut mcp::Bridge>,
@@ -2519,6 +2717,38 @@ fn dispatch_tool(
 ) -> Result<String, String> {
     // 结果**不在这里**截断 —— 单条输出预算统一由 run_tool 的
     // `tools::apply_budget` 收口（那里才知道工具名，超长要落盘）。
+
+    // 计划相位的入口（A7）：只置标志 + 通知前端，**没有本机副作用**，因此免审批。
+    // 幂等（模型重复调用无妨）：置真就是「置真」，没有计数要维护。
+    if name == "EnterPlanMode" {
+        tctx.plan_phase.store(true, Ordering::Relaxed);
+        emit(json!({
+            "type": "system",
+            "subtype": "plan_mode",
+            "state": "on",
+            "reason": input.get("reason").and_then(Value::as_str).unwrap_or("").trim(),
+        }));
+        return Ok(PLAN_MODE_ON_NOTE.into());
+    }
+    // 计划相位的出口（A7）：走到这里说明审批卡已经**批准**过（被拒的调用根本到不了
+    // 这一层 —— `run_one_tool` 的 `denied` 早退把它变成了 is_error 的 tool_result）。
+    if name == "ExitPlanMode" {
+        // 只读档下**退出计划模式没有意义**：写类工具被用户档位永久拒绝，批准了计划也
+        // 执行不了 —— 说「批准后就能写」是把模型引到一个永远失败的动作上。
+        // 所以直接拒，并让它改用正文交代计划（用户仍能读到计划，只是不能在这里批准）。
+        if tctx.read_only {
+            return Err(
+                "ExitPlanMode is disabled in read-only (plan) mode — the user's security profile \
+                 forbids writes, so approving a plan could not enable anything. Put the plan in \
+                 your reply as text instead; to have it executed the user must switch the profile \
+                 to \"project\" in Lunac settings."
+                    .into(),
+            );
+        }
+        tctx.plan_phase.store(false, Ordering::Relaxed);
+        emit(json!({ "type": "system", "subtype": "plan_mode", "state": "off" }));
+        return Ok(PLAN_MODE_OFF_NOTE.into());
+    }
     if name == "Skill" {
         return skills::run(skill_list, input);
     }
@@ -2549,12 +2779,13 @@ fn dispatch_tool(
                     bridge.read_resource(uri)
                 }
             }
-            // 长期记忆的写入侧（A4）。**plan（只读）档必须在这里拒** —— 它是写操作，
-            // 但上面那条 `needs_bridge` 早退把只读档的写类拦截（`tools::run` 里的
-            // read_only 判断）绕过去了，不在这一层补，只读档就能改长期记忆。
+            // 长期记忆的写入侧（A4）。**写类判据必须在这里补一次** —— 它是写操作，
+            // 但上面那条 `needs_bridge` 早退把 `tools::run` 里的拦截绕过去了，
+            // 不在这一层补，只读档 / 计划相位就能改长期记忆（2026-09-20 A7 起共用
+            // `tools::write_blocked`，两档的措辞自动分开）。
             "Remember" => {
-                if tctx.read_only {
-                    Err("Remember is disabled in plan mode (read-only)".into())
+                if let Some(why) = tools::write_blocked(tctx, "Remember") {
+                    Err(why)
                 } else {
                     let content = input
                         .get("content")
@@ -2582,9 +2813,10 @@ fn dispatch_tool(
     if !mcp::is_mcp(name) {
         return tools::run(tctx, name, input);
     }
-    // plan（只读）档：MCP 工具同样不许动手
-    if tctx.read_only {
-        return Err("MCP tools are disabled in read-only (plan) mode".into());
+    // 写类档位判据（只读档 / 计划相位）：MCP 工具同样不许动手。
+    // 判据与内置写类共用一处（`tools::write_blocked`），措辞自动分档。
+    if let Some(why) = tools::write_blocked(tctx, "MCP tools") {
+        return Err(why);
     }
     let Some(bridge) = mcp_bridge else {
         return Err(format!("MCP bridge is not connected, cannot call {name}"));
@@ -2650,11 +2882,12 @@ fn plan_tool_batches(calls: &[(String, String, Value)]) -> Vec<(bool, std::ops::
     out
 }
 
-/// 子代理的工具集：从本轮的 `tool_defs` 里**剔掉两类它用不了的**。
+/// 子代理的工具集：从本轮的 `tool_defs` 里**剔掉三类它用不了的**。
 ///
 /// | 剔掉的 | 为什么 |
 /// |---|---|
 /// | `Agent` | 防无限递归（约束⑤）—— 子代理不能再派子代理 |
+/// | `EnterPlanMode` / `ExitPlanMode`（A7） | 计划相位是**主循环**的状态。子代理**问不了用户**（它的提示词就是这么写的），`ExitPlanMode` 在里面只会弹一张无人能负责的卡；而 `EnterPlanMode` 若被子代理调用，等于它替主代理改了全局相位 —— 一个只该由主循环做的决定 |
 /// | 走 MCP 桥的（`tools::needs_bridge`） | 子代理**不接 MCP 桥**（`run_one_tool(…, None, …)`：桥是 `&mut` 单线程 stdio 通道，主循环还持有它）。留在工具表里就是**保证失败**：`mcp__*` 的 `needs_approval` 恒真 ⇒ 会先弹一张注定白问的审批卡，然后回 `MCP bridge is not connected`；`SessionSearch` / resources 读侧同样无桥可用 |
 ///
 /// 桥那一类走 `tools::BRIDGE_TOOLS` 这个**唯一真相源**，不在这里另写字符串 ——
@@ -2665,10 +2898,34 @@ fn subagent_tool_defs(tool_defs: &[Value]) -> Vec<Value> {
         .iter()
         .filter(|d| {
             let name = d.get("name").and_then(Value::as_str).unwrap_or("");
-            name != "Agent" && !tools::needs_bridge(name) && !mcp::is_mcp(name)
+            !matches!(name, "Agent" | "EnterPlanMode" | "ExitPlanMode")
+                && !tools::needs_bridge(name)
+                && !mcp::is_mcp(name)
         })
         .cloned()
         .collect()
+}
+
+/// 审批判据的**带输入版本**（2026-09-20 A5）。
+///
+/// `tools::needs_approval()` 只看名字，而 `Skill` 的两种模式副作用完全不同：
+///   · inline 技能是**纯读**（把 md 正文交回主循环，与 `Read` 同级）⇒ 不该弹卡；
+///   · fork 技能会派一个**能写文件、能跑命令**的子代理 ⇒ 与 `Agent` 同理，
+///     「派一个代理出去干活」这个决定本身值得确认。
+/// 判据差别藏在输入里（`skill` 指向哪个技能），所以只能在这一层补 —— 不要为此把
+/// `Skill` 整个塞进 `tools::needs_approval()`，那会让 inline 技能每次都白弹一张卡。
+///
+/// 前一半走本文件的 `needs_approval()`（内置写类 + MCP），**不要**直接调
+/// `tools::needs_approval()` —— 那会漏掉「全部 MCP 工具一律问」这条。
+fn needs_approval_with(name: &str, input: &Value, skills: &[skills::Skill]) -> bool {
+    if needs_approval(name) {
+        return true;
+    }
+    if name == "Skill" {
+        let want = input.get("skill").and_then(Value::as_str).unwrap_or("");
+        return matches!(skills::find(skills, want), Some(s) if s.fork);
+    }
+    false
 }
 
 fn run_query(
@@ -3221,7 +3478,7 @@ fn run_query(
         let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
             let ask = ask_permission
-                && needs_approval(name)
+                && needs_approval_with(name, input, skill_list)
                 && (!tctx.read_only || tools::gated_in_read_only(name));
             if ask {
                 pendings.push(Some(open_approval(name, id, input)));
@@ -3261,7 +3518,32 @@ fn run_query(
                 // 而 `dispatch_tool` 拿不到 —— 只能在这一层接。它也**不接 MCP 桥**
                 // （桥是 `&mut` 单线程 stdio 通道，主循环还持有它；子代理的工具集里
                 // 因此已经剔掉了 `mcp__*` 与 `SessionSearch`，见 `subagent_tool_defs`）。
-                slots[i] = Some(if calls[i].1 == "Agent" {
+                //
+                // `Skill` 的 **fork 模式同族**（2026-09-20 A5）：它同样要发 API、跑独立
+                // 循环，所以只能在这里接。**inline 技能不走这条路** —— 它只是把 md 正文
+                // 交回主循环（与 `Read` 同级），照常落进下面的 `run_one_tool`。
+                let forked = if calls[i].1 == "Skill" {
+                    let want = run_inputs[i]
+                        .get("skill")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    skills::find(skill_list, want).filter(|s| s.fork)
+                } else {
+                    None
+                };
+                slots[i] = Some(if let Some(sk) = forked {
+                    run_forked_skill(
+                        cfg,
+                        tctx,
+                        &subagent_defs,
+                        skill_list,
+                        subagent_system,
+                        ask_permission,
+                        sk,
+                        &run_inputs[i],
+                        denieds[i].as_deref(),
+                    )
+                } else if calls[i].1 == "Agent" {
                     run_agent_tool(
                         cfg,
                         tctx,
@@ -3431,6 +3713,18 @@ fn finish_error(
 mod tests {
     use super::*;
 
+    /// 计划相位 / 档位判据的单测用最小上下文（与 `tools.rs` 里那份同形）：
+    /// 只关心两个标志，不碰磁盘。
+    fn test_ctx() -> tools::Ctx {
+        tools::Ctx {
+            cwd: PathBuf::from("."),
+            add_dirs: Vec::new(),
+            read_only: false,
+            locked: false,
+            plan_phase: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// 系统提示词的**前缀缓存不变量**（2026-09-17 方案 B 的守门测试）。
     ///
     /// 方案 B 把「人格 + 文风」两块从**用户消息**（每问重发、必未命中）搬进了**系统提示词**
@@ -3452,15 +3746,15 @@ mod tests {
         assert!(!a.contains('{'), "残留了未被 format! 替换的占位符");
     }
 
-    /// 子代理工具集的守门测试（2026-09-20 复查补）。
+    /// 子代理工具集的守门测试（2026-09-20 复查补，A7 扩了一类）。
     ///
     /// 原实现只剔了 `Agent`，把 `mcp__*` 与 `SessionSearch` 一起发给了子代理 —— 而子代理
     /// **不接 MCP 桥**，那两件事在里面必然失败（`mcp__*` 还会先弹一张注定白问的审批卡）。
     /// 这条测试钉住「剔哪三类、留哪些、顺序不变」。
     #[test]
     fn subagent_tool_defs_drops_agent_and_bridge_only_tools() {
-        // 模拟主对话的工具池：内置（含 SessionSearch）+ 条件注册的 Skill / Remember
-        // + 两个 MCP 用户工具
+        // 模拟主对话的工具池：内置（含 SessionSearch 与计划相位两件）+ 条件注册的
+        // Skill / Remember + 两个 MCP 用户工具
         let mut defs = tools::defs(&[]);
         defs.push(skills::tool_def());
         defs.push(tools::remember_tool());
@@ -3479,11 +3773,20 @@ mod tests {
             .collect();
 
         assert!(!names.contains(&"Agent".to_string()), "防递归：子代理不能再派子代理");
-        assert!(!names.contains(&"SessionSearch".to_string()), "它走 MCP 桥，子代理没有桥");
+        assert!(
+            !names.contains(&"SessionSearch".to_string()),
+            "它走 MCP 桥，子代理没有桥"
+        );
         assert!(
             !names.contains(&"Remember".to_string()),
             "它走 MCP 桥（`lunac/memory_write`），子代理没有桥"
         );
+        for plan_tool in ["EnterPlanMode", "ExitPlanMode"] {
+            assert!(
+                !names.contains(&plan_tool.to_string()),
+                "{plan_tool} 改的是主循环的全局相位，且子代理问不了用户"
+            );
+        }
         assert!(
             !names.iter().any(|n| n.starts_with("mcp__")),
             "MCP 工具在子代理里必然失败（无桥 + 白问一次审批）"
@@ -3500,9 +3803,76 @@ mod tests {
         let expected: Vec<String> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str).map(String::from))
-            .filter(|n| n != "Agent" && !tools::needs_bridge(n) && !n.starts_with("mcp__"))
+            .filter(|n| {
+                !matches!(n.as_str(), "Agent" | "EnterPlanMode" | "ExitPlanMode")
+                    && !tools::needs_bridge(n)
+                    && !n.starts_with("mcp__")
+            })
             .collect();
         assert_eq!(names, expected, "剔除不得改变工具顺序");
+    }
+
+    /// 计划相位的状态机（A7）：只有两件工具能翻转它，且**出口只认批准**。
+    ///
+    /// 「被拒」那条路径不在这里测 —— 它压根到不了 `dispatch_tool`：`run_one_tool` 见到
+    /// `denied` 就直接回错误文本（见那两处的注释与 `await_approval`）。
+    #[test]
+    fn plan_phase_flips_only_through_the_two_tools() {
+        let ctx = test_ctx();
+        let plan = json!({"plan": "# 实现计划\n\n### Task 1: …"});
+
+        // 出口在没进过计划相位时也能用（幂等：置假就是置假）
+        assert!(!ctx.plan_phase.load(Ordering::Relaxed));
+        assert!(dispatch_tool(&ctx, None, &[], "ExitPlanMode", &plan).is_ok());
+        assert!(!ctx.plan_phase.load(Ordering::Relaxed));
+
+        // 入口：免审批，且立刻生效
+        let note = dispatch_tool(&ctx, None, &[], "EnterPlanMode", &json!({"reason": "任务较大"}))
+            .expect("进入计划模式不该失败");
+        assert!(ctx.plan_phase.load(Ordering::Relaxed), "EnterPlanMode 必须立刻生效");
+        assert!(
+            note.contains("ExitPlanMode"),
+            "回执要告诉模型怎么出去，实际是：{note}"
+        );
+
+        // 计划相位里写类一律被拒，且拒因指向「出计划、等批准」
+        for (n, args) in [
+            ("Write", json!({"file_path": "a.txt", "content": "x"})),
+            ("Edit", json!({"file_path": "a.txt", "old_string": "a", "new_string": "b"})),
+            ("Bash", json!({"command": "echo hi"})),
+            ("PowerShell", json!({"command": "echo hi"})),
+        ] {
+            let err = dispatch_tool(&ctx, None, &[], n, &args).expect_err("计划相位必须拦住写类");
+            assert!(
+                err.contains("ExitPlanMode"),
+                "{n} 的拒因该指向 ExitPlanMode（用户该做的是批准，不是改设置），实际是：{err}"
+            );
+        }
+        // 免审批那些照常可用（否则「先看代码再出计划」就做不成了）
+        assert!(dispatch_tool(&ctx, None, &[], "Glob", &json!({"pattern": "*"})).is_ok());
+
+        // 出口：批准后解除
+        let note = dispatch_tool(&ctx, None, &[], "ExitPlanMode", &plan).expect("批准后必须能出去");
+        assert!(!ctx.plan_phase.load(Ordering::Relaxed), "ExitPlanMode 批准后必须解除");
+        assert!(note.contains("approved"), "回执要说明计划已获批，实际是：{note}");
+    }
+
+    /// 只读档（用户在设置里选的「只读」）与计划相位是**两回事**，在出口上尤其明显：
+    /// 只读档下 `ExitPlanMode` 是**被拒**的 —— 批准了计划也执行不了，说「批准后就能写」
+    /// 会把模型引到一个必然失败的动作上。
+    #[test]
+    fn read_only_profile_refuses_the_plan_exit() {
+        let mut ctx = test_ctx();
+        ctx.read_only = true;
+        // 只读档下仍可**进入**计划相位（它不碰本机），但必须由正文交代计划
+        assert!(dispatch_tool(&ctx, None, &[], "EnterPlanMode", &json!({})).is_ok());
+        let err = dispatch_tool(&ctx, None, &[], "ExitPlanMode", &json!({"plan": "# p"}))
+            .expect_err("只读档下计划相位退不出去");
+        assert!(
+            err.contains("settings"),
+            "要做的是去设置里改档位，拒因必须这么说，实际是：{err}"
+        );
+        assert!(ctx.plan_phase.load(Ordering::Relaxed), "被拒时相位不得被清掉");
     }
 
     /// 轮次门槛（A4）。三条边界：`interval == 0` 是**关闭**而不是「每次都跑」；

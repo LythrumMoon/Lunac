@@ -18,8 +18,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -99,10 +99,49 @@ pub struct Ctx {
     pub cwd: PathBuf,
     /// 可访问目录：`--add-dir` 追加的 + 工具输出落盘目录（见 `prepare_output_dir`）
     pub add_dirs: Vec<PathBuf>,
-    /// `--permission-mode plan` → 只读
+    /// `--permission-mode plan` → 只读（**启动时定死**的用户档位）
     pub read_only: bool,
     /// 越界拦截开关（工作区已配置时为真）
     pub locked: bool,
+    /// **计划相位**（2026-09-20，原 backlog A7）：模型自己调 `EnterPlanMode` 声明
+    /// 「只出计划、不动手」，`ExitPlanMode` 被用户批准后解除。
+    ///
+    /// 为什么在这里、为什么是 `Arc<AtomicBool>`：
+    ///   · 它要和 `read_only` **在同一个地方被同一个判据读到**（见 `write_blocked`），
+    ///     否则「哪些工具算写类」这份知识会散到 `main.rs` 的五个调用点上去；
+    ///   · `Ctx` 是 `Clone` 且要能跨线程（只读工具并行批用 `&Ctx`、后台复盘 fork 拿
+    ///     克隆）⇒ 值语义的 `bool` 会各持一份、`Cell` 会破 `Sync`，只有
+    ///     `Arc<AtomicBool>` 既共享状态又满足 `Send + Sync`；
+    ///   · 派生出去的子代理 / fork 技能 / 后台复盘**自动继承**计划相位 —— 正是想要的：
+    ///     计划相位里它们同样不该写。
+    ///
+    /// 与 `read_only` 的区别（**两回事，别混**）：`read_only` 是**用户**在设置里选的边界，
+    /// 要重启 agent 才变，且只读档下写类工具**永远**被拒；计划相位是**模型自己**的临时承诺，
+    /// 进程内即时生效，`ExitPlanMode` 被批准后立刻解除。两者的**拒**共用同一个出口。
+    pub plan_phase: Arc<AtomicBool>,
+}
+
+/// 「写类操作现在能不能做」的统一判据（两档共用一个出口，差别只在措辞）。
+///
+/// 参数 `what` = 工具名（或「派子代理」这类动作名），只用于把拒绝理由说清楚。
+/// 返回值 = **拒绝原因**（`None` = 放行）。措辞必须分开，因为**用户该做的动作不同**：
+///   · 只读档 → 去设置里把安全档位改成「项目」（要重启 agent）；
+///   · 计划相位 → 先出计划、调 `ExitPlanMode` 让用户批准。
+/// 说错这一句，模型会去调一个在当前档位下永远不可能成功的动作。
+pub fn write_blocked(ctx: &Ctx, what: &str) -> Option<String> {
+    if ctx.read_only {
+        return Some(format!(
+            "{what} is disabled in read-only (plan) mode — the user must switch the security \
+             profile to \"project\" in Lunac settings to allow writes."
+        ));
+    }
+    if ctx.plan_phase.load(Ordering::Relaxed) {
+        return Some(format!(
+            "{what} is disabled while a plan is pending approval. Present the plan with \
+             ExitPlanMode and wait for the user to approve it before changing anything."
+        ));
+    }
+    None
 }
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
@@ -358,6 +397,46 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["description", "prompt"]
             }
         }),
+        json!({
+            "name": "EnterPlanMode",
+            "description": "Switch to PLAN MODE for the rest of this task: from now on every \
+                write-class tool (Write / Edit / Bash / PowerShell / Agent / MCP tools) is \
+                REFUSED, so you can only read and reason. Use it when the user asks for a \
+                plan first (\"先给我计划\", \"don't change anything yet\", \"plan this out\"), \
+                or when the task is large enough that agreeing on an approach up front is \
+                worth it. While in plan mode: read the code, then present the finished plan \
+                with ExitPlanMode — do NOT try to write anything, it will fail.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "One short sentence for the user: why planning first (shown in the UI)"
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "ExitPlanMode",
+            "description": "Present your plan and ask the user to approve it. This is the ONLY \
+                way out of plan mode: the user sees the plan in an approval card and either \
+                approves it (writes are re-enabled and you execute it task by task) or rejects \
+                it (you stay in plan mode — revise the plan and call this again). Pass the \
+                COMPLETE plan as `plan`, in markdown, following the plan format: goal / \
+                architecture, then bite-sized tasks, each with exact file paths and the exact \
+                commands to run.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "The full plan in markdown. Exact file paths and exact commands — no vague wording."
+                    }
+                },
+                "required": ["plan"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -508,9 +587,24 @@ pub fn needs_approval(name: &str) -> bool {
             // 子代理内部的每次写操作**仍会各自再走一次审批**（见 `run_subagent`），
             // 所以这不是「一次批准、后面全放行」。
             | "Agent"
+            // `ExitPlanMode` **要问**（2026-09-20 A7）：**这张卡就是它的产品** ——
+            // 用户必须在卡上读到整份计划再裁决（允许 = 解除计划相位、放行写类；
+            // 拒绝 = 留在计划相位继续改）。它**没有任何本机副作用**，走审批通道与
+            // `Skill` fork 同型：**为的是那个「允许 / 拒绝」的裁决点，不是因为有危害**。
+            | "ExitPlanMode"
     )
 }
 
+/// `EnterPlanMode` **刻意不在这里**（2026-09-20 A7）：它只把 agent 进程内的一个标志
+/// 置真、再给前端发一条状态事件 —— 既不碰本机也不改前端数据，比 `TodoWrite` 还轻
+/// （连面板都不重绘）。问它等于让用户批准「我要开始思考了」。
+/// 真正需要用户点头的是**出口**（`ExitPlanMode`），见上面的分支。
+
+/// `Skill` **刻意不在这里**（2026-09-20 A5）：它两种模式的副作用完全不同 ——
+/// inline 是纯读 `SKILL.md`（不该弹卡），fork 才派生能写文件、跑命令的子代理（该弹卡），
+/// 而判据藏在**入参**（`skill` 指向哪个技能）里，只看名字判不出来。
+/// 带输入的版本见 main.rs 的 `needs_approval_with()`。
+///
 /// 只读（plan）档下**仍需**审批的工具。
 ///
 /// 只读档对写类工具免于询问，是因为它们会被 `run()` 直接拒绝（问了白问）。
@@ -528,12 +622,15 @@ pub fn gated_in_read_only(name: &str) -> bool {
 /// 判据是「不碰本机可写状态、不依赖与别的调用的先后」：
 ///   · `Read` / `Glob` / `Grep` —— 纯读本地
 ///   · `WebSearch` / `WebFetch` —— 纯网络读取（慢的就是它们；无副作用）
-///   · `Skill` —— 只读 `SKILL.md` 正文
 ///   · `TodoWrite` —— 只回一段待办清单文本，不碰本机
 ///
 /// 以下**一律串行**，别往这里加：
 ///   · `Write` / `Edit` / `Bash` / `PowerShell` —— 有副作用，且「写文件 → 读该文件」
 ///     的相对顺序必须保持（并行批绝不允许跨越它们，见 `plan_tool_batches`）
+///   · `Skill` —— **两种模式一读一写，按最坏的那种算**（2026-09-20 A5）：
+///     inline 技能确实只读 `SKILL.md`，但 `context: fork` 的技能会派生一个**能写文件、
+///     能跑命令**的子代理去发自己的 API 请求。白名单是**只看名字**的，判不出是哪一种，
+///     所以整体串行 —— 代价只是少一次并行，判错的代价是并发发 API + 并发写文件。
 ///   · MCP 工具 —— 副作用未知，且共用一条 stdio JSON-RPC 通道
 ///   · `SessionSearch` —— **只读，但同样串行**：它也走那条 stdio 通道
 ///     （`Bridge::request` 是单线程「发一条、按 id 等一条」，并发只会互相排队甚至错配）。
@@ -541,11 +638,11 @@ pub fn gated_in_read_only(name: &str) -> bool {
 ///     与写入侧的 `Remember`
 ///     —— **判据是「要不要走桥」，不是「是不是只读」**（见 [`BRIDGE_TOOLS`]）。
 ///   · `AskUserQuestion` —— 要等人回答，并发弹问没有意义
+///   · `ExitPlanMode` —— 同 `AskUserQuestion`：它的结果**就是**用户的那一次裁决，
+///     并发弹两张计划卡只会让「批准了哪一份」变得无法回答；顺带它还会改 `plan_phase`
+///     这个全局标志（2026-09-20 A7）
 pub fn parallel_safe(name: &str) -> bool {
-    matches!(
-        name,
-        "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "Skill" | "TodoWrite"
-    )
+    matches!(name, "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "TodoWrite")
 }
 
 // ── 分发 ─────────────────────────────────────────────────────────
@@ -683,9 +780,26 @@ fn read(ctx: &Ctx, input: &Value) -> Result<String, String> {
 
 // ── Write ────────────────────────────────────────────────────────
 
+/// 写入内容的静态安全分析（2026-09-20，原 backlog A6；规则集见 `content_safety.rs`）。
+///
+/// 命中就往返回文本里附一句，**如实告知模型**。为什么工具侧也要报一次：审批卡上那
+/// 份是给**用户**看的，模型看不到 —— 不报的话它不知道用户为什么被多问了一次，
+/// 下次还会照着写同样的东西。
+fn secret_note(text: &str) -> String {
+    let report = crate::content_safety::analyze(text);
+    if report.is_clean() {
+        return String::new();
+    }
+    format!(
+        "\n[static analysis flagged possible credentials in this content: {}. \
+         If it is a real secret, prefer an environment variable or a gitignored file.]",
+        report.summary()
+    )
+}
+
 fn write(ctx: &Ctx, input: &Value) -> Result<String, String> {
-    if ctx.read_only {
-        return Err("Write is disabled in plan mode (read-only)".into());
+    if let Some(why) = write_blocked(ctx, "Write") {
+        return Err(why);
     }
     let path = resolve(ctx, &str_arg(input, "file_path")?);
     guard(ctx, &path)?;
@@ -707,8 +821,8 @@ fn write(ctx: &Ctx, input: &Value) -> Result<String, String> {
 // ── Edit ─────────────────────────────────────────────────────────
 
 fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
-    if ctx.read_only {
-        return Err("Edit is disabled in plan mode (read-only)".into());
+    if let Some(why) = write_blocked(ctx, "Edit") {
+        return Err(why);
     }
     let path = resolve(ctx, &str_arg(input, "file_path")?);
     guard(ctx, &path)?;
@@ -742,8 +856,10 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     };
     fs::write(&path, updated.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(format!(
-        "Edited {}: replaced {count} occurrence(s)",
-        path.display()
+        "Edited {}: replaced {count} occurrence(s){}",
+        path.display(),
+        // 只扫**写进去的** `new` —— `old` 是被删掉的内容，扫它没有意义
+        secret_note(&new)
     ))
 }
 
@@ -753,8 +869,8 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
 // 结果拼成「exit code + stdout + stderr」再走同一个上限截断，故共用 run_shell。
 
 fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
-    if ctx.read_only {
-        return Err("Bash is disabled in plan mode (read-only)".into());
+    if let Some(why) = write_blocked(ctx, "Bash") {
+        return Err(why);
     }
     let command = str_arg(input, "command")?;
     let timeout = timeout_arg(input);
@@ -772,8 +888,8 @@ fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
 }
 
 fn powershell(ctx: &Ctx, input: &Value) -> Result<String, String> {
-    if ctx.read_only {
-        return Err("PowerShell is disabled in plan mode (read-only)".into());
+    if let Some(why) = write_blocked(ctx, "PowerShell") {
+        return Err(why);
     }
     let command = str_arg(input, "command")?;
     let timeout = timeout_arg(input);
@@ -2075,6 +2191,17 @@ fn safe_name(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 只验证档位判据的最小上下文：不碰磁盘，两个标志都由测试自己摆。
+    fn test_ctx() -> Ctx {
+        Ctx {
+            cwd: PathBuf::from("."),
+            add_dirs: Vec::new(),
+            read_only: false,
+            locked: false,
+            plan_phase: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// `Agent`（A1 子代理）必须注册进内置工具表，且能被 `--disallowedTools` 正常裁掉。
     /// 这条顺带钉住「内置工具总数」—— 数量真的变了就该有人来这里改数字，而不是悄悄漂移。
     #[test]
@@ -2085,7 +2212,7 @@ mod tests {
             names(&all).contains(&"Agent".to_string()),
             "Agent 必须在内置工具表里"
         );
-        assert_eq!(total, 13, "内置工具应为 13 件（12 件原有 + Agent）");
+        assert_eq!(total, 15, "内置工具应为 15 件（12 件原有 + Agent + 计划相位两件）");
 
         let cut = defs(&["Agent".to_string()]);
         assert!(
@@ -2093,6 +2220,76 @@ mod tests {
             "disallowed 必须能裁掉 Agent"
         );
         assert_eq!(cut.len(), total - 1);
+    }
+
+    /// 计划相位两件（A7）的口径：
+    ///   · 都在 `defs()` 里（**无条件注册** —— 计划相位是运行期才翻转的，工具表却是
+    ///     请求体里的固定前缀，事后没法增删，所以只能靠执行侧硬拒）；
+    ///   · `EnterPlanMode` **免审批**（比 TodoWrite 还轻）、`ExitPlanMode` **要审批**
+    ///     （那张卡就是它的产品）；
+    ///   · 都不并行（前者改全局标志，后者等人回答）；
+    ///   · 都能被 `--disallowedTools` 裁掉（不想让模型自作主张进计划模式的用户可以关）。
+    #[test]
+    fn plan_mode_tools_are_registered_and_gated() {
+        let all = defs(&[]);
+        for n in ["EnterPlanMode", "ExitPlanMode"] {
+            assert!(
+                names(&all).contains(&n.to_string()),
+                "{n} 必须无条件注册：现在不放行只说明「此刻不在计划相位」，而不是这件工具不存在"
+            );
+            assert!(!parallel_safe(n), "{n} 必须串行");
+            let cut = defs(&[n.to_string()]);
+            assert_eq!(cut.len(), all.len() - 1, "disallowed 必须能裁掉 {n}");
+        }
+        assert!(
+            !needs_approval("EnterPlanMode"),
+            "进入计划模式只改一个进程内标志，不值得弹卡"
+        );
+        assert!(
+            needs_approval("ExitPlanMode"),
+            "批准计划必须过审批卡 —— 卡上那份计划是用户唯一的决策依据"
+        );
+        // 只读档不是「仍需审批」那一类：只读档下计划相位**退出也没意义**
+        //（写类工具被用户档位永久拒绝），所以 `ExitPlanMode` 在只读档是被**拒**的，
+        // 与这三件「照常放行、只补审批」的工具不同。
+        assert!(!gated_in_read_only("ExitPlanMode"), "只读档不放行退出计划模式");
+        assert!(!gated_in_read_only("EnterPlanMode"), "它本来就不问，不属这张表");
+    }
+
+    /// `write_blocked()` 是「写类能不能做」的唯一出口（2026-09-20 A7）：
+    /// 两档的**拒因措辞必须分开**（用户该做的动作不同），放行时返回 `None`。
+    #[test]
+    fn write_blocked_names_the_action_the_user_must_take() {
+        let mut ctx = test_ctx();
+        assert_eq!(write_blocked(&ctx, "Write"), None, "默认档位下写类放行");
+
+        ctx.plan_phase.store(true, Ordering::Relaxed);
+        let why = write_blocked(&ctx, "Write").expect("计划相位必须拦住写类");
+        assert!(
+            why.contains("ExitPlanMode") && why.contains("approve"),
+            "计划相位的拒因要指向「出计划、等批准」，实际是：{why}"
+        );
+        assert!(
+            !why.contains("settings"),
+            "别把计划相位说成「去改设置」——用户改设置也解不开它"
+        );
+
+        ctx.plan_phase.store(false, Ordering::Relaxed);
+        ctx.read_only = true;
+        let why = write_blocked(&ctx, "Bash").expect("只读档必须拦住写类");
+        assert!(
+            why.contains("settings") && why.contains("project"),
+            "只读档的拒因要指向「去设置里改档位」，实际是：{why}"
+        );
+        assert!(
+            !why.contains("ExitPlanMode"),
+            "只读档下批准计划也解不开写类的封锁，不能把模型引到那儿去"
+        );
+
+        // 两档同时成立时，报**用户档位**那条 —— 它是更硬的那道闸（计划相位解开了也没用）
+        ctx.plan_phase.store(true, Ordering::Relaxed);
+        let why = write_blocked(&ctx, "Edit").expect("两档叠加仍是拒");
+        assert!(why.contains("settings"), "两档叠加时应报只读档，实际是：{why}");
     }
 
     /// `Agent` 的审批 / 并行 / 只读三条口径（A1 约束③）：
@@ -2196,10 +2393,10 @@ mod tests {
         assert_eq!(safe_name("a/b:c*d"), "a_b_c_d");
     }
 
-    /// 并行白名单：只读的可以并行；写类 / 命令 / MCP / 交互一律串行
+    /// 并行白名单：只读的可以并行；写类 / 命令 / MCP / 交互 / 技能一律串行
     #[test]
     fn only_read_only_tools_may_run_in_parallel() {
-        for n in ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"] {
+        for n in ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"] {
             assert!(parallel_safe(n), "{n} 应可并行");
         }
         for n in [
@@ -2208,6 +2405,8 @@ mod tests {
             "Bash",
             "PowerShell",
             "AskUserQuestion",
+            // 技能按最坏模式算：fork 会派生能写文件、发 API 的子代理（A5）
+            "Skill",
             "mcp__fetch", // MCP 工具名带前缀，副作用未知且共用一条通道
             "Unknown",
         ] {
