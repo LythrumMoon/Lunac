@@ -3878,14 +3878,6 @@ function agentToolResult(isError: boolean, content: unknown, toolUseId?: string)
 // the agent would hang forever on any gated tool (e.g. Bash commands).
 const pendingPermissionCards = new Map<string, HTMLElement>();
 
-// Built-in safe command prefixes — auto-approved (read-only, no side effects)
-const BUILTIN_SAFE_PREFIXES = [
-  "ls", "dir", "cat", "type", "echo", "pwd", "head", "tail", "wc",
-  "git status", "git log", "git diff", "git branch", "git show",
-  "which", "where", "whoami", "date", "rg", "grep", "find",
-  "node -v", "npm -v", "python --version", "Get-ChildItem", "Get-Content",
-];
-
 /** 不可白名单化的命令前缀（解释器 / 启动器 / 动态执行）。
  *
  *  白名单是**前缀匹配**（`cmd === p || cmd.startsWith(p + " ")`），一旦把
@@ -3961,11 +3953,14 @@ interface RequestClass {
  *  · `opaque`    非空 → 含无法静态判定的成分（变量 / 编码执行 / 间接执行器），
  *                      **不得自动放行**（fail-closed）
  *  · `secrets`   非空 → 写入内容（`Write` 的 content / `Edit` 的 new_string）里扫出
- *                      疑似凭据，同样「必须人看」：不自动放行、也不给「始终允许」 */
+ *                      疑似凭据，同样「必须人看」：不自动放行、也不给「始终允许」
+ *  · `readonly`  = **可证只读**（A10）：**白名单档**据此自动放行。缺字段或 false
+ *                      都按「不放行」处理 —— false 不表示危险，只表示「证不出来」 */
 interface AgentAnalysis {
   dangerous?: string[];
   opaque?: string[];
   secrets?: Array<{ rule?: string; line?: number }>;
+  readonly?: boolean;
 }
 
 /** Classify a permission request: auto-allow (safe/whitelisted), danger
@@ -4023,7 +4018,7 @@ function classifyRequest(
     }
     const mode = getRunMode();
     if (mode === "auto") return { auto: true, danger: null, opaque: null, bashCmd };
-    // 手动档：连内置安全前缀也照问不误
+    // 手动档：连只读命令也照问不误
     if (mode === "manual") return { auto: false, danger: null, opaque: null, bashCmd };
     const cmd = bashCmd.trim();
     const wl = getUserWhitelist();
@@ -4031,7 +4026,14 @@ function classifyRequest(
     // 解释器前缀即便在用户白名单里也不放行 —— 否则「允许过一次
     // `powershell -Command A`」会变成「以后任何 `powershell …` 都自动放行」。
     const userHit = canWhitelistCmd(cmd) && wl.bash.some(hit);
-    if (BUILTIN_SAFE_PREFIXES.some(hit) || userHit) {
+    // ④ A10：白名单档的自动放行改由 **agent 侧的「可证只读」结论**决定，
+    //    取代原先那张 `BUILTIN_SAFE_PREFIXES` 前缀表。前缀匹配**看不见重定向与管道**，
+    //    `echo hi > important.txt`、`cat a.txt > b.txt` 会被它当「安全前缀」放行 ——
+    //    等于零询问地写文件。判据在 core-agent/src/bash_safety.rs（`readonly`）：
+    //    单条命令 + 无输出重定向 + 无包装器/命令替换 + 命令词在只读白名单里。
+    //    **缺 `analysis` 时按不放行处理**（只认显式的 `true`）—— 与危险/凭据那两档
+    //    一样，宁可多问一次。
+    if (userHit || analysis?.readonly === true) {
       return { auto: true, danger: null, opaque: null, bashCmd };
     }
     return { auto: false, danger: null, opaque: null, bashCmd };

@@ -2975,11 +2975,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Ask before every write (including allowlisted)",
   },
   "agent.run_mode_allowlist_hint": {
-    "zh-CN": "白名单前缀自动放行，其余先询问",
-    "zh-TW": "白名單前綴自動放行，其餘先詢問",
-    "ja": "許可リストの接頭辞は自動実行、他は確認",
-    "ko": "허용 목록 접두사는 자동 실행, 나머지는 확인",
-    "en": "Allowlisted prefixes auto-run; ask for the rest",
+    "zh-CN": "只读命令自动放行，其余先询问",
+    "zh-TW": "唯讀命令自動放行，其餘先詢問",
+    "ja": "読み取り専用コマンドは自動実行、他は確認",
+    "ko": "읽기 전용 명령은 자동 실행, 나머지는 확인",
+    "en": "Read-only commands auto-run; ask for the rest",
   },
   "agent.run_mode_auto_hint": {
     "zh-CN": "所有命令都不再询问（危险命令仍拦截）",
