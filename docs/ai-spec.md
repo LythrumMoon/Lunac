@@ -257,7 +257,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 |---|---|
 | env | `LUNAC_AGENT_BASE_URL`（已是完整端点，请求拼 `/v1/messages`）、`LUNAC_AGENT_TOKEN`（**必须走 `authorization: Bearer`**；用 `x-api-key` 会被兼容端点判 401）、`LUNAC_AGENT_MODEL`；另有 `LUNAC_THINKING`（思考开关：`off` = 关，其余 = 开；见 §3.5「思考开关跨模型自适应」）、`LUNAC_MAX_CONTEXT_TOKENS`（上下文预算，默认 128000、低于 8000 的取值视为无效）、`LUNAC_SUMMARY_COMPACT`（摘要式压缩开关：`0`/`false`/`off`/`no` = 关，其余含未设置 = **开**；见 §11 规则 39）、`LUNAC_HISTORY_INDEX`（往期会话索引注入开关：同上写法，默认**开**；见 §11 规则 53）、`LUNAC_MEMORY`（长期记忆读取/注入开关：同上写法，默认**开**；见 §11 规则 56）、`LUNAC_NUDGE_INTERVAL`（后台复盘的**轮次门槛**：每 N 次用户提问跑一次，默认 10，`0` = 关；非数字回落默认；见 §11 规则 56）、`LUNAC_SKILLS_DIR`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_SEARCH_PROVIDER` + `LUNAC_SEARCH_KEY`（WebSearch 主源的服务商与密钥，服务商可选 bocha / tavily / exa / firecrawl；缺任一项则只用无 key 的 Bing / 百度兜底源）、`LUNAC_LOG_DIR`（宿主注入的日志目录 = `<exe 根>\temp\logs`）、`LUNAC_LOG`（`off` = 关闭落盘日志）、`LUNAC_LOG_LEVEL`（`error\|warn\|info\|debug`，默认 `info`；见 §11 规则 20） |
 | 启动参数 | `--add-dir <dir>`（可重复，工作区外追加可访问目录）/ `--permission-mode plan`（只读）/ `--dangerously-skip-permissions`（忽略工作区锁）/ `--permission-prompt-tool stdio`（写类工具先审批）/ `--disallowedTools <name…>`（这些工具不进请求体）/ `--mcp-server stdio:<exe 路径>`（拉起该 exe 的 MCP server 并接入其工具，P3）；其余（`--print` / `--verbose` / `--input-format stream-json` / `--include-partial-messages` …）一律接受并忽略 |
-| stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`；`{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"\|"deny",…}}}` 为审批回包（P2，由 stdin 线程按 request_id 直接投递给等待中的工具调用）；`{"type":"set_history","messages":[{"role":"user"\|"assistant","content":"纯文本"}]}` 为**会话历史整体替换**（2026-09-17，回退 / 恢复历史时回灌上文的唯一通道，见 §11 规则 30）。`set_history` **不触发模型调用**（不是提问），只替换 agent 内的 `history` 并回一个 `system/history_set`（含 `messages` 条数）|
+| stdin | 每行一条 JSON：`{"type":"user","session_id":"","message":{"role":"user","content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}`（A8：`content` 里可再加图片块 `{"type":"image","source":{"type":"file","path":"…"}}`，见本节「图片附件」）；`{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"\|"deny",…}}}` 为审批回包（P2，由 stdin 线程按 request_id 直接投递给等待中的工具调用）；`{"type":"set_history","messages":[{"role":"user"\|"assistant","content":"纯文本"}]}` 为**会话历史整体替换**（2026-09-17，回退 / 恢复历史时回灌上文的唯一通道，见 §11 规则 30）。`set_history` **不触发模型调用**（不是提问），只替换 agent 内的 `history` 并回一个 `system/history_set`（含 `messages` 条数）|
 | stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`，瞬时失败退避重试时补发，前端解析分支早已就绪）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
 
 **P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮按 `history.truncate(base)` 整体回滚，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
@@ -590,6 +590,21 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 不做 `VerifyPlanExecution` | 验证环节交给已有的 `TodoWrite`（见 §12 的分期结论）：为「逐条核对计划是否执行」再造一件工具，等于把 `TodoWrite` 的职责抄第二遍 |
 | 子代理看不到这两件 | `subagent_tool_defs()` 把 `EnterPlanMode` / `ExitPlanMode` 一并剔掉：计划相位是**主循环**的状态，而子代理**问不了用户**（它的提示词就是这么写的）⇒ 在里面 `ExitPlanMode` 只会弹一张无人能负责的卡 |
 | 实测（2026-09-20，release + deepseek-flash） | 脚本扮演 lunac.exe 直驱 stdio（`--permission-prompt-tool stdio`），11 条断言全过：`EnterPlanMode` 广播 `plan_mode state=on`（带模型自述的理由）→ `Read` 通过 → `ExitPlanMode` 走审批通道（计划正文 1197 字符）→ **拒绝** → 拒因原话进入 `tool_result` → 第 2 问要求直接动手时 `Write` 被硬拒（`Write is disabled while a plan is pending approval. Present the plan with ExitPlanMode …`）→ 再交计划并**批准** → 广播 `state=off` → 同一个 `Write` 落盘且内容正确 |
+
+**图片附件（A8，2026-09-20）**：让模型**真的看到图**。此前附件（粘贴 / 拖拽 / 文件对话框）一律退化成 `[Attached files]` 文本里的**路径**，图片也只能靠模型自己去 `Read` —— 而那是二进制，读不出画面。要点：
+
+| 项 | 约定 |
+|---|---|
+| 契约（**只传路径、不传字节**） | stdin 的 user 消息 `content` 里可再加 `{"type":"image","source":{"type":"file","path":"C:\\…\\a.png"}}`；`media_type` **不用给**（由接收方按魔术字节判定）。字节由 core-agent 按路径读出来，转成端点要的 `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`。为什么不让前端传 base64：三种来源本来就已落成路径（剪贴板图片也是先落盘再变成 chip），几 MB 的 base64 既不必过 IPC 管道，也不必在 WebView 里再存一份 |
+| 文本块**照旧** | `[Attached files]` 文本仍然带上（§9 的字段登记要求「保持文本不变，旧消费者仍可读」——历史 / 标题 / 复制都只认它）。图片块是**追加**而不是替换：文本还承载「哪个路径对应哪张图」的对应关系 |
+| 开关在**前端**、默认关 | 设置面板「模型支持图片输入」⇒ `config\ai.json` 的 `vision`（走 `set_ai_config` / `get_ai_config`）。**为什么默认关**：发给不支持视觉的端点（DeepSeek 官方端点）会直接 400，agent 侧无从预判 ⇒ 只能由用户显式断言。它只决定「发不发块」，**不需要重启 agent**（不改任何启动参数） |
+| 类型只认魔术字节 | 只放行 PNG / JPEG / GIF / WebP（端点支持的就这四种），**不信扩展名**（改过名的文件、剪贴板落盘的 `.png` 都可能是别的东西）。BMP / TIFF / ICO 等仍走老路（路径文本交给模型） |
+| 上限 | 单图原始字节 ≤ **3.5 MB**（端点的 5 MB 通常按 base64 后算，而 base64 膨胀约 4/3 ⇒ 原始字节卡在 3.5 MB 才不越线）；一条消息 ≤ **10 张** |
+| 失败**如实上报** | agent 发 `system/attachment_note`（`skipped:[{path,reason}]`，**只在真有失败项时才发**），前端渲染成一条黄色 `.sys-note-warn`（i18n `agent.attachment_skipped`），正文逐条列「路径 — 原因」。没有它，用户只会看到「模型说它看不到图」而毫无线索 |
+| **不检查工作区锁**（刻意的） | 附件路径来自**用户显式选中**，不是模型自己找出来的 ⇒ 读它不走工作区锁；模型的 `Read` 照旧受锁约束。理由：剪贴板图片本来就落在 `%TEMP%`（在工作区之外），套锁会让**最主要的那条用法**直接失效 |
+| 历史与压缩 | 图片块**留在 `history` 里**（Anthropic 官方做法）：后续每次提问都会重发这些字节，这是视觉能力的固有代价，压缩会随消息自然衰减（瘦身档只动 `tool_result`，丢弃档整条消息一起丢）。**`set_history` 只认文本** ⇒ 回退 / 恢复会话后图片块不在（附件路径仍在文本里，模型可自行读该文件）—— 已知且刻意 |
+| 只做图片，不做 PDF | 原生 `document` 块只有 Claude 系端点支持；本地提文本要引 PDF 解析库、且对扫描件无效 ⇒ PDF 仍走「把路径交给模型」 |
+| 实测（2026-09-20） | `cargo test` core-agent **80 passed / 0 failed / 2 ignored**（新增 `image_blocks_are_resolved_by_path_and_limited`）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` 通过；**假端点实测**（本地 TcpListener 直接抓 `/v1/messages` 请求体，13 条断言全过）：真 PNG ⇒ 请求体里有 `"type":"image"` + `"media_type":"image/png"` + **与文件逐字节一致的 base64**；读不出来的那张 ⇒ 请求体里**没有**它、stdout 有且仅有一条 `attachment_note`（含路径与原因）；第 2 轮请求体里**仍带着第 1 轮那张图**（历史保留的证据），且**任何 `"type":"file"` 都不会真的发到端点** |
 
 **与旧 cli.exe 的完整差距清单、价值评级与实施顺序见 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md)。**
 
@@ -1013,7 +1028,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
 
 | 原位置 | 处理 |
 |---|---|
-| 本节「待办路线」20 条 | 已全部完成或已挪走 ⇒ **条目删除**。未完成的（插件市场、AI 人格、多模态、成本面板、调试状态栏…）在 backlog §1 / §2 / §3 |
+| 本节「待办路线」20 条 | 已全部完成或已挪走 ⇒ **条目删除**。未完成的（插件市场、AI 人格、成本面板、调试状态栏…）在 backlog §1 / §2 / §3 |
 | §13「参考设计」（**未落地**） | 两个设计思路都**不排期**，压缩为一行指针 + 与现状的区分说明 |
 | §19.6「待实现清单」 | 已按实测拆解：Humanizer 按钮与安全警告块**其实早已落地**（本文此前漏标，已纠正）；调试阶段状态栏挪进 backlog L4 |
 | §20「路径 2 插件市场」 | 挪进 backlog L1（含三条硬约束：CSP / 资产授权 / 常驻开销） |
@@ -1550,6 +1565,13 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **只读档下 `ExitPlanMode` 也要拒**：写类被用户档位永久拒绝时，批准计划也执行不了 —— 必须让模型改用正文交代计划、并说明「要执行得去设置里改档位」。说成「批准后就能写」是把模型引到一个必然失败的动作上。
     - **前端状态只镜像、不推断**：`system/plan_mode`（`state: on/off` + 可选 `reason`）是 agent 里那个标志的广播；前端**不许**拿「模型调过哪些工具」自己推 —— 那要在「调了工具」与「用户批准了没有」之间做二次判断，极易与真值脱节。**agent 进程重启要把横幅清掉**（`plan_phase` 是进程内状态，随进程消失）。
     - **计划落盘只在批准那一刻、且不挡执行**：`ModuleData\plans\<本地时间戳>.md`。时间戳由前端给（本地时区）+ Rust 侧严格校验（同 `append_usage_log`）；落盘失败只提示，**绝不**反过来拦住已经批准的执行。拒绝时给模型的回话必须**明说「你仍在计划模式」**（i18n `agent.plan_deny_msg`），否则它会接着调写类工具、白烧一轮往返。
+
+60. **图片附件（A8，2026-09-20）**：契约与实测见 §3.5「图片附件」。**五条不得回退**：
+    - **只传路径、不传字节**：stdin 里给的是 `{"type":"file","path":…}`，base64 由 core-agent 读出来再转 —— 前端三种附件来源本来就已经是路径，别为了「省一次读盘」把几 MB 的 base64 塞进 IPC 管道与 WebView 内存。
+    - **`[Attached files]` 文本必须保留**：新增的图片块是**追加**，不许替换那段文本（它是历史 / 标题 / 复制三条旧路径的唯一依据，也是「哪个路径对应哪张图」的唯一说明）。任何「有图片块了就把路径文本去掉」的改动都是回退。
+    - **开关默认关，且只在前端**：`config\ai.json` 的 `vision`（默认 `false`）。发给不支持视觉的端点必 400，而 agent 侧**无法预判**模型能力 ⇒ 只能由用户显式断言。**不许**改成「按模型名自动推断」或「先发再 400 回落」——前者会猜错，后者每轮白烧一次请求并打断前缀缓存。
+    - **类型只认魔术字节、失败必须可见**：放行 PNG / JPEG / GIF / WebP 四种（不信扩展名）；读不出来 / 超限 / 超张数的一律进 `system/attachment_note`（`skipped:[{path,reason}]`）并在前端可见地列出来。**静默丢弃是最坏的一种**——用户只会看到「模型说它看不到图」。
+    - **附件读盘不走工作区锁，这一点不许「顺手补上」**：路径来自用户显式选中（不是模型自己找到的），而剪贴板图片就落在 `%TEMP%` —— 套锁会让最主要的那条用法直接失效。模型的 `Read` 仍然照旧受锁约束，两者不要混为一谈。
 
 ## 12. Agent Plan 模式规范
 

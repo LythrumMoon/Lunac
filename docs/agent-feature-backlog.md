@@ -18,7 +18,7 @@
 > | §0 差距总览 / §4 不是缺口 | §1.1 组 A（工具）**A8 / A14** / **§5 边界声明**（A3 / A5 已落地）；其余见 §4 设想区 |
 > | §1.2 组 B / §1.3 组 C | **A13 按需重估**（+ §4 设想区） |
 > | §2.1 组 A（子系统） | **已全部落地** —— A6 写文件内容级安全扫描于 2026-09-20 完成（A4 长期记忆与后台复盘、会话持久化与检索更早已完成，见 `ai-spec.md` §3.5） |
-> | §2.2 组 B | **A8 / A9 / A10 / A11**（A3 / A5 已落地） |
+> | §2.2 组 B | **A9 / A10 / A11**（A3 / A5 / A8 已落地） |
 > | §2.3 组 C | **A13** + §4 设想区 |
 > | §3 协议 / 接口层 | **A11**（其中的 A1 子代理框架已于 2026-09-20 落地） |
 > | §5 空转 UI / 失实文案 | **已全部修复**，条目已删 |
@@ -36,7 +36,6 @@
 
 | 级别 | 条目 | 为什么在这个位置 |
 |---|---|---|
-| **P2** | A8 多模态输入（真内容块） | 依赖协议扩字段，收益随用户场景 |
 | **P2** | A9 权限 hooks | 用户脚本介入的工具链，属生态能力 |
 | **P2** | A10 自动权限分类器 | 减少询问频率，可与 A9 一起评估 |
 | **P2** | L1 插件市场（含 Live2D 桌宠） | **用户已定方向**，卡在三条硬约束（CSP / 资产 / 常驻开销） |
@@ -55,12 +54,6 @@
 ## 1. Agent 能力缺口
 
 ### P2
-
-**A8. 多模态输入（真正的图片 / PDF 内容块）**
-
-- 现状：图片走 `save_temp_image()` 落成**临时文件**，再把**路径**拼进 `[Attached files]` 文本让 agent 自己读；全仓无 `{"type":"image"}` / `image_url` / `{"type":"document"}` 的 content block，PDF 处理也没有。
-- 措辞要点：**附件本身可用**（路径 → agent 读取这条路是通的），缺的是「把图片/PDF 作为内容块直发模型」。
-- 依赖：协议扩字段 —— 走 `agent-ui-spec.md` §9 的字段登记流程（登记字段名与语义 + 保持文本不变 + 前端兼容缺字段）。
 
 **A9. 权限 hooks（19 类事件）**
 
@@ -238,3 +231,5 @@
 *2026-09-20 追加（同日第六批）：**A5 全部完成 + A6 已完成，两条均已从本文删除**。① **A5 前半（fork 模式）**：frontmatter `context: fork` 的技能改由**子代理执行**、主对话只收报告，工具面由 `allowed-tools` 收窄；`Skill` 因「副作用随入参而变」**移出 `parallel_safe` 白名单**（只看名字的判据按最坏模式算），带输入的判据另写 `needs_approval_with()`；fork 复用子代理引擎（`Agent` / A4 复盘 / fork 技能 = 三个调用方共用一个 `run_subagent()` + `ForkSpec`）。② **A5 后半（技能自带脚本 / 资源）**：技能目录里除 `SKILL.md` 之外的文件在扫描时登记（深度 ≤ 3 / ≤ 40 条 / 跳过隐藏项与 `node_modules`·`target` / **不跟随符号链接** ⇒ 「报出去的路径一定落在技能目录内」不需要逐条 `canonicalize()`），**调用 `Skill` 时**附在返回里（inline 附正文之后、fork 附进子代理任务说明），**刻意不进系统提示词**（否则前缀缓存跟着文件系统抖动）；路径给**相对形式**并写明相对谁；超限**如实上报**「还有没列出的」。**remote 已定论不移植**。③ **A6（写入内容的凭据扫描）**：`core-agent/src/content_safety.rs` —— 12 条规则分三类（私钥块 / 七家固定前缀 API key / JWT·`Bearer`·连接串口令·两条三道闸的通用赋值），`RegexSet` 先跑一遍（零命中即返回）、`Write` 取 `content`·`Edit` 取 `new_string`（**不扫 `old_string`**）、512 KB 上限如实上报；**只做凭据一类**（代码注入 / XSS 那类正则在正常代码里必然满屏误报 ⇒ 用户学会无视告警，比没有更糟）；只上报 `analysis.secrets`**不代替决策**，前端走**独立通道**（不自动放行含「自动」档、不给「始终允许」、命中项可见地列在卡片正文而不是只塞 tooltip）；规则集刻意与 `bash_safety.rs`（扫**命令**、**执行前**）分开。**实测**：`cargo test` core-agent **75 passed / 0 failed**（含新增 `content_safety` 10 条、`skills` 资源类 5 条）；deepseek-flash 真机跑 `Skill`（inline）确认自带资源清单进得了 `tool_result` 且模型能原样复述（`assets/tpl.md` / `scripts/run.py`）。契约在 `ai-spec.md` §3.5「命令静态安全分析 / 写入内容的凭据扫描」「P4 已完成」、§13.1，纪律在 §11 规则 57 / 58，预检在 `code-rules.md` #20。同期还落了外观项「恢复默认主题」的边界修订（`tintBase`：只有三组配色的**颜色**失效，三个透明度与**文字明度**照常生效 —— 见 `ai-spec.md` §11 规则 45 与 `code-rules.md` 预检 #17）。当前未落地 **10 项**（A7–A16）。*
 
 *2026-09-20 追加（同日第七批）：**A7（计划模式闭环）已完成并从本文删除**。形态刻意**不复用「只读档位」**，而是拆成两个互不替代的概念：**用户的只读档**（`--permission-mode plan`，设置里选、启动时定死、改它要重启 agent）与**模型的计划相位**（`plan_phase`，进程内即时生效、批准后立刻解除）。① **两件内置工具**：`EnterPlanMode`（只把相位标志置真 + 广播 `system/plan_mode state=on` 带模型自述理由，**免审批** —— 问它等于让用户批准「我要开始思考了」）、`ExitPlanMode`（**必须走审批** —— 这张卡就是它的产品，用户要在卡上读到整份计划再裁决），工具总数 13 → **15**；守门单测同步。② **判据收口到 `tools::write_blocked(ctx, what)` 一处**，两档的**拒因措辞分开**（用户该做的动作不同：只读档指向「去设置改档位」、计划相位指向「去批准计划」），把「哪些工具算写类」这份知识也收口到 `tools.rs`。③ 相位用 `Arc<AtomicBool>` 而非 `bool` / `Cell`：`Ctx` 是 `Clone` 且跨线程（并行只读批拿 `&Ctx`、后台复盘 fork 拿克隆）⇒ 值语义会各持一份、`Cell` 破 `Sync`；`Arc` 让**派生子代理 / fork 技能 / 后台复盘自动继承**相位。④ **四个早退分支全部补判**：`Skill` / `SessionSearch` / `needs_bridge` / MCP 工具都早于 `tools::run()` 返回、会绕过那里的拦截 ⇒ `Remember` / `Agent` / fork 技能 / MCP 四处各补一次 `write_blocked`（否则只读档与计划相位能从这条缝里写本机）。⑤ **只读档下不许** `ExitPlanMode`（否则模型能靠它把用户选的档位绕开），报错指向设置；相位**不被清**。⑥ **前端零协议新增字段**：计划正文本来就在 `request.input.plan` 里，`renderPlanCard()` 直读 ⇒ `open_approval()` **零改动**、计划卡 = 同一条审批通道的第三种行；`classifyRequest()` 对 `ExitPlanMode` 免疫（白名单也不放行）、不给「始终允许」；批准时 `save_plan_md` 落 `<exe 根>\ModuleData\plans\<本地时间戳>.md`（Rust 侧没有 chrono ⇒ 时间戳由**前端**给 + 后端只做严格形状校验 `YYYY-MM-DD_HHMMSS`，同 `append_usage_log` 先例）；`EnterPlanMode` 另挂顶部横幅，agent 重启时清掉。⑦ **刻意不做** `VerifyPlanExecution`（验证这一环交给 `TodoWrite`）；子代理看不到这两件工具，后台复盘门槛加 `&& !plan_phase`。**实测**：`cargo test` core-agent **79 passed / 0 failed / 2 ignored**、src-tauri **58 passed / 0 failed / 1 ignored**，`tsc --noEmit` exit 0，`cargo build --release` 通过；release 真机 E2E **11 条断言全过**（`EnterPlanMode` 广播 → `Read` 通过 → `ExitPlanMode` 走审批、计划正文 1197 字符 → **拒绝**后拒因原话进 `tool_result` → 下一问要求直接动手时 `Write` 被硬拒 → 再交计划并**批准** → 广播 `state=off` → 同一个 `Write` 落盘且内容正确）。契约在 `ai-spec.md` §3.5「计划模式闭环（A7）」、纪律在 §11 规则 59，UI 在 `agent-ui-spec.md` §3.6 / §4.4 / §9，预检在 `code-rules.md` #12（扩写：早退分支必须自己补 `write_blocked`）与 #21（新增：写类判据只改一处、两档措辞分开）。当前未落地 **9 项**（A8–A16）。*
+
+*2026-09-20 追加（同日第八批）：**A8（多模态输入·图片一半）已完成并从本文删除**。① **形态**：stdin 的 user 消息 `content` 里可再加 `{"type":"image","source":{"type":"file","path":"…"}}` —— **只传路径、不传字节**（前端三种附件来源本来就已落成路径；几 MB 的 base64 不必过 IPC 管道、也不必在 WebView 里再存一份），字节由 core-agent 读出来转成端点要的 `{"type":"base64","media_type":…,"data":…}` 块；`[Attached files]` **文本照旧保留**（历史 / 标题 / 复制三条旧路径只认它，且它承载「哪个路径对应哪张图」）。② **开关在前端、默认关**：设置面板「模型支持图片输入」→ `config\ai.json` 的 `vision`（`set_ai_config` / `get_ai_config`），**不改启动参数、不重启 agent**。理由是发给不支持视觉的端点（DeepSeek 官方端点）必 400，而 agent 侧**无法预判模型能力** ⇒ 只能由用户显式断言；刻意**不**做「按模型名推断」与「先发再 400 回落」。③ **接收方按内容判定**：类型只认**魔术字节**（PNG / JPEG / GIF / WebP 四种，不信扩展名），单图原始字节 ≤ 3.5 MB（端点 5 MB 按 base64 算 ⇒ 3.5 MB 才不越线）、每条 ≤ 10 张。④ **失败可见**：读不出来 / 超限 / 超张数的一律走 `system/attachment_note`（`skipped:[{path,reason}]`，只在真有失败项时才发），前端渲染成一条黄色 `.sys-note-warn` 明细行 —— 静默丢弃会让用户只看到「模型说它看不到图」。⑤ **附件读盘刻意不走工作区锁**：路径来自用户显式选中（不是模型找出来的），而剪贴板图片就落在 `%TEMP%`（在工作区之外）—— 套锁会让最主要的那条用法直接失效；模型的 `Read` 照旧受锁约束。⑥ **顺手修掉一个真 bug**：剪贴板图片落盘用的是 `lunac_ocr_<pid>.<ext>` / `lunac_clip_<pid>.<...>` **固定名**，同一进程第二次粘贴会覆盖第一张（而旧 chip 还指着同一路径）⇒ 改为 `temp_image_path()` 生成唯一名（四处现场全改）。**实测**：`cargo test` core-agent **80 passed / 0 failed / 2 ignored**（新增 `image_blocks_are_resolved_by_path_and_limited`）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` exit 0；**假端点实测**（本地 TcpListener 直抓 `/v1/messages` 请求体，13 条断言全过）：真 PNG ⇒ 请求体含 `"type":"image"` + `"media_type":"image/png"` + 与文件**逐字节一致**的 base64；读不出来的那张 ⇒ 请求体里没有它、stdout 有且仅有一条 `attachment_note`；第 2 轮请求体里仍带第 1 轮那张图（历史保留），且**任何 `"type":"file"` 都没真的发到端点**。契约在 `ai-spec.md` §3.5「图片附件」、纪律在 §11 规则 60，前端字段登记在 `agent-ui-spec.md` §9，预检在 `code-rules.md` #22。**PDF 刻意不做**（原生 `document` 块只有 Claude 系支持、本地提文本要引解析库且对扫描件无效）⇒ 仍走路径文本。当前未落地 **8 项**（A9–A16）。*

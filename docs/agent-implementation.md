@@ -2,7 +2,7 @@
 
 > **定位**：本文描述 Lunac 自研 agent（`agent.exe`）的**实现现状**与**用户可直接使用的本地扩展格式**。它回答两个问题：① 现在实现了什么；② 用户怎么用本地文件扩展它（`skills\` / `tools\`）。
 >
-> **待办不在这里**：本文只写「已经是什么样」。凡未完成的能力（技能包资源、多模态、权限 hooks…）一律登记在 **[agent-feature-backlog.md](./agent-feature-backlog.md)**，本文不再重复维护缺口清单。
+> **待办不在这里**：本文只写「已经是什么样」。凡未完成的能力（权限 hooks、自动权限分类器、插件市场、成本面板…）一律登记在 **[agent-feature-backlog.md](./agent-feature-backlog.md)**，本文不再重复维护缺口清单。
 >
 > **关联**：[ai-spec.md](./ai-spec.md) §3.5（协议契约）/ §11（硬约束规则）、[agent-feature-backlog.md](./agent-feature-backlog.md)（待办唯一真相源）、[agent-ui-spec.md](./agent-ui-spec.md)（对话面板 UI）。
 >
@@ -48,6 +48,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | **安全** | 写入内容的凭据扫描（`Write` / `Edit`）：**只做凭据 / 密钥泄漏**，写入前扫 `content` / `new_string`，命中随同一个 `analysis` 字段的 `secrets` 上报（`[{rule, line}]`），前端按「必须人看」处理 | `content_safety::analyze`（自研，单测 10 例）；展示通道见 ai-spec §3.5「写入内容的凭据扫描」、§13.1 与 §11 规则 58 |
 | **P2** | 权限审批：写类工具发 `can_use_tool` → 阻塞等前端回包（超时按拒绝） | 与工作区锁是**与**关系（ai-spec §11 规则 14） |
 | **P2** | 上下文预算 + 两级压缩 + 400 兜底 + **调模型的摘要式压缩** | 水位 0.85 / 0.95 + 滞回；瘦身 / 丢弃 / 强制三档；摘要在**丢弃档与 400 兜底档**触发（带三道成本闸 + `LUNAC_SUMMARY_COMPACT` 开关 + 失败降级）。见 ai-spec §3.5 与 §11 规则 23 / 39 |
+| **P2** | 图片附件（多模态输入，**只做图片那一半**）：附件里的图按路径读成 base64 块随本轮提问发给模型 | stdin 的 `image` 块（`source.type=file`）→ 端点块；类型按**魔术字节**判定（PNG / JPEG / GIF / WebP），单图 ≤ 3.5 MB、每条 ≤ 10 张，失败走 `system/attachment_note` 如实上报。开关是 `config\ai.json` 的 `vision`（**默认关**，由前端决定发不发块）；PDF 不做，仍走路径文本。见 ai-spec §3.5「图片附件」与 §11 规则 60 |
 | **上下文** | 单条工具输出预算：超 12000 字符落盘全文、只内联「头 8000 + 尾 2000 + 路径」，模型用 Read / Grep 取回全文 | `tools::apply_budget`（唯一出口，`run_tool` 调用）；落盘 `temp\tool-outputs`（7 天清理）并并入 `Ctx.add_dirs`；见 ai-spec §3.5「单条工具输出预算」与 §11 规则 27 |
 | **上下文** | 任务快照：压缩丢弃中段时，把最近一条 `TodoWrite` 清单钉回上下文，避免「压缩后忘了在做什么」 | `latest_todo_snapshot()`；纯文本 user 消息（与 `tool_use`/`tool_result` 配对结构解耦），插在第 1 条之后；见 ai-spec §11 规则 37 |
 | **执行** | 只读工具并行：一轮里**连续的**只读调用合成一批并发（上限 4），写类/命令/MCP 串行 | `tools::parallel_safe` + `plan_tool_batches`；结果按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序；见 ai-spec §3.5「只读工具并行」与 §11 规则 28 |

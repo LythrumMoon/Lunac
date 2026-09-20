@@ -381,6 +381,11 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   | `state`（`on` / `off`）+ `reason` | `system/plan_mode` | **计划相位**的广播（A7）：模型调 `EnterPlanMode` ⇒ `on`（`reason` = 模型给用户的一句话）；`ExitPlanMode` **被批准** ⇒ `off`。ai-spec §3.5「计划模式闭环」/ §11 规则 59 | 单例横幅 `.plan-mode-note`：`on` 时 `--yellow`，`off` 落回中性色；**agent 重启（`cli-status: starting`）要清掉** —— 相位是进程内状态，随进程消失。**不许**由前端拿工具调用自己推断状态 |
 
 - **计划卡不新增字段**（A7）：`ExitPlanMode` 复用既有的 `can_use_tool` 通道，整份计划就在 `request.input.plan` 里 —— 卡片按 §3.6 的骨架渲染，正文用 `textContent` 原样铺开（**不做 markdown 渲染、不用 `innerHTML`**：那是模型生成的任意文本）。批准时前端另调 `save_plan_md(stamp, plan)` 落档 `ModuleData\plans\`（失败只提示，不挡执行）。
+- **图片附件走 stdin 的 `image` 块，不动 stdout 契约**（A8）：前端只多传一个 `{"type":"image","source":{"type":"file","path":"…"}}` 内容块（契约见 ai-spec §3.5「图片附件」/ §11 规则 60）；agent 回报的是下面这条 **`system/attachment_note`**，前端渲染成一条黄色 `.sys-note-warn`（i18n `agent.attachment_skipped`，正文逐条「路径 — 原因」）。**没有事件 = 全部发出去了**，不需要画任何东西；`skipped` 为空数组时按无事件处理。
+
+| 字段 | 位置 | 语义 | 前端行为 |
+|---|---|---|---|
+| `skipped` = `[{path, reason}]` | `system/attachment_note` | 本轮**没能随提问发出**的附件与原因（A8）：读不出来 / 不是端点支持的图片 / 超过 3.5 MB 单图上限 / 超过 10 张 —— agent 侧判定，见 ai-spec §3.5「图片附件」 | 追加一条 `details.sys-note.sys-note-warn`，标题 `t("agent.attachment_skipped", {n})`、正文逐条 `path — reason`。**缺字段或空数组 ⇒ 什么都不画**（不是错误，也没有需要用户处理的失败） |
 - 新增前端 → 后端的调用（如 `set_security_profile` 已有、`log_frontend` 已有）必须参数名与 Rust 签名逐一对齐（code-rules §3.1），并确认是否需要 `capabilities/default.json`（自定义 `#[tauri::command]` 不需要，插件 API 需要）。
 
 ---
