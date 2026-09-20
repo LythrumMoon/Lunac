@@ -561,7 +561,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 项 | 约定 |
 |---|---|
 | 清单顺序 | 技能按 `key` 排序后再拼进系统提示词 —— 与 MCP 工具同理，顺序抖动等于废掉整段前缀缓存 |
-| 解析 | frontmatter 与正文分离；读不出的 SKILL.md 静默跳过，不影响其余技能。**只认四个字段**：`name` / `description` / `context` / `allowed-tools`（旧 CLI 的 `model` / `effort` / `paths` / `hooks` 在 Lunac 无落点，见 §11 规则 57） |
+| 解析 | frontmatter 与正文分离；读不出的 SKILL.md 静默跳过，不影响其余技能。**只认四个字段**：`name` / `description` / `context` / `allowed-tools`（旧 CLI 的 `model` / `effort` / `paths` / `hooks` 在 Lunac 无落点，见 §11 规则 57）。**注意区分**：这里的 `hooks` 指的是**技能 frontmatter 自带的 hooks 字段**（仍不解析）；**用户级权限 hooks 已于 A9 落地**（`config\hooks.json`，见 §3.5「权限 hooks」）—— 两者不是一回事 |
 | 匹配 | 调用参数先匹配 `key`（精确）→ frontmatter.name（忽略大小写）→ `key`（忽略大小写）；三条都不过就是 `Unknown skill "X". Available: …`。**inline 与 fork 两路共用同一个 `find()`** —— 各写一份必然在「谁优先」上漂移 |
 | **模式一：inline**（默认） | `Skill` 把**正文**交回主循环，模型自己在当前对话里照做。纯读（与 `Read` 同级）⇒ **不审批**、**plan 档放行**；并行上**与 fork 一起算串行**（白名单只看名字，见下行） |
 | **模式二：fork**（`context: fork`） | `Skill` **不返回指令，而是派生一个子代理去执行**，主对话只收报告。判据抄旧 CLI：`frontmatter.context === 'fork'`（精确小写整词，不发明第三态） |
@@ -607,6 +607,22 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 实测（2026-09-20） | `cargo test` core-agent **80 passed / 0 failed / 2 ignored**（新增 `image_blocks_are_resolved_by_path_and_limited`）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` 通过；**假端点实测**（本地 TcpListener 直接抓 `/v1/messages` 请求体，13 条断言全过）：真 PNG ⇒ 请求体里有 `"type":"image"` + `"media_type":"image/png"` + **与文件逐字节一致的 base64**；读不出来的那张 ⇒ 请求体里**没有**它、stdout 有且仅有一条 `attachment_note`（含路径与原因）；第 2 轮请求体里**仍带着第 1 轮那张图**（历史保留的证据），且**任何 `"type":"file"` 都不会真的发到端点** |
 
 **与旧 cli.exe 的完整差距清单、价值评级与实施顺序见 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md)。**
+
+**权限 hooks（A9，2026-09-20）**：让**用户自己的脚本**在 agent 的关键节点上介入（拦下一次工具调用、给模型补一句上下文、拦下整轮提问）。实现见 [core-agent/src/hooks.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/hooks.rs)（配置解析 + 事件执行，单测 13 条）、[main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `hook_tool_gate()` / `fire_plain_hook()` / `report_hook_run()` 与 [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 的三个设置面板命令。要点：
+
+| 项 | 约定 |
+|---|---|
+| 事件面（**只做真有落点的 8 个**） | `SessionStart`（cfg 就绪、开始收 stdin 之前）/ `UserPromptSubmit`（进 `run_query` 之前，**可拦整轮提问**）/ `PreToolUse`（**每一次**工具调用，含只读工具与子代理内部）/ `PermissionRequest`（**只在「本来就要弹审批卡」的那一刻** —— hook 可代答）/ `PostToolUse`（`run_one_tool()` 内、工具跑完之后）/ `PreCompact`（`compact_history()` 的三处调用点之前，带 `trigger: drop\|elide\|force`）/ `Stop`（`run_query` **成功**收尾、`result` 发出之后；出错收尾不发）/ `SessionEnd`（stdin 关闭、退出之前）。Claude Code 的 19 类里 `Notification` / `SubagentStop` / `TeammateIdle` 等在 Lunac **没有对应节点** ⇒ 一份都不空跑 |
+| 配置（唯一真相源） | `<exe 根>\config\hooks.json`：`{"enabled":true,"hooks":{"PreToolUse":[{"matcher":"Bash\|PowerShell","hooks":[{"type":"command","command":"…","timeout":30}]}]}}`。`enabled` 缺省 **true**（文件存在本身就表示用户配了）；文件不存在 = 没配 = 关。`matcher` 是**正则**（只对三个工具类事件有意义，用在别的事件上会被当配置警告报出来并按全匹配处理）；`timeout` 秒，缺省 60、上限 600。设置面板的开关写的**就是这个字段**（不另存一份前端状态） |
+| 谁读、何时读 | **agent 侧**读（宿主只在 spawn 时无条件注入 `LUNAC_HOOKS_FILE`）。**按文件 mtime 热重载** ⇒ 改完**即时生效、不必重启 agent**；解析失败**保留上一份有效配置**并落 WARN（配置写坏不该让工具链停摆），语法错在设置面板那一行同时报出来。UTF-8 BOM 两侧都容忍（编辑器常写 BOM，而 serde_json 见 BOM 直接判非法） |
+| hook 的**输入**（与 Claude Code 同形，便于搬脚本） | stdin 一行 JSON：`{session_id,cwd,hook_event_name,tool_name?,tool_input?,tool_use_id?,prompt?,trigger?,tool_response?}`；另给环境变量 `LUNAC_HOOK_EVENT`（与 `LUNAC_TOOL_NAME`）。子进程 **cwd = 工作区**，Windows 下 `CREATE_NO_WINDOW`，并发读干 stdout/stderr，超时 kill |
+| hook 的**输出**（只有一套形状） | 退出码 **0** = 看 stdout：整行 JSON 对象 `{"decision":"allow"\|"deny","reason":…,"additionalContext":…}`；纯文本 stdout = 一段说明（`PostToolUse` 时**交给模型**，其余事件里只是给用户看的提示）。退出码 **2** = 拒绝（`stderr` 当拒因；不能拦的事件里它只是「把这段话交给模型/用户」）。**其余非 0 / 超时 / 输出看不懂 = 失败**：一律**不拦**，但做一条**可见**的 `error` 提示 |
+| **只认显式拒绝** | 只有退出码 2 或 `{"decision":"deny"}` 才拦。超时 / 崩溃 / 坏 JSON **放行但可见** —— 「以为装了保护、其实没跑」是最危险的状态，所以宁可放过也不能静默 |
+| `allow` 的边界（**等价用户白名单，不是绕过闸门**） | hook 的 `allow` 只等于**跳过审批卡**：**静态安全分析命中（危险命令 / 写入内容里的凭据）仍强制弹卡**，工作区锁与计划相位也照旧生效（判据 `hook_allow_needs_card()`，见 §11 规则 14 / 59）。`opaque`（判不定）**不**强制弹卡 —— 与前端「自动」档口径一致 |
+| 多命中的次序 | 一个事件的全部命中 hook **按配置顺序全部执行**；`deny` 优先于 `allow`；**不并发**（用户脚本按顺序执行才可预期） |
+| 结果去哪 | 工具类事件：`deny` ⇒ 工具不执行，拒因以 `is_error` 的 `tool_result` 回给模型；`PostToolUse` 的 `info` / 退出码 2 文本 ⇒ **拼进 `tool_result` 的文本内部**（content 数组形状与块数不变，见规则 23）。用户可见面：`system/hook_note`（见 [agent-ui-spec.md](./agent-ui-spec.md) §9） |
+| 上限 | 每条提示文本 2000 字符（截断标记），单个 hook 的 stdout/stderr 各读 512 KB（读满即丢，与 `tools.rs` 的管道纪律同源） |
+| 实测（2026-09-20） | `cargo test` core-agent **93 passed / 0 failed / 2 ignored**（新增 `hooks` **13 条**）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` exit 0；**真机端到端 18 条断言全过**（假 Anthropic 端点抓请求体 + 真 hook 子进程 + 真 Bash 工具）：拦下 ⇒ 工具未执行 / 无审批卡 / 拒因进 `tool_result`；放行 ⇒ 免卡且 `tool_result` 有 `exit code: 0`；**放行 + 危险命令 ⇒ 仍弹卡且 `analysis.dangerous` 非空**；`PostToolUse` 的 `additionalContext` ⇒ 第 2 次请求体里出现 `[PostToolUse hook]`；`UserPromptSubmit` 拦下 ⇒ 端点**零请求** + `result.subtype=hook_blocked`；退出码 7 ⇒ **不拦**（照常弹卡）且 `kind=error` 可见；`enabled:false` ⇒ 一条 hook 都不跑 |
 
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
@@ -1572,6 +1588,15 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **开关默认关，且只在前端**：`config\ai.json` 的 `vision`（默认 `false`）。发给不支持视觉的端点必 400，而 agent 侧**无法预判**模型能力 ⇒ 只能由用户显式断言。**不许**改成「按模型名自动推断」或「先发再 400 回落」——前者会猜错，后者每轮白烧一次请求并打断前缀缓存。
     - **类型只认魔术字节、失败必须可见**：放行 PNG / JPEG / GIF / WebP 四种（不信扩展名）；读不出来 / 超限 / 超张数的一律进 `system/attachment_note`（`skipped:[{path,reason}]`）并在前端可见地列出来。**静默丢弃是最坏的一种**——用户只会看到「模型说它看不到图」。
     - **附件读盘不走工作区锁，这一点不许「顺手补上」**：路径来自用户显式选中（不是模型自己找到的），而剪贴板图片就落在 `%TEMP%` —— 套锁会让最主要的那条用法直接失效。模型的 `Read` 仍然照旧受锁约束，两者不要混为一谈。
+
+61. **权限 hooks（A9，2026-09-20）**：契约与实测见 §3.5「权限 hooks」。**七条不得回退**：
+    - **只做真有落点的事件，一个都不铺空跑**：`SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PreCompact` / `Stop` / `SessionEnd` 这 8 个，每一个都在 `main.rs` 里有确切调用点（表见 §3.5）。**别**为了「和 Claude Code 对齐」把 `Notification` / `SubagentStop` 之类也做成事件 —— 配了永不触发的项比没有更糟（用户以为装了保护）。
+    - **只认显式拒绝：失败一律「放行但可见」**：只有退出码 2 或 `{"decision":"deny"}` 才拦；**超时 / 崩溃 / 输出看不懂 = 不拦 + `kind:"error"` 的 `system/hook_note` + 一行 WARN 落 agent 日志**。也别反过来做成 fail-closed：用户脚本一崩就全线卡死，比没装 hook 更糟。这条与 A8 的「失败必须可见」是同一条纪律的两个落点。
+    - **`allow` 只等于用户白名单，不得越过安全闸门**：hook 放行 ⇒ 只跳过**审批卡**；**静态安全分析命中（危险命令 / 写入内容里的凭据）仍强制弹卡**（判据 `hook_allow_needs_card()`），工作区锁与计划相位的写类拦截也照旧 —— 规则 14 的「任何一道闸门都不得为了少点一次同意而放宽」在这里是同一句话。**别**把 `opaque`（判不定）也算进强制弹卡：它的口径要与前端「自动」档一致。
+    - **配置只有一份真相，且必须热重载**：`config\hooks.json`（`enabled` 缺省 true；文件不存在 = 没配）。**agent 按 mtime 重读**（改完即时生效，与技能的「扫描一次」不同 —— 这里没有前缀缓存的问题），解析失败**保留上一份有效配置**。宿主因此**无条件注入** `LUNAC_HOOKS_FILE`（连文件不存在时也给）：若改成「文件存在才注入」，运行中新建设置的用户就得等下次 spawn 才生效 —— 这类「开了没反应」的坑不要在别处重演。
+    - **事件必须挂在「所有工具调用都会经过的那一层」，不许下沉进 `tools::run`**：`PreToolUse` / `PermissionRequest` 在主循环与子代理循环各自的「执行工具」段统一过一遍（覆盖**只读工具**与**子代理内部**的调用），`PostToolUse` 在 `run_one_tool()` 里。下沉进 `tools::run` 会漏掉 `Skill` / `SessionSearch` / `needs_bridge` / `Agent` / fork 技能那几条**早退分支**（它们根本不进 `tools::run`）—— 与规则 59 里「早退分支各自补 `write_blocked`」是同一类陷阱的镜像。
+    - **`PostToolUse` 的文本只拼进 `tool_result` 的文本内部**：它是**追加**到既有 `content` 字符串里，**不得**新增消息、也不得新增内容块（规则 23 —— 末尾消息形态一变，缓存 `read` 就塌到 `system + tools` 的量级）。
+    - **Windows 下起 hook 进程必须用 `raw_arg` 拼命令行**：`cmd /C` 的引号语义由 cmd 自己解释，而 `Command::arg` 会按 MSVC 规则把命令里的 `"` 转义成 `\"`（命令含空格时必然触发）⇒ 形如 `python "C:\my hooks\check.py"` 的命令**整条失败**（实测：同一条 `type "<file>"` 带引号时 hook 拿不到任何输出，去掉引号即正常）。**同一个坑在 `tools.rs` 的 `Bash` / `PowerShell` 上同样存在**（尚未改动，见 backlog 的「另记」）。
 
 ## 12. Agent Plan 模式规范
 

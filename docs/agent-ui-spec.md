@@ -386,6 +386,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 | 字段 | 位置 | 语义 | 前端行为 |
 |---|---|---|---|
 | `skipped` = `[{path, reason}]` | `system/attachment_note` | 本轮**没能随提问发出**的附件与原因（A8）：读不出来 / 不是端点支持的图片 / 超过 3.5 MB 单图上限 / 超过 10 张 —— agent 侧判定，见 ai-spec §3.5「图片附件」 | 追加一条 `details.sys-note.sys-note-warn`，标题 `t("agent.attachment_skipped", {n})`、正文逐条 `path — reason`。**缺字段或空数组 ⇒ 什么都不画**（不是错误，也没有需要用户处理的失败） |
+| `hook_event` / `tool_name` / `items` = `[{kind, text, command}]` | `system/hook_note` | **权限 hooks**（A9）的裁决 / 输出 / 失败：`kind` ∈ `block`（拦下）/ `allow`（放行）/ `info`（补充信息）/ `error`（hook 崩了 / 超时 / 输出看不懂 —— **它没有拦任何东西**）。字段名是 `hook_event` 而不是 `event`（后者已被 `stream_event` 占用，形状是对象）。见 ai-spec §3.5「权限 hooks」/ §11 规则 61 | `renderHookNote()`：追加 `details.sys-note`，`block` / `error` 加 `.sys-note-warn` 并**自动展开**（必须看见 —— 静默会让用户「以为装了保护、其实没跑」），`info` / `allow` 中性色、默认折叠；标题 `t("agent.hook_note", {event, n})`、正文逐条 `[kind] text — command`（一个事件挂多个 hook 时靠 `command` 才分得清是谁）。**`items` 为空 ⇒ 什么都不画** |
+| 设置面板「权限 hooks」行 | 设置 · AI 分块 | 开关 = `config\hooks.json` 的 `enabled` 字段（`get_hooks_config` / `set_hooks_enabled`）；旁边一个「打开 hooks.json」按钮（`hooks_file_path` 缺文件先落骨架，再由前端 `open()` 打开）；文件语法错误时把 `error` 渲染成一行黄色提示 | 开关**失败要拨回去**并显示原因（面板显示「已开」而实际没生效是最难查的一类）；文案里说明「改完即时生效、不必重启 agent」（agent 按 mtime 热重载） |
 - 新增前端 → 后端的调用（如 `set_security_profile` 已有、`log_frontend` 已有）必须参数名与 Rust 签名逐一对齐（code-rules §3.1），并确认是否需要 `capabilities/default.json`（自定义 `#[tauri::command]` 不需要，插件 API 需要）。
 
 ---

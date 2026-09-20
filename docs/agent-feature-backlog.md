@@ -15,10 +15,10 @@
 >
 > | 旧编号 | 现在在哪 |
 > |---|---|
-> | §0 差距总览 / §4 不是缺口 | §1.1 组 A（工具）**A8 / A14** / **§5 边界声明**（A3 / A5 已落地）；其余见 §4 设想区 |
+> | §0 差距总览 / §4 不是缺口 | §1.1 组 A（工具）**A14** / **§5 边界声明**（A3 / A5 / A8 / A9 已落地）；其余见 §4 设想区 |
 > | §1.2 组 B / §1.3 组 C | **A13 按需重估**（+ §4 设想区） |
 > | §2.1 组 A（子系统） | **已全部落地** —— A6 写文件内容级安全扫描于 2026-09-20 完成（A4 长期记忆与后台复盘、会话持久化与检索更早已完成，见 `ai-spec.md` §3.5） |
-> | §2.2 组 B | **A9 / A10 / A11**（A3 / A5 / A8 已落地） |
+> | §2.2 组 B | **A10 / A11**（A3 / A5 / A8 / A9 已落地） |
 > | §2.3 组 C | **A13** + §4 设想区 |
 > | §3 协议 / 接口层 | **A11**（其中的 A1 子代理框架已于 2026-09-20 落地） |
 > | §5 空转 UI / 失实文案 | **已全部修复**，条目已删 |
@@ -27,7 +27,7 @@
 > | §8.2 摘要式压缩 | **已完成** ⇒ 结论在 `ai-spec.md` §11 规则 39 |
 > | §8.3 任务快照 | **已完成** ⇒ 结论在 `ai-spec.md` §11 规则 37 |
 > | §8.4 一次对话中的多任务并行 | **A14** |
-> | §8.5 对话数据库 | 五步全落地 ⇒ **已删除**（检索侧见 `ai-spec.md` §3.5「往期会话检索」；剩余的记忆**写入**触发点就是本文 **A4**） |
+> | §8.5 对话数据库 | 五步全落地 ⇒ **已删除**（检索侧见 `ai-spec.md` §3.5「往期会话检索」；记忆**写入**侧已由 A4 于 2026-09-20 落地，见 `ai-spec.md` §11 规则 56） |
 > | §8.6 建议顺序 | 本文 **「优先级总表」** |
 
 ---
@@ -36,8 +36,7 @@
 
 | 级别 | 条目 | 为什么在这个位置 |
 |---|---|---|
-| **P2** | A9 权限 hooks | 用户脚本介入的工具链，属生态能力 |
-| **P2** | A10 自动权限分类器 | 减少询问频率，可与 A9 一起评估 |
+| **P2** | A10 自动权限分类器 | 减少询问频率。A9（权限 hooks）落地后，「谁能放行」已有用户脚本这条通道；这一条做的是**内置的分类器**，仍待做 |
 | **P2** | L1 插件市场（含 Live2D 桌宠） | **用户已定方向**，卡在三条硬约束（CSP / 资产 / 常驻开销） |
 | **P2** | L2 AI 人格 / 风格录入 | **用户已选「人格编辑器」**，改动集中在提示词装配 |
 | **P3** | A11 会话续接 / rewind | 现状靠 `set_history` 灌历史已够用，属体验增强 |
@@ -54,11 +53,6 @@
 ## 1. Agent 能力缺口
 
 ### P2
-
-**A9. 权限 hooks（19 类事件）**
-
-- 做什么：`PreToolUse` / `PostToolUse` / `SessionStart` / `PreCompact` / `PermissionRequest` … 供用户脚本介入。
-- 现状：全仓零匹配（只有 NSIS 的 `installerHooks` 与键盘 LL 钩子，与本条无关）。
 
 **A10. 自动权限分类器**
 
@@ -194,7 +188,7 @@
 
 ## 6. 环境变量与数据根（核对基线）
 
-`core-agent` 当前读取的 `LUNAC_*` 环境变量共 **16 个**（均**只在 spawn 时注入**；切换其中任何一项 = `kill_and_cleanup()` 重启 agent）：
+`core-agent` 当前读取的 `LUNAC_*` 环境变量共 **17 个**（均**只在 spawn 时注入**；切换其中任何一项 = `kill_and_cleanup()` 重启 agent）：
 
 | 变量 | 落点 | 用途 |
 |---|---|---|
@@ -207,6 +201,7 @@
 | `LUNAC_SKILLS_DIR` | `main.rs` / `skills.rs` | 技能目录 |
 | `LUNAC_THINKING` | `main.rs` | 思考开关（`off` / 其余=开） |
 | `LUNAC_WORKSPACE_LOCKED` | `main.rs` | 工作区锁（硬边界，见 `ai-spec.md` §11 规则 14） |
+| `LUNAC_HOOKS_FILE` | `hooks.rs` | **权限 hooks 配置文件的路径**（`config\hooks.json`，无条件注入；「文件不在 = 没配」由 agent 一处判定，按 mtime 热重载 ⇒ 改配置不必重启 agent，见 §11 规则 61） |
 | `LUNAC_SEARCH_PROVIDER` / `LUNAC_SEARCH_KEY` | `tools.rs` | 联网检索主源 |
 | `LUNAC_LOG_DIR` / `LUNAC_LOG` / `LUNAC_LOG_LEVEL` | `log.rs` | 落盘日志 |
 
@@ -233,3 +228,5 @@
 *2026-09-20 追加（同日第七批）：**A7（计划模式闭环）已完成并从本文删除**。形态刻意**不复用「只读档位」**，而是拆成两个互不替代的概念：**用户的只读档**（`--permission-mode plan`，设置里选、启动时定死、改它要重启 agent）与**模型的计划相位**（`plan_phase`，进程内即时生效、批准后立刻解除）。① **两件内置工具**：`EnterPlanMode`（只把相位标志置真 + 广播 `system/plan_mode state=on` 带模型自述理由，**免审批** —— 问它等于让用户批准「我要开始思考了」）、`ExitPlanMode`（**必须走审批** —— 这张卡就是它的产品，用户要在卡上读到整份计划再裁决），工具总数 13 → **15**；守门单测同步。② **判据收口到 `tools::write_blocked(ctx, what)` 一处**，两档的**拒因措辞分开**（用户该做的动作不同：只读档指向「去设置改档位」、计划相位指向「去批准计划」），把「哪些工具算写类」这份知识也收口到 `tools.rs`。③ 相位用 `Arc<AtomicBool>` 而非 `bool` / `Cell`：`Ctx` 是 `Clone` 且跨线程（并行只读批拿 `&Ctx`、后台复盘 fork 拿克隆）⇒ 值语义会各持一份、`Cell` 破 `Sync`；`Arc` 让**派生子代理 / fork 技能 / 后台复盘自动继承**相位。④ **四个早退分支全部补判**：`Skill` / `SessionSearch` / `needs_bridge` / MCP 工具都早于 `tools::run()` 返回、会绕过那里的拦截 ⇒ `Remember` / `Agent` / fork 技能 / MCP 四处各补一次 `write_blocked`（否则只读档与计划相位能从这条缝里写本机）。⑤ **只读档下不许** `ExitPlanMode`（否则模型能靠它把用户选的档位绕开），报错指向设置；相位**不被清**。⑥ **前端零协议新增字段**：计划正文本来就在 `request.input.plan` 里，`renderPlanCard()` 直读 ⇒ `open_approval()` **零改动**、计划卡 = 同一条审批通道的第三种行；`classifyRequest()` 对 `ExitPlanMode` 免疫（白名单也不放行）、不给「始终允许」；批准时 `save_plan_md` 落 `<exe 根>\ModuleData\plans\<本地时间戳>.md`（Rust 侧没有 chrono ⇒ 时间戳由**前端**给 + 后端只做严格形状校验 `YYYY-MM-DD_HHMMSS`，同 `append_usage_log` 先例）；`EnterPlanMode` 另挂顶部横幅，agent 重启时清掉。⑦ **刻意不做** `VerifyPlanExecution`（验证这一环交给 `TodoWrite`）；子代理看不到这两件工具，后台复盘门槛加 `&& !plan_phase`。**实测**：`cargo test` core-agent **79 passed / 0 failed / 2 ignored**、src-tauri **58 passed / 0 failed / 1 ignored**，`tsc --noEmit` exit 0，`cargo build --release` 通过；release 真机 E2E **11 条断言全过**（`EnterPlanMode` 广播 → `Read` 通过 → `ExitPlanMode` 走审批、计划正文 1197 字符 → **拒绝**后拒因原话进 `tool_result` → 下一问要求直接动手时 `Write` 被硬拒 → 再交计划并**批准** → 广播 `state=off` → 同一个 `Write` 落盘且内容正确）。契约在 `ai-spec.md` §3.5「计划模式闭环（A7）」、纪律在 §11 规则 59，UI 在 `agent-ui-spec.md` §3.6 / §4.4 / §9，预检在 `code-rules.md` #12（扩写：早退分支必须自己补 `write_blocked`）与 #21（新增：写类判据只改一处、两档措辞分开）。当前未落地 **9 项**（A8–A16）。*
 
 *2026-09-20 追加（同日第八批）：**A8（多模态输入·图片一半）已完成并从本文删除**。① **形态**：stdin 的 user 消息 `content` 里可再加 `{"type":"image","source":{"type":"file","path":"…"}}` —— **只传路径、不传字节**（前端三种附件来源本来就已落成路径；几 MB 的 base64 不必过 IPC 管道、也不必在 WebView 里再存一份），字节由 core-agent 读出来转成端点要的 `{"type":"base64","media_type":…,"data":…}` 块；`[Attached files]` **文本照旧保留**（历史 / 标题 / 复制三条旧路径只认它，且它承载「哪个路径对应哪张图」）。② **开关在前端、默认关**：设置面板「模型支持图片输入」→ `config\ai.json` 的 `vision`（`set_ai_config` / `get_ai_config`），**不改启动参数、不重启 agent**。理由是发给不支持视觉的端点（DeepSeek 官方端点）必 400，而 agent 侧**无法预判模型能力** ⇒ 只能由用户显式断言；刻意**不**做「按模型名推断」与「先发再 400 回落」。③ **接收方按内容判定**：类型只认**魔术字节**（PNG / JPEG / GIF / WebP 四种，不信扩展名），单图原始字节 ≤ 3.5 MB（端点 5 MB 按 base64 算 ⇒ 3.5 MB 才不越线）、每条 ≤ 10 张。④ **失败可见**：读不出来 / 超限 / 超张数的一律走 `system/attachment_note`（`skipped:[{path,reason}]`，只在真有失败项时才发），前端渲染成一条黄色 `.sys-note-warn` 明细行 —— 静默丢弃会让用户只看到「模型说它看不到图」。⑤ **附件读盘刻意不走工作区锁**：路径来自用户显式选中（不是模型找出来的），而剪贴板图片就落在 `%TEMP%`（在工作区之外）—— 套锁会让最主要的那条用法直接失效；模型的 `Read` 照旧受锁约束。⑥ **顺手修掉一个真 bug**：剪贴板图片落盘用的是 `lunac_ocr_<pid>.<ext>` / `lunac_clip_<pid>.<...>` **固定名**，同一进程第二次粘贴会覆盖第一张（而旧 chip 还指着同一路径）⇒ 改为 `temp_image_path()` 生成唯一名（四处现场全改）。**实测**：`cargo test` core-agent **80 passed / 0 failed / 2 ignored**（新增 `image_blocks_are_resolved_by_path_and_limited`）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` exit 0；**假端点实测**（本地 TcpListener 直抓 `/v1/messages` 请求体，13 条断言全过）：真 PNG ⇒ 请求体含 `"type":"image"` + `"media_type":"image/png"` + 与文件**逐字节一致**的 base64；读不出来的那张 ⇒ 请求体里没有它、stdout 有且仅有一条 `attachment_note`；第 2 轮请求体里仍带第 1 轮那张图（历史保留），且**任何 `"type":"file"` 都没真的发到端点**。契约在 `ai-spec.md` §3.5「图片附件」、纪律在 §11 规则 60，前端字段登记在 `agent-ui-spec.md` §9，预检在 `code-rules.md` #22。**PDF 刻意不做**（原生 `document` 块只有 Claude 系支持、本地提文本要引解析库且对扫描件无效）⇒ 仍走路径文本。当前未落地 **8 项**（A9–A16）。*
+
+*2026-09-20 追加（同日第九批）：**A9（权限 hooks）已完成并从本文删除**。① **事件面砍到 8 个**：只做在 core-agent 里**真有落点**的 `SessionStart`（cfg 就绪后）/ `UserPromptSubmit`（进 `run_query` 前，**可拦整轮**）/ `PreToolUse`（**每一次**工具调用，含只读工具与子代理内部）/ `PermissionRequest`（只在「本来要弹卡」的那一刻，hook 可代答）/ `PostToolUse`（`run_one_tool()` 内、工具跑完之后）/ `PreCompact`（`compact_history()` 的三处调用点之前）/ `Stop`（成功收尾后）/ `SessionEnd`（stdin 关闭、退出前）。Claude Code 那套 19 类里的 `Notification` / `SubagentStop` / `TeammateIdle` 之类在 Lunac **没有对应节点**，一份都不空跑 —— 配了永不触发的事件比没有更糟。② **裁决权只到「等价白名单」为止**：hook 的 `allow` 只等于跳过审批卡，**静态安全分析命中（危险命令 / 写入内容里的凭据）仍强制弹卡**，工作区锁也照旧生效 —— 判据是 `hook_allow_needs_card()`，这是 §11 规则 14「任何一道闸门都不得为了少点一次同意而放宽」在 hooks 上的落点；`opaque`（判不定）刻意**不**强制弹卡，与前端「自动」档口径一致。③ **失败语义只认显式拒绝**：只有退出码 2 或 `{"decision":"deny"}` 才拦；**超时 / 崩溃 / 输出看不懂一律放行但可见**（`kind=error` 的 `system/hook_note` 到前端 + 一行 WARN 落到 agent 日志）—— 「以为装了保护、其实没跑」是最危险的状态，所以宁可放过也不能静默。④ **配置只有一份真相**：`config\hooks.json`（`enabled` 缺省为真；文件不存在 = 没配；设置面板的开关写的就是这个字段），**agent 侧按 mtime 热重载** ⇒ 改完**即时生效、不必重启 agent**（宿主因此**无条件**注入 `LUNAC_HOOKS_FILE`，连文件还不存在时也给 —— 否则用户在运行中新建配置文件就得等下次 spawn 才生效）；解析失败**保留上一份有效配置** + 落 WARN，语法错同时在设置面板那一行报出来。⑤ **顺手修掉三处真问题**：**(a)** `cmd /C` 前面用 `Command::arg` 会被 MSVC 引号规则把命令里的 `"` 转义成 `\"`，`cmd` 不认 ⇒ 形如 `type "C:\a b\x.json"` 的 hook 命令**整条失败**（实测：带引号时拿不到任何输出、去掉引号即正常）⇒ hooks 侧改用 `raw_arg` 原样拼命令行，**同一处陷阱在 `tools.rs` 的 `Bash` / `PowerShell` 上同样存在**（未在本批改动，另记）；**(b)** 设置面板的「模型支持图片输入」开关**从未回读** `ai.json`（A8 的编辑没落盘）⇒ 面板每次都显示「关」，用户一按保存就把开着的功能静默关掉，本批补回；**(c)** `i18n.ts` 里 `agent.attachment_skipped` 有落盘 ⇒ 提示标题渲染成裸 key，本批补回。**实测**：`cargo test` core-agent **93 passed / 0 failed / 2 ignored**（其中 `hooks` 13 条，含退出码 2 / 非 0 / 超时 / 坏 JSON / matcher 不匹配 / deny 优先等语义）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` exit 0。**真机端到端 18 条断言全过**（假 Anthropic 端点抓请求体 + 真 hook 子进程 + 真 `Bash` 工具）：拦下 ⇒ 工具未执行 / 无审批卡 / 拒因以 `is_error` 回灌；放行 ⇒ 免卡且 `tool_result` 里出现 `exit code: 0`；**放行 + 危险命令 ⇒ 仍弹卡且 `analysis.dangerous` 非空**；`PostToolUse` 的 `additionalContext` ⇒ 第 2 次请求体出现 `[PostToolUse hook]`；`UserPromptSubmit` 拦下 ⇒ 端点**零请求** + `result.subtype=hook_blocked`；退出码 7 ⇒ 不拦（照常弹卡）且 `kind=error` 可见；`enabled:false` ⇒ 一条 hook 都不跑。另有一轮更省的复跑（`target\hooktest\e2e-mini.ps1`，**不联网**、不落 marker、纯 ASCII 断言，覆盖 `SessionStart` / `UserPromptSubmit` / `SessionEnd` / `enabled` 开关）**13 条断言全过**，可作为 `PreToolUse` 那几条缺 harness 时的最低成本回归。契约在 `ai-spec.md` §3.5「权限 hooks」、纪律在 §11 规则 61，前端字段登记在 `agent-ui-spec.md` §9，预检在 `code-rules.md` #23。**顺带记一笔**：`tools.rs` 的 `Bash` / `PowerShell` 仍用 `Command::arg` 拼 `cmd /C` 命令行（同一个引号陷阱），本批**未改** —— 留待单独一笔，避免与 hooks 混在一起回滚。当前未落地 **7 项**（A10–A16）。*

@@ -2,11 +2,11 @@
 
 > **定位**：本文描述 Lunac 自研 agent（`agent.exe`）的**实现现状**与**用户可直接使用的本地扩展格式**。它回答两个问题：① 现在实现了什么；② 用户怎么用本地文件扩展它（`skills\` / `tools\`）。
 >
-> **待办不在这里**：本文只写「已经是什么样」。凡未完成的能力（权限 hooks、自动权限分类器、插件市场、成本面板…）一律登记在 **[agent-feature-backlog.md](./agent-feature-backlog.md)**，本文不再重复维护缺口清单。
+> **待办不在这里**：本文只写「已经是什么样」。凡未完成的能力（自动权限分类器、插件市场、成本面板…）一律登记在 **[agent-feature-backlog.md](./agent-feature-backlog.md)**，本文不再重复维护缺口清单。
 >
 > **关联**：[ai-spec.md](./ai-spec.md) §3.5（协议契约）/ §11（硬约束规则）、[agent-feature-backlog.md](./agent-feature-backlog.md)（待办唯一真相源）、[agent-ui-spec.md](./agent-ui-spec.md)（对话面板 UI）。
 >
-> **最后核对时间**：2026-09-19（逐条对照 `core-agent/src/`、`app/src/`、`app/src-tauri/src/` 实测）
+> **最后核对时间**：2026-09-20（逐条对照 `core-agent/src/`、`app/src/`、`app/src-tauri/src/` 实测）
 
 ---
 
@@ -29,7 +29,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | 通信 | stdin/stdout 上的 **stream-json**（NDJSON），契约见 [ai-spec.md](./ai-spec.md) §3.5；agent 的 stdout **只走协议**，日志一律落盘 |
 | 数据根 | **便携模式**：一律 `<exe 根>`（`current_exe()` 所在目录），实现 dev/release 物理隔离与卸载彻底化 |
 | 关键路径 | `skills\`（技能）、`tools\`（用户工具定义）、`ModuleData\`（`history\chat.db`、`usage\*.jsonl`）、`temp\logs\`（落盘日志） |
-| 环境注入 | 端点 / token / 模型 / 思考开关 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent。完整变量表（13 个 `LUNAC_*`）见 [agent-feature-backlog.md](./agent-feature-backlog.md) §6 |
+| 环境注入 | 端点 / token / 模型 / 思考开关 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_HOOKS_FILE` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent（**例外**：hooks 配置本身按 mtime 热重载，改 `hooks.json` 内容不必重启）。完整变量表（17 个 `LUNAC_*`）见 [agent-feature-backlog.md](./agent-feature-backlog.md) §6 |
 | 源码 | [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)（主循环 + 上下文压缩/摘要）、[tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)、[skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)、[mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)、[bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)（命令静态安全分析 → 审批卡判据）、[log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs) |
 
 ---
@@ -43,6 +43,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | **P1** | 内置工具 + `tool_use` / `tool_result` 往返循环 | 15 件内置工具，见 §4.1 |
 | **P1** | 子代理框架（`Agent` 工具）：派生独立上下文的子代理跑自包含任务，主对话只收最终报告 | `run_subagent()` / `run_agent_tool()` / `subagent_tool_defs()`；**串行** + 轮次上限 8 + token 预算 30 万；工具集剔掉 `Agent` / `SessionSearch` / `mcp__*`（无桥的必然失败项）、生成参数与主循环同源（thinking + max_tokens）、系统提示词含环境块与技能清单、非流式；事件 `task_started` / `task_progress` / `task_done`。契约见 ai-spec §3.5「子代理」与 §11 规则 54 |
 | **P2** | 计划模式闭环（`EnterPlanMode` / `ExitPlanMode`）：模型先出计划、用户批准后才动手 | **计划相位**（`tools::Ctx.plan_phase: Arc<AtomicBool>`）与用户的**只读档位**是两回事；相位内写类工具一律硬拒（判据统一在 `tools::write_blocked()`，含四个绕开 `tools::run` 的早退分支），`ExitPlanMode` 经审批卡批准后**即时**解除、**不重启**；批准的计划落档 `ModuleData\plans\<本地时间戳>.md`；前端横幅只镜像 `system/plan_mode`。契约见 ai-spec §3.5「计划模式闭环」与 §11 规则 59 |
+| **P2** | 权限 hooks：用户脚本在 8 个事件上介入（拦工具 / 补上下文 / 拦提问） | `config\hooks.json`（`enabled` 缺省真、`matcher` 正则、`timeout` 秒）；agent 侧按 **mtime 热重载**（改完即时生效）、解析失败保留上一份有效配置；**只认显式拒绝**（退出码 2 / `{"decision":"deny"}`），超时与崩溃**放行但可见**；hook 的 `allow` **只等于跳过审批卡** —— 危险命令与凭据命中仍强制弹卡；`PostToolUse` 的文本只拼进 `tool_result` 内部。契约见 ai-spec §3.5「权限 hooks」与 §11 规则 61；UI 在 [agent-ui-spec.md](./agent-ui-spec.md) §9 |
 | **可用性** | 瞬时失败重试：网络抖动 / 429 / 5xx（含 529）退避重试，**请求级**（不产生重复内容），并补发 `system/api_retry` | `retryable_status` / `retry_delay_ms` / `emit_api_retry`；见 ai-spec §3.5「瞬时失败重试」与 §11 规则 25 |
 | **安全** | 命令静态安全分析（Bash / PowerShell）：子命令拆分 + 引号/转义归一 + 包装器递归 + Windows 危险规则集 + **fail-closed** 不透明判定，结果随 `can_use_tool` 的 `analysis` 上报 | `bash_safety::analyze`（自研，单测 8 例）；见 ai-spec §3.5「命令静态安全分析」与 §11 规则 26 |
 | **安全** | 写入内容的凭据扫描（`Write` / `Edit`）：**只做凭据 / 密钥泄漏**，写入前扫 `content` / `new_string`，命中随同一个 `analysis` 字段的 `secrets` 上报（`[{rule, line}]`），前端按「必须人看」处理 | `content_safety::analyze`（自研，单测 10 例）；展示通道见 ai-spec §3.5「写入内容的凭据扫描」、§13.1 与 §11 规则 58 |
