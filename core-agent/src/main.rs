@@ -55,7 +55,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -66,6 +66,7 @@ use serde_json::{json, Value};
 
 mod bash_safety;
 mod content_safety;
+mod hooks;
 mod log;
 mod mcp;
 mod skills;
@@ -1432,6 +1433,129 @@ fn await_approval(pending: Pending, original: &Value) -> Decision {
     }
 }
 
+// ── 权限 hooks（A9，2026-09-20）───────────────────────────────────
+//
+// 用户在 `config\hooks.json` 里挂脚本，在 8 个事件上介入（契约与逐条纪律见
+// docs/ai-spec.md §3.5「权限 hooks」与 §11 规则 61）。**事件的实际落点**：
+//
+// | 事件 | 落点 |
+// |---|---|
+// | `SessionStart` | `main()` 里 cfg 就绪之后、收 stdin 之前 |
+// | `UserPromptSubmit` | stdin 循环的 `user` 分支，进 `run_query` 之前（可拦下整轮） |
+// | `PreToolUse` | 主循环与子代理循环的「执行工具」段，**全部**工具调用都过一遍 |
+// | `PermissionRequest` | 只在「本来要弹审批卡」的那一刻（hook 可代答） |
+// | `PostToolUse` | `run_one_tool()` 内部，工具跑完之后（文本拼进 `tool_result` 内部） |
+// | `PreCompact` | `compact_history()` 的三处调用点之前 |
+// | `Stop` | `run_query()` 成功收尾、`result` 发出之后 |
+// | `SessionEnd` | `main()` 退出前（stdin 关闭） |
+//
+// 所有「跑 + 上报」都收在下面这几个函数里，免得纪律散到 8 处。
+
+/// hook 对一次工具调用的裁决。
+enum HookGate {
+    /// 没有 hook 表态 —— 照原逻辑（该弹卡就弹卡）
+    Pass,
+    /// hook 明确放行 —— 等价用户白名单：跳过审批卡，但**安全分析命中仍要弹**
+    Allow,
+    /// hook 明确拒绝 —— 工具不执行，原因以 is_error 的 tool_result 回给模型
+    Deny(String),
+}
+
+/// 把一次 hook 运行的产出送到该去的地方：落盘日志 + 前端的 `system/hook_note`。
+/// `tool` 只有工具类事件才有。
+fn report_hook_run(event: &str, tool: Option<&str>, run: &hooks::Run) {
+    if run.is_quiet() {
+        return;
+    }
+    for it in &run.items {
+        let line = format!(
+            "hook {event}{} [{}] {}（{}）",
+            tool.map(|t| format!(" {t}")).unwrap_or_default(),
+            it.kind,
+            it.text,
+            it.command,
+        );
+        match it.kind {
+            "error" => log::warn(line),
+            _ => log::info(line),
+        }
+    }
+    emit(json!({
+        "type": "system",
+        "subtype": "hook_note",
+        // 字段名用 `hook_event`（不是 `event`）：`event` 已经被 `stream_event` 占用
+        // （那是个对象），前端同一个 interface 里两个形状会打架。
+        "hook_event": event,
+        "tool_name": tool,
+        "items": run
+            .items
+            .iter()
+            .map(|i| json!({ "kind": i.kind, "text": i.text, "command": i.command }))
+            .collect::<Vec<_>>(),
+    }));
+}
+
+/// 工具类事件的 payload（与 Claude Code 同形：`tool_name` / `tool_input` / `tool_use_id`）。
+fn hook_tool_payload(event: &str, cwd: &Path, tool: &str, id: &str, input: &Value) -> Value {
+    json!({
+        "session_id": "",
+        "hook_event_name": event,
+        "cwd": cwd.display().to_string(),
+        "tool_name": tool,
+        "tool_input": input,
+        "tool_use_id": id,
+    })
+}
+
+/// 工具类事件的统一裁决口（PreToolUse / PermissionRequest 共用）。
+fn hook_tool_gate(event: &str, cwd: &Path, tool: &str, id: &str, input: &Value) -> HookGate {
+    let h = hooks::current();
+    if h.is_empty() {
+        return HookGate::Pass;
+    }
+    let run = hooks::fire(&h, event, &hook_tool_payload(event, cwd, tool, id, input));
+    report_hook_run(event, Some(tool), &run);
+    match run.decision {
+        hooks::Decision::Pass => HookGate::Pass,
+        hooks::Decision::Allow => HookGate::Allow,
+        hooks::Decision::Deny(r) => HookGate::Deny(r),
+    }
+}
+
+/// hook 说「放行」时还要过一遍**静态安全分析**：命中危险命令 / 写入内容里的凭据，
+/// 就仍然要弹卡。这是 ai-spec 规则 14「任何一道闸门都不得为了少点一次同意而放宽」
+/// 在 hooks 上的落点 —— hook 的 allow 只等于用户白名单，不等于绕过安全分析。
+///
+/// 口径与前端「自动」档一致：`opaque`（判不定）**不**强制弹卡，`dangerous` / 凭据命中才强制。
+fn hook_allow_needs_card(tool: &str, input: &Value) -> bool {
+    if matches!(tool, "Bash" | "PowerShell") {
+        if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+            return !bash_safety::analyze(cmd).dangerous.is_empty();
+        }
+    }
+    if matches!(tool, "Write" | "Edit") {
+        if let Some(text) = written_payload(tool, input) {
+            return !content_safety::analyze(text).is_clean();
+        }
+    }
+    false
+}
+
+/// 非工具类事件的统一入口：构造 payload → 跑 → 上报，返回这次运行（调用方看 `decision`）。
+fn fire_plain_hook(event: &str, cwd: &Path, payload: Value) -> hooks::Run {
+    let h = hooks::current();
+    if h.is_empty() {
+        return hooks::Run::default();
+    }
+    let mut payload = payload;
+    payload["session_id"] = json!("");
+    payload["hook_event_name"] = json!(event);
+    payload["cwd"] = json!(cwd.display().to_string());
+    let run = hooks::fire(&h, event, &payload);
+    report_hook_run(event, None, &run);
+    run
+}
+
 // ── 启动参数 ─────────────────────────────────────────────────────
 //
 // src-tauri 传的是上游 CLI 风格命令行，这里只挑对 P1/P2 有意义的几个：
@@ -1761,6 +1885,11 @@ fn main() {
         if cfg.token.is_empty() { "(empty)" } else { "(set)" }
     ));
 
+    // ── SessionStart hook（A9）──
+    // 落点：配置就绪、还没开始收 stdin。此时发出的 stdout 事件前端**可能还没挂上监听**
+    // （宿主刚 spawn 出 agent ⇒ 这一条的产出以落盘日志为主，前端可见为辅）。
+    fire_plain_hook("SessionStart", &tools_ctx.cwd, json!({ "model": cfg.model }));
+
     // stdin 读取线程 → 查询线程（mpsc 解耦）。
     // 解耦的意义：查询线程在等审批回包时会阻塞，stdin 必须另有线程持续 drain，
     // 否则 control_response 根本读不到（这正是 P2 的前提）。
@@ -1813,6 +1942,31 @@ fn main() {
                 // `[Attached files]` 包装文本，这条是给别的调用方兜底。
                 if prompt.trim().is_empty() {
                     prompt = "(the user attached image(s) with no text)".to_string();
+                }
+                // ── UserPromptSubmit hook（A9）──
+                // 能拦下**整轮提问**：提问不进历史、不烧 token。拦下的原因必须让用户看见
+                // （`result.subtype=hook_blocked` ⇒ 前端按错误行渲染并退回 idle），
+                // 否则表现就是「发了消息没反应」，最像卡死。
+                if let hooks::Decision::Deny(reason) =
+                    fire_plain_hook(
+                        "UserPromptSubmit",
+                        &tools_ctx.cwd,
+                        json!({ "prompt": prompt }),
+                    )
+                    .decision
+                {
+                    log::warn(format!("UserPromptSubmit hook 拦下本轮提问：{reason}"));
+                    emit(json!({
+                        "type": "result",
+                        "subtype": "hook_blocked",
+                        "is_error": true,
+                        "duration_ms": 0,
+                        "num_turns": 0,
+                        "result": format!("被 UserPromptSubmit hook 拦下：{reason}"),
+                        "session_id": "",
+                        "total_cost_usd": 0.0,
+                    }));
+                    continue;
                 }
                 run_query(
                     &cfg,
@@ -1880,6 +2034,10 @@ fn main() {
         }
     }
     log::info("=== agent exit (stdin closed) ===");
+    // ── SessionEnd hook（A9）──
+    // 上游（lunac.exe）已退出 / 主动关了 stdin ⇒ 这个 agent 进程的生命周期结束。
+    // 同样是「只做事、拦不住」的一类：脚本可以用它清理临时资源、发通知。
+    fire_plain_hook("SessionEnd", &tools_ctx.cwd, json!({}));
 }
 
 /// 把宿主送来的「用户 / 助手」纯文本消息列表转成 API 历史。
@@ -2328,16 +2486,32 @@ fn run_subagent(
                     "task_id": task_id, "round": round, "tool": name,
                 }));
             }
-            let denied = if spec.ask_permission
-                && tools::needs_approval(name)
-                && (!tctx.read_only || tools::gated_in_read_only(name))
-            {
-                match await_approval(open_approval(name, id, input), input) {
-                    Decision::Allow(_) => None,
-                    Decision::Deny(msg, _) => Some(msg),
+            // hooks（A9）：子代理里的每次工具调用**同样**过 PreToolUse / PermissionRequest
+            // —— 「派代理」那一次批准只覆盖派人这个动作，不覆盖它内部每次写操作（规则 14）。
+            let denied = match hook_tool_gate("PreToolUse", &tctx.cwd, name, id, input) {
+                HookGate::Deny(r) => Some(format!("Denied by PreToolUse hook: {r}")),
+                gate => {
+                    let allowed =
+                        matches!(gate, HookGate::Allow) && !hook_allow_needs_card(name, input);
+                    if !allowed
+                        && spec.ask_permission
+                        && tools::needs_approval(name)
+                        && (!tctx.read_only || tools::gated_in_read_only(name))
+                    {
+                        match hook_tool_gate("PermissionRequest", &tctx.cwd, name, id, input) {
+                            HookGate::Deny(r) => {
+                                Some(format!("Denied by PermissionRequest hook: {r}"))
+                            }
+                            HookGate::Allow if !hook_allow_needs_card(name, input) => None,
+                            _ => match await_approval(open_approval(name, id, input), input) {
+                                Decision::Allow(_) => None,
+                                Decision::Deny(msg, _) => Some(msg),
+                            },
+                        }
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                None
             };
             let (text, is_error) = run_one_tool(
                 tctx,
@@ -2346,6 +2520,7 @@ fn run_subagent(
                 // 所以这里不能写死。
                 bridge.as_deref_mut(),
                 spec.skills,
+                id,
                 name,
                 input,
                 denied.as_deref(),
@@ -2979,6 +3154,7 @@ fn run_one_tool(
     tctx: &tools::Ctx,
     mcp_bridge: Option<&mut mcp::Bridge>,
     skill_list: &[skills::Skill],
+    tool_use_id: &str,
     name: &str,
     run_input: &Value,
     denied: Option<&str>,
@@ -2990,10 +3166,31 @@ fn run_one_tool(
     // 它是**纯重复** —— 同一件事在 `run_tool()` 里已经由 `tool {name} ok (…ms, out … chars)
     // args=…` 记全了（连耗时和参数摘要都有），而它走 eprintln ⇒ 宿主把它以 **warn**
     // 级再镜像一遍。实测这一行 + `等待审批` 合计占 dev 日志行数的三分之一。
-    match run_tool(tctx, mcp_bridge, skill_list, name, run_input) {
+    let (mut text, is_error) = match run_tool(tctx, mcp_bridge, skill_list, name, run_input) {
         Ok(s) => (s, false),
         Err(e) => (format!("Error: {e}"), true),
+    };
+
+    // ── PostToolUse hook（A9）──
+    // 工具**已经跑完**，所以这里没有「拦」这回事：hook 的 stdout（以及退出码 2 的反馈）
+    // 一律**拼进 `tool_result` 的文本内部**回给模型 —— content 数组的形状与块数量都不变
+    // （规则 23），前端也照常能从 `system/hook_note` 看到。子代理与 fork 技能走的也是
+    // 这里，所以它们的工具调用同样有 PostToolUse。
+    let h = hooks::current();
+    if !h.is_empty() {
+        let mut payload =
+            hook_tool_payload("PostToolUse", &tctx.cwd, name, tool_use_id, run_input);
+        // 回灌文本可能很长（已由 apply_budget 截断过），这里再取一段给 hook：
+        // hook 关心的是「发生了什么」，不必看全文。
+        let brief: String = text.chars().take(4000).collect();
+        payload["tool_response"] = json!({ "is_error": is_error, "text": brief });
+        let run = hooks::fire(&h, "PostToolUse", &payload);
+        report_hook_run("PostToolUse", Some(name), &run);
+        if let Some(note) = run.model_note() {
+            text = format!("{text}\n\n[PostToolUse hook]\n{note}");
+        }
     }
+    (text, is_error)
 }
 
 /// 把一轮的工具调用切成执行批：**连续的**只读调用合成一批（批内并行，见
@@ -3197,6 +3394,8 @@ fn run_query(
             let grew_enough =
                 measured > cfg.last_compact.get() + (budget as f64 * COMPACT_MIN_GROWTH) as u64;
             if ratio > DROP_RATIO {
+                // PreCompact hook（A9）：压缩**之前**发，让用户脚本能记录「这次压了什么水位」
+                fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "drop" }));
                 let out = compact_history(history, Compact::Drop, measured);
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 // 摘要压缩（backlog §8.2）：丢弃档是它**唯一**的常规触发点 ——
@@ -3344,6 +3543,7 @@ fn run_query(
             // 上下文超限 → 强制压缩后再试一次（水位估算失准时靠这条兜底）
             if status == 400 && !compacted_for_retry && context_related_error(&detail) {
                 compacted_for_retry = true;
+                fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "force" }));
                 let out = compact_history(history, Compact::Force, cfg.last_input.get());
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 // 兜底档也做摘要 —— 这一档丢弃量最大（连尾部都瘦），摘要在此时最值钱
@@ -3650,16 +3850,44 @@ fn run_query(
         // 问了也是白问。放行的那三件（WebSearch / WebFetch / AskUserQuestion）
         // 必须照问：搜索查询词与抓取的目标 URL 都是外部出口，后者的答案只能
         // 从卡片上取（见 gated_in_read_only）。
+        // ── PreToolUse hooks（A9）──
+        // 这一遍覆盖**全部**工具调用（不只是要审批的那些）：hook 的 deny 对只读工具
+        // 同样有效。它与工作区锁、审批卡是「与」关系，谁都不能把谁抵掉。
+        let hook_gates: Vec<HookGate> = calls
+            .iter()
+            .map(|(id, name, input)| hook_tool_gate("PreToolUse", &tctx.cwd, name, id, input))
+            .collect();
+
         let mut pendings: Vec<Option<Pending>> = Vec::with_capacity(calls.len());
-        for (id, name, input) in &calls {
-            let ask = ask_permission
-                && needs_approval_with(name, input, skill_list)
-                && (!tctx.read_only || tools::gated_in_read_only(name));
-            if ask {
-                pendings.push(Some(open_approval(name, id, input)));
-            } else {
-                pendings.push(None);
+        let mut hook_denied: Vec<Option<String>> = Vec::with_capacity(calls.len());
+        for ((id, name, input), gate) in calls.iter().zip(hook_gates) {
+            let mut pending = None;
+            let mut denied = None;
+            match gate {
+                HookGate::Deny(r) => denied = Some(format!("Denied by PreToolUse hook: {r}")),
+                _ => {
+                    // hook 放行 ⇒ 只剩「安全分析命中」这一种情况还能把卡叫回来
+                    let allowed = matches!(gate, HookGate::Allow)
+                        && !hook_allow_needs_card(name, input);
+                    let ask = !allowed
+                        && ask_permission
+                        && needs_approval_with(name, input, skill_list)
+                        && (!tctx.read_only || tools::gated_in_read_only(name));
+                    if ask {
+                        // PermissionRequest（A9）：只在「本来就要弹卡」的这一刻问 ——
+                        // 它能替用户答这一问（allow = 免卡，deny = 直接拒）
+                        match hook_tool_gate("PermissionRequest", &tctx.cwd, name, id, input) {
+                            HookGate::Deny(r) => {
+                                denied = Some(format!("Denied by PermissionRequest hook: {r}"))
+                            }
+                            HookGate::Allow if !hook_allow_needs_card(name, input) => {}
+                            _ => pending = Some(open_approval(name, id, input)),
+                        }
+                    }
+                }
             }
+            pendings.push(pending);
+            hook_denied.push(denied);
         }
 
         // 先把审批**按原顺序**全部解完（审批是阻塞等用户，且顺序不能乱：前端按
@@ -3667,9 +3895,10 @@ fn run_query(
         let mut interrupted = false;
         let mut run_inputs: Vec<Value> = Vec::with_capacity(calls.len());
         let mut denieds: Vec<Option<String>> = Vec::with_capacity(calls.len());
-        for ((_id, _name, input), pending) in calls.iter().zip(pendings.into_iter()) {
+        for (i, ((_id, _name, input), pending)) in calls.iter().zip(pendings.into_iter()).enumerate() {
             let mut run_input = input.clone();
-            let mut denied: Option<String> = None;
+            // hook 的拒绝先落座；审批卡只可能再补一个拒绝，不可能把它翻回来
+            let mut denied: Option<String> = hook_denied[i].clone();
             if let Some(p) = pending {
                 match await_approval(p, input) {
                     Decision::Allow(approved) => run_input = approved,
@@ -3734,6 +3963,7 @@ fn run_query(
                         tctx,
                         mcp_bridge.as_deref_mut(),
                         skill_list,
+                        &calls[i].0,
                         &calls[i].1,
                         &run_inputs[i],
                         denieds[i].as_deref(),
@@ -3769,6 +3999,7 @@ fn run_query(
                                         tctx,
                                         None,
                                         skill_list,
+                                        &calls_ref[i].0,
                                         &calls_ref[i].1,
                                         &inputs_ref[i],
                                         denieds_ref[i].as_deref(),
@@ -3859,6 +4090,11 @@ fn run_query(
             "requests": req_log,
         },
     }));
+
+    // ── Stop hook（A9）──
+    // 只在**成功收尾**时发（出错走 finish_error，本轮是被放弃的，不该报「回答完成」）。
+    // 它拦不住任何东西（回答已经产出），用途是用户脚本的收尾动作：统计、通知、清理。
+    fire_plain_hook("Stop", &tctx.cwd, json!({}));
 }
 
 /// 出错时收尾：把本轮压入的所有消息（user / assistant / tool_result）
