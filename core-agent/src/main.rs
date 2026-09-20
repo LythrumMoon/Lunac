@@ -275,14 +275,19 @@ const COMPACT_MIN_GROWTH: f64 = 0.15;
 const COMPACT_KEEP_TAIL: usize = 8;
 /// tool_result 内容超过该字符数才算「值得瘦身的大块」
 const ELIDE_TOOL_RESULT_CHARS: usize = 2_000;
-/// 瘦身档的「值不值得」闸门：**可省体积至少要占当前上下文这么大比例**，否则宁可不压。
+/// 端点侧前缀缓存的**命中折扣**：命中价 = miss 价 ÷ N（当前供应商 DeepSeek 的公开价差是 1/50）。
 ///
-/// 为什么需要：瘦身是**就地改写较早的消息**，端点侧从被改的那条起就再也匹配不上
-/// 已落盘的缓存前缀单元（DS 的命中要求「完整匹配缓存前缀单元」）—— 省一点点却让
-/// 后面整段失效是**净亏**。旧实现只要水位过 0.85 就压，于是长会话里频繁出现
-/// 「省了 2% 体积、废掉 60% 前缀」。**只加在瘦身档**（可选档）；丢弃档与 400
-/// 兜底档是安全刚需，照旧无条件压（见 ai-spec §11 规则 23）。
-const ELIDE_MIN_SAVINGS_RATIO: f64 = 0.05;
+/// **只当相对权重用**（这里不做任何金额计算）：本仓「价格不写进代码」那条纪律针对的是
+/// 成本面板要展示的单价（`config\pricing.json`，A12）；这个常数只决定闸门的松紧，
+/// 配大了只是更保守、不会算出错的金额。
+const CACHE_HIT_DISCOUNT: u64 = 50;
+/// 瘦身一次至少要能在**后续这么多次请求**里回本才动手（保守下界）。
+///
+/// 为什么是 50：一次提问常常就有 10–17 次请求，而瘦身省下的体积是**永久**的
+/// （被瘦身的那条消息此后一直是短文本，跟着会话活下去）⇒ 受益面远不止本轮的剩余轮数。
+/// 取与折扣同量级是最保守的写法，于是判据收敛成一句好记的话：**省下的要多于废掉的**。
+/// 详见 `worthwhile_elisions()` 的推导与 `docs/ai-spec.md` §11 规则 23。
+const ELIDE_PAYBACK_REQUESTS: u64 = 50;
 /// 估算字符→token 的经验系数（不引 tokenizer；同 Hermes 的估算口径）
 const CHARS_PER_TOKEN: f64 = 4.0;
 /// 单条用户输入上限（防一次粘贴把整个窗口顶爆）
@@ -462,8 +467,93 @@ struct CompactOutcome {
     pinned: usize,
 }
 
-/// 压缩历史。`measured_tokens` = 上一轮实测的上下文体积（0 = 未知），
-/// 只喂给瘦身档的「值不值得」闸门（见 ELIDE_MIN_SAVINGS_RATIO）。
+/// 瘦身档的成本模型算出来的一个方案（`picked` 为空 = 判定「不值得压」）。
+///
+/// `sigma` / `delta` / `net` 是**判据本身用的那几个数**，一并带出来只为日志 ——
+/// 事后复盘时不必再猜「当时为什么压了 / 为什么没压」。
+struct ElidePlan {
+    picked: Vec<(usize, usize, usize)>,
+    /// 省下的字符数（永久省）
+    sigma: usize,
+    /// 被作废的后缀字符数（改完要全价重发一次的那部分）
+    delta: usize,
+    /// `σ × ELIDE_PAYBACK_REQUESTS − Δ × CACHE_HIT_DISCOUNT`（> 0 才值得动手）
+    net: i128,
+}
+
+/// 瘦身档的**成本模型**（A15，2026-09-21）：从候选里挑出「值得动」的那一段。
+///
+/// 收益与代价都用**字符数**（两侧同系数，所以不必换算成 token）：
+///   σ = 省下的字符 —— 这条消息此后每次请求都少发这些，而且**永久**（会话继续活着）
+///   Δ = 被作废的后缀字符 —— `history[k..]` 瘦身之后再剩下的部分：改过之后它与端点侧
+///       已落盘的缓存对不上，要**全价（miss）重发一次**，命中价是它的 1/50
+/// 判据（两个常数的出处见各自注释）：
+///   `σ × ELIDE_PAYBACK_REQUESTS > Δ × CACHE_HIT_DISCOUNT`
+/// 白话：**省下的体积要真的多于被作废的体积**，否则就是「省小废大」。
+///
+/// 为什么只需要枚举一个下标 k：给定「最靠前被瘦身的那个块」k，**把 k 之后的候选全瘦掉
+/// 永远不比只瘦一部分差** —— σ 变大、Δ 变小，两头都改善。所以自由度只有一个：k 定在哪。
+/// 这里在候选下标上枚举（后缀和 O(1) 取值），取净收益最大的那个。
+///
+/// 注意这条判据管的是「**要不要**压」；`Drop` / `Force` 两档是防 400 的安全刚需，
+/// 照旧**无条件**压，不走这里（见 `compact_history()` 的调用点）。
+fn worthwhile_elisions(history: &[Value], candidates: &[(usize, usize, usize)]) -> ElidePlan {
+    let empty = ElidePlan { picked: Vec::new(), sigma: 0, delta: 0, net: 0 };
+    if candidates.is_empty() {
+        return empty;
+    }
+    let n = history.len();
+    // 逐条消息的 JSON 字符数：Δ 要算「k 之后剩下的全部」，不只是候选块本身
+    let msg_chars: Vec<usize> = history
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap_or_default().chars().count())
+        .collect();
+    let mut suffix_msg = vec![0usize; n + 1];
+    for i in (0..n).rev() {
+        suffix_msg[i] = suffix_msg[i + 1].saturating_add(msg_chars[i]);
+    }
+    // 候选块先按消息聚合，再做后缀和（同一条消息里可能不止一个可瘦的块）
+    let mut cand_at = vec![0usize; n + 1];
+    for (mi, _, chars) in candidates {
+        if *mi < n {
+            cand_at[*mi] = cand_at[*mi].saturating_add(*chars);
+        }
+    }
+    let mut suffix_cand = vec![0usize; n + 1];
+    for i in (0..n).rev() {
+        suffix_cand[i] = suffix_cand[i + 1].saturating_add(cand_at[i]);
+    }
+
+    let mut best: Option<(usize, usize, usize, i128)> = None; // (k, σ, Δ, net)
+    for &(mi, _, _) in candidates {
+        if best.map(|(k, _, _, _)| k) == Some(mi) {
+            continue;
+        }
+        let sigma = suffix_cand[mi];
+        let delta = suffix_msg[mi].saturating_sub(sigma);
+        let net = sigma as i128 * ELIDE_PAYBACK_REQUESTS as i128
+            - delta as i128 * CACHE_HIT_DISCOUNT as i128;
+        if best.map(|(_, _, _, b)| net > b).unwrap_or(true) {
+            best = Some((mi, sigma, delta, net));
+        }
+    }
+    match best {
+        Some((k, sigma, delta, net)) if net > 0 => ElidePlan {
+            picked: candidates
+                .iter()
+                .cloned()
+                .filter(|(mi, _, _)| *mi >= k)
+                .collect(),
+            sigma,
+            delta,
+            net,
+        },
+        Some((_, sigma, delta, net)) => ElidePlan { picked: Vec::new(), sigma, delta, net },
+        None => empty,
+    }
+}
+
+/// 压缩历史。`measured_tokens` = 上一轮实测的上下文体积（0 = 未知），只进日志。
 fn compact_history(
     history: &mut Vec<Value>,
     mode: Compact,
@@ -476,7 +566,7 @@ fn compact_history(
     let elide_keep = if force { 2 } else { COMPACT_KEEP_TAIL };
     let tail_start = history.len().saturating_sub(elide_keep);
 
-    // 先**只统计**能省多少，再决定动不动手（原因见 ELIDE_MIN_SAVINGS_RATIO）。
+    // 先**只统计**、再由成本模型决定动不动手（推导见 `worthwhile_elisions()`）。
     let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
     for (mi, msg) in history.iter().enumerate().take(tail_start) {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
@@ -494,19 +584,34 @@ fn compact_history(
             }
         }
     }
-    let savable: usize = candidates.iter().map(|(_, _, n)| *n).sum();
-    let needed = (measured_tokens as f64 * ELIDE_MIN_SAVINGS_RATIO * CHARS_PER_TOKEN) as usize;
-    let skip_elide = mode == Compact::Elide && savable < needed;
+    // 成本模型只在**瘦身档**生效（它是可选档：压不压都能跑）。
+    // `Drop`（0.95 水位）与 `Force`（400 兜底）是**安全刚需** —— 不压就可能撞上限，
+    // 所以这两档照旧无条件瘦，不看收益；Force 还连尾部也瘦（`elide_keep = 2`）。
+    let plan = if mode == Compact::Elide {
+        worthwhile_elisions(history, &candidates)
+    } else {
+        let sigma: usize = candidates.iter().map(|(_, _, n)| *n).sum();
+        ElidePlan { picked: candidates.clone(), sigma, delta: 0, net: 0 }
+    };
+    let skip_elide = mode == Compact::Elide && plan.picked.is_empty();
 
     let mut elided = 0usize;
     let mut elided_chars = 0usize;
     if skip_elide {
-        eprintln!(
-            "[agent] 跳过瘦身：可省 {savable} 字 < 阈值 {needed} 字（上下文≈{measured_tokens} tokens）\
-             —— 省下的体积不够抵偿前缀失效，等长够了再压"
-        );
+        // 判为「省小废大」：**一个字都不动**（动了就是白废一段前缀缓存）。
+        // 与旧实现的关键差别：旧闸门只看「可省体积占上下文的比例」，看不见代价的
+        // 位置 —— 于是「省 2%、废 60%」这种压法也能过闸（A15 的起因）。
+        //
+        // 数字写成 `sigma=/delta=/net=` 这种 `key=value`（与 A16 的 `请求前缀` 行同风格）：
+        // 中文散文给人看，键值给机器取 —— `target\hooktest\e2e-a15.ps1` 就是靠它们
+        // 断言的（PS 5.1 脚本是 ANSI，脚本里没法写中文模式串）。
+        log::info(format!(
+            "跳过瘦身 sigma={} delta={} net={} ctx={} tokens \
+             —— 判为省小废大（省下的不比废掉的多），一个字都不动",
+            plan.sigma, plan.delta, plan.net, measured_tokens
+        ));
     } else {
-        for (mi, bi, n) in &candidates {
+        for (mi, bi, n) in &plan.picked {
             let Some(block) = history
                 .get_mut(*mi)
                 .and_then(|m| m.get_mut("content"))
@@ -518,6 +623,14 @@ fn compact_history(
             block["content"] = json!(format!("[elided: {n} chars dropped to save context]"));
             elided += 1;
             elided_chars += n;
+        }
+        if mode == Compact::Elide && elided > 0 {
+            // 与上面那条「上下文压缩」汇总行配套：这里把**决策依据**也落一行，
+            // 事后复盘不必再猜「当时为什么压这一段」（A15 的埋点口径）。
+            log::info(format!(
+                "瘦身决策 sigma={} delta={} net={} ctx={} tokens —— 省大废小，动手（命中折扣 {}×）",
+                elided_chars, plan.delta, plan.net, measured_tokens, CACHE_HIT_DISCOUNT
+            ));
         }
     }
 
@@ -4707,46 +4820,126 @@ mod tests {
         );
     }
 
-    /// 造一段历史：开头是用户提问，中间塞一条大 tool_result，尾部留 COMPACT_KEEP_TAIL 条。
-    fn history_with_big_tool_result(chars: usize) -> (Vec<Value>, Value) {
-        let big = json!("x".repeat(chars));
+    /// 造一段历史：`tool_chars` 大小的 tool_result 躺在**瘦身范围**里，其后是
+    /// `COMPACT_KEEP_TAIL` 条 `tail_chars` 大小的文本消息（都在保留尾部里）。
+    ///
+    /// 尾部大小是构造「净亏」局面的旋钮：尾部**不是候选**（不在瘦身范围），瘦身也不动它，
+    /// 所以它只进 Δ —— `tail_chars × COMPACT_KEEP_TAIL > tool_chars` 就是「省小废大」。
+    fn history_for_elide(tool_chars: usize, tail_chars: usize) -> (Vec<Value>, Value) {
+        let big = json!("x".repeat(tool_chars));
         let mut history = vec![
             json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
             json!({"role":"user","content":[{"type":"tool_result","content":big.clone()}]}),
         ];
         for i in 0..COMPACT_KEEP_TAIL {
-            history.push(json!({"role":"user","content":[{"type":"text","text":format!("t{i}")}]}));
+            history.push(json!({"role":"user","content":[
+                {"type":"text","text":format!("t{i}:{}", "y".repeat(tail_chars))}
+            ]}));
         }
         (history, big)
     }
 
-    /// 瘦身档的「值不值得」闸门：省得不够多就不许动历史（动了会让其后整段前缀失效）
+    /// 成本模型（A15）：**省下的 < 废掉的** ⇒ 一个字都不许动。
+    ///
+    /// 旧闸门只看「可省体积 ÷ 上下文体积」，看不见**代价的位置** —— 这里刻意造出
+    /// 「总量很小、但被改的那条后面拖着一整段」（省 3000 / 废 2.4 万）：旧闸门会放行，
+    /// 新模型必须否决 —— 放行就是白废一段前缀缓存（A15 的起因）。
     #[test]
-    fn elide_is_skipped_when_savings_are_too_small() {
-        let (mut history, big) = history_with_big_tool_result(3_000);
-        // 上下文 10 万 token → 阈值 = 100000 × 0.05 × 4 = 20000 字 ≫ 可省 3000 字
+    fn elide_is_skipped_when_it_costs_more_than_it_saves() {
+        let (mut history, big) = history_for_elide(3_000, 3_000);
         let out = compact_history(&mut history, Compact::Elide, 100_000);
-        assert_eq!(out.elided, 0, "省得不够多时不该瘦身");
-        assert_eq!(history[1]["content"][0]["content"], big, "历史必须原样保留");
-
-        // 上下文小到阈值（1000 token → 200 字）以下 → 允许瘦身
-        let out = compact_history(&mut history, Compact::Elide, 1_000);
-        assert_eq!(out.elided, 1);
-        assert_ne!(history[1]["content"][0]["content"], big);
+        assert_eq!(out.elided, 0, "省 3000 废 2.4 万 ⇒ 判为省小废大，不该动手");
+        assert_eq!(out.dropped, 0, "瘦身档永不丢弃整条消息");
+        assert_eq!(history[1]["content"][0]["content"], big, "历史必须逐字节原样保留");
     }
 
-    /// 丢弃档 / 400 兜底档是安全刚需 —— 不受上面那道闸门约束
+    /// 成本模型：**省下的 > 废掉的** ⇒ 动手。
     #[test]
-    fn drop_mode_ignores_the_savings_gate() {
-        let (mut history, big) = history_with_big_tool_result(3_000);
-        let out = compact_history(&mut history, Compact::Drop, 100_000);
+    fn elide_proceeds_when_it_saves_more_than_it_costs() {
+        let (mut history, big) = history_for_elide(30_000, 1_000);
+        let out = compact_history(&mut history, Compact::Elide, 100_000);
         assert_eq!(out.elided, 1);
+        assert_ne!(history[1]["content"][0]["content"], big);
+        let text = history[1]["content"][0]["content"].as_str().unwrap();
+        assert!(text.starts_with("[elided:"), "瘦身后要留下占位标记：{text}");
+    }
+
+    /// 成本模型只动**净收益最大**的那一段：靠前那条大块若「连累的后缀太长」就留着不动。
+    ///
+    /// 这正是 backlog 候选手段②「瘦身从靠近尾部开始」的自然结果 —— 枚举「最靠前被瘦身的块」
+    /// 取净收益最大的 k，不必另加规则。
+    #[test]
+    fn elide_picks_the_segment_with_the_best_net_gain() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"user","content":[{"type":"tool_result","content":"a".repeat(3_000)}]}),
+            // 中间夹一段**非候选**的大文本：动上面那条要连它一起作废 ⇒ 不划算
+            json!({"role":"assistant","content":[{"type":"text","text":"z".repeat(50_000)}]}),
+            json!({"role":"user","content":[{"type":"tool_result","content":"b".repeat(30_000)}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL {
+            history.push(json!({"role":"user","content":[{"type":"text","text":format!("t{i}")}]}));
+        }
+        let out = compact_history(&mut history, Compact::Elide, 100_000);
+        assert_eq!(out.elided, 1, "只该动净收益更大的那一条（靠后那条）");
+        assert_eq!(
+            history[1]["content"][0]["content"].as_str().map(str::len),
+            Some(3_000),
+            "靠前那条要原样留着 —— 动它得连 5 万字一起作废"
+        );
+        assert!(
+            history[3]["content"][0]["content"].as_str().unwrap().starts_with("[elided:"),
+            "靠后那条（后缀短 ⇒ 净收益胜出）应当被瘦身"
+        );
+    }
+
+    /// `Drop` / `Force` 是防 400 的安全刚需 —— **不走成本模型**：净亏也照压。
+    #[test]
+    fn drop_and_force_ignore_the_cost_model() {
+        let (mut history, big) = history_for_elide(3_000, 3_000);
+        let out = compact_history(&mut history, Compact::Drop, 100_000);
+        assert_eq!(out.elided, 1, "Drop 是水位刚需，不许被成本模型拦下");
         assert_eq!(out.dropped, 0, "砍得动 tool_result 时不必丢整条消息");
         assert_ne!(history[1]["content"][0]["content"], big);
 
-        let (mut history, _) = history_with_big_tool_result(3_000);
+        let (mut history, _) = history_for_elide(3_000, 3_000);
         let out = compact_history(&mut history, Compact::Force, 100_000);
-        assert_eq!(out.elided, 1);
+        assert_eq!(out.elided, 1, "Force 是 400 兜底，不许被成本模型拦下");
+    }
+
+    /// 判据本体是纯函数：**位置**决定收益（σ）与代价（Δ），钉死四种局面。
+    #[test]
+    fn worthwhile_elisions_decides_by_positions() {
+        let text = |s: &str| json!({"role":"user","content":[{"type":"text","text":s}]});
+        let tool = |n: usize| {
+            json!({"role":"user","content":[{"type":"tool_result","content":"x".repeat(n)}]})
+        };
+
+        // ① 没有候选 → 什么都不做
+        let p = worthwhile_elisions(&[text("hi")], &[]);
+        assert!(p.picked.is_empty() && p.sigma == 0 && p.delta == 0 && p.net == 0);
+
+        // ② 单候选、后面拖着一大段非候选 ⇒ 净亏：否决，但把数字带出来供日志
+        let h = vec![text("hi"), tool(3_000), text(&"z".repeat(50_000))];
+        let p = worthwhile_elisions(&h, &[(1, 0, 3_000)]);
+        assert!(p.net < 0, "省 3000 废 5 万 ⇒ 净亏：{}", p.net);
+        assert!(p.picked.is_empty(), "净亏时不许挑出任何一段");
+        assert_eq!(p.sigma, 3_000);
+        assert!(p.delta > 50_000, "Δ 要把后缀里那段非候选也算进去：{}", p.delta);
+
+        // ③ 后缀里两条候选：最好的 k 在最靠前 ⇒ k 之后**全瘦**，σ 是后缀候选之和
+        let h = vec![text("hi"), tool(3_000), tool(30_000)];
+        let p = worthwhile_elisions(&h, &[(1, 0, 3_000), (2, 0, 30_000)]);
+        assert!(p.net > 0);
+        assert_eq!(p.sigma, 33_000);
+        assert_eq!(p.picked.len(), 2);
+
+        // ④ 两条候选中间夹一大段非候选 ⇒ 最优的 k 落在**后面**那条
+        let h = vec![text("hi"), tool(3_000), text(&"z".repeat(200_000)), tool(30_000)];
+        let p = worthwhile_elisions(&h, &[(1, 0, 3_000), (3, 0, 30_000)]);
+        assert_eq!(p.picked, vec![(3, 0, 30_000)], "只挑净收益最大的那一段");
+        assert_eq!(p.sigma, 30_000);
+        assert!(p.net > 0);
     }
 
     /// backlog §8.3：丢弃历史时，「当前任务清单」必须活下来（否则模型会跑偏）。
