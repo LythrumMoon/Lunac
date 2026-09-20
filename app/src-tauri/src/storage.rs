@@ -67,6 +67,11 @@ pub struct AiConfig {
     pub search_provider: String,
     #[serde(default)]
     pub search_key: String,
+    /// 当前模型是否支持图片输入（A8，2026-09-20）。**默认关** —— 发给不支持视觉的
+    /// 端点（如 DeepSeek 官方端点）会 400，所以由用户显式打开；开着时前端才会把
+    /// 图片附件作为 `image` 块发出去（见 ai-spec §3.5「图片附件」/ §11 规则 60）。
+    #[serde(default)]
+    pub vision: bool,
 }
 
 fn ai_config_path() -> PathBuf {

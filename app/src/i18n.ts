@@ -2115,6 +2115,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "실행 방식(입력줄 캡슐)은 '물어볼지', 보안 단계는 '허용할지'를 정합니다. 읽기 전용은 쓰기를 거부하고, 완전은 작업 공간 제한을 무시합니다. 전환하면 Agent가 재시작됩니다.",
     "en": "Run mode (the pill in the input bar) decides whether to ask; the security level decides what is allowed — read-only rejects writes outright, full ignores the workspace limit. Switching restarts the agent.",
   },
+  "settings.ai_vision": {
+    "zh-CN": "模型支持图片输入",
+    "zh-TW": "模型支援圖片輸入",
+    "ja": "モデルが画像入力に対応",
+    "ko": "모델이 이미지 입력 지원",
+    "en": "Model accepts image input",
+  },
+  "settings.ai_vision_hint": {
+    "zh-CN": "只有当前模型真的能看图时才打开：打开后附件里的图片（PNG / JPEG / GIF / WebP）会作为图片内容直接发给模型；关着时只把路径当文本给它。发给不支持图片的端点会直接报错（DeepSeek 官方端点不支持）。",
+    "zh-TW": "只有當前模型真的能看圖時才開啟：開啟後附件裡的圖片（PNG / JPEG / GIF / WebP）會作為圖片內容直接傳給模型；關著時只把路徑當文字給它。傳給不支援圖片的端點會直接報錯（DeepSeek 官方端點不支援）。",
+    "ja": "現在のモデルが実際に画像を扱える場合のみオンにしてください。オンにすると添付画像（PNG / JPEG / GIF / WebP）が画像そのものとして送信されます。オフの場合はパスのみをテキストで渡します。画像非対応のエンドポイントに送るとエラーになります（DeepSeek 公式エンドポイントは非対応）。",
+    "ko": "현재 모델이 실제로 이미지를 볼 수 있을 때만 켜세요. 켜면 첨부 이미지(PNG / JPEG / GIF / WebP)가 이미지 자체로 전송됩니다. 끄면 경로만 텍스트로 전달합니다. 이미지를 지원하지 않는 엔드포인트로 보내면 오류가 납니다(DeepSeek 공식 엔드포인트는 미지원).",
+    "en": "Turn this on only if the current model can actually see images: attachments (PNG / JPEG / GIF / WebP) are then sent as real image content. When off, only their paths go to the model as text. Sending images to an endpoint that does not support them fails outright (the official DeepSeek endpoint does not).",
+  },
   "settings.agent_autofold": {
     "zh-CN": "自动折叠思考与工具过程",
     "zh-TW": "自動收合思考與工具過程",

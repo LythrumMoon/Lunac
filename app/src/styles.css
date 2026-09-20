@@ -1709,6 +1709,9 @@ html, body {
 .sys-note > summary::-webkit-details-marker { display: none; }
 .sys-note > summary:hover { color: var(--text); }
 .sys-note-error > summary { color: var(--red); opacity: 0.85; }
+/* 附件未能发送（A8）：与 error 同级但**不是错误** —— 图片没发出去多半是格式 / 体积 /
+   张数问题，用户改一下就能重试，所以用黄而不是红。 */
+.sys-note-warn > summary { color: var(--yellow); opacity: 0.85; }
 .sys-note-body {
   margin: 4px 0 0 0;
   font-family: ui-monospace, Consolas, monospace;

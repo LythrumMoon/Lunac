@@ -732,6 +732,13 @@ let isVisible = false;
 let currentResults: Plugin[] = [];
 let currentApps: AppEntry[] = [];   // app results for Enter key handling
 let attachedFiles: string[] = [];   // files dragged/pasted into search bar
+/** 能作为 `image` 块发给端点的图片类型（A8）。
+ *
+ *  刻意**比 OCR 用的 `imageExtensions` 窄** —— 端点只认 PNG / JPEG / GIF / WebP，
+ *  BMP / TIFF / ICO 发过去必被拒，那些类型仍走老路（路径文本交给模型）。
+ *  这里只管「值不值得走新路」，类型最终由 agent 按**魔术字节**复核。
+ *  是否启用见设置面板「模型支持图片输入」（存 ai.json，**默认关**）。 */
+const VISION_IMAGE_RE = /\.(png|jpe?g|gif|webp)$/i;
 let selectedIndex = 0;
 
 // ── Unified render order ─────────────────────────────────────────
@@ -3073,6 +3080,9 @@ interface CliEventLine {
    *  `reason` 只有进入时才有（模型给用户的一句话说明）。 */
   state?: string;
   reason?: string;
+  /** system/attachment_note（图片附件，A8）：本轮**没能发出去**的附件及原因。
+   *  只有真有失败项时才发这个事件（见 renderAttachmentNote）。 */
+  skipped?: { path?: string; reason?: string }[];
   request?: {
     subtype?: string;
     tool_name?: string;
@@ -4309,6 +4319,30 @@ function clearPlanModeNotice() {
   planModeNotice = null;
 }
 
+/** 附件没能随本轮发送的如实提示（A8）。
+ *
+ *  agent 侧「按路径读图」可能整张读不出来（文件被移走 / 扩展名与内容不符 / 超过单图上限
+ *  / 一次给太多张）—— 那些块会**静默消失**在请求里，用户只会看到模型说「我看不到图」。
+ *  所以这里把每条失败的**原因**摆在明面上。与 `[Attached files]` 文本互补：文本始终是
+ *  路径清单，这条说的是「这一轮实际发出去几张、其余为什么没发」。 */
+function renderAttachmentNote(skipped: { path?: string; reason?: string }[]) {
+  if (!Array.isArray(skipped) || skipped.length === 0) return;
+  const host = agentView?.flow ?? resultsList;
+  const det = document.createElement("details");
+  det.className = "sys-note sys-note-warn";
+  det.innerHTML = `<summary></summary><pre class="sys-note-body"></pre>`;
+  const sum = det.querySelector("summary");
+  if (sum) sum.textContent = t("agent.attachment_skipped", { n: String(skipped.length) });
+  const body = det.querySelector<HTMLElement>(".sys-note-body");
+  if (body) {
+    body.textContent = skipped
+      .map((s) => `${s.path || "?"} — ${s.reason || "?"}`)
+      .join("\n");
+  }
+  host.appendChild(det);
+  agentScroll();
+}
+
 /** 权限卡里命令文本的**显示**归一化（纯排版，不改实际执行的命令）。
  *
  *  模型经常把命令写成「首行空白 + 后续行统一缩进」的多行串，而 `.approval-cmd`
@@ -4708,6 +4742,10 @@ listen<{ line: string }>("cli-output", (event) => {
     // 前端**只镜像**这个状态，不自己推断（理由见 renderPlanModeNotice）。
     else if (data.type === "system" && data.subtype === "plan_mode") {
       renderPlanModeNotice(String(data.state ?? ""), String(data.reason ?? ""));
+    }
+    // 附件未发送的如实提示（A8）：agent 按路径读图失败 / 超限时才会来这一条
+    else if (data.type === "system" && data.subtype === "attachment_note") {
+      renderAttachmentNote(Array.isArray(data.skipped) ? data.skipped : []);
     }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {
@@ -5816,11 +5854,14 @@ function pruneContext(messages: Array<{ role: string; content: string }>, maxTur
   return [...systemHints, ...kept];
 }
 
-async function startAgentChat(query: string) {
+async function startAgentChat(query: string, imagePaths: string[] = []) {
   // Reset failure counter for new conversation (ai-spec §17.2)
   consecutiveFailures = 0;
   // File info is already merged into query by startAIChat.
-  // (Retry path passes the stored finalQuery directly.)
+  // (Retry path passes the stored finalQuery directly — 那时没有图片块，附件仍以
+  //  `[Attached files]` 文本里的路径交给模型。)
+  // A8：`imagePaths` 只装**图片附件**的路径；真正发不发由这里按
+  // 「模型支持图片输入」开关（ai.json）决定，见下面拼 content 的地方。
   const finalQuery = query;
 
   // If CLI not ready, start it and queue this query for retry
@@ -6040,13 +6081,32 @@ async function startAgentChat(query: string) {
   liveCompaction = { elided: 0, dropped: 0 };
 
   try {
+    // 图片附件（A8）：只有在设置里断言过「当前模型支持图片输入」时，才把图片附件作为
+    // 真正的 `image` 块发出去（块里**只带路径**，字节由 agent 按路径读出来 —— 见
+    // ai-spec §3.5「图片附件」）。开关关着时一切照旧。
+    // **`[Attached files]` 文本无论如何都保留**：它承载「哪个路径对应哪张图」的对应
+    // 关系，也是历史 / 标题 / 复制三条旧路径的唯一依据（契约要求文本不变）。
+    const content: { type: string; text?: string; source?: { type: string; path: string } }[] = [
+      { type: "text", text: wrappedQuery },
+    ];
+    if (imagePaths.length > 0) {
+      let vision = false;
+      try {
+        vision = !!(await invoke<{ vision?: boolean }>("get_ai_config"))?.vision;
+      } catch { /* 读不到就按关处理：宁可不发图片块，也不要打给不支持的端点 */ }
+      if (vision) {
+        for (const f of imagePaths) {
+          content.push({ type: "image", source: { type: "file", path: f } });
+        }
+      }
+    }
     // Send NDJSON message to CLI (must include session_id and parent_tool_use_id)
     const msg = JSON.stringify({
       type: "user",
       session_id: "",
       message: {
         role: "user",
-        content: [{ type: "text", text: wrappedQuery }]
+        content
       },
       parent_tool_use_id: null,
     });
@@ -6160,7 +6220,8 @@ async function startAIChat(query: string, files?: string[]) {
 
   // Agent mode → use CLI subprocess (finalQuery already carries file info).
   // Simple mode (built-in chat.rs) was removed — see ai-spec §11 changelog.
-  await startAgentChat(finalQuery);
+  // A8：图片附件另外以 `image` 块带给 agent（开关关着 / 非图片类型时不带）。
+  await startAgentChat(finalQuery, hasAttach ? fileArr.filter(f => VISION_IMAGE_RE.test(f)) : []);
 }
 
 // Make startAIChat accessible from plugins (ai-agent.ts)

@@ -682,6 +682,13 @@ fn apply_ai_config(cfg: &crate::storage::AiConfig) {
     } else {
         env::set_var("AI_SEARCH_KEY", cfg.search_key.trim());
     }
+    // 图片输入开关（A8）：只在真开时留一个 `AI_VISION=1`，关着就**删掉变量** ——
+    // `get_ai_config` 用它回读，缺变量即「关」（与 `.env` 也能写 `AI_VISION=1` 兼容）。
+    if cfg.vision {
+        env::set_var("AI_VISION", "1");
+    } else {
+        env::remove_var("AI_VISION");
+    }
     if cfg.key.trim().is_empty() {
         crate::log::warn("AI key 为空 ⇒ 对话必然 401，请在设置面板填入 key");
     }
@@ -1092,6 +1099,7 @@ pub async fn set_ai_config(
     agent_url: Option<String>,
     search_provider: Option<String>,
     search_key: Option<String>,
+    vision: Option<bool>,
 ) -> Result<String, String> {
     if url.trim().is_empty() || model.trim().is_empty() {
         return Err("url / model must not be empty".into());
@@ -1106,16 +1114,20 @@ pub async fn set_ai_config(
         // 否则会一直用旧值）。
         search_provider: search_provider.unwrap_or_default().trim().to_lowercase(),
         search_key: search_key.unwrap_or_default().trim().to_string(),
+        // 图片输入开关：缺省（老前端不带这个参数）按**关**处理 —— 与「默认不发图片块」
+        // 的取向一致，不会因为漏传参数就把图片发给一个可能不支持的端点。
+        vision: vision.unwrap_or(false),
     };
     // 先落盘再注入 env。落盘失败必须如实报错 —— 否则会重演「面板像是保存成功、
     // 重启后又变回旧值」这种最难查的问题。
     crate::storage::save_ai_config(&cfg)?;
     apply_ai_config(&cfg);
     crate::log::info(crate::log::mask_secrets(&format!(
-        "AI 配置已保存（设置面板 → config\\ai.json）provider={} url={} model={} key_tail={}",
+        "AI 配置已保存（设置面板 → config\\ai.json）provider={} url={} model={} vision={} key_tail={}",
         cfg.provider,
         cfg.url,
         cfg.model,
+        cfg.vision,
         crate::log::key_tail(&cfg.key),
     )));
     Ok("AI config updated".into())
@@ -1132,6 +1144,8 @@ pub fn get_ai_config() -> serde_json::Value {
         "agent_url": env::var("AI_AGENT_URL").unwrap_or_default(),
         "search_provider": env::var("AI_SEARCH_PROVIDER").unwrap_or_default(),
         "search_key": env::var("AI_SEARCH_KEY").unwrap_or_default(),
+        // 图片输入开关（A8）：缺变量 = 关。前端据此决定要不要把图片附件发成 `image` 块。
+        "vision": env::var("AI_VISION").map(|v| v.trim() == "1").unwrap_or(false),
     })
 }
 
@@ -1761,6 +1775,22 @@ pub fn log_frontend(level: String, message: String) {
 }
 
 // ── Temp image save (for clipboard OCR) ──────────────────────────
+/// 临时图片文件的**唯一**路径：`lunac_<tag>_<pid>_<毫秒>_<序号>.<ext>`。
+///
+/// 为什么不能只带 pid（A8，2026-09-20 修）：同一进程里连续两次粘贴会算到**同一个**
+/// 路径 —— 旧 chip 还指着它，内容却已经被第二次粘贴覆盖。做图片内容块时这会被放大成
+/// 「同一张附件在两次提问里内容不同」，所以在源头就让它唯一。
+fn temp_image_path(tag: &str, ext: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("lunac_{tag}_{}_{ms}_{n}.{ext}", std::process::id()))
+}
+
 /// Save a base64 data URL as a temporary image file, return the path.
 /// Detects image format from the MIME type in the data URL and uses the
 /// correct file extension (png/jpg/bmp) for PaddleOCR-json compatibility.
@@ -1793,8 +1823,7 @@ pub fn save_temp_image(data_url: String) -> Result<String, String> {
     )
     .map_err(|e| format!("Base64 decode failed: {e}"))?;
 
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("lunac_ocr_{}.{}", std::process::id(), ext));
+    let tmp_path = temp_image_path("ocr", ext);
     std::fs::write(&tmp_path, &bytes)
         .map_err(|e| format!("Write temp file failed: {e}"))?;
 
@@ -2022,9 +2051,7 @@ fn clipboard_png_to_file() -> Option<String> {
         GlobalUnlock(h);
 
         let fingerprint = dib_fingerprint(&png);
-        let temp_path = PathBuf::from(std::env::temp_dir()).join(format!(
-            "lunac_clip_{}.png", std::process::id()
-        ));
+        let temp_path = temp_image_path("clip", "png");
         std::fs::write(&temp_path, &png).ok()?;
         Some(format!("{}|{}", temp_path.to_string_lossy(), fingerprint))
     }
@@ -2032,8 +2059,6 @@ fn clipboard_png_to_file() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn clipboard_dib_to_bmp() -> Option<String> {
-    use std::path::PathBuf;
-
     #[link(name = "user32")]
     extern "system" {
         fn OpenClipboard(hWndNewOwner: isize) -> i32;
@@ -2121,9 +2146,7 @@ fn clipboard_dib_to_bmp() -> Option<String> {
             let payload_start = bi_size as usize;
             if payload_start >= dib.len() { return None; }
             let payload: Vec<u8> = dib[payload_start..].to_vec();
-            let temp_path = PathBuf::from(std::env::temp_dir()).join(format!(
-                "lunac_clip_{}.{}", std::process::id(), ext
-            ));
+            let temp_path = temp_image_path("clip", ext);
             std::fs::write(&temp_path, &payload).ok()?;
             return Some(format!("{}|{}", temp_path.to_string_lossy(), fingerprint));
         }
@@ -2144,9 +2167,7 @@ fn clipboard_dib_to_bmp() -> Option<String> {
         bmp_data.extend_from_slice(&dib);
 
         // 7. Save
-        let temp_path = PathBuf::from(std::env::temp_dir()).join(format!(
-            "lunac_clip_{}.bmp", std::process::id()
-        ));
+        let temp_path = temp_image_path("clip", "bmp");
         std::fs::write(&temp_path, &bmp_data).ok()?;
 
         // Return path|fingerprint for JS dedup

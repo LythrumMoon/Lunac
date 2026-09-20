@@ -872,7 +872,7 @@ function belongsToOtherProvider(model: string, provider: string): boolean {
 /** AI 模型这一块的**内部内容**（不含 pane 外壳与分块标题）——
  *  由 buildAIPane 组装进「AI」分类。2026-09-19 批 9 起 AI 分类下有三个分块
  *  （AI 模型 / 技能 / 工具），每个分块用与「风格」相同的 .settings-group-title。 */
-function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): string {
+function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -988,6 +988,14 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         ${modelSelectHtml}
       </div>
       <div class="settings-row">
+        <span class="settings-label">${t("settings.ai_vision")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="settings-vision" ${vision ? "checked" : ""}>
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.ai_vision_hint")}</div>
+      <div class="settings-row">
         <span class="settings-label">${t("settings.base_url")}</span>
         <input type="text" id="settings-baseurl" class="settings-input" autocomplete="off" value="${esc(baseUrl)}" placeholder="${esc(PROVIDER_PRESETS[provider]?.default_url || "https://api.openai.com")}">
       </div>
@@ -1027,13 +1035,13 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
  *  用户要求：「将 skills 和 tools 和 ai模型 分类到 ai 分类里，各个分块采用跟
  *  风格里的分块一样」—— 所以三块都用 .settings-group-title（与「风格」的
  *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。 */
-async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string): Promise<string> {
+async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): Promise<string> {
   const [skillsHtml, toolsHtml] = await Promise.all([buildSkillsSection(), buildToolsSection()]);
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
-      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey)}
+      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision)}
       <div class="settings-group-title">${t("settings.skills")}</div>
       ${skillsHtml}
       <div class="settings-group-title">${t("settings.group_tools")}</div>
@@ -2460,6 +2468,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
       // （后端按删除处理，agent 回落到免 key 的 Bing / 百度兜底源）。
       const searchProvider = container.querySelector("#settings-search-provider .custom-select-option.selected")?.getAttribute("data-value") || "";
       const searchKey = (container.querySelector("#settings-searchkey") as HTMLInputElement)?.value || "";
+      // 图片输入开关（A8）：与模型一起存进 ai.json。**默认关** —— 发给不支持视觉的
+      // 端点会 400，所以只有用户明确断言「这个模型能看图」时才打开。
+      const vision = (container.querySelector("#settings-vision") as HTMLInputElement)?.checked || false;
       // Preserve existing agent_url if set (don't overwrite with empty)
       let agentUrl = "";
       try {
@@ -2474,6 +2485,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         agent_url: agentUrl,
         search_provider: searchProvider,
         search_key: searchKey,
+        vision,
       });
       // 落盘由后端完成（<exe 根>\config\ai.json，唯一真相源）。
       // 这里**不要**再写 localStorage —— 旧的 localStorage 回灌会在启动时覆盖
@@ -2984,6 +2996,8 @@ export const settingsPlugin: Plugin = {
     let apiKey = "";
     let searchProvider = "";
     let searchKey = "";
+    // 当前模型是否支持图片输入（A8）：跟着 ai.json 走，由用户在 AI 面板显式打开。
+    let vision = false;
 
     try {
       hotkey = await invoke<string>("get_hotkey_combo");
@@ -3017,7 +3031,7 @@ export const settingsPlugin: Plugin = {
 
     const generalPane = buildGeneralPane(hotkey, autoStart);
     const appearancePane = await buildAppearancePane();
-    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey);
+    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision);
     const pluginsPane = await buildPluginsPane();
     const searchPane = await buildSearchPane();
 
