@@ -15,11 +15,10 @@
 >
 > | 旧编号 | 现在在哪 |
 > |---|---|
-> | §0 差距总览 / §4 不是缺> | §1.1 组 A（工具） | **A5 / A8 /口 / §7 完整性声明 | **§5 边界声明** |
- A14**（A3 已落地）；其余见 §4 设想区 |
+> | §0 差距总览 / §4 不是缺口 | §1.1 组 A（工具）**A8 / A14** / **§5 边界声明**（A3 / A5 已落地）；其余见 §4 设想区 |
 > | §1.2 组 B / §1.3 组 C | **A13 按需重估**（+ §4 设想区） |
-> | §2.1 组 A（子系统） | **A6**（A4 长期记忆与后台复盘、会话持久化与检索均已完成，见 `ai-spec.md` §3.5） |
-> | §2.2 组 B | **A5 / A8 / A9 / A10 / A11**（A3 已落地） |
+> | §2.1 组 A（子系统） | **已全部落地** —— A6 写文件内容级安全扫描于 2026-09-20 完成（A4 长期记忆与后台复盘、会话持久化与检索更早已完成，见 `ai-spec.md` §3.5） |
+> | §2.2 组 B | **A8 / A9 / A10 / A11**（A3 / A5 已落地） |
 > | §2.3 组 C | **A13** + §4 设想区 |
 > | §3 协议 / 接口层 | **A11**（其中的 A1 子代理框架已于 2026-09-20 落地） |
 > | §5 空转 UI / 失实文案 | **已全部修复**，条目已删 |
@@ -37,9 +36,6 @@
 
 | 级别 | 条目 | 为什么在这个位置 |
 |---|---|---|
-| **P1** | A5 Skills fork / remote | 技能体系的剩余两种模式 |
-| **P1** | A6 写文件内容级安全扫描 | 唯一还没做的安全短板（命令侧已有 `bash_safety.rs`） |
-| **P2** | A7 计划模式闭环 | 需前端配套计划卡片，工作量集中在前端 |
 | **P2** | A8 多模态输入（真内容块） | 依赖协议扩字段，收益随用户场景 |
 | **P2** | A9 权限 hooks | 用户脚本介入的工具链，属生态能力 |
 | **P2** | A10 自动权限分类器 | 减少询问频率，可与 A9 一起评估 |
@@ -58,27 +54,7 @@
 
 ## 1. Agent 能力缺口
 
-### P1
-
-**A5. Skills 的 fork / remote 两种模式**
-
-- 现状：`core-agent/src/skills.rs` **只有 inline 模式** —— `load()` 读 `<key>/SKILL.md`、`run()` 返回正文并替换 `$ARGUMENTS`。fork（在子代理里执行技能）与 remote（远端拉取）均无代码，技能自带脚本 / 资源也没有。
-- 依赖：fork 模式依赖**已落地**的子代理（`Agent`，2026-09-20）—— 但 `Agent` 只回最终报告、**不给中间过程**，fork 语义（技能自己的脚本/资源要在子代理里跑）仍需一轮重估再动手。
-
-**A6. 写文件的内容级安全扫描**
-
-- 做什么：`Write` / `Edit` 落盘前扫凭据与危险模式，命中则告警或拦截。
-- 为什么是唯一的安全短板：命令侧已有自研 `core-agent/src/bash_safety.rs`（子命令拆分 + 引号归一 + 包装器递归 + Windows 危险规则集 + fail-closed），**文件内容侧完全空白** —— 全仓搜 `scanContent` / `scan_content` / `security` / `patterns` 零匹配。
-- 注意区分：`bash_safety.rs` 扫的是**命令**、在**执行前**判定；本条扫的是**文件内容**、在**写入前**判定。两者方向不同，别混（`ai-spec` §13.1 已登记这个区别）。
-- 参考：旧 CLI 的 `core/security/scanContent()`（25 条规则：代码注入 / XSS / 反序列化 / 加密缺陷 / CI 注入）。
-
 ### P2
-
-**A7. 计划模式闭环（`EnterPlanMode` / `ExitPlanMode` / `VerifyPlanExecution`）**
-
-- 做什么：模型先出计划、用户确认后再动手。
-- 现状：**前端零相关代码**，所以工作量主要不在 agent 侧，而在计划卡片 UI（可参照 `agent-ui-spec.md` 的分期思路）。
-- 规范前提：计划文档结构、任务粒度、铁律已写在 `ai-spec.md` §12（Agent Plan 模式规范）—— 实现时按那节走。
 
 **A8. 多模态输入（真正的图片 / PDF 内容块）**
 
@@ -215,7 +191,7 @@
 
 **覆盖**：用户可以观察到的能力面 —— **工具名**、**子系统**、**协议消息类型**、**界面分期**、**自身新目标**。
 
-- **工具面已核对完毕**：旧 CLI 的 `getAllBaseTools()` 里的每一个名字都已归位（实现 / 待办 / 设想）；Lunac 当前实际注册的是 **13 件内置工具**（`Read` / `Write` / `Edit` / `Bash` / `PowerShell` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `AskUserQuestion` / `TodoWrite` / `SessionSearch` / `Agent`）+ **条件注册**的四件：`Skill`（技能目录非空且未被黑名单裁掉时）+ `ListMcpResourcesTool` / `ReadMcpResourceTool`（**桥接上了用户工具时**，2026-09-20）+ `Remember`（**桥接通时**，2026-09-20，长期记忆写入侧）+ `mcp__*`（来自 `<exe 根>\tools\*.json`），可用 `--disallowedTools` 裁剪。
+- **工具面已核对完毕**：旧 CLI 的 `getAllBaseTools()` 里的每一个名字都已归位（实现 / 待办 / 设想）；Lunac 当前实际注册的是 **15 件内置工具**（`Read` / `Write` / `Edit` / `Bash` / `PowerShell` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `AskUserQuestion` / `TodoWrite` / `SessionSearch` / `Agent` / `EnterPlanMode` / `ExitPlanMode`）+ **条件注册**的四件：`Skill`（技能目录非空且未被黑名单裁掉时）+ `ListMcpResourcesTool` / `ReadMcpResourceTool`（**桥接上了用户工具时**，2026-09-20）+ `Remember`（**桥接通时**，2026-09-20，长期记忆写入侧）+ `mcp__*`（来自 `<exe 根>\tools\*.json`），可用 `--disallowedTools` 裁剪。
 - **不覆盖一**：`core-agent/src/` 里的实现细节级能力（如各工具的解析细节、日志格式），按子系统归并。
 - **不覆盖二**：旧 CLI 终端渲染组件（`core/tools/**/UI.tsx`）随 Ink TUI 一并排除。
 - **不覆盖三**：Lunac 与旧 CLI **都有**的能力不再列出（例如前端依赖的 stdout 契约 `system/init` / `stream_event` / `assistant` / `user/tool_result` / `control_request` / `result` **全部已提供**；`--disallowedTools` 链路已通；思考开关跨模型自适应是**超集**——只有开 / 关两档，不要按「多档更深」扩）。
@@ -258,3 +234,7 @@
 *2026-09-20 追加（同日第四批）：**A3（MCP resources 读侧）已完成并从本文删除** —— 服务端补 `resources/read`（**硬边界**：只允许读 `tools\` 目录内的 `.json`，`canonicalize()` 后比前缀，挡 `..` 与符号链接），客户端加 `Bridge::list_resources()` / `read_resource()`，两件工具 `ListMcpResourcesTool` / `ReadMcpResourceTool` **条件注册**（只在桥真的接上了用户工具时才进请求体，与 `Skill` 同理 —— 出厂时 `tools\` 只有模板，无条件注册就是在固定前缀里放两件空转工具）。契约与实测在 `ai-spec.md` §3.5「MCP resources 读侧」、纪律在 §11 规则 55。桥工具的名单收口到 `tools::BRIDGE_TOOLS` 一处（`dispatch_tool` 早退 / `subagent_tool_defs` 剔除 / 条件注册三处共用）。`cargo test`：core-agent **47 passed**、src-tauri **56 passed**。当前未落地 **13 项**（A4–A16）。*
 
 *2026-09-20 追加（同日第五批）：**A4（每轮后台复盘 fork + 长期记忆）已完成并从本文删除** —— 落点 `<exe 根>\ModuleData\memory\MEMORY.md`（桥上的 `lunac/memory_read` / `lunac/memory_write` 两个自定义方法，不进 `tools/list`），启动时**冻结快照**注入系统提示词（与会话索引同纪律），写入侧新增**条件注册**的 `Remember` 工具；每 `LUNAC_NUDGE_INTERVAL`（默认 10）次**用户提问**在**提问之间**派一次后台复盘 fork（白名单工具 `Read`/`Glob`/`Grep`/`Write`/`Edit`/`Skill`/`Remember`、自己连一条桥、独立 `Cfg` 副本、不发 `task_*` 事件、审批走同一条 `can_use_tool` 通道随前端运行方式，**不引定时器**）。顺带修掉前端一处**与后端语义不一致**：`classifyRequest()` 的 `opaque`（判不出来的命令）在**自动档**也弹卡 ⇒ 现改为按档位判定（自动档放行，手动 / 白名单仍弹卡），危险命令的优先级不变 —— 见 agent-ui-spec §4.2。契约与实测在 `ai-spec.md` §3.5「长期记忆与后台复盘 fork」、纪律在 §11 规则 56。`cargo test`：core-agent **52 passed**、src-tauri **57 passed**。当前未落地 **12 项**（A5–A16）。*
+
+*2026-09-20 追加（同日第六批）：**A5 全部完成 + A6 已完成，两条均已从本文删除**。① **A5 前半（fork 模式）**：frontmatter `context: fork` 的技能改由**子代理执行**、主对话只收报告，工具面由 `allowed-tools` 收窄；`Skill` 因「副作用随入参而变」**移出 `parallel_safe` 白名单**（只看名字的判据按最坏模式算），带输入的判据另写 `needs_approval_with()`；fork 复用子代理引擎（`Agent` / A4 复盘 / fork 技能 = 三个调用方共用一个 `run_subagent()` + `ForkSpec`）。② **A5 后半（技能自带脚本 / 资源）**：技能目录里除 `SKILL.md` 之外的文件在扫描时登记（深度 ≤ 3 / ≤ 40 条 / 跳过隐藏项与 `node_modules`·`target` / **不跟随符号链接** ⇒ 「报出去的路径一定落在技能目录内」不需要逐条 `canonicalize()`），**调用 `Skill` 时**附在返回里（inline 附正文之后、fork 附进子代理任务说明），**刻意不进系统提示词**（否则前缀缓存跟着文件系统抖动）；路径给**相对形式**并写明相对谁；超限**如实上报**「还有没列出的」。**remote 已定论不移植**。③ **A6（写入内容的凭据扫描）**：`core-agent/src/content_safety.rs` —— 12 条规则分三类（私钥块 / 七家固定前缀 API key / JWT·`Bearer`·连接串口令·两条三道闸的通用赋值），`RegexSet` 先跑一遍（零命中即返回）、`Write` 取 `content`·`Edit` 取 `new_string`（**不扫 `old_string`**）、512 KB 上限如实上报；**只做凭据一类**（代码注入 / XSS 那类正则在正常代码里必然满屏误报 ⇒ 用户学会无视告警，比没有更糟）；只上报 `analysis.secrets`**不代替决策**，前端走**独立通道**（不自动放行含「自动」档、不给「始终允许」、命中项可见地列在卡片正文而不是只塞 tooltip）；规则集刻意与 `bash_safety.rs`（扫**命令**、**执行前**）分开。**实测**：`cargo test` core-agent **75 passed / 0 failed**（含新增 `content_safety` 10 条、`skills` 资源类 5 条）；deepseek-flash 真机跑 `Skill`（inline）确认自带资源清单进得了 `tool_result` 且模型能原样复述（`assets/tpl.md` / `scripts/run.py`）。契约在 `ai-spec.md` §3.5「命令静态安全分析 / 写入内容的凭据扫描」「P4 已完成」、§13.1，纪律在 §11 规则 57 / 58，预检在 `code-rules.md` #20。同期还落了外观项「恢复默认主题」的边界修订（`tintBase`：只有三组配色的**颜色**失效，三个透明度与**文字明度**照常生效 —— 见 `ai-spec.md` §11 规则 45 与 `code-rules.md` 预检 #17）。当前未落地 **10 项**（A7–A16）。*
+
+*2026-09-20 追加（同日第七批）：**A7（计划模式闭环）已完成并从本文删除**。形态刻意**不复用「只读档位」**，而是拆成两个互不替代的概念：**用户的只读档**（`--permission-mode plan`，设置里选、启动时定死、改它要重启 agent）与**模型的计划相位**（`plan_phase`，进程内即时生效、批准后立刻解除）。① **两件内置工具**：`EnterPlanMode`（只把相位标志置真 + 广播 `system/plan_mode state=on` 带模型自述理由，**免审批** —— 问它等于让用户批准「我要开始思考了」）、`ExitPlanMode`（**必须走审批** —— 这张卡就是它的产品，用户要在卡上读到整份计划再裁决），工具总数 13 → **15**；守门单测同步。② **判据收口到 `tools::write_blocked(ctx, what)` 一处**，两档的**拒因措辞分开**（用户该做的动作不同：只读档指向「去设置改档位」、计划相位指向「去批准计划」），把「哪些工具算写类」这份知识也收口到 `tools.rs`。③ 相位用 `Arc<AtomicBool>` 而非 `bool` / `Cell`：`Ctx` 是 `Clone` 且跨线程（并行只读批拿 `&Ctx`、后台复盘 fork 拿克隆）⇒ 值语义会各持一份、`Cell` 破 `Sync`；`Arc` 让**派生子代理 / fork 技能 / 后台复盘自动继承**相位。④ **四个早退分支全部补判**：`Skill` / `SessionSearch` / `needs_bridge` / MCP 工具都早于 `tools::run()` 返回、会绕过那里的拦截 ⇒ `Remember` / `Agent` / fork 技能 / MCP 四处各补一次 `write_blocked`（否则只读档与计划相位能从这条缝里写本机）。⑤ **只读档下不许** `ExitPlanMode`（否则模型能靠它把用户选的档位绕开），报错指向设置；相位**不被清**。⑥ **前端零协议新增字段**：计划正文本来就在 `request.input.plan` 里，`renderPlanCard()` 直读 ⇒ `open_approval()` **零改动**、计划卡 = 同一条审批通道的第三种行；`classifyRequest()` 对 `ExitPlanMode` 免疫（白名单也不放行）、不给「始终允许」；批准时 `save_plan_md` 落 `<exe 根>\ModuleData\plans\<本地时间戳>.md`（Rust 侧没有 chrono ⇒ 时间戳由**前端**给 + 后端只做严格形状校验 `YYYY-MM-DD_HHMMSS`，同 `append_usage_log` 先例）；`EnterPlanMode` 另挂顶部横幅，agent 重启时清掉。⑦ **刻意不做** `VerifyPlanExecution`（验证这一环交给 `TodoWrite`）；子代理看不到这两件工具，后台复盘门槛加 `&& !plan_phase`。**实测**：`cargo test` core-agent **79 passed / 0 failed / 2 ignored**、src-tauri **58 passed / 0 failed / 1 ignored**，`tsc --noEmit` exit 0，`cargo build --release` 通过；release 真机 E2E **11 条断言全过**（`EnterPlanMode` 广播 → `Read` 通过 → `ExitPlanMode` 走审批、计划正文 1197 字符 → **拒绝**后拒因原话进 `tool_result` → 下一问要求直接动手时 `Write` 被硬拒 → 再交计划并**批准** → 广播 `state=off` → 同一个 `Write` 落盘且内容正确）。契约在 `ai-spec.md` §3.5「计划模式闭环（A7）」、纪律在 §11 规则 59，UI 在 `agent-ui-spec.md` §3.6 / §4.4 / §9，预检在 `code-rules.md` #12（扩写：早退分支必须自己补 `write_blocked`）与 #21（新增：写类判据只改一处、两档措辞分开）。当前未落地 **9 项**（A8–A16）。*

@@ -152,9 +152,10 @@
 - **排查心法**：用户说「命令有缩进 / 有空行」时，**先按这个顺序查，别凭截图猜** —— ① **把实际命令字符串取出来看**（`ModuleData\history\chat.db` 里该会话的 `steps` 快照；注意 `detail` 是**截断到 200 字符**的显示文本，不是全文，落盘日志也只记「等待审批 PowerShell」不记命令原文）；② 查 `white-space` 的**计算值**（`getComputedStyle(el).whiteSpace`）与容器高度能否**逐项对账**（文本高度 + padding + 附属行，有无余数）；③ 用 `Range.getClientRects()` 数容器内**空白文本节点**是否产生了行盒（`rectCount > 0` 即幽灵空行）。实测多次命令原文都是**干净单行、`normalizeCmdForDisplay()` 也没改坏**，别去改 agent 侧输出或那个归一化函数。
 - **命令区不放复制按钮**（2026-09）：按钮固定右上角会给短命令留一大段空白（`.approval-cmd-list` 还得预留 56px 右边距）；命令文本本身可选中复制。注意这与执行卡片 `.tool-row` 的「复制命令」是**两个不同组件**，不要混。
 - **同一次权限运行内合并成一行**（2026-09 放宽）：同一条未应答的命令组行是**唯一合并目标**，`Bash` 与 `PowerShell` **视作同一族**（用户要求「短时间内不同类型的命令也合并进同一个权限运行」）。合并**只影响审批展示** —— 每条命令仍由 agent 各自执行，`&&` 短路、退出码、输出都不受影响，所以含 `&&` / `|` / 重定向 / 换行的**复杂命令同样入组**（旧实现按算子排除，正是「复杂任务里同类请求一行一条堆满卡片」的原因）。上限 `MAX_CMD_GROUP = 20` 条 / 单条 2000 字符。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。
-- **合并后标题要重画**：工具名可能不止一个（显示 `Bash + PowerShell`），⛔ / ⚠ 标记也可能来自后来合并进来的那条命令 —— `renderGroupTitle()` 在每次合并时重画标题；`renderCmdGroupBody()` 顺带兜掉「始终允许」（组内只要有一条危险 / 不透明，整组都不给）。行的 `danger` 类同步补上。
+- **合并后标题要重画**：工具名可能不止一个（显示 `Bash + PowerShell`），⛔ / ⚠ / 🔑 标记也可能来自后来合并进来的那条命令 —— `renderGroupTitle()` 在每次合并时重画标题；`renderCmdGroupBody()` 顺带兜掉「始终允许」（组内只要有一条危险 / 不透明 / 命中凭据，整组都不给）。行的 `danger` 类同步补上。
 - **「始终允许」写白名单要写**组内**每一条**命令的命令词（旧实现只记第一条 → 组里第二条以后的同类命令下次还要再问一遍，即用户反馈的「允许过还要再问」）。解释器 / 启动器前缀与危险 / 不透明命令照旧排除（§4.3）。
 - **自动档不该弹卡**：`opaque` 判据 2026-09 已收窄到「不知道要跑哪个程序」（参数里的 `$HOME` / `$env:TEMP` 不算，见 ai-spec §3.5）—— 旧口径会让自动档下每条带 `$` 的命令都弹卡。
+- **计划卡 = 同一条通道的第三种行（2026-09-20，A7）**：`ExitPlanMode` 走 `can_use_tool`，整份计划在 `input.plan` 里。三条**不能省**：① **任何档位都不自动放行、白名单也免疫**（与 `AskUserQuestion` 同级 —— 自动放行等于「计划没人读过就开工」）；② **不给「始终允许」**（白名单化 = 以后每份计划都自动批准，等于关掉整个计划模式）；③ 正文用 `textContent` 原样铺开（**不是** `innerHTML`、**不引** markdown 渲染器 —— 计划是模型生成的任意文本）。按钮文案是「批准计划 / 拒绝」，结论提示要**说清后果**（`agent.plan_approved_note` / `agent.plan_rejected_note`），并随拒绝回一句说明「你仍在计划模式」的**专用拒因**（`agent.plan_deny_msg`，见 ai-spec §11 规则 59）。计划长（几十行是常态）⇒ 只在这一批出现计划卡时把**外层** `.approval-batch-body` 的上限放宽到 `62vh`（`.approval-batch-card.has-plan`），**不给正文加第二层滚动**（同上文嵌套双滚动条的教训）。
 
 ### 3.7 历史回顾（过程与表盘）
 
@@ -235,6 +236,16 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 
 - 运行方式 = **问不问**（频率）；
 - 安全档位 = **允不允许**（边界）：只读档直接拒绝写类工具，完全档忽略工作区锁。
+
+**第三个概念：计划相位（2026-09-20，A7）** —— 前两个都归**用户**，这个归**模型自己**：模型调 `EnterPlanMode` 声明「先出计划、不动手」，再由用户在**计划卡**上批准（`ExitPlanMode`）才恢复写权限。三者的分工：
+
+| 概念 | 谁定的 | 作用面 | 怎么变 |
+|---|---|---|---|
+| 运行方式 | 用户 | **问不问** | 面板切换，即时 |
+| 安全档位 | 用户 | **允不允许**（硬边界） | 面板切换 ⇒ 重启 agent |
+| 计划相位 | **模型** | **允不允许**（本轮的临时承诺） | `EnterPlanMode` / 批准 `ExitPlanMode`，**进程内即时生效** |
+
+UI 上必须能看出「现在处在计划相位」：对话流里一条**单例横幅**（`.plan-mode-note`，进入时 `--yellow`，解除后落回中性色），状态只跟着 agent 的 `system/plan_mode` 广播走。**只读档下不出现计划卡**（那个档位里批准计划也无法执行，agent 直接拒掉 `ExitPlanMode`）。详见 ai-spec §3.5「计划模式闭环」与 §11 规则 59。
 
 ---
 
@@ -363,9 +374,13 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   | 字段 | 位置 | 语义 | 前端行为 |
   |---|---|---|---|
   | `analysis.dangerous` / `analysis.opaque` | `control_request.request`（`can_use_tool`） | 命令的**执行侧**静态安全分析（ai-spec §3.5「命令静态安全分析」/ §11 规则 26） | `dangerous` 非空 ⇒ 弹危险卡且不给「始终允许」（任何档位）；`opaque` 非空 ⇒ 不自动放行（fail-closed）。**缺字段时回落到 `CMD_BLACKLIST` 正则**（兼容旧 agent） |
+  | `analysis.secrets` | `control_request.request`（`can_use_tool`） | **写入内容**的凭据扫描结果 `[{rule, line}]`（ai-spec §3.5「写入内容的凭据扫描」/ §13.1 / §11 规则 58） | 非空 ⇒ 与 `dangerous` 同级但**走独立通道**：不自动放行（任何档位）、不给「始终允许」、标题加 🔑 标记 + tooltip，且命中项以 🔑 明细行（`.approval-secret-warn`）**可见地**列在正文里。缺字段 ⇒ 按「无命中」处理 |
   | `elided` / `dropped` | `system/context_compacted` | 压缩计数 | 面板 tooltip 归因（§5.2） |
   | `attempt` / `max_retries` / `error_status` | `system/api_retry` | 瞬时失败重试 | 状态行文案（ai-spec §11 规则 25） |
   | `usage.requests[]` = `{in, read, create, out}` | `result.usage` | **每次 API 请求**的用量明细（顺序 = 请求顺序） | 前端**只落盘**（写进 `usage-*.jsonl` 的 `requests` 数组，与 DeepSeek 平台用量页逐行对账）；表盘口径不变（仍按每次提问累加）。**缺字段时写空数组**，`UsageRecord.requests` 为空则不写该键（旧记录兼容）。见 ai-spec §3.5「用量与对账」 |
+  | `state`（`on` / `off`）+ `reason` | `system/plan_mode` | **计划相位**的广播（A7）：模型调 `EnterPlanMode` ⇒ `on`（`reason` = 模型给用户的一句话）；`ExitPlanMode` **被批准** ⇒ `off`。ai-spec §3.5「计划模式闭环」/ §11 规则 59 | 单例横幅 `.plan-mode-note`：`on` 时 `--yellow`，`off` 落回中性色；**agent 重启（`cli-status: starting`）要清掉** —— 相位是进程内状态，随进程消失。**不许**由前端拿工具调用自己推断状态 |
+
+- **计划卡不新增字段**（A7）：`ExitPlanMode` 复用既有的 `can_use_tool` 通道，整份计划就在 `request.input.plan` 里 —— 卡片按 §3.6 的骨架渲染，正文用 `textContent` 原样铺开（**不做 markdown 渲染、不用 `innerHTML`**：那是模型生成的任意文本）。批准时前端另调 `save_plan_md(stamp, plan)` 落档 `ModuleData\plans\`（失败只提示，不挡执行）。
 - 新增前端 → 后端的调用（如 `set_security_profile` 已有、`log_frontend` 已有）必须参数名与 Rust 签名逐一对齐（code-rules §3.1），并确认是否需要 `capabilities/default.json`（自定义 `#[tauri::command]` 不需要，插件 API 需要）。
 
 ---

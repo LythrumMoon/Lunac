@@ -261,10 +261,10 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | stdout | 每行一条 JSON：`system/init`（含 `tools` 名单）→ `system/context_compacted`（`elided` / `dropped` 计数，压缩发生时补发）→ `system/api_retry`（`attempt` / `max_retries` / `error_status` / `delay_ms`，瞬时失败退避重试时补发，前端解析分支早已就绪）→ `stream_event`（`content_block_start` / `content_block_delta`(`text_delta`\|`thinking_delta`\|`input_json_delta`) / `content_block_stop` / `message_stop`）→ `assistant`（整包，含 `tool_use`，仅无增量时前端兜底）→ `control_request`（`can_use_tool`，写类工具执行前）→ `user`（整包，含 `tool_result`）→ `result`（`subtype` / `is_error` / `usage`，用量为整轮累计） |
 
 **P0 已完成**：多轮上下文（进程内 history）、SSE 增量打字、用量上报（input/output/cache_read/cache_creation）、错误回传（失败轮按 `history.truncate(base)` 整体回滚，不污染后续对话）、stdin 读取线程与查询线程经 mpsc 解耦（为 P2 的 `control_response` 预留通路）。
+#cbcbcb#cbcbcb
+**P1 已完成（2026-09，内置工具循环）**：**十五件**工具实现在 [core-agent/src/tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)（第 12 件 `SessionSearch` 于 2026-09-19 补入，见本节「往期会话检索」；第 13 件 `Agent` 于 2026-09-20 补入，见本节「子代理」；第 14 / 15 件 `EnterPlanMode` / `ExitPlanMode` 亦于 2026-09-20 补入，见本节「计划模式闭环（A7）」），主循环按「请求 → 流式收块 → 有 `tool_use` 就执行并以 `tool_result` 回灌 → 再请求」往返，直到模型不再调工具（上限 `MAX_TOOL_ROUNDS=16`，到顶后再给一次「只用文本收口」的机会）。
 
-**P1 已完成（2026-09，内置工具循环）**：**十三件**工具实现在 [core-agent/src/tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)（第 12 件 `SessionSearch` 于 2026-09-19 补入，见本节「往期会话检索」；第 13 件 `Agent` 于 2026-09-20 补入，见本节「子代理」），主循环按「请求 → 流式收块 → 有 `tool_use` 就执行并以 `tool_result` 回灌 → 再请求」往返，直到模型不再调工具（上限 `MAX_TOOL_ROUNDS=16`，到顶后再给一次「只用文本收口」的机会）。
-
-**条件注册的四件不要混进来**：`Skill`（装了技能才注册）、`ListMcpResourcesTool` / `ReadMcpResourceTool`（桥接上了用户工具才注册）、`Remember`（桥接通才注册）—— 它们**不在 `defs()` 的十三个里**，各自只在满足条件时追加进请求体。理由见各条目（§11 规则 18 ⑤ 的「空转项」）。
+**条件注册的四件不要混进来**：`Skill`（装了技能才注册）、`ListMcpResourcesTool` / `ReadMcpResourceTool`（桥接上了用户工具才注册）、`Remember`（桥接通才注册）—— 它们**不在 `defs()` 的十五个里**，各自只在满足条件时追加进请求体。理由见各条目（§11 规则 18 ⑤ 的「空转项」）。
 
 | 工具 | 入参 | 行为 |
 |---|---|---|
@@ -280,7 +280,9 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | `AskUserQuestion` | `questions`（1–4 题，每题 2–4 选项）/ `answers`（**由前端填**） | 结构化提问：选项给用户点选。**工具自身只做格式化** —— 答案由前端经审批卡的 `updatedInput` 回传（`{...input, answers}`），工具把它排成 `User has answered your questions: "题" = "答"`。收不到 `answers` 就**报错而非编答案**（模型会改用文本提问）—— 见下「结构化提问」一节 |
 | `TodoWrite` | `todos`（数组，项含 `content` / `status`(`pending`\|`in_progress`\|`completed`) / `activeForm`，三项必填） | 待办清单：模型**每次都发完整清单**（整体替换语义）。工具**不维护状态、不落盘、不碰本机** —— 清单的唯一真相是模型最近一条 `tool_use` 入参，进程重启 / 多会话并行都不会串味；`todo_write()` 只回一段确认 + 清单快照（状态回显成规范名，防止模型用别的词造成漂移）。**免审批**（`needs_approval` 不含它）。前端拿流式入参画面板（见下「待办面板」） |
 | `Agent` | `description`（3–5 词任务标签）/ `prompt`（**自包含**的任务说明，子代理看不到本对话） | 派生一个**独立上下文**的子代理跑一件自包含任务，只把最终报告回灌主对话（中间工具输出不进主上下文）。报告形态 `[task-<N>] subagent report:\n\n…`（≤8000 字符）。**要审批**（派生的是能写文件、能跑命令的子代理）、**串行执行**、**只读档直接拒绝**、**子代理工具集不含 `Agent`**（防无限递归）。见下「子代理」 |
-| `Remember`（**条件注册**） | `content`（一条自包含的事实）/ `replace`（可选：整体替换） | 写**跨会话长期记忆**（`<exe 根>\ModuleData\memory\MEMORY.md`，走桥的 `lunac/memory_write`）。**只在桥接通时注册**（没桥写不进去）、**要审批**、**必须串行**、**只读档以 `is_error=true` 拒绝**。见下「长期记忆与后台复盘」 |
+| `EnterPlanMode` | `reason`（可选：给用户看的一句话） | 进入**计划相位**：只把 `Ctx.plan_phase` 置真 + 广播 `system/plan_mode`（`state:"on"`），**没有任何本机副作用** ⇒ **免审批**、串行。此后写类工具（内置四件 + `Agent` + fork 技能 + `Remember` + MCP 工具）一律以 `is_error=true` 拒绝。见下「计划模式闭环」 |
+| `ExitPlanMode` | `plan`（**整份计划正文**，markdown） | 计划相位的**唯一出口**：走 `can_use_tool` 审批卡（正文 = `plan` 原样铺开），批准 ⇒ 广播 `state:"off"` 并解除相位（写类恢复）；拒绝 ⇒ 相位**保持为真**（前端回一句「你仍在计划模式」的专用拒因）。**只读档直接拒绝**（批准了也执行不了）。见下「计划模式闭环」 |
+| `Remember`（**条件注册**） | `content`（一条自包含的事实）/ `replace`（可选：整体替换） | 写**跨会话长期记忆**（`<exe 根>\ModuleData\memory\MEMORY.md`，走桥的 `lunac/memory_write`）。**只在桥接通时注册**（没桥写不进去）、**要审批**、**必须串行**、只读档 / 计划相位以 `is_error=true` 拒绝。见下「长期记忆与后台复盘」 |
 
 **工具权限策略**
 
@@ -316,6 +318,25 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 前端兼容 | **缺字段时回落到前端自己的正则**（`CMD_BLACKLIST`），旧 agent 照常工作；字段存在时**以 agent 判定为准**，正则降为二道网。`tool_result` 文本不变 |
 | 白名单化限制 | 解释器/启动器前缀（`cmd` / `powershell` / `bash` / `python` / `node` / `npx` / `iex` / `env` / `schtasks`…）**永不进白名单** —— 白名单是前缀匹配，放进去等于把「以后任何 `powershell …`」全自动放行；`opaque` 命令同样不给「始终允许」 |
 | 落盘 | 命中时写一条 `warn`（只记标签，不记命令原文，避免把命令里的凭据抄进日志；仍过 `mask_secrets`） |
+
+**写入内容的凭据扫描（`Write` / `Edit`，2026-09-20，原 backlog A6）**：同一个可选字段 `analysis` 下多一个 `secrets`（实现见 [core-agent/src/content_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/content_safety.rs)，落地形态见 §13.1，规则见 §11 规则 58）：
+
+```json
+{"type":"control_request","request_id":"req_…","request":{
+  "subtype":"can_use_tool","tool_name":"Write","tool_use_id":"tu_2",
+  "input":{"file_path":"…","content":"…"},
+  "analysis":{"secrets":[{"rule":"AWS access key","line":3}]}}}
+```
+
+| 项 | 约定 |
+|---|---|
+| 扫什么 | `Write` 的 `content` / `Edit` 的 `new_string`。**不扫 `old_string`** —— 那是要被删掉的内容，扫它会把「正在清理凭据」的操作标成可疑，正好反了 |
+| 只做一类 | **只做凭据 / 密钥泄漏**，不做代码注入 / XSS / 反序列化（正则在正常代码里做不了语义判定，必然满屏误报 ⇒ 用户学会无视它） |
+| 判定不代替决策 | agent 只上报 `[{rule, line}]`，**不拒绝执行** —— 与命令分析同一条纪律（规则 21） |
+| 前端强度 | 与 `dangerous` 同级但**走独立通道**：不自动放行（含「自动」档）、**不给「始终允许」**、命中项要**可见地**列在卡片正文（`agent.static_secrets_body`），不能只塞标题 tooltip |
+| 模型侧 | 工具返回文本里附一句 `secret_note()`（`tools.rs`），否则模型不知道用户为什么被多问了一次 |
+| 缺字段 | 旧 agent / 非写入类工具不带该字段 ⇒ 按「无命中」处理 |
+| 落盘 | 命中写一条 `warn`（**只记规则名与行号**，绝不记内容原文，仍过 `mask_secrets`） |
 
 ✅ **档位已可切换（2026-09）**：两个入口共用 `set_security_profile`（`restart=true` 才重启 agent）——① 设置 · AI 面板的**安全档位**下拉（只读 / 项目 / 完全，边界 = 允不允许）；② AI 输入栏的**运行方式**胶囊（手动 / 白名单 / 自动，频率 = 问不问，「自动」档映射 `full`）。两者关系、自动档二次确认与常驻警示、越界卡片的三个动作见 [agent-ui-spec.md](file:///d:/cc/claude-code-cli-master/docs/agent-ui-spec.md) §4，规则见 §11 规则 21。
 
@@ -371,10 +392,11 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 审批 | `Agent` 本身在 `needs_approval` 里；子代理**内部**每次写操作**各自再走一次** `await_approval`（`ask_permission` 透传），所以是「批一次派代理」+「每次动手再批」，不是一次批准全放行。plan（只读）档在 `run_subagent` 开头直接 `Err`，`task_done` 带 `ok=false`（**2026-09-20 实测**：主对话如实回报 `[task-1] subagent failed: Agent is disabled in read-only (plan) mode`） |
 | 报告收口 | 回灌文本 = `[task-<N>] subagent report:\n\n<报告>`，报告按 `SUBAGENT_REPORT_CHARS = 8000` 字符裁剪（`log::truncate_chars`）；整条链路失败为 `[task-<N>] subagent failed: <原因>`（`is_error=true`）。子代理跑完却不写报告时给 `(subagent <id> finished without writing a report)` |
 | task id | 只能来自**进程内存态**计数器 `TASK_SEQ: AtomicU64` → `task-1` / `task-2` …。理由：Lunac 的 `session_id` **恒为 `""`**，靠 session 无法归因；计数器每个 agent 进程从 1 起（重启即重置，属已知取舍 —— 它是「本次运行的第几个子任务」，不是全局工单号） |
-| 事件流（前端据此画「子任务」） | `system/task_started`（`task_id` / `description`）→ 每次工具往返前一条 `system/task_progress`（`task_id` / `round` / `tool`）→ `system/task_done`（`task_id` / `ok` / `ms`）。**前端解析分支早已就绪**（`main.ts` 把 `task_started` / `task_progress` 映射成状态行的「子任务」文案），本项只补后端 emit |
-| 与主循环的衔接 | `dispatch_tool()` **拿不到 `cfg`**（子代理要发自己的 API 请求），所以在主循环的工具执行分支里对 `Agent` **特判**（`run_agent_tool(cfg, …)`），与 `run_one_tool` 并列。并行批不受影响：`Agent` 不在只读白名单里 ⇒ 永远走串行分支。**特判的副作用（排查时别踩）**：`Agent` 不走 `run_tool`，所以日志里**没有** `tool Agent ok (…ms, args=…)` 那一行 —— 它的调用记录是 `子代理 task-N 启动：<description>` 与 `子代理 task-N 完成（Nms，报告 N 字）`/`失败（Nms）` 这对（含耗时与报告体积）。按「子代理」搜，别按 `tool Agent` 搜 |
-| 构建期校验 | `cargo test` 三条守门单测：`agent_tool_is_registered_and_filterable`（在内置表里 / 能被 `--disallowedTools` 裁掉 / **总数 = 13**）、`agent_is_gated_and_serial`（`needs_approval` 真、`parallel_safe` 假、`gated_in_read_only` 假）、`subagent_tool_defs_drops_agent_and_bridge_only_tools`（剔哪三类 / 留哪些 / 顺序不变） |
-| 实测（2026-09-20，deepseek-flash，release 产物） | **首次**：一次提问 → 模型发 `tool_use(Agent)` → `task_started(task-1)` → `task_progress`（round1 `Glob` / round1 `Bash` / round2 `PowerShell` / round3 `Read`×3）→ `task_done(ms=3938, ok=true)`；主对话 FINAL 恰为 `[task-1] subagent report: … Total lines: 21`（**答案正确**，3 个各 7 行的文件）；**无孙代理**。**复查复跑**（改完上面三处之后）：让子代理自报工具名与工作目录 → 它列出 `Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite`（**11 件 = 13 件内置 − `Agent` − `SessionSearch`**，无 `mcp__*`）、报出正确的绝对 cwd、正确数出 21 行；`task_done(ms=5825, ok=true)`，4 次工具调用全部 `ok`（含带 `thinking` 的非流式请求被端点接受）。plan 档拒绝亦已实测 |
+| 事件流（前端据此画「子任务」） | `system/task_started`（`task_id` / `description`）→ 每次工具往返前一条 `system/task_progress`（`task_id` / `round` / `tool`）→ `system/task_done`（`task_id` / `ok` / `ms`）。前端 `main.ts` 里 `task_started` / `task_progress` 映射成状态行的「子任务执行中」，**`task_done` 映射回「工作中」**（2026-09-20 A5 补：此前只进不出，状态栏会停在「子任务执行中」直到模型下一轮开口；此刻主循环还没结束，所以不是「就绪」）。**后台复盘 fork 刻意不发这一对事件**（无人值守，发了既扰民又没有恢复时机） |
+| 与主循环的衔接 | `dispatch_tool()` **拿不到 `cfg`**（子代理要发自己的 API 请求），所以在主循环的工具执行分支里对 `Agent` **特判**（`run_agent_tool(cfg, …)`），与 `run_one_tool` 并列。**`Skill` 的 fork 模式同样在这里特判**（2026-09-20 A5，`run_forked_skill(cfg, …)`）—— inline 技能**不走这条路**（它只是把 md 正文交回主循环，与 `Read` 同级）。并行批不受影响：`Agent` 与 `Skill` 都不在只读白名单里 ⇒ 永远走串行分支。**特判的副作用（排查时别踩）**：`Agent` 不走 `run_tool`，所以日志里**没有** `tool Agent ok (…ms, args=…)` 那一行 —— 它的调用记录是 `子代理 task-N 启动：<description>` 与 `子代理 task-N 完成（Nms，报告 N 字）`/`失败（Nms）` 这对（含耗时与报告体积）。按「子代理」搜，别按 `tool Agent` 搜；fork 技能同理按「fork 技能」搜 |
+| 三个调用方共用一台引擎 | `run_subagent()` + `ForkSpec` 现在有**三个**调用方：① `Agent` 工具（`emit_progress=true`、`bridge=None`、工具集 = `subagent_tool_defs()`）；② A4 后台复盘 fork（`emit_progress=false`、自带一条桥、工具集 = 读写记忆白名单）；③ **A5 fork 技能**（`emit_progress=true`、`bridge=None`、工具集 = `allowed-tools` 与 `subagent_tool_defs()` 的**交集**）。把差异收进结构体是这三个能共用的前提 —— **新增调用方时只加字段，不要在 `run_subagent` 里加 `if 调用方 == X`** |
+| 构建期校验 | `cargo test` 四条守门单测：`agent_tool_is_registered_and_filterable`（在内置表里 / 能被 `--disallowedTools` 裁掉 / **总数 = 15**）、`agent_is_gated_and_serial`（`needs_approval` 真、`parallel_safe` 假、`gated_in_read_only` 假）、`plan_mode_tools_are_registered_and_gated`（A7：两件计划工具的表口径）、`subagent_tool_defs_drops_agent_and_bridge_only_tools`（剔哪几类 / 留哪些 / 顺序不变） |
+| 实测（2026-09-20，deepseek-flash，release 产物） | **首次**：一次提问 → 模型发 `tool_use(Agent)` → `task_started(task-1)` → `task_progress`（round1 `Glob` / round1 `Bash` / round2 `PowerShell` / round3 `Read`×3）→ `task_done(ms=3938, ok=true)`；主对话 FINAL 恰为 `[task-1] subagent report: … Total lines: 21`（**答案正确**，3 个各 7 行的文件）；**无孙代理**。**复查复跑**（改完上面三处之后）：让子代理自报工具名与工作目录 → 它列出 `Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite`（**11 件 = 15 件内置 − `Agent` − `SessionSearch` − 计划相位两件**；A7 之前是 13 − 2，件数不变、只是式子变了）、报出正确的绝对 cwd、正确数出 21 行；`task_done(ms=5825, ok=true)`，4 次工具调用全部 `ok`（含带 `thinking` 的非流式请求被端点接受）。plan 档拒绝亦已实测 |
 
 **工具错误不中断整轮**：工具返回 Err 时转成 `is_error=true` 的 `tool_result` 交回模型自行纠正；只有 HTTP / 流错误才终止本轮并回滚 history。写回上下文的 assistant 消息会**剔除 thinking 块**（端点要求 thinking 带 `signature`，回灌会 400），发给前端的整包仍保留 thinking。
 
@@ -436,7 +458,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 
 | 面 | 约定 |
 |---|---|
-| 白名单 | `tools::parallel_safe(name)`：`Read` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `Skill` / `TodoWrite`。**写类（`Write`/`Edit`）与 `Bash`/`PowerShell` 一律不并行** —— 它们有副作用，且顺序本身就是语义 |
+| 白名单 | `tools::parallel_safe(name)`：`Read` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `TodoWrite`。**写类（`Write`/`Edit`）与 `Bash`/`PowerShell` 一律不并行** —— 它们有副作用，且顺序本身就是语义。**`Skill` 已从白名单移出**（2026-09-20 A5）：它两种模式一读一写（inline 只读、fork 会派子代理发 API），而白名单**只看名字**，按最坏的那种算 |
 | **批必须连续** | 只读段**绝不允许跨越写类调用**：否则「写 A → 读 A」会被重排成「读 A（旧内容）→ 写 A」，错得无声无息。切分见 `plan_tool_batches`，单元素的只读段**不标并行**（省一次线程 spawn，行为与串行完全一致） |
 | 并发上限 | `TOOL_PARALLELISM = 4`，靠「分块 + 块内 join」实现（不引信号量），见 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) |
 | 回灌顺序 | **恒等于 `tool_use` 的原顺序** —— 结果按下标回填 `slots`，再统一用 `tool_result_block()` 组装。并行只改变执行时机，不改变任何可观测顺序 |
@@ -495,7 +517,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 审批 | MCP 工具一律先发 `can_use_tool`（见上表）；deny → `is_error=true` 的 `tool_result` |
 | 顺序 | `tools/list` 的返回顺序不保证稳定，接入时**按工具名排序后再入请求体** —— tools 数组属于请求前缀，顺序一变端点侧的前缀缓存整段失效 |
 | 错误 | 上游 `isError=true`、进程退出、超时都转成 `is_error=true` 的 `tool_result`，不中断整轮；结果与内置工具走**同一预算出口**（超 12000 字符落盘、只内联头尾，见 §3.5「单条工具输出预算」） |
-| 容错 | spawn/握手失败只往 stderr 记一行并继续 —— 十三件内置工具必须照常可用；MCP server 的 stderr 直接并入 agent stderr（上游会转发到前端/终端），stdout 独占给 JSON-RPC |
+| 容错 | spawn/握手失败只往 stderr 记一行并继续 —— 十五件内置工具必须照常可用；MCP server 的 stderr 直接并入 agent stderr（上游会转发到前端/终端），stdout 独占给 JSON-RPC |
 | 生命周期 | agent.exe 退出时 kill 子进程（`Drop for Bridge`）；新增/改动 `tools\*.json` 后需重启 agent.exe 才生效（与工具黑名单同一套重启流程） |
 
 **MCP resources 读侧（A3，2026-09-20）**：`resources/list` 把 `<exe 根>\tools\*.json` 报成 resource，`resources/read` 把其中一个**原样读回来**。为什么要读侧：模型能从 `mcp__*` 的 schema 知道用户工具的名字与入参，但**看不到 `handler`**（到底跑哪条命令 / 打哪个 HTTP 端点），而 `tools\` 通常在**工作区之外** ⇒ 内置 `Read` 会被工作区锁直接拒掉。要点：
@@ -532,17 +554,42 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 不打扰主对话 | 复盘**不发** `task_started` / `task_progress` / `task_done`（前端收到 `task_progress` 只会把状态栏改成「子任务运行中」且没有恢复时机），结论**只进 `log::info`** —— 它的产物是**记忆文件本身**。前端在 `idle` 下收到 `control_request` 时**不推状态机**（`idle → approval` 本就是非法迁移），卡片照常显示 |
 | 技能目录进 `add_dirs` | 白名单里那两件写工具要能改**技能**（`<exe 根>\skills`），而技能目录在**工作区之外** —— 不进可访问范围，工作区锁会直接拒（不是弹审批，是拒），「改技能」就永远不会发生。与 `output_dir` 同理：进的是**应用自己的目录**，不是放宽用户的工作区边界 |
 | 无桥就不跑 | `remember_on` 为假（没桥 / `LUNAC_MEMORY=0` / `Remember` 被裁）时把复盘间隔当 0 ⇒ **不派复盘**。它的唯一产品是记忆条目，写不进去还每 N 轮花一次 API 调用是纯浪费 |
-| 实测（2026-09-20） | **服务端直驱**（向 `lunac.exe --mcp-server` 连打 9 条 JSON-RPC）：追加（55 字符）→ 同条重写回 `(already remembered — nothing changed)` → 追加第二条（98 字符）→ 空 `content` 拒绝 → `memory_read` 读回两条 → 未知方法拒绝 → `replace` 后文件只剩新内容（34 字节）。**模型侧端到端**（release `agent.exe` + 真桥 + `LUNAC_NUDGE_INTERVAL=2`）：`system/init` 出现 `Remember`（14 件）；第 1 问**逐字抄回**预置的记忆文件（注入可用）；第 2 问跨过门槛后日志出现 `后台复盘 review-1 启动（快照 9xx 字）` → 9 秒后两条 `tool Remember ok`（`args={"content":"The user works only in Rust."}` / `…cargo test before committing…`），记忆文件随即多出这两条（预置那条原样保留）。**全过程没有 `task_progress` 行**（`emit_progress=false` 生效）。**反证**：不传 `--mcp-server` 时启动行 `工具=[…]` 里**没有** `Remember`（13 件），且**没有**注入行 —— 记忆文件就在磁盘上，仅凭「没有桥」两件事都不发生 |
+| 实测（2026-09-20） | **服务端直驱**（向 `lunac.exe --mcp-server` 连打 9 条 JSON-RPC）：追加（55 字符）→ 同条重写回 `(already remembered — nothing changed)` → 追加第二条（98 字符）→ 空 `content` 拒绝 → `memory_read` 读回两条 → 未知方法拒绝 → `replace` 后文件只剩新内容（34 字节）。**模型侧端到端**（release `agent.exe` + 真桥 + `LUNAC_NUDGE_INTERVAL=2`）：`system/init` 出现 `Remember`（14 件；A7 之后同口径是 16 件 —— 那次实测在 A7 之前，件数是当时的真实数字）；第 1 问**逐字抄回**预置的记忆文件（注入可用）；第 2 问跨过门槛后日志出现 `后台复盘 review-1 启动（快照 9xx 字）` → 9 秒后两条 `tool Remember ok`（`args={"content":"The user works only in Rust."}` / `…cargo test before committing…`），记忆文件随即多出这两条（预置那条原样保留）。**全过程没有 `task_progress` 行**（`emit_progress=false` 生效）。**反证**：不传 `--mcp-server` 时启动行 `工具=[…]` 里**没有** `Remember`（13 件），且**没有**注入行 —— 记忆文件就在磁盘上，仅凭「没有桥」两件事都不发生 |
 
-**P4 已完成（2026-09，技能 SKILL.md）**：实现在 [core-agent/src/skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)。agent.exe 启动时扫 `LUNAC_SKILLS_DIR`（= `<exe 根>\skills`，见 §11 规则 3）下的 `<key>/SKILL.md`，采用**渐进披露**：系统提示词里只列 `key: 描述`（描述 ≤250 字符、清单总预算 8000 字符），模型需要时调内置 `Skill` 工具取回正文（`$ARGUMENTS` 已按调用参数替换）。要点：
+**P4 已完成（2026-09，技能 SKILL.md）；两种执行模式 2026-09-20（原 backlog A5 的 fork 一半）**：实现在 [core-agent/src/skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)。agent.exe 启动时扫 `LUNAC_SKILLS_DIR`（= `<exe 根>\skills`，见 §11 规则 3）下的 `<key>/SKILL.md`，采用**渐进披露**：系统提示词里只列 `key: 描述`（描述 ≤250 字符、清单总预算 8000 字符），模型需要时调内置 `Skill` 工具取回正文（`$ARGUMENTS` 已按调用参数替换）。要点：
 
 | 项 | 约定 |
 |---|---|
 | 清单顺序 | 技能按 `key` 排序后再拼进系统提示词 —— 与 MCP 工具同理，顺序抖动等于废掉整段前缀缓存 |
-| 解析 | frontmatter（`name` / `description`）与正文分离；读不出的 SKILL.md 静默跳过，不影响其余技能 |
-| 匹配 | 调用参数先匹配 `key`，再退到 frontmatter.name，均大小写不敏感 |
+| 解析 | frontmatter 与正文分离；读不出的 SKILL.md 静默跳过，不影响其余技能。**只认四个字段**：`name` / `description` / `context` / `allowed-tools`（旧 CLI 的 `model` / `effort` / `paths` / `hooks` 在 Lunac 无落点，见 §11 规则 57） |
+| 匹配 | 调用参数先匹配 `key`（精确）→ frontmatter.name（忽略大小写）→ `key`（忽略大小写）；三条都不过就是 `Unknown skill "X". Available: …`。**inline 与 fork 两路共用同一个 `find()`** —— 各写一份必然在「谁优先」上漂移 |
+| **模式一：inline**（默认） | `Skill` 把**正文**交回主循环，模型自己在当前对话里照做。纯读（与 `Read` 同级）⇒ **不审批**、**plan 档放行**；并行上**与 fork 一起算串行**（白名单只看名字，见下行） |
+| **模式二：fork**（`context: fork`） | `Skill` **不返回指令，而是派生一个子代理去执行**，主对话只收报告。判据抄旧 CLI：`frontmatter.context === 'fork'`（精确小写整词，不发明第三态） |
 | 生效 | 面板安装 / 保存 / 删除后调用 `__lunac_reload_agent` 重启 agent.exe（技能目录在启动时扫描一次） |
-| 未做 | fork / remote 两种技能模式 |
+| fork 的三种后果 | ① **要审批** —— 与 `Agent` 同理，「派一个代理出去干活」这个决定本身值得确认（判据带**入参**：`needs_approval_with()` 查 `skill` 指向的那个技能是不是 fork；**别**把 `Skill` 整件塞进 `tools::needs_approval()`，那会让 inline 技能每次都白弹卡）；② **plan 档拒绝**（`fork skills are disabled in read-only (plan) mode`）；③ **必须串行** —— `parallel_safe("Skill")` 已改 `false`（白名单只看名字，判不出模式，按最坏的那种算） |
+| fork 的工具面 | frontmatter `allowed-tools:`（兼容 `[a, b]` / `a, b` / `a b`）**只在 `subagent_tool_defs()` 的结果里挑** ⇒ 技能无法借白名单把 `Agent` / 走桥的 / `mcp__*` 弄进来，判据仍只有一处。空 = 不限制；非空但一件都没匹配上 = **一件也不给**（fail-closed，写错白名单不该悄悄放开成全集），并落一行 warn 日志 |
+| fork 与子代理共用同一台引擎 | 走 `run_subagent()` + `ForkSpec`（与 `Agent` 工具、A4 后台复盘**第三个调用方**共用）：任务 = 技能正文、工具集 = `allowed-tools` 交集、`emit_progress = true`（它是用户/模型主动发起的，进度必须回前端）、轮次与预算同 `MAX_SUBAGENT_ROUNDS` / `SUBAGENT_BUDGET_TOKENS`。**回灌措辞必须与 inline 区分**：inline 是「照着做的指令」，fork 是「已经做完了，这是结果」 |
+| 清单里的 `[subagent]` 标记 | fork 技能在系统提示词与 `Skill` 工具描述里都标出来。标记是技能固有属性 ⇒ 逐字节稳定，不破坏前缀缓存。**漏标等于让模型把「子代理的报告」当成「要自己再执行一遍的指令」** |
+| 递归 | 子代理的工具集里**有** `Skill`（技能组合很自然），但 fork 技能无法被再 fork —— `skills::run()` 对 fork 技能一律回 `cannot be loaded inline`。这是**防路由漏洞的保险**，正常路由不会走到 |
+| **自带脚本 / 资源**（2026-09-20，A5 剩余项收尾） | 启动扫描时登记技能目录里**除 `SKILL.md` 之外的文件**（`collect_resources()`），**调用 `Skill` 时**附在返回里（inline 附在正文之后、fork 附进子代理的任务说明）。清单是**相对路径**（`/` 分隔、已排序），抬头写明「相对于 `<skills dir>/<key>/`」—— 模型据此用 `Read` / `Glob` 自取；执行仍走 `Bash` / `PowerShell`，照常审批。**刻意不进系统提示词**：它随用户往目录里丢文件而变，进了提示词就等于让整段前缀缓存跟着文件系统抖动（规则 18）。边界保守：深度 ≤ 3、条数 ≤ 40（超了如实写一行「还有没列出的」）、跳过隐藏项与 `node_modules` / `target`、**不跟随符号链接**（「报出去的路径一定落在技能目录内」这条保证就来自这里，不需要逐条 `canonicalize()`） |
+| 未做 | **remote**（远端拉取）**结论：不移植** —— 旧 CLI 的 `remoteSkillLoader` / `remoteSkillState` 在 `feature('EXPERIMENTAL_SKILL_SEARCH')` 开关之后、**磁盘上文件已不存在**，且依赖 Lunac 没有的 `akiBackend` 服务。A5 至此**全部完成**（fork + 自带资源），条目已从 backlog 撤下 |
+
+**计划模式闭环（A7，2026-09-20）**：把 §12「Agent Plan 模式规范」从**一段写给模型看的提示词**变成**进程内的硬状态**。旧 `cli.exe` 的 `EnterPlanMode` / `ExitPlanMode` 在 Lunac **没法照抄** —— 那边的 `plan` 是 CLI 启动参数、切档要重启 agent，而「先出计划、用户点头后再动手」是一轮对话内部的事。所以这里做的是**计划相位**（`plan_phase`）：与用户的**安全档位**（`read_only`）是两回事。要点：
+
+| 项 | 约定 |
+|---|---|
+| 计划相位 vs 安全档位（**别混**） | `read_only` = **用户**在设置里选的「只读」（`--permission-mode plan`，**启动时定死**，改它要重启 agent，只读档下写类工具**永远**被拒）；`plan_phase` = **模型自己**的临时承诺（`EnterPlanMode` 置真、`ExitPlanMode` 被批准后置假，**进程内即时生效、不重启**）。两者的**拒**共用同一个出口 `tools::write_blocked()`，但**措辞必须分开** —— 用户该做的动作不同（一个去设置里改档位，一个去批准计划） |
+| 状态存在哪 | `tools::Ctx.plan_phase: Arc<AtomicBool>`（**不是** `main.rs` 的局部 bool）。三条理由：① 它要和 `read_only` **在同一个地方被同一个判据读到**，否则「哪些工具算写类」这份知识会散到 `main.rs` 的五六处早退分支上；② `Ctx` 是 `Clone` 且要跨线程（只读工具并行批用 `&Ctx`、后台复盘 fork 拿克隆）⇒ 值语义的 `bool` 会各持一份、`Cell` 会破 `Sync`；③ 派生出去的子代理 / fork 技能 / 后台复盘**自动继承**计划相位 —— 正是想要的 |
+| 两件工具 | `EnterPlanMode{reason?}`：**免审批**（只改一个进程内标志 + 发一条状态事件，比 `TodoWrite` 还轻）、`parallel_safe=false`；`ExitPlanMode{plan}`：**要审批**（那张卡就是它的产品）、必须串行（等人裁决，并发弹两张卡会让「批准了哪一份」无法回答）。两件都**无条件注册**进 `defs()`（计划相位是运行期翻转的，而工具表是请求体里的固定前缀，事后没法增删 ⇒ 只能靠执行侧硬拒），也都能被 `--disallowedTools` 裁掉 |
+| 硬拒（不靠模型自觉） | 写类工具在计划相位里一律返回 Err：内置四件走 `tools::write_blocked()`（`tools.rs` 的 `write` / `edit` / `bash` / `powershell`）；**四个早退分支必须各自补一次**，它们绕过 `tools::run()`：`Agent`（`run_subagent`）、fork 技能（`fork_skill_allows`）、`Remember`、`mcp__*`/走桥工具（`dispatch_tool`） |
+| 只读档下不许「退出计划模式」 | 只读档 + `ExitPlanMode` ⇒ **拒绝**，并说明「批准了计划也执行不了，请改用正文交代计划；要执行先去设置里把档位改成 project」。说不清这一句，模型会把用户引到一个必然失败的动作上 |
+| 为什么不改档位、不重启 | 计划相位是**一次对话内部**的状态；为了让写类解锁而重启 agent 会丢掉整段上下文，代价远超收益。用户的安全档位也不许被模型改 —— 那是**用户**的边界 |
+| 前端的三处落点（不新增协议字段） | ① `ExitPlanMode` 复用**已有的** `can_use_tool` 审批卡 + `updatedInput` 通道（同 `AskUserQuestion`：卡片正文 = 入参 `plan`，原样铺开、不用 markdown 渲染器、用 `textContent` 防注入）；② `EnterPlanMode` 只改 agent 状态 ⇒ 前端靠一条 `system/plan_mode`（`state: on/off` + 可选 `reason`）**镜像**它，自己**不推断**（推断要在「模型调过哪些工具」与「用户批准了没有」之间做二次判断，很容易和 agent 里的真值脱节）；③ 批准后把计划留档（见下一行） |
+| 计划落盘 | `<exe 根>\ModuleData\plans\<本地时间戳>.md`（`storage::save_plan_md`，前端在批准那一刻调）。文件名时间戳由**前端**给（`YYYY-MM-DD_HHMMSS`，本地时区）+ Rust 侧严格校验形状（前端给的文件名一律不可信）—— 同 `append_usage_log`，Rust 侧没有 chrono（见 `log.rs`）。**落盘不是执行的前置**：失败只提示，绝不反过来拦住执行 |
+| 拒绝路径 | 被拒时 `run_one_tool` 的 `denied` 早退**根本不会走到** `dispatch_tool` ⇒ 相位保持为真。前端随拒绝回一句**专用**拒因（i18n `agent.plan_deny_msg`）：必须说清「**你仍在计划模式**」，否则模型会以为可以接着动手，然后每个写类调用都撞一次 `write_blocked`、白烧一轮往返 |
+| 不做 `VerifyPlanExecution` | 验证环节交给已有的 `TodoWrite`（见 §12 的分期结论）：为「逐条核对计划是否执行」再造一件工具，等于把 `TodoWrite` 的职责抄第二遍 |
+| 子代理看不到这两件 | `subagent_tool_defs()` 把 `EnterPlanMode` / `ExitPlanMode` 一并剔掉：计划相位是**主循环**的状态，而子代理**问不了用户**（它的提示词就是这么写的）⇒ 在里面 `ExitPlanMode` 只会弹一张无人能负责的卡 |
+| 实测（2026-09-20，release + deepseek-flash） | 脚本扮演 lunac.exe 直驱 stdio（`--permission-prompt-tool stdio`），11 条断言全过：`EnterPlanMode` 广播 `plan_mode state=on`（带模型自述的理由）→ `Read` 通过 → `ExitPlanMode` 走审批通道（计划正文 1197 字符）→ **拒绝** → 拒因原话进入 `tool_result` → 第 2 问要求直接动手时 `Write` 被硬拒（`Write is disabled while a plan is pending approval. Present the plan with ExitPlanMode …`）→ 再交计划并**批准** → 广播 `state=off` → 同一个 `Write` 落盘且内容正确 |
 
 **与旧 cli.exe 的完整差距清单、价值评级与实施顺序见 [agent-feature-backlog.md](file:///d:/cc/claude-code-cli-master/docs/agent-feature-backlog.md)。**
 
@@ -759,7 +806,7 @@ core-agent/
 ├── src/main.rs                      # 自研 agent 核心 —— stream-json 契约、工具循环、审批，见 §3.5
 ├── src/tools.rs                     # P1 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
 ├── src/mcp.rs                       # P3 MCP 工具桥（stdio client，连 lunac.exe --mcp-server）
-├── src/skills.rs                    # P4 技能（LUNAC_SKILLS_DIR 的 <key>/SKILL.md + Skill 工具）
+├── src/skills.rs                    # P4 技能（LUNAC_SKILLS_DIR 的 <key>/SKILL.md + Skill 工具；inline / fork 两模式）
 ├── src/log.rs                       # 落盘日志（agent 侧：工具调用与错误、stderr、panic，见 §11 规则 20）
 ├── Cargo.toml
 └── target/release/agent.exe         # 编译产物（cargo build --release，约 2.5MB，不入库）
@@ -1016,11 +1063,11 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
 11. **自定义文件启动（快速启动 / Custom Launch）**：持久注册表为 `<exe 根>\ModuleData\custom\app_registry.json`（业务数据同根统一管理；旧 exe 同目录 / LOCALAPPDATA 文件首读自动迁移）。面板打开即列出**全部已注册项**（可启动 / 逐条删除 / 「添加启动项」），重启不丢失、数据不再“消失”；删除 = 注销注册表 + 摘除对应气泡。拖入/粘贴路径进搜索栏即自动注册；入口词多语言/拼音覆盖（launch/open/启动/qidong/dakai/自定义/快速启动…，中文由 pluginRegistry 自动生成拼音索引）。
 12. **卸载清理**：NSIS `installerHooks`（[nsis-hooks.nsh](file:///d:/cc/claude-code-cli-master/app/src-tauri/nsis-hooks.nsh)）`NSIS_HOOK_POSTUNINSTALL` 做**双清理**：① 递归删除 exe 安装根内的运行时数据子目录（ModuleData / temp / skills / tools / config / paddle-ocr）；② 删除旧版本遗留的 `%LOCALAPPDATA%\Lunac(-dev)`，实现干净卸载。
 13. **OCR 引擎按需下载**：PaddleOCR-json 引擎不随发行包分发，落到 `<exe 根>\paddle-ocr`（与数据根一致）。前端两条入口复用 `ocr.ts` 导出的 `installOcrEngine()`（监听 `ocr-engine-progress`/`ready`/`error`）：① OCR 面板执行识别前先 `ocr_engine_status()`，缺失则在状态行内联「下载并安装」按钮；② 设置 · 常规面板常驻「OCR 引擎」行（状态 + 下载/重试）。**安装必须原子化**：下载 → 解压到 `temp\paddle-ocr-staging` → 校验 `PaddleOCR-json.exe` + `models/config_chinese.txt` → 才删除并 `rename` 到目标目录，任一环节失败清理半成品，避免 `paddle_ocr_dir()` 定位到残缺目录导致 OCR 永久失败且无从诊断。
-14. **Agent 内置工具与审批（P1/P2，2026-09）**：十三件工具全部在 `core-agent/src/tools.rs`，工具名必须保持 **PascalCase**（前端 `main.ts` 对 `"Bash"` / `"PowerShell"` 有专门的命令展示与危险命令分类分支），新增/改名要同步 §3.5 的契约表。写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）**必须先发 `can_use_tool` 等前端回包**，agent 侧不做二次判断（白名单与危险命令分类归前端 `classifyRequest()`）；`plan` 档直接拒绝、`LUNAC_WORKSPACE_LOCKED=1` 拦越界 —— 这两道闸门与审批是**与**关系，任何一道都不得为了「少点一次同意」而放宽。**`WebSearch`、`WebFetch` 与 `AskUserQuestion` 同样必须先审批，且是「`plan` 档不解禁」的例外**（`tools::gated_in_read_only`）：只读档对写类工具免于询问，是因为那些工具反正会被拒（问了白问）；这三件在只读档**放行** —— `WebSearch` 会把查询词发往外部搜索源，`WebFetch` 能把 `Read` 到的文件内容拼进 URL 带出本机，`AskUserQuestion` 的答案只能从卡片上取。**`Agent`（子代理）也必须先审批，且 `plan` 档直接拒绝** —— 它派生的是一个能写文件、能跑命令的子代理；但这个批准**只覆盖「派代理」本身，子代理内部每次写操作仍各自再走一次审批**（不是一次批准、后面全放行）。**常驻免审批的只有 `TodoWrite`（只改前端面板）与只读的 `SessionSearch`（只读本机自己的会话库）**，它们的免审批不构成先例：判断新工具是否免问，看的是「执行会不会改变本机或把数据带出」。工具报错必须以 `is_error=true` 的 `tool_result` 回给模型（不中断整轮），只有 HTTP/流错误才回滚 history。
+14. **Agent 内置工具与审批（P1/P2，2026-09）**：十五件工具全部在 `core-agent/src/tools.rs`，工具名必须保持 **PascalCase**（前端 `main.ts` 对 `"Bash"` / `"PowerShell"` 有专门的命令展示与危险命令分类分支），新增/改名要同步 §3.5 的契约表。写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）**必须先发 `can_use_tool` 等前端回包**，agent 侧不做二次判断（白名单与危险命令分类归前端 `classifyRequest()`）；`plan` 档直接拒绝、`LUNAC_WORKSPACE_LOCKED=1` 拦越界 —— 这两道闸门与审批是**与**关系，任何一道都不得为了「少点一次同意」而放宽。**`WebSearch`、`WebFetch` 与 `AskUserQuestion` 同样必须先审批，且是「`plan` 档不解禁」的例外**（`tools::gated_in_read_only`）：只读档对写类工具免于询问，是因为那些工具反正会被拒（问了白问）；这三件在只读档**放行** —— `WebSearch` 会把查询词发往外部搜索源，`WebFetch` 能把 `Read` 到的文件内容拼进 URL 带出本机，`AskUserQuestion` 的答案只能从卡片上取。**`Agent`（子代理）也必须先审批，且 `plan` 档直接拒绝** —— 它派生的是一个能写文件、能跑命令的子代理；但这个批准**只覆盖「派代理」本身，子代理内部每次写操作仍各自再走一次审批**（不是一次批准、后面全放行）。**常驻免审批的只有 `TodoWrite`（只改前端面板）、只读的 `SessionSearch`（只读本机自己的会话库）与 `EnterPlanMode`（只改 agent 进程内的计划相位标志，见规则 59）**，它们的免审批不构成先例：判断新工具是否免问，看的是「执行会不会改变本机或把数据带出」。**`ExitPlanMode` 必须先审批**（那张卡就是它的产品，见规则 59）。工具报错必须以 `is_error=true` 的 `tool_result` 回给模型（不中断整轮），只有 HTTP/流错误才回滚 history。
 15. **Agent 上下文压缩不变量（2026-09）**：历史一律以 **user 文本消息**开头（不是 `tool_result`），`tool_use` 与对应 `tool_result` 不得被拆散（丢弃点要跳过 `tool_result` 开头的位置）。任何改动 `compact_history()` 的代码都必须同步修正调用方的回滚锚点 `base`（`base -= dropped`），并在压缩后往 `system/context_compacted` 事件里报出计数 —— 这三条是「压缩后仍能继续对话」的充分条件，改动后请用 `LUNAC_MAX_CONTEXT_TOKENS=8000` 的真实端点烟测复验。
 16. **测试一律用 flash 模型（2026-09）**：任何真实端点测试（工具往返、权限审批、上下文压缩、MCP 桥等）把 `AI_MODEL` / `LUNAC_AGENT_MODEL` 指向 **`deepseek-flash`**，**不要用 `deepseek-v4-pro`** —— 测试只验证链路、契约与结构，flash 足够且更快更省；只有当问题与回答质量本身相关、或需要复现线上行为时才用 pro。
-17. **MCP 工具命名与审批（P3，2026-09）**：接进请求体的用户工具名一律 `mcp__<原名>`，**前缀与清洗规则（非法字符换 `_`、超长截断、重名加 `_2`）不得随意改动** —— 前端审批卡的「始终允许」按完整工具名记 localStorage 白名单，改名等于让用户的白名单失效。MCP 工具**必须**先发 `can_use_tool`（handler 能跑 shell / 发 HTTP），且 plan（只读）档不接入；桥的失败（spawn/握手/超时）只记 stderr，**绝不允许影响十三件内置工具的可用性**。
-18. **前缀缓存不变量（2026-09）**：DeepSeek 等端点的自动前缀缓存按「最长公共前缀」命中，**请求体里任何靠前内容逐字节抖动都会让整段缓存失效**。已定稿的稳定化措施，改动时不得回退：① `history` 一律以 user 文本消息开头；② 压缩丢弃点左移 `base` 锚点而不是改历史首条；③ 系统提示词固定、技能清单按 `key` 排序；④ 内置工具名 PascalCase 稳定、MCP 工具数组**按名排序**后再入请求体；⑤ 工具黑名单只裁剪真实存在的工具名（`core-agent` 的内置十一件 + `Skill`），`src-tauri` 侧**不再内置旧 CLI 时代的默认名单** —— 那批名字对自研 agent 全是空转项，且按名精确比较会误伤同名 MCP 工具。判断「改了会不会掉缓存」的方法：把两次请求体开头做 diff，出现任何顺序变化即为回归。
+17. **MCP 工具命名与审批（P3，2026-09）**：接进请求体的用户工具名一律 `mcp__<原名>`，**前缀与清洗规则（非法字符换 `_`、超长截断、重名加 `_2`）不得随意改动** —— 前端审批卡的「始终允许」按完整工具名记 localStorage 白名单，改名等于让用户的白名单失效。MCP 工具**必须**先发 `can_use_tool`（handler 能跑 shell / 发 HTTP），且 plan（只读）档不接入；桥的失败（spawn/握手/超时）只记 stderr，**绝不允许影响十五件内置工具的可用性**。
+18. **前缀缓存不变量（2026-09）**：DeepSeek 等端点的自动前缀缓存按「最长公共前缀」命中，**请求体里任何靠前内容逐字节抖动都会让整段缓存失效**。已定稿的稳定化措施，改动时不得回退：① `history` 一律以 user 文本消息开头；② 压缩丢弃点左移 `base` 锚点而不是改历史首条；③ 系统提示词固定、技能清单按 `key` 排序；④ 内置工具名 PascalCase 稳定、MCP 工具数组**按名排序**后再入请求体；⑤ 工具黑名单只裁剪真实存在的工具名（`core-agent` 的内置十五件 + `Skill`），`src-tauri` 侧**不再内置旧 CLI 时代的默认名单** —— 那批名字对自研 agent 全是空转项，且按名精确比较会误伤同名 MCP 工具。判断「改了会不会掉缓存」的方法：把两次请求体开头做 diff，出现任何顺序变化即为回归。
 19. **用量口径不变量（2026-09）**：`result.usage` 是**每次提问的绝对值**（agent.exe 每次提问把四个计数器清零再累加本轮的工具往返），**永不改成会话累计** —— 累积是前端/面板的事，agent 侧一旦改成累计，回滚（失败轮 `history.truncate(base)`）就会让计数与上下文不一致。前端**禁止对 `result.usage` 做差**（旧 cli.exe 才是累计值，这条是历史包袱）。**表盘（命中率 / 总 token）口径 = 当前这次对话** —— 新建会话、切到别的会话都归零（用户 2026-09 明确要求；此前是「今日合计」，已改）。按天合计**照旧**落盘在 `ModuleData\usage\usage-YYYY-MM-DD.jsonl`，供与供应商平台逐条对账 —— **两套口径不要混**：日志是「天」，表盘是「对话」。日志字段名 `cacheRead` / `cacheCreate`（驼峰）是日志格式契约，改名会让外部对账脚本读不到。详见 §3.5「用量与对账」。
 20. **落盘日志（2026-09）**：release 是 GUI 子系统、没有控制台，`eprintln!` 线上全部丢失，前端也没有 DevTools —— 出问题原本**没有任何东西可查**。现在两个进程各自落盘到 **`<exe 根>\temp\logs\`**（`agent-YYYY-MM-DD.log` / `lunac-YYYY-MM-DD.log`，日期为 **UTC**、跨天自动换文件，启动时清理 7 天前的 `*.log`）：
     - **agent 侧**（[core-agent/src/log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs)）：启动/退出、`ready`（工具清单 / 审批档 / 技能与 MCP 数量）、`cfg`（端点与模型，token 只记 set/empty）、**每次工具调用**（`run_tool` 是唯一入口：名称 + 参数摘要 + 成功或 `FAILED` 文案 + 耗时，覆盖内置 / Skill / MCP 三类）、`run_shell` 的**退出码 / 是否超时 / 输出规模 / stderr 原文**、panic。
@@ -1100,7 +1147,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **落盘正文按 1.5MB 字节封顶**（切在字符边界）：必须低于 Read / Grep 的 `MAX_TEXT_BYTES`(2MB) 门槛，否则模型两个工具都打不开（Read 拒绝、Grep 跳过）。被砍时预览里必须如实写「only the first N chars」。
     - **保留 7 天**（启动时清 `*.txt`，与规则 20 的落盘日志同口径）；**不新增环境变量**（目录取 `log::log_dir()` 的父目录）。每次落盘往日志记一行「超预算（N 字符 / M 行）→ 路径」，否则线上无法判断「模型为什么没看到完整输出」。
 28. **只读工具并行（2026-09-15）**：一轮里的多条工具调用，**连续的只读调用**合成一批并行（上限 `TOOL_PARALLELISM = 4`），其余串行。契约见 §3.5「只读工具并行」。
-    - **白名单只有 7 个**（`tools::parallel_safe`）：`Read` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `Skill` / `TodoWrite`。**新增工具默认串行** —— 要进白名单必须先自证「只读、不落盘、无全局状态」。
+    - **白名单只有 6 个**（`tools::parallel_safe`）：`Read` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `TodoWrite`。**新增工具默认串行** —— 要进白名单必须先自证「只读、不落盘、无全局状态」。**`Skill` 在 2026-09-20 被移出**（A5）：判据是**只看名字**的，而 `Skill` 分 inline（纯读）/ fork（派子代理发 API、能写文件）两种模式，名字判不出来 ⇒ 按最坏的那种算。守门单测 `only_read_only_tools_may_run_in_parallel` 把 `Skill` 钉在「不该并行」一侧，改这段必跑。
     - **只读批绝不允许跨越写类调用**（「写 A → 读 A」被重排就是错得无声无息）。单元素只读段不标并行。
     - **回灌顺序恒等于 `tool_use` 原顺序**：结果按下标回填，禁止「谁先跑完谁先回灌」。同样地，**审批必须在并行之前**按原顺序解完（否则会打乱前端按「未应答行」合并同一批命令的结果）。
     - **MCP 与命令工具永不并行**：`&mut Bridge` 无法跨线程共享（也不该并发），命令工具带副作用。
@@ -1258,35 +1305,115 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **往 `#results-list` 增删条目 = 必须重新断言高度，且必须是同步测量（2026-09-19 修，不得只靠 ResizeObserver / rAF）**：用户报「唤出时第 3 项被截掉一半，直到搜索变动才恢复」。根因是空查询常驻项**分两步**渲染：`renderAIEntry()` 只渲染 2 项（Web 搜索 + AI）并**当场** `applyWindowSize()` 下发 2 项高（实测 199），随后 `renderClipboardOCREntry()`（剪贴板有图时）把 OCR 项插成第 3 项（需 255）**却没有补测** ⇒ 窗口停在 2 项高度，第 3 项只露出 46 − 33 ≈ 23px。`renderAIEntry` / `renderMixedResults` 收尾都同步调了 `applyWindowSize()`，只有这条插入路径漏了 —— 现在 `renderClipboardOCREntry()` 末尾同样同步调用它。**为什么必须是同步而不是等 RO / 双 rAF**：唤出瞬间 WebView 常仍被判定为「未渲染」，ResizeObserver 回调与 `requestAnimationFrame` 都会被推迟（隐藏页面里 rAF 干脆不跑），靠它们兜底就等于把这个错误高度一直留在屏幕上；`getBoundingClientRect()` 会强制一次布局，当场就能量到真值。浏览器实测：修复后「插入第 3 项」与「`setSize(254)` 下发」发生在**同一 tick（差 0ms）**，修复前要等 RO 的 60ms 防抖 + 定时器约 135ms。**纪律：任何改动 `#results-list` 条目的函数，收尾都要量一次高度。**
     - **已知取舍**：窗口变高时左上角不动、向下生长（`tauri.conf.json` 的 `center: true` 只管创建那一刻）。结果很多时窗口会一直向下长到屏幕底边附近 —— 被 `--results-max-h` 截住后转为内部滚动。**没有**做「贴底时自动向上生长」的重定位。
 
-45. **外观 / 主题：配置在 localStorage、主题包在文件、落地只走 CSS 变量（2026-09-19 新增）**：设置 → **风格** 分区，四块能力 = 背景（三按钮 + 5 滑块）+ 主题色（应用内取色器 或 跟随 Windows）+ 整套配色派生 + 主题包。
+45. **外观 / 主题：配置在 localStorage、主题包在文件、落地只走 CSS 变量（2026-09-19 新增；2026-09-20 三次重构「主题颜色」）**：设置 → **风格** 分区，现在四块能力 = 背景（三按钮 + **4** 滑块）+ 主题颜色（**恢复默认主题**开关置顶 + **底色自定义** + **按钮自定义** + **文字自定义**）+ 整套配色派生 + 主题包。
+    - **主题色取色器已删除（2026-09-20 第二次重构，用户要求「去除主题色取色」，并选「连字段一起删」）**：设置里的那一行没了，`Appearance.customAccent` 字段也没了，`buildAppearancePane` 不再挂 `ap-accent`。**主题色现在只有一个来源：主题包的 `tokens.accent`**（`main.ts` 的 `themeAccent()`；主题读不到 / 损坏时回落 `DEFAULT_ACCENT = "#c0a0a0"`）。
+      - **副作用（必须知道，不是 bug）**：老配置里存过的自定义主题色会**失去载体**，渲染回落到当前主题声明的 accent（默认主题 = `#c0a0a0`）。选主题时也不再「顺手把主色写进配置」——那段代码已删。
+      - 已删的键：`settings.appearance_color_picker`（i18n）。别在 `#ap-color-group` 里再挂 `colorPickerHtml("ap-accent", …)`。
+    - **「跟随 Windows 强调色」已整体下线（2026-09-20，用户指定）**：「取色方式」（自定义 / 跟随 Windows）分段按钮、`Appearance.colorMode` 字段、`systemTheme` 缓存、`refreshSystemTheme()`、启动时那次无条件取色、`lunac-window-shown` 时的取色、**15s 轮询**、设置里的「当前系统色 / 刷新」那一行，**全部删除**；`i18n` 里对应的 5 个键（`appearance_color_mode` / `appearance_color_custom` / `appearance_color_system` / `..._current` / `..._refresh` / `..._unavailable`）一并删掉。**影子值**：老配置里的 `colorMode` 变成未知键，读进来被忽略、下次落盘自动消失。
+      - **Rust 的 `get_system_theme` 命令保留**（`appearance.rs`）：那里钉着 AccentColor `0xAABBGGRR` / ColorizationColor `0xAARRGGBB` 的**本机取证与单测**，删掉等于丢证据。但前端已无调用方 —— 回归时不要把「前端没有入口」当成 bug。
     - **三层优先级：用户配置 > 主题包 > `styles.css` 的 `:root` 默认值**。`main.ts` 的 `applyAppearance()` 是**唯一**合成点，结果写在 `<html>` 行内 style 上（同 `--results-max-h` 的例外论据：值来自用户配置，写不进样式表）。配置存 `localStorage.lunac-appearance`（本机偏好）；主题包存 `<exe 根>\themes\<名>\theme.json`（含图片资产，必须落文件才能导入导出/分享 —— 与 skill / tool 同一套 portable 约束，见规则 24）。旧键 `lunac-bg-image` **一次性迁移**进新配置后立即删除（留着就是第二个真相源）。
-    - **整套配色由主色派生（`tintBase`，默认开）—— 这是「底色跟随主题色」的实现（2026-09-19 二次定稿）**：`derivePalette()` 按主色的**相对亮度**（WCAG，非 HSL 的 L —— 纯黄 `#ffe066` 的 HSL-L 只有 70% 看着「中等」，相对亮度却 0.75，人眼就是觉得亮）派生六项：
+    - **整套配色由主色派生（2026-09-19 二次定稿；2026-09-20 那个开关先改名「主题色代替底色」并反转默认值、同日再改名「恢复默认主题」并扩大失效范围）**：`derivePalette()` 按主色的**相对亮度**（WCAG，非 HSL 的 L —— 纯黄 `#ffe066` 的 HSL-L 只有 70% 看着「中等」，相对亮度却 0.75，人眼就是觉得亮）派生六项：
       - **文字一律纯灰阶、不带色相**（用户明确要求「不采用红绿蓝色相调整，只在黑白之间渐变」）：`--text`/`--text-dim`/`--text-muted` = `hsl(0, 0%, 89→9% / 68→10% / 50→8%)`；
       - **文字明暗与主色明暗反向**：主色很亮 → 文字黑；很暗 → 文字白；
       - **底色明度与文字同步反向**（`--surface-rgb` 明度 11% → 83%）—— 否则「亮主色 + 黑字」会落在深底上，等于看不清；
       - `--border-glass` 取「文字那一侧」的对比色（深色主题白、浅色主题黑），否则浅底上看不见边框；
-      - 转折点 = `APPEARANCE_DEFAULTS.customAccent`（`#c0a0a0`）的相对亮度 ⇒ `bright=0` 时逐项等于原配色（**默认外观几乎不变**）；中段用 `t=(bright−0.5)×2` 做**过渡带**，亮度落在 0~0.5 区间的颜色一律按深色主题处理（不做过渡带会得到「中灰底 + 中灰字」）。
-    - **优先级顺序 = 主题包先写、用户染色后写（不许调换）**：`applyAppearance()` 里 ④ 主题包 token、⑤ `tintBase` 派生。用户报的「#1C1A20 底色不跟随、有一层颜色蒙版」根因就是早期顺序相反 + 内置默认主题钉了 `surface: #1c1a20`（那层「蒙版」是 `#results-container::before` 的玻璃底色）。现在：`tintBase` 开着时派生值压过主题颜色；关掉时主题颜色生效（浏览器实测：关掉后精确回到 `28,26,32` / `#eae2da`）。**关掉不需要额外清理** —— ④ 已把这几项写成「主题值或空」。
-    - **CSS 变量契约**（`styles.css` 侧每一个都带默认值，即「不做任何覆盖时渲染不变」）：`--bg-opacity` / `--bg-blur` / `--bg-saturate`（背景图层 `#app-bg-image`）；`--glass-sheen-alpha`（反光，`0`）经 `--glass-sheen-image`（`linear-gradient(160deg, rgba(255,255,255,α) 0%, transparent 46%)`）落到**三个主面板的 `background-image`** 上 —— **刻意不用伪元素**：`#results-container` 的 `::before` 已是玻璃底色层，再叠 `::after` 会落在内容之上（伪元素是「最后子元素」），而 background-image 天然在背景色之上、内容之下；`--surface-alpha` 经 `--surface-rgb` / `--surface-rgb-hover` 合成 `--surface-glass*`（hover 用 `calc(var(--surface-alpha) - 0.08)` 保持「比常态再透一点」）；`--radius-search`（搜索栏形状）与 `--radius-results`（结果区 + 状态栏**底部**形状）**各自独立** —— 这就是「搜索栏与结果区不同图形」的实现方式，`#results-container` 自身仍是直角（它紧贴状态栏，给圆角会在接缝露出透明像素）；`--search-pattern-image` / `--pattern-opacity`（搜索栏花纹，走 `#search-bar::before`，默认 `none`；`border-radius: inherit` 跟随形状被裁剪）；`--accent-rgb` / `--accent` / `--accent-bg` / `--accent-border`（主题色：**`--accent-rgb` 是唯一真相源**的三元组 `r, g, b`，另外三项由它在 `:root` 派生 —— `--accent` 是 hex，半透明档 `--accent-bg`(0.14) / `--accent-border`(0.32)）；`--ink-rgb` / `--shade-scale`（中性叠加基色 / 凹陷压暗缩放，2026-09-19 批 6 收口，见规则 48）。
+      - 转折点 = `DEFAULT_ACCENT`（`#c0a0a0`）的相对亮度 ⇒ `bright=0` 时逐项等于原配色（**默认外观几乎不变**）；中段用 `t=(bright−0.5)×2` 做**过渡带**，亮度落在 0~0.5 区间的颜色一律按深色主题处理（不做过渡带会得到「中灰底 + 中灰字」）。
+    - **优先级顺序 = 主题包先写、派生后写、但主题包显式声明的底色不让位（不许调换）**：`applyAppearance()` 里 ④ 主题包 token、⑤ 派生。用户报的「#1C1A20 底色不跟随、有一层颜色蒙版」根因就是早期顺序相反 + 内置默认主题钉了 `surface: #1c1a20`（那层「蒙版」是 `#results-container::before` 的玻璃底色）。
+      - **「主题全面代替底色」的落点**：⑤ 的跳过条件是 `(baseOv || surface)` —— **主题包声明了 `tokens.surface` 就以它为准**（此前是 ⑤ 无条件覆盖，等于主题包的 `surface` 完全是死代码）。默认主题已于 2026-09-20 **删掉这个 token**（用户要求「去除默认主题对底色的影响」），所以默认主题下这条恒为空、底色完全由派生 / 用户自定义决定 ⇒ 默认渲染不变。
+      - **`themes/default/theme.json` 改完要同步 `app/src-tauri/target/debug/themes/default/theme.json`**：`themes_root()` = `<exe 根>\themes`（`storage::lunac_root_dir()`），dev 下 exe 在 `target\debug`，读的是那份**构建产物拷贝**（由 `tauri.conf.json` 的 `resources: { "themes": "themes" }` 复制）。只改源文件不重新构建的话，dev 实例仍按旧的 `surface` 渲染。
+    - **「恢复默认主题」开关 + 三组自定义的失效语义（2026-09-20 三次定稿，用户逐条指定）**：
+      - **开关本身**：文案「**恢复默认主题**」（`settings.appearance_restore_theme`），**摆在「主题颜色」整块的最顶上**（用户指定），不再夹在「底色自定义」面板里。字段名仍叫 `Appearance.tintBase`（`false` = 默认）—— **改名要动 localStorage 迁移，收益只有可读性**，所以只在注释里写明沿革。沿革：`底色跟随主题色` → `主题色代替底色` → **`恢复默认主题`**。
+      - **开关关着（默认）** → 底色 / 按钮线条 / 按钮背景 / 文字明度**全部可生效**：没动过底色（`baseColor` 空串）就仍按主题派生，动过就用用户的值；主题包声明了 `surface` 时以它为准。**默认渲染与 2026-09-19 逐像素一致**。
+      - **开关开着** → **回到一开始保存的那套默认主题配色**：`baseOv = null`（底色走主题包 surface 或 `derivePalette()`）、`colorsOn = false`（⑤c/⑤d 清空两个颜色内联值）。文字明度**不归零**（见下一条）。同时**锁住三组配色**（见下一条）。
+      - **锁定范围（用户原话：「开恢复默认主题时除了透明度…以外的选项都不可调」，随后又明确「文字明度不锁定」）**：
+        | | 项 | 开关开着时 |
+        |---|---|---|
+        | **锁** | 三个取色器（`#ap-base-picker` / `#ap-btn-line-picker` / `#ap-btn-bg-picker`） | 不可调 |
+        | **锁** | 三对「饱和度 / 明度」滑块（`#ap-base-axes` / `#ap-btn-line-axes` / `#ap-btn-bg-axes`） | 不可调 |
+        | **不锁** | 底色透明度 `surfaceAlpha` | **可调，且值仍然生效** |
+        | **不锁** | 按钮线条透明度 `btnLineAlpha` | **可调，且值仍然生效** |
+        | **不锁** | 按钮背景透明度 `btnBgAlpha` | **可调，且值仍然生效** |
+        | **不锁** | 文字明度 `textLight` | **可调，且值仍然生效**（`#ap-text-controls` 这个容器已删，别再给它加 `data-tint-lock`） |
+        - **锚点统一是 `data-tint-lock` 属性**（`buildAppearancePane` 里的 `tl()` 输出），`syncTintLock()` 一句 `querySelectorAll("[data-tint-lock]")` 覆盖全部 —— **加新项只要标一下属性，不会漏**。初始 `locked` class 写死在 HTML 里（免得 attach 之前闪一帧「可编辑」）。
+        - **四个例外必须「留在锁外」且「无条件写」**：这是这块最容易做错的地方 —— 上一版的实现是 `setVar("--btn-line-alpha", buttonsOn ? … : "")`，开关一开就把 α 清掉、回落到 `:root`。现在两个 α **任何状态下都写**（默认 0.32 / 0.14 == `:root` ⇒ 默认态零变化）；`--surface-alpha` 本来就在 ② 步无条件写；`textLight` 在 ⑤ 里**不**被 `tintBase` 归零。
+        - **锁定用 `.locked`（遮点击 + 降透明度）而不是 `disabled`**：自绘取色器不认 `disabled`（规则 46 已登记过这条教训）。
+      - **开关开着时「四个例外可调」与「颜色不可调」并不矛盾**：三个 α 是玻璃质感 / 叠加强度、`textLight` 是明度偏移，都与**色相**无关；开着时颜色来自默认主题套餐，用户仍可决定这套颜色**多透、文字多亮**。
+      - **为什么把默认值改成 false（上一轮定案，仍然有效）**：默认开着时那几个组一进去就是灰的、点不动，而解锁开关在**另一组**里 ⇒ 从「按钮自定义」进去的用户既看不出原因、也没有就地解锁的入口，实测被报成「按钮自定义颜色无法生效」。改成默认关着之后，进来就是可编辑的。**本轮把开关提到整块顶部之后这个坑也顺带消除了**（任何一组进去都能一眼看到它）。
+      - **配套的一次性迁移不能省**：磁盘上存着的 `tintBase: true` 是**上一版默认值自己写下去的**，留着它新默认值对老配置完全失效。`loadAppearance()` 里用独立键 `lunac-appearance-migrated` 做**只清一次**（放配置对象内部不行 —— 每次 `persistAppearance()` 整份重写会把它冲掉）；清掉后用户以后真的打开这个开关，重启不会被再次清掉。
+      - **开关与取色器必须看得见地联动**：切开关只重画 `.locked` + 那行 note，**不**动 `baseColor` / `btnLineColor` / `btnBgColor` / `textLight` —— 用户的值留着，开关再关回去立刻恢复，不需要重选、也不需要备份。
+      - **失效范围只剩一条边界**：**`--ctx-*` 反差四件套在开关开着时清空** ⇒ 回落 `:root`，等于跟随主题。（早先版本把 `--surface-alpha` / `textLight` 也算进失效范围，**两条均已作废**：前者升级成「锁外且生效」，后者改成「不锁也不失效」。）
+    - **底色的「饱和度 / 明度」滑块与色板是**同一组值**（2026-09-20 用户改定，推翻了早先的「微调偏移」）**：滑块写的就是色板的两轴（HSV 的 S / V），拖色板滑块跟着动、拖滑块色板跟着动。**「微调偏移」这套语义已彻底删除**（`baseSatOffset` / `baseLightOffset` / `btnLineSatOffset` / `btnLineLightOffset` 四个字段与 `resolveTunedColor()` 一并删掉；老配置里的这四个键变成未知键、读进来被忽略）。
+      - **实现**：`mountColorPicker()` 返回 `ColorPickerHandle`（只有 `apply(hex)`，**只重画不 commit**）。面板侧把三组颜色放进一张 `colors` 表（`base` / `btnline` / `btnbg`），每条路径都写同一份 `hex`：色板 commit → `syncAxes()` 回写滑块的 value 与读数；滑块 input → `hsvToHex()` 算出新色 → `handles[slot].apply()` 回写色板。
+      - **`apply()` 不 commit 是防回环的关键**（否则滑块 ↔ 色板互相触发）。这也是 2026-09-19 删掉「色轮 + 饱和度/明度滑块」三件套的理由 —— 现在之所以又能共存，是因为它们已经是同一组值，而不是两份各自解释的量。
+      - **色相从当前色现取**（`hexToHsv(c.hex).h`），只替换被拖动的那一轴。全灰（s = 0）时色相为 0，拖饱和度会往红走 —— 与色板左边缘的行为一致，已知且可接受。
+      - 滑块用 `data-axis` + `data-color` 两个属性（**不是** `data-ap`）：它的值不直接落配置，而是经所属取色器换算成 hex 再落 `<slot>Color`。加新取色器就用 `colorAxisRow()`。
+    - **「反差四件套」（2026-09-20 新增，`--ctx-*`）**：开关**关掉且设过底色**时，下面四处要「底色暗 ⇒ 比底色亮、底色亮 ⇒ 比底色暗」，**其余地方仍参考当前主题**：
+      | # | 位置 | 选择器 | 用到的 token |
+      |---|---|---|---|
+      | ① | 风格里的分类区域 | `.settings-group-title`（`settings.ts`） | `--ctx-rgb` |
+      | ② | 文本框 | `.settings-input` / `.custom-select-trigger` / `.ap-hex`（`settings.ts`）、`#chat-input`（`styles.css`） | `--ctx-shade-rgb` + `--ctx-shade-scale` / `--ctx-ink-rgb` / `--ctx-border-glass` |
+      | ③ | 取色器的框格 | `.ap-swatch-btn` / `.ap-pick-panel` / `.ap-sv` / `.ap-hue` / `.ap-preset` / `.ap-picker-toggle` | `--ctx-border-glass`（面板底走 `--ctx-ink-rgb`） |
+      | ④ | 结果区当前选中项 | `.result-item:hover, .result-item.selected` | `--ctx-rgb` |
+      - **取值方式：把「底色」当成主色，跑一遍 `derivePalette()`**（`contrastFor()`），取它的 ink（白 / 黑）+ shade + border。**不要另写一套阈值** —— 两套的「亮暗分界线」一旦不同，就会出现「底色偏亮时文字是白、反差却是黑」这种自相矛盾的结果。
+      - **`--ctx-shade-scale` 固定 0.35**，不取 `derivePalette` 给的 1：白洗叠在暗底上比黑洗叠在暗底上抢眼得多，用 1 会过冲（25% 白 ≈ 一块灰斑）。
+      - **`--ctx-shade-rgb` 是必须的第五个 token**：凹陷层的原式是 `rgba(0, 0, 0, α)`，而**黑洗没法反向变成白洗**，所以基色本身要可换（默认 `0, 0, 0` ⇒ 开着时等于原式）。
+      - **`--ctx-*` 的默认值就是「跟随主色」的那几项**（`styles.css` 的 `:root` 里写成 `var(--accent-rgb)` / `var(--ink-rgb)` / `var(--shade-scale)` / `var(--border-glass)`，加 `--ctx-shade-rgb: 0, 0, 0`）。**不需要自定义底色时，`main.ts` 把这五个写成空串清掉内联值即可** —— 逐像素回到改造前，不必逐个记值。**回归口径**：默认配置下 `<html>` 的 `style` 上不应出现任何 `--ctx-*`。
+      - **饱和度-明度框的渐变本身（`linear-gradient` 的黑 / 白与色相彩虹）一个字不许动** —— 那是取色器的真实颜色，不是主题洗色，见规则 48。
+    - **「按钮自定义」（2026-09-20 新增，按钮线条 + 按钮背景）**：两组变量 —— 线条 `--btn-line-*`、背景 `--btn-bg-*`。
+      - **作用对象是同一批按钮 + 所有切换开关**：**新建对话 / 更多设置 / 历史记录 / 发送 / 停止 / 添加文件**六个（`#chat-new-btn` / `#chat-more-btn` / `#chat-history-btn` / `#chat-send-btn` / `#chat-stop-btn` / `#chat-add-file-btn`）+ **项目内所有切换开关**（`.settings-toggle-slider` 的轨道底 + 开启态的描边）。
+        - 线条 → 这六个按钮的 `border` + **这六个按钮的图标（内联 SVG 的 `currentColor`）** + 开关的轨道 / 描边 + **所有滑块（拉条）的 `accent-color`**；背景 → 这六个按钮的 `background`。
+          - **图标跟线条，且用全不透明的 `rgb(var(--btn-line-rgb))`**（2026-09-20 用户要求「历史记录等等的 icon 颜色应该跟随按钮线条」）：图标只有形状没有 α 语义，带 α 会被洗淡；而默认下 `rgb(var(--btn-line-rgb))` == `var(--accent)` ⇒ **默认逐像素不变**。详见下面「图标分两档」那一条。
+          - **滑块也在「线条」的范围内（2026-09-20 用户要求「按钮也应该包括拉条的颜色」）**：`.ap-slider input[type="range"] { accent-color: rgb(var(--btn-line-rgb)) }`。**必须是全不透明的 `rgb(...)`**：① `accent-color` 带 α 会把轨道与圆点洗淡；② 默认下 `rgb(var(--btn-line-rgb))` == `rgb(var(--accent-rgb))` == 改造前的 `var(--accent)`，**逐像素不变**（写成 `rgba(..., var(--btn-line-alpha))` 就不成立）。
+          - **全项目只有这一处滑块样式**（`appearanceSliderRow()` 与 `colorAxisRow()` 都输出 `.ap-slider`）—— 所以「拉条跟按钮线条」改这一条规则就够了，`styles.css` 里没有第二处 `input[type=range]`。新增滑块时**沿用 `.ap-slider`**，别另写 `accent-color`。
+        - `#chat-stop-btn` 必须跟：它占的就是发送按钮那一格，不跟会出现「一开始生成就跳色」。`#chat-add-file-btn` 2026-09-20 补齐（它的边框原先是 `--accent-border`）—— **默认值下两者逐像素相同**（`--btn-line-rgb`/`α` 的默认就是 accent/0.32）。
+      - **按钮背景不再跟底色**（用户要求「按钮背景底色应该也可以自定义调节而不是跟随上方的底色」）：它读 `--btn-bg-rgb` / `--btn-bg-alpha`，**与 `--surface-rgb`（底色）没有任何关系**。默认值是原 `--accent-bg` 的配方（accent + 0.14）⇒ 不动控件时逐像素不变。
+        - hover / 打开态按**同一基色抬 α**：`.hover = calc(var(--btn-bg-alpha) + 0.06)`、`#chat-more-btn.open = calc(... + 0.14)`。默认 0.14 ⇒ 0.20 / 0.28，正是改造前的硬编码值。
+      - **按钮的图标仍跟随主题色** → **已作废（2026-09-20）**：见上面「线条」里那条 —— 六个按钮的图标现在跟按钮线条。**唯一例外是语义状态覆盖**：`#chat-more-btn.run-mode-auto { color: var(--red) }`（自动档警示）优先级更高，它**必须保持 `--red`**，别被「图标跟线条」这条规则顺手改掉。
+      - **开关的圆点也不跟**：它是「填充」不是「线条」。
+      - **轨道底的 alpha 取线条 alpha 的固定比例**（关 0.31 / 开 0.44）—— 这样拖「线条透明度」时三层同步缩放，不会只剩描边动。默认 0.32 ⇒ 0.0992 / 0.1408，与改造前的 0.1 / 0.14 肉眼无差。**唯一已知的像素级偏差**：关闭态轨道底的**色相**从「中性白黑」变成「按钮线条色」（明度不变）。
+      - **两个颜色字段空串 = 跟随主题色**（默认）⇒ 清掉内联值、回落 `:root` 的 `--btn-line-rgb: var(--accent-rgb)` / `--btn-bg-rgb: var(--accent-rgb)`。**两个 α 任何状态下都写**（默认 0.32 / 0.14 == 原 `--accent-border` / `--accent-bg` 的 α）—— **「恢复默认主题」开关开着时也照写**（用户要求那三项透明度仍可调，见上面「失效范围」表）。取色器在「跟随态」显示主题色 —— 由桥上的 `resolvedSwatches()` 给，面板不复制派生逻辑。
+      - **`resolvedSwatches()` 现在返回三项**（`base` / `btnLine` / `btnBg`）：底色取「主题包 surface 优先、否则派生」，另外两项都是当前主题色。
+      - **还有 20 余处 `var(--accent-border)` 有意没收进来**（输入框 focus、卡片左边线、`.detail-chip.active`、各类文字按钮…）：用户点名的是「按钮的线条」，那些不是按钮。**这是边界不是漏做**；要扩大范围先问。
+    - **「文字自定义」（2026-09-20 新增）—— 只调三档文字的明度**：一个 ±100 的滑块（`Appearance.textLight`，`data-ap="textLight"`），**偏移量**语义（0 = 主题派生原值 ⇒ 逐像素不变），叠在 `derivePalette()` 产出的 `--text` / `--text-dim` / `--text-muted` 上，三档**一起挪**。
+      - **实现在 ⑤ 的循环里**，用 `shiftHslLightness(v, delta)`：只认 `derivePalette()` 那种 `hsl(0, 0%, N%)` 形式（文字一律纯灰阶，见上面），不匹配就原样返回。**不许改 `derivePalette()` 本身**（它还被 `contrastFor()` / `resolvedSwatches()` 复用，加了偏移会让「反差四件套」的亮暗判定跟着漂）。
+      - **`delta !== 0` 才走替换**，等于 0 时逐字节写原值。
+      - **它不受「恢复默认主题」管辖**（用户 2026-09-20 明确「文字明度不锁定」：它是明度偏移、不是配色本身 ⇒ ⑤ 里 `textDelta` 照写），但**会被主题包锁定**（同规则 46）。
+    - **CSS 变量契约**（`styles.css` 侧每一个都带默认值，即「不做任何覆盖时渲染不变」）：`--bg-opacity` / `--bg-blur` / `--bg-saturate`（背景图层 `#app-bg-image`）；`--glass-sheen-alpha`（反光，`0`）经 `--glass-sheen-image`（`linear-gradient(160deg, rgba(255,255,255,α) 0%, transparent 46%)`）落到**三个主面板的 `background-image`** 上 —— **刻意不用伪元素**：`#results-container` 的 `::before` 已是玻璃底色层，再叠 `::after` 会落在内容之上（伪元素是「最后子元素」），而 background-image 天然在背景色之上、内容之下；`--surface-alpha` 经 `--surface-rgb` / `--surface-rgb-hover` 合成 `--surface-glass*`（hover 用 `calc(var(--surface-alpha) - 0.08)` 保持「比常态再透一点」）；`--radius-search`（搜索栏形状）与 `--radius-results`（结果区 + 状态栏**底部**形状）**各自独立** —— 这就是「搜索栏与结果区不同图形」的实现方式，`#results-container` 自身仍是直角（它紧贴状态栏，给圆角会在接缝露出透明像素）；`--search-pattern-image` / `--pattern-opacity`（搜索栏花纹，走 `#search-bar::before`，默认 `none`；`border-radius: inherit` 跟随形状被裁剪）；`--accent-rgb` / `--accent` / `--accent-bg` / `--accent-border`（主题色：**`--accent-rgb` 是唯一真相源**的三元组 `r, g, b`，另外三项由它在 `:root` 派生 —— `--accent` 是 hex，半透明档 `--accent-bg`(0.14) / `--accent-border`(0.32)）；`--ink-rgb` / `--shade-scale`（中性叠加基色 / 凹陷压暗缩放，2026-09-19 批 6 收口，见规则 48）；**`--ctx-rgb` / `--ctx-ink-rgb` / `--ctx-shade-rgb` / `--ctx-shade-scale` / `--ctx-border-glass`** 与 **`--btn-line-rgb` / `--btn-line-alpha`** / **`--btn-bg-rgb` / `--btn-bg-alpha`**（2026-09-20 新增；默认值即「跟随主色」⇒ 不写内联值就渲染不变，见上面「反差四件套」与「按钮自定义」两条）。
     - **按钮配色纪律：动作按钮跟随主题色、语义状态色固定、选中态文字不带色相（2026-09-19 新增，批 4 任务 1/2）**：
       - **只有 `--accent-rgb` 一个真相源**：样式表里凡「accent 带别的 alpha」一律写 `rgba(var(--accent-rgb), x)`（`x` 视场景取 0.06~0.6）。**禁止**再出现 `rgba(192, 160, 160, x)` 这类硬编码 rgb 分量 —— 用户报的「设置 → 搜索分类的 save 按钮没跟随主题颜色」正是由此而来（`styles.css` 曾散落 20 余处、`settings.ts`/`tool-editor.ts` 各数处）。同理，`applyAccent()` **只写 `--accent` 与 `--accent-rgb` 两行**，半透明档交给 `:root` 派生，不许各自 `setVar`。
       - **动作按钮 → `--accent` 系（底色 / 边框 / 图标，不含文字）**：`background: rgba(var(--accent-rgb), 0.1~0.18)`、`border: 1px solid var(--accent-border)`；`color: var(--accent)` **只留给「按钮内是纯图标」的情况**（内联 SVG 走 `currentColor`）与 `caret-color`，**按钮上的文字标签一律 `color: var(--text)`**。hover 抬到 0.2~0.25、active 到 0.35。已按此改造：`.settings-save-btn` / `.settings-install-btn` / `.settings-hotkey` / `.settings-tool-btn` / `.settings-skill-open` / `.custom-model-ok` / `#tool-editor-save` / `#tool-new-btn`（文字全部转灰阶，底色边框仍跟随主题色）。
       - **语义状态色保持固定，不跟随主题**：`--green`(成功/有效/放行) / `--red`(危险/失败/拒绝) / `--yellow`(警告/录制中/待确认) / `--blue`(信息)。判据是「它表达的是**状态**还是**可点的动作**」—— 例如 `.settings-save-msg`（「已保存」提示）保留 `var(--green)`，而旁边的 `.settings-save-btn` 改走 accent；`.approval-allow`/`.approval-deny`、`.tool-badge.valid/invalid`、`.agent-status.*`、`.file-chip`、`.memo-item-actions .memo-copy` 同理保持。**不要把这两个家族混为一谈**（把语义色也塞进 accent 会让「危险/成功」失去可辨识度）。
+        - **2026-09-20 补：`styles.css` 里 28 处硬编码 `rgba(157, 180, 172, x)`（`--green`）按同一条判据清了一遍**。判据仍是「这个绿表达的是**可点的动作**还是**状态**」：
+          - **改成 `rgba(var(--accent-rgb), x)`（α 原样保留）**：`.file-chip` / `.file-chip:hover` / `.file-chip-more-btn` / `.file-chip-more-btn:hover` / `.file-chip-list` 的虚线 / `#search-bar.drag-over` + `#chat-input-bar.drag-over` / `#chat-add-file-btn` / `.ql-add-btn`（文字同时由 `--green` 改为 `--text`）。
+          - **一个都没动**：`.tool-row.auto-approved` / `.tool-row.tool-ok` / `.tool-refusal-btn.tool-refusal-allow` / `.approval-allow` / `.approval-batch-card .approval-batch-allow-all` / `.agent-status.ready` / `.memo-item-actions .memo-copy:hover` / `.memo-item-actions .memo-save-edit` —— 它们旁边都还写着 `color: var(--green)`，那是「成功 / 放行 / 有效」。
+          - **唯一的例外：`.result-item-badge.app-badge`**（`quick-launch.ts` 的「常驻 / 本次」标记）**保持绿**。它的绿不是语义状态也不是动作，而是「与别的 badge 区隔」的分类色（注释原文 *distinct color to separate from plugin badges*）—— 改成 accent 就与 `.result-item-badge` 的底色 `--accent-bg` 重合，区分作用直接消失。**不要以「消除硬编码」为名把它一起改掉。**
       - **「文字只跟明暗、不带色相」的边界（2026-09-19 批 6 定稿，用户答复「文字全灰阶，图标留 accent」）**：判据只有一条 —— **看这个控件渲染出来的是文字还是图标**。
         - **文字**（含按钮标签、侧栏 / 下拉选中项、聊天区用户气泡正文、标签胶囊、状态词、占位与提示文字）一律走 `--text` / `--text-dim` / `--text-muted`（它们已由 `derivePalette()` 做成纯灰阶）；**严禁** `color: var(--accent)`。
-        - **图标**（内联 SVG 走 `currentColor` 的功能按钮：齿轮 / 发送 / 停止 / 新建对话 / 去 AI 痕迹）与 **`caret-color`**（输入光标、AI 逐字输出的 `▌` 光标）保留 `var(--accent)` —— 它们是「形状」，承载主题色正是用户要的效果。
+        - **图标**（内联 SVG 走 `currentColor`）里分两档：
+          - **六个聊天动作按钮的图标跟「按钮线条」**（2026-09-20 用户要求「类似于 ai 对话里面 历史记录等等的 icon 颜色应该跟随按钮线条」）：`color: rgb(var(--btn-line-rgb))` —— 发送 / 停止 / 历史记录 / 新建对话 / 更多设置 / 添加文件。**必须是全不透明的 `rgb(...)`**：默认下它 == `rgb(var(--accent-rgb))` == 改造前的 `var(--accent)`，**逐像素不变**（写成 `rgba(..., var(--btn-line-alpha))` 会把图标洗淡、也不满足默认不变）。
+          - **其余图标（如 `#settings-btn` 的齿轮、`#humanize-btn:hover` 的「去 AI 痕迹」、`.result-item-elevate:hover` 的盾牌）与「输出光标」`.ai-response .cursor-blink::after` 仍保留 `var(--accent)`** —— 它们不在「按钮自定义」的对象里。
+        - **`caret-color`**（输入光标）**一律保留 `var(--accent)`**（4 处）：它是文字输入点位，不属于任何按钮。
         - **混合控件（图标 + 文字标签，如「复制」「编辑」「保存」按钮）按文字算** ⇒ `var(--text)`。图标跟着变灰可以接受，文字上色不可接受。
         - **批量改法**：`styles.css` 全表 + `settings.ts` / `tool-editor.ts` 各一条，**逐块判定**（按 `选择器 { 声明 }` 切块，而不是整文件字符串替换）—— 用整文替换必然会误伤 `caret-color`（`caret-color: var(--accent)` 里含子串 `color: var(--accent)`）与紧跟在注释后的选择器。
         - **本轮清完的清单（回归时按此对账）**：`styles.css` 的 `.context-menu-item:hover` / `.context-menu-item-active` / `.clip-item-copy` / `.ocr-primary-btn` / `.ocr-copy-btn.ocr-copied` / `.result-item-badge` / `.tool-card.running .tool-state` / `.chat-msg-user` / `.msg-actions button:hover` / `.flow-copy:hover` / `.chat-more-seg button.active` / `.memo-tag-chip` / `.memo-tag-ok` / `.memo-item-actions .memo-edit:hover` / `.detail-preview-actions button`；`settings.ts` 的 `.settings-sidebar-item.active` / `.settings-hotkey` / `.settings-tool-btn` / `.settings-install-btn` / `.settings-save-btn` / `.settings-skill-open` / `.custom-select-option.selected`；`tool-editor.ts` 的 `#tool-editor-save` / `#tool-new-btn`。
-        - **保留 `--accent` 的白名单（只有这些，别再多）**：`#settings-btn:hover`、`#chat-send-btn`、`#chat-stop-btn`、`#chat-new-btn`、`#humanize-btn:hover`、`.result-item-elevate:hover`（盾牌 SVG，2026-09-19 批 8 前是 emoji 🛡）、`.ai-response .cursor-blink::after`（输出光标）、`.ap-picker-toggle:hover`（▾ 箭头），以及全部 `caret-color`。选中与否由**底色 / 边框**表达即可。
-    - **背景区 = 三按钮 + 一组可折叠拉条（2026-09-19 二次定稿）**：`选择图片`（唯一背景来源，优先级：主题自带背景 > 用户图片）/ `自定义`（**展开或收起**那五个拉条：毛玻璃化 / 饱和度 / 背景透明度 / 反光 / 界面玻璃透明度 —— 收起状态跨「关设置再打开」保留在 `bgSlidersOpen`）/ `清除`。**不要再把「自定义」理解成「另一种背景来源」**（曾按纯色背景实现，被用户纠正）。
+        - **保留 `--accent` 的白名单（只有这些，别再多）**：`#settings-btn:hover`、`#humanize-btn:hover`、`.result-item-elevate:hover`（盾牌 SVG，2026-09-19 批 8 前是 emoji 🛡）、`.ai-response .cursor-blink::after`（输出光标）、`.ap-picker-toggle:hover`（▾ 箭头），以及全部 `caret-color`。选中与否由**底色 / 边框**表达即可。
+          - **2026-09-20 从这份白名单里移出的**：`#chat-send-btn` / `#chat-stop-btn` / `#chat-new-btn` / `#chat-more-btn` / `#chat-history-btn` / `#chat-add-file-btn` —— 它们的图标改跟**按钮线条**（见上面「图标」那一条）。回归时别把这六个又「修」回 `var(--accent)`。
+    - **背景区 = 三按钮 + 一组可折叠拉条（2026-09-19 二次定稿）**：`选择图片`（唯一背景来源，优先级：主题自带背景 > 用户图片）/ `自定义`（**展开或收起**那**四个**拉条：毛玻璃化 / 饱和度 / 背景透明度 / 反光 —— 收起状态跨「关设置再打开」保留在 `bgSlidersOpen`）/ `清除`。**不要再把「自定义」理解成「另一种背景来源」**（曾按纯色背景实现，被用户纠正）。
+      - **原第五个「界面玻璃透明度」已于 2026-09-20 迁进「主题颜色 → 底色自定义」并改名「底色透明度」**：它就是 `surfaceAlpha`（玻璃底色的 alpha），属于**配色**而不是背景图 —— 与「恢复默认主题」那个开关管的是同一批东西，放在背景区是错的分组。字段名不变（`surfaceAlpha`），只是控件换了位置；且它是**「恢复默认主题」开启后仍可调的三个透明度之一**。
+      - **三种「自定义」= 三个独立的展开状态**（`bgSlidersOpen` / `basePanelOpen` / `btnPanelOpen` / `textPanelOpen`），形态统一为「按钮 + ▾ → 一块 `.ap-sliders-panel`」，绑定统一走 `bindPanel()`。**新增一组时照抄这套，不要新造形态**（2026-09-20 起共四组：背景 / 底色 / 按钮 / 文字）。
     - **主题图标只有一个出口**：`pluginIconSvg()` 先查 `themeIconUrls`（主题包 `assets.icons.<插件 id>`），命中返回 `<img class="result-item-icon-img">`，否则回退内联 SVG。**禁止在各个渲染点各自判断主题** —— 图标汇聚点只有这一个（`themeIconUrls` 的声明必须放在 `pluginIconSvg` 之前：`const` 在声明前是 TDZ，放文件末尾就是必然的白屏）。
     - **`theme.json` 资产路径必须做穿越防护**（`appearance.rs`：拒绝 `..`、绝对路径、resolve 后逃出主题目录）；单个主题解析失败只 `warn` 并跳过，**不能让一个坏主题打空整个列表**。
-    - **跟随 Windows = 跟随强调色**（`HKCU\Software\Microsoft\Windows\DWM\AccentColor`，**实测为 `0xAABBGGRR` 字节序** —— 证据与单测在 `appearance.rs` 文件头）。刷新时机三处：启动**无条件**取一次（设置面板要显示「当前系统色」，且切模式那一刻必须已有值）、`lunac-window-shown` 一次、系统模式下每 15s 轮询。**不做** `WM_DWMCOLORIZATIONCOLORCHANGED` 消息驱动（要动 `hotkey.rs` 的 WndProc 子类化，收益仅「变色后 15s 内察觉」）。返回的 `dark` 字段已取到但**暂未使用**（本 UI 只有深色）。切到「跟随系统」时必须**顺带刷一次并重画该行**，否则 `--accent` 停在上一个自定义色（浏览器实测：表现为「切了没反应，得再点一次刷新」）。
-    - **取色器是应用内自绘的，且是唯一取色入口**（2026-09-19 定稿）：`<input type="color">` 弹的是 Windows 原生对话框（WebView2 里样式改不了一个像素，与暗色玻璃界面脱节），**已移除**；「色轮 + 饱和度/明度滑块」与取色器表达同一组自由度、并存互相打架，**也已移除**。现形态 = 色号输入框 + 色块按钮 → 展开一个面板：色相条 + 饱和度/明度面板 + 预设色板（`colorPickerHtml` / `mountColorPicker` 工厂，**只挂一个实例**）。两条硬纪律：① hex 输入与预设给的**原始值必须原样落盘**，只有拖面板/色相条才允许走 hex→HSV→hex 往返（会丢 1/255 —— 实测把 `#3a7bd5` 存成 `#397ad5` 才加的这条）；② 初始化只重画界面、**不 commit**（否则每打开一次设置就把舍入误差存一次）。
-    - **取色器尺寸与对齐（2026-09-19 二次定稿，用户明确指定）**：所在行用 `.settings-row.ap-row-block`（整宽上下列，label 在上、取色器在下并占满内容宽，实测 355px @ 549 视口 / 约 410px @ 800 窗口）；`#ap-accent-sv` 高 **40px**（宽而扁，用户要求「宽度调宽、高度调低」）；展开按钮 **30×30 圆角正方形**（`border-radius: 8px`）；色块 34×26；**色号输入框排在头部最左**（`[hex][色块][▾]`）—— 放色块之后永远差「色块+间距」而无法与左侧 label 左端对齐（实测差 40px）。整块总高 ≈ 129px。
+    - **~~跟随 Windows = 跟随强调色~~ —— 已整体下线（2026-09-20）**：原先的实现读 `HKCU\Software\Microsoft\Windows\DWM\AccentColor`（**实测为 `0xAABBGGRR` 字节序**），刷新时机三处（启动无条件一次 / `lunac-window-shown` / 系统模式下每 15s 轮询）。**三段代码现在全部删除**（含那个 `setInterval`）。下面这条只作为**存档**保留，改回时按它还原：
+      - 若要恢复：语义是「强调色只是主题色的一个来源」，`dark` 字段读到了但**从未使用**（本 UI 只有深色）；切到跟随模式时必须**顺带刷一次并重画该行**，否则 `--accent` 停在上一个自定义色（浏览器实测：表现为「切了没反应，得再点一次刷新」）；**不做** `WM_DWMCOLORIZATIONCOLORCHANGED` 消息驱动（要动 `hotkey.rs` 的 WndProc 子类化，收益仅「变色后 15s 内察觉」）。
+    - **取色器是应用内自绘的，且是唯一取色入口**（2026-09-19 定稿）：`<input type="color">` 弹的是 Windows 原生对话框（WebView2 里样式改不了一个像素，与暗色玻璃界面脱节），**已移除**；「色轮 + 饱和度/明度滑块」与取色器表达同一组自由度、并存互相打架，**也已移除**。现形态 = 色号输入框 + 色块按钮 + **屏幕取色按钮** → 展开一个面板：色相条 + 饱和度/明度面板 + 预设色板。
+      - **同一份工厂现挂 3 个实例（2026-09-20 第二次重构后）**：`ap-base`（底色）/ `ap-btnline`（按钮线条）/ `ap-btnbg`（按钮背景）。**`ap-accent` 已删除**（主题色取色器下线）。**加新取色器就复用 `colorPickerHtml()` / `mountColorPicker()` / `colorAxisRow()`，不要另写一套。**
+      - **「从电脑中取色」（2026-09-20 新增，用户要求）**：`mountColorPicker()` 里绑 `#<id>-pick`，走 Chromium 的 **`EyeDropper` API**（屏幕任意位置吸一个像素，回传 `sRGBHex`）。三条纪律：① **不支持就 `classList.add("hidden")` 整条隐藏**（不留一个点了没反应的按钮）；② 用户按 Esc 取消时 `open()` 会 reject —— **静默**，不是错误；③ 回来的值先 `toLowerCase()` 再用 `/^#[0-9a-f]{6}$/` 校验，通过才 `paint(true, hex)`（与 hex 输入同一条路径，**原样落盘**）。图标是内联 SVG（走 `currentColor`，见上面「图标留 accent」那条），复用 `.ap-picker-toggle` 的方形尺寸。
+      - **`colorPickerHtml(id)` 会占掉 `#<id>` / `-hex` / `-swatch` / `-pick` / `-toggle` / `-panel` / `-sv` / `-sv-cursor` / `-hue` / `-hue-cursor` / `-presets`** —— 外层容器的 id **不要叫 `#<id>-panel`**。实测踩过：底色那组的外层拉条面板原本叫 `#ap-base-panel`，与取色器自己的展开面板同名，`querySelector` 取到错的那个，于是「展开取色器」会把整组拉条一起收起来。现名为 `#ap-base-sliders` / `#ap-btn-sliders` / `#ap-text-sliders`。
+      - 两条硬纪律：① hex 输入与预设给的**原始值必须原样落盘**，只有拖面板/色相条才允许走 hex→HSV→hex 往返（会丢 1/255 —— 实测把 `#3a7bd5` 存成 `#397ad5` 才加的这条）；② 初始化只重画界面、**不 commit**（否则每打开一次设置就把舍入误差存一次）。
+      - **「跟随态」显示什么色由桥给**（`resolvedSwatches()`）：底色 = 主题包 `surface` 或 `derivePalette(主题色)` 派生的表面色、按钮线条 / 按钮背景 = 主题色。**面板不许自己复制那份派生逻辑** —— 复制必然与 `applyAppearance()` 漂移。
+    - **取色器尺寸与对齐（2026-09-19 二次定稿；`.ap-sv` 高度 2026-09-20 改过）**：所在行用 `.settings-row.ap-row-block`（整宽上下列，label 在上、取色器在下并占满内容宽，实测 355px @ 549 视口 / 约 410px @ 800 窗口）；**`.ap-sv` 高 80px**（2026-09-20 用户要求「色板的高度调高至 80px」，原为 40px —— 现在它与同组的「饱和度 / 明度」滑块是同一组值，高度直接决定竖直方向的拖拽精度；**三个取色器共用这条 class，尺寸天然一致**，改高度只有这一个地方）；展开按钮 **30×30 圆角正方形**（`border-radius: 8px`）；色块 34×26；**色号输入框排在头部最左**（`[hex][色块][取色][▾]`）—— 放色块之后永远差「色块+间距」而无法与左侧 label 左端对齐（实测差 40px）。
       - **教训**：写这批样式时残留了一条 `#ap-accent { width: 46px; height: 24px; ... }`（本意是给已成历史的原生 `<input type=color>` 用），**ID 选择器优先级压过了 `.ap-picker { width: 100% }`**，于是取色器被压成 46px 宽的窄条（实测 `sv` 只有 30px 宽）。改这类「同名元素从原生控件换成自绘组件」的地方，**必须先把旧控件的 ID 规则删干净**。
-    - **原配色基线（2026-09-19 存档，改外观前请先对这张表）**：下面这套就是「改造前的外观」，也是 **`tintBase: false` + 选中默认主题** 时应有的取值。`themes/default/theme.json` 存的是 schema 能表达的那部分（accent / text / text_dim / text_muted / border_glass / surface / radius_search / radius_results / pattern_opacity）；`green`/`red`/`yellow`/`blue` 与 `--radius` 主题 schema **未收录**，只在 `:root` 里，改主题系统时别把它们弄丢。
+    - **原配色基线（2026-09-19 存档，改外观前请先对这张表）**：下面这套就是「改造前的外观」，也就是 **「主题色代替底色」关掉、但底色取色器没动过（`baseColor` 空串）+ 选中默认主题** 时应有的取值（`baseColor` 一旦有值，`--surface-rgb` 与「反差四件套」就由它派生，见上面两条）。`themes/default/theme.json` 存的是 schema 能表达的那部分 —— **2026-09-20 起不再含 `surface`**（用户要求「去除默认主题对底色的影响」；那张表里的 `28, 26, 32` 是**原始 `:root` 值**，而 `derivePalette(#c0a0a0)` 实际给出的是 `31, 25, 25`，与改造前真正渲染的值一致，所以删掉 `surface` 才是「零变化」的选择）；`green`/`red`/`yellow`/`blue` 与 `--radius` 主题 schema **未收录**，只在 `:root` 里，改主题系统时别把它们弄丢。
 
       | token | 原值 | 备注 |
       |---|---|---|
@@ -1303,9 +1430,13 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
 | `--ink-rgb` / `--shade-scale` | `255, 255, 255` / `1` | 中性叠加基色 / 凹陷压暗缩放（2026-09-19 批 6，见规则 48）；深色主题的默认值 == 改造前 |
     - 设置侧**只调桥**（`window.__lunac_appearance`），不自己写 localStorage、不自己拼 CSS 变量 —— 改造前的背景图就是「设置写 + main 读」两份实现，再加滑块必然漂移。**注意：往 `style.textContent` 的模板字符串里写 CSS 注释时禁止使用反引号**（会提前终止模板字符串，已**三次**踩到：`tsc` 报 `TS1005: ';' expected`）。
 46. **主题包锁定「主题颜色」与「背景图片」，玻璃质感拉条除外（2026-09-19 批 5 任务 1）**：`themeId !== "default"` 时，设置 → 风格的**主题颜色整块**与**「选择图片」按钮**必须不可用。
-    - **判据是「主题包 = 一整套定好的外观」**：放开配色与背景，用户一改就不像那个主题了；而「自定义」里那五个拉条（毛玻璃化 / 饱和度 / 背景透明度 / 反光 / 界面玻璃透明度）是**窗口玻璃质感**、与配色无关，任何主题下都必须**保持可用**。
+    - **判据是「主题包 = 一整套定好的外观」**：放开配色与背景，用户一改就不像那个主题了；而「自定义」里那**四个**拉条（毛玻璃化 / 饱和度 / 背景透明度 / 反光）是**窗口玻璃质感**、与配色无关，任何主题下都必须**保持可用**。（原第五个「界面玻璃透明度」2026-09-20 已迁进「底色自定义」，因此它**跟着「主题颜色」一起被锁** —— 它本来就是配色。）
     - **禁用而不是隐藏**（用户明确选的）：`#ap-color-group` 加 `.locked`（`opacity: 0.42` + `pointer-events: none`）、`#ap-bg-pick` 加 `disabled`、另起一行 `#ap-lock-note` 用 `--yellow`（语义警告色）说明原因。隐藏会让用户以为功能消失了。
-    - **为什么整块 `pointer-events: none` 而不是给每个控件加 `disabled`**：这块里有十几个控件（分段按钮 / 取色器 / hex 框 / 色相条 / 预设色板 / 开关），逐个加必然漏；且自绘取色器面板不认 `disabled`。
+      - **`#ap-color-group` 里现在有 3 个取色器 + 二十来个控件**（底色 / 按钮线条 / 按钮背景 + 各自的滑块、开关、与三组「自定义」按钮）—— 这也是「整块锁」而不是逐个加 `disabled` 的第二个理由。**新增的配色控件只要放进 `#ap-color-group` 就自动被主题包锁住**，不要另写一套。**「文字自定义」组也在里面** ⇒ 它同样被主题包锁（用户 2026-09-20 选「保持现状」）。
+    - **为什么整块 `pointer-events: none` 而不是给每个控件加 `disabled`**：控件太多逐个加必然漏；且自绘取色器面板不认 `disabled`。
+    - **同一个 `.locked` class 有两个用途，别混**：① 主题包锁定（整块 `#ap-color-group`，由 `syncThemeLock()` 实时同步）；② **「恢复默认主题」开着时禁用三组配色控件**（由 `syncTintLock()` 同步，锚点是 `data-tint-lock` 属性 —— 现在有 6 个块：3 个取色器 + 3 对饱和/明度）。判据相同（「这块现在不该被改」），所以刻意复用同一条 CSS，**不要新造 `disabled` 态**。
+      - **②的初始态是「不锁」**：`tintBase` 默认 false（2026-09-20 用户要求），所以**进设置就能直接改底色与按钮颜色**。②只在用户主动打开那个开关后才生效。
+      - **②的锁定范围与①不同（2026-09-20 四次定稿）**：②**不锁**底色透明度 / 按钮线条透明度 / 按钮背景透明度三行，也**不锁**文字明度。改 `syncTintLock()` 时注意别把这几项加进 `data-tint-lock` —— **锁了它们就等于让用户调不动**，那是用户明确要保留的能力。
     - 切主题时**必须实时同步**（`syncThemeLock(id)`）—— 只在 `buildAppearancePane()` 里算一次的话，切换主题要重开设置才生效。
 47. **搜索结果的呈现与检索容错（2026-09-19 批 5 任务 2/3，对齐 Win11 新版搜索 KB5120998）**：
     - **简洁搜索的结果区不再有类型标签**（用户明确要求，已全量移除）：`.result-item-badge`（快捷方式 / 文件夹 / 扩展名 / 工具 / AI / 网页 / OCR / memo）**一个都不留**，结果行只有「图标 + 标题 + 副行」。行类型由**图标**表达即可 —— 标签既占宽又和图标重复。**例外两处不要跟着删**：① 详细搜索面板的行（那是「来源标签」，见下条）；② `quicklaunch` 插件面板里的 `常驻 / 本次` 标记（它是状态、不是类型）。
@@ -1328,7 +1459,8 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **回归自查一句话**：样式表里 `rgba(255, 255, 255, α)` 与 `rgba(0, 0, 0, α)` 的**剩余出现次数应为 0**（`grep -c` 只允许命中规则文本与本条列出的取色器例外）—— 用户报的「设置里常规 / 风格 / ai模型 / 搜索 / 技能拓展 / 插件大类、热键设置、AI 助手四个按钮、各插件底色都漏改」就是靠这一条一次性兜住的。
 49. **UI 文案里永远不得内嵌 emoji 当图标（2026-09-19 批 8，用户明确要求）**：按钮标签、状态行 / 提示行、占位文案一律「**纯文字**」或「**§1 的线性 SVG + 文字**」，禁止 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ 剪贴板中暂无图片，请复制图片后重试` / `⏳ 识别中` / `✅ 完成` / `❌ 失败` 这类写法。
     - **判据**：这个 emoji 是「一条可点控件 / 一句提示的**文案的一部分**」（→ 禁止），还是「一个**条目 / 一条状态的标记**」（→ 允许）。
-    - **允许且必须保留**：① 列表项 / 条目图标（结果区行图标、目录数据自带的 `item.icon`、`plugin.icon` 与未知插件的 🔧 兜底、`.clip-item-icon` 📁/📋、`.history-item-icon` 💬、`.file-chip-icon` 📦/📎、todo 面板标题 📋、tool-editor 🔧、web-search 引擎图标 🔍/🌐/🐻）；② 单色状态符号 `✓ ✗ ⚠ ↔ ↩ ◐ ○ ✔ ✕ × ＋`（如 `clipboard.copied` = `"✓ 已复制"`、`clipboard.copy_failed` = `"✗ 失败"`、todo 的 `✔/◐/○`、工具黑名单的 `×/✓`）。带 `U+FE0F` 变体选择符的按 emoji 算（`⚠️` 禁止、`⚠` 允许）。
+    - **允许且必须保留**：① 列表项 / 条目图标（结果区行图标、目录数据自带的 `item.icon`、`plugin.icon` 与未知插件的 🔧 兜底、`.clip-item-icon` 📁/📋、`.file-chip-icon` 📦/📎、todo 面板标题 📋、tool-editor 🔧、web-search 引擎图标 🔍/🌐/🐻）；② 单色状态符号 `✓ ✗ ⚠ ↔ ↩ ◐ ○ ✔ ✕ × ＋`（如 `clipboard.copied` = `"✓ 已复制"`、`clipboard.copy_failed` = `"✗ 失败"`、todo 的 `✔/◐/○`、工具黑名单的 `×/✓`）。带 `U+FE0F` 变体选择符的按 emoji 算（`⚠️` 禁止、`⚠` 允许）。
+    - **对话记录条目上的 💬 已删除（2026-09-20，用户明确要求）**：`renderHistoryList()` / 历史抽屉两处的 `<span class="history-item-icon">💬</span>` 与其 CSS 规则一并移除，条目只剩「标题 + 条数 + 删除按钮」。**这是上一条「① 条目图标允许」的一个例外** —— 判据不是「它是不是条目图标」，而是用户要不要它；**不要**拿 ① 把它加回来。`.history-item-icon` 这个类名不得再出现在 HTML 或样式表里。
     - **完整条款与逐项清单在 [icon-style.md](./icon-style.md) §4.1 / §4.2**（那里是图标类规定的唯一真相源，本文件只做指针）。
     - **本轮已清理**：`ocr.ts` 全量（三个按钮 + 图片占位 + 引擎状态 + 全部状态行）、`clipboard-history.ts` 的复制按钮（原 `📎 复制` / `📋 复制`）、`i18n.ts` 的 `clipboard.copy`（原 `📋 复制`，5 语言）。**回归口径**：新增/修改按钮或状态行后，`grep` 该处文案不应命中任何 emoji 码位。
 
@@ -1391,9 +1523,39 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **复盘的写权限靠白名单收窄，不靠提示词**：工具集 = 从本轮工具池里挑 `Read`/`Glob`/`Grep`/`Write`/`Edit`/`Skill`/`Remember` 的子集（于是天然继承 `--disallowedTools` 与条件注册）。**`Bash` / `PowerShell` / `WebFetch` / `Agent` / MCP 工具一律不给** —— 它是无人值守进程。提示词里那句「只在用户明确说过时才改技能」是软约束，白名单才是硬约束，**别把工具面放宽成「反正提示词说了别乱用」**。
     - **审批走同一条通道、桥要自己一条、`Cfg` 要独立副本**：复盘的写操作经 `can_use_tool` 交前端（运行方式自动档 ⇒ 静默放行），**不给后台进程开审批旁路**；主循环那条 `&mut Bridge` 跨不了线程 ⇒ 复盘自己 `Bridge::connect`；`Cfg` 含 `Cell` 不是 `Sync` ⇒ `Cfg::detached()`（同端点/凭据/模型 + 当前已缓存的 thinking 形态）。**技能目录必须进 `add_dirs`**，否则白名单里的 `Write`/`Edit` 会被工作区锁直接拒，「改技能」永远不会发生。
 
+57. **技能（fork 模式 + 自带脚本 / 资源，2026-09-20，原 backlog A5）**：契约与逐项对照见 §3.5「P4 已完成」表。**九条不得回退**：
+    - **frontmatter 只认四个字段**：`name` / `description` / `context` / `allowed-tools`。旧 CLI 还有 `model:` / `effort:` / `paths:` / `hooks:` / `agent:` / `shell:` / `argument-hint:` —— 它们在 Lunac **没有落点**（端点只有一个模型、思考只有开/关两档、没有条件激活与技能钩子），**解析了不用就是死代码**，还会让人误以为改了会生效。要加新字段，先有落点再解析（守门单测 `unknown_frontmatter_keys_are_ignored` 钉住）。
+    - **`context` 只认 `fork` 整词**（去引号后忽略大小写比较），其余一律按 inline。抄旧 CLI 的 `context === 'fork' ? 'fork' : undefined`，**不要发明第三态**，也不要支持 `context: subagent` 之类的别名。
+    - **两路共用 `find()` / `instruction()`**：inline 与 fork 的差别**只有「谁来照做」**，查找顺序（精确 key → name 忽略大小写 → key 忽略大小写）与正文生成（剥 frontmatter + 替换 `$ARGUMENTS`）必须同源。各写一份的后果是「模型看到的可用列表」与「实际命中的技能」在边界情况下不一致。
+    - **副作用按最坏模式算，判据只有一处**：`parallel_safe("Skill")` = `false`（白名单只看名字，判不出模式）；`needs_approval_with(name, input, skills)` 才是带输入的判据（fork 要审批、inline 不要），且**必须复用本文件的 `needs_approval()`**（内含「全部 MCP 工具一律问」），别直接调 `tools::needs_approval()`。**plan（只读）档一律拒 fork** —— 技能正文是用户装的、里面可以写任意 `Bash`，放它出去等于把「只读」这个承诺交给第三方的 md 文件去守。
+    - **工具面：白名单是交集，不是并集**：`allowed-tools` **只在 `subagent_tool_defs()` 的结果里挑** ⇒ 技能无法借白名单把 `Agent` / 走桥的 / `mcp__*` 捞回来。空 = 不限制；非空但一件都没匹配上 = **一件也不给**（fail-closed + 一行 warn 日志）—— 写错白名单时宁可让子代理只靠推理，也不能悄悄放开成全集。
+    - **回灌措辞必须与 inline 明确区分**：fork 回的是「`Skill "X" ran in sub-agent [skill-N] — the work is DONE; this is its report:`」，不是「照着做的指令」。含糊的后果是模型把子代理的报告**再执行一遍**（同一件事做两次，还可能重复写文件）。同理，清单里 fork 技能必须带 `[subagent]` 标记 —— 那是模型唯一的提示。
+    - **递归**：子代理工具集里**保留** `Skill`（技能组合很自然），fork 技能的再 fork 由 `skills::run()` 的守卫拒绝（回 `context: fork … cannot be loaded inline`）。这是**防路由漏洞的保险**，正常路由不会走到（主循环与 `run_subagent` 都优先走 `run_forked_skill`）；**别**改成「在 `subagent_tool_defs()` 里把 `Skill` 也剔掉」—— 那会连带砍掉 inline 技能的子代理可用性。
+    - **自带资源只走「调用时附上」这一条通道，绝不进系统提示词**（2026-09-20 与用户定稿）：清单随用户往目录里丢文件而变，进了提示词就等于让整段前缀缓存跟着文件系统抖动（规则 18）。两个模式都要给到（inline 附在正文之后、fork 附进子代理的任务说明 —— 子代理看不到主对话与技能清单，不给它就只能猜路径）。路径给**相对形式**并写明相对谁（`<skills dir>/<key>/`），别给绝对路径：短、可移植、不把本机用户名写进会话历史，而绝对根 env_block 本来就给了。边界**保守**（深度 ≤ 3 / 条数 ≤ 40 / 跳过隐藏项与 `node_modules`·`target` / **不跟随符号链接**）：漏一个深层文件只是少一条提示，把几千条路径灌进上下文是灾难；截断时**如实上报**，不许静默。**别**为此新增 frontmatter 字段或新工具 —— 那是多一份会与磁盘漂移的状态、多一次往返。
+    - **remote 不移植（已定论，别再开工）**：旧 CLI 的 `remoteSkillLoader` / `remoteSkillState` 在 `feature('EXPERIMENTAL_SKILL_SEARCH')` 之后、**磁盘上文件已不存在**，且依赖 Lunac 没有的 `akiBackend` 服务。**A5 至此全部完成**（fork + 自带资源），条目已从 backlog 撤下。
+
+58. **写入内容的凭据扫描（2026-09-20，原 backlog A6）**：落地形态与规则清单见 §13.1（唯一真相源 `core-agent/src/content_safety.rs`）。**六条不得回退**：
+    - **只做「凭据 / 密钥泄漏」一类**（2026-09-20 与用户定稿）：**不做**「代码注入 / XSS / 反序列化 / 加密缺陷」。正则在正常代码里做不了语义级判定，那几类必然满屏误报，最后的结局是用户学会无视告警 —— 比没有更糟。§13.1 里旧设想的「25 条规则」是**抄不到的参照物**（`core/security/scanContent()` 整个目录不在仓库），**别照那个数字去补齐**。
+    - **扫的是「将要写进磁盘的文本」**：`Write` 取 `content`、`Edit` 取 `new_string`；**绝不扫 `old_string`** —— 那是要被删掉的内容，扫它会把「正在清理凭据」的操作反而标成可疑。
+    - **时机在写入前（`can_use_tool` 审批时），不是落盘后**：落盘后只能事后告知，而用户的决策点就在审批卡上。
+    - **判定不代替决策**：agent 只往 `analysis.secrets` 上报 `[{rule, line}]`，**不拒绝执行**。前端 `classifyRequest()` 把它当「必须人看」那一档：① **任何**运行方式档位（含「自动」）都不自动放行；② **不给「始终允许」**（写类工具的「始终允许」= 以后所有 `Write` 都免问，正是这条扫描想防的）；③ 命中项要**可见地列在卡片正文**（`agent.static_secrets_body`），不能只塞标题 tooltip —— 藏在 hover 里等于没做。工具侧另给**模型**一句提示（`tools.rs` 的 `secret_note()`），否则模型不知道用户为什么被多问了一次。
+    - **不并进 `dangerous` 通道**：那条的文案是「危险命令」，与「正常代码里混进了一把 key」是两回事，共用一个字段会让用户看不懂到底在问什么。
+    - **闸门是为了「宁漏勿误报」，只许收紧不许放松**：`RegexSet` 先跑一遍（零命中即返回，正常写入零额外成本）；通用赋值规则要**同时**过「键名含 key/secret/token/passwd/password/credential + 赋值到行尾 + 值不是占位符」三道闸；展示 5 条 / 采集 200 条 / 512 KB 上限都是**成本与噪声**的约束。动规则集必须同步 `content_safety.rs` 的 10 条单测并跑 `cargo test`；动前端展示要跑 `npx tsc --noEmit`。
+
+59. **计划模式闭环（计划相位，2026-09-20，原 backlog A7）**：契约与实测见 §3.5「计划模式闭环」；**计划文档本身的写法**仍以 §12 为准（那节是给模型看的规范，本节是给实现看的）。**七条不得回退**：
+    - **计划相位 ≠ 安全档位**：`Ctx.read_only` 是**用户**的档位（启动时定死、改它要重启 agent）；`plan_phase` 是**模型自己**的临时承诺（进程内即时生效、`ExitPlanMode` 被批准后立刻解除）。实现上必须让两者**共用一个判据出口**（`tools::write_blocked()`），但**拒绝措辞必须分开**。
+    - **约束是硬的，不靠模型自觉**：写类工具在计划相位里**执行侧直接拒**（不靠提示词劝），且**四个绕开 `tools::run` 的早退分支各自也要补一次**（`Agent` / fork 技能 / `Remember` / MCP 与走桥工具）—— 少一处就等于给「计划相位里不许写」开了个后门。将来新增任何早退分支（新工具、新的 `needs_bridge` 通道）**必须同时**补这一判据。
+    - **工具无条件注册，靠执行侧拦**：`EnterPlanMode` / `ExitPlanMode` 永远在 `defs()` 里 —— 工具表是请求体里的**固定前缀**（规则 18），而计划相位是运行期翻转的，事后没法增删 ⇒ 只能硬拒。别想着「进计划模式时把写类工具从工具表里删掉」。
+    - **`EnterPlanMode` 免审批、`ExitPlanMode` 要审批**：前者只改一个进程内标志（比 `TodoWrite` 还轻）；后者**那张卡就是它的产品** —— 用户必须在卡上读到整份计划再裁决。两件都**不能**进「始终允许」（把 `ExitPlanMode` 白名单化 = 以后每份计划都自动批准，等于把整个计划模式关掉）。
+    - **只读档下 `ExitPlanMode` 也要拒**：写类被用户档位永久拒绝时，批准计划也执行不了 —— 必须让模型改用正文交代计划、并说明「要执行得去设置里改档位」。说成「批准后就能写」是把模型引到一个必然失败的动作上。
+    - **前端状态只镜像、不推断**：`system/plan_mode`（`state: on/off` + 可选 `reason`）是 agent 里那个标志的广播；前端**不许**拿「模型调过哪些工具」自己推 —— 那要在「调了工具」与「用户批准了没有」之间做二次判断，极易与真值脱节。**agent 进程重启要把横幅清掉**（`plan_phase` 是进程内状态，随进程消失）。
+    - **计划落盘只在批准那一刻、且不挡执行**：`ModuleData\plans\<本地时间戳>.md`。时间戳由前端给（本地时区）+ Rust 侧严格校验（同 `append_usage_log`）；落盘失败只提示，**绝不**反过来拦住已经批准的执行。拒绝时给模型的回话必须**明说「你仍在计划模式」**（i18n `agent.plan_deny_msg`），否则它会接着调写类工具、白烧一轮往返。
+
 ## 12. Agent Plan 模式规范
 
 *来源：Hermes Agent 的 `plan` SKILL.md（MIT 协议，obra/superpowers 贡献），经适配整合。*
+
+> **2026-09-20 落地（原 backlog A7）**：本节是**写给模型看的计划规范**（计划长什么样、任务切多细）；**怎么让它成为硬约束**是 A7 —— 见 §3.5「计划模式闭环」与 §11 规则 59。两处分工：本节管**文档写法**，那两处管**相位状态机、执行侧拦截与前端计划卡**。曾列在同一 backlog 条目里的 `VerifyPlanExecution` **不做**（验证交给 `TodoWrite`）。
 
 ### 12.1 核心原则
 
@@ -1499,16 +1661,25 @@ git add ... && git commit -m "feat: ..."
 
 ---
 
-## 13. 参考设计（**未落地**，勿按此找代码）
+## 13. 参考设计（原样设想；**13.1 已按自己的形态落地**）
 
-> **2026-09-19 压缩说明**：本节原先用「模块清单 + API 表」的写法描述 Hermes 整合来的两个模块，读起来像已经实现 —— 但那些路径都指向 `core/`，而 **`core/` 是被 `.gitignore` 排除的旧 CLI 参考源码，不在仓库里**（`git clone` 下来不会有；仓库里只有 `app/`（前端 + src-tauri）、`core-agent/`（自研 agent 后端）、`vscode-extension/`、`scripts/`、`docs/`、`agent-templates/`）。原表里的每个路径都是「设想中的落点」，**照它去找一定找不到**。保留下来只为记两个设计思路，**不作为规范、也不对应任何待办**。
+> **2026-09-19 压缩说明**：本节原先用「模块清单 + API 表」的写法描述 Hermes 整合来的两个模块，读起来像已经实现 —— 但那些路径都指向 `core/`，而 **`core/` 是被 `.gitignore` 排除的旧 CLI 参考源码，不在仓库里**（`git clone` 下来不会有；仓库里只有 `app/`（前端 + src-tauri）、`core-agent/`（自研 agent 后端）、`vscode-extension/`、`scripts/`、`docs/`、`agent-templates/`）。原表里的每个路径都是「设想中的落点」，**照它去找一定找不到**。
+>
+> **2026-09-20 更正**：13.1 已经落地（2026-09-20，原 backlog A6），但**落点是自选的** —— 名字、路径、规则集都与旧设想不同，唯一真相源是 `core-agent/src/content_safety.rs`。13.2 仍然是「未落地也不打算做」。
 
-### 13.1 安全模式引擎（设想：写入文件后做静态安全扫描）
+### 13.1 文件内容级静态安全扫描（**已落地** 2026-09-20）
 
-来源：Anthropic `claude-plugins-official`（Apache 2.0）经 Hermes 中继。设想是「FileWrite/FileEdit 落盘后 `scanContent(content, path)` → 命中的 warnings 注入下一轮上下文」，规则集覆盖代码注入 / XSS / 反序列化 / 加密缺陷 / CI 注入等 25 条。
+来源：Anthropic `claude-plugins-official`（Apache 2.0）经 Hermes 中继。原设想是「FileWrite/FileEdit 落盘后 `scanContent(content, path)` → 命中的 warnings 注入下一轮上下文」，规则集覆盖代码注入 / XSS / 反序列化 / 加密缺陷 / CI 注入等 25 条。**参照物与规则集都不可得** —— 那个 `scanContent()` 在 `core/` 里，而 `core/` 不在仓库（见本节开头的压缩说明），所以规则集是自定的。
 
-- **本项目实际已有的等价物（唯一真相源）**：`core-agent/src/bash_safety.rs` —— 但它扫的是**命令**（不是文件内容），且在**执行前**把 dangerous / opaque 判定上报给前端审批卡（见 §11 规则 29）。两者方向相反，别混为一谈。
-- **未做的部分**：写入文件后的内容级扫描 —— 登记为 [agent-feature-backlog.md](./agent-feature-backlog.md) **A6**（唯一还没做的安全短板，不是「不排期」）。
+**落地的形态（唯一真相源：`core-agent/src/content_safety.rs`）**：
+
+- **时机是「写入前」，不是「落盘后」**。落盘后再报只能事后告知，而用户的决策点就在审批卡上；因此它挂在 `can_use_tool` 的 `open_approval()` 里，扫的是**将要写进磁盘的文本**（`Write` 取 `content`、`Edit` 取 `new_string` —— **不取 `old_string`**：那是要被删掉的内容，扫它会把「正在清理凭据」的操作也标成可疑，正好反了）。
+- **只做「凭据 / 密钥泄漏」这一类**（2026-09-20 与用户定稿）。刻意**不做**「代码注入 / XSS / 反序列化」：正则做不到语义级判定，在正常代码里必然满屏误报，最后的结果是用户学会无视它 —— 那比没有更糟。
+- **规则集 12 条，分三类**：① 形状唯一、零误报（`-----BEGIN … PRIVATE KEY-----`）；② 固定前缀的 API key（AWS / GitHub / OpenAI / Anthropic / Google / Slack / Stripe）；③ 自带结构的凭据（JWT、`Bearer`/`Basic` 头、带口令的连接串、以及两条「键名 + 赋值 + 非占位符值」的通用赋值规则）。
+- **成本与误报的闸门**：`RegexSet` 先跑一遍（绝大多数内容一个 pattern 都不命中 ⇒ 零额外成本返回）；通用赋值规则要**同时**满足「键名含 key/secret/token/passwd/password/credential + 赋值到行尾 + 值不是占位符」三道闸；单次最多**报** 5 条、每条规则最多**采集** 200 条、超 512 KB 只扫前段并在文案里**如实上报**「只扫了前 512 KB」。
+- **展示通道**：审批卡的 `analysis.secrets`（`[{rule, line}]`，与危险命令的 `analysis.dangerous` 同一字段家族，见 §11 规则 26 与规则 58）。前端 `classifyRequest()` 把它当**「必须人看」**这一档：不自动放行、不给「始终允许」、任何档位（含「自动」）都弹卡，并在卡片正文里**可见地**列出命中项（不是只放 tooltip）。
+- **两个方向别混**：`bash_safety.rs` 扫**命令**、在**执行前**判定；`content_safety.rs` 扫**文件内容**、在**写入前**判定。规则集互不通用。
+- **仍未做的部分**：`tool_result` 侧的警告渲染层（`securityWarnings` 色块）—— 现在只有审批卡这一条通道，工具返回文本里只有一句给**模型**看的提示（`tools.rs` 的 `secret_note()`，见 §19.4）。
 
 ### 13.2 会话文件清理服务（设想：`track` / `quick` / `cleanupSession`）
 
@@ -1640,7 +1811,7 @@ git add -A && git commit -m "[verified] <description>"
 
 > **2026-09-19 更正**：原文写「Step 2 的静态扫描已由 `core/security/index.ts` 的 `scanContent()` 自动执行」—— **该文件不存在**（见 §13 的说明）。
 
-**实际存在的那部分对应关系**：Static 扫描在本项目里的等价物是 `core-agent/src/bash_safety.rs`，但它扫的是**将要执行的命令**、时机在**执行前**，产物是审批卡上的 dangerous / opaque 标记（见 §11 规则 29）—— 与「写文件后扫文件内容」是两件事。本工作流的其余环节（测试、构建、审查清单）照旧有效。
+**实际存在的那部分对应关系**：Static 扫描在本项目里有**两个**等价物 —— ① 扫**命令**的 `core-agent/src/bash_safety.rs`（时机在**执行前**，产物是审批卡上的 dangerous / opaque 标记，见 §11 规则 26）；② 扫**文件内容**的 `core-agent/src/content_safety.rs`（时机在**写入前**，产物是审批卡的 `analysis.secrets`，见 §13.1 与规则 58）。**没有**任何「落盘后扫、再把 warnings 注入下一轮上下文」的环节。本工作流的其余环节（测试、构建、审查清单）照旧有效。
 
 ---
 
@@ -1840,7 +2011,7 @@ Hermes 那边的做法（Python 专属细节已省略）：**双目录扫描**�
 | 东西 | 状态 |
 |---|---|
 | 审批卡的**命令静态安全分析**告警（`agent.static_danger` + `.approval-danger-inline`，数据来自 agent 的 `can_use_tool.analysis`） | ✅ **已落地** |
-| `tool_result` 里**文件内容安全扫描**的警告块（`securityWarnings` 带色块渲染） | ❌ **未落地** —— 它依赖 [backlog](./agent-feature-backlog.md) **A6**（写文件内容级安全扫描）。**扫描器本身都还没有，渲染层无从接** |
+| `tool_result` 里**文件内容安全扫描**的警告块（`securityWarnings` 带色块渲染） | ⚠️ **部分落地** —— 扫描器已落地（§13.1 的 `core-agent/src/content_safety.rs`，原 backlog **A6**），但它只接在**审批卡**这条通道上（`analysis.secrets` → 卡片正文的 🔑 明细行 + 卡片标题的 🔑 标记）。`tool_result` 侧**没有**专门的 `securityWarnings` 色块组件；工具返回文本里另有一句**纯文本**提示（`tools.rs` 的 `secret_note()`，既给模型看、也照常显示在工具卡上）。 |
 
 ### 19.5 ✅ 会话清理状态（**已落地**）
 
@@ -1870,7 +2041,7 @@ Hermes 那边的做法（Python 专属细节已省略）：**双目录扫描**�
 
 **仍未做的**：远程传输（sse / http / ws）、prompts / roots / elicitation / OAuth、`.mcp.json` ⇒ [backlog](./agent-feature-backlog.md) **A13**。
 
-**技能（`skills\`）**：inline 模式已落地（`LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`，渐进披露 + `$ARGUMENTS` 替换）；**fork / remote 两种模式未做** ⇒ backlog **A5**。格式与生效方式见 [agent-implementation.md](./agent-implementation.md) §5。
+**技能（`skills\`）**：inline 模式已落地（`LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`，渐进披露 + `$ARGUMENTS` 替换）；**fork 模式 2026-09-20 已落地**（frontmatter `context: fork` + `allowed-tools:`，走 `run_subagent()`，见 §3.5 与 §11 规则 57）；**remote 已定论不移植**（旧 CLI 源码在磁盘上不存在 + 依赖 `akiBackend`），剩余缺口只剩「技能自带脚本 / 资源」⇒ backlog **A5**。格式与生效方式见 [agent-implementation.md](./agent-implementation.md) §5。
 
 ### 20.2 ❌ 路径 2：插件市场 —— **未落地**
 
@@ -1881,4 +2052,5 @@ Hermes 那边的做法（Python 专属细节已省略）：**双目录扫描**�
 ---
 
 *本文件整理说明（2026-09-19）：撤下 §9 的「已关闭问题」存档、§9.1 的长篇调研叙事（结论保留）、§10 待办路线、§13 的落点设想表、§18 的 Python 实现细节、§19.6 待实现清单、§20 的双路径详细计划。**未完成项全部并入 [agent-feature-backlog.md](./agent-feature-backlog.md)（唯一待办真相源）**；§11–§17 的**原有规则一条未删、未改**，只在 §11 末尾**新增规则 51（新增按钮必须有主题样式）与规则 52（文档结构纪律）**。*
+
 
