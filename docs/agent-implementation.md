@@ -53,7 +53,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | **P2** | 图片附件（多模态输入，**只做图片那一半**）：附件里的图按路径读成 base64 块随本轮提问发给模型 | stdin 的 `image` 块（`source.type=file`）→ 端点块；类型按**魔术字节**判定（PNG / JPEG / GIF / WebP），单图 ≤ 3.5 MB、每条 ≤ 10 张，失败走 `system/attachment_note` 如实上报。开关是 `config\ai.json` 的 `vision`（**默认关**，由前端决定发不发块）；PDF 不做，仍走路径文本。见 ai-spec §3.5「图片附件」与 §11 规则 60 |
 | **上下文** | 单条工具输出预算：超 12000 字符落盘全文、只内联「头 8000 + 尾 2000 + 路径」，模型用 Read / Grep 取回全文 | `tools::apply_budget`（唯一出口，`run_tool` 调用）；落盘 `temp\tool-outputs`（7 天清理）并并入 `Ctx.add_dirs`；见 ai-spec §3.5「单条工具输出预算」与 §11 规则 27 |
 | **上下文** | 任务快照：压缩丢弃中段时，把最近一条 `TodoWrite` 清单钉回上下文，避免「压缩后忘了在做什么」 | `latest_todo_snapshot()`；纯文本 user 消息（与 `tool_use`/`tool_result` 配对结构解耦），插在第 1 条之后；见 ai-spec §11 规则 37 |
-| **执行** | 只读工具并行：一轮里**连续的**只读调用合成一批并发（上限 4），写类/命令/MCP 串行 | `tools::parallel_safe` + `plan_tool_batches`；结果按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序；见 ai-spec §3.5「只读工具并行」与 §11 规则 28 |
+| **执行** | 两族并行批，其余串行：一轮里**连续的**只读调用合成一批并发（上限 4）、**连续的**子代理调用（`Agent` / fork 技能）合成一批并发（上限 3，A14）；写类 / 命令 / MCP 串行 | `tools::parallel_safe` + `plan_tool_batches`（返回 `Serial` / `ReadOnly` / `Subagent` 三类批）；结果一律按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序；见 ai-spec §3.5「只读工具并行」/「子代理并行批」与 §11 规则 28 / 65 |
 | **P3** | MCP 工具桥 | 把 `<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 接进请求体；**读侧**（A3）另有两件条件注册的 `resources` 工具，让模型能看到用户工具的 `handler` |
 | **P4** | 技能（渐进披露；**inline + fork 两种执行模式**；可自带脚本 / 资源） | `LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`；提示词只列 `key: 描述`，模型调 `Skill` 取正文（inline）或由子代理执行后回报告（`context: fork`）。目录里**除 `SKILL.md` 之外的文件**在扫描时登记、**调用时**附在返回里（相对路径 + 深度 ≤ 3 / ≤ 40 条，**不进提示词**，见 ai-spec §3.5「P4」与 §11 规则 57） |
 | **会话** | 历史持久化 / 恢复 / **回退到任意消息**（A11）；`session_id` 是真值（`sess_<pid>_<毫秒>`，一次 agent 运行一个 id） | `ModuleData\history\chat.db`（SQLite + FTS5，含专供 CJK 的 `trigram` 索引表）；`set_history` 协议把历史灌回 agent 上下文（见 ai-spec §11 规则 30）；回退**只动对话、不还原磁盘文件**，且 `data-idx` 要跟着上下文裁剪前移（见 §11 规则 64） |
@@ -79,10 +79,10 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | `TodoWrite` | 长任务进度面板（**免审批**：只改前端那块面板，不碰本机） |
 | `AskUserQuestion` | 结构化提问（答案经 `can_use_tool` 的 `updatedInput` 回传） |
 | `SessionSearch` | **往期会话检索**（2026-09-19）：检索本机会话库（`ModuleData\history\chat.db` 的 FTS5 索引），结果按会话分组返回。**只读、免审批**，走 MCP 桥的 `lunac/history_search` 自定义方法；`plan` 档同样可用。契约见 ai-spec §3.5「往期会话检索」 |
-| `Skill` | **条件注册**：技能目录非空且未被黑名单裁掉时追加。**两种模式**（2026-09-20，A5）：inline 取回本地技能正文（渐进披露的取回端，免审批、plan 档可用），`context: fork` 的技能则**派子代理执行后回报告**（要审批、串行、plan 档拒绝，工具面受 `allowed-tools:` 收窄）。契约见 ai-spec §3.5 与 §11 规则 57 |
+| `Skill` | **条件注册**：技能目录非空且未被黑名单裁掉时追加。**两种模式**（2026-09-20，A5）：inline 取回本地技能正文（渐进披露的取回端，免审批、plan 档可用），`context: fork` 的技能则**派子代理执行后回报告**（要审批、plan 档拒绝；与 `Agent` 同一族 ⇒ 同一轮里相邻时一起进并行批，A14；工具面受 `allowed-tools:` 收窄）。契约见 ai-spec §3.5 与 §11 规则 57 / 65 |
 | `mcp__*` | **动态**：`<exe 根>\tools\*.json` 的用户工具，按名排序后接入（前缀缓存不变量，ai-spec §11 规则 18） |
 | `ListMcpResourcesTool` / `ReadMcpResourceTool` | **条件注册**（2026-09-20，A3）：只在桥真的接上了用户工具（`!bridge.defs().is_empty()`）时才追加 —— 出厂时 `tools\` 只有模板，无条件注册就是在每次请求的固定前缀里放两件空转工具。用来列 / 读 `tools\*.json` 这些 resource（模型借此看到用户工具的 `handler`；`tools\` 在工作区外，内置 `Read` 会被工作区锁拒掉）。**免审批、plan 档放行、必须串行**（走单线程 stdio 桥）。契约见 ai-spec §3.5「MCP resources 读侧」与 §11 规则 55 |
-| `Agent` | **子代理**（2026-09-20）：派生一个独立上下文的子代理跑自包含任务，中间工具输出不进主上下文，只回最终报告（`[task-N] subagent report: …`）。**要审批、串行、plan 档拒绝**；子代理工具集剔掉 `Agent` 与计划相位两件（防递归 / 相位归主循环管）。契约见 ai-spec §3.5「子代理」 |
+| `Agent` | **子代理**（2026-09-20）：派生一个独立上下文的子代理跑自包含任务，中间工具输出不进主上下文，只回最终报告（`[task-N] subagent report: …`）。**要审批、plan 档拒绝；并发上限 3**（A14：一轮里连续的 `Agent` / fork 技能合成一批并发跑，每线程一份 `cfg.detached()`，结果按下标回填）。子代理工具集剔掉 `Agent` 与计划相位两件（防递归 / 相位归主循环管）。契约见 ai-spec §3.5「子代理」与 §11 规则 65 |
 | `EnterPlanMode` / `ExitPlanMode` | **计划模式闭环**（2026-09-20，A7）：`EnterPlanMode` 只把 `Ctx.plan_phase` 置真（**免审批**、不碰本机），此后写类工具（内置四件 + `Agent` + fork 技能 + `Remember` + MCP 与走桥工具）一律硬拒；`ExitPlanMode` 把整份计划（入参 `plan`）交给 `can_use_tool` 审批卡，**批准才解除相位**、拒绝则保持为真。**只读档下 `ExitPlanMode` 也被拒**（批准了也执行不了）。两件都无条件注册、必须串行。契约见 ai-spec §3.5「计划模式闭环」与 §11 规则 59 |
 | `Remember` | **条件注册**（2026-09-20，A4）：桥接通时追加。写**跨会话长期记忆**（`ModuleData\memory\MEMORY.md`，走桥的 `lunac/memory_write`），单条 ≤2000 字符、整文件 ≤6000 字符、按条去重。**要审批、串行、plan 档拒绝**（走 `needs_bridge` 早退分支 ⇒ 只读拒绝是分支内自判的）。填充它的**主要**是每 N 轮一次的后台复盘 fork（`LUNAC_NUDGE_INTERVAL`，默认 10）。契约见 ai-spec §3.5「长期记忆与后台复盘 fork」与 §11 规则 56 |
 
@@ -119,7 +119,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 - 清单**按 `key` 排序**后拼进提示词 —— 顺序抖动等于废掉整段前缀缓存（ai-spec §11 规则 18）。
 - **两种执行模式**（ai-spec §11 规则 57）：
   - **inline**（默认）：`Skill` 把正文交回主对话，模型当场照着做。不审批、`plan` 档可用。
-  - **fork**（frontmatter 加 `context: fork`）：**派生一个子代理去执行**（独立上下文，主对话只收报告），可用 `allowed-tools:` 限定它手里的工具（逗号分隔，空 = 不限制）。会审批、`plan` 档拒绝、串行执行。系统提示词里这类技能带 `[subagent]` 标记。
+  - **fork**（frontmatter 加 `context: fork`）：**派生一个子代理去执行**（独立上下文，主对话只收报告），可用 `allowed-tools:` 限定它手里的工具（逗号分隔，空 = 不限制）。会审批、`plan` 档拒绝；**与 `Agent` 同一族**，因此同一轮里与 `Agent` 相邻时一起进并行批（上限 3，A14）。系统提示词里这类技能带 `[subagent]` 标记。
 - 生效：设置 ·「AI → 技能」面板增删改后自动重启 agent；手工改目录需重启 Lunac。
 - **未实现**：**remote**（远端拉取）已定论**不移植**（旧 CLI 源码在磁盘上不存在 + 依赖 Lunac 没有的 `akiBackend` 服务）；A5 的剩余部分只有「技能自带脚本 / 资源」。
 

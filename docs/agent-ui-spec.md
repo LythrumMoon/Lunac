@@ -63,6 +63,7 @@
 | 代码变更接受/拒绝 + DiffView | **暂不做**（评估项） | 需要后端回传 diff 或前端重算，改动面大于阶段 1/2 ⇒ 登记为 [backlog](./agent-feature-backlog.md) **U1** |
 | 会话 Fork / 分享 | **不做** | Lunac 是本地单机工具，分享链路与产品定位不符；Fork 收益低 |
 | 回退到任意消息 | **已扩（A11，2026-09-20）** | 原决策是「已有，保持现状，不扩」（只到**用户轮**）。用户 2026-09-20 明确改为**扩到任意消息**：助手气泡也能当回退点、实时回合在页脚（`.turn-rollback`）给入口、被上下文裁剪丢掉的老气泡只留复制。**仍不做**文件内容快照 —— 回退只动对话与 agent 上下文，界面文案如实写明「磁盘上已改动的文件不会还原」（ai-spec §11 规则 64） |
+| 一轮里多个子任务并行 | **采用（分组面板，A14，2026-09-20）** | 用户三连裁决：**分组面板**（不是左右分栏）+ **并发上限 3** + **审批加 `task_id` 标注**。落地 = `agent-flow` 里一块 `.subtask-panel`，每个子任务一行（`.subtask-row`：id / 描述 / 状态），随 `task_*` 事件就地更新；状态行在并行时报并行数。**不做分栏**的理由是两条硬约束：分栏要改总体视窗宽度（§0 规则 1）、且列内会引入第二层滚动条（§0 与 ai-spec §11 规则 44 都禁止）。见 ai-spec §11 规则 65 |
 | 多轮缩略导航 | **P2** | 与现有历史抽屉职责重叠，先做抽屉增强 |
 | 语音输入 / 优化输入内容 | **不做** | 需要云端能力或额外模型调用 |
 | 文件/图片上下文 | **已有** | 搜索栏气泡 + 聊天输入栏复用，保持现状 |
@@ -80,6 +81,7 @@
   - `.think-block`（思考）
   - `.agent-text`（正文，流式增量）
   - `.tool-row`（工具调用与结果，见 §3.3）
+  - `.subtask-panel`（**子任务分组面板**，A14：一轮里并发的每个子代理一行，就地更新；没有子任务时**连容器都不创建**）
   - `.turn-footer`（回合汇总，回合结束时出现）
 - **新增**：回合计时与状态徽标（`.turn-badge`，可选显示）—— 回合进行中在 `.turn-footer` 位置显示「执行中 · 已用 N 秒」，结束后替换为「完成 · N 步工具调用」。
 
@@ -136,7 +138,7 @@
 
 ### 3.5 回合自动折叠
 
-- 回合完成后（收到 `result`），若回合内块数 ≥ 3 或工具调用 ≥ 2，**默认折叠**该回合的所有中间块（思考/工具/结果），仅保留：用户消息、助手最终正文、`.turn-footer`（含「展开过程」按钮）。
+- 回合完成后（收到 `result`），若回合内块数 ≥ 3 或工具调用 ≥ 2，**默认折叠**该回合的所有中间块（思考/工具/结果/子任务面板），仅保留：用户消息、助手最终正文、`.turn-footer`（含「展开过程」按钮）。
 - 折叠态在 `.turn-footer` 显示摘要行：`N 步工具调用 · M 次失败 · 耗时 Xs`。
 - 用户手动展开后，该回合在本次会话内保持展开（不因后续回合而回弹）。
 - **开关**：`localStorage` 键 `lunac-agent-autofold`，默认 `1`（开）；入口放设置面板「AI」分区。关闭时行为与现状一致（全部展开）。
@@ -156,6 +158,7 @@
 - **「始终允许」写白名单要写**组内**每一条**命令的命令词（旧实现只记第一条 → 组里第二条以后的同类命令下次还要再问一遍，即用户反馈的「允许过还要再问」）。解释器 / 启动器前缀与危险 / 不透明命令照旧排除（§4.3）。
 - **自动档不该弹卡**：`opaque` 判据 2026-09 已收窄到「不知道要跑哪个程序」（参数里的 `$HOME` / `$env:TEMP` 不算，见 ai-spec §3.5）—— 旧口径会让自动档下每条带 `$` 的命令都弹卡。
 - **计划卡 = 同一条通道的第三种行（2026-09-20，A7）**：`ExitPlanMode` 走 `can_use_tool`，整份计划在 `input.plan` 里。三条**不能省**：① **任何档位都不自动放行、白名单也免疫**（与 `AskUserQuestion` 同级 —— 自动放行等于「计划没人读过就开工」）；② **不给「始终允许」**（白名单化 = 以后每份计划都自动批准，等于关掉整个计划模式）；③ 正文用 `textContent` 原样铺开（**不是** `innerHTML`、**不引** markdown 渲染器 —— 计划是模型生成的任意文本）。按钮文案是「批准计划 / 拒绝」，结论提示要**说清后果**（`agent.plan_approved_note` / `agent.plan_rejected_note`），并随拒绝回一句说明「你仍在计划模式」的**专用拒因**（`agent.plan_deny_msg`，见 ai-spec §11 规则 59）。计划长（几十行是常态）⇒ 只在这一批出现计划卡时把**外层** `.approval-batch-body` 的上限放宽到 `62vh`（`.approval-batch-card.has-plan`），**不给正文加第二层滚动**（同上文嵌套双滚动条的教训）。
+- **子代理的审批要标明归属，且命令并不许跨任务（2026-09-20，A14）**：`control_request.request.task_id` 存在时，行标题前置一个 `.approval-task-tag`（纯文字 `task-1`，**不加 emoji** —— 与「控件文案不带 emoji」同一条纪律）；自动放行那条一行提示同样带 `[task-1] ` 前缀。**合并的边界必须比对 task id**（`findLastCmdGroup(taskId)`）：两个子任务的命令并进同一行，会让「允许」一次放行两个任务，而标注只能显示其中一个 —— 用户就分不清自己批了谁。缺 `task_id` = 主循环自己的调用，与主循环的合并（`undefined` 只与 `undefined` 相等）。
 
 ### 3.7 历史回顾（过程与表盘）
 
@@ -352,7 +355,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 - [ ] **插件/面板/菜单/抽屉/下拉的底色不得硬编码**（ai-spec §11 规则 48）：`#chat-more-menu`（更多设置菜单）、`#chat-drawer`（历史记录抽屉）、`.custom-select-dropdown`（AI 模型下拉）必须走 `var(--surface-glass)`；全工程不得再出现 `rgba(28, 26, 32` / `rgba(24,24,37` / `#1c1a20` 这类常量底色。实测口径：换主色后这三块的 `background-color` 必须跟着变。
 - [ ] **顶层插件面板不自加压暗**（ai-spec §11 规则 48 末条）：OCR 的 `.ocr-image-panel` / `.ocr-text-panel` 必须 `background: transparent`（与 memo 的 `.plugin-result` 一致，实测同为 `rgba(0,0,0,0)`），左右分栏靠 `border-right`；`rgba(0, 0, 0, calc(α * var(--shade-scale)))` 只允许出现在**嵌套**的次级块（输入框 / 工具卡 / 弹层 / 遮罩）上。
 - [ ] **回退按钮的位置与边界**（ai-spec §11 规则 64，2026-09-20 A11）：用户气泡 = 复制 + 回退 + 重试；**助手气泡 = 复制 + 回退**（任意消息都是合法回退点）；实时对话里助手回复不是独立气泡，入口在 `.turn-footer` 里的 `.turn-rollback`。回退文案（`.msg-rollback` 的 title 与回退后的状态行）**必须**写明「只回退对话，磁盘上已改动的文件不会还原」。**被 `pruneContext` 裁剪掉的老气泡只剩复制**（`shiftRenderedMsgIdx` 摘掉回退 / 重试）。回归口径：连问 13 轮以上让裁剪真的发生，点**最早那条仍有回退按钮**的气泡 → 重绘后的气泡数必须与保留的历史条数相等（不偏不差；此前 `data-idx` 不随裁剪前移，会切错消息）。
-- [ ] **控件文案里没有 emoji**（ai-spec §11 规则 49 + `icon-style.md` §4.1，2026-09-19 批 8）：按钮标签 / 状态行 / 占位提示一律「纯文字」或「线性 SVG + 文字」，不得出现 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ …` / `⏳ …` / `✅ …` / `❌ …`。**允许保留**：列表项 / 条目图标（`.clip-item-icon` 📁📋、`.history-item-icon` 💬、`.file-chip-icon` 📦📎、`plugin.icon`、`item.icon`、TODO 头 📋、tool-editor 🔧、web-search 引擎图标）与单色状态符号（`✓ ✗ ⚠ ✔ ◐ ○ ✕ ×`）。回归口径：对插件面板做一次「叶子节点 textContent 命中 emoji 正则」扫描，计数应为 0（列表项图标节点除外）。
+- [ ] **子任务面板是「分组面板」，不是分栏（ai-spec §11 规则 65，2026-09-20 A14）**：`.subtask-panel` 在 `.agent-flow` **内部**、每个子任务一行（`.subtask-row`：`.subtask-id` / `.subtask-desc` / `.subtask-state`），**不得**改成左右分栏、不得新建常驻侧栏、**不得给面板加 `max-height` / `overflow-y`**（第二层滚动条与限制结果区高度都是明令禁止的：§0 规则 1 + ai-spec §11 规则 44）。回合折叠时它与其它过程块一起隐藏（`flow-folded` 的选择器里必须有它）；没派子代理的回合 DOM 里**没有**这个容器。回归口径：一轮里派 2 个子任务 → 面板恰好 2 行、状态行显示并行数、两个都 `task_done` 后状态行才回「工作中」；`getComputedStyle(panel)` 的 `overflowY` 必须是 `visible`。
+- [ ] **控件文案里没有 emoji**（ai-spec §11 规则 49 + `icon-style.md` §4.1，2026-09-19 批 8）：按钮标签 / 状态行 / 占位提示一律「纯文字」或「线性 SVG + 文字」，不得出现 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ …` / `⏳ …` / `✅ …` / `❌ …`。**允许保留**：列表项 / 条目图标（`.clip-item-icon` 📁📋、`.history-item-icon` 💬、`.file-chip-icon` 📦📎、`plugin.icon`、`item.icon`、TODO 头 📋、tool-editor 🔧、web-search 引擎图标）与单色状态符号（`✓ ✗ ⚠ ✔ ◐ ○ ✕ ×`）。回归口径：对插件面板做一次「叶子节点 textContent 命中 emoji 正则」扫描，计数应为 0（列表项图标节点除外）。**子任务面板的 id / 状态与审批行的 `.approval-task-tag` 一律纯文字**（面板里那两个 `✓` / `✗` 属于允许的单色状态符号）。
 - [ ] **设置侧栏五项 + 分类归属正确**（ai-spec §11 规则 50）：侧栏**恰好**「常规 / 风格 / AI / 搜索 / 插件」五项（无独立「技能扩展」）；`#sp-ai` 内 `.settings-group-title` 恰好 4 个（AI 模型 / 技能 (Skill Store) / 工具 (MCP) / 用量与成本 —— 第四块 2026-09-20 由 A12 加入），且 `#settings-save-ai-btn` / `#settings-skill-install-url-btn` / `#settings-tool-url` / `#settings-open-tools` 全部落在 `#sp-ai` 作用域内；`#sp-plugins` 内是插件总览（`.settings-plugin-item` 数量 == `pluginRegistry.getAll().length`，每行「打开」按钮），且 `#settings-tool-url` **不在** `#sp-plugins` 内（tools 与插件必须分开）。
 - [ ] **插件名/描述已本地化**（ai-spec §11 规则 50）：结果区插件行、右键「运行 X」、详细搜索 commands 行、插件总览四处都走 `pluginName()` / `pluginDesc()`；把语言切到 `zh-CN` 后这些位置**不得出现英文常量**（`Custom Launch` / `Web Search` / `Search the web with your default browser`…）。新增插件必须同时补 `plugin.<id>` 与 `plugin.<id>.desc` 五语言。
 - [ ] **主题包锁定态不得回退**（ai-spec §11 规则 46）：`themeId !== "default"` 时 `#ap-color-group` 必须带 `.locked`（灰掉 + 不可点）、`#ap-bg-pick` 必须 `disabled`、`#ap-lock-note` 必须可见；**切换主题时实时同步**（不能只在构建时算一次）；**「自定义」那五个玻璃质感拉条在任何主题下都必须还能拖动**（实测口径：aurora 主题下拖 `bgBlur` → 行内 `--bg-blur` 必须变）。
@@ -383,6 +387,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   | `usage.requests[]` = `{in, read, create, out}` | `result.usage` | **每次 API 请求**的用量明细（顺序 = 请求顺序） | 前端**只落盘**（写进 `usage-*.jsonl` 的 `requests` 数组，与 DeepSeek 平台用量页逐行对账）；表盘口径不变（仍按每次提问累加）。**缺字段时写空数组**，`UsageRecord.requests` 为空则不写该键（旧记录兼容）。见 ai-spec §3.5「用量与对账」 |
   | `state`（`on` / `off`）+ `reason` | `system/plan_mode` | **计划相位**的广播（A7）：模型调 `EnterPlanMode` ⇒ `on`（`reason` = 模型给用户的一句话）；`ExitPlanMode` **被批准** ⇒ `off`。ai-spec §3.5「计划模式闭环」/ §11 规则 59 | 单例横幅 `.plan-mode-note`：`on` 时 `--yellow`，`off` 落回中性色；**agent 重启（`cli-status: starting`）要清掉** —— 相位是进程内状态，随进程消失。**不许**由前端拿工具调用自己推断状态 |
   | `session_id` | `system/init`（同一个值也出现在 `result` 与 hook payload 上） | 本次 **agent 运行** 的 id（A11）：`sess_<pid>_<启动时刻 epoch 毫秒>`，进程内恒定。语义是「一次运行」而非「一段对话」。ai-spec §3.5「会话 id 与 rewind」/ §11 规则 64 | 在 `system/init` 分支与 `model` 同一处记下（`agentSessionId`），随每次提问的用量写进 `usage-*.jsonl` 的 `sessionId` —— **只做归因**（对上 agent 落盘日志与 stdout），**界面不显示**。缺字段（旧 agent）⇒ 空串，写用量时不写该键 |
+  | `request.task_id` | `control_request.request`（`can_use_tool`） | 这条审批**来自哪个子任务**（A14）：`task-1` / `skill-2` …。**主循环自己发起的调用不写该键**。ai-spec §3.5「子代理」的「审批」行 / §11 规则 65 | 存在 ⇒ 行标题前置 `.approval-task-tag`（纯文字），自动放行的一行提示带 `[task-1] ` 前缀；并且**命令合并只与同 task id 的行合并**。缺字段 ⇒ 按主循环的调用渲染，且只与其它缺字段的行合并 |
+  | `task_id` / `description` / `tool` / `round` / `ok` / `ms` | `system/task_started` / `task_progress` / `task_done` | 子代理的**过程事件**（A1 起，A14 起前端按 `task_id` 归组）：`description` 只在 started 上、`tool` / `round` 只在 progress 上、`ok` / `ms` 只在 done 上。**子代理非流式** ⇒ 这是它在 UI 上的唯一落点。ai-spec §3.5「事件流」行 | 一块 `.subtask-panel`（每个 `task_id` 一行、就地更新）；状态行并行时报 `agent.subtask_parallel`，`task_done` 后**还有别的在跑就继续报并行数**，全跑完才回 `agent.working`。没有 `task_started` 的 `task_done` 不凭空造行 |
 
 - **计划卡不新增字段**（A7）：`ExitPlanMode` 复用既有的 `can_use_tool` 通道，整份计划就在 `request.input.plan` 里 —— 卡片按 §3.6 的骨架渲染，正文用 `textContent` 原样铺开（**不做 markdown 渲染、不用 `innerHTML`**：那是模型生成的任意文本）。批准时前端另调 `save_plan_md(stamp, plan)` 落档 `ModuleData\plans\`（失败只提示，不挡执行）。
 - **图片附件走 stdin 的 `image` 块，不动 stdout 契约**（A8）：前端只多传一个 `{"type":"image","source":{"type":"file","path":"…"}}` 内容块（契约见 ai-spec §3.5「图片附件」/ §11 规则 60）；agent 回报的是下面这条 **`system/attachment_note`**，前端渲染成一条黄色 `.sys-note-warn`（i18n `agent.attachment_skipped`，正文逐条「路径 — 原因」）。**没有事件 = 全部发出去了**，不需要画任何东西；`skipped` 为空数组时按无事件处理。
