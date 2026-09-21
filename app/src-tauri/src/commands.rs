@@ -537,6 +537,15 @@ fn start_cli_process(
         crate::storage::hooks_config_path().to_string_lossy().to_string(),
     ));
 
+    // 用户人格 / 自定义提示词（L2）→ agent.exe：同样**无条件给路径**（文件还不存在也给）。
+    // agent 启动时读一次、拼进系统提示词的固定段；「文件不存在 ⇒ 只用内置人格」这个判据
+    // 只有 agent 一处。**它不是热重载的**：面板保存后要重启 agent 才生效（改的正是固定前缀，
+    // 热读会让前缀每轮都变、把端点侧缓存打掉 —— 见 ai-spec §11 规则 18/23）。
+    envs.push((
+        "LUNAC_PERSONA_FILE",
+        crate::storage::persona_config_path().to_string_lossy().to_string(),
+    ));
+
     crate::log::info(format!(
         "agent spawn: workdir={} args=[{}]",
         workdir.display(),
@@ -1298,6 +1307,33 @@ pub fn commit_pricing_pending(
 #[tauri::command]
 pub fn discard_pricing_pending(state: State<'_, AppState>) -> Result<(), String> {
     crate::storage::clear_pricing_pending(&effective_workdir(&state))
+}
+
+/// 人格 / 自定义提示词的状态（L2）：文件路径 + 原文 + 长度上限。
+///
+/// **上限随状态一起给前端**：面板要拿它做 `maxlength` 与计数显示，而它只该有一处真相源
+/// （`storage::MAX_PERSONA_CHARS`）—— 前端再写一个 8000 就是第二处，早晚漂移。
+#[tauri::command]
+pub fn get_persona() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "path": crate::storage::persona_config_path().display().to_string(),
+        "text": crate::storage::load_persona_text()?.unwrap_or_default(),
+        "maxChars": crate::storage::MAX_PERSONA_CHARS,
+    }))
+}
+
+/// 保存人格文本（空串 = 恢复内置人格）。**先校验后写**，不合格时一个字节都不落盘。
+///
+/// 保存后需要**重启 agent** 才生效 —— 这里刻意不顺手重启：用户可能正在流式回答里，
+/// 而且「什么时候重启」是用户的动作（面板上有「立即重启」按钮）。
+#[tauri::command]
+pub fn set_persona(text: String) -> Result<(), String> {
+    crate::storage::save_persona_text(&text)?;
+    crate::log::info(format!(
+        "人格文本已保存：{} 字（重启 agent 后生效）",
+        text.chars().count()
+    ));
+    Ok(())
 }
 
 

@@ -1044,12 +1044,12 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
 }
 
 // ── AI 分类（2026-09-19 批 9：三个分块合成一个分类）────────────────
-/** AI 分类 = **AI 模型 + 技能（Skills）+ 工具（Tools / MCP）** 三个分块。
+/** AI 分类 = **AI 模型 + 技能（Skills）+ 工具（Tools / MCP）+ 用量与成本（A12）+ 人格（L2）**。
  *  用户要求：「将 skills 和 tools 和 ai模型 分类到 ai 分类里，各个分块采用跟
- *  风格里的分块一样」—— 所以三块都用 .settings-group-title（与「风格」的
+ *  风格里的分块一样」—— 所以各块都用 .settings-group-title（与「风格」的
  *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。 */
 async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean, hooksEnabled: boolean, hooksError: string): Promise<string> {
-  const [skillsHtml, toolsHtml, costHtml] = await Promise.all([buildSkillsSection(), buildToolsSection(), buildUsageCostSection()]);
+  const [skillsHtml, toolsHtml, costHtml, personaHtml] = await Promise.all([buildSkillsSection(), buildToolsSection(), buildUsageCostSection(), buildPersonaSection()]);
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
@@ -1061,7 +1061,101 @@ async function buildAIPane(provider: string, baseUrl: string, model: string, api
       ${toolsHtml}
       <div class="settings-group-title">${t("settings.cost_title")}</div>
       ${costHtml}
+      <div class="settings-group-title">${t("settings.persona_title")}</div>
+      ${personaHtml}
     </div>`;
+}
+
+// ── 人格 / 自定义提示词（L2）────────────────────────────────────
+//
+// 形态：一段纯文本落 `config\persona.md`，agent **启动时读一次**、拼进系统提示词的固定段
+// （在内置人格段之后）。所以保存后必须**重启 AI** 才生效 —— 面板如实写明这条，并给
+// 「立即重启」按钮（复用 `window.__lunac_reload_agent`，与技能目录 / 工具黑名单保存后同款）。
+// **刻意不做热更新**：改的正是固定前缀，热读会让系统提示词每轮都变、把端点侧缓存整段打掉
+// （ai-spec §11 规则 18/23）—— 那是我们花了两批工作才摆脱的东西。
+//
+// 另有一条硬约束要在面板上说清：这段**不进**子代理与后台复盘（它们是内部产物）。
+
+interface PersonaState { path: string; text: string; maxChars: number }
+
+async function buildPersonaSection(): Promise<string> {
+  return `<div id="settings-persona">${await renderPersonaBody()}</div>`;
+}
+
+async function renderPersonaBody(): Promise<string> {
+  let state: PersonaState | null = null;
+  try {
+    state = await invoke<PersonaState>("get_persona");
+  } catch {}
+  const text = state?.text ?? "";
+  // 上限由宿主给（storage::MAX_PERSONA_CHARS 是唯一真相源）：面板只用它做 maxlength 与计数
+  const max = state?.maxChars ?? 8000;
+  return `
+    <textarea id="settings-persona-text" class="settings-persona-text" spellcheck="false"
+      maxlength="${max}" placeholder="${esc(t("settings.persona_placeholder"))}">${esc(text)}</textarea>
+    <div class="settings-hint" id="settings-persona-count"></div>
+    <div class="settings-row">
+      <button type="button" class="settings-btn" id="settings-persona-save">${t("settings.persona_save")}</button>
+      <button type="button" class="settings-btn" id="settings-persona-reset">${t("settings.persona_reset")}</button>
+      <button type="button" class="settings-btn" id="settings-persona-restart">${t("settings.persona_restart")}</button>
+      <span class="settings-hint" id="settings-persona-msg" style="margin-left:8px;"></span>
+    </div>
+    <div class="settings-hint">${esc(t("settings.persona_hint", { max: String(max) }))}</div>
+    <div class="settings-hint" title="${esc(state?.path || "")}">${esc(t("settings.persona_path", { path: state?.path || "" }))}</div>`;
+}
+
+function wirePersona(container: HTMLElement): void {
+  const box = container.querySelector("#settings-persona-text") as HTMLTextAreaElement | null;
+  // 提示文字每次现查节点：容器整体重渲染会把 `#settings-persona-msg` 整个换掉
+  const showMsg = (text: string) => {
+    const el = container.querySelector("#settings-persona-msg") as HTMLElement | null;
+    if (el) el.textContent = text;
+  };
+  const count = () => {
+    const el = container.querySelector("#settings-persona-count") as HTMLElement | null;
+    if (el && box) {
+      el.textContent = t("settings.persona_count", {
+        n: String(box.value.length),
+        max: String(Number(box.maxLength) || 8000),
+      });
+    }
+  };
+  box?.addEventListener("input", count);
+  count();
+
+  const save = async (text: string, okMsg: string) => {
+    try {
+      await invoke("set_persona", { text });
+      // 保存 ≠ 生效：改的是系统提示词的固定前缀，得重启 agent 才读得到（如实告知）
+      showMsg(okMsg + t("settings.persona_takes_effect"));
+    } catch (e) {
+      showMsg(t("settings.persona_failed", { err: String(e) }));
+    }
+  };
+
+  container.querySelector("#settings-persona-save")?.addEventListener("click", () => {
+    void save(box?.value ?? "", t("settings.persona_saved"));
+  });
+
+  container.querySelector("#settings-persona-reset")?.addEventListener("click", async () => {
+    if (box) box.value = "";
+    count();
+    await save("", t("settings.persona_reset_done"));
+  });
+
+  container.querySelector("#settings-persona-restart")?.addEventListener("click", async () => {
+    const fn = (window as any).__lunac_reload_agent;
+    if (typeof fn !== "function") {
+      showMsg(t("settings.persona_failed", { err: "reload hook missing" }));
+      return;
+    }
+    try {
+      await fn();
+      showMsg(t("settings.persona_restarted"));
+    } catch (e) {
+      showMsg(t("settings.persona_failed", { err: String(e) }));
+    }
+  });
 }
 
 // ── 用量与成本（A12）──────────────────────────────────────────────
@@ -1791,6 +1885,29 @@ export async function attachSettingsListeners(container: HTMLElement) {
         caret-color: var(--accent);
       }
       .settings-input:focus { border-color: var(--accent-border); }
+      /* ── 人格 / 自定义提示词（L2）────────────────────────────────
+         一块多行文本框：默认 96px 高、可纵向拉伸（内容多时用户自己拉），
+         内部滚动交给全局那条 4px 滚动条（styles.css 唯一真相源，禁止按容器单写）。 */
+      .settings-persona-text {
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 96px;
+        max-height: 260px;
+        resize: vertical;
+        padding: 7px 9px;
+        font: inherit;
+        font-size: 0.73rem;
+        line-height: 1.55;
+        /* 凹陷层与 .settings-input 同源：底色暗 ⇒ 白洗、亮 ⇒ 黑洗 */
+        background: rgba(var(--ctx-shade-rgb), calc(0.25 * var(--ctx-shade-scale)));
+        border: 1px solid var(--ctx-border-glass);
+        border-radius: 6px;
+        color: var(--text);
+        outline: none;
+        caret-color: var(--accent);
+      }
+      .settings-persona-text:focus { border-color: var(--accent-border); }
+      .settings-persona-text::placeholder { color: var(--text-dim); opacity: 0.6; }
       .settings-btn {
         flex-shrink: 0;
         padding: 5px 10px;
@@ -2987,6 +3104,10 @@ export async function attachSettingsListeners(container: HTMLElement) {
   // 分块自己会重渲染（确认 / 放弃候选价格之后），所以绑定的入口是个函数，
   // 重渲染完它会再调自己一次。
   wireUsageCost(container);
+
+  // ── 人格 / 自定义提示词（L2）───────────────────────────────────
+  // 绑定入口独立成函数：分块内部若重渲染，直接再调一次 `wirePersona` 即可。
+  wirePersona(container);
 
   // ── AI 安全档位（文件边界）─────────────────────────────────────
   // 单独一个下拉，不跟 provider/model 那条保存链路混：切换立即生效（会重启 agent）。

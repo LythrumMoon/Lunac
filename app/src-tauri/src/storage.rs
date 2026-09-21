@@ -140,6 +140,64 @@ pub fn ensure_hooks_file() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+// ── 人格 / 自定义提示词（`config\persona.md`，L2）────────────────────
+//
+// 一段**纯文本**（Markdown 写法即可），用户自己在设置面板里编辑。宿主只做三件事：
+// 定位路径、存取原文、长度校验 —— **不解析、不加工**。
+//
+// 为什么是「文件 + 启动时读一次」而不是 hooks 或热更新（决策与实测见 ai-spec §3.5
+// 「人格 / 自定义提示词」）：这段文本进的是**系统提示词的固定前缀**（每次请求都要发），
+// 所以它必须与请求内容无关、进程内逐字节不变 —— 热读会让前缀每轮都变、把端点侧缓存整段
+// 打掉（§11 规则 18/23）。代价是「保存后要重启 agent 才生效」，这一点在面板上如实写明。
+
+/// 人格文本上限（字符）。**与 core-agent 的 `MAX_PERSONA_CHARS` 同值**，改一处要改两处。
+///
+/// 为什么要有上限：这段进的是**每次请求都要发的固定前缀**，塞一篇长文等于给每一轮都加一笔
+/// 固定成本，而它并不随任务变化。宿主这里是**硬拒绝**（用户当场知道），agent 侧另有截断兜底
+/// （防用户绕过面板直接改文件）。
+pub const MAX_PERSONA_CHARS: usize = 8_000;
+
+pub fn persona_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("persona.md")
+}
+
+/// 读原文；文件不存在返回 `Ok(None)`（= 用户没配过，agent 用内置人格）。
+pub fn load_persona_text() -> Result<Option<String>, String> {
+    let path = persona_config_path();
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读不出 {}：{e}", path.display())),
+    }
+}
+
+/// **先校验后写**：不合格时一个字节都不落盘（与 A12 定价表同一条纪律）。
+pub fn save_persona_text(text: &str) -> Result<(), String> {
+    validate_persona_text(text)?;
+    let path = persona_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+}
+
+/// 校验只挡两件会真出事的事：① 超长（固定前缀每轮都发）；② NUL（会破坏文本工具链）。
+///
+/// 刻意**不做内容审查**：这是**用户自己的**提示词，写什么由用户负责 —— 与 `hooks.json`
+/// 同口径（那里也是用户脚本，宿主不看内容）。空文本是**合法**输入：语义是「恢复内置人格」。
+pub fn validate_persona_text(text: &str) -> Result<(), String> {
+    let n = text.chars().count();
+    if n > MAX_PERSONA_CHARS {
+        return Err(format!(
+            "人格文本过长：{n} 字符，上限 {MAX_PERSONA_CHARS}（它进的是每次请求都要发的固定前缀）"
+        ));
+    }
+    if text.contains('\0') {
+        return Err("人格文本不能含空字符（NUL）".into());
+    }
+    Ok(())
+}
+
 // ── 定价表（`config\pricing.json`，A12）────────────────────────────
 //
 // 成本面板要显示「花了多少钱」，但**价格不能写进代码**：各家单价差十倍以上、官方
@@ -1048,5 +1106,42 @@ mod tests {
 
         let _ = fs::remove_file(&official);
         let _ = fs::remove_dir_all(&workdir);
+    }
+
+    /// 人格文本（L2）：**先校验后写**（拒绝时一个字节都不落盘）+ 往返一致 + 空文本合法。
+    ///
+    /// 空文本的语义是「恢复内置人格」，所以它必须能存（存成空文件），而不是被当成非法输入。
+    /// 收尾会把测试前的原文件**原样还原**（这是真实用户文件，不能测完留垃圾）。
+    #[test]
+    fn persona_text_is_validated_before_save_and_round_trips() {
+        let path = persona_config_path();
+        let before = load_persona_text().unwrap();
+
+        // ① 超长 / 含 NUL → 拒绝，且文件一字未改
+        let too_long = "x".repeat(MAX_PERSONA_CHARS + 1);
+        assert!(validate_persona_text(&too_long).is_err());
+        assert!(save_persona_text(&too_long).is_err());
+        assert!(validate_persona_text("a\0b").is_err());
+        assert!(save_persona_text("a\0b").is_err());
+        assert_eq!(load_persona_text().unwrap(), before, "拒绝时不该写文件");
+        // 边界：刚好到上限是合法的
+        assert!(validate_persona_text(&"x".repeat(MAX_PERSONA_CHARS)).is_ok());
+
+        // ② 正常写入 → 读回逐字节一致（中文 / 花括号 / 换行都要原样保留）
+        let text = "始终用中文回答。\n- 短句优先\n- 保留 {like this} 字面量";
+        save_persona_text(text).unwrap();
+        assert_eq!(load_persona_text().unwrap().as_deref(), Some(text));
+
+        // ③ 空文本 = 恢复内置人格（合法，读回空串）
+        save_persona_text("").unwrap();
+        assert_eq!(load_persona_text().unwrap().as_deref(), Some(""));
+
+        // 收尾：还原测试前的状态
+        match before {
+            Some(t) => fs::write(&path, t).unwrap(),
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 }

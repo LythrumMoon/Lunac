@@ -960,6 +960,94 @@ You are "Lunac", a sharp, fast desktop AI assistant built into a launcher. Stay 
 ## Output Style
 Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions."#;
 
+/// 用户人格 / 自定义提示词的来源文件（宿主注入的绝对路径，L2，2026-09-21）。
+///
+/// **为什么是「文件」而不是 hooks**：人格是**固定块** —— 必须进系统提示词的固定前缀（规则 18/23）。
+/// hooks 是**控制通道**（放行 / 拒绝 / 提示行），它的输出今天不进模型；用它承载人格等于给同一个
+/// 机制加第二个职责，还会引进来一条权限面（「谁能写 `hooks.json` 谁就能改系统指令」）。
+/// 详见 ai-spec §3.5「人格 / 自定义提示词」。
+const PERSONA_ENV: &str = "LUNAC_PERSONA_FILE";
+/// 用户人格段的表头。英文的原因同 `TRIMMED_MARKER`：这是**给模型看的元信息**，不进 i18n。
+/// 它同时是判据锚点 —— 单测与 e2e 都靠它判断「这段进没进提示词」。
+const USER_PERSONA_HEADER: &str = "## User-defined persona (from config\\persona.md — always apply)";
+/// 人格文本上限（字符）。**宿主侧 `storage::MAX_PERSONA_CHARS` 是同值硬校验**，改一处要改两处。
+///
+/// 为什么必须有上限：这段进的是**每次请求都要发的固定前缀**，塞一篇长文等于给每一轮都加一笔
+/// 固定成本，而它并不随任务变化。这里截断只是防御（比如用户绕过面板直接改文件）。
+const MAX_PERSONA_CHARS: usize = 8_000;
+
+/// 读用户人格文本 —— **只在启动时调一次**（结果进固定前缀，进程内不再变）。
+///
+/// 返回空串的三种情况都等价于「用户没配过」：环境变量没给 / 文件不存在 / 读不出来。
+/// 只有第三种落一行 warn（前两种是正常状态：出厂没有这个文件）。
+fn read_user_persona() -> String {
+    let path = std::env::var(PERSONA_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(path) = path else {
+        return String::new();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            let text = raw.trim();
+            if text.chars().count() > MAX_PERSONA_CHARS {
+                log::warn(format!(
+                    "用户人格超过 {MAX_PERSONA_CHARS} 字符（{path}）—— 固定前缀不适合放长文，已截断"
+                ));
+                return text.chars().take(MAX_PERSONA_CHARS).collect();
+            }
+            text.to_string()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            log::warn(format!("用户人格读不出（{path}）：{e} —— 本轮只用内置人格"));
+            String::new()
+        }
+    }
+}
+
+/// 把用户人格文本拼成系统提示词的**固定追加段**：空白输入 → 空串（一个字节都不加）。
+///
+/// 位置刻意是「内置人格段之后、`Environment:` 之前」：内置段保住产品底线约束（文风 / 禁 emoji 这类
+/// 不该被用户改掉），用户段紧跟其后；两段都在固定前缀里 ⇒ 永远命中缓存。
+fn persona_block(persona: &str) -> String {
+    let text = persona.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!("\n\n{USER_PERSONA_HEADER}\n{text}")
+}
+
+/// 主系统提示词的装配 —— **只在启动时调一次**（`persona` 由 `read_user_persona()` 给出）。
+///
+/// 抽成函数的唯一理由：让「用户人格**只**进主提示词」这条不变量能被单测钉住
+/// （见 `user_persona_reaches_only_the_main_prompt`）。
+fn build_system_prompt(
+    persona: &str,
+    env: &str,
+    skills: &str,
+    history: &str,
+    memory: &str,
+) -> String {
+    format!(
+        "{SYSTEM_PROMPT}\n\n{PERSONA_AND_STYLE}{}{env}{skills}{history}{memory}",
+        persona_block(persona)
+    )
+}
+
+/// 子代理 / 复盘的系统提示词（角色段 + 环境块 + 技能清单）：**刻意不含用户人格**。
+///
+/// 它们是内部产物（子代理报告 / 复盘写记忆），用户的文风口吻在那里没有意义；而多一份文本
+/// 就是每个并发子代理都要重发一次的固定成本。
+fn build_subagent_system(env: &str, skills: &str) -> String {
+    format!("{SUBAGENT_SYSTEM}{env}{skills}")
+}
+
+fn build_review_system(env: &str, skills: &str) -> String {
+    format!("{REVIEW_SYSTEM}{env}{skills}")
+}
+
 /// 环境说明（接在 SYSTEM_PROMPT 之后）。
 ///
 /// 为什么需要它：只说「你是 Lunac 的助手」不够 —— 模型在答「我自己的 skills 在哪」这类
@@ -1890,20 +1978,32 @@ fn main() {
         && mcp_bridge.is_some()
         && !cli.disallowed.iter().any(|d| d == "Remember");
     let memory_section = memory_block(mcp_bridge.as_mut(), remember_on);
-    let system_prompt = format!(
-        "{SYSTEM_PROMPT}\n\n{PERSONA_AND_STYLE}{}{}{}{}",
-        env_block(&tools_ctx.cwd),
-        skills::listing(if skills_on { &skills } else { &[] }),
-        history_block,
-        memory_section
+    // 用户人格 / 自定义提示词（L2，2026-09-21）：与 skills / 索引 / 记忆同款的**启动时读一次**。
+    // 宿主经 `LUNAC_PERSONA_FILE` 给出 `config\persona.md` 的路径；面板上保存后要**重启 agent**
+    // 才生效 —— 热读会让系统提示词每轮都变、把整个固定前缀的缓存打掉（规则 18/23），
+    // 而「重启才生效」这件事在面板上如实写明了。
+    let user_persona = read_user_persona();
+    if !user_persona.is_empty() {
+        log::info(format!(
+            "用户人格已注入系统提示词固定段：{} 字（{}）",
+            user_persona.chars().count(),
+            std::env::var(PERSONA_ENV).unwrap_or_default()
+        ));
+    }
+    // 三块共享的段落先算一次（都是纯函数、与请求无关）：主提示词 / 子代理 / 复盘各自拼装，
+    // 但环境块与技能清单**逐字节同源**，不各算一遍（规则 18 的「固定前缀」纪律）。
+    let env_section = env_block(&tools_ctx.cwd);
+    let skills_section = skills::listing(if skills_on { &skills } else { &[] });
+    let system_prompt = build_system_prompt(
+        &user_persona,
+        &env_section,
+        &skills_section,
+        &history_block,
+        &memory_section,
     );
     // 复盘 fork 的系统提示词 = 角色段 + 环境块 + 技能清单（与子代理同构，**不含记忆**：
     // 当前记忆每次都不同，放进复盘的**用户消息**里，系统提示词才能跨次逐字节相同）。
-    let review_system = format!(
-        "{REVIEW_SYSTEM}{}{}",
-        env_block(&tools_ctx.cwd),
-        skills::listing(if skills_on { &skills } else { &[] })
-    );
+    let review_system = build_review_system(&env_section, &skills_section);
     // 子代理的系统提示词 = 角色段 + 环境块 + 技能清单。**与主提示词同源、只构建一次**，
     // 因此所有子代理共享一段逐字节相同的前缀（ai-spec §11 规则 18）。
     //
@@ -1913,11 +2013,7 @@ fn main() {
     //      抄错了它还会照着一个不存在的位置去 Glob）；
     //   ② `Skill` 在子代理的工具集里（技能是纯本地能力，与 MCP 桥无关），而**技能清单
     //      原本只写在主提示词里** —— 不给清单，等于给一串不知道有哪些钥匙的钥匙串。
-    let subagent_system = format!(
-        "{SUBAGENT_SYSTEM}{}{}",
-        env_block(&tools_ctx.cwd),
-        skills::listing(if skills_on { &skills } else { &[] })
-    );
+    let subagent_system = build_subagent_system(&env_section, &skills_section);
 
     let mut tool_defs = tools::defs(&cli.disallowed);
     let mut tool_names = tools::names(&tool_defs);
@@ -4556,17 +4652,63 @@ mod tests {
     /// ① 同一 cwd 下逐字节可复现；② 两块文案真的在里面。
     #[test]
     fn system_prompt_is_stable_and_carries_persona() {
-        let build = || {
-            format!(
-                "{SYSTEM_PROMPT}\n\n{PERSONA_AND_STYLE}{}",
-                env_block(std::path::Path::new("C:/work"))
-            )
-        };
+        let env = env_block(std::path::Path::new("C:/work"));
+        let build = || build_system_prompt("", &env, "", "", "");
         let a = build();
         assert_eq!(a, build(), "同一 cwd 下系统提示词必须逐字节相同（否则前缀缓存每轮作废）");
         assert!(a.contains("## Personality (fixed — always apply)"), "人格块丢了");
         assert!(a.contains("## Output Style"), "文风块丢了");
         assert!(!a.contains('{'), "残留了未被 format! 替换的占位符");
+        assert!(!a.contains(USER_PERSONA_HEADER), "没配用户人格时不该多出这一段");
+    }
+
+    /// 用户人格（L2）：**逐字进主提示词、位置在内置人格之后、且只进主提示词**。
+    ///
+    /// 三条都是硬约束，各对应一个真实代价：
+    /// ① 逐字 —— 用户写的就是模型看到的（不做任何转义 / 改写）；
+    /// ② 位置 —— 内置段在前（保住「文风 / 禁 emoji」这类产品底线），用户段接在其后、
+    ///    环境块之前；两段都在固定前缀里 ⇒ 永远命中缓存；
+    /// ③ 只进主提示词 —— 子代理 / 复盘是内部产物，多一份就是每个并发子代理都要重发的固定成本。
+    #[test]
+    fn user_persona_reaches_only_the_main_prompt() {
+        let env = env_block(std::path::Path::new("C:/work"));
+        let persona = "Always answer in 中文。我是团队里的测试同学。\n- 短句优先\n- 保留 {like this} 字面量";
+        let main = build_system_prompt(persona, &env, "SKILLS", "HIST", "MEM");
+        assert!(main.contains(USER_PERSONA_HEADER), "用户人格段的表头丢了");
+        assert!(main.contains(persona), "用户人格正文必须逐字进提示词");
+        assert!(
+            main.find("## Personality").unwrap() < main.find(USER_PERSONA_HEADER).unwrap(),
+            "用户段必须接在内置人格之后"
+        );
+        assert!(
+            main.find(USER_PERSONA_HEADER).unwrap() < main.find("Environment:").unwrap(),
+            "用户段必须排在环境块之前"
+        );
+        // 花括号是**字面量**（persona 是作为 `format!` 的参数注入的，不参与格式解析）
+        assert!(main.contains("{like this}"), "persona 里的花括号被当成占位符了");
+        // 子代理 / 复盘刻意不含
+        assert!(!build_subagent_system(&env, "SKILLS").contains(USER_PERSONA_HEADER));
+        assert!(!build_subagent_system(&env, "SKILLS").contains(persona));
+        assert!(!build_review_system(&env, "SKILLS").contains(USER_PERSONA_HEADER));
+        assert!(!build_review_system(&env, "SKILLS").contains(persona));
+    }
+
+    /// 空白人格 = 完全不存在（不加表头、不加换行）—— 否则没配过的用户也会多一段空壳，
+    /// 而那是**每次请求都要发**的字节。
+    #[test]
+    fn blank_persona_adds_nothing_to_the_prompt() {
+        assert_eq!(persona_block(""), "");
+        assert_eq!(persona_block("   \n\t  "), "");
+        let env = env_block(std::path::Path::new("C:/work"));
+        let with_blank = build_system_prompt("  \n ", &env, "", "", "");
+        assert_eq!(
+            with_blank,
+            build_system_prompt("", &env, "", "", ""),
+            "全空白的人格必须与「没配」逐字节等价"
+        );
+        // 两端空白去掉后再注入（避免用户在面板里多敲的空行变成固定前缀里的噪声）
+        let one = persona_block("  Be terse.  ");
+        assert!(one.contains("Be terse.") && !one.ends_with(' ') && !one.ends_with('\n'));
     }
 
     /// 子代理工具集的守门测试（2026-09-20 复查补，A7 扩了一类）。
