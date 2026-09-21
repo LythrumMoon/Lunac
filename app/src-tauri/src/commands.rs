@@ -1892,6 +1892,50 @@ pub fn plugins_dir_path() -> String {
         .to_string()
 }
 
+/// 拉取**插件市场索引**（`plugin_market::INDEX_URL`，本仓 `main` 分支的 `plugins/index.json`）。
+///
+/// 由宿主去拉的两个理由：① 前端 CSP 的 `default-src` 不含 github 域（无 `connect-src` 声明
+/// ⇒ 回落 default-src），前端 `fetch()` 会被直接拦掉；② 索引里的每条 URL 都要**服务端先筛一遍**
+/// （`parse_index`：https + 安全 id + 有名字），前端拿到的就是可下载集合，
+/// 「谁写索引谁就决定前端能下什么」这条旁路也就不存在了。
+///
+/// 三条闸沿用插件包的口径：**只 https**（地址是常量）、**体积上限**（Content-Length 先拦 +
+/// 按真实读到的字节再拦）、**失败如实上报**（面板上显示原因，不静默退回空市场）。
+#[tauri::command]
+pub fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
+    let limit = crate::plugin_market::MAX_INDEX_BYTES;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Client error: {e}"))?;
+    let mut resp = client
+        .get(crate::plugin_market::INDEX_URL)
+        .send()
+        .map_err(|e| format!("Download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > limit {
+            return Err(format!("插件索引超过上限（{} KB）", limit / 1024));
+        }
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = resp.read(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() as u64 + n as u64 > limit {
+            return Err(format!("插件索引超过上限（{} KB）", limit / 1024));
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8(bytes).map_err(|e| format!("插件索引不是 UTF-8：{e}"))?;
+    crate::plugin_market::parse_index(&text)
+}
+
 /// 从 https 的 zip URL 安装插件，返回插件 id。
 #[tauri::command]
 pub fn install_plugin_from_url(url: String) -> Result<String, String> {

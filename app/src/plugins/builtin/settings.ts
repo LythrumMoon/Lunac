@@ -3,10 +3,12 @@ let activeSettingsCategory = "general";
 // 四组「自定义」拉条的展开状态：跨「关掉设置再打开」保留（否则每次进来都要再点一次
 // 「自定义」才看得到滑块，用户会以为设置在跳）。
 let bgSlidersOpen = false;
-/** 底色 / 按钮 / 文字（2026-09-20 新增的后两组，形态与背景那组一致）。 */
+/** 底色 / 按钮 / 文字（2026-09-20 新增的后两组，形态与背景那组一致）
+ *  + 其他颜色（2026-09-21）。 */
 let basePanelOpen = false;
 let btnPanelOpen = false;
 let textPanelOpen = false;
+let otherPanelOpen = false;
 
 // Unlisten functions for hotkey recording events — cleaned up on re-attach to avoid memory leaks
 let _clickOutsideHandler: ((e: Event) => void) | null = null;
@@ -16,7 +18,7 @@ let _unlistenHotkeyRecorded: (() => void) | null = null; // Tauri event (for Alt
 
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
-import { refreshMarketPlugins, type MarketPluginInfo } from "../market";
+import { refreshMarketPlugins, fetchPluginIndex, type MarketPluginInfo, type MarketIndexEntry } from "../market";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
@@ -177,6 +179,19 @@ interface AppearanceConfig {
   btnBgAlpha: number;
   /** 文字明度偏移 ±100（0 = 派生原值）。 */
   textLight: number;
+  /** ── 「其他颜色」六项（2026-09-21 新增，同一套「空串 = 跟随」约定）────────
+   *  颜色字段空串 ⇒ 回落 :root 的派生配方；α 恒写。默认值 = 改造前的表达式。 */
+  itemHoverColor: string;   // (a) 结果项 hover / 选中项的浮层
+  itemHoverAlpha: number;
+  navActiveColor: string;   // (b) 设置侧栏「当前选中项」的底色与左竖条
+  navActiveAlpha: number;
+  runtimeTextColor: string; // (c) 「运行端输出」正文文字
+  chatBgColor: string;      // (d) AI 对话面板背景
+  chatBgAlpha: number;
+  panelBgColor: string;     // (e) 设置面板背景（默认 α = 0 ⇒ 不画）
+  panelBgAlpha: number;
+  groupBgColor: string;     // (f) 设置面板「分类标题」块的底色
+  groupBgAlpha: number;
   themeId: string;
 }
 interface AppearanceThemeInfo {
@@ -187,10 +202,14 @@ interface AppearanceBridge {
   get(): AppearanceConfig;
   set(patch: Partial<AppearanceConfig>): void;
   themes(force?: boolean): Promise<AppearanceThemeInfo[]>;
-  /** 「跟随态」下三个取色器该显示什么色（底色 = 主题包 surface 或派生的表面色，
-   *  按钮线条 / 按钮背景 = 主题色）。只用于取色器的**初始显示**，不落盘 ——
-   *  面板不自己复制一份派生逻辑（否则必然漂移）。 */
-  resolvedSwatches(): { base: string; btnLine: string; btnBg: string };
+  /** 「跟随态」下取色器该显示什么色（底色 = 主题包 surface 或派生的表面色，
+   *  按钮线条 / 按钮背景 = 主题色；「其他颜色」六项见 main.ts 里的同名函数）。
+   *  只用于取色器的**初始显示**，不落盘 —— 面板不自己复制一份派生逻辑（否则必然漂移）。 */
+  resolvedSwatches(): {
+    base: string; btnLine: string; btnBg: string;
+    itemHover: string; navActive: string; runtimeText: string;
+    chatBg: string; panelBg: string; groupBg: string;
+  };
   themesDir(): Promise<string>;
   pickBgImage(): Promise<boolean>;
 }
@@ -444,17 +463,34 @@ async function buildAppearancePane(): Promise<string> {
     sheen: 0, surfaceAlpha: 0.88, tintBase: false,
     baseColor: "", btnLineColor: "", btnLineAlpha: 0.32,
     btnBgColor: "", btnBgAlpha: 0.14, textLight: 0,
+    itemHoverColor: "", itemHoverAlpha: 0.1,
+    navActiveColor: "", navActiveAlpha: 0.14,
+    runtimeTextColor: "",
+    chatBgColor: "", chatBgAlpha: 0.88,
+    panelBgColor: "", panelBgAlpha: 0,
+    groupBgColor: "", groupBgAlpha: 0.14,
     themeId: "default",
   };
   let themes: AppearanceThemeInfo[] = [];
   try { themes = (await ap?.themes()) ?? []; } catch { /* 主题包读不到 → 只留默认项 */ }
-  // 三个取色器在「跟随态」（对应字段是空串）下显示什么色，由 main.ts 算好给过来 ——
+  // 取色器在「跟随态」（对应字段是空串）下显示什么色，由 main.ts 算好给过来 ——
   // 面板不复制那份派生逻辑（复制必然漂移）。见 AppearanceBridge.resolvedSwatches。
-  const sw = ap?.resolvedSwatches() ?? { base: "#c0a0a0", btnLine: "#c0a0a0", btnBg: "#c0a0a0" };
+  const sw = ap?.resolvedSwatches() ?? {
+    base: "#c0a0a0", btnLine: "#c0a0a0", btnBg: "#c0a0a0",
+    itemHover: "#c0a0a0", navActive: "#c0a0a0", runtimeText: "#b2a9a3",
+    chatBg: "#1c1a20", panelBg: "#1c1a20", groupBg: "#c0a0a0",
+  };
   const shown = {
     base: cfg.baseColor || sw.base,
     btnline: cfg.btnLineColor || sw.btnLine,
     btnbg: cfg.btnBgColor || sw.btnBg,
+    // 「其他颜色」六项（2026-09-21）
+    itemHover: cfg.itemHoverColor || sw.itemHover,
+    nav: cfg.navActiveColor || sw.navActive,
+    runtimeText: cfg.runtimeTextColor || sw.runtimeText,
+    chatBg: cfg.chatBgColor || sw.chatBg,
+    panelBg: cfg.panelBgColor || sw.panelBg,
+    groupBg: cfg.groupBgColor || sw.groupBg,
   };
   // 三对「饱和度 / 明度」滑块的初值 = 上面那个色的 HSV 两轴（**与色板同一组值**）。
   const axis = (slot: "base" | "btnline" | "btnbg") => hexToHsv(shown[slot]) ?? { h: 0, s: 0, v: 0 };
@@ -607,6 +643,63 @@ async function buildAppearancePane(): Promise<string> {
       <div id="ap-text-sliders" class="ap-sliders-panel${textPanelOpen ? "" : " hidden"}">
         ${appearanceSliderRow("settings.appearance_text_light", "textLight", -100, 100, 1, cfg.textLight, v => formatAppearanceValue("textLight", v))}
       </div>
+
+      <!-- ── ⑤ 其他颜色（2026-09-21 新增，用户要求「分出来一个其他颜色选项」）──
+           六项原本只能跟着主题色 / 派生色走、用户改不了的颜色：
+           结果项浮层 / 设置选中项 / 运行端输出文字 / AI 对话背景 / 设置面板背景 / 分类标题背景。
+           每项一个取色器（取色器自带饱和度-明度框，所以**不再重复给轴滑块**）+ 一个透明度
+           （(c) 是文字色，没有 α）。**取色器受「恢复默认主题」管辖（data-tint-lock），
+           透明度滑块留在锁外** —— 与上面三组同一口径（见 ai-spec 规则 45）。 -->
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.appearance_other_label")}</span>
+        <div class="settings-bg-actions">
+          <button type="button" class="settings-btn ap-bg-custom" id="ap-other-custom">${t("settings.appearance_other_custom")}<span class="ap-toggle-caret" id="ap-other-caret">▾</span></button>
+        </div>
+      </div>
+      <div id="ap-other-sliders" class="ap-sliders-panel${otherPanelOpen ? "" : " hidden"}">
+        <div class="settings-hint ap-other-hint">${t("settings.appearance_other_hint")}</div>
+        <div ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_other_item_hover")}</span>
+            ${colorPickerHtml("ap-oitemhover", shown.itemHover)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_other_item_hover_alpha", "itemHoverAlpha", 0, 1, 0.01, cfg.itemHoverAlpha, v => formatAppearanceValue("itemHoverAlpha", v))}
+        <div ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_other_nav")}</span>
+            ${colorPickerHtml("ap-onav", shown.nav)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_other_nav_alpha", "navActiveAlpha", 0, 1, 0.01, cfg.navActiveAlpha, v => formatAppearanceValue("navActiveAlpha", v))}
+        <div ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_other_runtime_text")}</span>
+            ${colorPickerHtml("ap-oruntime", shown.runtimeText)}
+          </div>
+        </div>
+        <div ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_other_chat_bg")}</span>
+            ${colorPickerHtml("ap-ochatbg", shown.chatBg)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_other_chat_bg_alpha", "chatBgAlpha", 0, 1, 0.01, cfg.chatBgAlpha, v => formatAppearanceValue("chatBgAlpha", v))}
+        <div ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_other_panel_bg")}</span>
+            ${colorPickerHtml("ap-opanelbg", shown.panelBg)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_other_panel_bg_alpha", "panelBgAlpha", 0, 1, 0.01, cfg.panelBgAlpha, v => formatAppearanceValue("panelBgAlpha", v))}
+        <div ${tl()}>
+          <div class="settings-row ap-row-block">
+            <span class="settings-label">${t("settings.appearance_other_group_bg")}</span>
+            ${colorPickerHtml("ap-ogroupbg", shown.groupBg)}
+          </div>
+        </div>
+        ${appearanceSliderRow("settings.appearance_other_group_bg_alpha", "groupBgAlpha", 0, 1, 0.01, cfg.groupBgAlpha, v => formatAppearanceValue("groupBgAlpha", v))}
+      </div>
       </div>
 
       <div class="settings-group-title">${t("settings.appearance_theme_section")}</div>
@@ -672,6 +765,15 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
     base: { id: "ap-base", hex: cfg.baseColor || sw.base, set: (hex) => ap.set({ baseColor: hex }) },
     btnline: { id: "ap-btnline", hex: cfg.btnLineColor || sw.btnLine, set: (hex) => ap.set({ btnLineColor: hex }) },
     btnbg: { id: "ap-btnbg", hex: cfg.btnBgColor || sw.btnBg, set: (hex) => ap.set({ btnBgColor: hex }) },
+    // 「其他颜色」六项（2026-09-21）：同一条「空串 = 跟随」约定，一动就写成真 hex。
+    // 它们**没有**轴滑块（取色器自带的饱和度-明度框就是那两轴），所以下面
+    // `syncAxes()` 对这些 slot 是空转 —— 那是刻意的，不是漏做。
+    itemHover: { id: "ap-oitemhover", hex: cfg.itemHoverColor || sw.itemHover, set: (hex) => ap.set({ itemHoverColor: hex }) },
+    nav: { id: "ap-onav", hex: cfg.navActiveColor || sw.navActive, set: (hex) => ap.set({ navActiveColor: hex }) },
+    runtimeText: { id: "ap-oruntime", hex: cfg.runtimeTextColor || sw.runtimeText, set: (hex) => ap.set({ runtimeTextColor: hex }) },
+    chatBg: { id: "ap-ochatbg", hex: cfg.chatBgColor || sw.chatBg, set: (hex) => ap.set({ chatBgColor: hex }) },
+    panelBg: { id: "ap-opanelbg", hex: cfg.panelBgColor || sw.panelBg, set: (hex) => ap.set({ panelBgColor: hex }) },
+    groupBg: { id: "ap-ogroupbg", hex: cfg.groupBgColor || sw.groupBg, set: (hex) => ap.set({ groupBgColor: hex }) },
   };
   const syncAxes = (slot: string) => {
     const hsv = hexToHsv(colors[slot].hex);
@@ -751,6 +853,8 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
     () => btnPanelOpen, v => { btnPanelOpen = v; });
   bindPanel("#ap-text-custom", "#ap-text-sliders", "#ap-text-caret",
     () => textPanelOpen, v => { textPanelOpen = v; });
+  bindPanel("#ap-other-custom", "#ap-other-sliders", "#ap-other-caret",
+    () => otherPanelOpen, v => { otherPanelOpen = v; });
 
   // ── 主题包：单选。`main.ts` 的 set() 会在 themeId 变化时重画结果列表（图标）──
   // 同步「主题锁」：只有默认主题允许改主题色与背景图片（见 buildAppearancePane）。
@@ -1648,85 +1752,153 @@ async function buildToolsSection(): Promise<string> {
       </div>`;
 }
 
-/** 「插件」分类 = **插件市场总览**（2026-09-19 批 9，用户明确要求；2026-09-21 L1 起可装可卸）。
+/** 「插件」分类 = **插件市场**（2026-09-19 批 9 建立，2026-09-21 二次改版为用户要的形态）。
  *
- *  **与 AI 分类下的 tools 严格区分**：tools 是「AI Agent 能调用的自定义工具
- *  （MCP 桥）」，这里列的是 **Lunac 自己的插件**（结果区里能搜到、点开的那些）。
- *  此前两者混在同一个分类里，分类名还叫「插件 (MCP 工具)」—— 用户报的正是这里。
+ *  **与 AI 分类下的 tools 严格区分**：tools 是「AI Agent 能调用的自定义工具（MCP 桥）」，
+ *  这里列的是 **Lunac 自己的插件**（结果区里能搜到、点开的那些）。
  *
- *  总览（上半）：图标 + 本地化名称 + 本地化描述 + 「打开」；
- *  **搜索关键词进 title 属性**（悬停可见），不铺在界面上 —— 关键词数组里
- *  中英混杂且动辄十几个，平铺会把面板糊成一片。
+ *  **一段一张表**：每行一个插件，按钮由**本机事实**决定（不是索引自称的）——
+ *    · 已装且能用   ⇒ 「打开」（第三方多一个「卸载」；内置是编译进来的，没得卸）
+ *    · 装了但包坏了 ⇒ **不藏**：连原因一起显示 + 「卸载」（否则用户只看到插件莫名消失）
+ *    · 没装而索引里有 ⇒ 「下载」（https zip 装进 `<exe 根>\plugins\<id>\`，装完立即生效）
  *
- *  第三方插件（下半，L1）：数据源是**插件目录扫描**而不是 registry —— 坏包（清单坏了、
- *  入口丢了）根本没进 registry，但**必须在这里可见**，否则用户只会看到插件莫名消失、
- *  手上没有任何线索。每行一个两段式确认的「卸载」。
+ *  行数据的三个来源，合并顺序**固定**（顺序一抖，用户每次进来看到的东西都在跳）：
+ *    ① `pluginRegistry.getAll()` —— 已装且能用的（内置 + 第三方有效包），顺序照旧；
+ *    ② 插件目录里有、却没进 registry 的 —— 坏包；
+ *    ③ 远程索引（`fetch_plugin_index`）里本机还没有的 —— 只有它们有「下载」。
+ *
+ *  下载与手工安装走**同一条**宿主命令 `install_plugin_from_url`：索引只提供 URL，
+ *  校验 / 解压 / 落盘全在 Rust 侧那一套里（见 ai-spec §3.5「插件市场」）—— 别在前端另开一条。
+ *
+ *  **列表在挂载后由 `renderMarket()` 填**，不在这里取数：索引要走网络（差网络下最坏能拖到
+ *  超时），而这个字符串是**整块设置面板**的一部分 —— 在这里 await 会让「打开设置」跟着卡住。
  */
-async function buildPluginsPane(): Promise<string> {
-  const rows = pluginRegistry.getAll().map(pluginRowHtml).join("");
-  const { list, dir, error } = await readPluginMarket();
-  const dirRows = error
-    ? `<div class="settings-plugin-empty">${esc(t("settings.plugins_market_failed", { err: error }))}</div>`
-    : list.length === 0
-      ? `<div class="settings-plugin-empty">${t("settings.plugins_market_empty")}</div>`
-      : list.map(marketRowHtml).join("");
-
+function buildPluginsPane(): string {
   return `
     <div class="settings-pane" data-pane="plugins" id="sp-plugins">
       <div class="settings-pane-title">${t("settings.plugins")}</div>
-      <div class="settings-group-title">${t("settings.plugins_installed")}</div>
-      <div class="settings-plugin-list" id="settings-plugin-overview">${rows}</div>
-      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);line-height:1.5;margin:10px 0 0;">${t("settings.plugins_hint")}</div>
       <div class="settings-group-title">${t("settings.plugins_market")}</div>
-      <div class="settings-market-install">
-        <input type="text" id="settings-plugin-url" class="settings-input" spellcheck="false"
-          placeholder="${esc(t("settings.plugins_market_url"))}" />
-        <button type="button" class="settings-btn" id="settings-plugin-install">${t("settings.plugins_market_install")}</button>
-      </div>
-      <div class="settings-plugin-list" id="settings-plugin-dir">${dirRows}</div>
-      <div class="settings-hint" id="settings-plugin-msg"></div>
       <div class="settings-hint">${esc(t("settings.plugins_market_hint"))}</div>
-      <div class="settings-hint" title="${esc(dir)}">${esc(t("settings.plugins_market_dir", { path: dir }))}</div>
+      <div class="settings-plugin-list" id="settings-plugin-market">
+        <div class="settings-plugin-empty">${t("settings.plugins_market_loading")}</div>
+      </div>
+      <div class="settings-hint" id="settings-plugin-err"></div>
+      <div class="settings-hint" id="settings-plugin-msg"></div>
+      <div class="settings-hint">${t("settings.plugins_hint")}</div>
+      <div class="settings-hint" id="settings-plugin-dir-path"></div>
     </div>`;
 }
 
-/** 插件总览的一行（内置与第三方都走这里 —— 它们注册后是同一份 registry）。 */
-function pluginRowHtml(p: Plugin): string {
-  const icon = (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "";
-  const kw = p.keywords.join(" · ");
-  return `
-      <div class="settings-plugin-item" title="${esc(kw)}">
-        <div class="settings-plugin-icon">${icon}</div>
-        <div class="settings-plugin-info">
-          <span class="settings-plugin-name">${esc(pluginName(p.id, p.name))}</span>
-          <span class="settings-plugin-desc">${esc(pluginDesc(p.id, p.description))}</span>
-        </div>
-        <button class="settings-install-btn" data-open-plugin="${esc(p.id)}">${t("settings.skill_open")}</button>
-      </div>`;
+/** 市场的一行。三个按钮的显示条件见 `marketRowHtml` —— 判据全在这两个字段上：
+ *  `installed`（registry 里有没有它）/ `local`（盘上有没有它的目录）/ `url`（索引给不给下载地址）。 */
+interface MarketRow {
+  id: string;
+  name: string;
+  description: string;
+  /** 图标：插件自带的样式（内置走主题图标，第三方走清单里的 emoji 兜底） */
+  icon: string;
+  version: string;
+  /** 远程索引里的 https zip 地址；空串 = 索引里没有这条（只可能「打开」或「卸载」） */
+  url: string;
+  /** 来源（作者给的 homepage，没有就退回 zip 地址）—— 挂在行的 title 上：装谁 = 信任谁的代码，
+   *  来源必须能查，但不必铺在界面上。 */
+  source: string;
+  /** registry 里有 ⇒ 能「打开」 */
+  installed: boolean;
+  /** 插件目录里有 ⇒ 能「卸载」（内置插件没有目录，所以卸不掉） */
+  local: boolean;
+  /** 非空 = 本机这个包坏了（原因原样显示，不猜） */
+  broken: string;
 }
 
-/** 插件目录里的一行：名称 + 版本 + 来源 + 卸载（坏包多一行原因）。 */
-function marketRowHtml(p: MarketPluginInfo): string {
-  const name = p.version ? `${p.name} · v${p.version}` : p.name;
-  const src = p.homepage
-    ? `<span class="settings-market-src" title="${esc(p.homepage)}">${esc(p.homepage)}</span>`
+/** 三个来源合并成一张表。顺序：已装且能用 → 坏包 → 索引里还没装的。 */
+function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): MarketRow[] {
+  const rows: MarketRow[] = [];
+  const seen = new Set<string>();
+  const localById = new Map(local.map(p => [p.id, p]));
+
+  // ① 已装且能用（内置 + 第三方有效包），registry 的顺序照旧
+  for (const p of pluginRegistry.getAll()) {
+    const l = localById.get(p.id);
+    rows.push({
+      id: p.id,
+      name: pluginName(p.id, p.name),
+      description: pluginDesc(p.id, p.description),
+      icon: (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "",
+      version: l?.version || "",
+      url: "",
+      source: l?.homepage || "",
+      installed: true,
+      local: !!l,
+      broken: "",
+    });
+    seen.add(p.id);
+  }
+  // ② 目录里有、registry 里没有 —— 坏包必须可见（`valid === false` 时 `error` 非空）
+  for (const p of local) {
+    if (seen.has(p.id)) continue;
+    rows.push({
+      id: p.id,
+      name: pluginName(p.id, p.name || p.id),
+      description: pluginDesc(p.id, p.description),
+      icon: p.icon || "",
+      version: p.version,
+      url: "",
+      source: p.homepage,
+      installed: false,
+      local: true,
+      broken: p.error,
+    });
+    seen.add(p.id);
+  }
+  // ③ 索引里本机还没有的 —— 市场里唯一能「下载」的那批
+  for (const e of index) {
+    if (seen.has(e.id)) continue;
+    rows.push({
+      id: e.id,
+      name: pluginName(e.id, e.name || e.id),
+      description: pluginDesc(e.id, e.description),
+      icon: e.icon || "",
+      version: e.version,
+      url: e.url,
+      source: e.homepage || e.url,
+      installed: false,
+      local: false,
+      broken: "",
+    });
+    seen.add(e.id);
+  }
+  return rows;
+}
+
+/** 一行 HTML：名称（带版本）+ 描述（坏包换成原因）+ 该状态下的按钮。 */
+function marketRowHtml(r: MarketRow): string {
+  const name = r.version ? `${r.name} · v${r.version}` : r.name;
+  const meta = r.broken
+    ? `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: r.broken }))}</span>`
+    : `<span class="settings-plugin-desc">${esc(r.description)}</span>`;
+  const open = r.installed && !r.broken
+    ? `<button class="settings-install-btn" data-open-plugin="${esc(r.id)}">${t("settings.skill_open")}</button>`
     : "";
-  const broken = p.valid
-    ? ""
-    : `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: p.error }))}</span>`;
+  const download = r.url
+    ? `<button class="settings-install-btn" data-download-plugin="${esc(r.id)}" data-plugin-url="${esc(r.url)}">${t("settings.plugins_market_download")}</button>`
+    : "";
+  const remove = r.local
+    ? `<button class="settings-skill-del-installed" data-uninstall-plugin="${esc(r.id)}">${t("settings.plugins_market_uninstall")}</button>`
+    : "";
   return `
-      <div class="settings-market-row">
+      <div class="settings-market-row" title="${esc(r.source)}">
+        <div class="settings-plugin-icon">${r.icon}</div>
         <div class="settings-plugin-info">
           <span class="settings-plugin-name">${esc(name)}</span>
-          ${src}
-          ${broken}
+          ${meta}
         </div>
-        <button class="settings-skill-del-installed" data-uninstall-plugin="${esc(p.id)}">${t("settings.plugins_market_uninstall")}</button>
+        ${open}${download}${remove}
       </div>`;
 }
 
-/** 读插件目录：扫描结果 + 目录绝对路径；失败时把原因**原样**带回界面（不猜、不吞）。 */
-async function readPluginMarket(): Promise<{ list: MarketPluginInfo[]; dir: string; error: string }> {
+/** 读本机的插件目录：扫描结果 + 目录绝对路径；失败时把原因**原样**带回界面（不猜、不吞）。 */
+async function readLocalPlugins(): Promise<{ list: MarketPluginInfo[]; dir: string; error: string }> {
   try {
     const [list, dir] = await Promise.all([
       invoke<MarketPluginInfo[]>("list_installed_plugins"),
@@ -1738,36 +1910,56 @@ async function readPluginMarket(): Promise<{ list: MarketPluginInfo[]; dir: stri
   }
 }
 
-/** 重新画「已安装插件」总览（装完 / 卸完要立刻反映出来 —— 那是用户唯一能确认「真装上了」的地方）。 */
-function renderPluginOverview(container: HTMLElement) {
-  const el = container.querySelector<HTMLElement>("#settings-plugin-overview");
-  if (!el) return;
-  el.innerHTML = pluginRegistry.getAll().map(pluginRowHtml).join("");
-  bindOpenPluginButtons(el);
-}
-
-/** 总览每行的「打开」走 main.ts 的 `__lunac_open_plugin` 桥：设置面板不自己 executePlugin
- *  （那要动结果区 / 搜索栏状态，属于主界面的职责）。重绘后必须重新绑 —— 新节点没有监听。 */
-function bindOpenPluginButtons(root: HTMLElement) {
-  root.querySelectorAll<HTMLElement>("[data-open-plugin]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.openPlugin;
-      if (id) (window as any).__lunac_open_plugin?.(id);
-    });
-  });
-}
-
-/** 插件目录那一段的绑定（L1）：安装 / 卸载 / 重绘。
+/** 把整个市场画出来（两段，理由见下）。
  *
- *  装完**不必重启 AI 也不必刷前端** —— 第三方插件是前端的东西（与「技能改完要重启 agent」
+ *  **先本机、后索引**：插件目录扫描是本机调用（毫秒级），索引要走 GitHub（差网络下可能要等到
+ *  超时）。合成一次再画会让「已装的插件」跟着网络一起等 —— 那是用户最关心的那半张表，
+ *  不该被一个可有可无的推荐清单拖住。索引拉不到就只提示一行，表照旧可用。 */
+async function renderMarket(container: HTMLElement) {
+  const listEl = container.querySelector<HTMLElement>("#settings-plugin-market");
+  if (!listEl) return;
+  const local = await readLocalPlugins();
+  listEl.innerHTML = mergeMarketRows([], local.list).map(marketRowHtml).join("");
+  writeMarketFooter(container, local.dir, local.error ? [t("settings.plugins_market_failed", { err: local.error })] : []);
+
+  const idx = await fetchPluginIndex();
+  listEl.innerHTML = mergeMarketRows(idx.list, local.list).map(marketRowHtml).join("");
+  writeMarketFooter(
+    container,
+    local.dir,
+    [
+      ...(local.error ? [t("settings.plugins_market_failed", { err: local.error })] : []),
+      ...(idx.error ? [t("settings.plugins_market_index_failed", { err: idx.error })] : []),
+    ],
+  );
+}
+
+/** 表尾：错误行（黄）+ 插件目录（写着东西装哪儿了）。节点每次现查 —— 缓存引用会写进空气里。 */
+function writeMarketFooter(container: HTMLElement, dir: string, errors: string[]) {
+  const errEl = container.querySelector<HTMLElement>("#settings-plugin-err");
+  if (errEl) {
+    errEl.innerHTML = errors.map(e => `<div style="color:var(--yellow)">${esc(e)}</div>`).join("");
+  }
+  const dirEl = container.querySelector<HTMLElement>("#settings-plugin-dir-path");
+  if (dirEl && dir) {
+    dirEl.textContent = t("settings.plugins_market_dir", { path: dir });
+    dirEl.title = dir;
+  }
+}
+
+/** 市场那一段的绑定：打开 / 下载 / 卸载 + 重绘（L1，2026-09-21 二次改版）。
+ *
+ *  **用事件委托，只绑一次**：这三个动作过去是「重绘完再逐个 addEventListener」，而挂载时
+ *  没人调那次 render ⇒ 初始渲染出来的按钮全是死的（用户报的「卸载点了没反应」就是这个）。
+ *  委托之后重绘只改 innerHTML，监听永不丢 —— 这一类 bug 从此不存在。
+ *
+ *  装完**不必重启 AI 也不必刷前端**：第三方插件是前端的界面件（与「技能改完要重启 agent」
  *  是两回事），`refreshMarketPlugins()` 重注册一次就够了。 */
 function wirePluginMarket(container: HTMLElement) {
-  const listEl = container.querySelector<HTMLElement>("#settings-plugin-dir");
-  const urlInput = container.querySelector<HTMLInputElement>("#settings-plugin-url");
-  const installBtn = container.querySelector<HTMLButtonElement>("#settings-plugin-install");
-  if (!listEl || !installBtn) return;
+  const listEl = container.querySelector<HTMLElement>("#settings-plugin-market");
+  if (!listEl) return;
 
-  // 提示行**每次现查节点**：容器整体重渲染会把 #settings-plugin-msg 整个换掉，缓存引用会写进空气里
+  // 提示行**每次现查节点**：容器整体重渲染会把 #settings-plugin-msg 整个换掉
   const showMsg = (text: string, color: string) => {
     const el = container.querySelector<HTMLElement>("#settings-plugin-msg");
     if (!el) return;
@@ -1775,67 +1967,63 @@ function wirePluginMarket(container: HTMLElement) {
     el.style.color = color;
   };
 
-  const render = async () => {
-    const { list, error } = await readPluginMarket();
-    listEl.innerHTML = error
-      ? `<div class="settings-plugin-empty">${esc(t("settings.plugins_market_failed", { err: error }))}</div>`
-      : list.length === 0
-        ? `<div class="settings-plugin-empty">${t("settings.plugins_market_empty")}</div>`
-        : list.map(marketRowHtml).join("");
-    listEl.querySelectorAll<HTMLButtonElement>("[data-uninstall-plugin]").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        const id = btn.dataset.uninstallPlugin || "";
-        // 两段式确认（WebView2 下原生 confirm 不可靠，同技能删除的处置）
-        if (btn.dataset.armed !== "1") {
-          btn.dataset.armed = "1";
-          btn.textContent = t("settings.plugins_market_uninstall_confirm");
-          setTimeout(() => {
-            btn.dataset.armed = "";
-            btn.textContent = t("settings.plugins_market_uninstall");
-          }, 3000);
-          return;
-        }
-        try {
-          await invoke("uninstall_plugin", { id });
-          await refreshMarketPlugins();
-          renderPluginOverview(container);
-          await render();
-          showMsg(t("settings.plugins_market_uninstalled", { id }), "var(--yellow)");
-        } catch (e: any) {
-          showMsg(String(e), "var(--red)");
-        }
-      });
-    });
-  };
-
-  const install = async () => {
-    const url = (urlInput?.value || "").trim();
-    if (!url) {
-      showMsg(t("settings.enter_url"), "var(--yellow)");
-      return;
-    }
-    installBtn.disabled = true;
+  const download = async (btn: HTMLButtonElement) => {
+    const url = btn.dataset.pluginUrl || "";
+    if (!url) return;
+    btn.disabled = true;
     showMsg(t("settings.plugins_market_installing"), "var(--text-dim)");
     try {
       const id = await invoke<string>("install_plugin_from_url", { url });
-      if (urlInput) urlInput.value = "";
       await refreshMarketPlugins();
-      renderPluginOverview(container);
-      await render();
+      await renderMarket(container);
       showMsg(t("settings.plugins_market_installed_ok", { id }), "var(--green)");
     } catch (e: any) {
       showMsg(t("settings.plugins_market_install_failed", { err: String(e) }), "var(--red)");
-    } finally {
-      installBtn.disabled = false;
+      btn.disabled = false;
     }
   };
-  installBtn.addEventListener("click", install);
-  urlInput?.addEventListener("keydown", (e: KeyboardEvent) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      install();
+
+  const uninstall = async (btn: HTMLButtonElement) => {
+    const id = btn.dataset.uninstallPlugin || "";
+    // 两段式确认（WebView2 下原生 confirm 不可靠，同技能删除的处置）
+    if (btn.dataset.armed !== "1") {
+      btn.dataset.armed = "1";
+      btn.textContent = t("settings.plugins_market_uninstall_confirm");
+      setTimeout(() => {
+        if (btn.dataset.armed !== "1") return;
+        btn.dataset.armed = "";
+        btn.textContent = t("settings.plugins_market_uninstall");
+      }, 3000);
+      return;
     }
+    try {
+      await invoke("uninstall_plugin", { id });
+      await refreshMarketPlugins();
+      await renderMarket(container);
+      showMsg(t("settings.plugins_market_uninstalled", { id }), "var(--yellow)");
+    } catch (e: any) {
+      showMsg(String(e), "var(--red)");
+    }
+  };
+
+  listEl.addEventListener("click", (ev) => {
+    const target = (ev.target as HTMLElement | null)?.closest<HTMLElement>("button");
+    if (!target) return;
+    const openBtn = target.closest<HTMLElement>("[data-open-plugin]");
+    if (openBtn) {
+      // 走 main.ts 的 `__lunac_open_plugin` 桥：设置面板不自己 executePlugin
+      //（那要动结果区 / 搜索栏状态，属于主界面的职责）
+      const id = openBtn.dataset.openPlugin;
+      if (id) (window as any).__lunac_open_plugin?.(id);
+      return;
+    }
+    const dlBtn = target.closest<HTMLButtonElement>("[data-download-plugin]");
+    if (dlBtn) return void download(dlBtn);
+    const delBtn = target.closest<HTMLButtonElement>("[data-uninstall-plugin]");
+    if (delBtn) return void uninstall(delBtn);
   });
+
+  void renderMarket(container);
 }
 
 // ── Listener attachment ──────────────────────────────────────────
@@ -1881,13 +2069,25 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       .settings-sidebar-item.active {
         color: var(--text);
-        background: var(--accent-bg);
-        border-left-color: var(--accent);
+        /* 2026-09-21：「其他颜色 → 设置选中项」单独可调（默认就是 --accent-bg / --accent）。 */
+        background: rgba(var(--other-nav-rgb), var(--other-nav-alpha));
+        border-left-color: rgb(var(--other-nav-rgb));
       }
 
+      /* 2026-09-21 修「设置里进大窗口后无法滚动」：detached（双击搜索栏展开的
+         600px 大窗口）那段的两条 height:100%（见本文件 detached 段）把
+         .plugin-result 与 .settings-layout 钉成「视口等高」，而 .settings-layout
+         与这里的 .settings-content 都是 overflow:hidden ⇒ 全局唯一滚动容器
+         #results-list **拿不到任何溢出量**，滚轮与滚动条一起失效。修法：让内容区
+         自己成为滚动容器（min-height:0 才能在 flex 里被压到视口高度以下）；
+         嵌入态（.settings-layout 高度自动）下本行不产生滚动条、渲染与以前一致。
+         **绝不要动 #results-list** —— 它是全局滚动容器，把它的 overflow 改成
+         visible 会让 scrollTop 归零（见本文件下方 .sel-open 的注释）。 */
       .settings-content {
         flex: 1;
-        overflow: hidden;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
         padding: 4px 0;
       }
       /* 打开下拉时放开**设置面板自身**对下拉框的裁剪。
@@ -1969,18 +2169,10 @@ export async function attachSettingsListeners(container: HTMLElement) {
         caret-color: var(--accent);
       }
       .settings-input:focus { border-color: var(--accent-border); }
-      /* ── 插件市场（L1，2026-09-21）─────────────────────────────────
-         目录里的一行：名称 + 来源 + 卸载（坏包多一行原因）。
-         刻意与 .settings-plugin-item 分成两个类：那个是 registry 总览（行数被
-         agent-ui-spec §8 的回归清单钉着），而这里可能含坏包，混进同一个计数会
-         让「总览行数 == 插件数」这条断言变成假绿。 */
-      .settings-market-install {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin: 6px 0;
-      }
-      .settings-market-install .settings-input { flex: 1; min-width: 0; }
+      /* ── 插件市场（L1，2026-09-21；二次改版见 buildPluginsPane 头注释）─────────
+         一张表一行一个插件：图标 + 名称/描述 + 该状态下的一到两个按钮
+         （打开 / 下载 / 卸载）。刻意与 .settings-plugin-item 分成两个类：
+         那个是 AI 面板里的工具列表，行数有独立口径，别混进同一个计数。 */
       .settings-market-row {
         display: flex;
         align-items: center;
@@ -1990,13 +2182,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
         transition: background 0.1s;
       }
       .settings-market-row:hover { background: rgba(var(--ink-rgb), 0.04); }
-      .settings-market-src {
-        color: var(--text-dim);
-        font-size: 0.68rem;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
       .settings-market-broken { color: var(--yellow); font-size: 0.68rem; }
       .settings-btn {
         flex-shrink: 0;
@@ -2439,7 +2624,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
         font-size: 0.84rem;
         font-weight: 600;
         color: var(--text);
-        background: rgba(var(--ctx-rgb), 0.14);
+        /* 2026-09-21：「其他颜色 → 分类标题背景」单独可调（默认就是 rgba(ctx-rgb, 0.14)）。 */
+        background: rgba(var(--other-group-bg-rgb), var(--other-group-bg-alpha));
         border-left: 3px solid rgb(var(--ctx-rgb));
         border-radius: 4px;
       }
@@ -2452,6 +2638,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
         background: rgba(var(--ink-rgb), 0.03);
       }
       .ap-sliders-panel.hidden { display: none; }
+      /* 「其他颜色」分块顶部那句提示（面板背景默认透明），只给一点行距。 */
+      .ap-other-hint { margin: 0 0 6px 0; }
       .ap-toggle-caret { margin-left: 5px; font-size: 0.62rem; opacity: 0.75; }
       /* 取色器那一行整宽上下列（label 在上、取色器在下并占满宽度）：
          原先是 .settings-row 的右侧窄列，色盘被压成 26px 宽根本没法用。
@@ -3185,9 +3373,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
     setupCustomDropdown(searchEngineDD, () => {}); // onChange is no-op, save button handles persistence
   }
 
-  // ── 插件总览：每行的「打开」按钮（2026-09-19 批 9）── 绑定抽成函数，重绘后要再绑一次
-  bindOpenPluginButtons(container);
-  // ── 插件市场（L1，2026-09-21）：安装 / 卸载 / 重绘 ──────────────
+  // ── 插件市场（L1，2026-09-21 二次改版）：打开 / 下载 / 卸载 / 重绘。
+  //    表由这里填（`renderMarket`），**不是**在 buildPluginsPane 里 —— 那里 await 网络
+  //    会把「打开设置」一起拖住；绑定用事件委托，重绘多少次都不会出现死按钮。
   wirePluginMarket(container);
 
   // ── 用量与成本（A12）─────────────────────────────────────────
@@ -3707,7 +3895,7 @@ export const settingsPlugin: Plugin = {
     const generalPane = buildGeneralPane(hotkey, autoStart, autoStartStale);
     const appearancePane = await buildAppearancePane();
     const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision);
-    const pluginsPane = await buildPluginsPane();
+    const pluginsPane = buildPluginsPane();
     const searchPane = await buildSearchPane();
 
     const html = `

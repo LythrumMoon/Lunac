@@ -35,6 +35,21 @@ pub const MAX_ENTRIES: usize = 4000;
 /// id 长度上限（同时是目录名长度上限）。
 const MAX_ID_CHARS: usize = 48;
 
+/// 插件市场**索引文件**的地址（2026-09-21，L1 续）：市场面板要能列出「没装但可下载」的插件，
+/// 而本地扫描只能看见「已经装了的」。索引放在本仓 `main` 分支的 `plugins/index.json`，
+/// 经 `raw.githubusercontent.com` 拉取 —— **只读、无鉴权、随仓库一起版本化**。
+///
+/// 为什么由**宿主**去拉而不是前端 `fetch()`：CSP 的 `default-src` 不含 github 域（`connect-src`
+/// 未单独声明 ⇒ 回落 default-src），前端联网会被直接拦掉。放进宿主还多一层好处 ——
+/// **索引里的每个 URL 都要按插件包的标准重新校验**（见 `parse_index`），前端拿到手的已经是
+/// 筛过的结果，别让「谁写索引谁就决定了前端能下什么」成为一条绕过校验的路。
+pub const INDEX_URL: &str =
+    "https://raw.githubusercontent.com/LythrumMoon/Lunac/main/plugins/index.json";
+/// 索引文件体积上限（纯文本清单，1 MB 足够列几千条；超了就是拿它当文件传输用）。
+pub const MAX_INDEX_BYTES: u64 = 1024 * 1024;
+/// 索引条目数上限（防「十万条空条目」把面板拖死）。
+pub const MAX_INDEX_ENTRIES: usize = 500;
+
 /// 插件清单。除 `id` 外全部有默认值：缺字段的包也能装，但至少要能读出 id 与入口。
 ///
 /// 字段刻意与前端 `Plugin` 契约（`app/src/plugins/registry.ts`）对齐：`keywords` 参与搜索匹配、
@@ -140,6 +155,72 @@ pub fn parse_manifest(text: &str) -> Result<PluginManifest, String> {
     }
     validate_entry(&m.entry)?;
     Ok(m)
+}
+
+/// 市场索引里的一条：**只描述「去哪下」**，不描述包内容（包的真相在包自己的清单里）。
+///
+/// 字段名对齐前端 `MarketIndexEntry`（`app/src/plugins/market.ts`）；`url` 必须是 https 的
+/// 插件 zip 地址，其余字段只用于**下载前的预览**（装了之后一律以包内清单为准）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginIndexEntry {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+    /// https 的插件 zip 地址（唯一的必填项之一）
+    pub url: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub homepage: String,
+}
+
+/// 解析并**逐条校验**市场索引（顶层是一个数组）。
+///
+/// 校验口径（与「这个包能不能被下载执行」同源，不是另立一套）：
+///   - `id` 必须过 `is_safe_id()`（它将来要当目录名用）；
+///   - `url` 必须 `https://` 开头（明文 http 的包会被解压执行）；
+///   - `name` 不能全空（否则面板上是一行没有名字的东西）。
+///
+/// **坏条目只丢自己，不丢整份索引**：一条写错的 URL 不该让整个市场变空 —— 这与
+/// 「坏包必须可见」（`list_installed`）是两条不同的处置：那边是用户**已经装在盘上**的东西，
+/// 消失了他会找不到；这边是**一条指向别处的推荐**，丢掉即可，但要 `warn` 留痕。
+/// 同 id 重复取**第一条**（索引是人写的，重复意味着作者改漏了，先出现的那条是他先写的）。
+pub fn parse_index(text: &str) -> Result<Vec<PluginIndexEntry>, String> {
+    let text = text.trim_start_matches('\u{feff}');
+    let raw: Vec<PluginIndexEntry> =
+        serde_json::from_str(text).map_err(|e| format!("插件索引不是合法 JSON：{e}"))?;
+    let mut out: Vec<PluginIndexEntry> = Vec::new();
+    for e in raw {
+        if !is_safe_id(&e.id) {
+            crate::log::warn(format!("插件索引里有一条 id 非法，已跳过：{}", e.id));
+            continue;
+        }
+        if !e.url.starts_with("https://") {
+            crate::log::warn(format!("插件索引里的 {} 不是 https 地址，已跳过", e.id));
+            continue;
+        }
+        if e.name.trim().is_empty() {
+            crate::log::warn(format!("插件索引里的 {} 没有名字，已跳过", e.id));
+            continue;
+        }
+        if out.iter().any(|o| o.id == e.id) {
+            crate::log::warn(format!("插件索引里的 {} 重复，保留先出现的那条", e.id));
+            continue;
+        }
+        out.push(e);
+        if out.len() >= MAX_INDEX_ENTRIES {
+            crate::log::warn(format!("插件索引超过 {MAX_INDEX_ENTRIES} 条，其余已忽略"));
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// 把 zip 里的条目名规范化成 root 下的路径；**任何越界都返回 None**。
@@ -552,5 +633,32 @@ mod tests {
         assert!(!list[0].valid);
         assert!(list[0].error.contains("JSON"), "{:?}", list[0].error);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_keeps_good_entries_and_drops_bad_ones() {
+        let text = r#"[
+            {"id":"lunac-pet","name":"Lunac Pet","description":"desk pet","version":"1.0.0",
+             "url":"https://github.com/LythrumMoon/Lunac/releases/download/v1/lunac-pet.zip"},
+            {"id":"Bad_Id","name":"Bad","url":"https://example.com/b.zip"},
+            {"id":"plain-http","name":"Plain","url":"http://example.com/p.zip"},
+            {"id":"nameless","name":"  ","url":"https://example.com/n.zip"},
+            {"id":"lunac-pet","name":"Duplicated","url":"https://example.com/dup.zip"}
+        ]"#;
+        let out = parse_index(text).unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].id, "lunac-pet");
+        assert_eq!(out[0].version, "1.0.0");
+        assert_eq!(out[0].name, "Lunac Pet");
+    }
+
+    #[test]
+    fn index_rejects_non_json_and_accepts_bom_and_empty() {
+        assert!(parse_index("{ not json").is_err());
+        assert!(parse_index("\u{feff}[]").unwrap().is_empty());
+        // 缺省字段（只有 id + url）也要能用 —— 名字退回 id（前端行为），这里只要求不报错
+        let out = parse_index(r#"[{"id":"solo","name":"Solo","url":"https://e.com/a.zip"}]"#).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].description.is_empty() && out[0].version.is_empty());
     }
 }

@@ -42,6 +42,33 @@ export interface MarketPluginInfo {
   error: string;
 }
 
+/** 市场索引里的一条（与 Rust 侧 `plugin_market::PluginIndexEntry` 一一对应）。
+ *
+ *  它**只描述「去哪下」**：`url` 是 https 的插件 zip 地址，其余字段只用于下载前的预览。
+ *  装完之后一切以**包内清单**为准（`MarketPluginInfo`），索引说什么不再重要。 */
+export interface MarketIndexEntry {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  url: string;
+  keywords: string[];
+  icon: string;
+  homepage: string;
+}
+
+/** 拉市场索引（宿主去拉，见 `commands::fetch_plugin_index` 的两条理由）。
+ *
+ *  **失败不吞**：把原因原样带回去让面板显示出来，市场则退回「只有本机插件」那种形态
+ *  （也就是这个功能不存在时的样子）。索引拉不到不是错误状态 —— 它只是一份推荐清单。 */
+export async function fetchPluginIndex(): Promise<{ list: MarketIndexEntry[]; error: string }> {
+  try {
+    return { list: await invoke<MarketIndexEntry[]>("fetch_plugin_index"), error: "" };
+  } catch (e) {
+    return { list: [], error: String(e) };
+  }
+}
+
 /** 最近一次扫描的结果（设置面板渲染「插件目录」那一段时直接读它）。 */
 let installed: MarketPluginInfo[] = [];
 
