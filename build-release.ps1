@@ -1,8 +1,8 @@
 ﻿# Lunac Release Build Script
 # Usage: .\build-release.ps1 [-Version <x.y.z>] [-NoBump]
-#   .\build-release.ps1                   - 读 package.json 的版本，patch 自动 +1，并同步三处
-#   .\build-release.ps1 -Version 0.10.0   - 显式指定版本（不递增），并同步三处
-#   .\build-release.ps1 -NoBump           - 保持当前版本重新打包（调试用）
+#   .\build-release.ps1                   - 读 package.json 的版本，patch 自动 +1，并同步六处（含扩展与 lockfile）
+#   .\build-release.ps1 -Version 0.10.0   - 显式指定版本（不递增），并同步六处
+#   .\build-release.ps1 -NoBump           - 保持当前版本重新打包（调试用；仍会读回确认六处一致）
 #
 # Steps:
 #   1. Pre-flight checks (cargo / makensis)
@@ -43,17 +43,32 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Lunac Release Build"                    -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
-# ── Version：自动递增 + 三处同步（2026-09-17 改）────────────────────
-# 版本号在三处各写了一份，只改一处就会产出「安装包叫 0.9.1、exe 属性里还是 0.9.0」
-# 这种自相矛盾的包。所以这里统一：**递增一次 → 三处全部写回**。
+# ── Version：自动递增 + **六处**同步 + 读回确认（2026-09-21 扩）────────
+# 版本号在**六处**各写了一份，只改一处就会产出「安装包叫 0.9.1、exe 属性里还是 0.9.0」
+# 这种自相矛盾的包（历史上真的发生过：`vscode-extension/package.json` 长期不在同步链里
+# —— commit d2e8500 的父提交那会儿 app 三处是 0.9.0，扩展已经是 0.9.1；两个 lockfile 的
+# 根版本也各自停在 0.1.0 / 0.6.0）。所以这里统一：**递增一次 → 六处全部写回 → 读回确认**。
 #
 # **必须在第 5 步 `cargo build` 之前**做完：`Cargo.toml` 的 version 参与编译，
 # 改晚了 exe 里的版本就与安装包名不一致（tauri.conf.json 的 version 也会被嵌进 exe）。
+#
+# 不在本表里的两处各有归属，别硬塞进来：
+#   · `app/src-tauri/Cargo.lock` 里那条 `lunac` 由 **cargo 自己**跟着 `Cargo.toml` 走；
+#   · `scripts/lunac-installer.nsi` 的 `PRODUCT_VERSION` 由**第 ⑨ 步**写。
 $VersionFiles = @{
   PackageJson = "$Root\app\package.json"
   TauriConf   = "$Root\app\src-tauri\tauri.conf.json"
   CargoToml   = "$Root\app\src-tauri\Cargo.toml"
+  VsixPkg     = "$Root\vscode-extension\package.json"
+  # npm 会在 install 时改写 lockfile 的根版本，但**平时没人跑 install** ⇒ 旧号会一直躺着
+  # （实测 app 的停在 0.1.0、扩展的停在 0.6.0），任何按版本号 grep 的对账都会看到
+  # 「0.9.1 旁边躺着 0.6.0」。一并同步，代价只有一次正则替换。
+  AppLock     = "$Root\app\package-lock.json"
+  VsixLock    = "$Root\vscode-extension\package-lock.json"
 }
+# 允许缺席的三处（扩展与它的 lock，以及 app 的 lock）：缺了只提示、不阻断
+# （第 ⑦ 步本来就容忍 `vscode-extension/` 不存在）。其余三处缺失是真异常。
+$OptionalVersionFiles = @($VersionFiles.VsixPkg, $VersionFiles.AppLock, $VersionFiles.VsixLock)
 
 function Get-DeclaredVersion {
   # package.json 是唯一真相源（历史原因：本脚本一直读它）
@@ -72,21 +87,56 @@ function Set-VersionEverywhere([string]$ver) {
   # 一律用「正则替换**第一处**匹配」，不用「解析 JSON 再整体写回」：后者会重排字段、
   # 改缩进，diff 里全是无关改动。
   # 编码统一 **UTF-8 无 BOM**：JSON / TOML 带 BOM 会让 cargo 报 unexpected character。
-  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $jsonPat = '(?m)^(\s*"version"\s*:\s*")[^"]+(")'
   $edits = @(
-    @{ Path = $VersionFiles.PackageJson; Pattern = '(?m)^(\s*"version"\s*:\s*")[^"]+(")' },
-    @{ Path = $VersionFiles.TauriConf;   Pattern = '(?m)^(\s*"version"\s*:\s*")[^"]+(")' },
-    @{ Path = $VersionFiles.CargoToml;   Pattern = '(?m)^(version\s*=\s*")[^"]+(")' }
+    @{ Path = $VersionFiles.PackageJson; Pattern = $jsonPat },
+    @{ Path = $VersionFiles.TauriConf;   Pattern = $jsonPat },
+    @{ Path = $VersionFiles.CargoToml;   Pattern = '(?m)^(version\s*=\s*")[^"]+(")' },
+    @{ Path = $VersionFiles.VsixPkg;     Pattern = $jsonPat },
+    @{ Path = $VersionFiles.AppLock;     Pattern = $jsonPat },
+    @{ Path = $VersionFiles.VsixLock;    Pattern = $jsonPat }
   )
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
   foreach ($e in $edits) {
+    $rel = $e.Path.Replace("$Root\", '')
+    if (-not (Test-Path $e.Path)) {
+      Write-Host "    (skip) $rel 不存在" -ForegroundColor DarkGray
+      continue
+    }
     $text = [IO.File]::ReadAllText($e.Path)
     $re = [regex]::new($e.Pattern)
     if (-not $re.IsMatch($text)) {
       throw "在 $($e.Path) 里找不到可替换的版本号字段"
     }
     [IO.File]::WriteAllText($e.Path, $re.Replace($text, "`${1}$ver`${2}", 1), $utf8)
-    Write-Host "    $($e.Path.Replace("$Root\", ''))  ->  $ver" -ForegroundColor DarkGray
+    Write-Host "    $rel  ->  $ver" -ForegroundColor DarkGray
   }
+  Assert-VersionEverywhere $ver
+}
+
+# 写回之后**读回确认**：六处载体必须是同一个值，否则当场停，别等打完整包再让用户发现。
+# 为什么必须有：脚本以前只写不读，于是「漏了一处」要等装上去才暴露 —— 历史教训就是
+# 「安装包 0.9.x、随包的 VSCode 扩展 0.9.y」这种对不上。读回只要一次正则，代价可忽略。
+function Assert-VersionEverywhere([string]$ver) {
+  $bad = @()
+  foreach ($p in ($VersionFiles.Values | Select-Object -Unique)) {
+    $rel = $p.Replace("$Root\", '')
+    if (-not (Test-Path $p)) {
+      if ($OptionalVersionFiles -contains $p) { Write-Host "    (skip) $rel 不存在" -ForegroundColor DarkGray }
+      else { $bad += "$rel：文件不存在" }
+      continue
+    }
+    $text = [IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
+    # 与写入同一个「首匹配」口径取回该文件第一处版本声明（package-lock.json 的第一处正是根版本）
+    $m = [regex]::Match($text, '(?m)^\s*(?:"version"\s*:\s*"|version\s*=\s*")([^"\r\n]+)"')
+    if (-not $m.Success) { $bad += "$rel：读不到版本字段" }
+    elseif ($m.Groups[1].Value -ne $ver) { $bad += "$rel：读到 $($m.Groups[1].Value)" }
+  }
+  if ($bad.Count -gt 0) {
+    throw ("版本号没同步干净（期望 $ver）：`n    " + ($bad -join "`n    ") +
+           "`n  修法：把这几个文件手工对齐到 $ver 再重跑（或删掉多出来的那个文件）")
+  }
+  Write-Host "    读回确认：版本号全部一致 = $ver" -ForegroundColor Green
 }
 
 $CurrentVersion = Get-DeclaredVersion
@@ -95,10 +145,15 @@ if ($Version) {
   if ($Version -ne $CurrentVersion) {
     Write-Host "  版本同步到指定值：$CurrentVersion -> $Version" -ForegroundColor Green
     Set-VersionEverywhere $Version
+  } else {
+    # 与真相源同一个值：不写，但仍要**读回确认**六处载体一致
+    # （否则「再打一个同版本包」会把已经漂移的扩展 / lockfile 原样打进去）
+    Assert-VersionEverywhere $Version
   }
 } elseif ($NoBump) {
   $Version = $CurrentVersion
   Write-Host "  -NoBump：保持 $Version 重新打包" -ForegroundColor DarkGray
+  Assert-VersionEverywhere $Version
 } else {
   if ($CurrentVersion -notmatch '^\d+\.\d+\.\d+$') {
     throw "当前版本号不是 x.y.z，无法自动递增：$CurrentVersion（请显式传 -Version 或先修正）"

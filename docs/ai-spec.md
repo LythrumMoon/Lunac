@@ -936,24 +936,39 @@ npm run tauri:dev            # 启动 Vite + Tauri 开发模式（仅占用 5173
 
 ### 8.1 版本号规则
 
-采用 `x.y.z` 三段格式。**当前 0.9.1**（`build-release.ps1` 已改为**打包时自动把 patch +1** 并同步三处版本源，见 §8.2）：
+采用 `x.y.z` 三段格式。**当前 0.9.2**（`build-release.ps1` 在**打包时自动把 patch +1** 并同步下面「六处载体」+ 读回确认，见 §8.2）：
 
 | 阶段 | 版本号 | 触发条件 |
 |------|--------|---------|
 | 日常开发 | 不增版 | 每次修改完成后仅执行 `npm run build` / `cargo test` / `cargo check` 编译验证 |
-| 打包 | **patch 自动 +1** | 用户**明确要求打包**时执行 `build-release.ps1`：读 `package.json` 的版本 → patch +1 → 同步 `package.json` / `tauri.conf.json` / `Cargo.toml` 三处（**必须在 `cargo build` 之前**，否则 exe 内嵌版本与安装包名不一致） |
-| 大版本跳档 | 显式传 `-Version x.y.z` | e.g. `.\build-release.ps1 -Version 0.10.0`（不递增，直接同步到指定值）；`-NoBump` 则保持当前版本重打包 |
+| 打包 | **patch 自动 +1** | 用户**明确要求打包**时执行 `build-release.ps1`：读 `package.json` 的版本 → patch +1 → 同步**六处载体** → **读回确认**（**必须在 `cargo build` 之前**，否则 exe 内嵌版本与安装包名不一致） |
+| 大版本跳档 | 显式传 `-Version x.y.z` | e.g. `.\build-release.ps1 -Version 0.10.0`（不递增，直接同步到指定值）；`-NoBump` 则保持当前版本重打包（**仍会读回确认**） |
+
+**版本号载体清单（2026-09-21 收口）** —— 属于 **app 版本线**的共 **8 处**（表中前 8 行；第 9 行是**独立版本线**，列出来只为提醒别把它算进来）。有 N 处写版本就有 N-1 处会漂移，「安装包 0.9.x、随包的 VSCode 扩展 0.9.y」这类对不上就是这么来的：
+
+| 载体 | 值随谁变 | 说明 |
+|---|---|---|
+| `app/package.json` | **脚本** | 唯一真相源（`Get-DeclaredVersion` 读它来 +1） |
+| `app/src-tauri/tauri.conf.json` | **脚本** | 被 Tauri 嵌进 `lunac.exe` 的属性 |
+| `app/src-tauri/Cargo.toml` | **脚本** | 参与编译 ⇒ **必须早于 `cargo build`** 改 |
+| `vscode-extension/package.json` | **脚本（2026-09-21 才纳入）** | `vsce package` 用它命名 `.vsix`；不在链里时第 ⑦ 步挑不到匹配版本 ⇒ `WARN` 后把**旧版扩展**塞进新包（实测踩过：该文件曾比 app 三处**超前**一个小版本） |
+| `app/package-lock.json` | **脚本（2026-09-21 才纳入）** | npm 只在 `install` 时改写 ⇒ 平时一直躺着旧号（实测停在 0.1.0） |
+| `vscode-extension/package-lock.json` | **脚本（2026-09-21 才纳入）** | 同上（实测停在 0.6.0） |
+| `app/src-tauri/Cargo.lock` | **cargo**（不必管） | 构建时自己跟着 `Cargo.toml` 走 |
+| `scripts/lunac-installer.nsi` | **脚本第 ⑨ 步** | `PRODUCT_VERSION` —— 安装包名与「卸载」里的 `DisplayVersion` 都由它展开 |
+| `core-agent/Cargo.toml` | **独立版本线** | agent.exe 自己的版本（0.1.0），不跟 app 走；注意它**没有** VERSIONINFO，右键看不到版本号 |
 
 ### 8.2 打包流程
 
 仅在用户明确说"打包"或"生成安装包"时执行。一条命令搞定：
 
 ```
-powershell -ExecutionPolicy Bypass -File build-release.ps1        # 版本号取自 app/package.json
-powershell -ExecutionPolicy Bypass -File build-release.ps1 0.9.1  # 或显式指定
+powershell -ExecutionPolicy Bypass -File build-release.ps1                   # 自动 patch +1（推荐）
+powershell -ExecutionPolicy Bypass -File build-release.ps1 -Version 0.10.0   # 显式指定，不递增
+powershell -ExecutionPolicy Bypass -File build-release.ps1 -NoBump           # 保持当前版本重打包（调试用）
 ```
 
-脚本九步：① 预检 cargo / makensis ② kill 运行中的 lunac.exe / agent.exe ③ `npm run build`（前端）④ `cargo build --release`（core-agent → agent.exe，**必须早于第 5 步**）⑤ `cargo build --release`（src-tauri → lunac.exe）⑥ **清空并重建暂存目录** `release\Lunac\` + 拷 `lunac.exe` / `agent.exe` / `WebView2Loader.dll` + **拷 `agent-templates\{skills,tools}` → 暂存目录同名子目录**（README + `*.example` 模板，装完用户可照抄，见 §11 规则 24）⑦ 打包 VSCode 扩展 → `lunac.vsix` ⑧ 预置 PaddleOCR-json（本地 `paddle-ocr/` 优先，缺失则从 GitHub 下载 .7z）⑨ 改写 NSI 版本号 → **先删同名旧产物**（makensis 覆盖已存在文件时只会含糊地报 `Can't open output file`，实测于旧包刚生成、杀软仍在扫描它时）→ makensis → `release\Lunac-<版本>-Setup.exe`。
+脚本九步：⓪ **版本号**：读 `app/package.json` → patch +1 → 六处载体全部写回 → **读回确认**（任一处读到别的值就当场 `throw`，**必须在第 ⑤ 步之前**）① 预检 cargo / makensis ② kill 运行中的 lunac.exe / agent.exe ③ `npm run build`（前端）④ `cargo build --release`（core-agent → agent.exe，**必须早于第 5 步**）⑤ `cargo build --release`（src-tauri → lunac.exe）⑥ **清空并重建暂存目录** `release\Lunac\` + 拷 `lunac.exe` / `agent.exe` / `WebView2Loader.dll` + **拷 `agent-templates\{skills,tools}` → 暂存目录同名子目录**（README + `*.example` 模板，装完用户可照抄，见 §11 规则 24）⑦ 打包 VSCode 扩展 → `lunac.vsix`（**按第 ⓪ 步同步后的扩展版本现场 `vsce package`**；挑不到匹配版本的 `.vsix` 只 `WARN` 后回退最新的那个 —— 版本对不上时这就是**静默**的那一步，所以第 ⓪ 步的读回确认把扩展也纳入了）⑧ 预置 PaddleOCR-json（本地 `paddle-ocr/` 优先，缺失则从 GitHub 下载 .7z）⑨ 改写 NSI 版本号 → **先删同名旧产物**（makensis 覆盖已存在文件时只会含糊地报 `Can't open output file`，实测于旧包刚生成、杀软仍在扫描它时）→ makensis → `release\Lunac-<版本>-Setup.exe`。
 
 **NSI 脚本位置**：`scripts\lunac-installer.nsi`（**已入库**）。此前它放在 `release\` 内，而 `release\` 整体被 gitignore → 换个克隆就 `NSI script not found`，打包链路不可复现。脚本首部用 `!cd ${__FILEDIR__}\..\release` 锚定源文件目录：makensis 解析 `File` / `OutFile` 的相对路径用的是**脚本所在目录**而非调用方 CWD（实测从仓库根调用同样正确），因此 `File "Lunac\..."` 恒定解析到 `release\Lunac\`、Setup.exe 恒落在 `release\`，与 `Push-Location` 无关。
 
