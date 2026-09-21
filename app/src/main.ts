@@ -1030,8 +1030,16 @@ function queueSessionSave(fn: () => Promise<void>): Promise<void> {
  *  instead of the prompt boilerplate. Mirrors the title extraction in
  *  saveCurrentSession: the hint is a send-time wrapper, not conversation history.
  *  注：2026-09-17 起用户消息里只剩**关键词条件块**（固定的「人格 + 文风」已搬进 agent
- *  系统提示词），所以不含关键词的提问**根本没有** `\n\n---\n\n` —— 此时原样返回即可。 */
+ *  系统提示词），所以不含关键词的提问**根本没有** `\n\n---\n\n` —— 此时原样返回即可。
+ *
+ *  **必须加 `## ` 前缀闸**（2026-09-21）：`buildSystemPromptHint()` 产出的块**一定以
+ *  `## ` 开头**，而普通提问正文里完全可能出现 `\n\n---\n\n`（markdown 分隔线 / 用户自己
+ *  写的 `---`）。只按分隔线切，会把「上面\n\n---\n\n下面」整段头削掉 —— 落盘时就丢数据。
+ *  今天 `chatHistory` 存的已经是 clean query（`startAgentChat` 只把提示词拼进
+ *  `wrappedQuery` 发给 agent，见那里的注释），所以这个函数只在**读老记录**时真正生效；
+ *  加闸是为了让「没有注入过的文本」逐字不变。 */
 function stripInjectedHint(text: string): string {
+  if (!text.startsWith("## ")) return text;
   const sep = text.indexOf("\n\n---\n\n");
   return sep >= 0 ? text.slice(sep + 7) : text;
 }
@@ -1095,10 +1103,17 @@ async function persistCurrentSessionInner(
   // this required 1 user + 1 assistant, so conversations where the CLI
   // errored / was closed mid-stream silently never reached history.
   if (snapshotChat.filter(m => m.role === "user" && m.content.trim()).length < 1) return;
-  // Strip injected keyword hints from stored user messages so the history
-  // file never accumulates the "## Debugging Methodology ... ---" boilerplate.
+  // 落盘只剥**发送期注入的关键词提示词**（`## Debugging Methodology … ---`），
+  // **绝不能连 `[Attached files]` 一起剥掉**（2026-09-21 修的 bug）：
+  //   · `chatHistory` 里存的用户消息是 `startAIChat` 拼的 finalQuery，带 `[Attached files]` 块时
+  //     那个块**就是附件清单的唯一载体**（`parseAttachedQuery()` 靠它还原文件名做复制 / 重试，
+  //     气泡上的 `📎 文件名` 也靠它渲染）；
+  //   · 这里原先调的是 `cleanUserContent()`（= 提示词 + 附件包装一起剥），于是附件信息
+  //     **只活在内存里**，磁盘上只剩提问正文 ⇒ 一进「历史记录」气泡里的附件行就凭空消失。
+  //   · 实测 `chatHistory` 里**从来没有**提示词前缀（`startAgentChat` 只把它拼进
+  //     `wrappedQuery` 发给 agent，见那里的注释），所以这一步今天是空转、纯防御。
   const cleaned = snapshotChat.map(m =>
-    m.role === "user" ? { ...m, content: cleanUserContent(m.content) } : m
+    m.role === "user" ? { ...m, content: stripInjectedHint(m.content) } : m
   );
   const pruned = pruneContext(cleaned);
   const firstUser = pruned.find(m => m.role === "user");
@@ -1177,10 +1192,12 @@ function restoreSession(session: ChatSession) {
   }
   agentView = null;
   agentTurn = null;
-  // Strip injected keyword hints (## Debugging Methodology / ## TDD Requirement ...)
-  // from stored user messages so restored content shows the real question text.
+  // 只剥发送期注入的关键词提示词；**刻意不剥 `[Attached files]` 块** —— 它是附件清单的
+  // 唯一载体，恢复后要靠它做三件事：① 气泡里重建 `📎 文件名`（原来是「一进历史就消失」，
+  // 2026-09-21 修）；② `parseAttachedQuery()` 让「复制」只复制提问正文；③ 「重试」把附件
+  // 原样带上（见 retryChat）。剥掉它就等于这三条路径一起断掉。
   chatHistory = session.messages.map(m =>
-    m.role === "user" ? { ...m, content: cleanUserContent(m.content) } : m
+    m.role === "user" ? { ...m, content: stripInjectedHint(m.content) } : m
   );
   isChatHistoryView = false;
   pluginActive = true;
@@ -1226,7 +1243,10 @@ function renderChatLogHtml() {
   let html = '<div class="ai-response" id="chat-log">';
   chatHistory.forEach((msg, idx) => {
     const bubble = msg.role === "user" ? "chat-msg-user" : "chat-msg-assistant";
-    html += `<div class="${bubble}" data-idx="${idx}">${mdImagesToHtml(msg.content)}</div>`;
+    // 用户气泡走 `userBubbleText()`：把存着的 `[Attached files]…[User query]…` 还原成
+    // 与实时气泡一致的「提问 + 📎 文件名」（否则进历史后附件行消失，见该函数注释）。
+    const body = msg.role === "user" ? userBubbleText(msg.content) : msg.content;
+    html += `<div class="${bubble}" data-idx="${idx}">${mdImagesToHtml(body)}</div>`;
   });
   html += '</div>';
   resultsList.innerHTML = html;
@@ -1439,6 +1459,22 @@ function parseAttachedQuery(q: string): { text: string; files: string[] } {
     files: m[1].split("\n").map(l => l.replace(/^- /, "")).filter(Boolean),
     text: m[2],
   };
+}
+
+/** 用户气泡要显示的文本 —— **与实时路径 `appendUserMsg` 的形态逐字对齐**：
+ *  提问正文 +（有附件时）`\n📎 文件名1, 文件名2`。
+ *
+ *  为什么需要这个转换：实时气泡写的是「提问 + 📎 文件名」，而 `chatHistory` 里存的是
+ *  `startAIChat` 拼的原始 finalQuery（`[Attached files]…[User query]…`）。
+ *  恢复会话时若直接把 content 渲染出来，附件行就会消失（2026-09-21 用户报的
+ *  「历史记录进入时文件类型消息会消失」就是这个），所以两个形态必须在这里对齐。
+ *
+ *  没有 `[Attached files]` 块（普通提问 / 老记录）时 `parseAttachedQuery` 原样返回，
+ *  这里也就是恒等 —— 与改造前逐像素一致。 */
+function userBubbleText(content: string): string {
+  const { text, files } = parseAttachedQuery(content);
+  if (!files.length) return text;
+  return `${text}\n📎 ${files.map(f => f.split(/[\\/]/).pop() || f).join(", ")}`;
 }
 
 /** 重试：回退到该条用户消息之前（保留先前上下文），再重新发送其内容。
@@ -7600,6 +7636,15 @@ async function loadThemes(force = false): Promise<ThemeInfo[]> {
       dir: "", builtin: true,
       resolved: { background: null, search_pattern: null, icons: {} },
     });
+  }
+  // 磁盘上选过的主题包**被删掉之后**（里外都删了 / 换了台机器），配置里还留着那个 id ⇒
+  // **回落「默认」并落盘**。不回落的话「风格 → 主题颜色」整块会被主题锁灰掉且点不动
+  // （锁定判据是 `themeId !== "default"`，见 ai-spec 规则 46），而设置里的泡泡框一个都不是
+  // 选中态 —— 用户看到的是「配色突然改不动了，而且没有任何原因」，无从下手。
+  // 2026-09-21 用户要求删除内置主题包「魅魔 · 灰玫瑰」时补的这道闸。
+  if (!themeInfos.has(appearance.themeId)) {
+    appearance = clampAppearance({ ...appearance, themeId: "default" });
+    persistAppearance();
   }
   return [...themeInfos.values()];
 }

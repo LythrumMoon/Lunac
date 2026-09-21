@@ -707,7 +707,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 面板取数**不在构建期** | 表格字符串（`buildPluginsPane`）是**整块设置面板**的一部分，而索引要走网络（差网络下能拖到超时）⇒ 那里一旦 `await`，**打开设置**就跟着卡住。所以列表在**挂载后**由 `renderMarket()` 填，且**先本机、后索引**两段画：本机扫描是毫秒级的，不该被一份可有可无的推荐清单拖住 |
 | 事件绑定用**委托**（只在挂载时绑一次） | 这三个按钮过去是「重绘完再逐个 `addEventListener`」，而挂载时没人调那次 render ⇒ **初始渲染出来的按钮全是死的**（2026-09-21 用户报的「卸载点了没反应」就是这个根因）。改成在列表容器上委托后，重绘只改 `innerHTML`、监听永不丢 —— 这一类 bug 从此不存在。**新加的按钮一律并入这份委托，不要在重绘路径里重新绑** |
 | 模型资产（Live2D 等） | **安装包零第三方模型资产**：Lunac 只提供引擎与导入通道，模型由终端用户自备（他说下载时自己接受 Live2D 的协议）。版权四条线见 backlog **L1-B** —— 尤其：官方样例模型属 **No Redistribution**，**不得**随包分发 |
-| 实测（2026-09-21） | `cargo test --bins` src-tauri **73 passed / 0 failed / 1 ignored**（其中 `plugin_market` **9 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错 / **索引逐条筛（坏 id、明文 http、空名字、重复 id 各丢自己）/ 索引非 JSON 报错且接受 BOM 与空表**；`appearance` 增 **1 条**：**随包发货的两个主题包逐项校验**（清单能解析 + 声明的背景 / 花纹 / 8 个图标真在盘上 + `succubus` 主色与 `default` 同值））、`tsc --noEmit` exit 0、`npm run build` exit 0 |
+| 实测（2026-09-21） | `cargo test --bins` src-tauri **73 passed / 0 failed / 1 ignored**（其中 `plugin_market` **9 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错 / **索引逐条筛（坏 id、明文 http、空名字、重复 id 各丢自己）/ 索引非 JSON 报错且接受 BOM 与空表**；`appearance` 增 **1 条**：**随包发货的主题包逐项校验**（清单能解析 + 声明的背景 / 花纹 / 图标真在盘上；2026-09-21 删掉魅魔包后只断言 `default`，`succubus` 那两条断言一并删除））、`tsc --noEmit` exit 0、`npm run build` exit 0 |
 
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
@@ -1574,11 +1574,9 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
       - **三种「自定义」= 三个独立的展开状态**（`bgSlidersOpen` / `basePanelOpen` / `btnPanelOpen` / `textPanelOpen`），形态统一为「按钮 + ▾ → 一块 `.ap-sliders-panel`」，绑定统一走 `bindPanel()`。**新增一组时照抄这套，不要新造形态**（2026-09-20 起共四组：背景 / 底色 / 按钮 / 文字）。
     - **主题图标只有一个出口**：`pluginIconSvg()` 先查 `themeIconUrls`（主题包 `assets.icons.<插件 id>`），命中返回 `<img class="result-item-icon-img">`，否则回退内联 SVG。**禁止在各个渲染点各自判断主题** —— 图标汇聚点只有这一个（`themeIconUrls` 的声明必须放在 `pluginIconSvg` 之前：`const` 在声明前是 TDZ，放文件末尾就是必然的白屏）。
     - **`theme.json` 资产路径必须做穿越防护**（`appearance.rs`：拒绝 `..`、绝对路径、resolve 后逃出主题目录）；单个主题解析失败只 `warn` 并跳过，**不能让一个坏主题打空整个列表**。
-    - **内置主题包：`themes\default` 与 `themes\succubus`（2026-09-21 加）**：`tauri.conf.json` 的 `resources` 把仓库 `app/src-tauri/themes` 映射到 exe 根，两个目录都会被 `list_themes()` 扫到；**目录里有名为 `builtin` 的标记文件**的会被打上「内置」徽标（`ThemeInfo.builtin`）。第二个包 id = `succubus`、名 = 「魅魔 · 灰玫瑰」：
-      - `tokens.accent` = `#c0a0a0`，**与默认主题同值**（用户要求「主色采用我们保存的默认主题」）—— 主题色只有一个真相源 `--accent-rgb`（见上面那条），所以它一改就是全 UI 一起改。
-      - 它**带 `tokens.surface` = `29, 22, 21`**（暖墨褐 = 纸背阴影，不是紫黑）⇒ 按上面「主题全面代替底色」的优先级，**底色会由它接管**；`radius_search` 18px / `radius_results` 16px / `pattern_opacity` 0.09。
-      - 资产 = `background.png`（1920×1080 **墨线版**壁纸：暖墨底 + 奶油线稿 + 左下角的魅魔半身像，**中央刻意留空**给搜索栏）＋ `search_pattern.png`（512 可平铺植物蕾丝）＋ `icons\<插件id>.png`（8 个 96px 图标，经 `assets.icons` 接入 24×24 的 `<img>`）。
-      - **素材由 `D:\ui\_build`（SVG → resvg PNG）生成**：魅魔的身份靠三处墨线记号 —— **额侧弯角（角根一圈灰玫瑰细环）/ 背后蝠翼 / 颊边那颗心**；整幅画唯一真彩仍是灰玫瑰 `#B06A73`。**改素材改脚本、别手改 PNG**（脚本 `node build.mjs` 一次重出全套）。
+    - **内置主题包：现在只有 `themes\default`**：`tauri.conf.json` 的 `resources` 把仓库 `app/src-tauri/themes` 映射到 exe 根，目录会被 `list_themes()` 扫到；**目录里有名为 `builtin` 的标记文件**的会被打上「内置」徽标（`ThemeInfo.builtin`）。**新增内置包时不能只放素材** —— 必须同时把它的 id 加进 `appearance.rs` 的 `shipped_theme_packs_parse_and_their_assets_exist`（那条 `for` 循环只覆盖「已经扫到的包」，包整个漏掉时一次都不跑，等于没有守护）。
+      - **`themes\succubus`（「魅魔 · 灰玫瑰」）已于 2026-09-21 整包删除**：用户看过实际效果后判定不满意（原话「删除这个主题吧 我不是很满意」）。删掉的不只是素材目录 —— 一并清了 `appearance.rs` 里那两条断言（`contains("succubus")` 与「主色与 default 同值」）。**素材生成脚本留在 `D:\ui\_build` 不动**（它是通用的「SVG → resvg PNG」主题包生成器，不属于某一个主题）。
+      - **配套的「主题被删」闸（`loadThemes()`）**：磁盘上选过的主题包被删掉后，配置里还留着那个 id ⇒ **回落 `"default"` 并落盘**。不回落的话「风格 → 主题颜色」整块会被主题锁灰掉且点不动（锁定判据是 `themeId !== "default"`，见规则 46），而设置里的泡泡框一个都不是选中态 —— 用户看到的是「配色突然改不动了，而且没有任何原因」，无从下手。**删任何内置主题包时都靠这道闸兜住老配置。**
     - **主题列表 = 泡泡框（2026-09-21 定稿，用户要求「用分割出来的泡泡框去识别文件夹，然后点击切换」）**：每个**主题文件夹**渲染成一个 `.ap-theme` 泡泡（胶囊圆角 `border-radius: 999px`，与会分行铺开的 `.settings-group-title` 分割块区分开），内容是 `[主色圆点][名称][内置徽标]`；列表本身就是 `list_themes()` 扫 `<themes 根>\*\theme.json` 的结果 —— **取数来源不许改**（不要改成硬编码清单）。点击 = `ap.set({ themeId })` + `.active` 换位 + `syncThemeLock()`。
       - **主色圆点**：`<span class="ap-theme-dot" style="background:...">`，颜色取 `manifest.tokens.accent`，由 `themeAccentColor()` 归一化 —— **两种写法都认**（`#RRGGBB` 与 `r, g, b`，与 `tokens.surface` 同一宽容度），取不到时回落中性灰而不是让泡泡炸掉。圆点带一圈 `inset` 淡描边（主色接近底色时不至于「消失」）。加它就是为了「不用先点一下才知道那个主题什么颜色」。
       - **`title` 用文件夹名（= 主题 id）**，方便用户对照资源管理器里的 `<themes 根>`。
@@ -1734,6 +1732,11 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
 60. **图片附件（A8，2026-09-20）**：契约与实测见 §3.5「图片附件」。**五条不得回退**：
     - **只传路径、不传字节**：stdin 里给的是 `{"type":"file","path":…}`，base64 由 core-agent 读出来再转 —— 前端三种附件来源本来就已经是路径，别为了「省一次读盘」把几 MB 的 base64 塞进 IPC 管道与 WebView 内存。
     - **`[Attached files]` 文本必须保留**：新增的图片块是**追加**，不许替换那段文本（它是历史 / 标题 / 复制三条旧路径的唯一依据，也是「哪个路径对应哪张图」的唯一说明）。任何「有图片块了就把路径文本去掉」的改动都是回退。
+      - **2026-09-21 补：这条契约在「落盘 / 恢复」两处被违反过，已修**（用户报「历史记录进入时文件类型消息会消失」）。根因：`persistCurrentSessionInner()` 与 `restoreSession()` 都用 `cleanUserContent()` 洗用户消息，而它**同时剥掉**「发送期提示词」和「`[Attached files]` 块」⇒ 附件清单**只活在内存里**，磁盘上只剩提问正文，一进历史气泡里的 `📎 文件名` 就没了（连带「复制正文 / 重试带附件」两条路径一起断）。现在：
+        - **落盘 / 恢复只调 `stripInjectedHint()`**（只剥提示词，空转、纯防御 —— `startAgentChat()` 本来就把提示词拼进 `wrappedQuery` 发给 agent，`chatHistory` 里从来没有它）；该函数**必须先判 `text.startsWith("## ")` 再切 `\n\n---\n\n`**（2026-09-21 同批补的闸）：注入块一律以 `## ` 开头，而普通提问正文里完全可能出现 `\n\n---\n\n`（markdown 分隔线），不判前缀就切会把「上面\n\n---\n\n下面」削成「下面」，**落盘即丢前半段**。同日实测：加闸前该断言为红，加闸后全绿。
+        - **`cleanUserContent()` 只允许用在纯展示的一次性场景**（会话标题、抽屉预览）；
+        - **气泡文本由 `userBubbleText()` 从存储形态现推**（`parseAttachedQuery()` → `正文 + \n📎 文件名1, 文件名2`），与实时路径 `appendUserMsg()` 的形态逐字对齐 —— **两个形态必须在这一处对齐，别在渲染点各写一遍**。
+        - **回归口径**：发一条带附件的提问 → 打开历史记录点回来 ⇒ 气泡里的 `📎 文件名` 必须还在；「复制」只得到正文；「重试」能把原附件重新带上；再发一条正文里含 `---` 分隔线的提问 ⇒ 落盘后首段仍在。（`userBubbleText()` 的输出只用于渲染、**不得回写 `chatHistory`** —— 展示形态里没有路径，回写一次「复制 / 重试」就再也拿不回附件。）
     - **开关默认关，且只在前端**：`config\ai.json` 的 `vision`（默认 `false`）。发给不支持视觉的端点必 400，而 agent 侧**无法预判**模型能力 ⇒ 只能由用户显式断言。**不许**改成「按模型名自动推断」或「先发再 400 回落」——前者会猜错，后者每轮白烧一次请求并打断前缀缓存。
     - **类型只认魔术字节、失败必须可见**：放行 PNG / JPEG / GIF / WebP 四种（不信扩展名）；读不出来 / 超限 / 超张数的一律进 `system/attachment_note`（`skipped:[{path,reason}]`）并在前端可见地列出来。**静默丢弃是最坏的一种**——用户只会看到「模型说它看不到图」。
     - **附件读盘不走工作区锁，这一点不许「顺手补上」**：路径来自用户显式选中（不是模型自己找到的），而剪贴板图片就落在 `%TEMP%` —— 套锁会让最主要的那条用法直接失效。模型的 `Read` 仍然照旧受锁约束，两者不要混为一谈。
