@@ -534,7 +534,56 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// ② 最小 manifest `{"id":"x","name":"y"}` 也能解析，其余字段走默认值。
+    /// ② 仓库里**随包发货**的主题包（`themes\<id>\theme.json`）必须真的解析得出、声明的资产也真的在盘上。
+    ///
+    /// 主题包是**手写 JSON**（编译器管不着它），路径写错了不会报错 —— `resolve_asset` 只会把那一项
+    /// 悄悄置 None，用户选中主题后看到的是「背景没了 / 图标回退了」，而手上没有任何线索。
+    /// 所以这里查的是**清单里声明的相对路径**（不是 `resolved`，那个已经把坏路径吞掉了）。
+    /// 2026-09-21 加 `succubus`（魅魔 · 灰玫瑰）时补的这条闸。
+    #[test]
+    fn shipped_theme_packs_parse_and_their_assets_exist() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
+        let list = scan_themes_in(&root);
+        let ids: Vec<&str> = list.iter().map(|t| t.manifest.id.as_str()).collect();
+        assert!(ids.contains(&"default"), "缺内置默认主题：{ids:?}");
+        assert!(ids.contains(&"succubus"), "缺内置魅魔主题：{ids:?}");
+
+        for t in &list {
+            let dir = PathBuf::from(&t.dir);
+            let id = &t.manifest.id;
+            assert!(!t.manifest.name.trim().is_empty(), "{id} 没有名字");
+            assert!(
+                t.manifest.tokens.accent.is_some(),
+                "{id} 没写 tokens.accent —— 主题色只有一个真相源就是这个字段"
+            );
+            if let Some(rel) = &t.manifest.assets.background {
+                assert!(dir.join(rel).is_file(), "{id} 的背景不存在：{rel}");
+            }
+            if let Some(rel) = &t.manifest.assets.search_pattern {
+                assert!(dir.join(rel).is_file(), "{id} 的花纹不存在：{rel}");
+            }
+            for (pid, rel) in &t.manifest.assets.icons {
+                assert!(dir.join(rel).is_file(), "{id} 的插件图标 {pid} 不存在：{rel}");
+            }
+            assert_eq!(
+                t.resolved.icons.len(),
+                t.manifest.assets.icons.len(),
+                "{id} 有图标被 resolve 丢掉了（路径越界或文件缺失）"
+            );
+        }
+
+        // 魅魔主题的主色必须与默认主题**同值**（用户要求「主色采用我们保存的默认主题」）
+        let accent = |want: &str| {
+            list.iter()
+                .find(|t| t.manifest.id == want)
+                .and_then(|t| t.manifest.tokens.accent.clone())
+                .unwrap_or_default()
+                .to_lowercase()
+        };
+        assert_eq!(accent("succubus"), accent("default"));
+    }
+
+    /// ③ 最小 manifest `{"id":"x","name":"y"}` 也能解析，其余字段走默认值。
     #[test]
     fn parses_minimal_manifest_with_defaults() {
         let root = temp_root("minimal");

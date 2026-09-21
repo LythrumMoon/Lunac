@@ -689,7 +689,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 文件位置 | `<exe 根>\config\persona.md`，与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级（「应用配置」；业务数据才进 `ModuleData`） |
 | 实测（2026-09-21，`core-agent\target\hooktest\e2e-l2.ps1`，真 `agent.exe` + 假端点，**16 条断言全过**） | 两轮对照：**Run A** 把 `LUNAC_PERSONA_FILE` 指向含 `PERSONA-MARKER-42` 的文件 ⇒ 线上 `system` 字符串里 `## Personality` < `## User-defined persona` < `Environment:` 三个下标严格递增、marker 在场，且该问两次请求的 `system` 前缀哈希**同值**（逐字节不变）；**Run B** 指向空文件 ⇒ marker / 表头都不在，且前缀哈希与**未引入 L2 时的基线完全相同** ⇒「没配人格时不加任何字节」由实测坐实（不是靠代码里那句 `if` 说服自己） |
 
-**插件市场（L1，2026-09-21）**：`<exe 根>\plugins\<id>\` 下的第三方插件**在启动时被注册进同一个 `pluginRegistry`**，于是结果区渲染、拼音匹配、`pluginIconSvg()`、i18n 的 `plugin.<id>` 全部零改动。宿主侧实现：[app/src-tauri/src/plugin_market.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_market.rs)（扫描 / 解压 / 校验 / 卸载，7 条单测）+ [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 的四个命令；前端适配层 [app/src/plugins/market.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/market.ts)。要点：
+**插件市场（L1，2026-09-21）**：`<exe 根>\plugins\<id>\` 下的第三方插件**在启动时被注册进同一个 `pluginRegistry`**，于是结果区渲染、拼音匹配、`pluginIconSvg()`、i18n 的 `plugin.<id>` 全部零改动。宿主侧实现：[app/src-tauri/src/plugin_market.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_market.rs)（扫描 / 解压 / 校验 / 卸载 / **索引解析**，9 条单测）+ [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 的五个命令；前端适配层 [app/src/plugins/market.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/market.ts)；可下载清单由本仓 [plugins/index.json](file:///d:/cc/claude-code-cli-master/plugins/index.json) 提供。要点：
 
 | 项 | 约定 |
 |---|---|
@@ -700,8 +700,14 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 安全边界要诚实 | 这里做的是**防事故**（写坏路径、把包塞爆、装重了），**不是防恶意** —— 插件是用户自己选择安装的可执行代码，装上即等同一份本机权限（与 `tools\` 的 shell handler 同族）。别把这条写成「已沙箱化」 |
 | 生效语义 | 装完 / 卸完**立即生效，不必重启 AI 也不必刷前端**：`refreshMarketPlugins()` 把旧 id `unregister` 掉再 `register` 新对象（registry 不去重，直接二次 register 会让结果区出现两行）。这与「技能改完要重启 agent」是两回事（技能是 agent 的能力、插件是前端的界面件） |
 | 坏包必须可见 | 清单坏了、入口丢了的包**不进 registry**（用不了），但**必须列在面板上并写出原因** —— 否则用户只会看到插件莫名消失、手上没有任何线索。`list_installed_plugins` 因此返回 `valid` + `error` 两个字段 |
+| **索引 = 「去哪下」的清单**（2026-09-21 二次改版加的） | 面板要能列出「**没装但可以装**」的插件，而本地扫描只看得见「已经装了的」。索引放在本仓 `main` 分支：**`plugins/index.json`**（顶层是**数组**，一条 = `{ id, name, description, version, url, keywords?, icon?, homepage? }`；`url` 是 https 的插件 zip 地址）。地址是 **Rust 常量** `plugin_market::INDEX_URL`，**不由前端传** |
+| 索引**由宿主去拉**，且**逐条再筛一遍** | 两条理由：① 前端 CSP 的 `default-src` 不含 github 域（没写 `connect-src` ⇒ 回落 default-src），前端 `fetch()` 会被直接拦掉；② 索引是**远端可改的文本**，谁写索引谁就影响了「前端能下什么」⇒ 必须按插件包的口径重新校验：`id` 过 `is_safe_id()`（它将来是目录名）、`url` 必须 `https://`、`name` 不能空。判据收口在纯函数 **`parse_index()`**（两条单测），坏条目**只丢自己**（`warn` 留痕）而不是丢整份索引 —— 这与「坏包必须可见」是两条不同的处置：那边是用户**已经装在盘上**的东西，消失了他找不到 |
+| 索引的传输闸 | 与插件包同一套：**只 https**、体积上限（`MAX_INDEX_BYTES` = 1 MB，Content-Length 先拦 + 按真实读到的字节再拦）、条目数上限（`MAX_INDEX_ENTRIES` = 500）；拉不到就**只提示一行**，市场退回「只有本机插件」的形态（等于这个功能不存在时的样子），**不静默变成空表** |
+| 界面形态（2026-09-21 二次改版） | 插件面板**只有一段**「插件市场」，一张表一行一个插件，按钮由**本机事实**（`pluginRegistry` + 插件目录扫描）决定，**不是索引自称的**：已装且能用 ⇒ 「打开」（第三方多一个两段式确认的「卸载」；内置编译进 bundle，没有目录、没得卸）；装了但包坏了 ⇒ 原因 + 「卸载」；没装而索引里有 ⇒ 「下载」。合并顺序**固定**：已装（registry 顺序照旧）→ 坏包 → 索引里还没装的。**下载与手工安装是同一条**宿主命令 `install_plugin_from_url` —— 索引只提供 URL，别在前端另开一条 |
+| 面板取数**不在构建期** | 表格字符串（`buildPluginsPane`）是**整块设置面板**的一部分，而索引要走网络（差网络下能拖到超时）⇒ 那里一旦 `await`，**打开设置**就跟着卡住。所以列表在**挂载后**由 `renderMarket()` 填，且**先本机、后索引**两段画：本机扫描是毫秒级的，不该被一份可有可无的推荐清单拖住 |
+| 事件绑定用**委托**（只在挂载时绑一次） | 这三个按钮过去是「重绘完再逐个 `addEventListener`」，而挂载时没人调那次 render ⇒ **初始渲染出来的按钮全是死的**（2026-09-21 用户报的「卸载点了没反应」就是这个根因）。改成在列表容器上委托后，重绘只改 `innerHTML`、监听永不丢 —— 这一类 bug 从此不存在。**新加的按钮一律并入这份委托，不要在重绘路径里重新绑** |
 | 模型资产（Live2D 等） | **安装包零第三方模型资产**：Lunac 只提供引擎与导入通道，模型由终端用户自备（他说下载时自己接受 Live2D 的协议）。版权四条线见 backlog **L1-B** —— 尤其：官方样例模型属 **No Redistribution**，**不得**随包分发 |
-| 实测（2026-09-21） | `cargo test` src-tauri **69 passed / 0 failed / 1 ignored**（新增 `plugin_market` **7 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错）、`tsc --noEmit` exit 0、`npm run build` exit 0 |
+| 实测（2026-09-21） | `cargo test --bins` src-tauri **73 passed / 0 failed / 1 ignored**（其中 `plugin_market` **9 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错 / **索引逐条筛（坏 id、明文 http、空名字、重复 id 各丢自己）/ 索引非 JSON 报错且接受 BOM 与空表**；`appearance` 增 **1 条**：**随包发货的两个主题包逐项校验**（清单能解析 + 声明的背景 / 花纹 / 8 个图标真在盘上 + `succubus` 主色与 `default` 同值））、`tsc --noEmit` exit 0、`npm run build` exit 0 |
 
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
@@ -1553,6 +1559,11 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
       - **三种「自定义」= 三个独立的展开状态**（`bgSlidersOpen` / `basePanelOpen` / `btnPanelOpen` / `textPanelOpen`），形态统一为「按钮 + ▾ → 一块 `.ap-sliders-panel`」，绑定统一走 `bindPanel()`。**新增一组时照抄这套，不要新造形态**（2026-09-20 起共四组：背景 / 底色 / 按钮 / 文字）。
     - **主题图标只有一个出口**：`pluginIconSvg()` 先查 `themeIconUrls`（主题包 `assets.icons.<插件 id>`），命中返回 `<img class="result-item-icon-img">`，否则回退内联 SVG。**禁止在各个渲染点各自判断主题** —— 图标汇聚点只有这一个（`themeIconUrls` 的声明必须放在 `pluginIconSvg` 之前：`const` 在声明前是 TDZ，放文件末尾就是必然的白屏）。
     - **`theme.json` 资产路径必须做穿越防护**（`appearance.rs`：拒绝 `..`、绝对路径、resolve 后逃出主题目录）；单个主题解析失败只 `warn` 并跳过，**不能让一个坏主题打空整个列表**。
+    - **内置主题包：`themes\default` 与 `themes\succubus`（2026-09-21 加）**：`tauri.conf.json` 的 `resources` 把仓库 `app/src-tauri/themes` 映射到 exe 根，两个目录都会被 `list_themes()` 扫到；**目录里有名为 `builtin` 的标记文件**的会被打上「内置」徽标（`ThemeInfo.builtin`）。第二个包 id = `succubus`、名 = 「魅魔 · 灰玫瑰」：
+      - `tokens.accent` = `#c0a0a0`，**与默认主题同值**（用户要求「主色采用我们保存的默认主题」）—— 主题色只有一个真相源 `--accent-rgb`（见上面那条），所以它一改就是全 UI 一起改。
+      - 它**带 `tokens.surface` = `29, 22, 21`**（暖墨褐 = 纸背阴影，不是紫黑）⇒ 按上面「主题全面代替底色」的优先级，**底色会由它接管**；`radius_search` 18px / `radius_results` 16px / `pattern_opacity` 0.09。
+      - 资产 = `background.png`（1920×1080 **墨线版**壁纸：暖墨底 + 奶油线稿 + 左下角的魅魔半身像，**中央刻意留空**给搜索栏）＋ `search_pattern.png`（512 可平铺植物蕾丝）＋ `icons\<插件id>.png`（8 个 96px 图标，经 `assets.icons` 接入 24×24 的 `<img>`）。
+      - **素材由 `D:\ui\_build`（SVG → resvg PNG）生成**：魅魔的身份靠三处墨线记号 —— **额侧弯角（角根一圈灰玫瑰细环）/ 背后蝠翼 / 颊边那颗心**；整幅画唯一真彩仍是灰玫瑰 `#B06A73`。**改素材改脚本、别手改 PNG**（脚本 `node build.mjs` 一次重出全套）。
     - **~~跟随 Windows = 跟随强调色~~ —— 已整体下线（2026-09-20）**：原先的实现读 `HKCU\Software\Microsoft\Windows\DWM\AccentColor`（**实测为 `0xAABBGGRR` 字节序**），刷新时机三处（启动无条件一次 / `lunac-window-shown` / 系统模式下每 15s 轮询）。**三段代码现在全部删除**（含那个 `setInterval`）。下面这条只作为**存档**保留，改回时按它还原：
       - 若要恢复：语义是「强调色只是主题色的一个来源」，`dark` 字段读到了但**从未使用**（本 UI 只有深色）；切到跟随模式时必须**顺带刷一次并重画该行**，否则 `--accent` 停在上一个自定义色（浏览器实测：表现为「切了没反应，得再点一次刷新」）；**不做** `WM_DWMCOLORIZATIONCOLORCHANGED` 消息驱动（要动 `hotkey.rs` 的 WndProc 子类化，收益仅「变色后 15s 内察觉」）。
     - **取色器是应用内自绘的，且是唯一取色入口**（2026-09-19 定稿）：`<input type="color">` 弹的是 Windows 原生对话框（WebView2 里样式改不了一个像素，与暗色玻璃界面脱节），**已移除**；「色轮 + 饱和度/明度滑块」与取色器表达同一组自由度、并存互相打架，**也已移除**。现形态 = 色号输入框 + 色块按钮 + **屏幕取色按钮** → 展开一个面板：色相条 + 饱和度/明度面板 + 预设色板。
@@ -1760,7 +1771,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **落盘是 `config\persona.md` 纯文本**（与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级）：后台配置走 `config\`、业务数据走 `ModuleData\`，这条分工不许破例；宿主只在 spawn 时**无条件**注入 `LUNAC_PERSONA_FILE`（同 `LUNAC_HOOKS_FILE` 的先例：「文件不在 = 没配」由一处判定，宿主不替它判断）。
     - **UI 落点是输入栏「更多设置」的 ⋯ 菜单，不在设置面板（2026-09-21，用户明确要求）**：它是**进阶 / 一次性**配置，占设置面板一整块不值当 —— 设置面板那边整块撤掉，textarea 与保存 / 恢复 / 重启三个按钮搬进 ⋯ 菜单（`#chat-persona-*`，惰性装载：展开时才 `get_persona`，进程内只装一次以免冲掉没保存的草稿），提示压成**一句**（上限 + 重启生效 + 不进子代理）。**契约一个字都没变**（落盘路径 / 启动读一次 / 8000 上限 / 不进子代理），变的只是入口。
 
-67. **第三方插件市场（L1，2026-09-21，原 backlog L1 本体）**：契约与实测见 §3.5「插件市场」。形态：**`<exe 根>\plugins\<id>\` 下的包在启动时被注册进同一个 `pluginRegistry`**（于是结果区 / 拼音 / 图标 / i18n 零改动），安装走 **https 的 zip**（`lunac-plugin.json` + 已编译的 ESM 入口）。**七条不得回退**：
+67. **第三方插件市场（L1，2026-09-21，原 backlog L1 本体）**：契约与实测见 §3.5「插件市场」。形态：**`<exe 根>\plugins\<id>\` 下的包在启动时被注册进同一个 `pluginRegistry`**（于是结果区 / 拼音 / 图标 / i18n 零改动），安装走 **https 的 zip**（`lunac-plugin.json` + 已编译的 ESM 入口）；面板上**没装的条目**来自本仓 `plugins/index.json` 索引（宿主去拉并逐条再筛）。**八条不得回退**：
     - **加载通道只能是 asset 协议**：`convertFileSrc(entry)` → `import(/* @vite-ignore */ url)`。CSP 的 `script-src` **必须含 `https://asset.localhost`**（2026-09-21 加）；**永远不能走 CDN**（同 §3.7 的 KaTeX 缺陷）。这条链路的两个前提是**核实过 Tauri 源码**的，不是猜的：`.js` / `.mjs` 在 asset 协议下是 `text/javascript`（`tauri-utils` 的 `mime_type.rs`），asset 响应一律带 `Access-Control-Allow-Origin: <窗口 origin>`（`tauri/src/protocol/asset.rs`）。
     - **校验比 tools / skills 先例更严，因为解压的是可执行代码**：只收 https；压缩包与**解压后总量**都有上限 + 条目数上限（zip bomb）；路径穿越的判据收口在纯函数 `safe_join()`（拒绝对路径 / `..` / 空段 / 深路径 / 以点或空格结尾的分段）并有单测；`id` 只允许 `[a-z0-9._-]`；`entry` 必须相对且 `.js` / `.mjs`；**同 id 已存在 ⇒ 拒绝**（不静默覆盖）；先解到 `.staging-*` 再改名，失败即清理。
     - **安全边界写实话**：这是**防事故**，不是防恶意 —— 插件是用户自己装的代码，装上即等同一份本机权限。**禁止**把这条描述成「已沙箱化」（同 §4.1 的诚实原则）。
@@ -1768,6 +1779,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **生效语义 = 立即生效**：`refreshMarketPlugins()` 先 `unregister` 再 `register`（registry 不去重，二次 register 会让结果区出现两行）；**不要**去抄「技能改完要重启 agent」那条 —— 技能是 agent 的能力，插件是前端的界面件。
     - **安装包零第三方模型资产**：Lunac 只给引擎与导入通道，模型由终端用户自备。官方样例模型属 **No Redistribution**（见 backlog L1-B 的四条线），**不得**随包分发。
     - **设置面板里必须写清两件事**：这是**可执行代码**、装它等于在本机运行它（只装信任来源）；以及插件目录在哪。别让用户以为插件只是个配置项。
+    - **索引是「数据」，不是「指令」**（2026-09-21 二次改版加）：`plugins/index.json` 只提供 `url` 与展示用的文字，**判据一律取本机事实** —— 「已装 / 未装 / 坏了」由 `pluginRegistry` + 插件目录扫描说话，**不许**用索引自称的字段去决定。索引**由宿主拉**（前端 CSP 拦得住，见 §3.5）且**逐条再筛**（`id` 过 `is_safe_id` / `url` 只收 https / `name` 不能空，收口在纯函数 `parse_index()` 并有单测），坏条目**只丢自己**（`warn` 留痕）；索引地址是 **Rust 常量**，不由前端传。界面上的按钮**一律走事件委托**（在列表容器上绑一次，重绘只改 `innerHTML`）—— 2026-09-21 用户报的「卸载点了没反应」根因就是「监听只在重绘里绑、挂载时没人调那次重绘」，那条写法不得回退。
 
 ## 12. Agent Plan 模式规范
 
