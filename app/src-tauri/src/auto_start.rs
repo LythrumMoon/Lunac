@@ -39,6 +39,35 @@ pub struct AutoStartInfo {
     pub enabled: bool,
     /// `"task"`（登录时计划任务）/ `"run"`（HKCU Run 键）/ `"both"`（两条都在，可能被拉起两次）/ `"none"`
     pub mechanism: String,
+    /// **已注册的开机项指向的不是当前这份 exe**（见 `registered_entry_is_foreign`）。
+    /// 面板据此提示一次「修复」：它通常意味着开机拉起的是旧路径 / 别的构建（实测那会
+    /// 开机弹 cmd、界面还是旧的），而修复需要管理员权限，只能在用户点一下时提权做。
+    pub stale: bool,
+}
+
+/// 当前进程是不是**开发构建**（`cargo build` 产物，落在 `target\{debug,release}\`）。
+///
+/// 为什么要专门判它（2026-09-21 实测取证，不得删）：
+///   · 开发构建是**控制台子系统**（`#![cfg_attr(not(debug_assertions), windows_subsystem)]`
+///     只在 release 下生效），被开机项拉起时会**弹一个黑窗口**；
+///   · 它带着旧 `dist`（或 devUrl），出来的界面可能是旧的。
+/// 实测日志：计划任务曾被一次 dev 调试注册成 `…\target\debug\lunac.exe --background`，
+/// 之后每次登录都由它拉起 —— 用户看到的正是「开机弹 cmd + 呼出来的界面不能用」。
+/// 所以开发构建**一律不碰用户的开机项**：既不许注册，也不去「修复」。
+fn is_dev_build() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    std::env::current_exe()
+        .map(|p| looks_like_dev_build_path(&p.to_string_lossy()))
+        .unwrap_or(false)
+}
+
+/// 路径判据单独成函数，为的是可单测 —— `is_dev_build()` 在测试进程里恒为 `true`
+/// （测试就是 debug 构建），路径分支只能靠这个纯函数钉住。
+fn looks_like_dev_build_path(p: &str) -> bool {
+    let p = p.to_lowercase();
+    p.contains(r"\target\debug\") || p.contains(r"\target\release\")
 }
 
 fn current_exe_str() -> Result<String, String> {
@@ -318,6 +347,13 @@ fn try_elevated_logon_task() -> bool {
 ///
 /// 返回值只表达「开关有没有真的开起来」：落到 Run 键也算成功（见 ai-spec §9.1 难点 2）。
 pub fn enable_auto_start() -> Result<(), String> {
+    // ⓪ 开发构建一律不注册（见 `is_dev_build`）：它会被控制台窗口与旧界面拉起来。
+    //    这里**必须返回错误**而不是静默跳过 —— 开关要如实弹回去，别让用户以为开上了。
+    if is_dev_build() {
+        note("REFUSED — 开发构建不注册开机自启（会弹 cmd 窗口、界面也可能是旧的）");
+        return Err("当前是开发构建，不注册开机自启；请用安装版开启".into());
+    }
+
     // ① 无需提权就能建任务（本进程已带管理员令牌）→ 直接用任务，不留 Run 值
     if create_logon_task().is_ok() {
         delete_run_value();
@@ -359,6 +395,28 @@ pub fn disable_auto_start() -> Result<(), String> {
     Ok(())
 }
 
+/// 已注册的开机项是否指向**别的程序**（不是当前这份 exe）。
+///
+/// 为什么必须查得出这条：exe 被移动 / 升级，或曾被**别的构建**注册过（实测：一次 dev
+/// 调试把计划任务写成了 `…\target\debug\lunac.exe`），开机拉起的就不是这份程序 ——
+/// 用户看到「开机弹 cmd / 界面是旧的」而日志里只有一句「重建计划任务」，没有结论。
+/// Run 键与计划任务**两边都查**（`both` 机制下只对一半也是坏的）。
+/// 只对**读得到的内容**下结论：不存在 / 读不出（编码、语言、服务未就绪）一律 `false`，不猜。
+fn registered_entry_is_foreign() -> bool {
+    let Ok(exe) = current_exe_str() else {
+        return false;
+    };
+    let exe_l = exe.to_lowercase();
+    let run_foreign = run_key_value()
+        .map(|v| !v.to_lowercase().contains(&exe_l))
+        .unwrap_or(false);
+    let task_foreign = match probe_logon_task() {
+        TaskProbe::Command(c) => !c.to_lowercase().contains(&exe_l),
+        _ => false,
+    };
+    run_foreign || task_foreign
+}
+
 /// 当前自启状态 + **实际生效机制**（UI 显示用）。两条都在时如实报 `both`。
 ///
 /// 这是自启状态的**唯一实现**：`enabled = 计划任务存在 或 Run 值存在`。
@@ -374,13 +432,15 @@ pub fn auto_start_info() -> Result<AutoStartInfo, String> {
         (false, true) => "run",
         (false, false) => "none",
     };
+    let stale = registered_entry_is_foreign();
     note(format!(
-        "探测 run={} task={} ⇒ 机制={}",
-        run_present, task_present, mechanism
+        "探测 run={} task={} ⇒ 机制={} 指向旧程序={}",
+        run_present, task_present, mechanism, stale
     ));
     Ok(AutoStartInfo {
         enabled: task_present || run_present,
         mechanism: mechanism.into(),
+        stale,
     })
 }
 
@@ -440,6 +500,13 @@ fn decode_task_xml(bytes: &[u8]) -> String {
 /// 杀软 IO 最紧张的时候（那个 4s 延迟就是为避开它而设计的），重建真正要防的却只有
 /// 「exe 被移动 / 升级导致路径失效」一种情况 —— 对得上就应当什么都不做。
 pub fn repair_auto_start_on_startup() {
+    // ⓪ 开发构建**什么都不做**（见 `is_dev_build`）：它的启动就是「随手跑一次」，
+    //    既不该重写用户的开机项，更不该把开机项改指向 `target\debug\lunac.exe` ——
+    //    那正是「开机弹 cmd + 界面是旧的」的成因。清理/修复交给安装版做。
+    if is_dev_build() {
+        note("修复检查跳过：开发构建不碰用户的开机项");
+        return;
+    }
     // ① Run 键在手：比对现值，一致就不写（注册表写入不 spawn 进程，但仍是磁盘 IO）。
     if let Some(current) = run_key_value() {
         match startup_command_line() {
@@ -467,15 +534,32 @@ pub fn repair_auto_start_on_startup() {
         TaskProbe::Command(cmd) if cmd.to_lowercase().contains(&exe.to_lowercase()) => {
             note("修复检查：计划任务已指向当前 exe，跳过");
         }
-        TaskProbe::Command(_) => {
-            note("修复检查：重建计划任务（exe 路径已变）");
-            let _ = create_logon_task();
+        TaskProbe::Command(cmd) => {
+            note(format!(
+                "修复检查：计划任务指向的是别的程序（{cmd}）→ 重建"
+            ));
+            rebuild_logon_task();
         }
         // 解析不出来时按旧行为重建：宁可多 spawn 一次，也不能让自愈能力静默消失
         TaskProbe::Unreadable => {
             note("修复检查：任务内容读不出 → 按旧行为重建（不让自愈能力静默消失）");
-            let _ = create_logon_task();
+            rebuild_logon_task();
         }
+    }
+}
+
+/// 重建登录计划任务，并**如实记账成败**。
+///
+/// 为什么失败必须写清楚：非管理员下 `schtasks /create` 必报「拒绝访问」，而这条路径
+/// 在启动时自动跑（不弹 UAC）—— 旧实现 `let _ = create_logon_task();` 把失败吞了，
+/// 于是「开机项一直指向旧程序」既修不好、日志里也看不出原因，用户只看到开机弹 cmd。
+/// 现在失败会留一行结论，设置面板也会因 `AutoStartInfo.stale` 提示用户点一次「修复」（那条会提权）。
+fn rebuild_logon_task() {
+    match create_logon_task() {
+        Ok(()) => note("修复检查：计划任务已重建"),
+        Err(e) => note(format!(
+            "修复检查：重建失败（非管理员下必然如此，需要用户在设置面板点「修复」提权）{e}"
+        )),
     }
 }
 
@@ -506,6 +590,25 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn shell_execute_info_size_matches_the_win32_struct() {
         assert_eq!(std::mem::size_of::<ShellExecuteInfoW>(), 112);
+    }
+
+    /// 开发构建的路径判据（2026-09-21）。**这是「开机弹 cmd + 界面是旧的」那条 bug 的
+    /// 根因守卫**：`target\{debug,release}` 下的 exe 是 cargo 产物（控制台子系统 + 旧 dist），
+    /// 一旦被开机项拉起就是这个现象 —— 所以这类路径必须被判为开发构建，从而既不注册自启、
+    /// 也不去「修复」用户的开机项。正常安装路径（如 `D:\Lunac\lunac.exe`）必须放过。
+    #[test]
+    fn dev_build_path_detection() {
+        assert!(looks_like_dev_build_path(
+            r"D:\cc\claude-code-cli-master\app\src-tauri\target\debug\lunac.exe"
+        ));
+        assert!(looks_like_dev_build_path(
+            r"D:\cc\app\src-tauri\TARGET\Release\deps\lunac.exe"
+        ));
+        assert!(!looks_like_dev_build_path(r"D:\Lunac\lunac.exe"));
+        assert!(!looks_like_dev_build_path(r"C:\Program Files\Lunac\lunac.exe"));
+        // 测试进程本身就是开发构建（debug 或 target\release 下的 deps）→ 必须判为 true：
+        // 一旦这个断言变红，就说明守卫失效、测试机上的自启会被开发构建改写。
+        assert!(is_dev_build());
     }
 
     /// 提权参数必须是**不带引号、不带空格**的开关：本参数会经 ShellExecute 拼进
