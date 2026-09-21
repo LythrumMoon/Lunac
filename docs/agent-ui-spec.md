@@ -124,7 +124,7 @@
 - **成功/失败判定**：优先看 `tool_result.is_error`；`is_error=false` 但退出码 ≠ 0 时显示为「完成（退出码非零）」，仍**不**标红 —— 与后端语义一致（工具本身没失败，是命令返回非零）。
 - 若上述解析在真实数据上覆盖率不足，再走「后端新增结构化字段」路线（见 §9 的登记流程），**不得**先私自加字段。
 
-**命令类工具**：`Bash` / `PowerShell` 用等宽字体显示命令原文（保留换行，最多 3 行 + 省略）；`Read` / `Write` / `Edit` / `Grep` / `Glob` 显示 `k=v` 摘要（现状逻辑保留）。`TodoWrite` 仍走 `.todo-panel`（不画卡片）。
+**命令类工具**：`Bash` / `PowerShell` 用等宽字体显示命令原文（保留换行，最多 3 行 + 省略）；`Read` / `Write` / `Edit` / `Grep` / `Glob` 显示 `k=v` 摘要（现状逻辑保留）。`TodoWrite` **不在对话流里画任何块**（2026-09-21 起连 `.todo-panel` 也撤掉），一律交给 §3.9 的任务抽屉。
 
 > **注意区分两个「复制」**：上面的操作区属于**执行卡片**（`.tool-row`，命令已经跑完）。**审批卡**（`.approval-batch-card`）的命令区**不放复制按钮**（2026-09 用户要求删除）—— 按钮固定在右上角，短命令与它之间会空出一大片（还得给 `.approval-cmd-list` 预留 56px 右边距），而命令文本本身已可选中复制（`.approval-cmd-box` 有 `user-select: text`），够了。**不得**为「方便复制」把按钮加回去。
 
@@ -168,20 +168,41 @@
 - **`usage`（表盘快照）**：恢复历史时写回 token 仪表盘（`usageTotals` + `updateTokenDashboard()`）—— 表盘口径是「当前这次对话」，所以此时显示的就是**那次对话**的数值。
 - 缺字段（旧记录）时两者都按空处理，不得报错。
 
-### 3.8 被改动文件的路径追踪（2026-09-17）
+### 3.8 被改动文件的路径追踪（2026-09-17，2026-09-21 挪进任务抽屉）
 
 被 `Write` / `Edit` 动过的文件在两个地方出现，且**两处共用 `.file-link` 这一个类名与同一套委托点击**：
 
 | 位置 | 内容 | 形态 |
 |---|---|---|
 | 工具卡头部 `.tool-cmd` | 可点 `.file-link`（**完整路径**）+ `.tool-cmd-rest`（该次调用的其余入参，压暗、超 160 字符截断） | 行内替换原来的纯文本摘要 |
-| 对话流末尾 `.changed-files-card` | 「N 个文件已改动」，`<details>` 折叠，展开是 `.changed-file` 列表：左侧 `.file-link` 显示**文件名**、右侧 `.changed-file-dir` 显示所在目录 | 只在 `sessionChangedFiles` 非空时存在；每次更新 `appendChild` 到 `#chat-log` 末尾（复用节点即自动移到末尾），新回合开始后仍贴在最新内容之后 |
+| 任务抽屉 `#todo-drawer-files`（§3.9） | 左侧 `.file-link` 显示**文件名**、右侧 `.changed-file-dir` 显示所在目录 | 只随抽屉一起出现（`sessionChangedFiles` 非空**且**用户点了「展开详细更改文件」）；旧实现是对话流末尾的 `.changed-files-card` 折叠卡，2026-09-21 按用户要求**整块撤掉** —— 文件列表与待办同进抽屉，`#chat-log` 里不再有任何改动文件区块 |
 
 - **点击 → `reveal_in_explorer(path)`**：调 `explorer.exe /select,<path>` 打开所在文件夹并选中该文件。**只定位、不打开**（不是「用默认程序打开文件」）。失败（文件已被移动 / 删除）时把状态行文案换成 `agent.reveal_failed`，**不弹窗、不清列表**。
 - **路径只来自 `tool_use` 入参**（`Write` / `Edit` 的 `file_path`），不是从工具输出正文里解析 —— 详见 ai-spec §11 规则 32（含为什么不能猜）。
 - **`.file-link` 一律不设固定宽度、`word-break: break-all`**（工具卡里路径可能很长）；列表里的**目录段才是被截断的那一段**（`text-overflow: ellipsis`），文件名必须完整可读。
 - **列表内容与界面留下的历史一致**：`steps` 快照每条带可选 `path`（`SessionStep.path`），`restoreSession()` / `rollbackChat()` 用 `rebuildChangedFilesFromSteps()` 重建、新对话清空列表。工具卡上的路径**不写回 agent 上下文**（纯前端展示）。
-- **不新增滚动容器**：面板不过度增长（每文件一行）、不设 `max-height`；将来若要设，走 §5.4 那条唯一的全局 `::-webkit-scrollbar`，**禁止**在此声明 `scrollbar-width` / `scrollbar-color`。
+- **滚动容器移到抽屉里（2026-09-21）**：列表本身不过度增长（每文件一行），限高与滚动都由抽屉的 `.todo-items`（`max-height: 132px` + `overscroll-behavior: contain`）承担；条带仍走 §5.4 那条唯一的全局 `::-webkit-scrollbar`，**禁止**在此声明 `scrollbar-width` / `scrollbar-color`。
+
+### 3.9 任务抽屉 `#todo-drawer`（2026-09-21）
+
+待办清单（`TodoWrite`）与「本次会话改动过的文件」两样东西**都不再进对话流**，统一收在输入框上方的抽屉里，理由（用户原话）：待办「现在是直接在对话中的链路中体现，我们需要将其提取出来用小型抽屉放置在对话框的上方」。
+
+- **位置与显隐**：DOM 在 `#results-list` 之后、`#chat-input-bar` 之前。**有内容的唯一判据** = `todoItems.length > 0 || sessionChangedFiles.length > 0`；两者都空时整块 `.hidden`（不占位、不画空壳）。`renderTodoDrawer()` 是唯一的渲染入口。
+- **头行 `#todo-drawer-head`**：`#todo-drawer-title`（`agent.todo_title`）· `#todo-drawer-progress`（`agent.todo_progress` = 「已完成 D / 共 N」；**只有待办存在时才有文字**，否则留空）· 三个 `<button>`：`-tasks-btn`（展开详细任务）/ `-files-btn`（展开详细更改文件，文案复用 `agent.changed_files` 带数量）/ `-ok-btn`（确认）。
+- **按钮即开关**：`setTodoDrawerBtn()` 统一处理 `disabled`（没有对应数据就禁用）与 `.open`（展开态高亮）。两个列表**互斥**：点一个展开就收起另一个（`todoTasksOpen` / `todoFilesOpen`）。
+- **无图标**：整个抽屉不出现 `📋 ✔ ◐ ○` 之类字符，标题栏也不放图标。待办状态**只用文字颜色**表达（`.todo-item.in_progress` = 强调色 / `.completed` = 弱化 / `.pending` = 次要）。
+- **确认 = 清掉待办**：点 `-ok-btn` 把 `todoItems` 置空并收起两个列表（`sessionChangedFiles` **保留** —— 用户可能还要照着列表去定位文件）。因为没有算力再做别的判断，这里不做二次确认弹窗。
+- **数据来源两个、生命周期不同**：待办来自 `renderTodoPanel()`（agent 的 `TodoWrite` 入参，**内存态、不落盘**）；文件列表来自 `noteChangedFile()` / `rebuildChangedFilesFromSteps()`（随 `steps` 快照可重建）。因此**恢复历史 / 回退对话时待办一律清空**（重建不出来），文件列表照旧重建；`newConversation()` 两者都清。
+- **回退（`recordTurnSteps`）**：采集过程快照时不再数 `.todo-panel`，工具卡判定从「`.todo-card` / `.todo-panel` 特判」简化成普通分支 —— 抽屉不进 `steps`、不进历史。
+
+### 3.10 「打开本地文件 / 目录」一律走宿主 `open_path`（2026-09-21）
+
+前端凡是「打开**本地路径**」（主题目录、hooks.json、pricing.json、插件目录…）的按钮，**必须** `invoke("open_path", { path })`，**不得**用 `@tauri-apps/plugin-shell` 的 `open()`：
+
+- **原因**：shell 插件的 `open` 入参会过一道 **scope 正则校验**（`capabilities/default.json` 的 `shell:allow-open`），只放行 URL scheme（`mailto:…` / `https://…`）。传本地路径时后端直接抛 `scoped command argument at position 0 was found but failed regex validation` —— 而调用点通常 `.catch(() => {})` 吞掉异常（那是为「用户点了取消」准备的静默分支），**表现就是「按钮点了没反应」**（用户原话：「主题目录按钮识别路径无效 点击无效」/「打开 hooks.json…会出现保存失败…报错」）。
+- **URL 仍走 `open()`**：`open(u).catch(() => {})`（web-search 结果行、插件来源链接）保持原样，那条路本来就能过校验。
+- **不要把本地路径加进 open scope**：等于给**所有**前端代码（含第三方插件）开了「任意本地路径」的口子。宿主侧 `open_path` 是自定义 `#[tauri::command]`，**不需要**改 `capabilities/default.json`。
+- 回归口径：点这四处按钮，DevTools 里**不得**出现 `failed regex validation`，且系统资源管理器必须真的弹出。
 
 ---
 
@@ -356,8 +377,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 - [ ] **顶层插件面板不自加压暗**（ai-spec §11 规则 48 末条）：OCR 的 `.ocr-image-panel` / `.ocr-text-panel` 必须 `background: transparent`（与 memo 的 `.plugin-result` 一致，实测同为 `rgba(0,0,0,0)`），左右分栏靠 `border-right`；`rgba(0, 0, 0, calc(α * var(--shade-scale)))` 只允许出现在**嵌套**的次级块（输入框 / 工具卡 / 弹层 / 遮罩）上。
 - [ ] **回退按钮的位置与边界**（ai-spec §11 规则 64，2026-09-20 A11）：用户气泡 = 复制 + 回退 + 重试；**助手气泡 = 复制 + 回退**（任意消息都是合法回退点）；实时对话里助手回复不是独立气泡，入口在 `.turn-footer` 里的 `.turn-rollback`。回退文案（`.msg-rollback` 的 title 与回退后的状态行）**必须**写明「只回退对话，磁盘上已改动的文件不会还原」。**被 `pruneContext` 裁剪掉的老气泡只剩复制**（`shiftRenderedMsgIdx` 摘掉回退 / 重试）。回归口径：连问 13 轮以上让裁剪真的发生，点**最早那条仍有回退按钮**的气泡 → 重绘后的气泡数必须与保留的历史条数相等（不偏不差；此前 `data-idx` 不随裁剪前移，会切错消息）。
 - [ ] **子任务面板是「分组面板」，不是分栏（ai-spec §11 规则 65，2026-09-20 A14）**：`.subtask-panel` 在 `.agent-flow` **内部**、每个子任务一行（`.subtask-row`：`.subtask-id` / `.subtask-desc` / `.subtask-state`），**不得**改成左右分栏、不得新建常驻侧栏、**不得给面板加 `max-height` / `overflow-y`**（第二层滚动条与限制结果区高度都是明令禁止的：§0 规则 1 + ai-spec §11 规则 44）。回合折叠时它与其它过程块一起隐藏（`flow-folded` 的选择器里必须有它）；没派子代理的回合 DOM 里**没有**这个容器。回归口径：一轮里派 2 个子任务 → 面板恰好 2 行、状态行显示并行数、两个都 `task_done` 后状态行才回「工作中」；`getComputedStyle(panel)` 的 `overflowY` 必须是 `visible`。
-- [ ] **控件文案里没有 emoji**（ai-spec §11 规则 49 + `icon-style.md` §4.1，2026-09-19 批 8）：按钮标签 / 状态行 / 占位提示一律「纯文字」或「线性 SVG + 文字」，不得出现 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ …` / `⏳ …` / `✅ …` / `❌ …`。**允许保留**：列表项 / 条目图标（`.clip-item-icon` 📁📋、`.history-item-icon` 💬、`.file-chip-icon` 📦📎、`plugin.icon`、`item.icon`、TODO 头 📋、tool-editor 🔧、web-search 引擎图标）与单色状态符号（`✓ ✗ ⚠ ✔ ◐ ○ ✕ ×`）。回归口径：对插件面板做一次「叶子节点 textContent 命中 emoji 正则」扫描，计数应为 0（列表项图标节点除外）。**子任务面板的 id / 状态与审批行的 `.approval-task-tag` 一律纯文字**（面板里那两个 `✓` / `✗` 属于允许的单色状态符号）。
-- [ ] **设置侧栏五项 + 分类归属正确**（ai-spec §11 规则 50）：侧栏**恰好**「常规 / 风格 / AI / 搜索 / 插件」五项（无独立「技能扩展」）；`#sp-ai` 内 `.settings-group-title` 恰好 5 个（AI 模型 / 技能 (Skill Store) / 工具 (MCP) / 用量与成本 —— 第四块 2026-09-20 由 A12 加入 / **人格** —— 第五块 2026-09-21 由 L2 加入），且 `#settings-save-ai-btn` / `#settings-skill-install-url-btn` / `#settings-tool-url` / `#settings-open-tools` 全部落在 `#sp-ai` 作用域内；`#sp-plugins` 内是插件总览（`.settings-plugin-item` 数量 == `pluginRegistry.getAll().length`，每行「打开」按钮），且 `#settings-tool-url` **不在** `#sp-plugins` 内（tools 与插件必须分开）。
+- [ ] **控件文案里没有 emoji**（ai-spec §11 规则 49 + `icon-style.md` §4.1，2026-09-19 批 8）：按钮标签 / 状态行 / 占位提示一律「纯文字」或「线性 SVG + 文字」，不得出现 `📋 复制结果` / `📁 选择文件` / `🖼️ 暂无图片` / `⚠️ …` / `⏳ …` / `✅ …` / `❌ …`。**允许保留**：列表项 / 条目图标（`.clip-item-icon` 📁📋、`.history-item-icon` 💬、`.file-chip-icon` 📦📎、`plugin.icon`、`item.icon`、tool-editor 🔧、web-search 引擎图标）与单色状态符号（`✓ ✗ ⚠ ✔ ◐ ○ ✕ ×`）。**任务抽屉（§3.9）是例外中的例外：整个抽屉一个图标都不许有**（连单色状态符号也不用，状态只靠文字颜色）—— 2026-09-21 用户明确要求「代办列表需要做成去除 icon」。回归口径：对插件面板做一次「叶子节点 textContent 命中 emoji 正则」扫描，计数应为 0（列表项图标节点除外）。**子任务面板的 id / 状态与审批行的 `.approval-task-tag` 一律纯文字**（面板里那两个 `✓` / `✗` 属于允许的单色状态符号）。
+- [ ] **设置侧栏五项 + 分类归属正确**（ai-spec §11 规则 50）：侧栏**恰好**「常规 / 风格 / AI / 搜索 / 插件」五项（无独立「技能扩展」）；`#sp-ai` 内 `.settings-group-title` 恰好 4 个（AI 模型 / 技能 (Skill Store) / 工具 (MCP) / 用量与成本 —— 第四块 2026-09-20 由 A12 加入；**人格块 2026-09-21 已搬出本面板 → 输入栏 ⋯ 菜单**，不得再加回来），且 `#settings-save-ai-btn` / `#settings-skill-install-url-btn` / `#settings-tool-url` / `#settings-open-tools` 全部落在 `#sp-ai` 作用域内；`#sp-plugins` 内是插件总览（`.settings-plugin-item` 数量 == `pluginRegistry.getAll().length`，每行「打开」按钮），且 `#settings-tool-url` **不在** `#sp-plugins` 内（tools 与插件必须分开）。
 - [ ] **插件分区里「总览」与「插件目录」是两个列表、两套类名（ai-spec §11 规则 67，2026-09-21 L1）**：`#settings-plugin-overview` 用 `.settings-plugin-item`（**行数必须等于 `pluginRegistry.getAll().length`** —— 它是 registry 的镜像），`#settings-plugin-dir` 用 **`.settings-market-row`**（**可能含坏包**，行数等于插件目录里的包数）。**不得**把市场行也写成 `.settings-plugin-item` —— 那会让「总览行数 == 插件数」这条断言变成假绿。插件市场的 UI 必须写清两件事：**插件是可执行代码**（只装信任来源）+ **插件目录在哪**；装完 / 卸完立即生效（不重启 AI、不刷前端），坏包要连**原因**一起显示。
 - [ ] **插件名/描述已本地化**（ai-spec §11 规则 50）：结果区插件行、右键「运行 X」、详细搜索 commands 行、插件总览四处都走 `pluginName()` / `pluginDesc()`；把语言切到 `zh-CN` 后这些位置**不得出现英文常量**（`Custom Launch` / `Web Search` / `Search the web with your default browser`…）。新增插件必须同时补 `plugin.<id>` 与 `plugin.<id>.desc` 五语言。
 - [ ] **主题包锁定态不得回退**（ai-spec §11 规则 46）：`themeId !== "default"` 时 `#ap-color-group` 必须带 `.locked`（灰掉 + 不可点）、`#ap-bg-pick` 必须 `disabled`、`#ap-lock-note` 必须可见；**切换主题时实时同步**（不能只在构建时算一次）；**「自定义」那五个玻璃质感拉条在任何主题下都必须还能拖动**（实测口径：aurora 主题下拖 `bgBlur` → 行内 `--bg-blur` 必须变）。
@@ -398,9 +419,9 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 |---|---|---|---|
 | `skipped` = `[{path, reason}]` | `system/attachment_note` | 本轮**没能随提问发出**的附件与原因（A8）：读不出来 / 不是端点支持的图片 / 超过 3.5 MB 单图上限 / 超过 10 张 —— agent 侧判定，见 ai-spec §3.5「图片附件」 | 追加一条 `details.sys-note.sys-note-warn`，标题 `t("agent.attachment_skipped", {n})`、正文逐条 `path — reason`。**缺字段或空数组 ⇒ 什么都不画**（不是错误，也没有需要用户处理的失败） |
 | `hook_event` / `tool_name` / `items` = `[{kind, text, command}]` | `system/hook_note` | **权限 hooks**（A9）的裁决 / 输出 / 失败：`kind` ∈ `block`（拦下）/ `allow`（放行）/ `info`（补充信息）/ `error`（hook 崩了 / 超时 / 输出看不懂 —— **它没有拦任何东西**）。字段名是 `hook_event` 而不是 `event`（后者已被 `stream_event` 占用，形状是对象）。见 ai-spec §3.5「权限 hooks」/ §11 规则 61 | `renderHookNote()`：追加 `details.sys-note`，`block` / `error` 加 `.sys-note-warn` 并**自动展开**（必须看见 —— 静默会让用户「以为装了保护、其实没跑」），`info` / `allow` 中性色、默认折叠；标题 `t("agent.hook_note", {event, n})`、正文逐条 `[kind] text — command`（一个事件挂多个 hook 时靠 `command` 才分得清是谁）。**`items` 为空 ⇒ 什么都不画** |
-| 设置面板「权限 hooks」行 | 设置 · AI 分块 | 开关 = `config\hooks.json` 的 `enabled` 字段（`get_hooks_config` / `set_hooks_enabled`）；旁边一个「打开 hooks.json」按钮（`hooks_file_path` 缺文件先落骨架，再由前端 `open()` 打开）；文件语法错误时把 `error` 渲染成一行黄色提示 | 开关**失败要拨回去**并显示原因（面板显示「已开」而实际没生效是最难查的一类）；文案里说明「改完即时生效、不必重启 agent」（agent 按 mtime 热重载） |
-| 设置面板「人格 / 自定义提示词」分块（L2） | 设置 · AI 分块的**第五块**（在「用量与成本」之后，同样用 `.settings-group-title`） | 数据来自 `get_persona`（返回 `{path, text, maxChars}`，`path` = `config\persona.md` 的绝对路径、`text` 缺文件时为空串、`maxChars` = 8000）；保存走 `set_persona(text)`（宿主侧先校验后写，失败返回 `{err}`） | textarea `#settings-persona-text`（`maxlength` = `maxChars`）+ 实时字数 `#settings-persona-count` + 三个按钮：保存（`-save`）/ 恢复内置（`-reset`，**写空文本**，不是删文件）/ 立即重启 AI（`-restart`，复用 `window.__lunac_reload_agent`，让新人格在 agent 侧生效）+ 提示行 `-msg`（保存成功后拼一句「重启后生效」）。**提示行每次现查节点**（容器整体重渲染会把 `#settings-persona-msg` 整个换掉，缓存引用会写进空气里）。文案见 ai-spec §3.5「人格 / 自定义提示词」/ §11 规则 66 |
-| 设置面板「用量与成本」分块（A12） | 设置 · AI 分块的**第四块**（在「工具 (MCP)」之后，同样用 `.settings-group-title`） | 数据来自 `get_pricing_state`（正式 + 候选两份定价表的**原文**）与 `read_usage_range(dates)`（近 30 天，日期列表由前端按本地日期算）。金额在**前端**按 `config\pricing.json` 算，分模型计价 | ① 「打开 pricing.json」= `pricing_file_path`（缺文件落空骨架）+ 前端 `open()`；② 「更新价格」把提示词经 `__lunac_agent_task` 发给 agent（设置面板不自己发消息），安全档位为「只读」时**不发**并说明原因；③ 有候选文件时显示 `.cost-pending` 预览卡（旧值 → 新值 / 新增 / 「确认后失去价格」）+ 确认 / 放弃两个按钮，确认走 `commit_pricing_pending(today)`、放弃走 `discard_pricing_pending`，两者都**重渲染本块**；④ 汇总行 + 按天表格（新的在上）；未定价的模型单列一行黄色提示、金额前缀 `≥`。契约与纪律见 ai-spec §3.5「定价表与成本面板」/ §11 规则 63 |
+| ~~设置面板「权限 hooks」行~~ → **UI 已移除（2026-09-21）** | 无（开发者选项，**常驻可用**） | 开关 = `config\hooks.json` 的 `enabled` 字段（`get_hooks_config` / `set_hooks_enabled`；**缺省即视为 true**，用户不改配置文件就是开着的）。宿主三命令（含 `hooks_file_path`）**保留**，但前端**不得**再接线 | 设置面板里**没有** hooks 分块、没有「打开 hooks.json」按钮（用户原话：「hooks 是作为开发者的一个选项并不需要展示给用户…是否可以常驻开启」）。要看 / 改直接开 `config\hooks.json`；agent 按 mtime 热重载，改完即时生效。上述 `system/hook_note` 的裁决提示**照旧**渲染 —— 不显示开关 ≠ 不告诉用户被拦了 |
+| 「人格 / 自定义提示词」（L2，**2026-09-21 搬到输入栏 ⋯ 菜单**） | 输入栏「更多设置」（`⋯`）下拉的**最后一块**（在工具黑名单之后） | 数据来自 `get_persona`（返回 `{path, text, maxChars}`，`path` = `config\persona.md` 的绝对路径、`text` 缺文件时为空串、`maxChars` = 8000）；保存走 `set_persona(text)`（宿主侧先校验后写，失败返回 `{err}`） | 默认收起 —— 只有 `#chat-persona-label` + 一个「编辑」（`#chat-persona-edit`，`settings.persona_edit`）；点开才显示 `#chat-persona-box`（host 是懒装载：**第一次展开才 `get_persona`**，避免每次开菜单都读盘）。框内：`#chat-persona-hint`（**一句话**）· `#chat-persona-text`（`maxlength` = `maxChars`）· 三个按钮「保存 / 恢复内置 / 重启 AI」（`-save` / `-reset` / `-restart`，后者复用 `window.__lunac_reload_agent`）· 提示行 `#chat-persona-msg`。**不再显示字数计数**（`settings.persona_count` / `persona_path` 两条 i18n 已删）。**提示行每次现查节点**。文案见 ai-spec §3.5「人格 / 自定义提示词」/ §11 规则 66 |
+| 设置面板「用量与成本」分块（A12） | 设置 · AI 分块的**第四块**（在「工具 (MCP)」之后，同样用 `.settings-group-title`） | 数据来自 `get_pricing_state`（正式 + 候选两份定价表的**原文**）与 `read_usage_range(dates)`（近 30 天，日期列表由前端按本地日期算）。金额在**前端**按 `config\pricing.json` 算，分模型计价 | ① 「打开 pricing.json」= `pricing_file_path`（缺文件落空骨架）+ **宿主命令 `open_path()`**（**不是** shell 的 `open()` —— 本地路径会被它的 scope 正则拒掉，见 §3.10）；② 「更新价格」把提示词经 `__lunac_agent_task` 发给 agent（设置面板不自己发消息），安全档位为「只读」时**不发**并说明原因；③ 有候选文件时显示 `.cost-pending` 预览卡（旧值 → 新值 / 新增 / 「确认后失去价格」）+ 确认 / 放弃两个按钮，确认走 `commit_pricing_pending(today)`、放弃走 `discard_pricing_pending`，两者都**重渲染本块**；④ 汇总行 + 按天表格（新的在上）；未定价的模型单列一行黄色提示、金额前缀 `≥`。契约与纪律见 ai-spec §3.5「定价表与成本面板」/ §11 规则 63 |
 | 设置面板「插件」分区的市场段（L1，2026-09-21） | 设置 · 插件分区第二块（`.settings-group-title` = 第三方插件），在只读总览之后 | `list_installed_plugins()`（含坏包：`valid=false` + `error`）与 `plugins_dir_path()`；安装走 `install_plugin_from_url(url)`（**只收 https 的 zip**）、卸载走 `uninstall_plugin(id)`。这些是**自定义 `#[tauri::command]`，不需要 `capabilities/default.json`**（同 §9 末条） | URL 输入框 `#settings-plugin-url` + 安装按钮 `#settings-plugin-install` + 目录列表 `#settings-plugin-dir`（每行 `.settings-market-row`：名称 · 版本 / 来源 / 卸载）+ 提示行 `#settings-plugin-msg` + 目录路径行。卸载是**两段式确认**（复用 `.settings-skill-del-installed` 与 `[data-armed=1]` 红色确认态）。装完 / 卸完要**同时重画两处**：`#settings-plugin-overview`（registry 镜像）+ `#settings-plugin-dir`（目录镜像）。契约与纪律见 ai-spec §3.5「插件市场」/ §11 规则 67 |
 - 新增前端 → 后端的调用（如 `set_security_profile` 已有、`log_frontend` 已有）必须参数名与 Rust 签名逐一对齐（code-rules §3.1），并确认是否需要 `capabilities/default.json`（自定义 `#[tauri::command]` 不需要，插件 API 需要）。
 
