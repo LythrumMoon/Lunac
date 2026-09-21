@@ -33,6 +33,7 @@ windows = { version = "0.58", features = [
     "Foundation",
 ] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -11,7 +11,7 @@ use crate::windows_ocr;
 use crate::paddle_ocr;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use tauri::{AppHandle, Emitter, State};
@@ -1820,6 +1820,86 @@ pub fn delete_skill(key: String) -> Result<String, String> {
     }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("Delete error: {}", e))?;
     Ok(key)
+}
+
+// ── 插件市场（L1，2026-09-21）────────────────────────────────────
+// 落点 <exe 根>\plugins\<id>\（与 skills / tools 同级），包里必须带 `lunac-plugin.json`
+// 与**已编译好的 ESM 入口** —— 前端经 asset 协议 `import()` 它（CSP 是 script-src 'self'
+// + asset.localhost，插件代码不能走 CDN）。
+// 每一条校验的理由（https only / 大小上限 / 路径穿越 / 已存在拒绝 / staging 改名）见
+// [plugin_market.rs](plugin_market.rs) 的头注释 —— 这里只做 Tauri 侧的薄封装。
+
+/// 列出已安装插件。**坏包也要列出来**（清单坏了、入口丢了都要让用户看见原因，
+/// 否则插件会「莫名其妙消失」，而用户手上没有任何线索）。
+#[tauri::command]
+pub fn list_installed_plugins() -> Vec<crate::plugin_market::InstalledPlugin> {
+    crate::plugin_market::list_installed(&crate::plugin_market::plugins_dir())
+}
+
+/// 插件目录绝对路径（面板上显示，让用户知道东西装去哪儿了）。
+#[tauri::command]
+pub fn plugins_dir_path() -> String {
+    crate::plugin_market::plugins_dir()
+        .to_string_lossy()
+        .to_string()
+}
+
+/// 从 https 的 zip URL 安装插件，返回插件 id。
+#[tauri::command]
+pub fn install_plugin_from_url(url: String) -> Result<String, String> {
+    let url = url.trim().to_string();
+    // 明文 http 的 zip 会被解压执行 ⇒ 只收 https（这是本命令与 tools / skills 那两个先例的差别）
+    if !url.starts_with("https://") {
+        return Err("只允许 https 的插件包地址".into());
+    }
+    let limit = crate::plugin_market::MAX_ARCHIVE_BYTES;
+    let over = || format!("插件包超过上限（{} MB）", limit / 1024 / 1024);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Client error: {}", e))?;
+    let mut resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Download failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
+    }
+    // 两道拦截：先看 Content-Length（省得白下几十 MB），再按**真实读到的字节**累计
+    if let Some(len) = resp.content_length() {
+        if len > limit {
+            return Err(over());
+        }
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| format!("Read error: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() as u64 + n as u64 > limit {
+            return Err(over());
+        }
+        bytes.extend_from_slice(&buf[..n]);
+    }
+    let id = crate::plugin_market::install_from_bytes(&bytes, &crate::plugin_market::plugins_dir())?;
+    crate::log::info(format!(
+        "插件已安装：{}（{} 字节，来源 {url}）",
+        id,
+        bytes.len()
+    ));
+    Ok(id)
+}
+
+/// 卸载插件（递归删 <exe 根>\plugins\<id>）。id 必须安全、目录必须在插件根内 —— 见 `plugin_market::uninstall`。
+#[tauri::command]
+pub fn uninstall_plugin(id: String) -> Result<String, String> {
+    crate::plugin_market::uninstall(&id, &crate::plugin_market::plugins_dir())?;
+    crate::log::info(format!("插件已卸载：{id}"));
+    Ok(id)
 }
 
 /// Download a tool definition JSON from a URL and save to the tools directory.

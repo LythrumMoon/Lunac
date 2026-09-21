@@ -16,6 +16,7 @@ let _unlistenHotkeyRecorded: (() => void) | null = null; // Tauri event (for Alt
 
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
+import { refreshMarketPlugins, type MarketPluginInfo } from "../market";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
@@ -1721,20 +1722,53 @@ async function buildToolsSection(): Promise<string> {
       </div>`;
 }
 
-/** 「插件」分类 = **插件市场总览**（2026-09-19 批 9，用户明确要求）。
+/** 「插件」分类 = **插件市场总览**（2026-09-19 批 9，用户明确要求；2026-09-21 L1 起可装可卸）。
  *
  *  **与 AI 分类下的 tools 严格区分**：tools 是「AI Agent 能调用的自定义工具
  *  （MCP 桥）」，这里列的是 **Lunac 自己的插件**（结果区里能搜到、点开的那些）。
  *  此前两者混在同一个分类里，分类名还叫「插件 (MCP 工具)」—— 用户报的正是这里。
  *
- *  只读总览（用户选定）：图标 + 本地化名称 + 本地化描述 + 「打开」；
+ *  总览（上半）：图标 + 本地化名称 + 本地化描述 + 「打开」；
  *  **搜索关键词进 title 属性**（悬停可见），不铺在界面上 —— 关键词数组里
- *  中英混杂且动辄十几个，平铺会把面板糊成一片。 */
+ *  中英混杂且动辄十几个，平铺会把面板糊成一片。
+ *
+ *  第三方插件（下半，L1）：数据源是**插件目录扫描**而不是 registry —— 坏包（清单坏了、
+ *  入口丢了）根本没进 registry，但**必须在这里可见**，否则用户只会看到插件莫名消失、
+ *  手上没有任何线索。每行一个两段式确认的「卸载」。
+ */
 async function buildPluginsPane(): Promise<string> {
-  const rows = pluginRegistry.getAll().map(p => {
-    const icon = (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "";
-    const kw = p.keywords.join(" · ");
-    return `
+  const rows = pluginRegistry.getAll().map(pluginRowHtml).join("");
+  const { list, dir, error } = await readPluginMarket();
+  const dirRows = error
+    ? `<div class="settings-plugin-empty">${esc(t("settings.plugins_market_failed", { err: error }))}</div>`
+    : list.length === 0
+      ? `<div class="settings-plugin-empty">${t("settings.plugins_market_empty")}</div>`
+      : list.map(marketRowHtml).join("");
+
+  return `
+    <div class="settings-pane" data-pane="plugins" id="sp-plugins">
+      <div class="settings-pane-title">${t("settings.plugins")}</div>
+      <div class="settings-group-title">${t("settings.plugins_installed")}</div>
+      <div class="settings-plugin-list" id="settings-plugin-overview">${rows}</div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);line-height:1.5;margin:10px 0 0;">${t("settings.plugins_hint")}</div>
+      <div class="settings-group-title">${t("settings.plugins_market")}</div>
+      <div class="settings-market-install">
+        <input type="text" id="settings-plugin-url" class="settings-input" spellcheck="false"
+          placeholder="${esc(t("settings.plugins_market_url"))}" />
+        <button type="button" class="settings-btn" id="settings-plugin-install">${t("settings.plugins_market_install")}</button>
+      </div>
+      <div class="settings-plugin-list" id="settings-plugin-dir">${dirRows}</div>
+      <div class="settings-hint" id="settings-plugin-msg"></div>
+      <div class="settings-hint">${esc(t("settings.plugins_market_hint"))}</div>
+      <div class="settings-hint" title="${esc(dir)}">${esc(t("settings.plugins_market_dir", { path: dir }))}</div>
+    </div>`;
+}
+
+/** 插件总览的一行（内置与第三方都走这里 —— 它们注册后是同一份 registry）。 */
+function pluginRowHtml(p: Plugin): string {
+  const icon = (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "";
+  const kw = p.keywords.join(" · ");
+  return `
       <div class="settings-plugin-item" title="${esc(kw)}">
         <div class="settings-plugin-icon">${icon}</div>
         <div class="settings-plugin-info">
@@ -1743,15 +1777,139 @@ async function buildPluginsPane(): Promise<string> {
         </div>
         <button class="settings-install-btn" data-open-plugin="${esc(p.id)}">${t("settings.skill_open")}</button>
       </div>`;
-  }).join("");
+}
 
+/** 插件目录里的一行：名称 + 版本 + 来源 + 卸载（坏包多一行原因）。 */
+function marketRowHtml(p: MarketPluginInfo): string {
+  const name = p.version ? `${p.name} · v${p.version}` : p.name;
+  const src = p.homepage
+    ? `<span class="settings-market-src" title="${esc(p.homepage)}">${esc(p.homepage)}</span>`
+    : "";
+  const broken = p.valid
+    ? ""
+    : `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: p.error }))}</span>`;
   return `
-    <div class="settings-pane" data-pane="plugins" id="sp-plugins">
-      <div class="settings-pane-title">${t("settings.plugins")}</div>
-      <div class="settings-group-title">${t("settings.plugins_installed")}</div>
-      <div class="settings-plugin-list" id="settings-plugin-overview">${rows}</div>
-      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);line-height:1.5;margin:10px 0 0;">${t("settings.plugins_hint")}</div>
-    </div>`;
+      <div class="settings-market-row">
+        <div class="settings-plugin-info">
+          <span class="settings-plugin-name">${esc(name)}</span>
+          ${src}
+          ${broken}
+        </div>
+        <button class="settings-skill-del-installed" data-uninstall-plugin="${esc(p.id)}">${t("settings.plugins_market_uninstall")}</button>
+      </div>`;
+}
+
+/** 读插件目录：扫描结果 + 目录绝对路径；失败时把原因**原样**带回界面（不猜、不吞）。 */
+async function readPluginMarket(): Promise<{ list: MarketPluginInfo[]; dir: string; error: string }> {
+  try {
+    const [list, dir] = await Promise.all([
+      invoke<MarketPluginInfo[]>("list_installed_plugins"),
+      invoke<string>("plugins_dir_path"),
+    ]);
+    return { list, dir, error: "" };
+  } catch (e) {
+    return { list: [], dir: "", error: String(e) };
+  }
+}
+
+/** 重新画「已安装插件」总览（装完 / 卸完要立刻反映出来 —— 那是用户唯一能确认「真装上了」的地方）。 */
+function renderPluginOverview(container: HTMLElement) {
+  const el = container.querySelector<HTMLElement>("#settings-plugin-overview");
+  if (!el) return;
+  el.innerHTML = pluginRegistry.getAll().map(pluginRowHtml).join("");
+  bindOpenPluginButtons(el);
+}
+
+/** 总览每行的「打开」走 main.ts 的 `__lunac_open_plugin` 桥：设置面板不自己 executePlugin
+ *  （那要动结果区 / 搜索栏状态，属于主界面的职责）。重绘后必须重新绑 —— 新节点没有监听。 */
+function bindOpenPluginButtons(root: HTMLElement) {
+  root.querySelectorAll<HTMLElement>("[data-open-plugin]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.openPlugin;
+      if (id) (window as any).__lunac_open_plugin?.(id);
+    });
+  });
+}
+
+/** 插件目录那一段的绑定（L1）：安装 / 卸载 / 重绘。
+ *
+ *  装完**不必重启 AI 也不必刷前端** —— 第三方插件是前端的东西（与「技能改完要重启 agent」
+ *  是两回事），`refreshMarketPlugins()` 重注册一次就够了。 */
+function wirePluginMarket(container: HTMLElement) {
+  const listEl = container.querySelector<HTMLElement>("#settings-plugin-dir");
+  const urlInput = container.querySelector<HTMLInputElement>("#settings-plugin-url");
+  const installBtn = container.querySelector<HTMLButtonElement>("#settings-plugin-install");
+  if (!listEl || !installBtn) return;
+
+  // 提示行**每次现查节点**：容器整体重渲染会把 #settings-plugin-msg 整个换掉，缓存引用会写进空气里
+  const showMsg = (text: string, color: string) => {
+    const el = container.querySelector<HTMLElement>("#settings-plugin-msg");
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = color;
+  };
+
+  const render = async () => {
+    const { list, error } = await readPluginMarket();
+    listEl.innerHTML = error
+      ? `<div class="settings-plugin-empty">${esc(t("settings.plugins_market_failed", { err: error }))}</div>`
+      : list.length === 0
+        ? `<div class="settings-plugin-empty">${t("settings.plugins_market_empty")}</div>`
+        : list.map(marketRowHtml).join("");
+    listEl.querySelectorAll<HTMLButtonElement>("[data-uninstall-plugin]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.uninstallPlugin || "";
+        // 两段式确认（WebView2 下原生 confirm 不可靠，同技能删除的处置）
+        if (btn.dataset.armed !== "1") {
+          btn.dataset.armed = "1";
+          btn.textContent = t("settings.plugins_market_uninstall_confirm");
+          setTimeout(() => {
+            btn.dataset.armed = "";
+            btn.textContent = t("settings.plugins_market_uninstall");
+          }, 3000);
+          return;
+        }
+        try {
+          await invoke("uninstall_plugin", { id });
+          await refreshMarketPlugins();
+          renderPluginOverview(container);
+          await render();
+          showMsg(t("settings.plugins_market_uninstalled", { id }), "var(--yellow)");
+        } catch (e: any) {
+          showMsg(String(e), "var(--red)");
+        }
+      });
+    });
+  };
+
+  const install = async () => {
+    const url = (urlInput?.value || "").trim();
+    if (!url) {
+      showMsg(t("settings.enter_url"), "var(--yellow)");
+      return;
+    }
+    installBtn.disabled = true;
+    showMsg(t("settings.plugins_market_installing"), "var(--text-dim)");
+    try {
+      const id = await invoke<string>("install_plugin_from_url", { url });
+      if (urlInput) urlInput.value = "";
+      await refreshMarketPlugins();
+      renderPluginOverview(container);
+      await render();
+      showMsg(t("settings.plugins_market_installed_ok", { id }), "var(--green)");
+    } catch (e: any) {
+      showMsg(t("settings.plugins_market_install_failed", { err: String(e) }), "var(--red)");
+    } finally {
+      installBtn.disabled = false;
+    }
+  };
+  installBtn.addEventListener("click", install);
+  urlInput?.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      install();
+    }
+  });
 }
 
 // ── Listener attachment ──────────────────────────────────────────
@@ -1908,6 +2066,35 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       .settings-persona-text:focus { border-color: var(--accent-border); }
       .settings-persona-text::placeholder { color: var(--text-dim); opacity: 0.6; }
+      /* ── 插件市场（L1，2026-09-21）─────────────────────────────────
+         目录里的一行：名称 + 来源 + 卸载（坏包多一行原因）。
+         刻意与 .settings-plugin-item 分成两个类：那个是 registry 总览（行数被
+         agent-ui-spec §8 的回归清单钉着），而这里可能含坏包，混进同一个计数会
+         让「总览行数 == 插件数」这条断言变成假绿。 */
+      .settings-market-install {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0;
+      }
+      .settings-market-install .settings-input { flex: 1; min-width: 0; }
+      .settings-market-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        transition: background 0.1s;
+      }
+      .settings-market-row:hover { background: rgba(var(--ink-rgb), 0.04); }
+      .settings-market-src {
+        color: var(--text-dim);
+        font-size: 0.68rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .settings-market-broken { color: var(--yellow); font-size: 0.68rem; }
       .settings-btn {
         flex-shrink: 0;
         padding: 5px 10px;
@@ -3090,15 +3277,10 @@ export async function attachSettingsListeners(container: HTMLElement) {
     setupCustomDropdown(searchEngineDD, () => {}); // onChange is no-op, save button handles persistence
   }
 
-  // ── 插件总览：每行的「打开」按钮（2026-09-19 批 9）──────────────
-  // 走 main.ts 的 __lunac_open_plugin 桥：设置面板不能自己 executePlugin
-  // （那要动结果区 / 搜索栏状态，属于主界面的职责）。
-  container.querySelectorAll<HTMLElement>("[data-open-plugin]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.openPlugin;
-      if (id) (window as any).__lunac_open_plugin?.(id);
-    });
-  });
+  // ── 插件总览：每行的「打开」按钮（2026-09-19 批 9）── 绑定抽成函数，重绘后要再绑一次
+  bindOpenPluginButtons(container);
+  // ── 插件市场（L1，2026-09-21）：安装 / 卸载 / 重绘 ──────────────
+  wirePluginMarket(container);
 
   // ── 用量与成本（A12）─────────────────────────────────────────
   // 分块自己会重渲染（确认 / 放弃候选价格之后），所以绑定的入口是个函数，

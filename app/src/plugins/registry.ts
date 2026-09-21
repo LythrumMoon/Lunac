@@ -141,6 +141,17 @@ class PluginRegistry {
     }
   }
 
+  /** 摘掉一个已注册的插件（**按 id**）。
+   *
+   *  为什么需要它（L1，2026-09-21）：第三方插件是**运行时**从磁盘注册进来的，用户装完 / 卸载后
+   *  要重新同步一次。registry 本身不去重，直接二次 `register()` 会让结果区出现两行同名插件；
+   *  所以「重新注册」的正确姿势永远是 `unregister(id)` → `register(plugin)`。
+   *  （内置插件不需要它：它们在启动时注册一次，之后不再变。） */
+  unregister(id: string) {
+    const i = this.plugins.findIndex(p => p.id === id);
+    if (i >= 0) this.plugins.splice(i, 1);
+  }
+
   /** Search plugins by query. Uses fuzzy matching + keyword index + pinyin. */
   search(query: string): Plugin[] {
     const q = query.toLowerCase().trim();

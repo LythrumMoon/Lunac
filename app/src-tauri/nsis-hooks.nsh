@@ -10,6 +10,7 @@
   RMDir /r "$INSTDIR\temp"
   RMDir /r "$INSTDIR\skills"
   RMDir /r "$INSTDIR\tools"
+  RMDir /r "$INSTDIR\plugins"
   RMDir /r "$INSTDIR\config"
   RMDir /r "$INSTDIR\paddle-ocr"
 

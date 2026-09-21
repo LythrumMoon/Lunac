@@ -12,6 +12,7 @@ mod system_catalog;
 mod icon_extractor;
 mod proxy_server;
 mod storage;
+mod plugin_market;
 mod chat_db;
 mod appearance;
 mod auto_start;
@@ -45,6 +46,7 @@ use commands::{
     download_tool_from_url,
     list_installed_skills, read_skill_file, save_skill_file, delete_skill,
     import_skill_content, install_skill_from_url,
+    list_installed_plugins, install_plugin_from_url, uninstall_plugin, plugins_dir_path,
     run_ocr,
     save_temp_image,
     delete_temp_image,
@@ -477,6 +479,10 @@ fn main() {
             delete_skill,
             import_skill_content,
             install_skill_from_url,
+            list_installed_plugins,
+            install_plugin_from_url,
+            uninstall_plugin,
+            plugins_dir_path,
             run_ocr,
             save_temp_image,
             delete_temp_image,

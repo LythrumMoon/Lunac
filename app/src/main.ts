@@ -8,6 +8,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
+import { refreshMarketPlugins } from "./plugins/market";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
 
@@ -1642,6 +1643,9 @@ function forceResetPluginUI() {
   loadSavedLanguage();
   applyI18nToStaticUI();
   registerBuiltinPlugins();
+  // 第三方插件（L1）：扫 `<exe 根>\plugins\` 并注册进同一个 registry —— 放在状态行之前，
+  // 让「插件 N」把第三方也算上（结果区能搜到的就是这一份）。失败不抛（只记控制台）。
+  await refreshMarketPlugins();
   statusText.textContent = t("status.plugin_count", { count: String(pluginRegistry.getAll().length) });
 
   // 预热备忘录标识检索索引（供搜索栏“标识直达编辑”使用）
