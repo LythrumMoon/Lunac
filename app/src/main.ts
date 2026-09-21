@@ -107,6 +107,25 @@ const chatToolsTitle = el("chat-tools-title");
 const chatToolsList = el("chat-tools-list");
 const chatToolsSave = el("chat-tools-save");
 const chatToolsMsg = el("chat-tools-msg");
+// 人格 / 自定义提示词（L2）搬进「更多设置」后的节点（2026-09-21）
+const chatPersonaLabel = el("chat-persona-label");
+const chatPersonaEdit = el("chat-persona-edit") as HTMLButtonElement;
+const chatPersonaBox = el("chat-persona-box");
+const chatPersonaHint = el("chat-persona-hint");
+const chatPersonaText = el("chat-persona-text") as HTMLTextAreaElement;
+const chatPersonaSave = el("chat-persona-save") as HTMLButtonElement;
+const chatPersonaReset = el("chat-persona-reset") as HTMLButtonElement;
+const chatPersonaRestart = el("chat-persona-restart") as HTMLButtonElement;
+const chatPersonaMsg = el("chat-persona-msg");
+// 任务抽屉（2026-09-21）：输入框上方那条小抽屉的六个节点，见 renderTodoDrawer()
+const todoDrawer = el("todo-drawer");
+const todoDrawerTitle = el("todo-drawer-title");
+const todoDrawerProgress = el("todo-drawer-progress");
+const todoDrawerTasks = el("todo-drawer-tasks");
+const todoDrawerFiles = el("todo-drawer-files");
+const todoDrawerTasksBtn = el("todo-drawer-tasks-btn") as HTMLButtonElement;
+const todoDrawerFilesBtn = el("todo-drawer-files-btn") as HTMLButtonElement;
+const todoDrawerOkBtn = el("todo-drawer-ok-btn") as HTMLButtonElement;
 
 // ── 窗口尺寸 —— 实测驱动（方案A，修复「窗口尺寸与结果区渲染区域不一致」）──
 // 设计宽度 800px；窗口可拖拽缩放（tauri.conf resizable:true），宽度变化经
@@ -890,6 +909,7 @@ function renderMoreMenuLabels() {
   if (chatMoreWorkspaceLabel) chatMoreWorkspaceLabel.textContent = t("settings.workspace");
   renderWorkspaceMenuLabels();
   renderToolsBlacklistLabels();
+  renderPersonaLabels();
 }
 
 /** 打开菜单时把各行的动态状态刷新一遍。 */
@@ -1184,8 +1204,9 @@ function restoreSession(session: ChatSession) {
   renderChatLogHtml();
   // 过程快照：每个回合的过程块插到该回合的助手气泡之后（可折叠）
   renderHistoryProcess(session);
-  // 「本次会话改动过的文件」由过程快照重建（必须在 renderChatLogHtml() 之后 —— 那次调用
-  // 会重建 #chat-log，面板挂在它里面）。backlog §8.1。
+  // 「本次会话改动过的文件」由过程快照重建（任务抽屉的唯一数据源之一，见 renderTodoDrawer）。
+  // 待办清单重建不出来（它不落盘），所以**同时清空** —— 否则切会话会看到上一个会话的任务。
+  // backlog §8.1。
   rebuildChangedFilesFromSteps(sessionSteps);
   statusText.textContent = t("status.history_restored");
   // 把该会话的历史灌回 agent：恢复只是重建了 DOM，agent 侧还留着它自己上一段对话的
@@ -1273,7 +1294,7 @@ function clipStep(s: string, n = STEP_MAX): string {
 function recordTurnSteps(flowEl: HTMLElement) {
   const items: SessionStep[] = [];
   flowEl
-    .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card, .todo-panel")
+    .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card")
     .forEach(el => {
       if (items.length >= STEPS_PER_TURN_MAX) return;
       if (el.classList.contains("think-block")) {
@@ -1282,7 +1303,7 @@ function recordTurnSteps(flowEl: HTMLElement) {
       } else if (el.classList.contains("agent-text")) {
         const text = clipStep(el.textContent || "");
         if (text) items.push({ kind: "text", detail: text });
-      } else if (el.classList.contains("tool-card")) {
+      } else {
         items.push({
           kind: "tool",
           name: el.querySelector(".tool-name")?.textContent?.trim() || "",
@@ -1293,10 +1314,6 @@ function recordTurnSteps(flowEl: HTMLElement) {
           // 重建「本次会话改动过的文件」列表。**不从 detail 文本里解析路径**。
           path: el.dataset.file || undefined,
         });
-      } else {
-        // TodoWrite 面板：把清单文本压成一行留痕
-        const text = clipStep((el.textContent || "").replace(/\s+/g, " "));
-        if (text) items.push({ kind: "text", detail: text });
       }
     });
   if (items.length) sessionSteps.push({ turn: sessionSteps.length + 1, items });
@@ -1508,7 +1525,7 @@ async function rollbackChat(idx: number) {
   queueAgentHistory(chatHistory);
   // 4) Re-render
   renderChatLogHtml();
-  // 「改动过的文件」跟着过程快照重建（`renderChatLogHtml()` 会重建 #chat-log，必须排在它之后）。
+  // 「改动过的文件」跟着过程快照重建（写进任务抽屉，见 renderTodoDrawer）。
   // 注：`sessionSteps` 本身不随回退裁剪（既有行为），所以这里通常与回退前一致 ——
   // 但它保证「列表 = 记录里真实存在的改动」这一条恒成立，不依赖调用顺序。
   rebuildChangedFilesFromSteps(sessionSteps);
@@ -1905,9 +1922,13 @@ async function newConversation(skipCliRestart = false) {
   // 新对话 → 过程快照也重新开始（旧会话的已随它自己的记录落盘）
   sessionSteps = [];
   // 「改动过的文件」跟着同一条生命周期（它本来就是从过程快照推导出来的）——
-  // 不跟着清会看到上一次对话改的文件还挂在列表里。
+  // 不跟着清会看到上一次对话改的文件还挂在列表里。待办清单同理（它是下一条
+  // TodoWrite 才会重新建立的临时状态）。两者都装在任务抽屉里，清完即收起。
   sessionChangedFiles = [];
-  renderChangedFilesPanel();
+  todoItems = [];
+  todoTasksOpen = false;
+  todoFilesOpen = false;
+  renderTodoDrawer();
 
   // Restart CLI to clear accumulated conversation context.
   // Without this, the CLI retains all previous messages in its
@@ -2283,6 +2304,83 @@ function renderToolsBlacklistLabels() {
   if (chatToolsSave) chatToolsSave.textContent = t("chat.tools_save");
 }
 
+// ── 人格 / 自定义提示词（L2，2026-09-21 从设置面板搬进「更多设置」）───────
+// 形体：一段纯文本落 `config\persona.md`，agent **启动时读一次**、拼进系统提示词的固定段
+// （内置人格之后）。改的正是固定前缀，所以**刻意不做热更新** —— 热读会让系统提示词每轮
+// 都变、把端点侧缓存整段打掉（ai-spec §11 规则 18/23）。保存后必须重启 AI 才生效，界面
+// 如实写明，并给一个「重启 AI」按钮（复用 `window.__lunac_reload_agent`）。
+// 为什么从设置面板搬来这里：它是进阶/一次性的配置，不该常驻占设置面板一整块；
+// 描述也只留一句（用户要求「所有描述都得精简」）。
+// 另有一条硬约束在提示里说明：这段**不进**子代理与后台复盘。
+interface PersonaState { path: string; text: string; maxChars: number }
+
+/** 上限的唯一真相源是宿主（`storage::MAX_PERSONA_CHARS`）—— 这里只做回显与 maxlength。 */
+let personaMax = 8000;
+/** 每次进程内只装载一次：避免「收起再展开」把用户没保存的草稿冲掉。 */
+let personaLoaded = false;
+
+function renderPersonaLabels() {
+  chatPersonaLabel.textContent = t("settings.persona_title");
+  chatPersonaEdit.textContent = t("settings.persona_edit");
+  chatPersonaSave.textContent = t("settings.persona_save");
+  chatPersonaReset.textContent = t("settings.persona_reset");
+  chatPersonaRestart.textContent = t("settings.persona_restart");
+  chatPersonaHint.textContent = t("settings.persona_hint", { max: String(personaMax) });
+}
+
+async function loadPersona() {
+  try {
+    const state = await invoke<PersonaState>("get_persona");
+    personaMax = state.maxChars || personaMax;
+    chatPersonaText.maxLength = personaMax;
+    chatPersonaText.value = state.text || "";
+  } catch {
+    /* 读不到就留空：用户照样能写，保存走宿主校验，不必在这里报错 */
+  }
+  chatPersonaText.placeholder = t("settings.persona_placeholder");
+  renderPersonaLabels();
+}
+
+async function savePersona(text: string, okMsg: string) {
+  try {
+    await invoke("set_persona", { text });
+    // 保存 ≠ 生效：改的是系统提示词的固定前缀，得重启 agent 才读得到（如实告知）
+    chatPersonaMsg.textContent = okMsg + t("settings.persona_takes_effect");
+  } catch (e) {
+    chatPersonaMsg.textContent = t("settings.persona_failed", { err: String(e) });
+  }
+}
+
+chatPersonaEdit?.addEventListener("click", async () => {
+  const willOpen = chatPersonaBox.classList.contains("hidden");
+  chatPersonaBox.classList.toggle("hidden", !willOpen);
+  chatPersonaEdit.classList.toggle("open", willOpen);
+  if (willOpen && !personaLoaded) {
+    personaLoaded = true;
+    await loadPersona();
+  }
+});
+chatPersonaSave?.addEventListener("click", () => {
+  void savePersona(chatPersonaText.value, t("settings.persona_saved"));
+});
+chatPersonaReset?.addEventListener("click", async () => {
+  chatPersonaText.value = "";
+  await savePersona("", t("settings.persona_reset_done"));
+});
+chatPersonaRestart?.addEventListener("click", async () => {
+  const fn = (window as any).__lunac_reload_agent;
+  if (typeof fn !== "function") {
+    chatPersonaMsg.textContent = t("settings.persona_failed", { err: "reload hook missing" });
+    return;
+  }
+  try {
+    await fn();
+    chatPersonaMsg.textContent = t("settings.persona_restarted");
+  } catch (e) {
+    chatPersonaMsg.textContent = t("settings.persona_failed", { err: String(e) });
+  }
+});
+
 // ── 「更多」菜单开关（思考 / 运行方式 / 工作区 / 工具黑名单四行）─────
 function closeMoreMenu() {
   chatMoreMenu?.classList.add("hidden");
@@ -2391,6 +2489,7 @@ function renderDrawerHistory(sessions: ChatSession[]) {
 
 chatHistoryBtn.addEventListener("click", () => toggleDrawer());
 chatDrawerClose.addEventListener("click", () => toggleDrawer(false));
+attachTodoDrawer();
 
 function sendChatMessage() {
   const text = chatInput.value.trim();
@@ -3482,7 +3581,7 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, to
     v.curToolArgs = "";
     v.curToolId = toolId || "";
     if (v.curToolName === "TodoWrite") {
-      // 待办清单单独画成一块面板（见 renderTodoPanel），不占命令卡片
+      // 待办清单一律交给输入框上方的任务抽屉（见 renderTodoDrawer），不占命令卡片
       v.current = null;
       v.openCard = null;
     } else {
@@ -3617,14 +3716,15 @@ function pathDir(p: string): string {
   return i > 0 ? p.slice(0, i) : "";
 }
 
-/** 记一笔改动并刷新面板（同一路径只留一次）。 */
+/** 记一笔改动并刷新抽屉（同一路径只留一次）。 */
 function noteChangedFile(path: string) {
   if (!path || sessionChangedFiles.includes(path)) return;
   sessionChangedFiles.push(path);
-  renderChangedFilesPanel();
+  renderTodoDrawer();
 }
 
-/** 由过程快照重建列表（恢复 / 回退历史后调用）：只有带 `path` 的步骤才算真改动。 */
+/** 由过程快照重建列表（恢复 / 回退历史后调用）：只有带 `path` 的步骤才算真改动。
+ *  顺便清掉待办清单 —— 它不落盘、无法从快照重建，留着就是「上一个会话的残留」。 */
 function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
   const out: string[] = [];
   for (const g of steps) {
@@ -3633,50 +3733,112 @@ function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
     }
   }
   sessionChangedFiles = out;
-  renderChangedFilesPanel();
+  todoItems = [];
+  todoTasksOpen = false;
+  renderTodoDrawer();
 }
 
-/** 一次可点的文件链接。工具卡与面板共用同一套类名，点击走下面那个委托监听。 */
+/** 一次可点的文件链接。工具卡与抽屉共用同一套类名，点击走下面那个委托监听。 */
 function fileLinkHtml(path: string): string {
   return `<a class="file-link" data-path="${esc(path)}" title="${esc(t("agent.reveal_in_explorer"))}">${esc(path)}</a>`;
 }
 
-/** 「本次会话改动过的文件」面板：只在有改动时出现，始终贴在对话流末尾。
- *  用 `appendChild` 复用**同一个**节点 —— 它会把已存在的节点移到末尾，于是新回合开始时
- *  面板自动跟在最新内容之后（不重排历史块，只移动自己这一个节点）。 */
-function renderChangedFilesPanel() {
-  const log = document.getElementById("chat-log");
-  if (!log) return;
-  let panel = log.querySelector<HTMLElement>(".changed-files-card");
-  if (sessionChangedFiles.length === 0) {
-    panel?.remove();
-    return;
+// ── 任务抽屉（2026-09-21）────────────────────────────────────────────
+// 待办清单与「本次会话改动过的文件」统一收进**输入框上方那条小抽屉**
+// （index.html 的 #todo-drawer）。
+//
+// 为什么不画在对话链路里：TodoWrite 每轮都重发完整清单、就地重绘，夹在思考与命令卡
+// 之间会把真正的对话内容挤散（用户要求「提取出来」）。抽屉展示的是**状态**、不是对话
+// 内容，所以它也**不进回合快照**（`recordTurnSteps` 已不再收 `.todo-panel`）。
+//
+// 抽屉只有四件东西（用户指定）：标题、进度文本（N/M 已完成）、两个展开按钮
+// （详细任务 / 更改文件）、确认按钮。**全程无图标** —— `📋 ✔ ◐ ○` 一律去掉，
+// 状态只用文字颜色区分。两个列表互斥展开（同时铺开会把抽屉撑高、把输入框顶下去）。
+// 确认 = 收工：清空待办并收起任务列表；改动文件列表保留（用户可能还要去定位文件）。
+
+/** 最近一次 TodoWrite 的完整清单（抽屉重绘的唯一数据源）。 */
+let todoItems: unknown[] = [];
+/** 两个列表的展开状态：跨重绘保留 —— 用户点开了就别自己收回去。 */
+let todoTasksOpen = false;
+let todoFilesOpen = false;
+
+function renderTodoDrawer() {
+  const hasTasks = todoItems.length > 0;
+  const hasFiles = sessionChangedFiles.length > 0;
+  // 没内容就整块不显示（用户要求：只有里面有内容时抽屉才出现）
+  todoDrawer.classList.toggle("hidden", !hasTasks && !hasFiles);
+  if (!hasTasks && !hasFiles) return;
+
+  todoDrawerTitle.textContent = t("agent.todo_title");
+
+  let done = 0;
+  for (const raw of todoItems) {
+    if ((raw as { status?: unknown } | null)?.status === "completed") done++;
   }
-  if (!panel) {
-    panel = document.createElement("details");
-    panel.className = "changed-files-card";
-    panel.innerHTML =
-      `<summary class="changed-files-head"></summary>` + `<ul class="changed-files-list"></ul>`;
-  }
-  const head = panel.querySelector(".changed-files-head");
-  if (head) head.textContent = t("agent.changed_files", { n: String(sessionChangedFiles.length) });
-  const ul = panel.querySelector(".changed-files-list");
-  if (ul) {
-    const hint = esc(t("agent.reveal_in_explorer"));
-    ul.innerHTML = sessionChangedFiles
-      .map(
-        (p) =>
-          `<li class="changed-file">` +
-          `<a class="file-link" data-path="${esc(p)}" title="${hint}">${esc(pathBase(p))}</a>` +
-          `<span class="changed-file-dir" title="${esc(p)}">${esc(pathDir(p))}</span>` +
-          `</li>`
-      )
-      .join("");
-  }
-  log.appendChild(panel); // 移到末尾（新回合开始后仍贴在最新内容之后）
+  todoDrawerProgress.textContent = hasTasks
+    ? t("agent.todo_progress", { d: String(done), n: String(todoItems.length) })
+    : "";
+
+  todoDrawerTasks.innerHTML = todoItems
+    .map((raw) => {
+      const o = (raw ?? {}) as { content?: unknown; status?: unknown };
+      const text = typeof o.content === "string" ? o.content : "";
+      const status = o.status === "completed" || o.status === "in_progress" ? o.status : "pending";
+      return `<li class="todo-item ${status}">${esc(text)}</li>`;
+    })
+    .join("");
+  todoDrawerTasks.classList.toggle("hidden", !(hasTasks && todoTasksOpen));
+
+  const hint = esc(t("agent.reveal_in_explorer"));
+  todoDrawerFiles.innerHTML = sessionChangedFiles
+    .map(
+      (p) =>
+        `<li class="changed-file">` +
+        `<a class="file-link" data-path="${esc(p)}" title="${hint}">${esc(pathBase(p))}</a>` +
+        `<span class="changed-file-dir" title="${esc(p)}">${esc(pathDir(p))}</span>` +
+        `</li>`
+    )
+    .join("");
+  todoDrawerFiles.classList.toggle("hidden", !(hasFiles && todoFilesOpen));
+
+  setTodoDrawerBtn(todoDrawerTasksBtn, hasTasks, t("agent.todo_tasks_btn"), todoTasksOpen);
+  setTodoDrawerBtn(
+    todoDrawerFilesBtn,
+    hasFiles,
+    t("agent.changed_files", { n: String(sessionChangedFiles.length) }),
+    todoFilesOpen
+  );
+  todoDrawerOkBtn.textContent = t("agent.todo_ok_btn");
+  agentScroll();
 }
 
-// 事件委托：`.file-link` 都是**动态重绘**的（面板每次重画、工具卡随流式增量重写），
+/** 抽屉里的展开按钮共用：有内容才显示，展开态加 `.open`（底色实一档）。 */
+function setTodoDrawerBtn(b: HTMLButtonElement, enabled: boolean, label: string, open: boolean) {
+  b.textContent = label;
+  b.classList.toggle("hidden", !enabled);
+  b.classList.toggle("open", enabled && open);
+}
+
+/** 抽屉三个按钮的行为：开合 / 收起。状态只写在上面两个变量里，重绘即生效。 */
+function attachTodoDrawer() {
+  todoDrawerTasksBtn.addEventListener("click", () => {
+    todoTasksOpen = !todoTasksOpen;
+    if (todoTasksOpen) todoFilesOpen = false; // 两个列表不并存
+    renderTodoDrawer();
+  });
+  todoDrawerFilesBtn.addEventListener("click", () => {
+    todoFilesOpen = !todoFilesOpen;
+    if (todoFilesOpen) todoTasksOpen = false;
+    renderTodoDrawer();
+  });
+  todoDrawerOkBtn.addEventListener("click", () => {
+    todoItems = [];
+    todoTasksOpen = false;
+    renderTodoDrawer();
+  });
+}
+
+// 事件委托：`.file-link` 都是**动态重绘**的（抽屉每次重画、工具卡随流式增量重写），
 // 逐个绑监听会在重绘后全部失效 —— 挂在 document 上一次即可。
 document.addEventListener("click", (e) => {
   const link = (e.target as HTMLElement | null)?.closest<HTMLElement>(".file-link");
@@ -3718,30 +3880,12 @@ function parseTodoArgs(raw: string): unknown[] | null {
   }
 }
 
-/** 画 TodoWrite 的待办面板：模型每轮发**完整**清单，这里就地重绘同一块面板，
- *  所以同一轮里多次 TodoWrite 只留最后一份状态，不会堆成一摞。 */
+/** 收到一份新的 TodoWrite 清单 → 交给抽屉（见 renderTodoDrawer）。
+ *  模型每轮发的是**完整**清单，所以这里整体替换即可：同一轮里多次 TodoWrite 只留最后
+ *  一份状态，既不堆成一摞，也不再往对话链路里塞面板。 */
 function renderTodoPanel(todos: unknown[]) {
-  const v = agentView;
-  if (!v) return;
-  let panel = v.flow.querySelector<HTMLElement>(".todo-panel");
-  if (!panel) {
-    panel = document.createElement("div");
-    panel.className = "todo-panel";
-    panel.innerHTML = `<div class="todo-head">📋 <span class="todo-title"></span></div><ul class="todo-list"></ul>`;
-    v.flow.appendChild(panel);
-  }
-  const title = panel.querySelector(".todo-title");
-  if (title) title.textContent = t("agent.todo_title");
-  const ul = panel.querySelector(".todo-list");
-  if (!ul) return;
-  ul.innerHTML = todos.map((raw) => {
-    const o = (raw ?? {}) as { content?: unknown; status?: unknown };
-    const text = typeof o.content === "string" ? o.content : "";
-    const status = o.status === "completed" || o.status === "in_progress" ? o.status : "pending";
-    const mark = status === "completed" ? "✔" : status === "in_progress" ? "◐" : "○";
-    return `<li class="todo-item todo-${status}"><span class="todo-mark">${mark}</span><span class="todo-text">${esc(text)}</span></li>`;
-  }).join("");
-  agentScroll();
+  todoItems = todos;
+  renderTodoDrawer();
 }
 
 function agentCloseBlock() {
@@ -6276,7 +6420,7 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
 
       // 只有这一轮真的产生了「过程」才给折叠按钮
       const processEls = flowEl.querySelectorAll(
-        ".think-block, .tool-card, .tool-row, .todo-panel, .subtask-panel, .sys-note",
+        ".think-block, .tool-card, .tool-row, .subtask-panel, .sys-note",
       );
       if (processEls.length > 0) {
         const foldBtn = doc("button");

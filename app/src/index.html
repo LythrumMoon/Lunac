@@ -176,6 +176,21 @@
       <div id="chat-drawer-list"></div>
     </div>
     <div id="results-list"></div>
+      <!-- 任务抽屉（2026-09-21）：待办清单**不再占用对话链路**，改成输入框上方的一条小抽屉。
+           没有内容（既无待办、也无改动文件）时整块隐藏；「确认」= 收工，清空并收起抽屉。
+           结构：标题 + 进度文本 + 三个按钮（详细任务 / 更改文件 / 确认）+ 两个可展开的列表。
+           图标（`✔ ◐ ○` 与 `📋`）按用户要求全部去掉，状态只用文字颜色区分。 -->
+      <div id="todo-drawer" class="hidden">
+        <div id="todo-drawer-head">
+          <span id="todo-drawer-title"></span>
+          <span id="todo-drawer-progress"></span>
+          <button id="todo-drawer-tasks-btn" type="button"></button>
+          <button id="todo-drawer-files-btn" type="button"></button>
+          <button id="todo-drawer-ok-btn" type="button"></button>
+        </div>
+        <ul id="todo-drawer-tasks" class="todo-items hidden"></ul>
+        <ul id="todo-drawer-files" class="todo-items hidden"></ul>
+      </div>
       <!-- Chat input bar (visible when AI chat is active) -->
       <div id="chat-input-bar" class="hidden">
         <!-- Chat file chips — same as search bar chips, shown in AI mode -->
@@ -291,6 +306,26 @@
                 <div class="chat-tools-actions">
                   <button id="chat-tools-save" type="button"></button>
                   <span id="chat-tools-msg" class="chat-tools-msg"></span>
+                </div>
+              </div>
+              <!-- 人格 / 自定义提示词（L2，2026-09-21 从设置面板搬进「更多设置」）：
+                   进阶用户才会改的一段固定文本，不占设置面板；描述压成一句。 -->
+              <div class="chat-more-row chat-more-block">
+                <span class="chat-more-label" id="chat-persona-label"></span>
+                <div class="chat-more-actions">
+                  <button id="chat-persona-edit" type="button"></button>
+                </div>
+              </div>
+              <div id="chat-persona-box" class="chat-persona-box hidden">
+                <div class="chat-persona-hint" id="chat-persona-hint"></div>
+                <textarea id="chat-persona-text" class="chat-persona-text" spellcheck="false"></textarea>
+                <div class="chat-persona-foot">
+                  <div class="chat-more-actions">
+                    <button id="chat-persona-save" type="button"></button>
+                    <button id="chat-persona-reset" type="button"></button>
+                    <button id="chat-persona-restart" type="button"></button>
+                  </div>
+                  <span id="chat-persona-msg" class="chat-persona-msg"></span>
                 </div>
               </div>
             </div>

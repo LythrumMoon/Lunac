@@ -1583,6 +1583,22 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "자동 시작",
     "en": "Auto-start",
   },
+  // 开机项指向别的程序（实测：开机弹 cmd、界面是旧的）→ 提示 + 一次性提权修复。
+  // 描述按「所有描述都得精简」的要求压成一句。
+  "settings.auto_start_stale": {
+    "zh-CN": "开机项指向旧程序（开机可能弹命令行窗口）",
+    "zh-TW": "開機項指向舊程式（開機可能彈命令列視窗）",
+    "ja": "起動項目が古いプログラムを指しています（起動時にコマンド窓が出ることがあります）",
+    "ko": "시작 항목이 이전 프로그램을 가리킵니다(부팅 시 명령 창이 뜰 수 있음)",
+    "en": "Startup entry points at an old build (a console window may appear at boot)",
+  },
+  "settings.auto_start_fix": {
+    "zh-CN": "修复",
+    "zh-TW": "修復",
+    "ja": "修復",
+    "ko": "복구",
+    "en": "Fix",
+  },
   "settings.general": {
     "zh-CN": "常规",
     "zh-TW": "一般",
@@ -2137,12 +2153,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "완전",
     "en": "Full",
   },
+  // 描述精简（2026-09-21，用户要求「所有描述都得精简」）：一句说完，不再逐档解释。
   "settings.security_profile_hint": {
-    "zh-CN": "运行方式（输入栏胶囊）决定「问不问」，安全档位决定「允不允许」：只读档直接拒绝写操作，完全档忽略工作区限制。切换会重启 Agent。",
-    "zh-TW": "執行方式（輸入欄膠囊）決定「問不問」，安全檔位決定「允不允許」：唯讀檔直接拒絕寫入，完全檔忽略工作區限制。切換會重啟 Agent。",
-    "ja": "実行モード（入力欄のカプセル）は「確認するか」、セキュリティ段階は「許可するか」を決めます。読み取り専用は書き込みを拒否し、完全はワークスペース制限を無視します。切り替えると Agent を再起動します。",
-    "ko": "실행 방식(입력줄 캡슐)은 '물어볼지', 보안 단계는 '허용할지'를 정합니다. 읽기 전용은 쓰기를 거부하고, 완전은 작업 공간 제한을 무시합니다. 전환하면 Agent가 재시작됩니다.",
-    "en": "Run mode (the pill in the input bar) decides whether to ask; the security level decides what is allowed — read-only rejects writes outright, full ignores the workspace limit. Switching restarts the agent.",
+    "zh-CN": "档位决定写操作是否被自动放行；切换会重启 Agent。",
+    "zh-TW": "檔位決定寫入是否自動放行；切換會重啟 Agent。",
+    "ja": "段階は書き込みを自動許可するかを決めます。切り替えると Agent を再起動します。",
+    "ko": "단계는 쓰기 자동 허용 여부를 정합니다. 전환하면 Agent가 재시작됩니다.",
+    "en": "The level decides whether writes are auto-approved. Switching restarts the agent.",
   },
   "settings.ai_vision": {
     "zh-CN": "模型支持图片输入",
@@ -2151,48 +2168,8 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "모델이 이미지 입력 지원",
     "en": "Model accepts image input",
   },
-  "settings.ai_vision_hint": {
-    "zh-CN": "只有当前模型真的能看图时才打开：打开后附件里的图片（PNG / JPEG / GIF / WebP）会作为图片内容直接发给模型；关着时只把路径当文本给它。发给不支持图片的端点会直接报错（DeepSeek 官方端点不支持）。",
-    "zh-TW": "只有當前模型真的能看圖時才開啟：開啟後附件裡的圖片（PNG / JPEG / GIF / WebP）會作為圖片內容直接傳給模型；關著時只把路徑當文字給它。傳給不支援圖片的端點會直接報錯（DeepSeek 官方端點不支援）。",
-    "ja": "現在のモデルが実際に画像を扱える場合のみオンにしてください。オンにすると添付画像（PNG / JPEG / GIF / WebP）が画像そのものとして送信されます。オフの場合はパスのみをテキストで渡します。画像非対応のエンドポイントに送るとエラーになります（DeepSeek 公式エンドポイントは非対応）。",
-    "ko": "현재 모델이 실제로 이미지를 볼 수 있을 때만 켜세요. 켜면 첨부 이미지(PNG / JPEG / GIF / WebP)가 이미지 자체로 전송됩니다. 끄면 경로만 텍스트로 전달합니다. 이미지를 지원하지 않는 엔드포인트로 보내면 오류가 납니다(DeepSeek 공식 엔드포인트는 미지원).",
-    "en": "Turn this on only if the current model can actually see images: attachments (PNG / JPEG / GIF / WebP) are then sent as real image content. When off, only their paths go to the model as text. Sending images to an endpoint that does not support them fails outright (the official DeepSeek endpoint does not).",
-  },
-  "settings.hooks": {
-    "zh-CN": "权限 hooks",
-    "zh-TW": "權限 hooks",
-    "ja": "権限 hooks",
-    "ko": "권한 hooks",
-    "en": "Permission hooks",
-  },
-  "settings.hooks_hint": {
-    "zh-CN": "允许你自己的脚本在 8 个事件上介入 agent：PreToolUse / PermissionRequest 可拦可放一次工具调用，PostToolUse 把补充信息交回模型，UserPromptSubmit 可拦下整轮提问，另有 SessionStart / PreCompact / Stop / SessionEnd。脚本写在 config\\hooks.json，改完即时生效、不必重启 agent。",
-    "zh-TW": "允許你自己的腳本在 8 個事件上介入 agent：PreToolUse / PermissionRequest 可攔可放一次工具呼叫，PostToolUse 把補充資訊交回模型，UserPromptSubmit 可攔下整輪提問，另有 SessionStart / PreCompact / Stop / SessionEnd。腳本寫在 config\\hooks.json，改完即時生效、不必重啟 agent。",
-    "ja": "自分のスクリプトを 8 つのイベントで agent に介入させます。PreToolUse / PermissionRequest はツール呼び出しを拒否も許可もでき、PostToolUse は補足情報をモデルに返し、UserPromptSubmit は質問全体を止められます。ほかに SessionStart / PreCompact / Stop / SessionEnd。設定は config\\hooks.json に書き、変更は即時反映（agent の再起動は不要）。",
-    "ko": "직접 만든 스크립트를 8개 이벤트에서 agent에 개입시킵니다. PreToolUse / PermissionRequest는 도구 호출을 막거나 허용할 수 있고, PostToolUse는 보충 정보를 모델에 돌려주며, UserPromptSubmit은 질문 한 회차를 막을 수 있습니다. 그 밖에 SessionStart / PreCompact / Stop / SessionEnd. 설정은 config\\hooks.json에 작성하며 변경은 즉시 반영됩니다(agent 재시작 불필요).",
-    "en": "Let your own scripts step into the agent on 8 events: PreToolUse / PermissionRequest can deny or allow a tool call, PostToolUse hands extra context back to the model, UserPromptSubmit can block a whole prompt, plus SessionStart / PreCompact / Stop / SessionEnd. Scripts live in config\\hooks.json and take effect immediately (no agent restart).",
-  },
-  "settings.hooks_open": {
-    "zh-CN": "打开 hooks.json",
-    "zh-TW": "開啟 hooks.json",
-    "ja": "hooks.json を開く",
-    "ko": "hooks.json 열기",
-    "en": "Open hooks.json",
-  },
-  "settings.hooks_invalid": {
-    "zh-CN": "hooks.json 解析失败：{err}",
-    "zh-TW": "hooks.json 解析失敗：{err}",
-    "ja": "hooks.json の解析に失敗：{err}",
-    "ko": "hooks.json 파싱 실패: {err}",
-    "en": "hooks.json failed to parse: {err}",
-  },
-  "settings.hooks_failed": {
-    "zh-CN": "保存失败：{err}",
-    "zh-TW": "儲存失敗：{err}",
-    "ja": "保存に失敗：{err}",
-    "ko": "저장 실패: {err}",
-    "en": "Save failed: {err}",
-  },
+  // 权限 hooks 的 UI（开关 / 描述 / 打开文件 / 报错文案）已于 2026-09-21 全部移除 ——
+  // 它是**开发者选项**，常驻开启，只由 config\hooks.json 的 enabled 字段决定（缺省 true）。
   "settings.cost_title": {
     "zh-CN": "用量与成本",
     "zh-TW": "用量與成本",
@@ -2201,11 +2178,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Usage & Cost",
   },
   "settings.cost_hint": {
-    "zh-CN": "价格单位「元 / 百万 token」，按输入（未命中缓存）/ 缓存命中 / 缓存写入 / 输出四类分别计价；价格表在 config\\pricing.json，可自己改。金额由本地用量日志算出，只反映 agent 的 token 花费。",
-    "zh-TW": "價格單位「元 / 百萬 token」，按輸入（未命中快取）/ 快取命中 / 快取寫入 / 輸出四類分別計價；價格表在 config\\pricing.json，可自行修改。金額由本機用量日誌算出，只反映 agent 的 token 花費。",
-    "ja": "単価は「元 / 100万トークン」で、入力（キャッシュ未命中）/ キャッシュ命中 / キャッシュ書き込み / 出力の4区分ごとに計算します。価格表は config\\pricing.json（編集可）。金額はローカルの使用量ログから算出した agent のトークン費用のみです。",
-    "ko": "단가는 「위안 / 100만 토큰」이며 입력(캐시 미스) / 캐시 적중 / 캐시 쓰기 / 출력 네 가지로 각각 계산합니다. 가격표는 config\\pricing.json(직접 수정 가능). 금액은 로컬 사용량 로그로 계산한 agent 토큰 비용입니다.",
-    "en": "Prices are in CNY per million tokens, billed separately for four buckets: input (cache miss) / cache hit / cache write / output. The price table lives in config\\pricing.json and is editable. Amounts are computed from the local usage log and cover agent token spend only.",
+    "zh-CN": "单价单位「元 / 百万 token」，四类分别计价；价格表可自己改（config\\pricing.json）。",
+    "zh-TW": "單價單位「元 / 百萬 token」，四類分別計價；價格表可自行修改（config\\pricing.json）。",
+    "ja": "単価は「元 / 100万トークン」の4区分。価格表は config\\pricing.json で編集できます。",
+    "ko": "단가는 「위안 / 100만 토큰」 네 가지 구분. 가격표는 config\\pricing.json에서 수정할 수 있습니다.",
+    "en": "CNY per million tokens, four buckets; edit the table in config\\pricing.json.",
   },
   "settings.cost_open": {
     "zh-CN": "打开 pricing.json",
@@ -2257,11 +2234,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Pending new prices",
   },
   "settings.cost_pending_hint": {
-    "zh-CN": "确认后整体覆盖 config\\pricing.json；放弃则删掉候选文件，正式价格不动。候选文件：{path}",
-    "zh-TW": "確認後整體覆蓋 config\\pricing.json；放棄則刪掉候選檔案，正式價格不動。候選檔案：{path}",
-    "ja": "確定すると config\\pricing.json を丸ごと上書きします。破棄すると候補ファイルを削除し、正式な価格は変更しません。候補ファイル：{path}",
-    "ko": "확인하면 config\\pricing.json을 전체 덮어씁니다. 버리면 후보 파일만 삭제하고 기존 가격은 그대로 둡니다. 후보 파일: {path}",
-    "en": "Confirming replaces config\\pricing.json wholesale; discarding deletes the candidate file and leaves the current prices alone. Candidate file: {path}",
+    "zh-CN": "确认 = 覆盖正式价格表；放弃 = 不改动。",
+    "zh-TW": "確認 = 覆蓋正式價格表；放棄 = 不改動。",
+    "ja": "確定で正式な価格表を上書き、破棄では変更しません。",
+    "ko": "확인하면 기존 가격표를 덮어쓰고, 버리면 변경하지 않습니다.",
+    "en": "Confirm overwrites the live price table; discard leaves it untouched.",
   },
   "settings.cost_confirm": {
     "zh-CN": "确认写入",
@@ -2396,12 +2373,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "페르소나 / 사용자 지시문",
     "en": "Persona / custom instructions",
   },
+  // 人格（L2）2026-09-21 搬进输入栏「更多设置」：描述压成**一句**（用户要求所有描述精简）。
   "settings.persona_hint": {
-    "zh-CN": "这段文本会接在内置人格之后，成为系统提示词的一部分（每次请求都要发，所以别放长文，上限 {max} 字符）。它只在内置人格之后追加一段，不会覆盖内置的文风与底线约束；子代理与后台复盘不会带上它。",
-    "zh-TW": "這段文字會接在內建人格之後，成為系統提示詞的一部分（每次請求都要送，所以別放長文，上限 {max} 字元）。它只在內建人格之後追加一段，不會覆蓋內建的文風與底線約束；子代理與背景複盤不會帶上它。",
-    "ja": "この文章は内蔵ペルソナの後に連結され、システムプロンプトの一部になります（毎回のリクエストで送信されるため長文は避けてください。上限 {max} 文字）。内蔵ペルソナに追記するだけで、内蔵の文体や最低限の制約は上書きしません。サブエージェントとバックグラウンドの振り返りには含まれません。",
-    "ko": "이 텍스트는 내장 페르소나 뒤에 이어져 시스템 프롬프트의 일부가 됩니다(매 요청마다 전송되므로 긴 글은 피하세요. 최대 {max}자). 내장 페르소나에 추가될 뿐이며 내장 문체와 기본 제약을 덮어쓰지 않습니다. 서브 에이전트와 백그라운드 회고에는 포함되지 않습니다.",
-    "en": "This text is appended after the built-in persona and becomes part of the system prompt (it is sent with every request, so keep it short — {max} characters max). It only adds to the built-in persona; it never overrides the built-in style and guardrails. Subagents and the background review never receive it.",
+    "zh-CN": "接在内置人格之后，最多 {max} 字符；不进子代理。保存后需重启 AI。",
+    "zh-TW": "接在內建人格之後，最多 {max} 字元；不進子代理。儲存後需重啟 AI。",
+    "ja": "内蔵ペルソナの後に追加、最大 {max} 文字。サブエージェントには入りません。保存後は AI の再起動が必要。",
+    "ko": "내장 페르소나 뒤에 추가, 최대 {max}자. 서브 에이전트에는 미포함. 저장 후 AI 재시작 필요.",
+    "en": "Appended after the built-in persona, {max} chars max; not sent to subagents. Restart the AI after saving.",
+  },
+  "settings.persona_edit": {
+    "zh-CN": "编辑",
+    "zh-TW": "編輯",
+    "ja": "編集",
+    "ko": "편집",
+    "en": "Edit",
   },
   "settings.persona_placeholder": {
     "zh-CN": "例如：\n- 叫我老王，别用「您」\n- 回答先给结论，再给理由\n- 代码示例一律用 Rust",
@@ -2409,20 +2394,6 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "例：\n- 呼び方は「さん」付けで\n- 結論を先に、理由は後に\n- コード例は常に Rust",
     "ko": "예:\n- 존댓말 대신 반말로\n- 결론을 먼저, 이유는 나중에\n- 코드 예시는 항상 Rust",
     "en": "For example:\n- Call me Alex, skip the formalities\n- Lead with the conclusion, then the reasoning\n- Always write code samples in Rust",
-  },
-  "settings.persona_count": {
-    "zh-CN": "{n} / {max} 字符",
-    "zh-TW": "{n} / {max} 字元",
-    "ja": "{n} / {max} 文字",
-    "ko": "{n} / {max}자",
-    "en": "{n} / {max} characters",
-  },
-  "settings.persona_path": {
-    "zh-CN": "文件：{path}",
-    "zh-TW": "檔案：{path}",
-    "ja": "ファイル：{path}",
-    "ko": "파일: {path}",
-    "en": "File: {path}",
   },
   "settings.persona_save": {
     "zh-CN": "保存",
@@ -2523,11 +2494,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Default (whole system)",
   },
   "settings.workspace_hint": {
-    "zh-CN": "设置工作区后，Agent 仅在该目录内自动批准修改；未设置时可在整个系统内工作，敏感操作会弹出确认。",
-    "zh-TW": "設定工作區後，Agent 僅在該目錄內自動批准修改；未設定時可在整個系統內工作，敏感操作會彈出確認。",
-    "ja": "ワークスペースを設定すると、Agent はそのディレクトリ内でのみ自動承認されます。未設定時はシステム全体で動作し、重要な操作は確認が表示されます。",
-    "ko": "작업 공간을 설정하면 Agent는 해당 디렉토리 안에서만 수정을 자동 승인합니다. 미설정 시 전체 시스템에서 작업하며 중요한 작업은 확인 메시지가 표시됩니다.",
-    "en": "With a workspace set, Agent auto-approves edits only inside it; without one it works across the whole system, and sensitive operations ask for confirmation.",
+    "zh-CN": "设定后 Agent 只在该目录内自动批准修改。",
+    "zh-TW": "設定後 Agent 僅在該目錄內自動批准修改。",
+    "ja": "設定すると Agent はそのフォルダ内だけ自動承認します。",
+    "ko": "설정하면 Agent는 해당 폴더 안에서만 자동 승인합니다.",
+    "en": "Once set, Agent auto-approves edits only inside that folder.",
   },
   "settings.workspace_ok": {
     "zh-CN": "工作区已更新",
@@ -2567,11 +2538,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Installed Plugins",
   },
   "settings.plugins_hint": {
-    "zh-CN": "这里是 Lunac 的全部插件总览。AI 模型、技能（Skills）与工具（Tools / MCP）已归到左侧「AI」分类下。",
-    "zh-TW": "這裡是 Lunac 的全部外掛總覽。AI 模型、技能（Skills）與工具（Tools / MCP）已歸到左側「AI」分類下。",
-    "ja": "ここは Lunac の全プラグインの一覧です。AI モデル・スキル（Skills）・ツール（Tools / MCP）は左の「AI」カテゴリに移動しました。",
-    "ko": "여기는 Lunac의 전체 플러그인 개요입니다. AI 모델·스킬(Skills)·도구(Tools / MCP)는 왼쪽 'AI' 분류로 이동했습니다.",
-    "en": "Overview of every Lunac plugin. AI model, Skills and Tools (MCP) now live under the AI category.",
+    "zh-CN": "全部插件总览；AI 模型 / 技能 / 工具已归入左侧「AI」。",
+    "zh-TW": "全部外掛總覽；AI 模型 / 技能 / 工具已歸入左側「AI」。",
+    "ja": "全プラグインの一覧。AI モデル・スキル・ツールは左の「AI」にあります。",
+    "ko": "전체 플러그인 개요. AI 모델·스킬·도구는 왼쪽 'AI'에 있습니다.",
+    "en": "All plugins. AI model, Skills and Tools now live under the AI category.",
   },
   "settings.plugins_market": {
     "zh-CN": "第三方插件",
@@ -2665,11 +2636,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Plugin folder: {path}",
   },
   "settings.plugins_market_hint": {
-    "zh-CN": "插件包是 https 的 zip，包内要有 lunac-plugin.json 与已编译的 JS 入口（ESM）。注意：插件是可执行代码，装上就等于在本机运行它 —— 只装你信任来源的包；装完立即生效，不必重启 AI。模型文件（例如 Live2D 模型）请自行准备，Lunac 不随包分发任何第三方模型。",
-    "zh-TW": "外掛包是 https 的 zip，包內要有 lunac-plugin.json 與已編譯的 JS 入口（ESM）。注意：外掛是可執行的程式碼，裝上就等於在本機執行它 —— 只裝你信任來源的套件；裝完立即生效，不必重啟 AI。模型檔案（例如 Live2D 模型）請自行準備，Lunac 不隨包分發任何第三方模型。",
-    "ja": "プラグインは https の zip で、中に lunac-plugin.json とビルド済みの JS エントリ（ESM）が必要です。注意：プラグインは実行可能なコードで、入れるとこの PC 上で動きます。信頼できる配布元のものだけ入れてください。入れた直後から有効で、AI の再起動は不要です。モデルファイル（Live2D モデルなど）はご自身で用意してください。Lunac はサードパーティ製モデルを同梱しません。",
-    "ko": "플러그인은 https zip이며, 안에 lunac-plugin.json과 빌드된 JS 엔트리(ESM)가 있어야 합니다. 주의: 플러그인은 실행 코드이며 설치하면 이 PC에서 실행됩니다. 신뢰할 수 있는 배포처의 것만 설치하세요. 설치 즉시 적용되며 AI 재시작은 필요 없습니다. 모델 파일(예: Live2D 모델)은 직접 준비하세요. Lunac은 서드파티 모델을 함께 배포하지 않습니다.",
-    "en": "A plugin is an https zip containing lunac-plugin.json and a built JS entry (ESM). Heads up: a plugin is executable code — installing one runs it on this machine, so only install packages from sources you trust. It takes effect immediately; no AI restart needed. Model files (Live2D models, for example) are yours to supply — Lunac never bundles third-party models.",
+    "zh-CN": "插件包 = https zip（含 lunac-plugin.json 与已编译的 ESM 入口），装完即生效。插件是可执行代码，只装可信来源。",
+    "zh-TW": "外掛包 = https zip（含 lunac-plugin.json 與已編譯的 ESM 入口），裝完即生效。外掛是可執行程式碼，只裝可信來源。",
+    "ja": "プラグインは https zip（lunac-plugin.json とビルド済み ESM エントリ入り）。入れた直後から有効。実行可能コードなので信頼できる配布元のみ。",
+    "ko": "플러그인은 https zip(lunac-plugin.json + 빌드된 ESM 엔트리)이며 설치 즉시 적용됩니다. 실행 코드이므로 신뢰할 수 있는 배포처만 설치하세요.",
+    "en": "A plugin is an https zip (lunac-plugin.json + built ESM entry) and takes effect immediately. It is executable code — only install from sources you trust.",
   },
   "settings.plugins_market_no_execute": {
     "zh-CN": "插件 {id} 的入口没有导出 execute 函数",
@@ -3495,6 +3466,28 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "할 일 목록",
     "en": "Task list",
   },
+  // ── 任务抽屉（2026-09-21）：输入框上方那条小抽屉的进度文本与两个按钮 ──
+  "agent.todo_progress": {
+    "zh-CN": "{d}/{n} 已完成",
+    "zh-TW": "{d}/{n} 已完成",
+    "ja": "{d}/{n} 完了",
+    "ko": "{d}/{n} 완료",
+    "en": "{d}/{n} done",
+  },
+  "agent.todo_tasks_btn": {
+    "zh-CN": "详细任务",
+    "zh-TW": "詳細任務",
+    "ja": "タスク詳細",
+    "ko": "작업 상세",
+    "en": "Tasks",
+  },
+  "agent.todo_ok_btn": {
+    "zh-CN": "确认",
+    "zh-TW": "確認",
+    "ja": "OK",
+    "ko": "확인",
+    "en": "OK",
+  },
   // ── 被改动文件的路径追踪（backlog §8.1）─────────────────────────
   "agent.changed_files": {
     "zh-CN": "{n} 个文件已改动",
@@ -3812,11 +3805,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Installed Skills",
   },
   "settings.skills_installed_hint": {
-    "zh-CN": "安装目录：Lunac 数据根（exe 所在目录）\\skills，与 agent.exe 共用；agent.exe 启动时自动加载该目录下的技能。",
-    "zh-TW": "安裝目錄：Lunac 資料根（exe 所在目錄）\\skills，與 agent.exe 共用；agent.exe 啟動時自動載入該目錄下的技能。",
-    "ja": "インストール先: Lunac データルート(exe のあるフォルダ)\\skills。agent.exe と共有し、agent.exe 起動時に自動で読み込みます。",
-    "ko": "설치 폴더: Lunac 데이터 루트(exe 위치)\\skills. agent.exe와 공유하며 agent.exe 시작 시 자동 로드됩니다.",
-    "en": "Directory: Lunac data root (where the exe lives)\\skills, shared with agent.exe; agent.exe auto-loads skills here at start.",
+    "zh-CN": "目录：数据根（exe 所在目录）\\skills，与 agent.exe 共用，启动时自动加载。",
+    "zh-TW": "目錄：資料根（exe 所在目錄）\\skills，與 agent.exe 共用，啟動時自動載入。",
+    "ja": "フォルダ: データルート(exe のある場所)\\skills（agent.exe と共有、起動時に自動読み込み）。",
+    "ko": "폴더: 데이터 루트(exe 위치)\\skills (agent.exe와 공유, 시작 시 자동 로드).",
+    "en": "Folder: data root (next to the exe)\\skills, shared with agent.exe and auto-loaded at start.",
   },
   "settings.skills_none": {
     "zh-CN": "暂无已安装技能。可通过上方「从 URL 安装」导入 SKILL.md，或用「新建 / 粘贴」创建。",

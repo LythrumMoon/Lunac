@@ -23,6 +23,21 @@ import { open } from "@tauri-apps/plugin-shell";
 import { t, setLanguage, resetToSystemLanguage, pluginName, pluginDesc } from "../../i18n.js";
 import { installOcrEngine } from "./ocr.js";
 
+/** 打开**本地路径**（目录 / 文件）—— 一律走宿主命令 `open_path`。
+ *
+ *  **不能用 `@tauri-apps/plugin-shell` 的 `open()`**：那个命令的入参要过 shell 插件的
+ *  open scope 正则，而默认 scope 只放行 URL scheme（`mailto:` / `http(s):` / `tel:`），
+ *  本地路径一律被拒 —— 报错原文 `scoped command argument at position 0 was found but
+ *  failed regex validation`。此前四处调用点（主题目录 / hooks.json / pricing.json /
+ *  技能目录）都把异常吞进 console，用户看到的就是「点了没反应」（2026-09-21 修）。
+ *  走宿主侧还有一条好处：不必放宽 shell 的 open scope ⇒ 第三方插件（它们也能调 `open()`）
+ *  仍然只能开 URL。**URL 仍走 `open()`**（那条路本来就能过）。
+ *
+ *  失败**如实抛给调用方**（面板上显示原因），别再静默吞掉。 */
+async function openLocalPath(path: string): Promise<void> {
+  await invoke("open_path", { path });
+}
+
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -69,7 +84,7 @@ function currentLangSelection(): string {
   } catch { return "system"; }
 }
 
-function buildGeneralPane(hotkey: string, autoStart: boolean): string {
+function buildGeneralPane(hotkey: string, autoStart: boolean, autoStartStale: boolean): string {
   const langOptions = LANG_OPTIONS.map(o => ({
     value: o.value,
     label: o.label ?? t(o.labelKey!),
@@ -92,6 +107,15 @@ function buildGeneralPane(hotkey: string, autoStart: boolean): string {
           <input type="checkbox" id="settings-autostart" ${autoStart ? "checked" : ""}>
           <span class="settings-toggle-slider"></span>
         </label>
+      </div>
+      <!-- 开机项指向的不是当前这份 exe：开机拉起的是旧程序（实测会弹 cmd 窗口、界面也是旧的），
+           而重建计划任务需要管理员权限 —— 只能在用户点一下时提权做，所以这里给一个「修复」入口。
+           同一个节点也用来显示开关被拒的原因（如开发构建不注册自启）。 -->
+      <div class="settings-row${autoStartStale ? "" : " hidden"}" id="settings-autostart-stale">
+        <span class="settings-label" id="settings-autostart-stale-msg">${esc(t("settings.auto_start_stale"))}</span>
+        <div class="settings-bg-actions">
+          <button type="button" class="settings-btn" id="settings-autostart-fix">${esc(t("settings.auto_start_fix"))}</button>
+        </div>
       </div>
       <div class="settings-row">
         <span class="settings-label">${t("settings.language")}</span>
@@ -533,9 +557,10 @@ async function buildAppearancePane(): Promise<string> {
         </div>
       </div>
 
-      <!-- ── ③ 按钮自定义（2026-09-20）──────────────────────────────────
-           线条 = 项目内所有切换开关 + 新建对话 / 更多设置 / 历史记录 / 发送 / 停止 /
-           添加文件 六个按钮的边框；背景 = 同样这六个按钮的底色。
+      <!-- ── ③ 按钮自定义（2026-09-20，覆盖面 2026-09-21 扩大）──────────
+           线条 = 项目内所有切换开关 + 按钮的边框；背景 = **所有按钮**的常驻底色
+           （2026-09-21 起由 styles.css 末尾那条 #app button:where(...) 规则统一施加，
+           连原本 background:none 的纯图标按钮也含在内 —— 用户要求「包含所有按钮」）。
            **按钮背景不再跟底色**（用户要求）—— 它自己一条 --btn-bg-*，与上方底色无关。
            两组各自「取色器 + 透明度 + 饱和度/明度」，其中**两个透明度滑块留在锁外**。 -->
       <div class="settings-row">
@@ -748,7 +773,7 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
     });
   });
   pick("#ap-theme-dir")?.addEventListener("click", async () => {
-    try { await open(await ap.themesDir()); } catch (e) { console.error("[lunac] open themes dir failed:", e); }
+    try { await openLocalPath(await ap.themesDir()); } catch (e) { console.error("[lunac] open themes dir failed:", e); }
   });
 }
 
@@ -873,7 +898,7 @@ function belongsToOtherProvider(model: string, provider: string): boolean {
 /** AI 模型这一块的**内部内容**（不含 pane 外壳与分块标题）——
  *  由 buildAIPane 组装进「AI」分类。2026-09-19 批 9 起 AI 分类下有三个分块
  *  （AI 模型 / 技能 / 工具），每个分块用与「风格」相同的 .settings-group-title。 */
-function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean, hooksEnabled: boolean, hooksError: string): string {
+function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -989,27 +1014,6 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         ${modelSelectHtml}
       </div>
       <div class="settings-row">
-        <span class="settings-label">${t("settings.ai_vision")}</span>
-        <label class="settings-toggle">
-          <input type="checkbox" id="settings-vision" ${vision ? "checked" : ""}>
-          <span class="settings-toggle-slider"></span>
-        </label>
-      </div>
-      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.ai_vision_hint")}</div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.hooks")}</span>
-        <label class="settings-toggle">
-          <input type="checkbox" id="settings-hooks" ${hooksEnabled ? "checked" : ""}>
-          <span class="settings-toggle-slider"></span>
-        </label>
-      </div>
-      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.hooks_hint")}</div>
-      <div class="settings-row">
-        <button type="button" class="settings-btn" id="settings-hooks-open">${t("settings.hooks_open")}</button>
-        <span class="settings-hint" id="settings-hooks-msg" style="font-size:0.7rem;color:var(--text-dim);margin-left:8px;"></span>
-      </div>
-      ${hooksError ? `<div class="settings-hint" style="font-size:0.7rem;color:var(--yellow);margin:2px 0 6px;">${esc(t("settings.hooks_invalid", { err: hooksError }))}</div>` : ""}
-      <div class="settings-row">
         <span class="settings-label">${t("settings.base_url")}</span>
         <input type="text" id="settings-baseurl" class="settings-input" autocomplete="off" value="${esc(baseUrl)}" placeholder="${esc(PROVIDER_PRESETS[provider]?.default_url || "https://api.openai.com")}">
       </div>
@@ -1038,6 +1042,13 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         </label>
       </div>
       <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.agent_autofold_hint")}</div>
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.ai_vision")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="settings-vision" ${vision ? "checked" : ""}>
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
       <div class="settings-row" style="justify-content: flex-end;">
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
         <span id="settings-save-msg" class="settings-save-msg"></span>
@@ -1045,119 +1056,33 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
 }
 
 // ── AI 分类（2026-09-19 批 9：三个分块合成一个分类）────────────────
-/** AI 分类 = **AI 模型 + 技能（Skills）+ 工具（Tools / MCP）+ 用量与成本（A12）+ 人格（L2）**。
+/** AI 分类 = **AI 模型 + 技能（Skills）+ 工具（Tools / MCP）+ 用量与成本（A12）**。
  *  用户要求：「将 skills 和 tools 和 ai模型 分类到 ai 分类里，各个分块采用跟
  *  风格里的分块一样」—— 所以各块都用 .settings-group-title（与「风格」的
- *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。 */
-async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean, hooksEnabled: boolean, hooksError: string): Promise<string> {
-  const [skillsHtml, toolsHtml, costHtml, personaHtml] = await Promise.all([buildSkillsSection(), buildToolsSection(), buildUsageCostSection(), buildPersonaSection()]);
+ *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。
+ *  人格（L2）2026-09-21 已搬出本面板 → 输入栏「更多设置」的 ⋯ 菜单（见 main.ts）。 */
+async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): Promise<string> {
+  const [skillsHtml, toolsHtml, costHtml] = await Promise.all([buildSkillsSection(), buildToolsSection(), buildUsageCostSection()]);
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
-      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision, hooksEnabled, hooksError)}
+      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision)}
       <div class="settings-group-title">${t("settings.skills")}</div>
       ${skillsHtml}
       <div class="settings-group-title">${t("settings.group_tools")}</div>
       ${toolsHtml}
       <div class="settings-group-title">${t("settings.cost_title")}</div>
       ${costHtml}
-      <div class="settings-group-title">${t("settings.persona_title")}</div>
-      ${personaHtml}
     </div>`;
 }
 
-// ── 人格 / 自定义提示词（L2）────────────────────────────────────
+// ── 人格 / 自定义提示词（L2）已搬走（2026-09-21）─────────────────
 //
-// 形态：一段纯文本落 `config\persona.md`，agent **启动时读一次**、拼进系统提示词的固定段
-// （在内置人格段之后）。所以保存后必须**重启 AI** 才生效 —— 面板如实写明这条，并给
-// 「立即重启」按钮（复用 `window.__lunac_reload_agent`，与技能目录 / 工具黑名单保存后同款）。
-// **刻意不做热更新**：改的正是固定前缀，热读会让系统提示词每轮都变、把端点侧缓存整段打掉
-// （ai-spec §11 规则 18/23）—— 那是我们花了两批工作才摆脱的东西。
-//
-// 另有一条硬约束要在面板上说清：这段**不进**子代理与后台复盘（它们是内部产物）。
-
-interface PersonaState { path: string; text: string; maxChars: number }
-
-async function buildPersonaSection(): Promise<string> {
-  return `<div id="settings-persona">${await renderPersonaBody()}</div>`;
-}
-
-async function renderPersonaBody(): Promise<string> {
-  let state: PersonaState | null = null;
-  try {
-    state = await invoke<PersonaState>("get_persona");
-  } catch {}
-  const text = state?.text ?? "";
-  // 上限由宿主给（storage::MAX_PERSONA_CHARS 是唯一真相源）：面板只用它做 maxlength 与计数
-  const max = state?.maxChars ?? 8000;
-  return `
-    <textarea id="settings-persona-text" class="settings-persona-text" spellcheck="false"
-      maxlength="${max}" placeholder="${esc(t("settings.persona_placeholder"))}">${esc(text)}</textarea>
-    <div class="settings-hint" id="settings-persona-count"></div>
-    <div class="settings-row">
-      <button type="button" class="settings-btn" id="settings-persona-save">${t("settings.persona_save")}</button>
-      <button type="button" class="settings-btn" id="settings-persona-reset">${t("settings.persona_reset")}</button>
-      <button type="button" class="settings-btn" id="settings-persona-restart">${t("settings.persona_restart")}</button>
-      <span class="settings-hint" id="settings-persona-msg" style="margin-left:8px;"></span>
-    </div>
-    <div class="settings-hint">${esc(t("settings.persona_hint", { max: String(max) }))}</div>
-    <div class="settings-hint" title="${esc(state?.path || "")}">${esc(t("settings.persona_path", { path: state?.path || "" }))}</div>`;
-}
-
-function wirePersona(container: HTMLElement): void {
-  const box = container.querySelector("#settings-persona-text") as HTMLTextAreaElement | null;
-  // 提示文字每次现查节点：容器整体重渲染会把 `#settings-persona-msg` 整个换掉
-  const showMsg = (text: string) => {
-    const el = container.querySelector("#settings-persona-msg") as HTMLElement | null;
-    if (el) el.textContent = text;
-  };
-  const count = () => {
-    const el = container.querySelector("#settings-persona-count") as HTMLElement | null;
-    if (el && box) {
-      el.textContent = t("settings.persona_count", {
-        n: String(box.value.length),
-        max: String(Number(box.maxLength) || 8000),
-      });
-    }
-  };
-  box?.addEventListener("input", count);
-  count();
-
-  const save = async (text: string, okMsg: string) => {
-    try {
-      await invoke("set_persona", { text });
-      // 保存 ≠ 生效：改的是系统提示词的固定前缀，得重启 agent 才读得到（如实告知）
-      showMsg(okMsg + t("settings.persona_takes_effect"));
-    } catch (e) {
-      showMsg(t("settings.persona_failed", { err: String(e) }));
-    }
-  };
-
-  container.querySelector("#settings-persona-save")?.addEventListener("click", () => {
-    void save(box?.value ?? "", t("settings.persona_saved"));
-  });
-
-  container.querySelector("#settings-persona-reset")?.addEventListener("click", async () => {
-    if (box) box.value = "";
-    count();
-    await save("", t("settings.persona_reset_done"));
-  });
-
-  container.querySelector("#settings-persona-restart")?.addEventListener("click", async () => {
-    const fn = (window as any).__lunac_reload_agent;
-    if (typeof fn !== "function") {
-      showMsg(t("settings.persona_failed", { err: "reload hook missing" }));
-      return;
-    }
-    try {
-      await fn();
-      showMsg(t("settings.persona_restarted"));
-    } catch (e) {
-      showMsg(t("settings.persona_failed", { err: String(e) }));
-    }
-  });
-}
+// 原实现（`buildPersonaSection` / `renderPersonaBody` / `wirePersona` + 一块多行文本框）
+// **整体移到输入栏「更多设置」的 ⋯ 菜单**（`app/src/main.ts`，见 renderPersonaLabels）。
+// 原因（用户要求）：它是进阶/一次性的配置，不该常驻设置面板占一整块；描述也只该留一句。
+// 契约未变：仍旧是 `config\persona.md`、agent 启动时读一次、保存后需重启 AI 才生效。
 
 // ── 用量与成本（A12）──────────────────────────────────────────────
 //
@@ -1453,8 +1378,9 @@ function wireUsageCost(container: HTMLElement): void {
 
   openBtn?.addEventListener("click", async () => {
     try {
-      // 缺文件时后端先落一份空骨架再返回路径；真正的「打开」交给前端 `open()`
-      await open(await invoke<string>("pricing_file_path"));
+      // 缺文件时后端先落一份空骨架再返回路径；「打开」走宿主命令 open_path
+      // （本地路径不能走 shell 的 open()，原因见文件顶部 openLocalPath 的注释）
+      await openLocalPath(await invoke<string>("pricing_file_path"));
     } catch (e) {
       showMsg(t("settings.cost_failed", { err: String(e) }));
     }
@@ -2043,29 +1969,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
         caret-color: var(--accent);
       }
       .settings-input:focus { border-color: var(--accent-border); }
-      /* ── 人格 / 自定义提示词（L2）────────────────────────────────
-         一块多行文本框：默认 96px 高、可纵向拉伸（内容多时用户自己拉），
-         内部滚动交给全局那条 4px 滚动条（styles.css 唯一真相源，禁止按容器单写）。 */
-      .settings-persona-text {
-        width: 100%;
-        box-sizing: border-box;
-        min-height: 96px;
-        max-height: 260px;
-        resize: vertical;
-        padding: 7px 9px;
-        font: inherit;
-        font-size: 0.73rem;
-        line-height: 1.55;
-        /* 凹陷层与 .settings-input 同源：底色暗 ⇒ 白洗、亮 ⇒ 黑洗 */
-        background: rgba(var(--ctx-shade-rgb), calc(0.25 * var(--ctx-shade-scale)));
-        border: 1px solid var(--ctx-border-glass);
-        border-radius: 6px;
-        color: var(--text);
-        outline: none;
-        caret-color: var(--accent);
-      }
-      .settings-persona-text:focus { border-color: var(--accent-border); }
-      .settings-persona-text::placeholder { color: var(--text-dim); opacity: 0.6; }
       /* ── 插件市场（L1，2026-09-21）─────────────────────────────────
          目录里的一行：名称 + 来源 + 卸载（坏包多一行原因）。
          刻意与 .settings-plugin-item 分成两个类：那个是 registry 总览（行数被
@@ -2801,6 +2704,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
 
   // ── Auto-start toggle ────────────────────────────────────────
   const autoStartCheck = container.querySelector("#settings-autostart") as HTMLInputElement | null;
+  const autoStartStaleRow = container.querySelector("#settings-autostart-stale") as HTMLElement | null;
+  const autoStartStaleMsg = container.querySelector("#settings-autostart-stale-msg") as HTMLElement | null;
+  const autoStartFixBtn = container.querySelector("#settings-autostart-fix") as HTMLButtonElement | null;
+  /** 开机项报错/提示都显示在同一行：先写成规范文案，出错时临时换成原因（见下面两处）。 */
+  const showAutoStartNote = (text: string) => {
+    if (autoStartStaleMsg) autoStartStaleMsg.textContent = text;
+    autoStartStaleRow?.classList.remove("hidden");
+  };
   if (autoStartCheck) {
     autoStartCheck.addEventListener("change", async () => {
       try {
@@ -2809,12 +2720,30 @@ export async function attachSettingsListeners(container: HTMLElement) {
         // 仍然是「已开启，只是慢」。关闭 = 计划任务若存在，同样要管理员确认才删得掉。
         // 机制细节只进落盘日志，不在 UI 暴露（见 ai-spec §11 规则 1）。
         await invoke("set_auto_start", { enabled: autoStartCheck.checked });
-      } catch {
+        autoStartStaleRow?.classList.add("hidden");
+      } catch (e) {
         // Revert checkbox on failure to keep UI consistent
         autoStartCheck.checked = !autoStartCheck.checked;
+        // 失败原因如实说出来（例如开发构建被拒）—— 静默弹回去等于让用户以为点了没反应
+        showAutoStartNote(String(e));
       }
     });
   }
+  // 「修复」：开机项指向旧程序时的一次性提权修复（重建计划任务 → 可能弹一次 UAC）。
+  // 复用 `set_auto_start(enabled: true)`：它先落 Run 键保底，再提权补建指向当前 exe 的任务。
+  autoStartFixBtn?.addEventListener("click", async () => {
+    autoStartFixBtn.disabled = true;
+    try {
+      await invoke("set_auto_start", { enabled: true });
+      const info = await invoke<{ enabled: boolean; stale?: boolean }>("get_auto_start_info");
+      if (autoStartCheck) autoStartCheck.checked = info.enabled;
+      if (info.stale) showAutoStartNote(t("settings.auto_start_stale"));
+      else autoStartStaleRow?.classList.add("hidden");
+    } catch (e) {
+      showAutoStartNote(String(e));
+    }
+    autoStartFixBtn.disabled = false;
+  });
 
   // ── 外观 / 主题（「风格」分区）─────────────────────────────────
   // 2026-09-19：原来写在这里的「自定义背景」两个按钮被这一段整体取代 —— 配置与
@@ -3224,33 +3153,12 @@ export async function attachSettingsListeners(container: HTMLElement) {
     }
   }
 
-  // ── 权限 hooks（A9）───────────────────────────────────────────
-  // 开关写的是 config\hooks.json 的 `enabled` 字段（agent 侧按 mtime 热重载 ⇒
-  // 改完**即时生效、不需要重启 agent**）。失败必须**把开关拨回去**并把原因显示出来 ——
-  // 面板显示「已开」而实际没生效，是最难查的一类不一致。
-  const hooksToggle = container.querySelector("#settings-hooks") as HTMLInputElement | null;
-  const hooksMsg = container.querySelector("#settings-hooks-msg") as HTMLElement | null;
-  const hooksOpenBtn = container.querySelector("#settings-hooks-open") as HTMLButtonElement | null;
-  hooksToggle?.addEventListener("change", async () => {
-    const want = hooksToggle.checked;
-    try {
-      await invoke("set_hooks_enabled", { enabled: want });
-      if (hooksMsg) hooksMsg.textContent = "";
-    } catch (e) {
-      hooksToggle.checked = !want;
-      if (hooksMsg) hooksMsg.textContent = t("settings.hooks_failed", { err: String(e) });
-    }
-  });
-  hooksOpenBtn?.addEventListener("click", async () => {
-    try {
-      // 缺文件时后端先落一份骨架再返回路径；真正的「打开」交给前端 `open()`
-      // （与主题目录那行同一套做法，见文件顶部 import）。
-      const p = await invoke<string>("hooks_file_path");
-      await open(p);
-    } catch (e) {
-      if (hooksMsg) hooksMsg.textContent = t("settings.hooks_failed", { err: String(e) });
-    }
-  });
+  // ── 权限 hooks（A9）：**面板上不再暴露**（2026-09-21 用户裁决）─────────
+  // 理由：hooks 是**开发者选项**（自己写脚本拦工具调用），不是普通用户的开关；
+  // 它的唯一真相源始终是 `config\hooks.json` 本身（`enabled` 缺省为真 = 常驻开启），
+  // 要关掉就直接改那个文件 —— 少了面板这一层，也就少了「面板显示已开、其实没生效」
+  // 这类不一致。`set_hooks_enabled` / `hooks_file_path` / `get_hooks_config` 三个命令
+  // 仍然留在宿主侧（开发者可从文件与日志入手），只是前端不再调用。
 
   // ── Search engine save ──────────────────────────────────────
   const saveSearchBtn = container.querySelector("#settings-save-search-btn") as HTMLButtonElement | null;
@@ -3286,10 +3194,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
   // 分块自己会重渲染（确认 / 放弃候选价格之后），所以绑定的入口是个函数，
   // 重渲染完它会再调自己一次。
   wireUsageCost(container);
-
-  // ── 人格 / 自定义提示词（L2）───────────────────────────────────
-  // 绑定入口独立成函数：分块内部若重渲染，直接再调一次 `wirePersona` 即可。
-  wirePersona(container);
 
   // ── AI 安全档位（文件边界）─────────────────────────────────────
   // 单独一个下拉，不跟 provider/model 那条保存链路混：切换立即生效（会重启 agent）。
@@ -3490,7 +3394,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
     const bindInstalledRowActions = () => {
       // 打开技能目录（Explorer）
       installedListEl?.querySelectorAll<HTMLElement>(".settings-skill-open").forEach(btn => {
-        btn.addEventListener("click", () => { const d = btn.dataset.dir || ""; if (d) open(d).catch(() => {}); });
+        btn.addEventListener("click", () => { const d = btn.dataset.dir || ""; if (d) openLocalPath(d).catch(() => {}); });
       });
       // 编辑（读取 SKILL.md 全文 → 内联编辑器）
       installedListEl?.querySelectorAll<HTMLElement>(".settings-skill-edit").forEach(btn => {
@@ -3749,6 +3653,8 @@ export const settingsPlugin: Plugin = {
   async execute(_input: string) {
     let hotkey = "Ctrl+Alt+Space";
     let autoStart = false;
+    /** 开机项是否指向别的程序（见 auto_start.rs `registered_entry_is_foreign`）→ 显示「修复」行。 */
+    let autoStartStale = false;
     // 未配置 provider 时由模型名反推其所属供应商，避免“OpenAI 供应商却带
     // DeepSeek 模型”等跨供应商脏数据；baseUrl 默认填该供应商文档地址。
     let provider = "";
@@ -3759,9 +3665,6 @@ export const settingsPlugin: Plugin = {
     let searchKey = "";
     // 当前模型是否支持图片输入（A8）：跟着 ai.json 走，由用户在 AI 面板显式打开。
     let vision = false;
-    // 权限 hooks（A9）：开关 + 语法错误（都取自 config\hooks.json 这一份真相）。
-    let hooksEnabled = false;
-    let hooksError = "";
 
     try {
       hotkey = await invoke<string>("get_hotkey_combo");
@@ -3772,9 +3675,11 @@ export const settingsPlugin: Plugin = {
     } catch {}
 
     try {
-      // 只取开关状态；实际生效机制（task / run）由后端写进落盘日志，不进 UI
-      const info = await invoke<{ enabled: boolean }>("get_auto_start_info");
+      // 只取开关状态；实际生效机制（task / run）由后端写进落盘日志，不进 UI。
+      // `stale` = 开机项指向的是**别的程序**（实测表现为开机弹 cmd、界面是旧的）→ 给「修复」入口。
+      const info = await invoke<{ enabled: boolean; stale?: boolean }>("get_auto_start_info");
       autoStart = info.enabled;
+      autoStartStale = !!info.stale;
     } catch {}
 
     try {
@@ -3790,13 +3695,8 @@ export const settingsPlugin: Plugin = {
       vision = !!aiCfg.vision;
     } catch {}
 
-    // 权限 hooks（A9）：开关状态就是 config\hooks.json 的 `enabled` 字段
-    // （文件不存在 = 没配 = 关）。语法错误一并取回，在面板上直接报出来。
-    try {
-      const hk = await invoke<{ enabled?: boolean; error?: string | null }>("get_hooks_config");
-      hooksEnabled = !!hk.enabled;
-      hooksError = hk.error || "";
-    } catch {}
+    // 权限 hooks（A9）**不再取开关状态**：面板上不暴露它（开发者选项，见 attachSettingsListeners
+    // 里的说明）。agent 侧照旧把 config\hooks.json 当唯一真相源。
 
     // 未配置供应商（环境缺 AI_PROVIDER）：用模型名反推；仍无则回退 openai
     if (!provider) provider = inferProviderForModel(model, "openai");
@@ -3804,9 +3704,9 @@ export const settingsPlugin: Plugin = {
     if (!baseUrl && preset) baseUrl = preset.default_url;
     if (!model && preset) model = preset.default_model;
 
-    const generalPane = buildGeneralPane(hotkey, autoStart);
+    const generalPane = buildGeneralPane(hotkey, autoStart, autoStartStale);
     const appearancePane = await buildAppearancePane();
-    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision, hooksEnabled, hooksError);
+    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision);
     const pluginsPane = await buildPluginsPane();
     const searchPane = await buildSearchPane();
 

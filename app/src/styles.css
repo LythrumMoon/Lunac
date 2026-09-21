@@ -1743,44 +1743,78 @@ html, body {
   border-bottom-color: var(--text-dim);
 }
 
-.changed-files-card {
-  margin: 8px 0 10px 0;
-  padding: 5px 10px;
-  border-left: 2px solid var(--accent-border);
-  background: rgba(var(--ink-rgb), 0.02);
-  border-radius: 0 8px 8px 0;
+/* ── 任务抽屉（2026-09-21）───────────────────────────────────────
+   待办清单 + 「本次会话改动过的文件」收在输入框上方一条小抽屉里（无内容时整块隐藏）。
+   底色/描边沿用「按钮自定义」那套 token（--btn-bg-* / --btn-line-*），与输入栏那一排
+   按钮同族；**全程无图标**（原来的 📋 ✔ ◐ ○ 已按用户要求去掉），状态只用文字颜色区分。
+   两个列表互斥展开、各自限高滚动 —— 同时铺开会把输入框顶下去。 */
+#todo-drawer {
+  margin: 0 8px 6px 8px;
+  padding: 6px 8px;
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) * 0.6));
+  border: 1px solid rgba(var(--btn-line-rgb), calc(var(--btn-line-alpha) * 0.7));
+  border-radius: 8px;
   font-size: 11px;
+  flex-shrink: 0;
+  pointer-events: auto;
 }
-.changed-files-head {
-  cursor: pointer;
-  list-style: none;
+#todo-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#todo-drawer-title {
+  flex-shrink: 0;
   color: var(--text-dim);
-  user-select: none;
+  font-weight: 600;
+  letter-spacing: 0.03em;
 }
-.changed-files-head::-webkit-details-marker {
-  display: none;
+#todo-drawer-progress {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
 }
-.changed-files-head::before {
-  content: "▸";
-  margin-right: 4px;
-  font-size: 9px;
-  opacity: 0.55;
+#todo-drawer-head button {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  border-radius: 6px;
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  color: rgb(var(--btn-line-rgb));
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
 }
-.changed-files-card[open] > .changed-files-head::before {
-  content: "▾";
+#todo-drawer-head button:hover {
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
-.changed-files-head:hover {
-  color: var(--text);
+#todo-drawer-head button.open {
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.14));
 }
 
-.changed-files-list {
+.todo-items {
   margin: 6px 0 0 0;
   padding: 0;
   list-style: none;
   display: flex;
   flex-direction: column;
   gap: 3px;
+  max-height: 132px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
+/* 状态**不用图标**（用户要求）：进行中 = 强调色，已完成 = 弱化，未开始 = 次要 */
+.todo-item.in_progress { color: var(--accent); }
+.todo-item.completed { color: var(--text-muted); }
+.todo-item.pending { color: var(--text-dim); }
+
+/* 改动文件行（原对话流末尾的 <details> 卡片已并入抽屉，故只留行样式） */
 .changed-file {
   display: flex;
   align-items: baseline;
@@ -1805,7 +1839,6 @@ html, body {
 .agent-flow.flow-folded .think-block,
 .agent-flow.flow-folded .tool-card,
 .agent-flow.flow-folded .tool-row,
-.agent-flow.flow-folded .todo-panel,
 .agent-flow.flow-folded .subtask-panel,
 .agent-flow.flow-folded .sys-note {
   display: none;
@@ -2386,7 +2419,7 @@ html, body {
 .think-block summary,
 .tool-row,
 .tool-result,
-.todo-panel,
+#todo-drawer,
 .turn-footer,
 .turn-tool,
 .history-item-preview,
@@ -3030,6 +3063,55 @@ html, body {
   white-space: nowrap;
 }
 
+/* ── 人格 / 自定义提示词（L2，2026-09-21 从设置面板搬进「更多设置」）──────
+   默认收起，点「编辑」才铺开 —— 它是进阶/一次性配置，不该让 ⋯ 菜单常态变高。
+   描述只留一句（用户要求所有描述精简）。 */
+.chat-persona-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+}
+.chat-persona-hint {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.chat-persona-text {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 84px;
+  max-height: 200px;
+  resize: vertical;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  /* 凹陷层与设置面板的输入框同源：底色暗 ⇒ 白洗、亮 ⇒ 黑洗 */
+  background: rgba(var(--ctx-shade-rgb), calc(0.25 * var(--ctx-shade-scale)));
+  border: 1px solid var(--ctx-border-glass);
+  border-radius: 6px;
+  color: var(--text);
+  outline: none;
+  caret-color: var(--accent);
+}
+.chat-persona-text:focus { border-color: var(--accent-border); }
+.chat-persona-text::placeholder { color: var(--text-dim); opacity: 0.6; }
+.chat-persona-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-persona-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 
 /* ── Agent status badge ───────────────────────────────────────── */
 .agent-status {
@@ -3510,6 +3592,45 @@ html, body {
 .msg-actions button:hover {
   background-image: none;
   box-shadow: none;
+}
+
+/* ── 按钮底色全覆盖（2026-09-21，用户要求「按钮背景要包含所有按钮」）────────
+   上面那三组只清掉纹理层，**底色**仍各写各的（多数纯图标按钮压根是
+   `background: none`）—— 「风格 → 按钮自定义」里的「按钮背景」因此只作用于
+   输入栏那六个按钮。这一段把它扩到**所有 `<button>`**：常驻底色一律取
+   `--btn-bg-rgb` / `--btn-bg-alpha`，与输入栏那一排完全同源。
+
+   **两处非有不可的排除**（都在 `:where()` 里，特异性仍为 0）：
+   ① **语义色按钮**：表达「放行 / 拒绝 / 危险 / 成功」的按钮按 ai-spec 规则
+      45/48 必须保持固定色，不随主题漂移 —— 名单是 `.tool-refusal-btn` /
+      `.approval-btn`（含 allow / deny / always 三种）/ `.memo-save-btn` /
+      `.file-chip-more-clear` / `.file-chip-remove` / `.result-item-remove` /
+      `.run-mode-confirm-ok`（自动档那段红底确认）/ `.ocr-copy-btn` /
+      `.settings-save-btn`。
+   ② **状态类**：`.active`（段选 / 侧栏当前项）与 `[data-armed="1"]`（两段式
+      确认的「待确认」红底）自己就带底色，而它们的特异性只有 (0,2,0) —— 不排除
+      的话会被本规则盖掉：段选看着像没选中、两段式确认看着像没进入待确认。
+
+   特异性说明：`#app button`(1,0,1) 恰好高过各按钮自己的类选择器(0,1,0)，
+   所以能盖住前面所有 `background: none`；而 `:where()` 贡献 0 特异性，
+   于是**盖不掉**带 id 的状态规则（`#chat-more-btn.open`、`#settings-btn:hover`
+   等）。**已知代价（用户 2026-09-21 明确接受）**：纯类选择器的 hover 底色
+   （`.chat-more-actions button:hover` / `.memo-item-actions button:hover` …）
+   会被下面那条 hover 规则统一成同一套主题底色 —— 各按钮 hover 时**颜色 /
+   边框**的变化照旧保留，只有底色被统一。 */
+#app button:where(
+  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"])
+) {
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+}
+/* 同一份名单 + 抬 α：让「没有自己 hover 规则」的按钮也有一致的悬停反馈，
+   不会出现「hover 一下底色就没了」。与输入栏六个按钮的 hover 配方同源。
+   **`:disabled` 只在 hover 这条里排除**：禁用按钮照旧有底色（外观一致），
+   但不该给「点得动」的反馈。 */
+#app button:where(
+  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(:disabled)
+):hover {
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
 /* ── 详细搜索大界面（双击搜索栏进入；见 docs/ai-spec.md §2.1.2）────────
