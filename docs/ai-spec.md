@@ -676,6 +676,19 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 上限 | 每条提示文本 2000 字符（截断标记），单个 hook 的 stdout/stderr 各读 512 KB（读满即丢，与 `tools.rs` 的管道纪律同源） |
 | 实测（2026-09-20） | `cargo test` core-agent **93 passed / 0 failed / 2 ignored**（新增 `hooks` **13 条**）、src-tauri **58 passed / 0 failed / 1 ignored**、`tsc --noEmit` exit 0；**真机端到端 18 条断言全过**（假 Anthropic 端点抓请求体 + 真 hook 子进程 + 真 Bash 工具）：拦下 ⇒ 工具未执行 / 无审批卡 / 拒因进 `tool_result`；放行 ⇒ 免卡且 `tool_result` 有 `exit code: 0`；**放行 + 危险命令 ⇒ 仍弹卡且 `analysis.dangerous` 非空**；`PostToolUse` 的 `additionalContext` ⇒ 第 2 次请求体里出现 `[PostToolUse hook]`；`UserPromptSubmit` 拦下 ⇒ 端点**零请求** + `result.subtype=hook_blocked`；退出码 7 ⇒ **不拦**（照常弹卡）且 `kind=error` 可见；`enabled:false` ⇒ 一条 hook 都不跑 |
 
+**人格 / 自定义提示词（L2，2026-09-21）**：让用户在设置里写一段**自己的**人格 / 输出风格，与内置人格段一起进系统提示词的**固定前缀**。实现：落盘 `config\persona.md`（纯文本）+ 宿主注入 `LUNAC_PERSONA_FILE` + [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `read_user_persona()` / `persona_block()` / `build_system_prompt()`；前端 `get_persona` / `set_persona`。要点：
+
+| 项 | 约定 |
+|---|---|
+| 落点（**唯一正确的位置**） | 系统提示词的**固定段**，位置 = **内置人格段之后、`Environment:` 之前**：`SYSTEM_PROMPT + PERSONA_AND_STYLE + [用户人格段] + env_block + skills::listing() + 索引 + 记忆`（`build_system_prompt()`）。理由：人格是**固定块**（每次都要生效、内容与请求无关）⇒ 只有进固定前缀才永远命中缓存（§11 规则 18/23）。**绝不按消息拼接**（旧形态，已废），也**绝不用 hooks 承载** —— hooks 是控制通道，它的输出今天不进模型（只有 `PostToolUse` 能拼进已有 `tool_result` 文本内部），且那样会多出一条权限面「谁能写 `hooks.json` 谁就能改系统指令」 |
+| 谁读、何时读 | **agent 侧**读，**启动时读一次**（`read_user_persona()` 只在 `main()` 装配处调一次，之后进程内逐字节不变）。宿主只在 spawn 时**无条件**注入路径（与 `LUNAC_HOOKS_FILE` 同形，不判断文件在不在）。⇒ **改完必须重启 agent 才生效**，面板如实写明并给「立即重启 AI」按钮 —— 这与 hooks 的 mtime 热重载**语义相反**，两处不要混 |
+| 「没配」的三种情况都等价 | 环境变量没给 / 文件不存在 / 读不出来 ⇒ 空串 ⇒ `persona_block()` 返回**空串**，提示词里**一个字节都不加**（只有第三种落一行 warn）。空文本是合法状态，面板「恢复内置」写的就是空文本（**不是**切开关、也**不是**删文件） |
+| 为什么在**内置段之后** | 内置 `PERSONA_AND_STYLE` 保住产品底线约束（文风 / 禁 emoji 这类不该被用户改掉的），用户段是**追加**而非替换 |
+| 长度上限 **8000 字符** | `core-agent` 的 `MAX_PERSONA_CHARS` 与宿主 `storage::MAX_PERSONA_CHARS` **两处同值**（改一处要改两处）。分工：宿主在**保存前硬校验**（超长 / 含 NUL ⇒ 拒收、一个字都不写），agent 侧读到超长**截断 + warn**（防御绕过面板直接改文件的人）。上限的理由：这段进的是**每次请求都要发的固定前缀** |
+| **刻意不进**子代理与后台复盘 | `build_subagent_system()` / `build_review_system()` 只有「角色段 + 环境块 + 技能清单」—— 两者都是内部产物（子代理报告 / 复盘写记忆），用户的文风口吻在那里没有意义，而多一份文本就是**每个并发子代理**都要重发一次的固定成本。守门单测 `user_persona_reaches_only_the_main_prompt` |
+| 文件位置 | `<exe 根>\config\persona.md`，与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级（「应用配置」；业务数据才进 `ModuleData`） |
+| 实测（2026-09-21，`core-agent\target\hooktest\e2e-l2.ps1`，真 `agent.exe` + 假端点，**16 条断言全过**） | 两轮对照：**Run A** 把 `LUNAC_PERSONA_FILE` 指向含 `PERSONA-MARKER-42` 的文件 ⇒ 线上 `system` 字符串里 `## Personality` < `## User-defined persona` < `Environment:` 三个下标严格递增、marker 在场，且该问两次请求的 `system` 前缀哈希**同值**（逐字节不变）；**Run B** 指向空文件 ⇒ marker / 表头都不在，且前缀哈希与**未引入 L2 时的基线完全相同** ⇒「没配人格时不加任何字节」由实测坐实（不是靠代码里那句 `if` 说服自己） |
+
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
 ### 3.6 数学公式渲染
@@ -1115,7 +1128,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
 
 | 原位置 | 处理 |
 |---|---|
-| 本节「待办路线」20 条 | 已全部完成或已挪走 ⇒ **条目删除**。未完成的（插件市场、AI 人格、成本面板、调试状态栏…）在 backlog §1 / §2 / §3 |
+| 本节「待办路线」20 条 | 已全部完成或已挪走 ⇒ **条目删除**。未完成的（插件市场、调试状态栏…）在 backlog §1 / §2 / §3 —— 其中**AI 人格**（2026-09-21 L2 ⇒ 规则 66）与**成本面板**（A12 ⇒ 规则 63）**均已落地**，不再是待办 |
 | §13「参考设计」（**未落地**） | 两个设计思路都**不排期**，压缩为一行指针 + 与现状的区分说明 |
 | §19.6「待实现清单」 | 已按实测拆解：Humanizer 按钮与安全警告块**其实早已落地**（本文此前漏标，已纠正）；调试阶段状态栏挪进 backlog L4 |
 | §20「路径 2 插件市场」 | 挪进 backlog L1（含三条硬约束：CSP / 资产授权 / 常驻开销） |
@@ -1189,7 +1202,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **一次权限运行 = 一行命令组（2026-09）**：同一次运行内 `Bash` 与 `PowerShell` 视作**同一族**，合并成**一条**未应答行（含 `&&` / `|` / 重定向 / 换行的复杂命令同样入组 —— 按算子排除会让复杂任务里「一行一条」堆满卡片）；合并**只影响审批展示**，执行语义不变。`.approval-item` **不得设固定高度**（旧 `height:144px` + `.approval-body{flex:1}` 会把命令挤在中间、上方留大片空档），命令区高度自适应内容。**命令区不许再有第二层滚动容器**（2026-09-15 修）：`.approval-cmd-box` 曾自带上限 + `overflow-y:auto`，与外层 `.approval-batch-body`（`max-height:380px` + `overflow-y:auto`）叠成嵌套双滚动条 —— 实测两条稍长的命令折行后 `scrollHeight=106 / clientHeight=72`，内层把 34px 内容裁在框外（「已合并 N 条命令」整行不见、末尾折行只剩半行），用户看到的就是「空白区域」还以为是模型输出带了空行。滚动**只由 `.approval-batch-body` 承担**。另：`└ ` 前缀行（第 2 条起）必须挂 `.with-sep`（`padding-left: 2ch; text-indent: -2ch`）—— 前缀是 inline，不挂的话折行续行会回到框左边缘、比正文左移 2ch（实测 12.11px），看起来就是「缩进对不齐」。**排版前先确认模型输出是否真有缩进**：实测拿到的命令是干净单行、`normalizeCmdForDisplay()` 也没改坏，纯粹是上面两条 CSS 造成的观感，别去改 agent 侧或 `normalizeCmdForDisplay()`。「始终允许」必须把**组内每一条**命令的命令词都写进白名单（只写第一条 = 用户反馈的「允许过还要再问」）；合并后标题要重画（工具名可能不止一个，⛔/⚠ 标记可能来自后并入的那条）。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。详见 [agent-ui-spec.md](./agent-ui-spec.md) §3.6。
     - **历史回顾不得省略过程与表盘（2026-09）**：会话记录（**2026-09-17 起存放于 `ModuleData\history\chat.db`（SQLite），旧位置是 `chat-history.json`**）除 `messages` 外还存 `usage`（表盘口径的 token 快照）与 `steps`（按回合分组的过程快照）；恢复历史时把表盘数值写回仪表盘、把过程渲染成可折叠的「过程 · N 步」块。**不是 `localStorage`**。详见 [agent-ui-spec.md](./agent-ui-spec.md) §3.7。
     - **滚动条统一（不得回退）**：项目内**所有**可滚动容器共用 `styles.css` 里**唯一**的全局 `::-webkit-scrollbar` 规则（4px / 轨道透明 / 滑块 `rgba(255,255,255,0.18)` / hover 0.32）。**禁止写 `scrollbar-width` / `scrollbar-color`** —— Chromium（WebView2）看到非 `auto` 值会让 `::-webkit-scrollbar` 整段失效、退回系统默认外观（历史事故：`#chat-input` / `.tool-result` 就是这么变成「WebView2 默认滚动条」的）；**禁止按容器单独声明**滚动条样式（新增容器必漏）。详见 [agent-ui-spec.md](./agent-ui-spec.md) §5.4。
-22. **系统提示词环境块（2026-09）**：agent 的系统提示词 = `SYSTEM_PROMPT`（身份 / 工具使用） + `PERSONA_AND_STYLE`（固定的「人格 + 文风」，2026-09-17 方案 B 从用户消息搬来） + `env_block(cwd)` + `skills::listing()`，四段拼接且**只构建一次**，见 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `env_block()`。环境块必须写明：宿主是 **Lunac**（不是任何其它 agent 框架的一部分）、**工作目录的绝对路径**、**Lunac 自己的技能目录**（`LUNAC_SKILLS_DIR`），并**显式禁止用磁盘上的文件反推宿主**。
+22. **系统提示词环境块（2026-09）**：agent 的系统提示词 = `SYSTEM_PROMPT`（身份 / 工具使用） + `PERSONA_AND_STYLE`（内置的固定「人格 + 文风」，2026-09-17 方案 B 从用户消息搬来） + **用户人格段**（L2，2026-09-21：`config\persona.md` 有内容时紧接在内置人格段之后追加，空则**一个字节都不加**） + `env_block(cwd)` + `skills::listing()`（+ 往期会话索引 / 记忆块，各自按开关），按序拼接且**只构建一次**，见 [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs) 的 `env_block()` / `build_system_prompt()`。环境块必须写明：宿主是 **Lunac**（不是任何其它 agent 框架的一部分）、**工作目录的绝对路径**、**Lunac 自己的技能目录**（`LUNAC_SKILLS_DIR`），并**显式禁止用磁盘上的文件反推宿主**。
     - **为什么必须写**（真实案例）：默认工作区是用户主目录，而用户主目录里可能躺着**别的 agent 框架**的目录（实测：`~/.hermes/skills`）。模型回答「我自己的 skills 在哪」时只能从文件系统反推 —— Glob 到那些目录后，它把宿主认成了那个框架，整个思考过程都锁死在那里（只是「你是 Lunac 的助手」这一句并不够）。
     - **不得回退**：这段话是身份纠偏的唯一来源，删掉就会退回「模型自己猜宿主」。内容在一次会话内必须**逐字节不变**（cwd 与技能目录在 agent 进程生命周期内都是常量），否则违反规则 18 的前缀缓存不变量。
 23. **缓存命中率的解释口径（2026-09）**：命中率**有自然下限**，不能拿 100% 当目标 —— 每轮新增的 user 提问 / assistant 输出 / `tool_result` 都是新内容，天然不被上一轮缓存覆盖，命中上限 ≈ 上一轮长度 ÷ 本轮长度；工具往返多、`tool_result` 大时必然偏低。**因此必须把「自然未命中」与「断裂失效」分开统计**，只有后者才是回归。
@@ -1211,7 +1224,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **思考开关不直接进前缀**：thinking 只进 `display`、**不进 history**（回灌会 400）；其 400 降级只改 `thinking` 形态与 `max_tokens` 两个生成参数（`Thinking` / `max_tokens_for`），是否掉缓存取决于端点侧 hash 口径（本仓库无法自证）。但**切思考开关会重启 agent ⇒ history 清空 ⇒ 缓存必然重建**，这是「切换后命中率骤降」的合理解释，属预期行为。
     - **思考只有开 / 关两态（2026-09-15，不得回退）**：端点**没有**思考力度旋钮（`budget_tokens` 不被 enforce、`effort` 字段被静默忽略，实测见 §3.5），因此**禁止**再把档位做成「快速 / 思考 / 深度」这类深度分级、也禁止把 `budget_tokens` 暴露给用户 —— 那是在承诺端点做不到的事。开关值只有 `on` / `off`（`LUNAC_THINKING`），`budget_tokens` 退化为单一常量 `THINKING_BUDGET`。
     - **注入提示的「固定 / 条件」位置纪律（2026-09-17，方案 B，不得回退）**：给模型的行为约束按「是否随请求变化」分成两类，**落点不同**：
-      - **固定块**（人格 / 文风 —— 每次都要生效、内容与请求无关）**必须放进 agent 的系统提示词**（`core-agent/src/main.rs` 的 `PERSONA_AND_STYLE`，与 `SYSTEM_PROMPT` 拼接）。它是固定前缀的一部分 ⇒ 永远命中缓存。
+      - **固定块**（人格 / 文风 —— 每次都要生效、内容与请求无关）**必须放进 agent 的系统提示词**（`core-agent/src/main.rs` 的 `PERSONA_AND_STYLE`，与 `SYSTEM_PROMPT` 拼接）。它是固定前缀的一部分 ⇒ 永远命中缓存。**2026-09-21 起这一段是两截**：内置常量 `PERSONA_AND_STYLE` + 用户在设置里写的那段（`config\persona.md`，**启动时读一次**，见 §3.5「人格 / 自定义提示词」/ §11 规则 66）—— 「可配置」与「进固定前缀」这两件事必须同时成立，别为了让用户能改就把它挪进消息侧。
       - **条件块**（`## Debugging Methodology` / `## TDD Requirement` / `## Code Review Pipeline` —— 按 query 关键词命中）**只能留在用户消息里**，因为随 query 变；搬进系统提示词会让提示词每轮都变、把整个固定前缀打掉（比不搬更糟）。
       - **为什么这条是硬约束**：原本两块固定文案（1153 字符 ≈ 288 token）由前端 `buildSystemPromptHint()` 拼在**每条用户消息最前面**，位置决定了它**每次提问都必然未命中**（新用户消息天生不在上一轮缓存前缀里）。实测纯问答类提问的首请求未命中量 `in = 236 / 289 / 313` token 与它几乎相等 ⇒ **首请求未命中的约 90% 就是这两块**。搬进系统提示词后它们进入固定前缀，从此零未命中。
       - 守门测试：`core-agent` 的 `system_prompt_is_stable_and_carries_persona`（同一 cwd 下逐字节可复现 + 两块文案确实在提示词里）。**前端 `buildSystemPromptHint()` 返回空串是合法状态**（不含关键词的提问就是空），`wrappedQuery` 与 `cleanUserContent()` 都按「没有 `\n\n---\n\n` 分隔符」处理。
@@ -1715,6 +1728,14 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **结果按下标回填 ⇒ 回灌顺序 = `tool_use` 原序**：`slots[i]` 回填 + 批区间无缝覆盖（规则 23 的同一条纪律），并发的完成先后**不得**影响回灌顺序；worker panic 也按下标写一条 `is_error` 结果，不留空洞。
     - **审批带归属；合并不许跨任务；审批通道不许改成主线程轮询**：子代理内部发出的 `control_request` 在 `request.task_id` 写明属于哪个子任务，主循环自己发起的调用**不写该键**（前端据此标注归属）。前端的命令合并（`findLastCmdGroup(taskId)`）必须比对 task id —— 否则两个子任务的命令并进同一行，「允许」一次放行两个任务、而标注只能显示其中一个。**死锁红线**：审批由**独立的 stdin 线程**按 `request_id` 投递（`route_control_response` + `pending_approvals`），所以主线程阻塞在 `thread::scope` 里也照样收发；**不要**把审批改成在主线程上轮询，那会在多子代理同时等审批时直接锁死。
     - **前端按 `task_id` 归组，且不动总体视窗**：三个 `task_*` 事件按 `task_id` 渲染成一块「子任务」面板（每个子任务一行、就地更新），**不做左右分栏** —— 分栏要改总体视窗宽度、还会在列内引入第二层滚动条，两条都是明令禁止的（agent-ui-spec §0 规则 1、规则 44）。面板**不给** `max-height` / `overflow`（高度跟内容长，滚动交给外层）。状态行在 `task_done` 后**还有别的子任务在跑就继续报并行数**，全跑完才回「工作中」——一个 `task_done` 就说「工作中」会让用户以为剩下的也结束了。
+
+66. **用户人格 / 自定义提示词（L2，2026-09-21，原 backlog L2）**：契约与实测见 §3.5「人格 / 自定义提示词」。一句话形态：**把「人格」从写死的 Rust 常量变成用户在设置里可编辑的一段文本，但它仍然落在系统提示词的固定前缀里**。**六条不得回退**：
+    - **落点只能是系统提示词的固定段**（内置人格段之后、`Environment:` 之前），**绝不按消息拼接**（那会让提示词每轮都变、把整个固定前缀打掉 —— 规则 23 的实测：那两块固定文案占首请求未命中的约 90%），**也绝不用 hooks 承载**（hooks 是**控制通道**：放行 / 拒绝 / 提示行，它的输出今天不进模型，只有 `PostToolUse` 能拼进**已有** `tool_result` 的文本内部；拿它当文本注入通道等于给同一机制加第二个职责，还会多出一条权限面「谁能写 `hooks.json` 谁就能改系统指令」）。
+    - **启动时读一次**（`read_user_persona()` 在 `main()` 装配处调一次），进程内**逐字节不变** —— 这是规则 18 的前缀缓存不变量，「可配置」不等于「每轮可变」。代价是**改完必须重启 agent 才生效**：面板必须**如实写明**并给「立即重启 AI」按钮（复用 `window.__lunac_reload_agent`，不要另造重启通道）。**不要**以「hooks 是热重载的」为由把这段也做成热重载 —— 提示词不是配置，它是请求体的一部分。
+    - **「没配」必须等于「一个字节都不加」**：环境变量没给 / 文件不存在 / 读不出来 ⇒ 空串 ⇒ `persona_block()` 返回空串。**别加空行、别加表头、别用占位文案** —— e2e 的判据就是「空文件时的 `system` 前缀哈希与未引入本功能前**完全相同**」。空文本是合法状态（面板的「恢复内置」写的就是空文本，不是删文件、也不是切开关）。
+    - **只进主提示词，刻意不进子代理与后台复盘**：`build_subagent_system()` / `build_review_system()` 保持「角色段 + 环境块 + 技能清单」。理由是那两者是内部产物（报告 / 写记忆），用户文风在那里没有意义，而多出的文本是**每个并发子代理**都要重发一次的固定成本。守门单测 `user_persona_reaches_only_the_main_prompt` 同时钉住「逐字在场 / 位置正确 / 花括号按字面量走（不进 `format!` 求值） / 只进主提示词」四件事。
+    - **长度上限 8000 字符，两侧同值**（`core-agent` 的 `MAX_PERSONA_CHARS` 与宿主 `storage::MAX_PERSONA_CHARS`）：宿主**保存前**硬校验（超长 / 含 NUL ⇒ 拒收且一个字都不写），agent 侧读到超长只**截断 + warn**。为什么要上限：这段是**每次请求都要发**的固定前缀，塞长文等于给每一轮都加一笔固定成本 —— 它不是「用户想写多少就写多少」的地方（用户绕过面板直接编辑文件是这条截断兜的场景）。
+    - **落盘是 `config\persona.md` 纯文本**（与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级）：后台配置走 `config\`、业务数据走 `ModuleData\`，这条分工不许破例；宿主只在 spawn 时**无条件**注入 `LUNAC_PERSONA_FILE`（同 `LUNAC_HOOKS_FILE` 的先例：「文件不在 = 没配」由一处判定，宿主不替它判断）。
 
 ## 12. Agent Plan 模式规范
 
