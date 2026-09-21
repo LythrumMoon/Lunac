@@ -689,6 +689,20 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 文件位置 | `<exe 根>\config\persona.md`，与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级（「应用配置」；业务数据才进 `ModuleData`） |
 | 实测（2026-09-21，`core-agent\target\hooktest\e2e-l2.ps1`，真 `agent.exe` + 假端点，**16 条断言全过**） | 两轮对照：**Run A** 把 `LUNAC_PERSONA_FILE` 指向含 `PERSONA-MARKER-42` 的文件 ⇒ 线上 `system` 字符串里 `## Personality` < `## User-defined persona` < `Environment:` 三个下标严格递增、marker 在场，且该问两次请求的 `system` 前缀哈希**同值**（逐字节不变）；**Run B** 指向空文件 ⇒ marker / 表头都不在，且前缀哈希与**未引入 L2 时的基线完全相同** ⇒「没配人格时不加任何字节」由实测坐实（不是靠代码里那句 `if` 说服自己） |
 
+**插件市场（L1，2026-09-21）**：`<exe 根>\plugins\<id>\` 下的第三方插件**在启动时被注册进同一个 `pluginRegistry`**，于是结果区渲染、拼音匹配、`pluginIconSvg()`、i18n 的 `plugin.<id>` 全部零改动。宿主侧实现：[app/src-tauri/src/plugin_market.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_market.rs)（扫描 / 解压 / 校验 / 卸载，7 条单测）+ [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 的四个命令；前端适配层 [app/src/plugins/market.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/market.ts)。要点：
+
+| 项 | 约定 |
+|---|---|
+| 包形状 | **https 的 zip**，包内（根目录或唯一一层子目录 —— GitHub 的 zip 会给一个顶层目录）必须有 `lunac-plugin.json` + **已编译好的 ESM 入口**（`entry`，默认 `index.js`）。清单字段：`id`（**同时是目录名**）/ `name` / `description` / `keywords` / `icon` / `version` / `entry` / `homepage` |
+| 加载通道 | `convertFileSrc(entry)` → `import(/* @vite-ignore */ url)`。**CSP 必须含 `https://asset.localhost`（script-src）**—— 2026-09-21 已在 `tauri.conf.json` 加上。两条前提经 Tauri 源码核实（不是猜的）：`.js` / `.mjs` 在 asset 协议下被标成 **`text/javascript`**（`tauri-utils/src/mime_type.rs`），asset 响应一律带 **`Access-Control-Allow-Origin: <窗口 origin>`**（`tauri/src/protocol/asset.rs`）⇒ 跨 origin 的模块加载成立。**插件代码永远不能走 CDN**（同 §3.7 的 KaTeX 缺陷是同一条约束） |
+| 插件契约 | 入口**默认导出** `{ execute(input) => string \| { type, content } }`；也接受「默认导出就是函数」或「具名导出 execute」。入参是搜索栏原始文本（与内置插件一致）；`type: 'html'` 的结果会被 `innerHTML` 渲染 —— 与内置插件同路，所以**装谁 = 信任谁的代码**，界面上必须把「这是可执行代码 + 来源」写出来 |
+| 校验（比 tools / skills 先例更严，因为解压的是可执行代码） | ① **只收 https**（明文 http 的 zip 会被解压执行）；② 压缩包 ≤ 32MB、**解压后总量 ≤ 192MB**、条目 ≤ 4000（zip bomb）；③ 逐条拒绝绝对路径 / `..` / 空段 / 深度 > 16 / 以点或空格结尾的分段（路径穿越，判据收口在纯函数 `safe_join()`，有单测）；④ `id` 只允许 `[a-z0-9._-]` 且不以 `.` 开头（它直接当目录名）；⑤ `entry` 必须是相对路径且以 `.js` / `.mjs` 结尾；⑥ **同 id 已存在 ⇒ 拒绝**（不静默覆盖：无声换掉一个插件目录里的代码是最不该发生的事；用户要升级就先卸载）；⑦ 先解到 `.staging-*` 再改名进正式目录，**失败即清理**（不留半成品） |
+| 安全边界要诚实 | 这里做的是**防事故**（写坏路径、把包塞爆、装重了），**不是防恶意** —— 插件是用户自己选择安装的可执行代码，装上即等同一份本机权限（与 `tools\` 的 shell handler 同族）。别把这条写成「已沙箱化」 |
+| 生效语义 | 装完 / 卸完**立即生效，不必重启 AI 也不必刷前端**：`refreshMarketPlugins()` 把旧 id `unregister` 掉再 `register` 新对象（registry 不去重，直接二次 register 会让结果区出现两行）。这与「技能改完要重启 agent」是两回事（技能是 agent 的能力、插件是前端的界面件） |
+| 坏包必须可见 | 清单坏了、入口丢了的包**不进 registry**（用不了），但**必须列在面板上并写出原因** —— 否则用户只会看到插件莫名消失、手上没有任何线索。`list_installed_plugins` 因此返回 `valid` + `error` 两个字段 |
+| 模型资产（Live2D 等） | **安装包零第三方模型资产**：Lunac 只提供引擎与导入通道，模型由终端用户自备（他说下载时自己接受 Live2D 的协议）。版权四条线见 backlog **L1-B** —— 尤其：官方样例模型属 **No Redistribution**，**不得**随包分发 |
+| 实测（2026-09-21） | `cargo test` src-tauri **69 passed / 0 failed / 1 ignored**（新增 `plugin_market` **7 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错）、`tsc --noEmit` exit 0、`npm run build` exit 0 |
+
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
 ### 3.6 数学公式渲染
@@ -1736,6 +1750,15 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **只进主提示词，刻意不进子代理与后台复盘**：`build_subagent_system()` / `build_review_system()` 保持「角色段 + 环境块 + 技能清单」。理由是那两者是内部产物（报告 / 写记忆），用户文风在那里没有意义，而多出的文本是**每个并发子代理**都要重发一次的固定成本。守门单测 `user_persona_reaches_only_the_main_prompt` 同时钉住「逐字在场 / 位置正确 / 花括号按字面量走（不进 `format!` 求值） / 只进主提示词」四件事。
     - **长度上限 8000 字符，两侧同值**（`core-agent` 的 `MAX_PERSONA_CHARS` 与宿主 `storage::MAX_PERSONA_CHARS`）：宿主**保存前**硬校验（超长 / 含 NUL ⇒ 拒收且一个字都不写），agent 侧读到超长只**截断 + warn**。为什么要上限：这段是**每次请求都要发**的固定前缀，塞长文等于给每一轮都加一笔固定成本 —— 它不是「用户想写多少就写多少」的地方（用户绕过面板直接编辑文件是这条截断兜的场景）。
     - **落盘是 `config\persona.md` 纯文本**（与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级）：后台配置走 `config\`、业务数据走 `ModuleData\`，这条分工不许破例；宿主只在 spawn 时**无条件**注入 `LUNAC_PERSONA_FILE`（同 `LUNAC_HOOKS_FILE` 的先例：「文件不在 = 没配」由一处判定，宿主不替它判断）。
+
+67. **第三方插件市场（L1，2026-09-21，原 backlog L1 本体）**：契约与实测见 §3.5「插件市场」。形态：**`<exe 根>\plugins\<id>\` 下的包在启动时被注册进同一个 `pluginRegistry`**（于是结果区 / 拼音 / 图标 / i18n 零改动），安装走 **https 的 zip**（`lunac-plugin.json` + 已编译的 ESM 入口）。**七条不得回退**：
+    - **加载通道只能是 asset 协议**：`convertFileSrc(entry)` → `import(/* @vite-ignore */ url)`。CSP 的 `script-src` **必须含 `https://asset.localhost`**（2026-09-21 加）；**永远不能走 CDN**（同 §3.7 的 KaTeX 缺陷）。这条链路的两个前提是**核实过 Tauri 源码**的，不是猜的：`.js` / `.mjs` 在 asset 协议下是 `text/javascript`（`tauri-utils` 的 `mime_type.rs`），asset 响应一律带 `Access-Control-Allow-Origin: <窗口 origin>`（`tauri/src/protocol/asset.rs`）。
+    - **校验比 tools / skills 先例更严，因为解压的是可执行代码**：只收 https；压缩包与**解压后总量**都有上限 + 条目数上限（zip bomb）；路径穿越的判据收口在纯函数 `safe_join()`（拒绝对路径 / `..` / 空段 / 深路径 / 以点或空格结尾的分段）并有单测；`id` 只允许 `[a-z0-9._-]`；`entry` 必须相对且 `.js` / `.mjs`；**同 id 已存在 ⇒ 拒绝**（不静默覆盖）；先解到 `.staging-*` 再改名，失败即清理。
+    - **安全边界写实话**：这是**防事故**，不是防恶意 —— 插件是用户自己装的代码，装上即等同一份本机权限。**禁止**把这条描述成「已沙箱化」（同 §4.1 的诚实原则）。
+    - **坏包必须可见**：清单坏 / 入口丢的包用不了（不进 registry），但**要列出来并写出原因** —— 否则用户只看到插件莫名消失。
+    - **生效语义 = 立即生效**：`refreshMarketPlugins()` 先 `unregister` 再 `register`（registry 不去重，二次 register 会让结果区出现两行）；**不要**去抄「技能改完要重启 agent」那条 —— 技能是 agent 的能力，插件是前端的界面件。
+    - **安装包零第三方模型资产**：Lunac 只给引擎与导入通道，模型由终端用户自备。官方样例模型属 **No Redistribution**（见 backlog L1-B 的四条线），**不得**随包分发。
+    - **设置面板里必须写清两件事**：这是**可执行代码**、装它等于在本机运行它（只装信任来源）；以及插件目录在哪。别让用户以为插件只是个配置项。
 
 ## 12. Agent Plan 模式规范
 
