@@ -915,6 +915,8 @@ build-release.ps1                    # 一键打包（仓库根，见 §8.2）
 
 > 所有 ps1 脚本必须用 `$PSScriptRoot` / `Split-Path -Parent $PSScriptRoot` 推导仓库根，**禁止硬编码本机绝对路径**；统一包管理器为 `npm`。
 > **含中文的 `.ps1` 与 `.nsi` 必须以 UTF-8 with BOM 保存** —— Windows PowerShell 5.1 与 makensis 对无 BOM 文件按 ANSI(GBK) 解码，中文字符会把紧随其后的引号/换行吞进双字节：ps1 报「字符串缺少终止符」，NSI 报 `Bad text encoding: <file>:<line>`（行号指向**首个非 ASCII 行**，不是真正出问题的那一行，极易误判）。已知触发源：`download-paddle-ocr.ps1` / `build-release.ps1`（PS 侧），以及**用会丢 BOM 的编辑器/批量替换工具改 `scripts\lunac-installer.nsi`**（实测：一次文本替换就把 BOM 抹掉，makensis 立刻在第 14 行中文注释处报 `Bad text encoding`，整个打包链路直接断掉）。`build-release.ps1` 第 ⑨ 步每次都会用 `UTF8Encoding($true)` 重写 NSI，所以**从仓库新鲜克隆的 NSI 有没有 BOM 取决于最后一次提交** —— 提交前请确认首三字节是 `EF BB BF`。
+>
+> **2026-09-21 补一种更隐蔽的坏法：两份 BOM（实测坏掉的就是 `build-release.ps1`）。** 一次批量文本编辑把文件按「BOM + 原文」（原文自己已带 BOM）重存 ⇒ 首六字节 `EF BB BF EF BB BF`。PS 5.1 只吃掉**第一份** BOM，剩下的 `U+FEFF` 让**首行**（`# Lunac Release Build Script`）变成一条命令 ⇒ 第 18 行的 `param()` 不再是「首语句」⇒ **脚本参数全部不绑定**（`$Version` / `$NoBump` 全成 `$null`），而报错是「无法将 `?#` 项识别为 cmdlet」+「无法将 `param` 项识别为 cmdlet」这种与真实原因**毫不相干**的东西，最后停在「版本号必须形如 x.y.z，收到： False」（`$Version` 在消息里显示成字符串 `False`）—— 只看报错完全猜不到根因。**判据**：首三字节 `EF BB BF` **且第四字节不是 `EF`**（两份 BOM 时 PS 报不出「BOM」这个词，所以必须主动查字节）。**修法**是「以 UTF-8 with BOM **重存**」（等价于去掉多余 BOM），不是「再加一份 BOM」。**自动守卫**：`npm run verify` 第 ⑧ 节扫全仓 `.ps1` / `.nsi`，两种坏法都报 FAIL —— ① 开头有两份 BOM；② 含中文却没有 BOM（这一条同时把 `docs\parse-minidump.ps1` 的旧违规修掉）。两个分支都做过反向验证（临时造坏文件，确认真的报 FAIL 并让 `verify` 以 1 退出）。
 
 ## 7. 开发命令
 

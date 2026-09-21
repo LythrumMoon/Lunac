@@ -1,4 +1,4 @@
-# Parse a Windows kernel minidump to extract the bugcheck (BSOD) code.
+﻿# Parse a Windows kernel minidump to extract the bugcheck (BSOD) code.
 #
 # 用法：  powershell -File docs\parse-minidump.ps1 -Path 'C:\Windows\Minidump\xxxx.dmp'
 #         powershell -File docs\parse-minidump.ps1            # 不给就取该目录下最新的一个

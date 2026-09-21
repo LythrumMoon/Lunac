@@ -23,7 +23,7 @@ Write-Host "仓库根: $root"
 Write-Host ""
 
 # ── 1. 平台与工具链 ─────────────────────────────────────────────
-Write-Host "[1/7] 平台与工具链" -ForegroundColor Cyan
+Write-Host "[1/8] 平台与工具链" -ForegroundColor Cyan
 if ($env:OS -eq "Windows_NT") {
   Ok "Windows（本项目仅支持 Windows：Win32 全局热键 / 系统托盘 / NSIS）"
 } else {
@@ -55,7 +55,7 @@ if ($nsis) { Ok "makensis 已安装（可打 Setup.exe 安装包）" }
 else { Warn "未安装 NSIS（仅打 Setup.exe 安装包时需要）" }
 
 # ── 2. 前端依赖 ─────────────────────────────────────────────────
-Write-Host "[2/7] 前端依赖" -ForegroundColor Cyan
+Write-Host "[2/8] 前端依赖" -ForegroundColor Cyan
 if (Test-Path (Join-Path $appDir "node_modules")) {
   Ok "app\node_modules 已存在"
 } else {
@@ -64,7 +64,7 @@ if (Test-Path (Join-Path $appDir "node_modules")) {
 }
 
 # ── 3. Agent 后端 ───────────────────────────────────────────────
-Write-Host "[3/7] Agent 后端 core-agent\target\release\agent.exe" -ForegroundColor Cyan
+Write-Host "[3/8] Agent 后端 core-agent\target\release\agent.exe" -ForegroundColor Cyan
 $agent = Join-Path $root "core-agent\target\release\agent.exe"
 if (Test-Path $agent) {
   Ok ("agent.exe 已编译（{0} MB）" -f [math]::Round((Get-Item $agent).Length / 1MB, 1))
@@ -75,7 +75,7 @@ if (Test-Path $agent) {
 }
 
 # ── 4. AI 配置 ──────────────────────────────────────────────────
-Write-Host "[4/7] AI 配置 app\src-tauri\.env" -ForegroundColor Cyan
+Write-Host "[4/8] AI 配置 app\src-tauri\.env" -ForegroundColor Cyan
 $envFile = Join-Path $appDir "src-tauri\.env"
 if (Test-Path $envFile) {
   $text = Get-Content $envFile -Raw
@@ -95,7 +95,7 @@ if (Test-Path $envFile) {
 }
 
 # ── 5. 离线 OCR 引擎（可选）────────────────────────────────────
-Write-Host "[5/7] 离线 OCR 引擎 paddle-ocr\（可选）" -ForegroundColor Cyan
+Write-Host "[5/8] 离线 OCR 引擎 paddle-ocr\（可选）" -ForegroundColor Cyan
 $paddleExe = Get-ChildItem -Path (Join-Path $root "paddle-ocr") -Recurse -Filter "PaddleOCR-json.exe" -ErrorAction SilentlyContinue |
   Select-Object -First 1
 if ($paddleExe) {
@@ -106,7 +106,7 @@ if ($paddleExe) {
 }
 
 # ── 6. 开发端口 ─────────────────────────────────────────────────
-Write-Host "[6/7] 开发端口 5173（Vite strictPort）" -ForegroundColor Cyan
+Write-Host "[6/8] 开发端口 5173（Vite strictPort）" -ForegroundColor Cyan
 $busy = Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue
 if ($busy) {
   $owner = ($busy | Select-Object -First 1).OwningProcess
@@ -117,9 +117,40 @@ if ($busy) {
 }
 
 # ── 7. 数据目录 ─────────────────────────────────────────────────
-Write-Host "[7/7] 数据目录（便携模式）" -ForegroundColor Cyan
+Write-Host "[7/8] 数据目录（便携模式）" -ForegroundColor Cyan
 Ok "根目录 = exe 所在目录；dev 落在 app\src-tauri\target\debug\ 旁，release 落在安装根"
 Note "子目录: temp\（缓存）ModuleData\（历史/备忘录/自定义启动项）skills\ tools\ config\ paddle-ocr\"
+
+# ── 8. 脚本编码（.ps1 / .nsi 的 UTF-8 BOM）──────────────────────
+# 这条不是洁癖：含中文的 .ps1 / .nsi 一旦丢了 BOM，PS 5.1 与 makensis 会按 ANSI(GBK)
+# 解码，中文字符会把紧随其后的引号/换行吞进双字节 —— 表现是「字符串缺少终止符」或
+# makensis 的 `Bad text encoding`（行号还指向首个非 ASCII 行，极易误判）。
+# 更隐蔽的是**两份 BOM**：PS 5.1 只吃掉第一份，剩下的 U+FEFF 让**首行变成一条命令**
+# ⇒ 第 18 行的 param() 不再是首语句 ⇒ 脚本参数**全部不绑定**，而报错信息是
+# 「无法将"?#"项识别为 cmdlet」+「无法将"param"项识别为 cmdlet」这种看不懂的东西
+# （实测 build-release.ps1 就是这么坏掉的：版本号最后变成字符串 "False"）。
+Write-Host "[8/8] 脚本编码（UTF-8 with BOM，且只有一份）" -ForegroundColor Cyan
+$encFiles = Get-ChildItem -Path $root -Recurse -File -Include *.ps1, *.nsi -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -notmatch '\\(node_modules|target|release|dist|\.git|core|mingw64)\\' }
+$encBad = 0
+foreach ($f in $encFiles) {
+  $b = [IO.File]::ReadAllBytes($f.FullName)
+  $bom = $b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF
+  $doubleBom = $bom -and $b.Length -ge 6 -and $b[3] -eq 0xEF -and $b[4] -eq 0xBB -and $b[5] -eq 0xBF
+  $nonAscii = $false
+  foreach ($x in $b) { if ($x -gt 0x7F) { $nonAscii = $true; break } }
+  $rel = $f.FullName.Replace("$root\", "")
+  if ($doubleBom) {
+    Bad "$rel 开头有**两份** BOM"
+    Note "修复: 以 UTF-8 with BOM 重存（首三字节 EF BB BF，第四字节不能又是 EF）"
+    $encBad++
+  } elseif ($nonAscii -and -not $bom) {
+    Bad "$rel 含中文但没有 BOM"
+    Note "修复: 以 UTF-8 with BOM 重存"
+    $encBad++
+  }
+}
+if ($encBad -eq 0) { Ok "$($encFiles.Count) 个 .ps1 / .nsi 编码正确" }
 
 # ── 汇总 ────────────────────────────────────────────────────────
 Write-Host ""
