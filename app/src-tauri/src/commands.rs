@@ -1811,6 +1811,54 @@ pub fn install_skill_from_url(url: String) -> Result<String, String> {
     Ok(key)
 }
 
+/// 用系统默认程序打开一个**本地路径**（目录 → 资源管理器；文件 → 关联程序）。
+///
+/// 为什么不让前端直接用 `@tauri-apps/plugin-shell` 的 `open()`：那个命令的入参要过 shell 插件的
+/// **open scope 正则**，而它的默认 scope 只放行 URL scheme（`mailto:` / `http(s):` / `tel:`），
+/// 本地路径一律被拒 —— 报错原文就是
+/// `scoped command argument at position 0 was found but failed regex validation`。
+/// 而调用点又把异常吞进 console，于是表现为「按钮点了没反应」：设置里的**主题目录**、
+/// hooks.json、pricing.json、技能目录四处全踩了这个（2026-09-21 统一改走本命令）。
+///
+/// 走宿主侧还有一条**安全上的好处**：不必给 shell 插件放宽 open scope ⇒ 第三方插件
+/// （它们也能调 `open()`）仍然只能开 URL，开不了本机任意路径 —— 权限面不因此变宽。
+///
+/// 实现用 `cmd /c start "" "<path>"`：`start` 走 ShellExecute 语义（目录开资源管理器、
+/// 文件走关联程序），比 `explorer <path>` 对文件更可靠；**必须 CREATE_NO_WINDOW** ——
+/// release 是 GUI 子系统进程，不设这个标志会闪出一个 cmd 窗口。
+#[tauri::command]
+pub fn open_path(path: String) -> Result<(), String> {
+    let p = path.trim().to_string();
+    if p.is_empty() {
+        return Err("路径为空".into());
+    }
+    // raw_arg 下整条命令行是拼出来的 ⇒ 路径里的引号会破坏结构（第 3 个 args 之后的都成了别的东西）
+    if p.contains('"') {
+        return Err("路径含引号，已拒绝".into());
+    }
+    let pb = std::path::Path::new(&p);
+    if !pb.is_absolute() {
+        return Err(format!("只接受绝对路径：{p}"));
+    }
+    if !pb.exists() {
+        return Err(format!("路径不存在：{p}"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd")
+            .raw_arg(format!("/c start \"\" \"{p}\""))
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .map_err(|e| format!("打开失败：{e}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
 /// 删除技能目录（递归）。
 #[tauri::command]
 pub fn delete_skill(key: String) -> Result<String, String> {

@@ -173,7 +173,10 @@ export function attachQuickLaunchListeners(container: HTMLElement) {
       // Hide first, then launch — fire both concurrently, no await
       getCurrentWindow().hide().catch(() => {});
       invoke("launch_app", { path }).catch(async () => {
-        await open(path);
+        // 兜底：**本地路径**必须走宿主命令 `open_path`（shell 的 `open()` 要过 open scope
+        // 正则，只放行 URL scheme，本地路径一律被拒）；网页快捷方式仍走 `open()`。
+        if (/^[a-zA-Z]:[\\/]/.test(path)) await invoke("open_path", { path });
+        else await open(path);
       });
     });
   });
