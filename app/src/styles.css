@@ -96,6 +96,22 @@
      hover / 打开态按同一基色抬 α，见各按钮规则。 */
   --btn-bg-rgb: var(--accent-rgb);
   --btn-bg-alpha: 0.14;
+  /* ── 「其他颜色」（2026-09-21 新增，设置 → 风格 · 其他颜色）────────────
+     六项原本只能跟着主题色 / 派生色走、用户改不了的颜色。约定与上面 --btn-* 一致：
+     **颜色是 rgb 三元组、透明度单独一条 α**；每一项的默认值都等于改造前的表达式
+     （多数直接引用 --accent-rgb / --ctx-rgb / --surface-rgb / --text-dim）⇒
+     用户不碰控件时逐像素不变 —— main.ts 只在对应字段被改过时才写内联值。 */
+  --other-item-hover-rgb: var(--ctx-rgb);        /* (a) 结果项 hover / 选中项的浮层 */
+  --other-item-hover-alpha: 0.1;
+  --other-nav-rgb: var(--accent-rgb);            /* (b) 设置侧栏「当前选中项」的底色与左竖条 */
+  --other-nav-alpha: 0.14;
+  --other-runtime-text: var(--text-dim);         /* (c) 「运行端输出」折叠块的正文文字 */
+  --other-chat-bg-rgb: var(--surface-rgb);       /* (d) AI 对话面板背景（默认 = 玻璃底色） */
+  --other-chat-bg-alpha: var(--surface-alpha, 0.88);
+  --other-panel-bg-rgb: var(--surface-rgb);      /* (e) 设置面板背景（默认 α = 0 ⇒ 不画） */
+  --other-panel-bg-alpha: 0;
+  --other-group-bg-rgb: var(--ctx-rgb);          /* (f) 设置面板「分类标题」块的底色 */
+  --other-group-bg-alpha: 0.14;
   /* 玻璃反光（设置 → 风格 · 背景 · 反光）：一道从左上打到右下的高光斜带，
      模拟钢化玻璃的镜面反射。默认 alpha 0 = **完全不可见**，与改造前一致。
      为什么用 background-image 而不是再加一层 ::after：`#results-container` 的
@@ -1063,6 +1079,13 @@ html, body {
   background-color: var(--surface-glass);
   background-image: var(--glass-sheen-image);
 }
+/* AI 对话模式下这层底色的落点（2026-09-21，设置 → 风格 · 其他颜色 → 对话背景）：
+   默认 `--other-chat-bg-rgb/alpha` 就等于 `--surface-rgb` / `--surface-alpha`，
+   所以不碰控件时与上面那位逐像素相同。只在 ai-chat 下生效 —— 别的插件与搜索结果
+   区照旧用 `--surface-glass`。 */
+#results-container.ai-chat::before {
+  background-color: rgba(var(--other-chat-bg-rgb), var(--other-chat-bg-alpha));
+}
 
 #results-list {
   overflow-y: auto;
@@ -1150,10 +1173,11 @@ html, body {
   transition: background 0.08s;
 }
 
-/* ④ 结果区当前选中项 —— 走「反差四件套」（见 :root 的 --ctx-* 注释）。 */
+/* ④ 结果区当前选中项 —— 走「反差四件套」（见 :root 的 --ctx-* 注释）；
+   2026-09-21 起可被「风格 · 其他颜色 → 结果项浮层」单独覆盖（默认值就是 --ctx-rgb）。 */
 .result-item:hover,
 .result-item.selected {
-  background: rgba(var(--ctx-rgb), 0.1);
+  background: rgba(var(--other-item-hover-rgb), var(--other-item-hover-alpha));
 }
 
 .result-item-icon {
@@ -1321,6 +1345,12 @@ html, body {
   font-size: 0.88rem;
   line-height: 1.6;
   animation: plugin-in 0.2s ease both;
+}
+/* 设置面板自己的底色（2026-09-21，设置 → 风格 · 其他颜色 → 设置面板背景）。
+   **默认 α = 0 ⇒ 什么都不画**，设置面板与其它插件一样直接坐在 #results-container 的
+   玻璃底上（历史上就是这样，不许为了「有个背景」把它默认改成不透明）。 */
+.plugin-result > .settings-layout {
+  background: rgba(var(--other-panel-bg-rgb), var(--other-panel-bg-alpha));
 }
 
 @keyframes plugin-in {
@@ -1721,7 +1751,9 @@ html, body {
   word-break: break-word;
   max-height: 180px;
   overflow-y: auto;
-  color: var(--text-dim);
+  /* 2026-09-21：「运行端输出」的正文文字可被「风格 · 其他颜色」单独调色。
+     默认值就是原来的 --text-dim（见 :root 的 --other-runtime-text）⇒ 逐像素不变。 */
+  color: var(--other-runtime-text);
 }
 
 /* ── 被改动文件的路径追踪（backlog §8.1）────────────────────────────

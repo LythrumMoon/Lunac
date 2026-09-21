@@ -1651,6 +1651,8 @@ function forceResetPluginUI() {
   // Hide chat input bar
   chatInputBar.classList.add("hidden");
   resultsContainer.classList.remove("ai-chat");
+  // 退出 AI 模式 ⇒ 任务抽屉也要跟着消失（它只在 ai-chat 下显示，见 renderTodoDrawer）
+  renderTodoDrawer();
   showTokenDashboard(false);
 }
 
@@ -1851,6 +1853,8 @@ function setPluginBar(title: string | null) {
     showTokenDashboard(false);
     statusHint.classList.remove("hidden");
   }
+  // 进出 AI 模式都要重算任务抽屉的显隐（它只在 ai-chat 下显示，见 renderTodoDrawer）
+  renderTodoDrawer();
   // Re-render file chips so they live in the chat bar while AI is active
   // and return to the search bar otherwise (point 5/17).
   renderFileChips();
@@ -1928,6 +1932,7 @@ async function newConversation(skipCliRestart = false) {
   todoItems = [];
   todoTasksOpen = false;
   todoFilesOpen = false;
+  todoDismissed = false;
   renderTodoDrawer();
 
   // Restart CLI to clear accumulated conversation context.
@@ -3720,6 +3725,7 @@ function pathDir(p: string): string {
 function noteChangedFile(path: string) {
   if (!path || sessionChangedFiles.includes(path)) return;
   sessionChangedFiles.push(path);
+  todoDismissed = false; // 又有新改动 ⇒ 抽屉该回来（见 renderTodoDrawer）
   renderTodoDrawer();
 }
 
@@ -3735,6 +3741,8 @@ function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
   sessionChangedFiles = out;
   todoItems = [];
   todoTasksOpen = false;
+  todoFilesOpen = false;
+  todoDismissed = false;
   renderTodoDrawer();
 }
 
@@ -3761,13 +3769,23 @@ let todoItems: unknown[] = [];
 /** 两个列表的展开状态：跨重绘保留 —— 用户点开了就别自己收回去。 */
 let todoTasksOpen = false;
 let todoFilesOpen = false;
+/** 「确认」= 收工：收工后整块藏起来，直到又有**新**待办 / **新**改动文件。
+ *  （2026-09-21 用户报「点了确认没反应」：只有改动文件、没有待办时，旧实现
+ *  在视觉上什么都不会变 —— 现在确认一定让抽屉消失。） */
+let todoDismissed = false;
 
 function renderTodoDrawer() {
   const hasTasks = todoItems.length > 0;
   const hasFiles = sessionChangedFiles.length > 0;
-  // 没内容就整块不显示（用户要求：只有里面有内容时抽屉才出现）
-  todoDrawer.classList.toggle("hidden", !hasTasks && !hasFiles);
-  if (!hasTasks && !hasFiles) return;
+  const hasContent = hasTasks || hasFiles;
+  // 两个硬条件（2026-09-21 修）：
+  //  ① **只在 AI 对话模式下出现** —— 抽屉是 `#results-list` 的**兄弟节点**
+  //     （index.html），不判模式的话退出 AI 之后它会浮在别的插件结果上面
+  //     （用户报的「退出 ai 助手后会漂浮在各个结果区插件里面」）；
+  //  ② 没内容整块不显示，确认过也整块不显示（用户要求：只有里面有内容时才出现）。
+  const chatMode = resultsContainer.classList.contains("ai-chat");
+  todoDrawer.classList.toggle("hidden", !hasContent || !chatMode || todoDismissed);
+  if (!hasContent) return;
 
   todoDrawerTitle.textContent = t("agent.todo_title");
 
@@ -3832,8 +3850,13 @@ function attachTodoDrawer() {
     renderTodoDrawer();
   });
   todoDrawerOkBtn.addEventListener("click", () => {
+    // 收工：清空待办 + 收起两个列表 + **整块藏起来**（`todoDismissed`）。
+    // 改动文件列表刻意不清 —— 用户还要照着它去定位文件；下次有新的待办或
+    // 新的改动文件时抽屉会自己回来（见 noteChangedFile / renderTodoPanel）。
     todoItems = [];
     todoTasksOpen = false;
+    todoFilesOpen = false;
+    todoDismissed = true;
     renderTodoDrawer();
   });
 }
@@ -3885,6 +3908,7 @@ function parseTodoArgs(raw: string): unknown[] | null {
  *  一份状态，既不堆成一摞，也不再往对话链路里塞面板。 */
 function renderTodoPanel(todos: unknown[]) {
   todoItems = todos;
+  todoDismissed = false; // 新清单 ⇒ 抽屉该回来（用户确认过的是**上一份**清单）
   renderTodoDrawer();
 }
 
@@ -7109,6 +7133,21 @@ interface Appearance {
    *  **不受「恢复默认主题」管辖**（用户 2026-09-20 明确「文字明度不锁定」）——
    *  它是明度偏移、不是配色本身，开关开着也照常生效。 */
   textLight: number;
+  /** ── 「其他颜色」（2026-09-21 新增，设置 → 风格 · 其他颜色）──────────────
+   *  六项原本只能跟着主题色 / 派生色走、用户改不了的颜色。约定与按钮那两组完全一致：
+   *  **颜色字段空串 = 跟随**（清掉内联变量、回落 `:root` 的派生配方），α 字段恒写。
+   *  默认值全部等于改造前的表达式 ⇒ 不碰控件时逐像素不变（见 ai-spec 规则 45）。 */
+  itemHoverColor: string;   // (a) 结果项 hover / 选中项那层浮起的底色
+  itemHoverAlpha: number;
+  navActiveColor: string;   // (b) 设置面板侧栏「当前选中项」的底色与左竖条
+  navActiveAlpha: number;
+  runtimeTextColor: string; // (c) 「运行端输出」（stderr 折叠块）的正文文字色
+  chatBgColor: string;      // (d) AI 对话面板的背景（默认 = 玻璃底色）
+  chatBgAlpha: number;
+  panelBgColor: string;     // (e) 设置面板背景（默认 α = 0 ⇒ 透明，什么都不画）
+  panelBgAlpha: number;
+  groupBgColor: string;     // (f) 设置面板「分类标题」块的底色
+  groupBgAlpha: number;
   themeId: string;          // "default" = 不套主题包
 }
 
@@ -7128,12 +7167,24 @@ const APPEARANCE_DEFAULTS: Appearance = {
   // 空串时 main.ts 会把内联变量清掉，回落到 :root 里那几行 `var(--accent-*)`。
   baseColor: "", btnLineColor: "", btnLineAlpha: 0.32,
   btnBgColor: "", btnBgAlpha: 0.14, textLight: 0,
+  // 「其他颜色」六项：颜色空串 = 跟随（回落 styles.css 的 :root 里那几行
+  // `var(--accent-rgb)` / `var(--surface-rgb)` / `var(--text-dim)`），α 等于改造前
+  // 各自写死的值 —— 尤其 `panelBgAlpha: 0`（设置面板原本**没有**自己的背景，必须保持透明）。
+  itemHoverColor: "", itemHoverAlpha: 0.1,
+  navActiveColor: "", navActiveAlpha: 0.14,
+  runtimeTextColor: "",
+  chatBgColor: "", chatBgAlpha: 0.88,
+  panelBgColor: "", panelBgAlpha: 0,
+  groupBgColor: "", groupBgAlpha: 0.14,
 };
 /** 各数值的合法区间：滑块的 min/max 只是 UI 提示，手工改 localStorage 或旧版本
  *  残留都可能给出越界值（`bgOpacity: 5` 会让背景变成纯色块直接盖住面板）。 */
 const APPEARANCE_RANGE: Record<string, [number, number]> = {
   bgBlur: [0, 40], bgSaturate: [0, 200], bgOpacity: [0, 1], sheen: [0, 1], surfaceAlpha: [0.3, 1],
   btnLineAlpha: [0, 1], btnBgAlpha: [0, 1], textLight: [-100, 100],
+  // 「其他颜色」的五个透明度（(c) 运行端文字没有 α —— 文字色不带透明度）
+  itemHoverAlpha: [0, 1], navActiveAlpha: [0, 1], chatBgAlpha: [0, 1],
+  panelBgAlpha: [0, 1], groupBgAlpha: [0, 1],
 };
 
 let appearance: Appearance = { ...APPEARANCE_DEFAULTS };
@@ -7156,6 +7207,13 @@ function clampAppearance(a: Appearance): Appearance {
   out.baseColor = hexOr(out.baseColor, true) ?? APPEARANCE_DEFAULTS.baseColor;
   out.btnLineColor = hexOr(out.btnLineColor, true) ?? APPEARANCE_DEFAULTS.btnLineColor;
   out.btnBgColor = hexOr(out.btnBgColor, true) ?? APPEARANCE_DEFAULTS.btnBgColor;
+  // 「其他颜色」的六个颜色字段（同一条空串哨兵约定）。
+  out.itemHoverColor = hexOr(out.itemHoverColor, true) ?? APPEARANCE_DEFAULTS.itemHoverColor;
+  out.navActiveColor = hexOr(out.navActiveColor, true) ?? APPEARANCE_DEFAULTS.navActiveColor;
+  out.runtimeTextColor = hexOr(out.runtimeTextColor, true) ?? APPEARANCE_DEFAULTS.runtimeTextColor;
+  out.chatBgColor = hexOr(out.chatBgColor, true) ?? APPEARANCE_DEFAULTS.chatBgColor;
+  out.panelBgColor = hexOr(out.panelBgColor, true) ?? APPEARANCE_DEFAULTS.panelBgColor;
+  out.groupBgColor = hexOr(out.groupBgColor, true) ?? APPEARANCE_DEFAULTS.groupBgColor;
   if (typeof out.themeId !== "string" || !out.themeId) out.themeId = "default";
   if (out.bgImage !== null && typeof out.bgImage !== "string") out.bgImage = null;
   // tintBase 只接受真布尔
@@ -7519,6 +7577,35 @@ function applyAppearance() {
   const btnBg = colorsOn && appearance.btnBgColor ? resolveCustomColor(appearance.btnBgColor) : null;
   setVar("--btn-bg-rgb", btnBg ? btnBg.triplet : "");
   setVar("--btn-bg-alpha", String(appearance.btnBgAlpha));
+  // ⑤e 「其他颜色」（2026-09-21 新增，设置 → 风格 · 其他颜色）：六项原本只能跟着
+  //     主题色 / 派生色走的颜色（结果项浮层 / 设置选中项 / 运行端文字 / 对话背景 /
+  //     设置面板背景 / 分类标题背景）。与 ⑤c/⑤d **同一套约定**：颜色是空串 ⇒ 清掉
+  //     内联值、回落 `:root` 的派生配方（默认态逐像素不变），α 恒写。
+  //     也受「恢复默认主题」管辖（`colorsOn`）—— 它是配色，不是透明度。
+  const otherColor = (hex: string) =>
+    colorsOn && hex ? resolveCustomColor(hex) : null;
+  const oItemHover = otherColor(appearance.itemHoverColor);
+  setVar("--other-item-hover-rgb", oItemHover ? oItemHover.triplet : "");
+  setVar("--other-item-hover-alpha", String(appearance.itemHoverAlpha));
+  const oNav = otherColor(appearance.navActiveColor);
+  setVar("--other-nav-rgb", oNav ? oNav.triplet : "");
+  setVar("--other-nav-alpha", String(appearance.navActiveAlpha));
+  setVar("--other-runtime-text",
+    colorsOn && appearance.runtimeTextColor ? appearance.runtimeTextColor : "");
+  const oChatBg = otherColor(appearance.chatBgColor);
+  setVar("--other-chat-bg-rgb", oChatBg ? oChatBg.triplet : "");
+  // 对话背景的 α **默认跟随底色透明度**（:root 里写的就是 `var(--surface-alpha)`）：
+  // 只有用户真拖过它才写内联值，否则清掉、继续跟 ② 步的 `--surface-alpha` 走 ——
+  // 不这样做的话，改「底色透明度」时对话背景会与其它玻璃面不同步。
+  setVar("--other-chat-bg-alpha",
+    appearance.chatBgAlpha === APPEARANCE_DEFAULTS.chatBgAlpha
+      ? "" : String(appearance.chatBgAlpha));
+  const oPanelBg = otherColor(appearance.panelBgColor);
+  setVar("--other-panel-bg-rgb", oPanelBg ? oPanelBg.triplet : "");
+  setVar("--other-panel-bg-alpha", String(appearance.panelBgAlpha));
+  const oGroupBg = otherColor(appearance.groupBgColor);
+  setVar("--other-group-bg-rgb", oGroupBg ? oGroupBg.triplet : "");
+  setVar("--other-group-bg-alpha", String(appearance.groupBgAlpha));
   // 注意 `--surface-alpha`（底色透明度）在 ② 步**无条件**写：它是玻璃质感、不随底色颜色
   // 变化，且历史上属于「背景」组、老配置里可能是非默认值 —— 归进那个开关的失效范围
   // 会把老用户的透明度静默改回 0.88。见 ai-spec 规则 45「失效范围」那一段。
@@ -7574,7 +7661,11 @@ async function loadThemes(force = false): Promise<ThemeInfo[]> {
   /** 「跟随态」下三个取色器该显示什么色：底色 = 当前生效的表面色（主题包 surface 优先，
    *  否则派生），按钮线条 / 按钮背景 = 当前主题色。设置面板只拿它做**初始显示**、不落盘 ——
    *  派生逻辑只有这一份，面板复制一份必然漂移。 */
-  resolvedSwatches: (): { base: string; btnLine: string; btnBg: string } => {
+  resolvedSwatches: (): {
+    base: string; btnLine: string; btnBg: string;
+    itemHover: string; navActive: string; runtimeText: string;
+    chatBg: string; panelBg: string; groupBg: string;
+  } => {
     const accent = themeAccent();
     let base = accent;
     const surf = themeSurface();
@@ -7585,7 +7676,17 @@ async function loadThemes(force = false): Promise<ThemeInfo[]> {
       const parts = (derivePalette(accent)?.["--surface-rgb"] ?? "").split(",").map(s => Number(s.trim()));
       if (parts.length === 3 && parts.every(Number.isFinite)) base = toHex(parts[0], parts[1], parts[2]);
     }
-    return { base, btnLine: accent, btnBg: accent };
+    // 「其他颜色」六项在「跟随态」下显示什么色，同样由这里现算（面板不复制派生逻辑）：
+    //   (a) 结果项浮层 / (b) 设置选中项 / (f) 分类标题 = 主题色；
+    //   (d) 对话背景 / (e) 设置面板背景 = 当前表面色（就是上面那个 base）；
+    //   (c) 运行端文字 = 主题色派生出的次要文字色。
+    const textDim = derivePalette(accent)?.["--text-dim"] ?? "#b2a9a3";
+    return {
+      base, btnLine: accent, btnBg: accent,
+      itemHover: accent, navActive: accent, groupBg: accent,
+      chatBg: base, panelBg: base,
+      runtimeText: textDim,
+    };
   },
   themesDir: (): Promise<string> => invoke<string>("themes_dir"),
   /** 选择背景图（设置面板只管选文件，落配置与应用都走这里，避免两处实现漂移）。 */
