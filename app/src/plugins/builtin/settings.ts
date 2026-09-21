@@ -179,23 +179,20 @@ interface AppearanceConfig {
   btnBgAlpha: number;
   /** 文字明度偏移 ±100（0 = 派生原值）。 */
   textLight: number;
-  /** ── 「其他颜色」六项（2026-09-21 新增，同一套「空串 = 跟随」约定）────────
+  /** ── 「其他颜色」的统一浮层（2026-09-21 新增 → 同日定稿为一组）──────────
+   *  初版拆成六项（结果项浮层 / 设置选中项 / 运行端文字 / 对话背景 / 设置面板背景 /
+   *  分类标题背景），用户判定「分得太细」并明确「不应该分出来几类，而是由一个调色
+   *  统一控制」，于是运行端文字、对话背景、设置面板背景三项**整项删除**（各回主题），
+   *  余下三处 + 顶栏图标按钮的 hover 浮层合成**一对**字段。
    *  颜色字段空串 ⇒ 回落 :root 的派生配方；α 恒写。默认值 = 改造前的表达式。 */
-  itemHoverColor: string;   // (a) 结果项 hover / 选中项的浮层
-  itemHoverAlpha: number;
-  navActiveColor: string;   // (b) 设置侧栏「当前选中项」的底色与左竖条
-  navActiveAlpha: number;
-  runtimeTextColor: string; // (c) 「运行端输出」正文文字
-  chatBgColor: string;      // (d) AI 对话面板背景
-  chatBgAlpha: number;
-  panelBgColor: string;     // (e) 设置面板背景（默认 α = 0 ⇒ 不画）
-  panelBgAlpha: number;
-  groupBgColor: string;     // (f) 设置面板「分类标题」块的底色
-  groupBgAlpha: number;
+  overlayColor: string;
+  overlayAlpha: number;
   themeId: string;
 }
 interface AppearanceThemeInfo {
-  manifest: { id: string; name: string; version: string; author: string };
+  /** `tokens` 只用到 `accent`：主题泡泡框右下角那个主色圆点（2026-09-21）。
+   *  主题包没写 accent 时它为空 ⇒ 圆点退化成中性灰（与 `.ap-theme.active` 同一口径）。 */
+  manifest: { id: string; name: string; version: string; author: string; tokens?: { accent?: string | null } };
   builtin: boolean;
 }
 interface AppearanceBridge {
@@ -203,12 +200,10 @@ interface AppearanceBridge {
   set(patch: Partial<AppearanceConfig>): void;
   themes(force?: boolean): Promise<AppearanceThemeInfo[]>;
   /** 「跟随态」下取色器该显示什么色（底色 = 主题包 surface 或派生的表面色，
-   *  按钮线条 / 按钮背景 = 主题色；「其他颜色」六项见 main.ts 里的同名函数）。
+   *  按钮线条 / 按钮背景 = 主题色；「其他颜色」的统一浮层见 main.ts 里的同名函数）。
    *  只用于取色器的**初始显示**，不落盘 —— 面板不自己复制一份派生逻辑（否则必然漂移）。 */
   resolvedSwatches(): {
-    base: string; btnLine: string; btnBg: string;
-    itemHover: string; navActive: string; runtimeText: string;
-    chatBg: string; panelBg: string; groupBg: string;
+    base: string; btnLine: string; btnBg: string; overlay: string;
   };
   themesDir(): Promise<string>;
   pickBgImage(): Promise<boolean>;
@@ -456,6 +451,21 @@ function formatAppearanceValue(field: string, v: number): string {
   return v.toFixed(2);
 }
 
+/** 主题包 `tokens.accent` → 主题泡泡框里那个主色圆点用的 CSS 颜色。
+ *  与 `tokens.surface` 一样，主题包允许写 "#RRGGBB" 与 "r, g, b" 两种形式
+ *  （见 appearance.rs 的 ThemeTokens 注释），这里两种都认。
+ *  取不到 / 写坏时返回中性灰：圆点宁可退化成灰，也不能让整个泡泡框渲染不出来。 */
+function themeAccentColor(raw: string | null | undefined): string {
+  const s = (raw ?? "").trim();
+  if (!s) return "rgba(255, 255, 255, 0.22)";
+  if (s.startsWith("#")) return s;
+  const parts = s.split(",").map(x => Number(x.trim()));
+  if (parts.length === 3 && parts.every(n => Number.isFinite(n) && n >= 0 && n <= 255)) {
+    return `rgb(${parts.map(n => Math.round(n)).join(", ")})`;
+  }
+  return "rgba(255, 255, 255, 0.22)";
+}
+
 async function buildAppearancePane(): Promise<string> {
   const ap = appearanceBridge();
   const cfg: AppearanceConfig = ap?.get() ?? {
@@ -463,12 +473,7 @@ async function buildAppearancePane(): Promise<string> {
     sheen: 0, surfaceAlpha: 0.88, tintBase: false,
     baseColor: "", btnLineColor: "", btnLineAlpha: 0.32,
     btnBgColor: "", btnBgAlpha: 0.14, textLight: 0,
-    itemHoverColor: "", itemHoverAlpha: 0.1,
-    navActiveColor: "", navActiveAlpha: 0.14,
-    runtimeTextColor: "",
-    chatBgColor: "", chatBgAlpha: 0.88,
-    panelBgColor: "", panelBgAlpha: 0,
-    groupBgColor: "", groupBgAlpha: 0.14,
+    overlayColor: "", overlayAlpha: 0.1,
     themeId: "default",
   };
   let themes: AppearanceThemeInfo[] = [];
@@ -476,21 +481,14 @@ async function buildAppearancePane(): Promise<string> {
   // 取色器在「跟随态」（对应字段是空串）下显示什么色，由 main.ts 算好给过来 ——
   // 面板不复制那份派生逻辑（复制必然漂移）。见 AppearanceBridge.resolvedSwatches。
   const sw = ap?.resolvedSwatches() ?? {
-    base: "#c0a0a0", btnLine: "#c0a0a0", btnBg: "#c0a0a0",
-    itemHover: "#c0a0a0", navActive: "#c0a0a0", runtimeText: "#b2a9a3",
-    chatBg: "#1c1a20", panelBg: "#1c1a20", groupBg: "#c0a0a0",
+    base: "#c0a0a0", btnLine: "#c0a0a0", btnBg: "#c0a0a0", overlay: "#c0a0a0",
   };
   const shown = {
     base: cfg.baseColor || sw.base,
     btnline: cfg.btnLineColor || sw.btnLine,
     btnbg: cfg.btnBgColor || sw.btnBg,
-    // 「其他颜色」六项（2026-09-21）
-    itemHover: cfg.itemHoverColor || sw.itemHover,
-    nav: cfg.navActiveColor || sw.navActive,
-    runtimeText: cfg.runtimeTextColor || sw.runtimeText,
-    chatBg: cfg.chatBgColor || sw.chatBg,
-    panelBg: cfg.panelBgColor || sw.panelBg,
-    groupBg: cfg.groupBgColor || sw.groupBg,
+    // 「其他颜色」的统一浮层（2026-09-21）
+    overlay: cfg.overlayColor || sw.overlay,
   };
   // 三对「饱和度 / 明度」滑块的初值 = 上面那个色的 HSV 两轴（**与色板同一组值**）。
   const axis = (slot: "base" | "btnline" | "btnbg") => hexToHsv(shown[slot]) ?? { h: 0, s: 0, v: 0 };
@@ -505,6 +503,13 @@ async function buildAppearancePane(): Promise<string> {
    *  免得 attach 之前闪一帧「可编辑」。 */
   const tl = () => `class="ap-locked-group${cfg.tintBase ? " locked" : ""}" data-tint-lock="1"`;
 
+  // ── 主题泡泡框（2026-09-21 定稿）──────────────────────────────────
+  // 用户原话：「设置里的主题应该用分割出来的泡泡框去识别文件夹，然后点击切换」。
+  // 所以每一项都是**一个主题文件夹对应一个泡泡**（列表本身就是 `list_themes` 扫
+  // `<themes 根>\*\theme.json` 的结果，不改取数来源），泡泡里放：
+  //   ① 该主题的主色圆点（`tokens.accent`）② 名称 ③ 内置主题的「内置」徽标。
+  // 圆点让「选哪个主题」不用先点一下才知道 —— 这是从纯文字按钮改成泡泡框的全部理由。
+  // `title` 用文件夹名（id），便于用户对照 `<themes 根>` 里的目录。
   const themeButtons = themes.map(th => {
     const id = th.manifest.id;
     const active = id === cfg.themeId;
@@ -512,7 +517,9 @@ async function buildAppearancePane(): Promise<string> {
     const label = th.manifest.name || t("settings.appearance_theme_default");
     const badge = th.builtin && id !== "default"
       ? `<span class="ap-badge">${t("settings.appearance_theme_builtin")}</span>` : "";
-    return `<button type="button" class="ap-theme${active ? " active" : ""}" data-theme="${esc(id)}">${esc(label)}${badge}</button>`;
+    return `<button type="button" class="ap-theme${active ? " active" : ""}" data-theme="${esc(id)}" title="${esc(id)}">`
+      + `<span class="ap-theme-dot" style="background:${esc(themeAccentColor(th.manifest.tokens?.accent))}"></span>`
+      + `<span class="ap-theme-name">${esc(label)}</span>${badge}</button>`;
   }).join("");
 
   return `
@@ -644,12 +651,15 @@ async function buildAppearancePane(): Promise<string> {
         ${appearanceSliderRow("settings.appearance_text_light", "textLight", -100, 100, 1, cfg.textLight, v => formatAppearanceValue("textLight", v))}
       </div>
 
-      <!-- ── ⑤ 其他颜色（2026-09-21 新增，用户要求「分出来一个其他颜色选项」）──
-           六项原本只能跟着主题色 / 派生色走、用户改不了的颜色：
-           结果项浮层 / 设置选中项 / 运行端输出文字 / AI 对话背景 / 设置面板背景 / 分类标题背景。
-           每项一个取色器（取色器自带饱和度-明度框，所以**不再重复给轴滑块**）+ 一个透明度
-           （(c) 是文字色，没有 α）。**取色器受「恢复默认主题」管辖（data-tint-lock），
-           透明度滑块留在锁外** —— 与上面三组同一口径（见 ai-spec 规则 45）。 -->
+      <!-- ── ⑤ 其他颜色（2026-09-21 新增 → 同日定稿为「一组统一控制」）──
+           初版拆成六项独立取色器，用户判定「分得太细」并要求
+           「不应该分出来几类，而是由一个调色统一控制」：
+             · 运行端输出文字 / 对话背景 / 设置面板背景 **整项删除**（各回主题）；
+             · 余下三处（结果项浮层 / 设置选中项 / 分类标题背景）+ **顶栏图标按钮的
+               hover 浮层**（进入设置 / 退出设置 / 退出插件）合并成**一个**取色器 +
+               **一条**透明度（取色器自带饱和度-明度框，所以不再重复给轴滑块）。
+           取色器受「恢复默认主题」管辖（data-tint-lock），透明度滑块留在锁外 ——
+           与上面三组同一口径（见 ai-spec 规则 45）。 -->
       <div class="settings-row">
         <span class="settings-label">${t("settings.appearance_other_label")}</span>
         <div class="settings-bg-actions">
@@ -660,45 +670,11 @@ async function buildAppearancePane(): Promise<string> {
         <div class="settings-hint ap-other-hint">${t("settings.appearance_other_hint")}</div>
         <div ${tl()}>
           <div class="settings-row ap-row-block">
-            <span class="settings-label">${t("settings.appearance_other_item_hover")}</span>
-            ${colorPickerHtml("ap-oitemhover", shown.itemHover)}
+            <span class="settings-label">${t("settings.appearance_other_overlay")}</span>
+            ${colorPickerHtml("ap-ooverlay", shown.overlay)}
           </div>
         </div>
-        ${appearanceSliderRow("settings.appearance_other_item_hover_alpha", "itemHoverAlpha", 0, 1, 0.01, cfg.itemHoverAlpha, v => formatAppearanceValue("itemHoverAlpha", v))}
-        <div ${tl()}>
-          <div class="settings-row ap-row-block">
-            <span class="settings-label">${t("settings.appearance_other_nav")}</span>
-            ${colorPickerHtml("ap-onav", shown.nav)}
-          </div>
-        </div>
-        ${appearanceSliderRow("settings.appearance_other_nav_alpha", "navActiveAlpha", 0, 1, 0.01, cfg.navActiveAlpha, v => formatAppearanceValue("navActiveAlpha", v))}
-        <div ${tl()}>
-          <div class="settings-row ap-row-block">
-            <span class="settings-label">${t("settings.appearance_other_runtime_text")}</span>
-            ${colorPickerHtml("ap-oruntime", shown.runtimeText)}
-          </div>
-        </div>
-        <div ${tl()}>
-          <div class="settings-row ap-row-block">
-            <span class="settings-label">${t("settings.appearance_other_chat_bg")}</span>
-            ${colorPickerHtml("ap-ochatbg", shown.chatBg)}
-          </div>
-        </div>
-        ${appearanceSliderRow("settings.appearance_other_chat_bg_alpha", "chatBgAlpha", 0, 1, 0.01, cfg.chatBgAlpha, v => formatAppearanceValue("chatBgAlpha", v))}
-        <div ${tl()}>
-          <div class="settings-row ap-row-block">
-            <span class="settings-label">${t("settings.appearance_other_panel_bg")}</span>
-            ${colorPickerHtml("ap-opanelbg", shown.panelBg)}
-          </div>
-        </div>
-        ${appearanceSliderRow("settings.appearance_other_panel_bg_alpha", "panelBgAlpha", 0, 1, 0.01, cfg.panelBgAlpha, v => formatAppearanceValue("panelBgAlpha", v))}
-        <div ${tl()}>
-          <div class="settings-row ap-row-block">
-            <span class="settings-label">${t("settings.appearance_other_group_bg")}</span>
-            ${colorPickerHtml("ap-ogroupbg", shown.groupBg)}
-          </div>
-        </div>
-        ${appearanceSliderRow("settings.appearance_other_group_bg_alpha", "groupBgAlpha", 0, 1, 0.01, cfg.groupBgAlpha, v => formatAppearanceValue("groupBgAlpha", v))}
+        ${appearanceSliderRow("settings.appearance_other_overlay_alpha", "overlayAlpha", 0, 1, 0.01, cfg.overlayAlpha, v => formatAppearanceValue("overlayAlpha", v))}
       </div>
       </div>
 
@@ -753,27 +729,23 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
     syncBgRow();
   });
 
-  // ── 三个取色器 + 各自的「饱和度 / 明度」滑块：**同一组值、双向联动**（2026-09-20 用户改定）
+  // ── 四个取色器（底色 / 按钮线条 / 按钮背景 / 其他颜色浮层）：前三个各带一对
+  //    「饱和度 / 明度」滑块、**同一组值、双向联动**（2026-09-20 用户改定）
   // 每个 slot 的当前颜色只留一份（`colors[slot].hex`），两条输入路径都写它：
   //   · 取色器（色板 / 色相条 / hex / 预设 / 屏幕取色）→ commit → `syncAxes()` 回写滑块；
   //   · 滑块 → `hsvToHex()` 算出新色 → `handle.apply()` 回写色板（**不 commit**，防回环）。
   // 「跟随态」（字段是空串）下起点是 main.ts 给的派生色；用户一动就写成真 hex，
   // 从此以用户的为准（用户选的那一档：「没动过就自动派生」）。
-  // **主题色取色器已删除**：主题色只由主题包提供，所以这里只剩底色 / 按钮线条 / 按钮背景三个。
+  // **主题色取色器已删除**：主题色只由主题包提供，所以这里只有上面四个。
   const sw = ap.resolvedSwatches();
   const colors: Record<string, { id: string; hex: string; set: (hex: string) => void }> = {
     base: { id: "ap-base", hex: cfg.baseColor || sw.base, set: (hex) => ap.set({ baseColor: hex }) },
     btnline: { id: "ap-btnline", hex: cfg.btnLineColor || sw.btnLine, set: (hex) => ap.set({ btnLineColor: hex }) },
     btnbg: { id: "ap-btnbg", hex: cfg.btnBgColor || sw.btnBg, set: (hex) => ap.set({ btnBgColor: hex }) },
-    // 「其他颜色」六项（2026-09-21）：同一条「空串 = 跟随」约定，一动就写成真 hex。
-    // 它们**没有**轴滑块（取色器自带的饱和度-明度框就是那两轴），所以下面
-    // `syncAxes()` 对这些 slot 是空转 —— 那是刻意的，不是漏做。
-    itemHover: { id: "ap-oitemhover", hex: cfg.itemHoverColor || sw.itemHover, set: (hex) => ap.set({ itemHoverColor: hex }) },
-    nav: { id: "ap-onav", hex: cfg.navActiveColor || sw.navActive, set: (hex) => ap.set({ navActiveColor: hex }) },
-    runtimeText: { id: "ap-oruntime", hex: cfg.runtimeTextColor || sw.runtimeText, set: (hex) => ap.set({ runtimeTextColor: hex }) },
-    chatBg: { id: "ap-ochatbg", hex: cfg.chatBgColor || sw.chatBg, set: (hex) => ap.set({ chatBgColor: hex }) },
-    panelBg: { id: "ap-opanelbg", hex: cfg.panelBgColor || sw.panelBg, set: (hex) => ap.set({ panelBgColor: hex }) },
-    groupBg: { id: "ap-ogroupbg", hex: cfg.groupBgColor || sw.groupBg, set: (hex) => ap.set({ groupBgColor: hex }) },
+    // 「其他颜色」的统一浮层（2026-09-21）：同一条「空串 = 跟随」约定，一动就写成真 hex。
+    // 它**没有**轴滑块（取色器自带的饱和度-明度框就是那两轴），所以下面
+    // `syncAxes()` 对这个 slot 是空转 —— 那是刻意的，不是漏做。
+    overlay: { id: "ap-ooverlay", hex: cfg.overlayColor || sw.overlay, set: (hex) => ap.set({ overlayColor: hex }) },
   };
   const syncAxes = (slot: string) => {
     const hsv = hexToHsv(colors[slot].hex);
@@ -2069,9 +2041,10 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       .settings-sidebar-item.active {
         color: var(--text);
-        /* 2026-09-21：「其他颜色 → 设置选中项」单独可调（默认就是 --accent-bg / --accent）。 */
-        background: rgba(var(--other-nav-rgb), var(--other-nav-alpha));
-        border-left-color: rgb(var(--other-nav-rgb));
+        /* 2026-09-21：「其他颜色」的统一浮层（默认色 = --accent-rgb，默认 α = 0.1 × 1.4 = 0.14，
+           就是改造前的 --accent-bg / --accent 配方）。 */
+        background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha));
+        border-left-color: rgb(var(--other-overlay-rgb));
       }
 
       /* 2026-09-21 修「设置里进大窗口后无法滚动」：detached（双击搜索栏展开的
@@ -2624,8 +2597,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
         font-size: 0.84rem;
         font-weight: 600;
         color: var(--text);
-        /* 2026-09-21：「其他颜色 → 分类标题背景」单独可调（默认就是 rgba(ctx-rgb, 0.14)）。 */
-        background: rgba(var(--other-group-bg-rgb), var(--other-group-bg-alpha));
+        /* 2026-09-21：「其他颜色」的统一浮层（默认 α 0.1 × 1.4 = 0.14）。 */
+        background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha));
         border-left: 3px solid rgb(var(--ctx-rgb));
         border-radius: 4px;
       }
@@ -2638,7 +2611,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         background: rgba(var(--ink-rgb), 0.03);
       }
       .ap-sliders-panel.hidden { display: none; }
-      /* 「其他颜色」分块顶部那句提示（面板背景默认透明），只给一点行距。 */
+      /* 「其他颜色」分块顶部那句提示，只给一点行距。 */
       .ap-other-hint { margin: 0 0 6px 0; }
       .ap-toggle-caret { margin-left: 5px; font-size: 0.62rem; opacity: 0.75; }
       /* 取色器那一行整宽上下列（label 在上、取色器在下并占满宽度）：
@@ -2736,15 +2709,22 @@ export async function attachSettingsListeners(container: HTMLElement) {
         width: 18px; height: 18px; padding: 0; cursor: pointer;
         border-radius: 4px; border: 1px solid var(--ctx-border-glass);
       }
+      /* ── 主题泡泡框（2026-09-21 定稿）──────────────────────────────
+         一个主题文件夹 = 一个泡泡（形状用胶囊圆角，与「分割块」区分开）：主色圆点 + 名称
+         (+ 内置徽标)。选中态同 .ap-seg-btn.active：主题名是「文字」，一律保持中性灰阶、
+         不带主题色相 —— 选中与否靠底色/边框表达（用户批 4 任务 2 的要求）。 */
       .ap-themes { display: flex; flex-wrap: wrap; gap: 6px; }
       .ap-theme {
         display: inline-flex; align-items: center; gap: 6px;
-        padding: 5px 10px; font-size: 0.72rem; border-radius: 6px;
+        padding: 5px 12px; font-size: 0.72rem; border-radius: 999px;
         border: 1px solid var(--border-glass); background: none;
         color: var(--text-dim); cursor: pointer;
       }
-      /* 选中态同 .ap-seg-btn.active：主题名也是「文字」，一律保持中性灰阶，
-         不带主题色相 —— 选中与否靠底色/边框表达（用户批 4 任务 2 的要求）。 */
+      .ap-theme-dot {
+        width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+        /* 一圈极淡的描边：主色接近底色时圆点才不会「消失」 */
+        box-shadow: inset 0 0 0 1px rgba(var(--ink-rgb), 0.25);
+      }
       .ap-theme.active { border-color: var(--accent-border); background: var(--accent-bg); color: var(--text); }
       .ap-badge { font-size: 0.62rem; opacity: 0.75; }
     `;

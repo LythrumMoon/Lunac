@@ -1998,7 +1998,9 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Text lightness",
   },
   /* ── 其他颜色（2026-09-21）─────────────────────────────────────
-     六项原本只能跟着主题色 / 派生色走的颜色，各自「取色器 + 透明度」。
+     初版六项各自「取色器 + 透明度」，用户判定「分得太细」并要求「由一个调色统一
+     控制」⇒ 现在只剩一组：结果项浮层 / 设置选中项 / 分类标题背景 + 顶栏图标按钮的
+     hover 浮层（进入设置 / 退出设置 / 退出插件）共用一个取色器 + 一条透明度。
      默认不写内联变量 ⇒ 与改造前逐像素一致；**取色器**受「恢复默认主题」管辖。 */
   "settings.appearance_other_label": {
     "zh-CN": "其他颜色",
@@ -2015,88 +2017,25 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Custom other colors",
   },
   "settings.appearance_other_hint": {
-    "zh-CN": "面板背景默认透明，调大透明度才看得见。",
-    "zh-TW": "面板背景預設透明，調高透明度才看得見。",
-    "ja": "パネル背景は既定で透明です。不透明度を上げると表示されます。",
-    "ko": "패널 배경은 기본이 투명합니다. 불투명도를 올려야 보입니다.",
-    "en": "Panel background is transparent by default; raise its opacity to see it.",
+    "zh-CN": "统一控制结果项浮层、设置选中项、分类标题背景，以及进入设置 / 退出设置 / 退出插件按钮的悬停浮层。",
+    "zh-TW": "統一控制結果項浮層、設定選取項、分類標題背景，以及進入設定 / 退出設定 / 退出外掛按鈕的懸停浮層。",
+    "ja": "結果項目のホバー、設定の選択中タブ、見出しの背景、および設定を開く / 閉じる / プラグインを終了 ボタンのホバーをまとめて制御します。",
+    "ko": "결과 항목 호버, 설정 선택 항목, 분류 제목 배경, 그리고 설정 열기 / 닫기 / 플러그인 종료 버튼의 호버를 함께 제어합니다.",
+    "en": "Controls result hover, the selected settings tab, section titles, and the hover of the Settings / Exit settings / Exit plugin buttons.",
   },
-  "settings.appearance_other_item_hover": {
-    "zh-CN": "结果项浮层",
-    "zh-TW": "結果項浮層",
-    "ja": "結果項目のホバー",
-    "ko": "결과 항목 호버",
-    "en": "Result hover",
+  "settings.appearance_other_overlay": {
+    "zh-CN": "浮层颜色",
+    "zh-TW": "浮層顏色",
+    "ja": "ホバー色",
+    "ko": "호버 색상",
+    "en": "Overlay color",
   },
-  "settings.appearance_other_item_hover_alpha": {
+  "settings.appearance_other_overlay_alpha": {
     "zh-CN": "浮层透明度",
     "zh-TW": "浮層透明度",
     "ja": "ホバーの不透明度",
     "ko": "호버 불투명도",
-    "en": "Hover opacity",
-  },
-  "settings.appearance_other_nav": {
-    "zh-CN": "设置选中项",
-    "zh-TW": "設定選取項",
-    "ja": "設定の選択中タブ",
-    "ko": "설정 선택 항목",
-    "en": "Selected tab",
-  },
-  "settings.appearance_other_nav_alpha": {
-    "zh-CN": "选中项透明度",
-    "zh-TW": "選取項透明度",
-    "ja": "選択中の不透明度",
-    "ko": "선택 항목 불투명도",
-    "en": "Selected opacity",
-  },
-  "settings.appearance_other_runtime_text": {
-    "zh-CN": "运行端输出文字",
-    "zh-TW": "執行端輸出文字",
-    "ja": "実行側の出力テキスト",
-    "ko": "실행端 출력 텍스트",
-    "en": "Runtime output text",
-  },
-  "settings.appearance_other_chat_bg": {
-    "zh-CN": "对话背景",
-    "zh-TW": "對話背景",
-    "ja": "チャット背景",
-    "ko": "대화 배경",
-    "en": "Chat background",
-  },
-  "settings.appearance_other_chat_bg_alpha": {
-    "zh-CN": "对话背景透明度",
-    "zh-TW": "對話背景透明度",
-    "ja": "チャット背景の不透明度",
-    "ko": "대화 배경 불투명도",
-    "en": "Chat opacity",
-  },
-  "settings.appearance_other_panel_bg": {
-    "zh-CN": "设置面板背景",
-    "zh-TW": "設定面板背景",
-    "ja": "設定パネルの背景",
-    "ko": "설정 패널 배경",
-    "en": "Settings background",
-  },
-  "settings.appearance_other_panel_bg_alpha": {
-    "zh-CN": "面板背景透明度",
-    "zh-TW": "面板背景透明度",
-    "ja": "パネル背景の不透明度",
-    "ko": "패널 배경 불투명도",
-    "en": "Settings opacity",
-  },
-  "settings.appearance_other_group_bg": {
-    "zh-CN": "分类标题背景",
-    "zh-TW": "分類標題背景",
-    "ja": "見出しの背景",
-    "ko": "분류 제목 배경",
-    "en": "Section title",
-  },
-  "settings.appearance_other_group_bg_alpha": {
-    "zh-CN": "分类标题透明度",
-    "zh-TW": "分類標題透明度",
-    "ja": "見出しの不透明度",
-    "ko": "분류 제목 불투명도",
-    "en": "Section title opacity",
+    "en": "Overlay opacity",
   },
   "settings.appearance_theme_section": {
     "zh-CN": "主题包",

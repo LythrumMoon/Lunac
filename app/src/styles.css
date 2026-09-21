@@ -96,22 +96,26 @@
      hover / 打开态按同一基色抬 α，见各按钮规则。 */
   --btn-bg-rgb: var(--accent-rgb);
   --btn-bg-alpha: 0.14;
-  /* ── 「其他颜色」（2026-09-21 新增，设置 → 风格 · 其他颜色）────────────
-     六项原本只能跟着主题色 / 派生色走、用户改不了的颜色。约定与上面 --btn-* 一致：
-     **颜色是 rgb 三元组、透明度单独一条 α**；每一项的默认值都等于改造前的表达式
-     （多数直接引用 --accent-rgb / --ctx-rgb / --surface-rgb / --text-dim）⇒
-     用户不碰控件时逐像素不变 —— main.ts 只在对应字段被改过时才写内联值。 */
-  --other-item-hover-rgb: var(--ctx-rgb);        /* (a) 结果项 hover / 选中项的浮层 */
-  --other-item-hover-alpha: 0.1;
-  --other-nav-rgb: var(--accent-rgb);            /* (b) 设置侧栏「当前选中项」的底色与左竖条 */
-  --other-nav-alpha: 0.14;
-  --other-runtime-text: var(--text-dim);         /* (c) 「运行端输出」折叠块的正文文字 */
-  --other-chat-bg-rgb: var(--surface-rgb);       /* (d) AI 对话面板背景（默认 = 玻璃底色） */
-  --other-chat-bg-alpha: var(--surface-alpha, 0.88);
-  --other-panel-bg-rgb: var(--surface-rgb);      /* (e) 设置面板背景（默认 α = 0 ⇒ 不画） */
-  --other-panel-bg-alpha: 0;
-  --other-group-bg-rgb: var(--ctx-rgb);          /* (f) 设置面板「分类标题」块的底色 */
-  --other-group-bg-alpha: 0.14;
+  /* ── 「其他颜色」浮层（2026-09-21 新增 → 同日定稿为「一组统一控制」）────
+     初版把六个颜色各自拆成一个取色器，用户判定「分得太细」并要求
+     「不应该分出来几类，而是由一个调色统一控制」，于是：
+       · 「运行端输出」文字色**整项删除** ⇒ 回归主题派生的 --text-dim；
+       · 「对话背景」/「设置面板背景」**整项删除** ⇒ 回归 --surface-*；
+       · 余下三处（结果项浮层 / 设置选中项 / 分类标题背景）+ 顶栏图标按钮的
+         hover 浮层（进入设置 / 退出设置 / 退出插件）**共用下面这一对变量**。
+     约定与上面 --btn-* 一致：**颜色是 rgb 三元组、透明度单独一条 α**。
+     三处消费位的历史 α 本来就不同，统一成一条 α 后由下面两条派生变量按比例还原：
+      结果项 = α 本身（0.1）、设置选中项 / 分类标题 = α × 1.4（0.14）、
+      顶栏图标按钮的 hover 浮层 = α × 2（**0.2**）——
+      **取 0.2 而不是源码里写的那个 0.05**：那三条 `#settings-btn:hover` 式的规则
+      其实一直被全局 hover 规则压住（特异性 (1,2,1) > (1,1,0)，见本文件末尾
+      「按钮底色全覆盖」那段的 ⚠），浏览器实测它们当时的真实悬停底色是
+      `--btn-bg-alpha + 0.06` = 0.14 + 0.06 = **0.2** ⇒ 跟着 0.2 才是逐像素不变。
+      **统一 α 保持默认 0.1 时四处分别回到 0.1 / 0.14 / 0.14 / 0.2。** */
+  --other-overlay-rgb: var(--accent-rgb);
+  --other-overlay-alpha: 0.1;
+  --other-overlay-nav-alpha: calc(var(--other-overlay-alpha) * 1.4);   /* 设置选中项 / 分类标题：历史 0.14 */
+  --other-overlay-btn-alpha: calc(var(--other-overlay-alpha) * 2);     /* 顶栏图标按钮 hover：历史 0.2 */
   /* 玻璃反光（设置 → 风格 · 背景 · 反光）：一道从左上打到右下的高光斜带，
      模拟钢化玻璃的镜面反射。默认 alpha 0 = **完全不可见**，与改造前一致。
      为什么用 background-image 而不是再加一层 ::after：`#results-container` 的
@@ -556,10 +560,17 @@ html, body {
   flex-shrink: 0;
 }
 
+/* 【2026-09-21】顶栏图标按钮的 **hover 浮层** 并入「风格 · 其他颜色」的统一浮层：
+   用户原话「鼠标移至上方的浮层，相同的还有进入设置的按钮、退出插件的按钮」——
+   即这一个 hover 底色改由 --other-overlay-* 一族驱动（默认色 = 主题色）。
+   **默认 α 与改造前实测值一致（0.2），所以观感零变化**；
+   注意这条规则要生效，必须让文件末尾那条全局 hover 规则放过本按钮
+   （见「按钮底色全覆盖」段里的额外放行名单 —— 否则这里写什么都无效）。
+   **图标色仍是各按钮的语义色**（退出用 --red、设置跟随 --accent），只统一底色。 */
 #plugin-bar-exit:hover {
   opacity: 1;
   color: var(--red);
-  background: rgba(var(--ink-rgb), 0.05);
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
 /* Search bar locked (plugin active) — hide input, show plugin bar */
@@ -586,10 +597,13 @@ html, body {
   flex-shrink: 0;
 }
 
+/* 进入设置按钮的 hover 浮层同样走「其他颜色」的统一浮层（原来是 --accent-bg 硬编码，
+   但那条一直没生效，实测值来自全局 hover 规则的 --btn-bg-alpha + 0.06 = 0.2）——
+   见 #plugin-bar-exit 上方那段说明。 */
 #settings-btn:hover {
   opacity: 1;
   color: var(--accent);
-  background: var(--accent-bg);
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
 .hidden { display: none !important; }
@@ -651,12 +665,13 @@ html, body {
   flex-shrink: 0;
 }
 
+/* 大窗口（detached）顶栏的同族按钮（还原搜索栏 / 关闭插件）也走同一个 hover 浮层 */
 #detached-back-btn:hover,
 #detached-vscode-btn:hover,
 #detached-close-btn:hover {
   opacity: 1;
   color: var(--text);
-  background: rgba(var(--ink-rgb), 0.05);
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
 #detached-vscode-btn:hover {
@@ -966,8 +981,8 @@ html, body {
 /* 【示例 2 · item 3】图标动作按钮并入「发送按钮」那一套（底色 + 边框 + 图标色）。
    位置：AI 输入栏的「历史记录」按钮（#chat-history-btn）—— 它此前在上面那组里是
    `border: none` + `--text-dim` 中性色，与紧邻的发送按钮明显不是一套。
-   为什么不改「更多设置」#chat-more-btn：它是有开合状态的菜单入口（`.open` 态），
-   先留着等你看过这个示例再决定要不要统一。 */
+   「更多设置」#chat-more-btn 已于同日（2026-09-21）并入**同一套**，
+   见下方 #chat-more-btn 的规则：底色 / 描边 / 图标色三项全部取同一组 --btn-* token。 */
 /* 【item 3 · 示例 2】发送 / 历史记录按钮 —— 与「按钮自定义」两组 token 同源：
    底色 rgba(--btn-bg-*) / 描边 rgba(--btn-line-*, α) / **图标 rgb(--btn-line-*)**。
    2026-09-20 图标由 `color: var(--accent)` 改成跟**按钮线条**（用户要求「历史记录等等的
@@ -1079,13 +1094,9 @@ html, body {
   background-color: var(--surface-glass);
   background-image: var(--glass-sheen-image);
 }
-/* AI 对话模式下这层底色的落点（2026-09-21，设置 → 风格 · 其他颜色 → 对话背景）：
-   默认 `--other-chat-bg-rgb/alpha` 就等于 `--surface-rgb` / `--surface-alpha`，
-   所以不碰控件时与上面那位逐像素相同。只在 ai-chat 下生效 —— 别的插件与搜索结果
-   区照旧用 `--surface-glass`。 */
-#results-container.ai-chat::before {
-  background-color: rgba(var(--other-chat-bg-rgb), var(--other-chat-bg-alpha));
-}
+/* AI 对话模式下**刻意不给** `#results-container::before` 另写底色：
+   2026-09-21 初版曾开一个「其他颜色 → 对话背景」让它独立可调，用户随后要求删除，
+   于是这层底色回归上面的 --surface-glass（与其它插件、搜索结果区同源）。 */
 
 #results-list {
   overflow-y: auto;
@@ -1174,10 +1185,10 @@ html, body {
 }
 
 /* ④ 结果区当前选中项 —— 走「反差四件套」（见 :root 的 --ctx-* 注释）；
-   2026-09-21 起可被「风格 · 其他颜色 → 结果项浮层」单独覆盖（默认值就是 --ctx-rgb）。 */
+   2026-09-21 起可被「风格 · 其他颜色」的统一浮层覆盖（默认色就是 --accent-rgb）。 */
 .result-item:hover,
 .result-item.selected {
-  background: rgba(var(--other-item-hover-rgb), var(--other-item-hover-alpha));
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-alpha));
 }
 
 .result-item-icon {
@@ -1346,12 +1357,9 @@ html, body {
   line-height: 1.6;
   animation: plugin-in 0.2s ease both;
 }
-/* 设置面板自己的底色（2026-09-21，设置 → 风格 · 其他颜色 → 设置面板背景）。
-   **默认 α = 0 ⇒ 什么都不画**，设置面板与其它插件一样直接坐在 #results-container 的
-   玻璃底上（历史上就是这样，不许为了「有个背景」把它默认改成不透明）。 */
-.plugin-result > .settings-layout {
-  background: rgba(var(--other-panel-bg-rgb), var(--other-panel-bg-alpha));
-}
+/* 设置面板**没有**自己的底色（2026-09-21 定稿）：初版曾开一个「其他颜色 → 设置面板
+   背景」并默认 α=0（什么都不画），用户随后要求删除，于是这里不留任何规则 ——
+   设置面板与其它插件一样直接坐在 #results-container 的玻璃底上。 */
 
 @keyframes plugin-in {
   from { opacity: 0; }
@@ -1751,9 +1759,10 @@ html, body {
   word-break: break-word;
   max-height: 180px;
   overflow-y: auto;
-  /* 2026-09-21：「运行端输出」的正文文字可被「风格 · 其他颜色」单独调色。
-     默认值就是原来的 --text-dim（见 :root 的 --other-runtime-text）⇒ 逐像素不变。 */
-  color: var(--other-runtime-text);
+  /* 「运行端输出」的正文文字：跟随主题派生的次要文字色。
+     2026-09-21 初版曾把它做成「风格 · 其他颜色」里的一项，用户随后要求
+     「控制台输出文本的颜色退出其他颜色的控制」⇒ 整项删除、退回 var(--text-dim)。 */
+  color: var(--text-dim);
 }
 
 /* ── 被改动文件的路径追踪（backlog §8.1）────────────────────────────
@@ -2765,6 +2774,13 @@ html, body {
 }
 /* 【item 3 · 批量】「更多设置」并入同一套（原先是 `--ink-rgb` 弱底 + `--border-glass` 弱边 +
    `--text-dim`，在发送/历史/新建三个同排按钮旁边明显不是一族）。
+   **2026-09-21 用户报「更多设置按钮好像不受按钮颜色控制」后的定稿**：
+   它的底色 / 描边 / 图标色**从上面那次批量起就已经**全部取 `--btn-*` token（与
+   #chat-add-file-btn / #chat-send-btn 逐条同源），这次补上最后一处**形状**差异 ——
+   圆角由 8px 收回 6px，与同排的添加文件 / 发送 / 历史记录完全一致（尺寸 28px 与
+   「添加文件」相同，比发送/历史的 30px 小一档，是输入栏既有的两档规格）。
+   排查路径记档：这类「不受颜色控制」的报告，先对齐**三处形状**（尺寸 / 圆角 / 边框）
+   再查颜色 —— 颜色确实同源时，观感差异一定来自形状或状态规则。
    `.open` 比 hover 再实一档 —— 它是菜单入口，「菜单正开着」要看得出来。 */
 #chat-more-btn {
   display: flex;
@@ -2774,7 +2790,7 @@ html, body {
   height: 28px;
   background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
-  border-radius: 8px;
+  border-radius: 6px;
   color: rgb(var(--btn-line-rgb));
   cursor: pointer;
   flex-shrink: 0;
@@ -3645,8 +3661,22 @@ html, body {
 
    特异性说明：`#app button`(1,0,1) 恰好高过各按钮自己的类选择器(0,1,0)，
    所以能盖住前面所有 `background: none`；而 `:where()` 贡献 0 特异性，
-   于是**盖不掉**带 id 的状态规则（`#chat-more-btn.open`、`#settings-btn:hover`
-   等）。**已知代价（用户 2026-09-21 明确接受）**：纯类选择器的 hover 底色
+   于是**盖不掉**带 id 的状态规则（`#chat-more-btn.open` 等）。
+
+   ⚠ **上面那条「盖不掉带 id 的状态规则」对下面的 hover 规则不成立**（2026-09-21
+   浏览器实测发现的真 bug）：`#app button:where(...):not(:disabled):hover` 的特异性
+   是 (1,2,1) 而不是 (1,0,1) —— `:not()` 本身贡献 0，但**它参数里的 `:disabled`
+   是伪类、照样记一档 (0,1,0)**，再加 `:hover` 一档。于是它盖得掉
+   `#settings-btn:hover` / `#plugin-bar-exit:hover` / `#detached-*:hover`
+   (1,1,0) —— 那三条 hover 底色**一直没生效**（实测：悬停齿轮得到的是
+   `rgba(192,160,160,0.2)` = 全局规则的 `--btn-bg-alpha + 0.06`，而不是它们自己
+   写的值）。**修法是「从 hover 规则的排除名单里点名放行」**：把这几个 id 加进
+   下面 hover 那条的 `:where()`（`:where()` 内的 `:not(#id)` 仍贡献 0 特异性），
+   它们自己的 id 规则(1,1,0) 就高过 hover 规则的 (1,0,1) 了。
+   为什么不改 `#settings-btn:hover` 的特异性去硬拼（写成 `#app #settings-btn:hover`）：
+   那样「谁赢」取决于两处选择的写法，改一个按钮要动两处；放行名单是单点开关。
+
+   **已知代价（用户 2026-09-21 明确接受）**：纯类选择器的 hover 底色
    （`.chat-more-actions button:hover` / `.memo-item-actions button:hover` …）
    会被下面那条 hover 规则统一成同一套主题底色 —— 各按钮 hover 时**颜色 /
    边框**的变化照旧保留，只有底色被统一。 */
@@ -3658,9 +3688,13 @@ html, body {
 /* 同一份名单 + 抬 α：让「没有自己 hover 规则」的按钮也有一致的悬停反馈，
    不会出现「hover 一下底色就没了」。与输入栏六个按钮的 hover 配方同源。
    **`:disabled` 只在 hover 这条里排除**：禁用按钮照旧有底色（外观一致），
-   但不该给「点得动」的反馈。 */
+   但不该给「点得动」的反馈。
+   **额外放行名单（只有这条有，见上方 ⚠ 说明）**：顶栏那五个纯图标按钮
+   （进入设置 / 退出设置·退出插件 / 大窗口的还原·VSCode·关闭）—— 它们的 hover
+   浮层由「风格 · 其他颜色」的 `--other-overlay-*` 统一控制，所以要点名让
+   下面这条规则放过它们，否则它们的 id 规则永远被本规则压住。 */
 #app button:where(
-  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(:disabled)
+  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(#settings-btn):not(#plugin-bar-exit):not(#detached-back-btn):not(#detached-vscode-btn):not(#detached-close-btn):not(:disabled)
 ):hover {
   background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
