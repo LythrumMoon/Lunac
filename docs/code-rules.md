@@ -50,6 +50,8 @@
 
 | 34 | 若你要**洗一条用户消息的文本**（`cleanUserContent()` / `stripAttachedQuery()` 这类），是否先分清这条文本**处在哪个形态**？本仓同一个用户消息有**三个形态、各有各的消费方**，混用一次就丢数据：① **发送期形态** = `startAIChat()` 拼的 `[Attached files]…\n\n[User query]\n…`，它是**附件清单的唯一载体**（气泡上的 `📎 文件名` / 「复制」只取正文 / 「重试」重新带上附件，三条路径全靠 `parseAttachedQuery()` 解析它）；② **落盘形态** = 与 ① 相同，只许剥**发送期注入的关键词提示词**（`stripInjectedHint()`）；③ **展示形态** = 「正文 + `📎 文件名`」，由 `userBubbleText()` 从 ② 现推（实时路径 `appendUserMsg()` 写的也是这个形态）。**纪律**：`cleanUserContent()`（提示词 + 附件块一起剥）**只允许用在纯展示的一次性场景**（会话标题 / 抽屉预览），**落盘与恢复路径一律禁用** —— 用了就等于「附件信息只活在内存里，一进历史就消失」（2026-09-21 用户报的「历史记录进入时文件类型消息会消失」就是这个根因：`persistCurrentSessionInner()` 与 `restoreSession()` 都调了它）。同时注意**展示形态不得回写 `chatHistory`**：`chatHistory` 存的是 ②，展示形态的 `📎 文件名` 里**没有路径**，回写一次「复制 / 重试」就再也拿不回附件（`parseAttachedQuery()` 解析不出 files）。**另**：`stripInjectedHint()` 切分隔线前**必须先判 `text.startsWith("## ")`** —— 注入块的唯一特征是它以 `## ` 开头（`buildSystemPromptHint()` 的产出一律如此），而普通提问正文里完全可能出现 `\n\n---\n\n`（markdown 分隔线）。不判前缀就切，会把「上面\n\n---\n\n下面」削成「下面」，**落盘即丢前半段**（2026-09-21 顺手补的闸）。回归口径：发一条带附件的提问 → 打开历史记录点回来，`📎 文件名` 必须还在、复制只得到正文、重试能带上原附件、且连存两次不会多出一行 `📎`；再发一条正文里含 `---` 分隔线的提问，落盘后首段仍在。 | ai-spec §11 规则 60 |
 
+| 35 | 新增 / 修改 `#[tauri::command]` 时，命令体里**有没有等待**（`reqwest::blocking`、`Command::output()` / `schtasks`、图标提取、OCR、大文件读写）？有就必须搬出主线程：写成 `pub async fn foo(...)` 薄壳 + `run_blocking(move \|\| foo_blocking(...)).await`（`run_blocking` 见 `commands.rs` 顶部）。非 `async` 命令跑在**主线程**上（消息泵所在），阻塞多久窗口就「未响应」多久 —— 2026-09-22 实测 `fetch_plugin_index` 在 GitHub 不可达时阻塞 19783ms，同期页面心跳延迟 19675ms，而设置面板每次打开都调它。**别改用 `#[tauri::command(async)]`** 顶替（那只丢进 tokio worker，一个挂 20s 的阻塞体会长期占住一个 worker）。回归口径：改完在同一场景下用 CDP 探针看**页面心跳无一次 > 120ms**，别只看 `cargo test` 绿。 | §4.6 / ai-spec §11 规则 68 |
+
 ---
 
 ## 第 2 章：Tauri 2 权限系统
@@ -190,6 +192,34 @@ setTimeout(() => { /* fallback logic */ }, 500);
 ### 4.5 mousedown 优于 focusin 用于预判 popup 可见性
 
 `focusin` 事件在浏览器**已完成** native popup 可见性判定后才触发。需要在点击**瞬间**（popup 渲染前）修改 CSS 时，用 `mousedown` + `{ capture: true }`。
+
+### 4.6 阻塞 IO 必须离开主线程（否则 Windows 报「应用未响应」）
+
+Tauri 的**非 `async` 命令跑在主线程上**（和窗口消息泵同一个线程）。命令体里任何等待 —— `reqwest::blocking`、`Command::output()` / `schtasks`、图标提取、OCR、大文件读写 —— 都会冻住整个窗口。冻多久，任务管理器里那句「应用程序未响应」就挂多久。
+
+```rust
+// ❌ 同步命令 + 阻塞 HTTP：主线程陪着网络一起等
+#[tauri::command]
+pub fn fetch_thing() -> Result<Vec<T>, String> {
+    let resp = reqwest::blocking::Client::new().get(URL).send().unwrap(); // 挂 20s = 窗口卡 20s
+    /* … */
+}
+
+// ✅ 薄壳 async + 阻塞体丢进专用阻塞池
+#[tauri::command]
+pub async fn fetch_thing() -> Result<Vec<T>, String> {
+    run_blocking(fetch_thing_blocking).await
+}
+fn fetch_thing_blocking() -> Result<Vec<T>, String> { /* 原来那一坨 */ }
+```
+
+`run_blocking` 定义在 [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 顶部（`tauri::async_runtime::spawn_blocking` + 错误包装）。**不要**用 `#[tauri::command(async)]` 顶替它：那只是把阻塞体丢到 tokio 的 **worker 线程**（默认数量 = 核数），`reqwest::blocking` 挂一次就长期占住一个 worker，其它异步命令跟着排队；而阻塞体在 `spawn_blocking` 的**专用阻塞池**（上限 512）里跑才是对的。
+
+**为什么不能只凭「体感很快」放过**：本仓实测（2026-09-22，dev 实例 + CDP 探针）——`raw.githubusercontent.com` 不可达时 `fetch_plugin_index` 单次阻塞 **19783ms**，同期页面心跳（每 150ms 一次最轻命令）延迟 **19675ms**。设置面板**每次打开**都拉一次市场索引 ⇒「开设置 = 卡 20s」。同一个探针在改后跑：fetch 3.7s 期间心跳**无一次 > 120ms**。
+
+**搬走之后要看一眼「共享资源」还扛不扛得住并发**：主线程是天然串行的，搬进阻塞池就变成真并发，原本被串行掩盖的竞态会当场暴露。本仓实测（2026-09-22）：`get_app_icon` 搬走当天，**新进程的第一批并发图标请求只回来 1/6**（同批之后再跑 4 次都是 6/6），而搬走前的同步版本第一批就是 6/6 ⇒ 是并发踩的。修法是**在共享资源的唯一入口加进程内串行闸**（`icon_extractor::ICON_LOCK`），而不是退回主线程 —— 请求在阻塞池里排队，主线程照样不被占。GDI / 剪贴板 / 句柄这类东西搬之前先问「并发调用安全吗」。
+
+**唯一例外及理由**：`run_ocr` 走 WinRT（`Windows.Media.Ocr`），WinRT 的激活与 `IAsyncOperation::get()` 要求调用线程先初始化过套间，而 windows 0.58 没给 `initialize_mta()` ⇒ 它留在主线程（且前端不调它，识别走 `run_paddle_ocr`）。新增例外必须在命令头注释里写清「为什么不能搬」，否则按本条处理。
 
 ---
 

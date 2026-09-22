@@ -233,9 +233,27 @@ fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// 图标抽取的**进程内串行闸**。
+///
+/// Windows 这条链（`SHGetFileInfoW` 的主图标缓存路径 + `GetDC(0)` / `CreateDIBSection` /
+/// `DrawIconEx` 的 GDI 设备上下文）**并发调用会互相踩**，而踩出来的结果是「拿不到图标」——
+/// 不是报错，是静默返回 `None`（界面上表现为某几行退回文字占位符）。
+///
+/// 实测（2026-09-22，新进程 + CDP 探针）：同一批 6 个 exe 并发请求，**第一个**批只回来 1 个
+/// （`010000`），此后同样的批跑 4 次全是 `111111`；而改之前（`get_app_icon` 是同步命令，
+/// 跑在主线程上天然串行）同样的新进程第一批就是 `111111`。所以：**并发是根因，且这是搬出
+/// 主线程后新引入的**（搬出主线程本身是对的，见 `commands::run_blocking`）。
+///
+/// 收口方式：本函数是**唯一**的图标抽取入口（`extract_thumbnail_base64` 的回落也走它），
+/// 在这里串行就同时管住了 `get_app_icon` 与 `get_file_thumbnail` 两条路 —— 并发请求变成
+/// 在阻塞线程池里排队，主线程照样不被占（这才是我们要的），结果恢复确定性。
+static ICON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Extract a 32x32 icon from a file path, return as base64 PNG data URL.
 /// Only works for .exe, .lnk, .dll, .ico files etc.
 pub fn extract_icon_base64(path: &str) -> Option<String> {
+    // 中毒也继续用（上一次抽取 panic 不该让此后所有图标都拿不到）
+    let _serial = ICON_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         let wide = to_wide(path);
 

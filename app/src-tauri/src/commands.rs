@@ -16,6 +16,30 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use tauri::{AppHandle, Emitter, State};
 
+/// 把「同步阻塞体」挪到阻塞线程池执行 —— **测试并解决「频繁应用未响应」的关键（2026-09-22）**。
+///
+/// Tauri 的非 `async` 命令跑在**主线程**上（WebView 的消息泵也在那儿），所以命令体里任何
+/// 阻塞 IO（`reqwest::blocking`、`schtasks`、图标提取、OCR）都会冻住整个窗口 —— Windows 上
+/// 直接显示「应用程序未响应」。实测：设置面板每次打开都调 `fetch_plugin_index`，GitHub 不可达
+/// 时该命令阻塞 19–22s，于是「开设置 = 卡 5s+」反复出现。
+///
+/// 为什么不是直接 `#[tauri::command(async)]`：那样只是把阻塞体丢到 tokio 的 **worker** 线程
+/// （默认 = 核数），`reqwest::blocking` 一挂 20s 就长期占住一个 worker，异步命令会跟着排队；
+/// 阻塞体必须在 `spawn_blocking` 的**专用阻塞池**里跑才是对的（`reqwest::blocking` 若直接在
+/// async 上下文里跑还会 panic）。
+///
+/// 用法：`#[tauri::command] pub async fn foo(a: String) -> Result<T, String> {
+///     run_blocking(move || foo_blocking(a)).await }`
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("blocking task failed: {e}"))?
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatusPayload {
     pub state: String,
@@ -1051,9 +1075,13 @@ pub fn list_custom_apps() -> Vec<AppEntry> {
 }
 
 /// Extract the system icon for a file path, returned as base64 PNG data URL.
+///
+/// 走 `run_blocking`：实测单次要 26–272ms，而**搜索结果里每一行**都会调一次
+/// （`main.ts` 的列表渲染 + 详细搜索的选中行）—— 留在主线程上就是「输一个字母卡半秒」
+/// 那类卡顿（2026-09-22）。
 #[tauri::command]
-pub fn get_app_icon(path: String) -> Result<Option<String>, String> {
-    Ok(crate::icon_extractor::extract_icon_base64(&path))
+pub async fn get_app_icon(path: String) -> Result<Option<String>, String> {
+    run_blocking(move || Ok(crate::icon_extractor::extract_icon_base64(&path))).await
 }
 
 /// 文件缩略图（详细搜索右侧预览区）：图片真解码、其余回落系统类型图标。
@@ -1527,9 +1555,12 @@ pub fn set_auto_start(enabled: bool) -> Result<String, String> {
 /// UI 只用 `enabled` 拨开关 —— 机制名是纯实现术语，不做展示（见 ai-spec §11 规则 1）。
 /// `mechanism` 保留给落盘日志：计划任务与 HKCU Run 的触发时间实测差约 60 秒，
 /// 「开机后要等很久」这类反馈只能靠它判断实际走的是哪条（见 ai-spec §9.1 难点 2）。
+///
+/// 走 `run_blocking`：内部要 spawn `schtasks /query` 并等它退出（实测 112–261ms），
+/// 而设置面板一打开就调它（`settings.ts` 两处）⇒ 留在主线程上又是一次可见卡顿。
 #[tauri::command]
-pub fn get_auto_start_info() -> Result<crate::auto_start::AutoStartInfo, String> {
-    crate::auto_start::auto_start_info()
+pub async fn get_auto_start_info() -> Result<crate::auto_start::AutoStartInfo, String> {
+    run_blocking(crate::auto_start::auto_start_info).await
 }
 
 // ── User tool definitions (MCP bridge) ────────────────────────────
@@ -1777,8 +1808,16 @@ pub fn import_skill_content(content: String) -> Result<String, String> {
 }
 
 /// 从 raw SKILL.md URL 安装技能到固定目录。
+///
+/// 走 `run_blocking`：内部是 20s 超时的 `reqwest::blocking`，留在主线程上就是
+/// 「点一下安装 ⇒ 应用未响应」（2026-09-22）。
 #[tauri::command]
-pub fn install_skill_from_url(url: String) -> Result<String, String> {
+pub async fn install_skill_from_url(url: String) -> Result<String, String> {
+    run_blocking(move || install_skill_from_url_blocking(url)).await
+}
+
+/// 见 `install_skill_from_url`：真正干活的同步体，只在阻塞线程池里跑。
+fn install_skill_from_url_blocking(url: String) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -1902,7 +1941,12 @@ pub fn plugins_dir_path() -> String {
 /// 三条闸沿用插件包的口径：**只 https**（地址是常量）、**体积上限**（Content-Length 先拦 +
 /// 按真实读到的字节再拦）、**失败如实上报**（面板上显示原因，不静默退回空市场）。
 #[tauri::command]
-pub fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
+pub async fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
+    run_blocking(fetch_plugin_index_blocking).await
+}
+
+/// 见 `fetch_plugin_index` 头注释：真正干活的同步体，只在阻塞线程池里跑。
+fn fetch_plugin_index_blocking() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
     let limit = crate::plugin_market::MAX_INDEX_BYTES;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -1937,8 +1981,16 @@ pub fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginIndexEntry
 }
 
 /// 从 https 的 zip URL 安装插件，返回插件 id。
+///
+/// 走 `run_blocking`：内部是 120s 超时、逐块读的 `reqwest::blocking`，是本仓**最长的**
+/// 阻塞体 —— 留在主线程上，网络一慢整个窗口就「未响应」（2026-09-22）。
 #[tauri::command]
-pub fn install_plugin_from_url(url: String) -> Result<String, String> {
+pub async fn install_plugin_from_url(url: String) -> Result<String, String> {
+    run_blocking(move || install_plugin_from_url_blocking(url)).await
+}
+
+/// 见 `install_plugin_from_url`：真正干活的同步体，只在阻塞线程池里跑。
+fn install_plugin_from_url_blocking(url: String) -> Result<String, String> {
     let url = url.trim().to_string();
     // 明文 http 的 zip 会被解压执行 ⇒ 只收 https（这是本命令与 tools / skills 那两个先例的差别）
     if !url.starts_with("https://") {
@@ -1996,8 +2048,15 @@ pub fn uninstall_plugin(id: String) -> Result<String, String> {
 
 /// Download a tool definition JSON from a URL and save to the tools directory.
 /// Returns the saved filename on success.
+///
+/// 走 `run_blocking`：内部是 15s 超时的 `reqwest::blocking`（同类的另两个下载命令同理）。
 #[tauri::command]
-pub fn download_tool_from_url(url: String) -> Result<String, String> {
+pub async fn download_tool_from_url(url: String) -> Result<String, String> {
+    run_blocking(move || download_tool_from_url_blocking(url)).await
+}
+
+/// 见 `download_tool_from_url`：真正干活的同步体，只在阻塞线程池里跑。
+fn download_tool_from_url_blocking(url: String) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -2048,6 +2107,13 @@ pub fn download_tool_from_url(url: String) -> Result<String, String> {
 
 // ── Windows OCR ──────────────────────────────────────────────────
 /// Recognize text from an image file using Windows 10/11 built-in OCR.
+///
+/// 注：本命令**故意**没搬出主线程（与上面同类的其它阻塞命令不同）——
+/// `windows_ocr::recognize_image` 是 WinRT（`Windows.Media.Ocr`）调用，WinRT 的激活与
+/// `IAsyncOperation::get()` 都要求**调用线程先初始化过套间**，而 windows 0.58 没提供
+/// `initialize_mta()`；搬进阻塞线程池有直接失败的风险。前端当前也不调它
+/// （图片识别走 `run_paddle_ocr`，那是子进程 + 等待，已搬走），所以这里保持原样 ——
+/// 不拿一条没测过的路径去赌。真要启用它，先把套间初始化补上再搬。
 #[tauri::command]
 pub fn run_ocr(path: String) -> Result<String, String> {
     windows_ocr::recognize_image(&path)
@@ -2058,10 +2124,16 @@ pub fn run_ocr(path: String) -> Result<String, String> {
 /// Supports Chinese, English, Japanese, Korean, Cyrillic.
 /// Much higher accuracy than Windows OCR, especially for Chinese text.
 /// lang: "chs" (default, Chinese+English), "cht", "en", "japan", "korean", "cyrillic"
+///
+/// 走 `run_blocking`：内部要拉起 PaddleOCR-json 子进程并等它出结果（实测可达数秒），
+/// 留在主线程上就是「识别一张图 ⇒ 窗口未响应」。
 #[tauri::command]
-pub fn run_paddle_ocr(path: String, lang: Option<String>) -> Result<String, String> {
-    let lang = lang.unwrap_or_else(|| "chs".into());
-    paddle_ocr::recognize_image(&path, &lang)
+pub async fn run_paddle_ocr(path: String, lang: Option<String>) -> Result<String, String> {
+    run_blocking(move || {
+        let lang = lang.unwrap_or_else(|| "chs".into());
+        paddle_ocr::recognize_image(&path, &lang)
+    })
+    .await
 }
 
 // ── OCR 引擎（PaddleOCR-json）按需安装 ───────────────────────────

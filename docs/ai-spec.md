@@ -1803,6 +1803,14 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **设置面板里必须写清两件事**：这是**可执行代码**、装它等于在本机运行它（只装信任来源）；以及插件目录在哪。别让用户以为插件只是个配置项。
     - **索引是「数据」，不是「指令」**（2026-09-21 二次改版加）：`plugins/index.json` 只提供 `url` 与展示用的文字，**判据一律取本机事实** —— 「已装 / 未装 / 坏了」由 `pluginRegistry` + 插件目录扫描说话，**不许**用索引自称的字段去决定。索引**由宿主拉**（前端 CSP 拦得住，见 §3.5）且**逐条再筛**（`id` 过 `is_safe_id` / `url` 只收 https / `name` 不能空，收口在纯函数 `parse_index()` 并有单测），坏条目**只丢自己**（`warn` 留痕）；索引地址是 **Rust 常量**，不由前端传。界面上的按钮**一律走事件委托**（在列表容器上绑一次，重绘只改 `innerHTML`）—— 2026-09-21 用户报的「卸载点了没反应」根因就是「监听只在重绘里绑、挂载时没人调那次重绘」，那条写法不得回退。
 
+68. **宿主命令里不许有阻塞 IO（2026-09-22，「release / dev 频繁应用未响应」的根因）**：Tauri 的**非 `async` 命令跑在主线程上**（窗口消息泵就在那儿），命令体里任何等待都等于冻住整个窗口 —— 用户看到的就是 Windows 那句「应用程序未响应」。**六条不得回退**：
+    - **判据是「命令体里有没有等待」，不是「平时快不快」**：`reqwest::blocking`、`Command::output()` / `schtasks`、图标提取、OCR、大文件读写一律算。落地形态统一为「`#[tauri::command] pub async fn foo(...)` 薄壳 + `run_blocking(move || foo_blocking(...)).await`」，`run_blocking` 定义在 `commands.rs` 顶部（`tauri::async_runtime::spawn_blocking` + 错误包装）。**不要**改用 `#[tauri::command(async)]` 顶替 —— 那只把阻塞体丢到 tokio 的 worker 线程（默认数量 = 核数），一个挂 20s 的 `reqwest::blocking` 会长期占住一个 worker，其余异步命令跟着排队。
+    - **实测（2026-09-22，dev 实例 + CDP 探针，同一台机）**：`raw.githubusercontent.com` 不可达时 `fetch_plugin_index` 单次阻塞 **19783ms**，同一时刻页面心跳（每 150ms 一次最轻命令 `plugins_dir_path`）延迟 **19675ms** —— **命令的阻塞时长 = 窗口的阻塞时长**（另两次同口径采样：fetch 770ms ⇒ 心跳卡 606ms；fetch 360ms ⇒ 心跳卡 360ms）。而设置面板**每次打开**都会拉一次市场索引（`settings.ts` 的 `wirePluginMarket()` → `renderMarket()`）⇒「开设置 = 卡 20s」，这就是「频繁未响应」的来源。改后同一场景：fetch 3752ms 期间心跳**无一次 > 120ms**。
+    - **本次一并搬走的同类命令**：`install_plugin_from_url`（120s 超时）、`install_skill_from_url`（20s）、`download_tool_from_url`（15s）、`get_auto_start_info`（spawn `schtasks`，实测 112–261ms，设置面板一开就调两次）、`get_app_icon`（实测 26–272ms，**结果区每行都调一次**）、`run_paddle_ocr`（子进程 + 等待）。`get_file_thumbnail` / `search_files` / `read_clipboard_files` 等原先已经是 `#[tauri::command(async)]` 的保持不动。
+    - **搬出主线程后要让「共享资源」自己排队**：主线程天然串行的东西，搬走后会变成真并发，于是暴露出原本被串行掩盖的竞态。本仓实测（2026-09-22）：`get_app_icon` 搬走当天，**新进程里第一批并发图标请求只回来 1/6**（同一批之后再跑 4 次都是 6/6），而搬走前的同步版本新进程第一批就是 6/6 ⇒ 是并发踩的，不是路径的问题。修法**不是退回主线程**，而是在共享资源的**唯一入口**加进程内串行闸（`icon_extractor::ICON_LOCK`，同时管住 `get_app_icon` 与 `get_file_thumbnail` 的图标回落）—— 请求在阻塞池里排队，主线程照样不被占。同类资源（GDI / 剪贴板 / 单实例句柄）搬之前先问一句「这东西并发调用安全吗」。
+    - **唯一的例外要写明理由**：`run_ocr` 是 WinRT（`Windows.Media.Ocr`）调用，WinRT 的激活与 `IAsyncOperation::get()` 要求调用线程**先初始化过套间**，而 windows 0.58 没提供 `initialize_mta()` ⇒ 它留在主线程（且前端当前不调它，图片识别走 `run_paddle_ocr`）。**新增例外必须在命令头注释里写清「为什么不能搬」，否则按本条处理。**
+    - **回归口径**：同一场景下用探针看**页面心跳无一次 > 120ms**（探针口径见 §9.1 与本条实测行）。只跑 `cargo test` 绿**不算**通过 —— 单测跑在测试线程里，天然看不见「主线程被冻住」。
+
 ## 12. Agent Plan 模式规范
 
 *来源：Hermes Agent 的 `plan` SKILL.md（MIT 协议，obra/superpowers 贡献），经适配整合。*
