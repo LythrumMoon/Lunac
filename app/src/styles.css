@@ -3953,6 +3953,41 @@ html, body {
   color: var(--text-muted);
 }
 
+/* 文件索引加载态：纯转圈、无文字（2026-09-22，用户明确要求「不用文字，用圆圈转向动画」）。
+   颜色只取主题 token —— 静止那段 `--border-glass`、转动那段 `--accent`，所以任何主题下
+   都不会撞色；两处用法见 main.ts 的 `spinnerEl()`（状态行 inline / 结果区居中 block）。 */
+.lunac-spinner-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lunac-spinner-wrap--block {
+  width: 100%;
+  padding: 22px 0;
+}
+
+.lunac-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border-glass);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: lunac-spin 0.75s linear infinite;
+}
+
+.lunac-spinner-wrap--block .lunac-spinner {
+  width: 26px;
+  height: 26px;
+  border-width: 3px;
+}
+
+@keyframes lunac-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 #detail-results .result-item {
   padding: 7px 10px;
 }

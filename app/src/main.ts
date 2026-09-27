@@ -8431,7 +8431,14 @@ function renderDetail() {
   if (detailSel >= detailRows.length) detailSel = Math.max(0, detailRows.length - 1);
 
   const frag = document.createDocumentFragment();
-  if (!detailRows.length) {
+  // 索引还没载入 → 在**最前面**钉一条转圈，不管本次查询有没有别的结果。
+  //
+  // 为什么不是「结果为空时」才显示：文件搜索此刻一定返回空，而应用/设置/网页搜索那几行
+  // 常常把结果区填满 ⇒ 只在空列表时提示等于「大多数时候没有提示」（2026-09-22 实测：
+  // 刚启动进大界面时结果区是「命令」分组，文件区一个字都没有，用户只会以为搜不到文件）。
+  // 载入完成后 `refreshDetailStatus()` 会自动重跑这次查询，转圈随之消失。
+  if (detailIndexNotLoaded()) frag.appendChild(spinnerEl("block"));
+  if (!detailRows.length && !detailIndexNotLoaded()) {
     const empty = doc("div");
     empty.className = "detail-group-title";
     empty.textContent = t("detail.no_results", { q: detailInput.value.trim() });
@@ -8852,10 +8859,50 @@ function clearDetailArmed() {
 }
 
 // ── 索引状态 ─────────────────────────────────────────────────────
+//
+// 加载态 = **纯转圈、无文字**（2026-09-22 用户明确要求：「提示用户正在加载，不用文字，
+// 用圆圈转向动画」）。只拦截「文件索引还没载入」这一段 —— 索引一旦有数据，文件搜索就
+// 已经可用，此时再叠一层加载态只会挡住结果。
+//
+// 判据是 `saved_ms`：Rust 侧 `file_indexer::load_cache()` 只有在**成功读到落盘缓存**时
+// 才会写入它（首次安装没有缓存 / 正在重扫时它一直是 0）⇒「count==0 且 saved_ms==0」
+// 表示**还没载入**，而不是「索引确实是空的」。两者在界面上必须分开：前者给转圈，
+// 后者才是真的「没有找到」。
+
+/** 结果区/状态行的转圈节点。`inline` = 状态行（跟文字同高）；`block` = 结果区居中。 */
+function spinnerEl(size: "inline" | "block"): HTMLElement {
+  const wrap = doc("div");
+  wrap.className = `lunac-spinner-wrap${size === "block" ? " lunac-spinner-wrap--block" : ""}`;
+  // 无障碍文案只进 aria-label（屏幕阅读器读得到、屏幕上不显示），所以走 t() 不违反「无文字」
+  wrap.setAttribute("role", "status");
+  wrap.setAttribute("aria-label", t("detail.indexing"));
+  const ring = doc("div");
+  ring.className = "lunac-spinner";
+  wrap.appendChild(ring);
+  return wrap;
+}
+
+/** 文件索引是否**还没载入**（详见本节顶部注释的 `saved_ms` 判据）。 */
+function detailIndexNotLoaded(): boolean {
+  return !detailStatus.count && !detailStatus.saved_ms;
+}
+
+/** 只在「该显示的东西换了」时才替换子节点。
+ *
+ *  状态每 2s 轮询一次，如果每次都 `replaceChildren` 重建转圈，节点会被摘下再挂上，
+ *  CSS 动画从头开始 ⇒ 用户看到的是每 2s 抖一下而不是匀速转。 */
+let detailIndexSpinner: HTMLElement | null = null;
+function setDetailIndexContent(node: Node) {
+  if (detailIndexEl.childNodes.length === 1 && detailIndexEl.firstChild === node) return;
+  detailIndexEl.replaceChildren(node);
+}
 
 function renderDetailStatus() {
-  if (detailStatus.scanning || !detailStatus.count) {
-    detailIndexEl.textContent = t("detail.indexing");
+  // 「还没载入」与「正在重扫」都是加载态 → 都只给转圈（原来那句「正在建立文件索引…」
+  // 文案按用户要求撤掉；重建期间文件搜索仍然可用，所以结果区不会被转圈挡住）
+  if (detailIndexNotLoaded() || detailStatus.scanning) {
+    if (!detailIndexSpinner) detailIndexSpinner = spinnerEl("inline");
+    setDetailIndexContent(detailIndexSpinner);
     return;
   }
   detailIndexEl.textContent = detailStatus.truncated
