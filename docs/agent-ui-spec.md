@@ -126,6 +126,26 @@
 
 **命令类工具**：`Bash` / `PowerShell` 用等宽字体显示命令原文（保留换行，最多 3 行 + 省略）；`Read` / `Write` / `Edit` / `Grep` / `Glob` 显示 `k=v` 摘要（现状逻辑保留）。`TodoWrite` **不在对话流里画任何块**（2026-09-21 起连 `.todo-panel` 也撤掉），一律交给 §3.9 的任务抽屉。
 
+**命令组**（2026-09-27 加，`ensureCmdGroup` / `refreshCmdGroup` / `closeCmdGroup`）：一轮里
+**一段连续的工具调用**收进一个 `<details class="cmd-group">`，组头一行写
+「已执行 N 条命令 · M 次失败」—— 整段全是 `Bash` / `PowerShell` 时写「命令」，混进别的工具
+时写「工具调用」（`agent.cmd_group_cmds` / `agent.cmd_group_calls` / `agent.cmd_group_fails`）。三条纪律：
+
+1. **分组边界 = 一段连续的工具调用**：中间出现 `text` / `thinking` 就另起一组
+   （`agentNewBlock` 开新块时调 `closeCmdGroup`）。不这么做的话第二组的卡片会被塞进第一组，
+   在 DOM 里跑到中间那段正文**前面** —— 顺序错乱。
+2. **回合折叠折的是组，不是卡片**：`.flow-folded` 的隐藏名单里**不得**再出现 `.tool-card`
+   （见 §3.5）。历史「过程」块没有命令组可收，单独用
+   `.agent-flow.history-process.flow-folded .tool-card` 兜住 —— 那条规则与前者是一对，都不许删。
+3. **组头计数从组内 DOM 现推**（`group.querySelectorAll(".tool-card")`），不另记一份计数状态 ——
+   卡片会在任意时刻被追加 / 标成失败，两份状态必然漂移。
+
+**卡片正文必须有完整命令**（2026-09-27 加）：头部的 `.tool-cmd` 活在单行 `summary` 里，被
+`text-overflow: ellipsis` 截断 ⇒ **展开卡片也看不到命令全文**（用户反馈的第三处）。所以卡片正文
+（`.tool-body`）里加一个 `<pre class="tool-cmd-full">`，只给命令类工具（`Bash` / `PowerShell`）写值 ——
+`Write` / `Edit` 的入参里带整个文件内容，铺进 `<pre>` 会把对话流压垮。写入前必须
+`JSON.parse` 成功（流式分片是合法前缀，会把半截 JSON 当命令显示）。
+
 > **注意区分两个「复制」**：上面的操作区属于**执行卡片**（`.tool-row`，命令已经跑完）。**审批卡**（`.approval-batch-card`）的命令区**不放复制按钮**（2026-09 用户要求删除）—— 按钮固定在右上角，短命令与它之间会空出一大片（还得给 `.approval-cmd-list` 预留 56px 右边距），而命令文本本身已可选中复制（`.approval-cmd-box` 有 `user-select: text`），够了。**不得**为「方便复制」把按钮加回去。
 
 ### 3.4 结果与错误
@@ -139,6 +159,14 @@
 ### 3.5 回合自动折叠
 
 - 回合完成后（收到 `result`），若回合内块数 ≥ 3 或工具调用 ≥ 2，**默认折叠**该回合的所有中间块（思考/工具/结果/子任务面板），仅保留：用户消息、助手最终正文、`.turn-footer`（含「展开过程」按钮）。
+- **折叠折的是「命令组」，不是命令卡**（2026-09-27 修）：`.flow-folded` 只隐藏
+  `.think-block` / `.tool-row` / `.subtask-panel` / `.sys-note`，**不再隐藏 `.tool-card`** ——
+  卡片装在 `.cmd-group` 里，由那个 `<details>` 自己承担开合，折叠态保底留一行
+  「已执行 N 条命令」。旧规则把卡片一起 `display: none`，于是回合结束后命令、退出码、输出
+  全都看不到（用户反馈「命令的执行无法显示」的根因）。`setFolded()` 同步所有
+  `details.cmd-group` 的 `open`：折叠 ⇒ 全收，展开 ⇒ 全摊开（不让「展开回合」变成还要再点一次）。
+  **唯一例外**是历史「过程 · N 步」块（`renderHistoryProcess`）—— 那里的 `.tool-card` 是 flow 的
+  直接子节点、没有命令组，所以另留一条 `.agent-flow.history-process.flow-folded .tool-card` 规则。
 - 折叠态在 `.turn-footer` 显示摘要行：`N 步工具调用 · M 次失败 · 耗时 Xs`。
 - 用户手动展开后，该回合在本次会话内保持展开（不因后续回合而回弹）。
 - **开关**：`localStorage` 键 `lunac-agent-autofold`，默认 `1`（开）；入口放设置面板「AI」分区。关闭时行为与现状一致（全部展开）。

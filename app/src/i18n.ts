@@ -3859,6 +3859,28 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "전체 보기",
     "en": "Show all",
   },
+  // 命令组（一段连续工具调用的折叠头，2026-09-27）：全是命令写「命令」，混进别的工具写「工具调用」
+  "agent.cmd_group_cmds": {
+    "zh-CN": "已执行 {n} 条命令",
+    "zh-TW": "已執行 {n} 條命令",
+    "ja": "{n} 件のコマンドを実行",
+    "ko": "명령 {n}개 실행",
+    "en": "{n} commands run",
+  },
+  "agent.cmd_group_calls": {
+    "zh-CN": "已执行 {n} 个工具调用",
+    "zh-TW": "已執行 {n} 個工具呼叫",
+    "ja": "{n} 件のツール呼び出しを実行",
+    "ko": "도구 호출 {n}회 실행",
+    "en": "{n} tool calls run",
+  },
+  "agent.cmd_group_fails": {
+    "zh-CN": "{n} 次失败",
+    "zh-TW": "{n} 次失敗",
+    "ja": "失敗 {n} 回",
+    "ko": "실패 {n}회",
+    "en": "{n} failed",
+  },
   // 回合（turn）状态与自动折叠
   "agent.turn_running": {
     "zh-CN": "执行中 · 已用 {dur}",

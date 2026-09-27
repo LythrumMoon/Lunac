@@ -3456,6 +3456,11 @@ interface AgentView {
   subtasks: Map<string, AgentSubtask>;
   /** A14：「子任务」分组面板（惰性建，见 `agentSubtaskPanel()`）；随 flow 一起销毁 */
   taskPanel: HTMLElement | null;
+  /** 当前这一段连续工具调用所在的「命令组」（见 `ensureCmdGroup`）。
+   *  `cmdGroupBody` 在遇到 text / thinking 时置空 —— 意味着下一个工具调用另起一组，
+   *  保证 DOM 顺序与时间顺序一致（否则第二组命令会插到中间那段正文前面）。 */
+  cmdGroup: HTMLDetailsElement | null;
+  cmdGroupBody: HTMLElement | null;
 }
 
 /** 一个并行子任务的实时状态（A14）。
@@ -3621,7 +3626,60 @@ function fillThinkContent(det: HTMLDetailsElement, box: HTMLElement) {
     text.slice(-THINK_TAIL_CHARS);
 }
 
-/** 建一张命令执行卡片：头部（工具名 + 命令 + 状态）+ 折叠体（元信息 / 输出 / 操作）。 */
+/** 一轮里「连续若干次工具调用」的折叠容器（agent-ui-spec §3.3 / §3.5）。
+ *
+ *  **为什么必须有它**：回合结束的自动折叠（`.flow-folded`）原本把 `.tool-card` 整块
+ *  `display: none` —— 于是用户回头看不到任何命令、退出码与输出（2026-09-27 反馈
+ *  「命令的执行无法显示」）。现在折叠作用在这个容器上（`<details>` 收起），
+ *  组头那一行「已执行 N 条命令」始终可见；展开即见每条命令与它们的输出。
+ *
+ *  分组边界 = **一段连续的工具调用**。中间出现 text / thinking 就另起一组
+ *  （见 `agentNewBlock`），否则后一组的卡片会被塞进前一组、在 DOM 里跑到中间那段正文之前。
+ */
+function ensureCmdGroup(v: AgentView): HTMLElement {
+  if (v.cmdGroupBody) return v.cmdGroupBody;
+  const el = document.createElement("details");
+  el.className = "cmd-group";
+  el.open = true; // 进行中摊开，让用户看到命令与实时输出
+  el.innerHTML =
+    `<summary class="cmd-group-head">${TERM_SVG}` +
+    `<span class="cmd-group-label"></span></summary>` +
+    `<div class="cmd-group-body"></div>`;
+  v.flow.appendChild(el);
+  v.cmdGroup = el;
+  v.cmdGroupBody = el.querySelector<HTMLElement>(".cmd-group-body")!;
+  refreshCmdGroup(el);
+  return v.cmdGroupBody;
+}
+
+/** 组头文案。**计数一律从组内 DOM 现推**（不另记一份状态）：卡片可能在任何时刻被
+ *  追加或标成失败，而组头只有一个 —— 两份状态必然漂移。空组不写文案。 */
+function refreshCmdGroup(group: Element | null) {
+  const label = group?.querySelector<HTMLElement>(".cmd-group-label");
+  if (!label) return;
+  const cards = group!.querySelectorAll<HTMLElement>(".tool-card");
+  if (cards.length === 0) {
+    label.textContent = "";
+    return;
+  }
+  let other = 0;
+  cards.forEach(c => {
+    const n = c.querySelector(".tool-name")?.textContent?.trim() || "";
+    if (n !== "Bash" && n !== "PowerShell") other++;
+  });
+  const fails = group!.querySelectorAll(".tool-card.failed").length;
+  const key = other === 0 ? "agent.cmd_group_cmds" : "agent.cmd_group_calls";
+  label.textContent =
+    t(key, { n: String(cards.length) }) +
+    (fails > 0 ? ` · ${t("agent.cmd_group_fails", { n: String(fails) })}` : "");
+}
+
+/** 结束当前命令组（下一个工具调用会另起一组）。只清「往哪儿追加」，DOM 留在 flow 里。 */
+function closeCmdGroup(v: AgentView) {
+  v.cmdGroupBody = null;
+}
+
+/** 建一张命令执行卡片：头部（工具名 + 命令 + 状态）+ 折叠体（元信息 / 完整命令 / 输出 / 操作）。 */
 function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
   const el = document.createElement("details");
   el.className = "tool-card running";
@@ -3635,10 +3693,13 @@ function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
     `</summary>` +
     `<div class="tool-body">` +
     `<div class="tool-meta"></div>` +
+    `<pre class="tool-cmd-full"></pre>` +
     `<pre class="tool-out"></pre>` +
     `<div class="tool-actions"></div>` +
     `</div>`;
-  v.flow.appendChild(el);
+  // 卡片一律进「命令组」（见 ensureCmdGroup）—— 回合折叠时藏的是组，不是卡片
+  ensureCmdGroup(v).appendChild(el);
+  refreshCmdGroup(v.cmdGroup); // 组头计数从组内 DOM 现推，追加完再刷一次
   const card: AgentToolCard = { el, name, cmd: "", startAt: performance.now(), done: false };
   if (id) v.toolCards.set(id, card);
   return card;
@@ -3651,6 +3712,7 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, to
   v.flow.querySelector(".plugin-result-loading")?.remove();
 
   if (kind === "thinking") {
+    closeCmdGroup(v); // 正文/思考插进来 ⇒ 当前命令组到此为止，下一批工具调用另起一组
     const det = document.createElement("details");
     det.className = "think-block";
     det.open = true; // 进行中展开，让用户看得到「在思考」
@@ -3687,6 +3749,7 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, to
       v.openCard = card;
     }
   } else {
+    closeCmdGroup(v); // 同 thinking：正文把命令组分段
     const p = document.createElement("div");
     p.className = "agent-text";
     v.flow.appendChild(p);
@@ -3732,13 +3795,31 @@ function toolArgsDisplay(name: string, raw: string): string {
   return raw;
 }
 
-/** 把入参摘要写进当前卡片：流式分片路径与整包回落路径共用。 */
-function agentToolInput(name: string, rawJson: string) {
-  const card = agentView?.openCard;
+/** 入参 JSON 是否已经收齐（流式分片是合法前缀，只有末片能解析）。 */
+function isCompleteJson(raw: string): boolean {
+  try {
+    JSON.parse(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 把入参摘要写进当前卡片：流式分片路径与整包回落路径共用。
+ *  `target` 只在「整包回落要给一张早就建好的卡补写」时传（端点没发 input_json_delta 的情形）。 */
+function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
+  const card = target ?? agentView?.openCard;
   if (!card) return;
   const display = toolArgsDisplay(name, rawJson);
   card.cmd = display;
   const el = card.el.querySelector<HTMLElement>(".tool-cmd");
+  const fullEl = card.el.querySelector<HTMLElement>(".tool-cmd-full");
+  // 卡片正文里放**完整命令**：头部的 `.tool-cmd` 在单行 summary 里被
+  // `text-overflow: ellipsis` 截断，展开卡片也看不到全文（2026-09-27 反馈的第三处）。
+  // 只给命令类工具：Write/Edit 的入参里有整个文件内容，铺进 <pre> 会把对话流压垮。
+  if (fullEl && (name === "Bash" || name === "PowerShell") && isCompleteJson(rawJson)) {
+    fullEl.textContent = display;
+  }
   if (!el) return;
 
   // 写类工具：把 `file_path` 摘出来渲染成**可点链接**（点击 → 资源管理器定位该文件），
@@ -4258,6 +4339,9 @@ function agentToolResult(isError: boolean, content: unknown, toolUseId?: string)
     card.done = true;
     if (v?.openCard === card) v.openCard = null;
     fillToolCard(card, txt, isError);
+    // 失败数进组头（「已执行 3 条命令 · 1 次失败」）。按**卡片所属的组**刷，
+    // 不用 `v.cmdGroup`（那可能已经是下一组的引用）。
+    if (isError) refreshCmdGroup(card.el.closest("details.cmd-group"));
     if (isError) {
       consecutiveFailures++;
       if (consecutiveFailures >= 3) {
@@ -5296,7 +5380,24 @@ listen<{ line: string }>("cli-output", (event) => {
             const todos = todosFromInput(block.input);
             if (todos) renderTodoPanel(todos);
           }
-          if (!cliSawStreamDelta) {
+          // **工具卡不按 `cliSawStreamDelta` 跳过**（2026-09-27 修）：那个标志只说明
+          // 「这一轮出现过流式分片」，与「这张卡建过没有」是两件事。旧写法在
+          // 「正文走了流式、工具块的 input_json_delta 没来（端点直接给全量 input）」
+          // 时会把整张卡跳掉 ⇒ 卡片退化成**没有命令文本的一行**（用户反馈的第 2 处）。
+          // 判据换成卡自己的 id；id 缺失（异常端点）时退到「同名的最后一张未完成卡」，
+          // 与 `agentToolResult` 的兜底配对同一个口径。
+          const v0 = agentView;
+          const existing = block.id
+            ? v0?.toolCards.get(block.id)
+            : v0?.openCard && v0.openCard.name === block.name && !v0.openCard.done
+              ? v0.openCard
+              : undefined;
+          if (existing) {
+            // 卡在、命令文本却是空的 ⇒ 用整包入参补写（流式路径没给到的东西）
+            if (!existing.cmd && block.input !== undefined) {
+              agentToolInput(block.name || "", JSON.stringify(block.input), existing);
+            }
+          } else {
             agentNewBlock("tool", block.name, block.id);
             if (block.input !== undefined) {
               agentToolInput(block.name || "", JSON.stringify(block.input));
@@ -6458,6 +6559,8 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     thinkText: "",
     subtasks: new Map<string, AgentSubtask>(),
     taskPanel: null,
+    cmdGroup: null,
+    cmdGroupBody: null,
   };
 
   cliDoneCallback = (info?: ChatDoneInfo) => {
@@ -6548,6 +6651,11 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
         foldBtn.setAttribute("type", "button");
         const setFolded = (folded: boolean) => {
           flowEl.classList.toggle("flow-folded", folded);
+          // 命令组跟着回合一起开合：折叠 ⇒ 只剩「已执行 N 条命令」一行；展开 ⇒ 摊开全部命令。
+          // 不这么做的话，展开回合还得再点一次每个组，等于折叠变成了两层。
+          flowEl.querySelectorAll<HTMLDetailsElement>("details.cmd-group").forEach(g => {
+            g.open = !folded;
+          });
           foldBtn.textContent = folded ? t("agent.turn_expand") : t("agent.turn_collapse");
         };
         foldBtn.addEventListener("click", () => {

@@ -1665,6 +1665,44 @@ html, body {
   word-break: break-word;
 }
 
+/* ── 命令组：一段连续工具调用的折叠容器（2026-09-27，agent-ui-spec §3.3 / §3.5）──
+   折叠态只留组头一行「已执行 N 条命令 · M 次失败」，展开才见每条命令卡。
+   **回合自动折叠（`.flow-folded`）作用在这个组上，而不是把 `.tool-card` 整块藏掉** ——
+   旧写法在回合结束后把命令、退出码、输出一起藏了，用户反馈「命令的执行无法显示」。 */
+.cmd-group {
+  margin: 3px 0;
+  /* 见 ai-spec §11 规则 33：往对话流里拼 innerHTML 的模板不得让继承来的
+     `white-space: pre-wrap` 把缩进换行渲染成空行 —— 结构容器自己声明回 normal。 */
+  white-space: normal;
+}
+.cmd-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, calc(0.14 * var(--shade-scale)));
+  border-radius: 6px;
+  cursor: pointer;
+  list-style: none;
+}
+.cmd-group-head::-webkit-details-marker { display: none; }
+.cmd-group-head::before { content: "▸"; font-size: 9px; opacity: 0.55; }
+.cmd-group[open] > .cmd-group-head::before { content: "▾"; }
+.cmd-group-head:hover { color: var(--text); }
+.cmd-group-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmd-group[open] > .cmd-group-head { margin-bottom: 3px; }
+/* 卡片进组后由组提供间距，自己那 3px 外边距去掉，并缩进一档表示从属关系 */
+.cmd-group-body { display: flex; flex-direction: column; }
+.cmd-group-body > .tool-card { margin: 2px 0 0 0; }
+
 /* ── AI 命令执行卡片（参照 Trae 侧栏，见 docs/agent-ui-spec.md §3.3）──
    只用既有主题变量（--surface-glass / --border-glass / --text-dim / 语义色），
    不新增配色；图标为内联线性 SVG（docs/icon-style.md §1）。 */
@@ -1720,6 +1758,23 @@ html, body {
   color: var(--text-muted);
   opacity: 0.8;
 }
+
+/* 卡片正文里的**完整命令**（2026-09-27 加）。头部的 `.tool-cmd` 活在单行 summary 里，
+   被 `text-overflow: ellipsis` 截断 —— 展开卡片也看不到全文是第三处缺陷，这里是它的落点。
+   只在命令类工具（Bash / PowerShell）上写值：Write/Edit 的入参里有整个文件内容。 */
+.tool-card .tool-cmd-full {
+  margin: 4px 0 0 0;
+  padding: 4px 6px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, calc(0.24 * var(--shade-scale)));
+  border-radius: 5px;
+}
+.tool-card .tool-cmd-full:empty { display: none; }
 
 .tool-card .tool-state {
   flex: none;
@@ -1973,12 +2028,22 @@ html, body {
   font-size: 10.5px;
 }
 
-/* 回合折叠（Trae 的对话流节点自动折叠）：只留用户消息 + 正文 + 汇总行 */
+/* 回合折叠（Trae 的对话流节点自动折叠）：只留用户消息 + 正文 + 汇总行。
+   **`.tool-card` 不在这个名单里**（2026-09-27 改）：卡片现在装在 `.cmd-group` 里，
+   折叠由那个 `<details>` 自己承担（组头那行「已执行 N 条命令」始终可见）；把卡片
+   列进来会让「展开回合」也看不到任何命令与输出 —— 用户反馈的「命令的执行无法显示」。
+   历史「过程」块里的工具卡仍是 flow 的直接子节点（没有 `.cmd-group` 包着），
+   所以单独保留那条规则（见下）。 */
 .agent-flow.flow-folded .think-block,
-.agent-flow.flow-folded .tool-card,
 .agent-flow.flow-folded .tool-row,
 .agent-flow.flow-folded .subtask-panel,
 .agent-flow.flow-folded .sys-note {
+  display: none;
+}
+
+/* 历史「过程 · N 步」块：`historyStepHtml()` 直接产出 `.tool-card`，没有命令组可收，
+   折叠态照旧整块隐藏（展开后每张卡自己可开合）。 */
+.agent-flow.history-process.flow-folded .tool-card {
   display: none;
 }
 
