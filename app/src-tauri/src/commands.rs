@@ -30,7 +30,10 @@ use tauri::{AppHandle, Emitter, State};
 ///
 /// 用法：`#[tauri::command] pub async fn foo(a: String) -> Result<T, String> {
 ///     run_blocking(move || foo_blocking(a)).await }`
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
+///
+/// `pub(crate)`：`music.rs` 这类新模块的命令同样要遵守本条纪律（命令体里有联网/等待就
+/// 必须搬出主线程），共用一个实现比各自抄一份好。
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,

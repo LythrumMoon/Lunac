@@ -3988,6 +3988,258 @@ html, body {
   }
 }
 
+/* ── 音乐插件（歌词 + Spotify 播放控制，2026-09-27）───────────────
+   刻意**不写按钮底色**：`#app button:where(...)` 那条全局规则已经把所有按钮的
+   常驻/tint/hover 底色统一到 `--btn-bg-*`（见上方「按钮底色全覆盖」），这里再写
+   一份 `background` 只会与主题系统打架（特异性还低，写了也不生效）。本段只负责
+   尺寸 / 排版 / 滚动，颜色一律取主题 token。
+   滚动条走文件顶部那条全局 `::-webkit-scrollbar` —— 这里禁止再声明
+   `scrollbar-width` / `scrollbar-color`（会把 WebView2 打回系统默认外观）。 */
+.music-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
+.music-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+.music-head .music-status { flex: 0 0 auto; }
+.music-head .music-device {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  opacity: 0.75;
+}
+
+/* 纯图标小按钮（复制 / 齿轮）—— 尺寸与 .memo-* 同族 */
+.music-ghost-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 0.7rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-ghost-btn:hover { color: var(--text); border-color: var(--accent-border); }
+
+.music-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.music-hint {
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+.music-field { display: flex; flex-direction: column; gap: 3px; }
+.music-field label { font-size: 0.66rem; color: var(--text-muted); }
+.music-field input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 9px;
+  font-size: 0.74rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.music-field input[type="text"]:focus { border-color: var(--accent-border); }
+.music-field-port input[type="text"] { width: 96px; }
+.music-redirect-row { display: flex; align-items: center; gap: 6px; }
+.music-redirect-row code {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 5px 9px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  user-select: all;
+}
+.music-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.music-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  font-size: 0.72rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-btn:hover { color: var(--text); }
+.music-btn.music-primary { border-color: var(--accent-border); color: var(--text); }
+.music-msg {
+  min-height: 0.9rem;
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+
+.music-player { display: flex; flex-direction: column; gap: 8px; }
+.music-now { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.music-cover {
+  flex: 0 0 auto;
+  width: 52px;
+  height: 52px;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  overflow: hidden;
+}
+.music-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.music-meta { flex: 1 1 auto; min-width: 0; }
+.music-title {
+  font-size: 0.8rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-sub {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 5px;
+}
+.music-progress {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  overflow: hidden;
+}
+.music-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.35s linear;
+}
+.music-time {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.music-controls { display: flex; align-items: center; gap: 8px; }
+.music-round-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border-glass);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-round-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-play-btn { width: 34px; height: 34px; }
+.music-round-btn:disabled { opacity: 0.4; cursor: default; }
+.music-vol {
+  flex: 1 1 auto;
+  min-width: 60px;
+  height: 3px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.music-vol::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+}
+
+.music-lyrics-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.music-lyrics-head { display: flex; align-items: center; gap: 6px; }
+.music-lyrics-title {
+  flex: 0 1 auto;
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-lyrics-head input {
+  flex: 1 1 auto;
+  min-width: 60px;
+  padding: 4px 8px;
+  font-size: 0.68rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.music-lyrics {
+  /* 内嵌插件视图是固定高（360px）的滚动容器（`#results-list`），但 `.plugin-result`
+     本身高度是 auto ⇒ 这里的百分比高度**解析不出来**，所以用 max-height 把歌词盒
+     钉成一个「内部可滚」的定高块。给 `syncActiveLine()` 的居中滚动一个可用的滚动盒。 */
+  min-height: 60px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  font-size: 0.74rem;
+  line-height: 1.7;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border-glass);
+  scroll-behavior: smooth;
+}
+.music-lrc-line { padding: 1px 0; transition: color 0.2s; }
+.music-lrc-line.active { color: var(--accent); }
+.music-lrc-plain { white-space: pre-wrap; }
+.music-lyric-empty { color: var(--text-muted); opacity: 0.8; padding: 6px 0; }
+.music-cands { display: flex; flex-direction: column; gap: 3px; }
+.music-cand {
+  text-align: left;
+  padding: 4px 8px;
+  font-size: 0.7rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-cand:hover { color: var(--text); }
+
 #detail-results .result-item {
   padding: 7px 10px;
 }

@@ -2833,6 +2833,8 @@ const PLUGIN_ICON_PATHS: Record<string, string> = {
   "ocr": `<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>`,
   "quick-launch": `<line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14l-1.5-2h-11z"/><path d="M12 2a5 5 0 0 0-5 5c0 2.5 2 4 3.5 5.5L12 14l1.5-1.5C15 11 17 9.5 17 7a5 5 0 0 0-5-5z"/>`,
   "tool-editor": `<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>`,
+  // 音乐歌词（2026-09-27）：八分音符 + 音符头，与既有图标同一套「扫笔 + 高光」语言
+  "music": `<path d="M9 18V5l10-2v13"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/>`,
   "clipboard-history": `<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
 };
 
@@ -3173,6 +3175,9 @@ async function closePluginView() {
       pendingInput: chatInput.value,
     });
   }
+  // 音乐插件有 1s 一次的播放态轮询 —— 面板一关就必须停表（模块内另有
+  // `root.isConnected` 自停兜底，这里显式停一次是为了不依赖 DOM 时序）。
+  (window as any).__lunac_music_stop?.();
   // Cancel any active streaming (increment id so old callbacks are ignored)
   if (isStreaming) {
     streamId++;
@@ -5965,7 +5970,7 @@ async function executePlugin(plugin: Plugin) {
   // a "bubble" wrapper in detached mode with mismatched element IDs.
   // Quick-launch never restores — 面板 = 注册表的实时视图（重开必须重列，
   // 否则缓存 HTML 会让“新添加的注册项消失”）。
-  const skipRestore = plugin.id === "settings" || plugin.id === "ai-agent" || plugin.id === "ocr" || plugin.id === "memo" || plugin.id === "quick-launch";
+  const skipRestore = plugin.id === "settings" || plugin.id === "ai-agent" || plugin.id === "ocr" || plugin.id === "memo" || plugin.id === "quick-launch" || plugin.id === "music";
   const saved = skipRestore ? undefined : pluginStates.get(plugin.id);
   if (saved?.html) {
     resultsList.innerHTML = saved.html;
@@ -6058,6 +6063,13 @@ async function executePlugin(plugin: Plugin) {
         setTimeout(() =>
           import("./plugins/builtin/memo").then(m =>
             m.attachMemoListeners(resultsList)
+          ), 50);
+      }
+      // 音乐歌词：面板要轮询播放态，且是 skipRestore（每次重开都重新挂 + 重新拉状态）
+      if (plugin.id === "music") {
+        setTimeout(() =>
+          import("./plugins/builtin/music").then(m =>
+            m.attachMusicListeners(resultsList)
           ), 50);
       }
     } else {

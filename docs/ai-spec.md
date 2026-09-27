@@ -36,7 +36,7 @@ Lunac 是一个 **uTools 风格的桌面启动器 / 搜索工具**，由 Tauri 2
 │  main.ts → 毛玻璃搜索栏 + 插件系统 + 键盘导航                                  │
 │  plugins/builtin/ → quick-launch / web-search /                  │
 │                     settings / clipboard-history / tool-editor / ai-agent /│
-│                     ocr / memo 等 8 个插件                           │
+│                     ocr / memo 等 9 个插件                           │
 │  tools/*.json → Agent MCP Tools (sys_info 等)                     │
 └────────────────────────────┬─────────────────────────────────────┘
                              │ Tauri IPC + WebView2
@@ -63,7 +63,7 @@ Lunac 是一个 **uTools 风格的桌面启动器 / 搜索工具**，由 Tauri 2
 |------|------|------|
 | 主入口 | `app/src/main.ts` | 搜索栏 UI + 插件搜索 + 键盘事件 |
 | 插件注册 | `app/src/plugins/registry.ts` | 关键词模糊匹配 + 评分排序 |
-| 插件列表 | `app/src/plugins/builtin/index.ts` | 注册所有 8 个内置插件 |
+| 插件列表 | `app/src/plugins/builtin/index.ts` | 注册所有 9 个内置插件 |
 | 快速启动 | `builtin/quick-launch.ts` | Start Menu 应用搜索与启动 |
 | 网页搜索 | `builtin/web-search.ts` | 默认浏览器打开搜索页（Google / Bing / Baidu，见 §11 规则 6） |
 | 剪贴板历史 | `builtin/clipboard-history.ts` | 剪贴板历史管理 — 自动保存复制内容 |
@@ -853,6 +853,41 @@ searchInput (总端口)
 | ai-agent | 🤖 | (被搜索过滤排除，仅作为无匹配时的回退显示) |
 | ocr | 🔍 | ocr, 识别, 文字识别, 图像识别, 图片转文字, 截图识别, 图识字, 文字提取 |
 | memo | 📝 | 备忘录, memo, 便签, 笔记, 记事本 |
+| music | 🎵 | 音乐, 歌词, 歌曲, 正在播放, music, lyrics, spotify, 播放控制, 暂停, 下一首 |
+
+### 4.6 音乐插件（歌词 + Spotify 播放控制，2026-09-27）
+
+用户要求把「歌词抓取」与「Spotify 播放控制」做成**一个**插件。前端只画界面 + 轮询，
+**一切联网都在宿主** —— 理由与「插件市场索引必须由宿主去拉」完全相同（§11 规则 67 第 ⑥ 条）：
+`tauri.conf.json` 的 CSP 是 `default-src 'self' https://asset.localhost`，**不含远端域**，
+插件里 `fetch()` 会被直接拦掉。
+
+| 宿主命令（[music.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/music.rs)） | 作用 |
+|---|---|
+| `music_config_get` / `music_config_set` | 读写 `config\music.json`（Client ID / 回调端口 / 令牌）。**不回传令牌**给前端 |
+| `spotify_connect` | 起环回服务器并返回授权 URL（前端交给 `open()`）。**唯一不用 `run_blocking` 的命令**：它只 bind 端口就返回，accept + 换令牌在独立线程 |
+| `spotify_disconnect` | 清空本地令牌（等于「忘记账号」） |
+| `spotify_status` | `GET /me/player`；204 = 无活跃设备（不是错误） |
+| `spotify_control` | play / pause / next / previous / seek / volume |
+| `lyrics_get` / `lyrics_search` | LRCLIB 歌词（`/api/get` 精确 + `/api/search` 回落） |
+
+**三条不得回退的约束**：
+
+1. **只走官方 OAuth（Authorization Code + PKCE + 环回地址）**。Spotify **没有**「账号密码异地登入」
+   这类接口；桌面端正确姿势是 RFC 8252 的环回重定向。播放控制另需 **Premium** +
+   `user-modify-playback-state`；读状态需 `user-read-playback-state` / `user-read-currently-playing`。
+2. **Redirect URI 必须是 `http://127.0.0.1:<port>/callback`**：Spotify 自 2025-11 起对新应用
+   **拒绝 `localhost`**（只接受 HTTPS 或 127.0.0.1/[::1] 字面量），且要求**逐字符精确匹配**
+   （唯一豁免是环回 IP 的端口可动态分配）。端口固定在 `music.rs` 的 `DEFAULT_PORT`（8899，
+   刻意避开 8788/8789 的本地服务与 9222 的调试口），面板上把完整回调地址显示出来供用户照抄。
+3. **令牌过期要能自动救回来**：`ensure_access_token()` 在 `expires_at` 前 60s 主动刷新；
+   **刷新被拒就清空本地令牌并报 `ERR_NOT_CONNECTED`**，让面板退回「未登录」而不是反复 401。
+   刷新响应里**可能不带新的 refresh_token**，此时必须保留旧的（清掉等于把用户踢下线）。
+
+**边界要诚实**：这个插件控制的是「当前活跃的 Spotify Connect 设备」（本机 Spotify 客户端即可），
+**不是**在 Lunac 里发声；WebView2 内出声需要 Web Playback SDK（Premium + EME/DRM），不做。
+另外播放控制要求调用方注册的 App 处于 Development Mode 白名单内（最多 5 个授权用户，
+App 所有者需 Premium）—— 用户必须自己有一个 Client ID，Lunac 不代发任何凭据。
 
 ## 5. 关键设计决策
 

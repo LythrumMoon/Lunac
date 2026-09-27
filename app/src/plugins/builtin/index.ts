@@ -7,6 +7,7 @@ import { aiAgentPlugin } from "./ai-agent";
 import { clipboardHistoryPlugin } from "./clipboard-history";
 import { ocrPlugin } from "./ocr";
 import { memoPlugin } from "./memo";
+import { musicPlugin } from "./music";
 import toolEditor from "./tool-editor";
 
 export function registerBuiltinPlugins() {
@@ -23,4 +24,6 @@ export function registerBuiltinPlugins() {
   pluginRegistry.register(ocrPlugin);
   // 备忘录 — 本地自动保存 (点17)
   pluginRegistry.register(memoPlugin);
+  // 音乐歌词 — LRCLIB 歌词抓取 + Spotify 播放控制（一个插件两件事，2026-09-27）
+  pluginRegistry.register(musicPlugin);
 }

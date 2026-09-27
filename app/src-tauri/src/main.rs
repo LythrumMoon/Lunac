@@ -19,6 +19,7 @@ mod auto_start;
 mod mcp_server;
 mod windows_ocr;
 mod paddle_ocr;
+mod music;
 mod cli_bridge;
 mod agent_server;
 mod log;
@@ -499,6 +500,15 @@ fn main() {
             run_paddle_ocr,
             ocr_engine_status,
             ocr_engine_install,
+            // 音乐插件（歌词 + Spotify 播放控制）—— 见 src/music.rs
+            music::music_config_get,
+            music::music_config_set,
+            music::spotify_connect,
+            music::spotify_disconnect,
+            music::spotify_status,
+            music::spotify_control,
+            music::lyrics_get,
+            music::lyrics_search,
             hide_lunac,
             appearance::get_system_theme,
             appearance::list_themes,

@@ -23,6 +23,11 @@ tokio = { version = "1", features = ["sync", "macros"] }
 futures = "0.3"
 dotenvy = "0.15"
 base64 = "0.22"
+# Spotify OAuth 的 PKCE（S256）需要 SHA-256；`percent-encoding` 用于拼授权 URL 与解回调查询串。
+# 两者在依赖树里**本来就有**（sha2 0.10.9 / percent-encoding 2.3.2 已在 Cargo.lock），
+# 这里只是提为直接依赖，不新增任何下载（见 music.rs 顶部说明）。
+sha2 = "0.10"
+percent-encoding = "2"
 pinyin = { version = "0.11", features = ["plain"] }
 winreg = "0.52"
 windows = { version = "0.58", features = [
