@@ -8,6 +8,7 @@ import { clipboardHistoryPlugin } from "./clipboard-history";
 import { ocrPlugin } from "./ocr";
 import { memoPlugin } from "./memo";
 import { musicPlugin } from "./music";
+import { convertPlugin } from "./convert";
 import toolEditor from "./tool-editor";
 
 export function registerBuiltinPlugins() {
@@ -26,4 +27,6 @@ export function registerBuiltinPlugins() {
   pluginRegistry.register(memoPlugin);
   // 音乐歌词 — LRCLIB 歌词抓取 + Spotify 播放控制（一个插件两件事，2026-09-27）
   pluginRegistry.register(musicPlugin);
+  // 文件转换 — 图片 / 音频 / 视频互转（走本机 ffmpeg，2026-09-27）
+  pluginRegistry.register(convertPlugin);
 }

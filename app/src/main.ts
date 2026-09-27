@@ -2835,6 +2835,8 @@ const PLUGIN_ICON_PATHS: Record<string, string> = {
   "tool-editor": `<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>`,
   // 音乐歌词（2026-09-27）：八分音符 + 音符头，与既有图标同一套「扫笔 + 高光」语言
   "music": `<path d="M9 18V5l10-2v13"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/>`,
+  // 文件转换（2026-09-27）：双向箭头 —— 「换格式」最直白的图形
+  "convert": `<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>`,
   "clipboard-history": `<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
 };
 
@@ -3178,6 +3180,8 @@ async function closePluginView() {
   // 音乐插件有 1s 一次的播放态轮询 —— 面板一关就必须停表（模块内另有
   // `root.isConnected` 自停兜底，这里显式停一次是为了不依赖 DOM 时序）。
   (window as any).__lunac_music_stop?.();
+  // 文件转换要撤掉 convert-progress 监听（否则重开面板会叠监听器）
+  (window as any).__lunac_convert_stop?.();
   // Cancel any active streaming (increment id so old callbacks are ignored)
   if (isStreaming) {
     streamId++;
@@ -5581,6 +5585,31 @@ async function runSearchNow(searchSeq: number) {
       }
     }
 
+    // 文件转换 — 附件的后缀属图片/音频/视频时出现（插件自身按后缀给候选格式；
+    // 后缀不认识时插件会如实说「不支持」，所以这里只做粗筛，不必与 convert.rs 的表逐项对齐）
+    const mediaExtensions = /\.(png|jpe?g|jfif|webp|bmp|tiff?|gif|ico|heic|avif|mp3|wav|flac|m4a|aac|ogg|opus|wma|aiff|ape|amr|mp4|mkv|webm|avi|mov|wmv|flv|m4v|mpg|mpeg|ts|3gp|rmvb)$/i;
+    const mediaFile = attachedFiles.find(f => mediaExtensions.test(f));
+    if (mediaFile) {
+      const convertPluginEntry = pluginRegistry.getAll().find(p => p.id === "convert");
+      if (convertPluginEntry) {
+        const convertItem = doc("div");
+        convertItem.className = "result-item";
+        convertItem.dataset.kind = "convert"; // right-click → Ask AI fallback
+        convertItem.innerHTML = `
+          <div class="result-item-icon">${pluginIconSvg("convert")}</div>
+          <div class="result-item-content">
+            <div class="result-item-title">${pluginName("convert")}</div>
+            <div class="result-item-desc">${t("chat.attach_convert_file")}</div>
+          </div>
+        `;
+        convertItem.addEventListener("click", () => {
+          (window as any).__lunac_convert_file = mediaFile;
+          executePlugin(convertPluginEntry);
+        });
+        resultsList.appendChild(convertItem);
+      }
+    }
+
     // Custom Local Launch
     const launchItem = doc("div");
     launchItem.className = "result-item";
@@ -5970,7 +5999,7 @@ async function executePlugin(plugin: Plugin) {
   // a "bubble" wrapper in detached mode with mismatched element IDs.
   // Quick-launch never restores — 面板 = 注册表的实时视图（重开必须重列，
   // 否则缓存 HTML 会让“新添加的注册项消失”）。
-  const skipRestore = plugin.id === "settings" || plugin.id === "ai-agent" || plugin.id === "ocr" || plugin.id === "memo" || plugin.id === "quick-launch" || plugin.id === "music";
+  const skipRestore = plugin.id === "settings" || plugin.id === "ai-agent" || plugin.id === "ocr" || plugin.id === "memo" || plugin.id === "quick-launch" || plugin.id === "music" || plugin.id === "convert";
   const saved = skipRestore ? undefined : pluginStates.get(plugin.id);
   if (saved?.html) {
     resultsList.innerHTML = saved.html;
@@ -6070,6 +6099,13 @@ async function executePlugin(plugin: Plugin) {
         setTimeout(() =>
           import("./plugins/builtin/music").then(m =>
             m.attachMusicListeners(resultsList)
+          ), 50);
+      }
+      // 文件转换：要 listen 宿主的 convert-progress 事件并把预置源文件探出候选格式
+      if (plugin.id === "convert") {
+        setTimeout(() =>
+          import("./plugins/builtin/convert").then(m =>
+            m.attachConvertListeners(resultsList)
           ), 50);
       }
     } else {

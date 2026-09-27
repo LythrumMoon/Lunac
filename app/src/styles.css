@@ -4240,6 +4240,113 @@ html, body {
 }
 .music-cand:hover { color: var(--text); }
 
+/* ── 文件转换插件（图片 / 音频 / 视频，2026-09-27）─────────────────
+   与音乐插件同一条纪律：**不写按钮底色**（`#app button:where(...)` 全局规则已统一），
+   这里只管尺寸 / 排版 / 滚动。滚动条走文件顶部的全局 `::-webkit-scrollbar`。 */
+.convert-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
+.convert-head { display: flex; align-items: center; gap: 8px; }
+.convert-engine {
+  flex: 1 1 auto;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.convert-warn { color: var(--yellow); }
+
+.convert-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  font-size: 0.72rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.convert-btn:hover { color: var(--text); }
+.convert-btn:disabled { opacity: 0.45; cursor: default; }
+.convert-btn.convert-primary { border-color: var(--accent-border); color: var(--text); }
+
+.convert-source {
+  font-size: 0.74rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+  word-break: break-all;
+}
+.convert-file { color: var(--text); }
+.convert-sub { font-size: 0.68rem; color: var(--text-muted); }
+
+.convert-target-wrap { display: flex; flex-direction: column; gap: 4px; }
+.convert-label { font-size: 0.66rem; color: var(--text-muted); }
+.convert-targets { display: flex; flex-wrap: wrap; gap: 5px; max-height: 92px; overflow-y: auto; }
+.convert-chip {
+  padding: 3px 10px;
+  font-size: 0.7rem;
+  border: 1px solid var(--border-glass);
+  border-radius: 999px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.convert-chip:hover { color: var(--text); }
+/* 选中态用语义色描边表达 —— 底色仍归全局规则管 */
+.convert-chip.active {
+  border-color: var(--accent-border);
+  color: var(--text);
+  background: var(--accent-bg);
+}
+
+.convert-actions { display: flex; align-items: center; gap: 8px; }
+.convert-status { font-size: 0.68rem; color: var(--text-dim); }
+
+.convert-progress { display: flex; align-items: center; gap: 8px; }
+.convert-progress-bar {
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  overflow: hidden;
+}
+.convert-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.3s linear;
+}
+/* 时长未知（图片）时的**不确定态**：不编假百分比，改为来回扫的一条 */
+.convert-progress-fill.indeterminate {
+  width: 32%;
+  animation: convert-scan 1.1s ease-in-out infinite;
+}
+@keyframes convert-scan {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+.convert-percent {
+  flex: 0 0 38px;
+  text-align: right;
+  font-size: 0.66rem;
+  color: var(--text-muted);
+}
+
+.convert-done { display: flex; flex-direction: column; gap: 5px; }
+.convert-out {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+.convert-done-actions { display: flex; gap: 6px; }
+
 #detail-results .result-item {
   padding: 7px 10px;
 }

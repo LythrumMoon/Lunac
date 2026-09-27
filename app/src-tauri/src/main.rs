@@ -20,6 +20,7 @@ mod mcp_server;
 mod windows_ocr;
 mod paddle_ocr;
 mod music;
+mod convert;
 mod cli_bridge;
 mod agent_server;
 mod log;
@@ -509,6 +510,10 @@ fn main() {
             music::spotify_control,
             music::lyrics_get,
             music::lyrics_search,
+            // 文件转换插件（图片 / 音频 / 视频，走 ffmpeg）—— 见 src/convert.rs
+            convert::convert_engine_status,
+            convert::convert_probe,
+            convert::convert_run,
             hide_lunac,
             appearance::get_system_theme,
             appearance::list_themes,

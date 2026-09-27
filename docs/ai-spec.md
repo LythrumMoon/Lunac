@@ -63,7 +63,7 @@ Lunac 是一个 **uTools 风格的桌面启动器 / 搜索工具**，由 Tauri 2
 |------|------|------|
 | 主入口 | `app/src/main.ts` | 搜索栏 UI + 插件搜索 + 键盘事件 |
 | 插件注册 | `app/src/plugins/registry.ts` | 关键词模糊匹配 + 评分排序 |
-| 插件列表 | `app/src/plugins/builtin/index.ts` | 注册所有 9 个内置插件 |
+| 插件列表 | `app/src/plugins/builtin/index.ts` | 注册所有 10 个内置插件 |
 | 快速启动 | `builtin/quick-launch.ts` | Start Menu 应用搜索与启动 |
 | 网页搜索 | `builtin/web-search.ts` | 默认浏览器打开搜索页（Google / Bing / Baidu，见 §11 规则 6） |
 | 剪贴板历史 | `builtin/clipboard-history.ts` | 剪贴板历史管理 — 自动保存复制内容 |
@@ -854,6 +854,7 @@ searchInput (总端口)
 | ocr | 🔍 | ocr, 识别, 文字识别, 图像识别, 图片转文字, 截图识别, 图识字, 文字提取 |
 | memo | 📝 | 备忘录, memo, 便签, 笔记, 记事本 |
 | music | 🎵 | 音乐, 歌词, 歌曲, 正在播放, music, lyrics, spotify, 播放控制, 暂停, 下一首 |
+| convert | 🔄 | 转换, 格式转换, 转格式, convert, 格式, 转码, 提取音频, 图片转换, 视频转换, 音频转换 |
 
 ### 4.6 音乐插件（歌词 + Spotify 播放控制，2026-09-27）
 
@@ -888,6 +889,49 @@ searchInput (总端口)
 **不是**在 Lunac 里发声；WebView2 内出声需要 Web Playback SDK（Premium + EME/DRM），不做。
 另外播放控制要求调用方注册的 App 处于 Development Mode 白名单内（最多 5 个授权用户，
 App 所有者需 Premium）—— 用户必须自己有一个 Client ID，Lunac 不代发任何凭据。
+
+### 4.7 文件转换插件（图片 / 音频 / 视频，2026-09-27）
+
+用户选定范围：图片格式互转、音频格式互转、视频格式互转。引擎 = **本机 ffmpeg**，
+前端插件只画界面，**转换必须由宿主做** —— 插件跑在 WebView 里，没有执行外部进程的能力
+（与 §4.6「联网必须走宿主」是同一条纪律，code-rules 预检 #36）。
+
+| 宿主命令（[convert.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/convert.rs)） | 作用 |
+|---|---|
+| `convert_engine_status` | 找 ffmpeg / ffprobe（**exe 根自带 → PATH**，只找不下载）并回报版本 |
+| `convert_probe` | 按后缀给出 `kind` / 体积 / 时长 / **可选目标格式** |
+| `convert_run` | 跑一次转换；进度经 `convert-progress` 事件回传 |
+
+**一个引擎覆盖三类**：ffmpeg 同时能读写图片（png/jpg/webp/bmp/tiff/gif）、音频
+（mp3/wav/flac/m4a/aac/ogg/opus）、视频（mp4/mkv/webm/avi/mov/gif），所以不引第二套实现。
+曾考虑用 `image` crate 单做图片，但那样就有两条路径、两套错误语义，且 `image` 的 webp
+**只有解码**。目标格式表刻意只列 ffmpeg 稳的（不加 avif / heic / ico：前者看构建里的编码器，
+后者 ffmpeg 写出来容易是坏的）。
+
+**四条不得回退的约束**：
+
+1. **ffmpeg 不随包分发**（体积 + 许可）。找不到就在面板上如实说「未找到 ffmpeg」并给出装法，
+   同时禁掉选择按钮 —— 与 OCR 引擎缺失、插件市场拉不到索引是同一条「坏状态要可见」的纪律。
+2. **输出路径由宿主算**，前端只传目标扩展名。三条硬约束：① 绝不等同源文件（否则就是覆盖
+   用户的原始素材）；② 已存在就加 ` (1)` / ` (2)` 递增，静默覆盖是最不该发生的事；
+   ③ 失败要把半成品删掉，别在用户目录里留一个「转坏了的文件」。
+3. **子进程的 stderr 必须在独立线程里排空**：stdout（`-progress pipe:1`）与 stderr 两个管道
+   都塞满时（ffmpeg 报错刷屏），主线程只读 stdout ⇒ 子进程写阻塞 ⇒ **双向死锁**。
+4. **进度诚实**：`-progress` 的 `out_time_us` 实测是**微秒**（ffmpeg 8 里同行的
+   `out_time_ms` 同样是微秒 —— 只认 `out_time_us`）；`ffprobe` 探不到时长（图片就是没有
+   时长这个概念）时 `percent = -1`，面板切成**不确定态**进度条，**不编一个假百分比**。
+
+**无音轨的视频不给音频目标**：录屏、静音素材抽不出音轨。`convert_probe` 用**一次** ffprobe
+同时拿时长与 `codec_type`，没有音轨的视频就不列音频目标（`targets_for_input()`，有单测），
+`convert_run` 用同一判据拒绝 —— 否则用户会看到 `Output file does not contain any stream`
+这种看不懂的报错。
+
+**探测失败一律按「有音轨 + 时长 0」处理**：拦不住就交给 ffmpeg 如实报错，
+好过因为探测本身失败而凭空砍掉候选。
+
+**附件入口**：附件的后缀属图片 / 音频 / 视频时，搜索结果里多一条「文件转换」，
+点它即把该文件预置为源文件（`window.__lunac_convert_file`）。前端只做**粗筛**
+（一张正则），后缀不认识时插件会如实说「不支持」，所以不必与 `convert.rs` 的格式表逐项对齐。
 
 ## 5. 关键设计决策
 

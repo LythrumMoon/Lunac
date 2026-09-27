@@ -1165,6 +1165,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "음악 가사",
     "en": "Music & Lyrics",
   },
+  "plugin.convert": {
+    "zh-CN": "文件转换",
+    "zh-TW": "檔案轉換",
+    "ja": "ファイル変換",
+    "ko": "파일 변환",
+    "en": "File Converter",
+  },
   // ── Plugin descriptions ──────────────────────────────────────
   // 结果区 / 插件总览展示用。**必须与 plugin.<id> 名字键成对出现**：
   // 渲染点一律走 pluginName(id, fallback) / pluginDesc(id, fallback)，
@@ -1232,6 +1239,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "歌詞取得 + Spotify 再生コントロール",
     "ko": "가사 가져오기 + Spotify 재생 제어",
     "en": "Lyrics lookup + Spotify playback control",
+  },
+  "plugin.convert.desc": {
+    "zh-CN": "图片 / 音频 / 视频格式互转",
+    "zh-TW": "圖片 / 音訊 / 影片格式互轉",
+    "ja": "画像 / 音声 / 動画の形式変換",
+    "ko": "이미지 / 오디오 / 동영상 형식 변환",
+    "en": "Image / audio / video format conversion",
   },
 
   // ── OCR Plugin ──────────────────────────────────────────────
@@ -1863,6 +1877,149 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "ブラウザで認可ページを開きました。完了したらここに戻ってください",
     "ko": "브라우저에서 인증 페이지를 열었습니다. 완료 후 여기로 돌아오세요",
     "en": "Opened the authorization page in your browser — come back here when done",
+  },
+
+  // ── Convert Plugin（文件转换：图片 / 音频 / 视频，2026-09-27）────
+  // 引擎是本机 ffmpeg；找不到时面板要给出**可自救**的装法，不能只说「失败」。
+  "convert.engine": {
+    "zh-CN": "ffmpeg",
+    "zh-TW": "ffmpeg",
+    "ja": "ffmpeg",
+    "ko": "ffmpeg",
+    "en": "ffmpeg",
+  },
+  "convert.engine_checking": {
+    "zh-CN": "检测引擎…",
+    "zh-TW": "檢測引擎…",
+    "ja": "エンジン確認中…",
+    "ko": "엔진 확인 중…",
+    "en": "Checking engine…",
+  },
+  "convert.engine_missing": {
+    "zh-CN": "未找到 ffmpeg",
+    "zh-TW": "未找到 ffmpeg",
+    "ja": "ffmpeg が見つかりません",
+    "ko": "ffmpeg를 찾을 수 없습니다",
+    "en": "ffmpeg not found",
+  },
+  "convert.engine_missing_hint": {
+    "zh-CN": "装一个 ffmpeg 就能用：在终端执行 winget install Gyan.FFmpeg，然后重启 Lunac。也可以把 ffmpeg.exe 放到 Lunac 安装目录下。",
+    "zh-TW": "裝一個 ffmpeg 就能用：在終端執行 winget install Gyan.FFmpeg，然後重啟 Lunac。也可以把 ffmpeg.exe 放到 Lunac 安裝目錄下。",
+    "ja": "ffmpeg を入れると使えます：ターミナルで winget install Gyan.FFmpeg を実行し、Lunac を再起動してください。ffmpeg.exe を Lunac のインストール先に置く方法でも構いません。",
+    "ko": "ffmpeg를 설치하면 사용할 수 있습니다: 터미널에서 winget install Gyan.FFmpeg 실행 후 Lunac를 재시작하세요. ffmpeg.exe를 Lunac 설치 폴더에 두어도 됩니다.",
+    "en": "Install ffmpeg to enable this: run winget install Gyan.FFmpeg in a terminal, then restart Lunac. Dropping ffmpeg.exe into the Lunac folder works too.",
+  },
+  "convert.pick": {
+    "zh-CN": "选择文件",
+    "zh-TW": "選擇檔案",
+    "ja": "ファイルを選択",
+    "ko": "파일 선택",
+    "en": "Choose file",
+  },
+  "convert.pick_hint": {
+    "zh-CN": "选一个文件，或把文件拖成搜索栏附件后走「文件转换」进入",
+    "zh-TW": "選一個檔案，或把檔案拖成搜尋欄附件後用「檔案轉換」進入",
+    "ja": "ファイルを選ぶか、検索バーに添付して「ファイル変換」から開いてください",
+    "ko": "파일을 선택하거나, 검색창에 첨부한 뒤 '파일 변환'으로 들어오세요",
+    "en": "Pick a file, or attach one in the search bar and open it via the converter",
+  },
+  "convert.target": {
+    "zh-CN": "转换为",
+    "zh-TW": "轉換為",
+    "ja": "変換先",
+    "ko": "변환 대상",
+    "en": "Convert to",
+  },
+  "convert.start": {
+    "zh-CN": "开始转换",
+    "zh-TW": "開始轉換",
+    "ja": "変換開始",
+    "ko": "변환 시작",
+    "en": "Start",
+  },
+  "convert.converting": {
+    "zh-CN": "转换中…（大文件可能需要一会儿）",
+    "zh-TW": "轉換中…（大檔案可能需要一段時間）",
+    "ja": "変換中…（大きなファイルは時間がかかります）",
+    "ko": "변환 중… (큰 파일은 시간이 걸릴 수 있습니다)",
+    "en": "Converting… (large files take a while)",
+  },
+  "convert.done": {
+    "zh-CN": "完成",
+    "zh-TW": "完成",
+    "ja": "完了",
+    "ko": "완료",
+    "en": "Done",
+  },
+  "convert.open_file": {
+    "zh-CN": "打开文件",
+    "zh-TW": "開啟檔案",
+    "ja": "ファイルを開く",
+    "ko": "파일 열기",
+    "en": "Open file",
+  },
+  "convert.reveal": {
+    "zh-CN": "打开所在目录",
+    "zh-TW": "開啟所在目錄",
+    "ja": "フォルダーを開く",
+    "ko": "폴더 열기",
+    "en": "Show in folder",
+  },
+  "convert.kind_image": {
+    "zh-CN": "图片",
+    "zh-TW": "圖片",
+    "ja": "画像",
+    "ko": "이미지",
+    "en": "Image",
+  },
+  "convert.kind_audio": {
+    "zh-CN": "音频",
+    "zh-TW": "音訊",
+    "ja": "音声",
+    "ko": "오디오",
+    "en": "Audio",
+  },
+  "convert.kind_video": {
+    "zh-CN": "视频",
+    "zh-TW": "影片",
+    "ja": "動画",
+    "ko": "동영상",
+    "en": "Video",
+  },
+  "convert.kind_unknown": {
+    "zh-CN": "未知类型",
+    "zh-TW": "未知類型",
+    "ja": "不明な種類",
+    "ko": "알 수 없는 형식",
+    "en": "Unknown",
+  },
+  "convert.unsupported": {
+    "zh-CN": "这个后缀不支持转换",
+    "zh-TW": "這個副檔名不支援轉換",
+    "ja": "この拡張子は変換できません",
+    "ko": "이 확장자는 변환할 수 없습니다",
+    "en": "This file type cannot be converted",
+  },
+  "convert.err_no_file": {
+    "zh-CN": "文件不存在或不可读",
+    "zh-TW": "檔案不存在或無法讀取",
+    "ja": "ファイルが存在しないか読み取れません",
+    "ko": "파일이 없거나 읽을 수 없습니다",
+    "en": "File is missing or unreadable",
+  },
+  "convert.err_no_engine": {
+    "zh-CN": "未找到 ffmpeg，请先安装",
+    "zh-TW": "未找到 ffmpeg，請先安裝",
+    "ja": "ffmpeg が見つかりません。先にインストールしてください",
+    "ko": "ffmpeg를 찾을 수 없습니다. 먼저 설치하세요",
+    "en": "ffmpeg not found — install it first",
+  },
+  "chat.attach_convert_file": {
+    "zh-CN": "把这个附件转成别的格式",
+    "zh-TW": "把這個附件轉成別的格式",
+    "ja": "この添付を別の形式に変換",
+    "ko": "이 첨부를 다른 형식으로 변환",
+    "en": "Convert this attachment to another format",
   },
 
   "chat.memo_edit_tag": {
