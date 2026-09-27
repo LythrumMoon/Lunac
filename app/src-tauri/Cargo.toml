@@ -1,6 +1,6 @@
 [package]
 name = "lunac"
-version = "0.9.3"
+version = "0.9.5"
 edition = "2021"
 description = "Lunac - Native AI coding assistant with local + cloud hybrid inference"
 
