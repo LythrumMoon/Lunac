@@ -96,26 +96,25 @@ pub fn plugin_window_init(window: WebviewWindow) -> Result<PluginWindowInit, Str
     }
 }
 
-/// 打开（或复用）插件悬浮窗。
-///
-/// **刻意不用 `run_blocking`**：建窗不是阻塞 IO，而是「交给事件循环去建」——
-/// 它必须在**非主线程**上发起（主线程发起会与消息泵互等）。所以这里用
-/// `async fn` 薄壳本身，理由与 `music::spotify_connect` 相同。
-#[tauri::command]
-pub async fn open_plugin_window(
-    app: AppHandle,
-    plugin_id: String,
-    input: Option<String>,
-) -> Result<(), String> {
-    if !is_safe_plugin_id(&plugin_id) {
+/// 某个插件窗现在是否开着。**自动弹出类功能**（音乐插件，见 `music.rs` 的
+/// `spawn_spotify_watcher`）用它判断该不该建窗 —— 已经开着就不要再去 `open()`，
+/// 那条复用路径会 `set_focus()` 抢焦点。
+pub fn is_open(app: &AppHandle, plugin_id: &str) -> bool {
+    app.get_webview_window(&label_for(plugin_id)).is_some()
+}
+
+/// 建窗或复用（同一个插件不建第二个）。宿主内部与前端命令**共用这一条实现** ——
+/// 「复用要推一条 `plugin-window-input`」「建窗前必须写好 PENDING」这些约束只有一份。
+pub fn open(app: &AppHandle, plugin_id: &str, input: &str) -> Result<(), String> {
+    if !is_safe_plugin_id(plugin_id) {
         return Err("ERR_BAD_PLUGIN_ID".into());
     }
-    let label = label_for(&plugin_id);
-    let input = input.unwrap_or_default();
+    let label = label_for(plugin_id);
 
+    // 必须在建窗**之前**写好：页面可能比这条命令返回得更快，前端一启动就会来取
     {
         let mut guard = pending().lock().map_err(|e| format!("lock: {e}"))?;
-        guard.insert(label.clone(), (plugin_id.clone(), input.clone()));
+        guard.insert(label.clone(), (plugin_id.to_string(), input.to_string()));
     }
 
     // 已经开着 ⇒ 只把它拎到前面，并把新入参推给它（同一个插件不该开出两个窗）
@@ -127,8 +126,8 @@ pub async fn open_plugin_window(
         return Ok(());
     }
 
-    let built = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("plugin.html".into()))
-        .title(plugin_id.clone())
+    let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("plugin.html".into()))
+        .title(plugin_id)
         .inner_size(WIN_W, WIN_H)
         .min_inner_size(MIN_W, MIN_H)
         // 与主窗口同一套观感：无边框 + 透明 + 毛玻璃（圆角与阴影由前端 CSS 画）
@@ -146,6 +145,20 @@ pub async fn open_plugin_window(
     OPEN_WINDOWS.fetch_add(1, Ordering::SeqCst);
     crate::log::info(&format!("plugin_window: opened {label}"));
     Ok(())
+}
+
+/// 打开（或复用）插件悬浮窗 —— 前端命令，实现见 `open()`。
+///
+/// **刻意不用 `run_blocking`**：建窗不是阻塞 IO，而是「交给事件循环去建」——
+/// 它必须在**非主线程**上发起（主线程发起会与消息泵互等）。所以这里用
+/// `async fn` 薄壳本身，理由与 `music::spotify_connect` 相同。
+#[tauri::command]
+pub async fn open_plugin_window(
+    app: AppHandle,
+    plugin_id: String,
+    input: Option<String>,
+) -> Result<(), String> {
+    open(&app, &plugin_id, input.as_deref().unwrap_or_default())
 }
 
 /// 关掉自己（标题栏的 ×）。`window` 由 Tauri 注入。

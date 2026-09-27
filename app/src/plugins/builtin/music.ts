@@ -35,6 +35,8 @@ interface MusicConfigDto {
   redirect_uri: string;
   connected: boolean;
   display_name: string;
+  /** 当前用的是不是内置 Client ID（宿主 `music.rs` 的 `BUILTIN_CLIENT_ID`）。 */
+  builtin: boolean;
 }
 interface TrackDto {
   id: string;
@@ -89,6 +91,8 @@ let manualPick = false;
 let cands: LyricsDto[] = [];
 let lrcLines: LrcLine[] = [];
 let activeLine = -1;
+/** 用户对「凭据字段展开/收起」的手动选择；`null` = 跟随「有没有 Client ID」自动决定。 */
+let fieldsOverride: boolean | null = null;
 
 let pollTimer: number | undefined;
 let pollBusy = false;
@@ -155,22 +159,27 @@ function shellHtml(): string {
       <button class="music-ghost-btn" id="music-setup-toggle" title="${esc(t("music.settings"))}">${SVG.gear}</button>
     </div>
 
-    <!-- 配置区（未配置时默认展开） -->
+    <!-- 配置区（未登录时默认展开） -->
     <div class="music-setup hidden" id="music-setup">
-      <div class="music-hint">${t("music.setup_hint")}</div>
-      <div class="music-field">
-        <label for="music-client-id">${t("music.client_id")}</label>
-        <input id="music-client-id" type="text" spellcheck="false" autocomplete="off" placeholder="${esc(t("music.client_id_ph"))}">
-      </div>
-      <div class="music-field music-field-port">
-        <label for="music-port">${t("music.port")}</label>
-        <input id="music-port" type="text" inputmode="numeric" autocomplete="off">
-      </div>
-      <div class="music-field">
-        <label>${t("music.redirect")}</label>
-        <div class="music-redirect-row">
-          <code id="music-redirect"></code>
-          <button class="music-ghost-btn" id="music-copy-redirect" title="${esc(t("music.copy"))}">${SVG.copy}</button>
+      <div class="music-hint" id="music-setup-hint">${t("music.setup_hint")}</div>
+      <!-- 凭据字段默认只在「没有内置 Client ID」或用户主动展开时显示：
+           内置值让「登录」变成一步操作，Redirect URI 那一串对普通用户是噪音。 -->
+      <button class="music-ghost-btn music-fields-toggle hidden" id="music-fields-toggle"></button>
+      <div id="music-setup-fields">
+        <div class="music-field">
+          <label for="music-client-id">${t("music.client_id")}</label>
+          <input id="music-client-id" type="text" spellcheck="false" autocomplete="off" placeholder="${esc(t("music.client_id_ph"))}">
+        </div>
+        <div class="music-field music-field-port">
+          <label for="music-port">${t("music.port")}</label>
+          <input id="music-port" type="text" inputmode="numeric" autocomplete="off">
+        </div>
+        <div class="music-field">
+          <label>${t("music.redirect")}</label>
+          <div class="music-redirect-row">
+            <code id="music-redirect"></code>
+            <button class="music-ghost-btn" id="music-copy-redirect" title="${esc(t("music.copy"))}">${SVG.copy}</button>
+          </div>
         </div>
       </div>
       <div class="music-actions">
@@ -229,14 +238,32 @@ function renderSetup(root: HTMLElement, force?: boolean) {
   const box = root.querySelector<HTMLElement>("#music-setup");
   const playerBox = root.querySelector<HTMLElement>("#music-player");
   if (!box || !playerBox) return;
-  const needSetup = force ?? (!cfg?.connected || !cfg?.client_id);
+  const needSetup = force ?? !cfg?.connected;
   show(box, needSetup);
   show(playerBox, !needSetup);
+  // 凭据字段：**只在真的用内置 Client ID 时**才默认收起来（那时用户只需点「连接」，
+  // Redirect URI 那一串是噪音）。自己填 Client ID 的用户照旧看见这组字段 ——
+  // 收起来对他们没有好处，反而要从一个按钮里再翻出来。
+  const showFields = fieldsOverride ?? !cfg?.builtin;
+  show(root.querySelector("#music-setup-fields"), showFields);
+  // 「保存」只在字段可见时才有意义（保存的就是这两个输入框）
+  show(root.querySelector("#music-save"), showFields);
+  const toggle = root.querySelector<HTMLElement>("#music-fields-toggle");
+  show(toggle, !!cfg?.builtin);
+  setText(toggle, showFields ? t("music.hide_fields") : t("music.use_own_client_id"));
+  // 提示语按「用的是不是内置值」选：内置值那条是本轮新增的普通用户视角，
+  // 自填那条才需要讲 developer.spotify.com 与 Redirect URI（见 i18n.ts 两段文案）。
+  setText(
+    root.querySelector("#music-setup-hint"),
+    cfg?.builtin ? t("music.setup_builtin") : t("music.setup_hint"),
+  );
   const idEl = root.querySelector<HTMLInputElement>("#music-client-id");
   const portEl = root.querySelector<HTMLInputElement>("#music-port");
   // 输入框里有内容时不要被轮询覆盖（用户可能正在敲）
   if (idEl && document.activeElement !== idEl) idEl.value = cfg?.client_id ?? "";
-  if (portEl && document.activeElement !== portEl) portEl.value = String(cfg?.port ?? 8888);
+  // 兜底值必须与宿主 `music.rs` 的 `DEFAULT_PORT` 一致（8899），否则面板显示的
+  // 回调地址与真正监听的那个端口对不上（配置读不到时才会走到这里）。
+  if (portEl && document.activeElement !== portEl) portEl.value = String(cfg?.port ?? 8899);
   setText(root.querySelector("#music-redirect"), cfg?.redirect_uri ?? "");
 }
 
@@ -475,6 +502,9 @@ export async function attachMusicListeners(root: HTMLElement) {
   const view = root.querySelector<HTMLElement>(".music-root");
   if (!view) return;
   currentRoot = view;
+  // 每次挂载都回到「自动决定」：这个模块的状态是跨挂载存活的，而「上次我手动展开过
+  // 字段」不该影响下一次打开面板。
+  fieldsOverride = null;
 
   const msg = (s: string) => setText(view.querySelector("#music-msg"), s);
   const q = <T extends HTMLElement>(sel: string) => view.querySelector<T>(sel);
@@ -494,6 +524,12 @@ export async function attachMusicListeners(root: HTMLElement) {
   q<HTMLElement>("#music-setup-toggle")?.addEventListener("click", () => {
     const box = q<HTMLElement>("#music-setup");
     if (box) box.classList.toggle("hidden");
+  });
+
+  // 展开 / 收起「自己填 Client ID」的那组字段（用内置值时才默认收起）
+  q<HTMLElement>("#music-fields-toggle")?.addEventListener("click", () => {
+    fieldsOverride = !(fieldsOverride ?? !cfg?.builtin);
+    renderSetup(view);
   });
 
   q<HTMLElement>("#music-copy-redirect")?.addEventListener("click", () => {

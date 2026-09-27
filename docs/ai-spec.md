@@ -872,7 +872,36 @@ searchInput (总端口)
 | `spotify_control` | play / pause / next / previous / seek / volume |
 | `lyrics_get` / `lyrics_search` | LRCLIB 歌词（`/api/get` 精确 + `/api/search` 回落） |
 
-**三条不得回退的约束**：
+**凭据：内置 Client ID + 保留自填**（2026-09-27 加）——**两条路必须并存**。
+
+`music.rs` 顶部的 `pub const BUILTIN_CLIENT_ID: &str` 是给仓库主人填**自己那个应用**的
+Client ID 的（2026-09-27 **已填入**仓库主人的应用 ID；改成空串 = 没有内置值，行为与加这个
+常量之前完全一致）。填上之后：
+
+- 普通用户**只需点「连接 Spotify」并在浏览器里登自己的账号**，不必去 developer.spotify.com
+  建应用 —— 这是用户 2026-09-27 提的第 4 条（「这个步骤只是针对了开发者」）。
+- `MusicConfigDto.builtin` 告诉前端当前用的是不是内置值，面板据此把凭据字段**默认收起来**
+  （`music.ts` 的 `renderSetup` + `#music-fields-toggle`）。自填入口**不得删**：内置值只有
+  **5 个授权名额**（见下），超过就得用自己的应用。
+- **所有者那一侧有前置**：内置值的那个应用里必须已经登记面板上显示的那个回调地址
+  （默认 `http://127.0.0.1:8899/callback`；端口改过就要与新的逐字符一致），否则用户点
+  「连接」会在浏览器里撞上 `INVALID_CLIENT: Invalid redirect URI`。Spotify **不接受 `localhost`**。
+
+**自动弹出**（2026-09-27 加，`spawn_spotify_watcher`，由 `main.rs` 的 `setup` 起线程）：
+Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `plugin-music` 悬浮窗
+（用户选定的触发条件是「只要 Spotify 在运行就弹」）。三条约束：
+
+1. **判据是进程存在，不是「正在播放」** —— 后者要先有 OAuth 令牌，未登录时永远判不出来。
+   用 raw FFI 的 `CreateToolhelp32Snapshot` 读进程表（`music.rs` 的 `win_proc` 模块），
+   **不引 `sysinfo`、也不 spawn `tasklist`**（后者每 3 秒起一个进程，且输出是本地化文本）。
+2. **只在边沿触发**（`SPOTIFY_WAS_RUNNING` 原子量 + `!running || was` ⇒ 跳过）。
+   写成「只要在跑就确保窗口存在」的话，用户刚关掉窗口就会被 3 秒后下一轮重新拎出来 ——
+   **关掉等于关不掉**。边沿语义下「关掉」有效：要它再弹，得让 Spotify 退出再启动。
+3. **已经开着就不动**（`plugin_window::is_open`）—— `open()` 的复用路径会 `set_focus()`，
+   从后台线程定时抢焦点是最不该发生的事。另：开机自启（`--background`）时把「上一轮」
+   预置成 `true`，于是「开机时 Spotify 已经在跑」不构成边沿，静默启动不会弹窗。
+
+**四条不得回退的约束**：
 
 1. **只走官方 OAuth（Authorization Code + PKCE + 环回地址）**。Spotify **没有**「账号密码异地登入」
    这类接口；桌面端正确姿势是 RFC 8252 的环回重定向。播放控制另需 **Premium** +
@@ -884,11 +913,31 @@ searchInput (总端口)
 3. **令牌过期要能自动救回来**：`ensure_access_token()` 在 `expires_at` 前 60s 主动刷新；
    **刷新被拒就清空本地令牌并报 `ERR_NOT_CONNECTED`**，让面板退回「未登录」而不是反复 401。
    刷新响应里**可能不带新的 refresh_token**，此时必须保留旧的（清掉等于把用户踢下线）。
+4. **Client ID 的默认值走 `serde(default = "default_client_id")` 而不是 `#[serde(default)]`** ——
+   两者差别就在「老配置文件里没有这个字段」时：前者补内置值，后者补空串，于是老用户
+   明明有内置值可用却仍然被判成「未配置」。面板不允许保存空 Client ID（前端会拒），
+   所以「文件里是空」只可能来自老版本，补内置值正是想要的。
 
-**边界要诚实**：这个插件控制的是「当前活跃的 Spotify Connect 设备」（本机 Spotify 客户端即可），
-**不是**在 Lunac 里发声；WebView2 内出声需要 Web Playback SDK（Premium + EME/DRM），不做。
-另外播放控制要求调用方注册的 App 处于 Development Mode 白名单内（最多 5 个授权用户，
-App 所有者需 Premium）—— 用户必须自己有一个 Client ID，Lunac 不代发任何凭据。
+**边界要诚实**（这一节直接决定用户会不会白折腾）：
+
+- 这个插件控制的是「当前活跃的 Spotify Connect 设备」（本机 Spotify 客户端即可），
+  **不是**在 Lunac 里发声；WebView2 内出声需要 Web Playback SDK（Premium + EME/Widevine DRM），
+  **不做**。所以「选 Web Playback SDK」这条路不必考虑 —— 桌面端控制的正解是 **Web API**
+  （`/me/player*` 那组端点），SDK 只能把网页自己变成一台播放器，控制不了已经开着的 Spotify 客户端。
+- **控制播放（play / pause / next / previous / seek / volume）必须有 Premium**，
+  这是 Spotify 的规则，与 Lunac 无关；**只看歌词 / 封面 / 正在播放则不需要 Premium**。
+  文案里必须把这两件事分开说（`music.setup_builtin` / `music.setup_hint` 就是这么写的）。
+- **Development Mode 的硬限制**（2026-02-11 起，老应用宽限到 2026-03-09）：
+  应用所有者**必须持有 Premium**（掉订阅就整个应用停摆）；**每个应用最多 5 个授权用户**
+  （含所有者自己，要在仪表盘的 User Management 里逐个加白）；**搜索类端点每次最多 10 条**；
+  一部分端点被关掉。**解除限制要申请 Extended Quota Mode**，而那条路自 2025-03 起只发给
+  「**合法注册的组织** + **月活 ≥ 25 万**」的申请者 —— 个人拿不到，**不要**在任何文案里
+  承诺「以后能支持更多用户」。2026-07 起一个开发者可建的 Client ID 数从 1 提到 25，但
+  **名额（5 用户/应用）没变**，多建几个 Client ID 只是绕开「1 个 ID」的限制。
+- **refresh token 会在用户首次授权后 6 个月硬过期**（刷新 access token 不会延长它），
+  所以正式发出去的版本要预期「约每半年重新登录一次」，面板的报错要能被用户看懂。
+- 公开只读的歌词源是 LRCLIB（免费、无需 key，要求带 `User-Agent` 并遵守 429 的 `Retry-After`），
+  与 Spotify 的授权完全无关 —— 没登 Spotify 也能用歌词。
 
 ### 4.7 文件转换插件（图片 / 音频 / 视频，2026-09-27）
 

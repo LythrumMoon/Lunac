@@ -4153,6 +4153,9 @@ html, body {
   color: var(--text-dim);
   opacity: 0.85;
 }
+/* 展开 / 收起「自己填 Client ID」那一组字段（内置值存在时默认收起）。
+   `.music-setup` 是 column flex，默认 stretch 会把按钮拉满整行 —— 这里要的是链接式小按钮。 */
+.music-fields-toggle { align-self: flex-start; }
 .music-field { display: flex; flex-direction: column; gap: 3px; }
 .music-field label { font-size: 0.66rem; color: var(--text-muted); }
 .music-field input[type="text"] {

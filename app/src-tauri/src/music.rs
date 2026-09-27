@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
@@ -37,7 +38,34 @@ const SPOTIFY_TOKEN: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API: &str = "https://api.spotify.com/v1";
 const LRCLIB: &str = "https://lrclib.net/api";
 
-/// 需要的授权面：读播放态 + 改播放态 + 读当前曲目。
+/// 内置的 Client ID —— **留给仓库主人填自己的那一个**（2026-09-27 加）。
+///
+/// **为什么要有它**：Spotify 的 OAuth 要求每个「应用」有自己的 Client ID，而
+/// Development Mode 的规则（2026-02-11 起）是：应用所有者必须有 Premium、**每个应用
+/// 最多 5 个授权用户**、名单要在仪表盘里逐个加白（详见 ai-spec §4.6）。让每个用户
+/// 自己去 developer.spotify.com 建应用，对「只想登自己的账号听歌」的人是纯负担。
+/// 内置一个 ID 后，用户点一下「登录 Spotify」就能用。
+///
+/// **但它只能服务 5 个人**（含所有者自己）—— 这是 Spotify 的硬规则，不是实现选择。
+/// 要超过 5 人必须申请 Extended Quota Mode，而那条路只发给月活 ≥ 25 万的注册组织，
+/// 个人拿不到。所以**自填入口必须保留**（`music_config_set` + 面板上的输入框），
+/// 不能因为有了内置值就把那条路堵掉。
+///
+/// 空串 = 没有内置值，面板此时直接把凭据字段展开（与加这个常量之前的行为一致）。
+/// 填法：在 developer.spotify.com 建一个 Web API 应用，把
+/// `http://127.0.0.1:8899/callback`（或你自己改过的端口）加进它的 Redirect URI，
+/// 然后把 Client ID 粘到这里。**不要**把 Client Secret 放进来 —— 桌面端走 PKCE 公开
+/// 客户端流程，不需要它，放进来反而多一个泄露面。
+///
+/// **已填入**（2026-09-27，仓库主人的应用）：填上之后面板会走
+/// `music.setup_builtin` 那段普通用户文案，并把凭据字段默认收起。
+/// Client ID 是公开标识（PKCE 流程里它就出现在授权 URL 上），不是密钥。
+pub const BUILTIN_CLIENT_ID: &str = "590875b9724848a284198bfe1bd85588";
+
+/// 音乐插件在插件窗口体系里的 id（`plugin_window::label_for` 会变成 `plugin-music`）。
+const MUSIC_PLUGIN_ID: &str = "music";
+
+/// 需要授权面：读播放态 + 改播放态 + 读当前曲目。
 const SCOPES: &str = "user-read-playback-state user-modify-playback-state user-read-currently-playing";
 
 /// 环回回调的默认端口。**固定端口**：Spotify 的 Redirect URI 要求逐字符精确匹配
@@ -87,9 +115,17 @@ fn default_port() -> u16 {
     DEFAULT_PORT
 }
 
+/// Client ID 的默认值 = 内置值。**用 `serde(default = ...)` 而不是 `#[serde(default)]`**：
+/// 两者差别就在「老配置文件里没有这个字段」时 —— 前者补上内置值，后者补空串。
+/// 面板不允许保存空 Client ID（前端会拒），所以「文件里是空」只可能来自老版本，
+/// 补内置值正是想要的。
+fn default_client_id() -> String {
+    BUILTIN_CLIENT_ID.to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MusicConfig {
-    #[serde(default)]
+    #[serde(default = "default_client_id")]
     pub client_id: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -108,7 +144,7 @@ pub struct MusicConfig {
 impl Default for MusicConfig {
     fn default() -> Self {
         Self {
-            client_id: String::new(),
+            client_id: default_client_id(),
             port: DEFAULT_PORT,
             access_token: String::new(),
             refresh_token: String::new(),
@@ -161,6 +197,11 @@ pub struct MusicConfigDto {
     pub redirect_uri: String,
     pub connected: bool,
     pub display_name: String,
+    /// 当前用的是不是**内置** Client ID（不是用户自己填的那个）。
+    ///
+    /// 面板据此决定要不要把凭据字段收起来（见 `music.ts` 的 `renderSetup`）：
+    /// 用内置值时用户只需要点「登录」，不必看见 Redirect URI 那一串。
+    pub builtin: bool,
 }
 
 fn config_dto(cfg: &MusicConfig) -> MusicConfigDto {
@@ -170,6 +211,7 @@ fn config_dto(cfg: &MusicConfig) -> MusicConfigDto {
         redirect_uri: cfg.redirect_uri(),
         connected: cfg.has_token(),
         display_name: cfg.display_name.clone(),
+        builtin: !BUILTIN_CLIENT_ID.is_empty() && cfg.client_id == BUILTIN_CLIENT_ID,
     }
 }
 
@@ -893,11 +935,188 @@ pub async fn lyrics_search(q: String) -> Result<Vec<LyricsDto>, String> {
     .await
 }
 
+// ── Spotify 桌面端探测 + 自动弹出（2026-09-27）────────────────────
+//
+// 用户的触发条件（逐字）：「这个抓取的时机是在 lunac 应用和 spotify 应用同时存在 …
+// 这个时候自动弹出这个音乐插件」，并在追问中选定「只要 Spotify 在运行就弹」。
+//
+// **判据用「进程存在」而不是「正在播放」**：后者要先有 OAuth 令牌 —— 未登录时永远
+// 判不出「在播放」，于是第一次使用的用户永远等不到弹出。进程判据没有这个前置，
+// 而且它正是用户说的「两个应用同时存在」。
+
+/// 上一次轮询时 Spotify 是否在跑 —— 自动弹出**只在边沿触发**，见 `spawn_spotify_watcher`。
+static SPOTIFY_WAS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 轮询间隔。3 秒 = 「点开 Spotify 后几乎立刻看到面板」与「白烧 CPU」的折中：
+/// 探测只是读一次进程快照，**不 spawn 进程、不发网络请求**。
+const SPOTIFY_POLL_SECS: u64 = 3;
+
+/// Spotify 桌面客户端的进程名。官网安装包与 Microsoft Store 版**都是这个名字**
+/// （Store 版的路径在 `WindowsApps` 下，但映像名一致）。用数组是为了将来加别名时
+/// 不动匹配逻辑。
+const SPOTIFY_EXE: [&str; 1] = ["Spotify.exe"];
+
+/// 映像名是否算 Spotify 桌面客户端。**忽略大小写**：系统上报的大小写不保证。
+/// （与 `spotify_desktop_running()` 分开是为了能单测 —— 那个函数要真读进程表。）
+fn exe_name_matches(name: &str) -> bool {
+    SPOTIFY_EXE.iter().any(|x| name.eq_ignore_ascii_case(x))
+}
+
+/// 本机是否在跑 Spotify 桌面客户端。
+///
+/// 非 Windows 恒 `false`：本仓只发 Windows 包（`tauri.conf.json` 的 target 与
+/// `winreg` / `windows` 依赖都是 Windows 专属）。
+pub fn spotify_desktop_running() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win_proc::process_names().iter().any(|n| exe_name_matches(n))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// 进程枚举（raw FFI）。**刻意不引 `sysinfo` 这类新依赖**，也不 spawn `tasklist`：
+/// 后者每 3 秒起一个进程、输出还是本地化文本（`tasklist /FI` 无匹配时打的那句
+/// 「信息: 没有运行的任务…」随系统语言变，按文本判会误判）。`hotkey.rs` 里已经有一批
+/// 手写 `extern "system"` 的同类写法（`user32` / `kernel32` / `shell32`），这里是同一套。
+#[cfg(target_os = "windows")]
+mod win_proc {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    /// `MAX_PATH`。`szExeFile` 是定长数组，进程映像名（不含路径）不可能超过它。
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    /// 当前所有进程的**映像名**（不含路径，如 `Spotify.exe`）。读不到就返回空表 ——
+    /// 调用方只关心「有没有」，把失败当「没在跑」比抛错更合适（拿不到快照不该打断任何事）。
+    pub fn process_names() -> Vec<String> {
+        let mut out = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == 0 || snap == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            // `dwSize` 必须在第一次调用前填好，否则 Process32FirstW 直接失败
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    let len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(MAX_PATH);
+                    out.push(
+                        OsString::from_wide(&entry.szExeFile[..len])
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                    if Process32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        out
+    }
+}
+
+/// 起一个后台轮询线程：Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻，
+/// 开一个音乐插件窗（`plugin-music`）。
+///
+/// 三条刻意的设计：
+///
+/// 1. **只在边沿触发**（`!running || was` ⇒ 跳过）。若按「只要在跑就确保窗口存在」写，
+///    用户刚关掉窗口就会被 3 秒后的下一轮重新拎出来 —— 关掉等于关不掉。
+///    边沿语义下「关掉」是有效的：要它再弹，得让 Spotify 退出再启动。
+/// 2. **已经开着就不动**（`is_open`）。`plugin_window::open()` 的复用路径会
+///    `set_focus()`，从后台线程定时抢焦点是最不该发生的事。
+/// 3. **`silent_start` 抑制首轮**：开机自启（`--background`）时把「上一轮」预置成
+///    `true`，于是「开机时 Spotify 已经在跑」不构成边沿 —— 那一刻用户并没有在用
+///    Lunac，弹出窗口与「静默自启」的设计相冲（见 main.rs 里 `--background` 的说明）。
+///    Spotify 之后关掉再开仍是一次真边沿，照常弹。
+pub fn spawn_spotify_watcher(app: AppHandle, silent_start: bool) {
+    SPOTIFY_WAS_RUNNING.store(silent_start, Ordering::SeqCst);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(SPOTIFY_POLL_SECS));
+        let running = spotify_desktop_running();
+        let was = SPOTIFY_WAS_RUNNING.swap(running, Ordering::SeqCst);
+        if !running || was {
+            continue;
+        }
+        if crate::plugin_window::is_open(&app, MUSIC_PLUGIN_ID) {
+            continue;
+        }
+        match crate::plugin_window::open(&app, MUSIC_PLUGIN_ID, "") {
+            Ok(()) => crate::log::info("spotify: 桌面客户端在运行 ⇒ 已自动打开音乐插件窗"),
+            Err(e) => crate::log::warn(&format!("spotify: 自动打开音乐插件窗失败（{e}）")),
+        }
+    });
+}
+
 // ── 单元测试 ──────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spotify_exe_name_match_ignores_case() {
+        assert!(exe_name_matches("Spotify.exe"));
+        // 系统上报的大小写不保证，不能按字面比
+        assert!(exe_name_matches("spotify.exe"));
+        assert!(exe_name_matches("SPOTIFY.EXE"));
+        // 不能连「名字里含 spotify」的都算（`SpotifyWebHelper.exe` 是另一回事，
+        // 且进程名必须整体相等）
+        assert!(!exe_name_matches("SpotifyWebHelper.exe"));
+        assert!(!exe_name_matches(""));
+        assert!(!exe_name_matches("notspotify.exe"));
+    }
+
+    #[test]
+    fn builtin_client_id_makes_config_default_consistent() {
+        // 内置值为空时：内置判定必须为假（面板照旧展开凭据字段）
+        let dto = config_dto(&MusicConfig::default());
+        assert_eq!(dto.builtin, !BUILTIN_CLIENT_ID.is_empty());
+        if !BUILTIN_CLIENT_ID.is_empty() {
+            assert_eq!(dto.client_id, BUILTIN_CLIENT_ID);
+        }
+    }
+
+    #[test]
+    fn missing_client_id_field_falls_back_to_builtin() {
+        // 老配置文件里没有 client_id 字段 ⇒ 补内置值（不是空串）
+        let cfg: MusicConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.client_id, BUILTIN_CLIENT_ID);
+    }
 
     #[test]
     fn redirect_uri_uses_fixed_port_and_loopback_ip() {

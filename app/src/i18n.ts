@@ -1584,12 +1584,39 @@ const DICT: Record<string, Record<LangTag, string>> = {
 
   // ── Music Plugin（歌词 + Spotify 播放控制，2026-09-27）──────────
   // 文案纪律：控件文案里**不带 emoji**（icon-style.md §4.1）；图标一律走 music.ts 里的线性 SVG。
+  //
+  // 两段提示语各说一件事（2026-09-27 改）：
+  //   · `setup_builtin` —— **普通用户视角**（用的是 Lunac 内置的 Client ID）：一句话讲清
+  //     「点连接 → 浏览器里登自己的账号」，并如实写明「控制播放要 Premium」。
+  //     以前只有下面那段开发者视角的文案，对只想听歌的人是纯负担（用户 2026-09-27 提出的第 4 条）。
+  //   · `setup_hint` —— 仍是**自填路径**的说明，只有用户主动点「使用自己的 Client ID」才看得到。
+  "music.setup_builtin": {
+    "zh-CN": "已使用内置的 Client ID —— 只需点「连接 Spotify」，在打开的浏览器页面里登录你自己的账号即可。控制播放（播放 / 暂停 / 跳转 / 音量）需要 Premium 账号，只看歌词与封面则不需要。想换成自己的 Client ID，点下面的按钮。",
+    "zh-TW": "已使用內建的 Client ID —— 只要點「連接 Spotify」，在開啟的瀏覽器頁面登入你自己的帳號即可。控制播放（播放 / 暫停 / 跳轉 / 音量）需要 Premium 帳號，只看歌詞與封面則不需要。想換成自己的 Client ID，點下面的按鈕。",
+    "ja": "内蔵の Client ID を使用します。「Spotify に接続」を押し、開いたブラウザで自分のアカウントにログインするだけです。再生の操作（再生 / 一時停止 / スキップ / 音量）には Premium アカウントが必要で、歌詞とカバーを見るだけなら不要です。自分の Client ID に切り替えるには下のボタンを押してください。",
+    "ko": "내장된 Client ID를 사용합니다. 'Spotify 연결'을 누르고 열린 브라우저에서 본인 계정으로 로그인하면 됩니다. 재생 제어(재생 / 일시정지 / 이동 / 볼륨)에는 Premium 계정이 필요하며, 가사와 커버만 보는 경우에는 필요하지 않습니다. 본인 Client ID로 바꾸려면 아래 버튼을 누르세요.",
+    "en": "Using the built-in Client ID — just click Connect Spotify and sign in with your own account in the browser tab that opens. Controlling playback (play / pause / skip / volume) requires a Premium account; lyrics and cover art do not. To switch to your own Client ID, use the button below.",
+  },
   "music.setup_hint": {
-    "zh-CN": "需先在 developer.spotify.com 建一个 App（勾 Web API），把下面的回调地址原样填进它的 Redirect URI，再把 Client ID 粘到这里。Spotify 不接受 localhost，必须是 127.0.0.1。",
-    "zh-TW": "需先在 developer.spotify.com 建一個 App（勾 Web API），把下面的回呼位址原樣填進它的 Redirect URI，再把 Client ID 貼到這裡。Spotify 不接受 localhost，必須是 127.0.0.1。",
-    "ja": "developer.spotify.com で App（Web API）を作成し、下のコールバック URL をそのまま Redirect URI に入力してから、Client ID をここに貼り付けてください。localhost は不可、127.0.0.1 である必要があります。",
-    "ko": "developer.spotify.com에서 App(Web API)을 만들고 아래 콜백 주소를 Redirect URI에 그대로 입력한 뒤 Client ID를 여기에 붙여넣으세요. localhost는 안 되고 127.0.0.1이어야 합니다.",
-    "en": "Create an app (Web API) at developer.spotify.com, paste the callback address below into its Redirect URI, then paste the Client ID here. Spotify rejects localhost — it must be 127.0.0.1.",
+    "zh-CN": "使用你自己的 Client ID：在 developer.spotify.com 建一个 App（勾 Web API），把下面的回调地址原样填进它的 Redirect URI，再把 Client ID 粘到这里（不需要 Client Secret）。Spotify 不接受 localhost，必须是 127.0.0.1。控制播放需要 Premium 账号。",
+    "zh-TW": "使用你自己的 Client ID：在 developer.spotify.com 建一個 App（勾 Web API），把下面的回呼位址原樣填進它的 Redirect URI，再把 Client ID 貼到這裡（不需要 Client Secret）。Spotify 不接受 localhost，必須是 127.0.0.1。控制播放需要 Premium 帳號。",
+    "ja": "自分の Client ID を使う場合：developer.spotify.com で App（Web API）を作成し、下のコールバック URL をそのまま Redirect URI に入力したうえで、Client ID をここに貼り付けてください（Client Secret は不要）。localhost は不可、127.0.0.1 である必要があります。再生の操作には Premium アカウントが必要です。",
+    "ko": "본인 Client ID를 쓰는 경우: developer.spotify.com에서 App(Web API)을 만들고 아래 콜백 주소를 Redirect URI에 그대로 입력한 뒤 Client ID를 여기에 붙여넣으세요(Client Secret은 필요 없음). localhost는 안 되고 127.0.0.1이어야 합니다. 재생 제어에는 Premium 계정이 필요합니다.",
+    "en": "Using your own Client ID: create an app (Web API) at developer.spotify.com, paste the callback address below into its Redirect URI, then paste the Client ID here (no Client Secret needed). Spotify rejects localhost — it must be 127.0.0.1. Controlling playback requires a Premium account.",
+  },
+  "music.use_own_client_id": {
+    "zh-CN": "使用自己的 Client ID",
+    "zh-TW": "使用自己的 Client ID",
+    "ja": "自分の Client ID を使う",
+    "ko": "본인 Client ID 사용",
+    "en": "Use my own Client ID",
+  },
+  "music.hide_fields": {
+    "zh-CN": "收起 Client ID 设置",
+    "zh-TW": "收起 Client ID 設定",
+    "ja": "Client ID 設定を閉じる",
+    "ko": "Client ID 설정 접기",
+    "en": "Hide Client ID settings",
   },
   "music.client_id": {
     "zh-CN": "Client ID",

@@ -371,6 +371,12 @@ fn main() {
             // 永不扫盘（见 docs/ai-spec.md §2.1.2 与 file_indexer.rs 头注释）。
             crate::file_indexer::init();
 
+            // Spotify 桌面端探测：一旦它「从没在跑变成在跑」，自动弹一个音乐插件窗
+            // （用户选定的触发条件是「只要 Spotify 在运行就弹」，见 music.rs 的同名函数）。
+            // `is_background` 抑制开机自启那一次首轮弹出 —— 静默启动不该弹窗。
+            // 放在这里（而不是更早）：它是每 3 秒一次的纯后台轮询，不参与启动关键路径。
+            crate::music::spawn_spotify_watcher(app.handle().clone(), is_background);
+
             // Start Agent HTTP bridge for VSCode extension (127.0.0.1:8789)
             if let Err(e) = agent_server::start() {
                 eprintln!("[agent_server] Failed to start: {}", e);
