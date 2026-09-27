@@ -573,12 +573,40 @@ html, body {
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
+/* 悬浮（2026-09-27）：与退出插件同族 —— 同形状、同底色来源（--other-overlay-*），
+   只把图标色换成 --accent（「进入某个视图」类动作用主题色，与 #settings-btn 一致；
+   退出/关闭类才用 --red）。 */
+#plugin-bar-float {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+#plugin-bar-float:hover {
+  opacity: 1;
+  color: var(--accent);
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
+}
+
 /* Search bar locked (plugin active) — hide input, show plugin bar */
 /* !important needed to override .hidden { display: none !important } */
 #search-bar.plugin-locked #search-input { display: none !important; }
 #search-bar.plugin-locked #settings-btn { display: none !important; }
 #search-bar.plugin-locked #plugin-bar-title { display: block !important; }
 #search-bar.plugin-locked #plugin-bar-exit { display: flex !important; }
+/* 只对「可悬浮」插件显示 —— .hidden 由 main.ts 的 setPluginBar 按
+   FLOATABLE_PLUGINS 增删，这里再用 has() 兜一层：万一 setPluginBar 没跑到，
+   面板标题出现了却多出一个点了没用的按钮。 */
+#search-bar.plugin-locked:has(#plugin-bar-float:not(.hidden)) #plugin-bar-float { display: flex !important; }
 
 /* ── Settings button ──────────────────────────────────────────── */
 #settings-btn {
@@ -645,6 +673,75 @@ html, body {
 
 #app.detached #detached-header {
   display: flex !important;
+}
+
+/* ── 插件悬浮窗标题栏（2026-09-27，plugin.html 专用）──────────────
+   独立窗口没有系统边框（decorations:false + transparent），所以要自己画一条：
+   拖拽区 + 标题 + 置顶 / 最小化 / 关闭三个按钮。
+   形状与配色照 `#detached-header` 那一套，避免出现第二套窗口观感。
+   注意 plugin.html 里 **没有** `#detached-header`，这条只对它自己生效。 */
+#plugin-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 12px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  flex-shrink: 0;
+  pointer-events: auto;
+  min-height: 34px;
+  margin: 0;
+}
+
+#plugin-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 4px;
+}
+
+#plugin-pin,
+#plugin-min,
+#plugin-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+/* 同族 hover 浮层（与 #detached-* 一致，走「其他颜色」的统一浮层） */
+#plugin-pin:hover,
+#plugin-min:hover,
+#plugin-close:hover {
+  opacity: 1;
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
+}
+#plugin-close:hover {
+  color: var(--red);
+}
+/* 置顶是**持续态**，不能只靠 hover 表达：常亮主题色 + 半透明底。
+   初值由 plugin-window.ts 问宿主（plugin_window_pin_state）后写上 ——
+   建窗时就是 always_on_top(true)，前端不许自己猜。 */
+#plugin-pin.active {
+  opacity: 1;
+  color: var(--accent);
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
 #detached-back-btn,
@@ -3588,9 +3685,13 @@ html, body {
 #humanize-btn,
 #chat-drawer-close,
 #plugin-bar-exit,
+#plugin-bar-float,
 #detached-back-btn,
 #detached-vscode-btn,
-#detached-close-btn {
+#detached-close-btn,
+#plugin-pin,
+#plugin-min,
+#plugin-close {
   background-image: none;
   box-shadow: none;
 }
@@ -3599,9 +3700,13 @@ html, body {
 #humanize-btn:hover,
 #chat-drawer-close:hover,
 #plugin-bar-exit:hover,
+#plugin-bar-float:hover,
 #detached-back-btn:hover,
 #detached-vscode-btn:hover,
-#detached-close-btn:hover {
+#detached-close-btn:hover,
+#plugin-pin:hover,
+#plugin-min:hover,
+#plugin-close:hover {
   background-image: none;
   box-shadow: none;
 }
@@ -3694,7 +3799,7 @@ html, body {
    浮层由「风格 · 其他颜色」的 `--other-overlay-*` 统一控制，所以要点名让
    下面这条规则放过它们，否则它们的 id 规则永远被本规则压住。 */
 #app button:where(
-  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(#settings-btn):not(#plugin-bar-exit):not(#detached-back-btn):not(#detached-vscode-btn):not(#detached-close-btn):not(:disabled)
+  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(#settings-btn):not(#plugin-bar-exit):not(#plugin-bar-float):not(#detached-back-btn):not(#detached-vscode-btn):not(#detached-close-btn):not(#plugin-pin):not(#plugin-min):not(#plugin-close):not(:disabled)
 ):hover {
   background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }

@@ -40,6 +40,25 @@
       <span id="search-hint" class="hidden"></span>
       <!-- Plugin bar — replaces input when a plugin is active -->
       <span id="plugin-bar-title" class="hidden" data-tauri-drag-region></span>
+      <!-- 悬浮（2026-09-27）：把这个插件面板搬进独立窗口，主窗口随即回到搜索态 ——
+           两者同时存在。只在「可悬浮」插件上出现（音乐 / 转换 / 备忘录 等一列内容的
+           面板）；设置（800px 侧栏布局）、AI 对话（主窗口本体）、OCR（双栏 detached）
+           不出现这个按钮，理由见 main.ts 的 FLOATABLE_PLUGINS。 -->
+      <button id="plugin-bar-float" class="hidden" title="Float" aria-label="Float">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.7">
+            <path d="M15 3h6v6"/>
+            <path d="M9 21H3v-6"/>
+            <path d="M21 3l-7 7"/>
+            <path d="M3 21l7-7"/>
+          </g>
+          <path d="M15 3h6v6"/>
+          <path d="M9 21H3v-6"/>
+          <path d="M21 3l-7 7"/>
+          <path d="M3 21l7-7"/>
+          <circle cx="19.4" cy="4.6" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
       <button id="plugin-bar-exit" class="hidden" title="Exit plugin (Esc)" aria-label="Exit">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">

@@ -4,10 +4,11 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LogicalSize } from "@tauri-apps/api/dpi";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
+import { attachPluginListeners } from "./plugins/attach";
 import { refreshMarketPlugins } from "./plugins/market";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
@@ -70,6 +71,7 @@ const tokenDashboard = el("token-dashboard");
 const settingsBtn = el("settings-btn");
 const pluginBarTitle = el("plugin-bar-title");
 const pluginBarExit = el("plugin-bar-exit");
+const pluginBarFloat = el("plugin-bar-float");
 const detachedHeader = el("detached-header");
 const detachedTitle = el("detached-title");
 const detachedBackBtn = el("detached-back-btn");
@@ -1873,6 +1875,8 @@ function setPluginBar(title: string | null) {
   if (title) {
     searchBar.classList.add("plugin-locked");
     pluginBarTitle.textContent = title;
+    // 「悬浮」只给可悬浮的插件（2026-09-27）。判据见 FLOATABLE_PLUGINS。
+    pluginBarFloat.classList.toggle("hidden", !FLOATABLE_PLUGINS.has(activePluginId || ""));
     searchInput.disabled = true;
     // Show chat input bar for AI chat
     if (activePluginId === "ai-agent") {
@@ -1884,6 +1888,7 @@ function setPluginBar(title: string | null) {
     }
   } else {
     searchBar.classList.remove("plugin-locked");
+    pluginBarFloat.classList.add("hidden");
     searchInput.disabled = false;
     resultsContainer.classList.remove("ai-chat");
     showTokenDashboard(false);
@@ -1907,6 +1912,48 @@ function refocusChatIfActive() {
 // ── Plugin bar exit button → close plugin view ─────────────────
 pluginBarExit.addEventListener("click", async () => {
   if (pluginActive) await closePluginView();
+});
+
+// ── 插件悬浮窗（2026-09-27）─────────────────────────────────────
+/**
+ * 可悬浮的插件。判据是「面板本身是不是一列内容」：
+ *  · **能悬浮** —— 音乐 / 转换 / 备忘录 / 剪贴板历史 / 快速启动 / 工具编辑 / 网页搜索，
+ *    它们的内容与宽度无关，塞进 420px 小窗照样成立；
+ *  · **不悬浮** —— `settings`（按 800px 宽 + 左侧栏分类设计，小窗里会散架）、
+ *    `ai-agent`（对话流就是主窗口本身，没有「搬进小窗」这一步）、
+ *    `ocr`（detached 双栏：左图右文，同 settings 的理由）。
+ * 这份清单必须与 index.html 里那个按钮的注释、以及 ai-spec 的插件表一致。
+ */
+const FLOATABLE_PLUGINS = new Set([
+  "music",
+  "convert",
+  "memo",
+  "clipboard-history",
+  "quick-launch",
+  "tool-editor",
+  "web-search",
+]);
+
+/**
+ * 把当前插件面板搬进独立窗口，主窗口随即回到搜索态 ——
+ * 这就是「插件窗与搜索窗同时存在」的入口（此前 `runSearchNow()` 开头那句
+ * `if (pluginActive) return;` 会让插件开着时搜索栏彻底失灵）。
+ *
+ * **顺序不能反**：先把窗口开出来，成功了再关内嵌面板。反过来的话开窗失败
+ * （权限 / 插件 id 非法）会把用户的插件直接关掉且没有任何提示。
+ */
+pluginBarFloat.addEventListener("click", async () => {
+  const id = activePluginId;
+  if (!pluginActive || !id) return;
+  const input = searchInput.value.trim();
+  try {
+    await invoke("open_plugin_window", { pluginId: id, input });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    statusText.textContent = t("plugin.float_failed", { error: msg });
+    return;
+  }
+  await closePluginView();
 });
 
 // Clicking status bar / token dashboard in AI chat refocuses chat input
@@ -6066,48 +6113,13 @@ async function executePlugin(plugin: Plugin) {
             ${result.content}
           </div>`;
       }
-      if (plugin.id === "settings") {
-        setTimeout(() =>
-          import("./plugins/builtin/settings")
-            .then(m => {
-              console.log("[lunac main] settings module loaded, calling attachSettingsListeners...");
-              m.attachSettingsListeners(resultsList);
-            })
-            .catch(err => console.error("[lunac main] FAILED to import settings module:", err)),
-          50);
-      }
-      if (plugin.id === "quick-launch") {
-        setTimeout(() =>
-          import("./plugins/builtin/quick-launch").then(m =>
-            m.attachQuickLaunchListeners(resultsList)
-          ), 50);
-      }
-      if (plugin.id === "tool-editor") {
-        setTimeout(() =>
-          import("./plugins/builtin/tool-editor").then(m =>
-            m.attachToolEditorListeners()
-          ), 50);
-      }
-      if (plugin.id === "memo") {
-        setTimeout(() =>
-          import("./plugins/builtin/memo").then(m =>
-            m.attachMemoListeners(resultsList)
-          ), 50);
-      }
-      // 音乐歌词：面板要轮询播放态，且是 skipRestore（每次重开都重新挂 + 重新拉状态）
-      if (plugin.id === "music") {
-        setTimeout(() =>
-          import("./plugins/builtin/music").then(m =>
-            m.attachMusicListeners(resultsList)
-          ), 50);
-      }
-      // 文件转换：要 listen 宿主的 convert-progress 事件并把预置源文件探出候选格式
-      if (plugin.id === "convert") {
-        setTimeout(() =>
-          import("./plugins/builtin/convert").then(m =>
-            m.attachConvertListeners(resultsList)
-          ), 50);
-      }
+      // 挂载统一走 plugins/attach.ts —— 插件悬浮窗（plugin-window.ts）用的是**同一份**
+      // 映射，否则同一条 `if (plugin.id === "music")` 会存在两处，加了插件只改一边
+      // 就会出现「内嵌能用、悬浮窗是死的」。这里仍保留 50ms 延时：面板 HTML 刚写进
+      // resultsList，部分插件的挂载要读到已渲染的节点。
+      setTimeout(() => {
+        void attachPluginListeners(plugin, resultsList);
+      }, 50);
     } else {
       resultsList.innerHTML = `
         <div class="plugin-result">
@@ -6801,6 +6813,7 @@ function applyI18nToStaticUI() {
   if (chatInputEl) chatInputEl.placeholder = t("chat.placeholder");
   setTitle("settings-btn", "tooltip.settings");
   setTitle("plugin-bar-exit", "tooltip.exit_plugin");
+  setTitle("plugin-bar-float", "tooltip.float_plugin");
   setTitle("chat-add-file-btn", "tooltip.add_file");
   setTitle("chat-new-btn", "tooltip.new_chat");
   setTitle("chat-history-btn", "tooltip.history");
@@ -7508,10 +7521,16 @@ function resolveBaseOverride(): { hex: string; triplet: string; hoverTriplet: st
 /** 写一个 CSS 变量；值为空串时**删除**该内联变量（回落到 :root 的默认值）。
  *  CSSOM 规定 `setProperty(name, "")` 等价于 `removeProperty` —— 靠这条语义
  *  实现「切回默认主题 = 清掉主题包留下的形状/花纹」，不必逐个记变量名。 */
+/** 见过名字的外观变量（见 `setVar` 的说明）。 */
+const _themeVarNames = new Set<string>();
+
 function setVar(name: string, value: string) {
   const s = document.documentElement.style;
   if (value === "") s.removeProperty(name);
   else s.setProperty(name, value);
+  // 记名**只增不减**（2026-09-27，为插件悬浮窗的外观同步）：清掉的变量也必须在
+  // `broadcastThemeVars` 的载荷里出现（值为空串），否则悬浮窗会留着上一个主题的旧值。
+  _themeVarNames.add(name);
 }
 
 /** 主题色 → CSS 变量。**只写两行**（2026-09-19 批 4 任务 1）：
@@ -7663,7 +7682,36 @@ function applyAppearance() {
   for (const [id, abs] of Object.entries(rs?.icons ?? {})) {
     themeIconUrls.set(id, convertFileSrc(abs));
   }
+
+  // ⑦ 转给插件悬浮窗（2026-09-27）。放在最后：此刻内联变量已是最终值。
+  broadcastThemeVars();
 }
+
+/** 主题变量事件名 —— 必须与 plugin-window.ts 里的常量逐字一致。 */
+const THEME_VARS_EVENT = "lunac-theme-vars";
+const THEME_REQ_EVENT = "lunac-theme-request";
+
+/**
+ * 把主窗口**算好的**外观变量广播给插件悬浮窗。
+ *
+ * **为什么不让悬浮窗自己算**：`applyAppearance` 那一整套（主题包 tokens → 底色 /
+ * 按钮色 / 文字明度 / 统一浮层的派生）有近百行，复刻一份必然漂移 —— 换个主题就会出现
+ * 「主窗口变了、音乐小窗还是旧配色」。这里只做转运，真相源仍在主窗口。
+ *
+ * 取的是 `documentElement` 上的**内联**变量（`setVar` 只写内联）：
+ * `:root` 里那套默认值两边都从同一份 `styles.css` 来，不必传。
+ * 名字表**含已被清掉的变量**（值为空串）—— 悬浮窗据此把旧值也删掉。
+ */
+function broadcastThemeVars() {
+  const s = document.documentElement.style;
+  const vars: Record<string, string> = {};
+  for (const name of _themeVarNames) vars[name] = s.getPropertyValue(name);
+  emit(THEME_VARS_EVENT, vars).catch(() => {});
+}
+
+// 悬浮窗启动时会来要一次：主窗口的主题可能早就应用完了，
+// 那份「一次性的 applyAppearance」不会为迟到的窗口重跑。
+void listen(THEME_REQ_EVENT, () => broadcastThemeVars());
 
 /** 拉一次主题列表并缓存。任何失败都只是「没有主题包」——不能因此挡住外观应用。 */
 async function loadThemes(force = false): Promise<ThemeInfo[]> {

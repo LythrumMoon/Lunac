@@ -54,6 +54,8 @@
 
 | 36 | 新增的前端插件**要联网**吗？要联网就**不能**在插件里 `fetch()` —— `tauri.conf.json` 的 CSP 是 `default-src 'self' https://asset.localhost`，**不含远端域**，`fetch` 会被直接拦掉（`img-src` 倒是放了 `https:`，所以能直接用远端图片 URL）。一律**加宿主命令**去请求（`music.rs` 的 LRCLIB/Spotify 与 `plugin_market` 的索引是同一套做法，ai-spec §11 规则 67 第 ⑥ 条）。若这条链路要**登入第三方**：Spotify 这类只提供 OAuth 2.0，桌面端走「Authorization Code + PKCE + 环回 `http://127.0.0.1:<port>/callback`」，`localhost` 会被拒；且**凭据不能由宿主代发**，用户必须自己注册应用（见 ai-spec §4.6）。**同理，要执行外部进程**（调 ffmpeg 转码这类）也**只能由宿主做** —— WebView 里没有起进程的能力，`convert.rs` 是同一套做法。这类命令还有两条额外纪律：① 子进程的 **stderr 必须在独立线程排空**（stdout 与 stderr 两个管道都塞满时会双向死锁）；② **输出路径由宿主算**，前端只传「目标扩展名」，宿主保证「绝不覆盖源文件、已存在就递增、失败删半成品」（见 ai-spec §4.7）。 | ai-spec §4.6 / §4.7 / §11 规则 67 |
 
+| 37 | 要**新建窗口**（插件悬浮窗这类「第二个 Webview」）吗？本仓原本是**单窗口**架构，加窗口时这五条必须一起过：① **`on_window_event` 按 `window.label()` 分流** —— `CloseRequested` 的 `prevent_close + hide`（收进托盘）与 `Destroyed` 里的全局清理（`cli_bridge::kill_and_cleanup` / `kill_port(5173)` / `agent_server::stop`）都**只描述主窗口**，新窗口走进去等于「关掉一个小窗把整个后端清掉」。② **`capabilities/default.json` 的 `windows` 要加新 label（可用通配 `plugin-*`）** —— 不在清单里连 `core:window:*` 都会被拒；label 前缀常量与那个通配必须逐字对齐。③ **新窗口的前端必须「惰性」** —— 宿主有一批**全局单值**状态（`hotkey::UI_MODE` / `DETACHED` / `QUERY_EMPTY` / `MAIN_HWND`），第二个窗口去写它们就是两窗互抢；所以独立入口（如 `plugin.html`）**绝不**调 `set_ui_mode` / `set_detached` / `set_query_state` / `hide_lunac`，也不要重复注册剪贴板/热键/对话流链路。④ **失焦守卫要放行** —— `hotkey.rs` 那条「可见但不在前台 ⇒ 2s 自动隐藏」会让「两窗同时存在」在 2 秒后自我推翻；落点是一个**计数**原子量（不是 bool：开两个小窗时关掉一个不该让守卫复活）。⑤ **启动载荷不要塞进 URL query** —— `WebviewUrl::App` 的路径经 url join 处理，改用「宿主先存、前端启动后来取」的命令；且载荷必须在建窗**之前**写好（页面可能比命令返回更快）。另：多页要同时配 `vite.config.ts` 的 `build.rollupOptions.input`，否则打包版只有 index.html（dev 下按需编译，看不出问题）。 | ai-spec §4.8 / 预检 #35 |
+
 ---
 
 ## 第 2 章：Tauri 2 权限系统

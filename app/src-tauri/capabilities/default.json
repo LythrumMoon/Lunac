@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capability set",
-  "windows": ["main"],
+  "windows": ["main", "plugin-*"],
   "permissions": [
     "core:default",
     "core:window:allow-hide",
@@ -10,6 +10,12 @@
     "core:window:allow-is-visible",
     "core:window:allow-start-dragging",
     "core:window:allow-set-size",
+    "core:window:allow-minimize",
+    "core:window:allow-unminimize",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:window:allow-is-always-on-top",
+    "core:window:allow-set-always-on-top",
     "shell:allow-open",
     "shell:allow-execute",
     "dialog:default",

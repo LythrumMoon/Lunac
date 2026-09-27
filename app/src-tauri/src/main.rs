@@ -21,6 +21,7 @@ mod windows_ocr;
 mod paddle_ocr;
 mod music;
 mod convert;
+mod plugin_window;
 mod cli_bridge;
 mod agent_server;
 mod log;
@@ -387,14 +388,25 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // **按 label 分流**：这个回调对**所有**窗口生效，而两条分支都只描述主窗口 ——
+            // 「关掉 = 收进托盘」是主窗口的语义，`Destroyed` 里的全局清理
+            // （`cli_bridge::kill_and_cleanup` / `kill_port(5173)` / `agent_server::stop`）
+            // 更是整个应用的后端。插件悬浮窗若走进去，关掉一个音乐小窗就会把 agent 一起清掉。
+            let is_plugin_window = window.label().starts_with(plugin_window::LABEL_PREFIX);
             match event {
-                // Prevent window close → hide to tray instead
+                // Prevent window close → hide to tray instead（仅主窗口）
                 WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    window.hide().ok();
+                    if !is_plugin_window {
+                        api.prevent_close();
+                        window.hide().ok();
+                    }
                 }
-                // Real cleanup on tray "Quit" → app.exit(0)
+                // Real cleanup on tray "Quit" → app.exit(0)（仅主窗口）
                 WindowEvent::Destroyed => {
+                    if is_plugin_window {
+                        plugin_window::note_destroyed(window.label());
+                        return;
+                    }
                     log::info("window destroyed → app exit");
                     let state = window.state::<AppState>();
 
@@ -514,6 +526,13 @@ fn main() {
             convert::convert_engine_status,
             convert::convert_probe,
             convert::convert_run,
+            // 插件悬浮窗（多窗口基础设施）—— 见 src/plugin_window.rs
+            plugin_window::open_plugin_window,
+            plugin_window::plugin_window_init,
+            plugin_window::plugin_window_close,
+            plugin_window::plugin_window_minimize,
+            plugin_window::plugin_window_set_pin,
+            plugin_window::plugin_window_pin_state,
             hide_lunac,
             appearance::get_system_theme,
             appearance::list_themes,

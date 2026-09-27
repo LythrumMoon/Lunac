@@ -1046,7 +1046,15 @@ pub fn start_hotkey(app: AppHandle) {
             // 插件态可能正在跑长任务（AI 流式、OCR），不许失焦即隐藏；
             // 详细搜索是被动视图、没有在跑的东西，故照旧允许自动隐藏
             // —— 这里刻意只排除 PLUGIN，不是「非 Main 全排除」，以免顺手改了既有行为。
-            if !DETACHED.load(Ordering::SeqCst) && UI_MODE.load(Ordering::SeqCst) != UI_MODE_PLUGIN {
+            //
+            // **插件悬浮窗也算「不许隐藏」**（2026-09-27 多窗口）：用户点插件窗口时
+            // 主窗口必然不在前台，若不放行，「插件窗与搜索窗同时存在」这条需求
+            // 会在 2 秒后被这条守卫自己推翻（主窗口被藏掉）。
+            let plugin_windows_open = crate::plugin_window::OPEN_WINDOWS.load(Ordering::SeqCst) > 0;
+            if !DETACHED.load(Ordering::SeqCst)
+                && UI_MODE.load(Ordering::SeqCst) != UI_MODE_PLUGIN
+                && !plugin_windows_open
+            {
                 let fg = GetForegroundWindow();
                 if fg != 0 && fg != hwnd {
                     let now = GetTickCount();

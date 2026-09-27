@@ -933,6 +933,64 @@ App 所有者需 Premium）—— 用户必须自己有一个 Client ID，Lunac 
 点它即把该文件预置为源文件（`window.__lunac_convert_file`）。前端只做**粗筛**
 （一张正则），后缀不认识时插件会如实说「不支持」，所以不必与 `convert.rs` 的格式表逐项对齐。
 
+### 4.8 插件悬浮窗（多窗口基础设施，2026-09-27）
+
+**为什么加**：在此之前整个项目**只有 `main` 一个窗口**（`tauri.conf.json` 的
+`app.windows` 只有一项，全仓没有任何 `WebviewWindowBuilder`）。插件面板是**内嵌**在
+主窗口 `#results-list` 里的，于是 `runSearchNow()` 开头那句 `if (pluginActive) return;`
+会把「插件开着时用户敲进搜索栏的每一个字」**整段丢弃** —— 想看插件就用不了搜索。
+用户要求「插件窗口与搜索窗同时存在」，所以这里加一套真正的多窗口。
+
+| 宿主命令（[plugin_window.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_window.rs)） | 作用 |
+|---|---|
+| `open_plugin_window(plugin_id, input)` | 建窗或**复用**（同 id 不建第二个）；复用路径只 `unminimize + show + set_focus` 并推一条 `plugin-window-input` |
+| `plugin_window_init` | 窗口自己来取启动载荷（`{plugin_id, input}`） |
+| `plugin_window_close` / `plugin_window_minimize` | 关 / 最小化自己 |
+| `plugin_window_set_pin` / `plugin_window_pin_state` | 置顶开关 / 读当前置顶态（前端**不许猜**初始值） |
+
+**窗口形态**：`label = plugin-<id>`、420×560（最小 300×200）、`decorations:false` +
+`transparent` + `always_on_top`、可缩放、进任务栏。前端入口是**独立的 `plugin.html` +
+`plugin-window.ts`**（vite 多页入口），不是把 `main.ts` 跑两遍。
+
+**五条不得回退的约束**：
+
+1. **插件窗口必须是「惰性」的。** 宿主有一批**全局单值**状态 —— `hotkey::UI_MODE` /
+   `DETACHED` / `QUERY_EMPTY`、`MAIN_HWND`，以及 `main.rs` `on_window_event` 里
+   `Destroyed` 的全局清理（`cli_bridge::kill_and_cleanup()` + `kill_port(5173)` +
+   `agent_server::stop()`）。这些**全都只描述主窗口**。所以：
+   `on_window_event` 必须按 `window.label()` 分流；插件窗口的前端**绝不**调
+   `set_ui_mode` / `set_detached` / `set_query_state` / `hide_lunac`；
+   热键与 Esc 逻辑一律只认 `MAIN_HWND`（原本就如此，不要改）。
+   违反任何一条就是「关掉一个音乐小窗把整个 agent 后端清掉」这类灾难。
+2. **失焦守卫必须放行。** `hotkey.rs` 的轮询里有「可见但不在前台 ⇒ 2s 后自动隐藏」。
+   用户点插件窗口时主窗口必然不在前台 —— 不放行的话，「两窗同时存在」这条需求
+   会在 2 秒后被守卫自己推翻。落点是 `plugin_window::OPEN_WINDOWS` 这个**计数**原子量
+   （用计数不是 bool：同时开两个小窗时，关掉一个不该让守卫重新生效）。
+3. **`capabilities/default.json` 的 `windows` 必须含 `plugin-*`** —— 它是 host 命令的
+   授权清单，label 不在里面连 `set_always_on_top` 都会被拒。窗口 label 的前缀常量
+   （`plugin_window::LABEL_PREFIX`）与这个通配必须**逐字对齐**（有单测钉住）。
+4. **参数传递不走 URL query。** `WebviewUrl::App` 的路径经 url join 处理，把
+   `?id=…&input=…` 塞进 `PathBuf` 是在赌它的拼接实现。改成「宿主先把载荷存进
+   `PENDING`、前端启动后自己 `plugin_window_init` 来取」—— 没有时序问题也不用转义
+   （页面可能比命令返回更快，所以载荷必须在建窗**之前**写好）。
+5. **外观不在悬浮窗里自己算。** `applyAppearance` 那一整套（主题包 tokens → 底色 /
+   按钮色 / 文字明度 / 统一浮层的派生）有近百行，复刻一份必然漂移。落点是
+   **主窗口广播它算好的内联 CSS 变量**（`lunac-theme-vars`），悬浮窗原样套用；
+   悬浮窗启动时发一次 `lunac-theme-request`（主窗口那份一次性的 applyAppearance
+   不会为迟到的窗口重跑）。名字表**只增不减**，清掉的变量要广播成空串，
+   否则悬浮窗会留着上一个主题的值。
+
+**可悬浮的插件是一份显式清单**（`main.ts` 的 `FLOATABLE_PLUGINS`）：音乐 / 转换 /
+备忘录 / 剪贴板历史 / 快速启动 / 工具编辑 / 网页搜索。**不含** `settings`
+（按 800px 宽 + 左侧栏分类设计，小窗里会散架）、`ai-agent`（对话流就是主窗口本身）、
+`ocr`（detached 双栏，同 settings 的理由）。
+
+**挂载只有一处**（[plugins/attach.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/attach.ts)）：
+主窗口的内嵌面板与悬浮窗共用同一份 `attachPluginListeners(plugin, root)` 映射。
+分两份写的话，加了插件只改一边就会出现「内嵌能用、悬浮窗是死的」。
+好消息是**内置插件模块都不依赖 `main.ts`**（只依赖 registry / i18n / Tauri API），
+独立入口因此不需要把 main.ts 拆开。
+
 ## 5. 关键设计决策
 
 | 决策 | 原因 |

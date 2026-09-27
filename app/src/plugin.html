@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lunac</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <!-- 插件悬浮窗入口（2026-09-27）。
+       刻意**不引 KaTeX**（主窗口引它是为了对话里的公式渲染），
+       悬浮窗只承载插件面板，省一次 CDN 往返。
+
+       结构照抄主窗口的 detached 形态（`#app.detached`：padding 2px +
+       `#results-container` 玻璃底 + `#results-list` 内部滚动），
+       这样插件面板的既有 CSS 一行都不用改就落得下来。
+       标题栏是本窗口独有的（主窗口的 `#detached-header` 不属于这里）。 -->
+</head>
+<body>
+  <div id="app" class="detached">
+    <div id="plugin-titlebar" data-tauri-drag-region>
+      <span id="plugin-title" data-tauri-drag-region>Lunac</span>
+      <button id="plugin-pin" title="Pin" aria-label="Pin">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.7">
+            <line x1="12" y1="17" x2="12" y2="22"/>
+            <path d="M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.8a2 2 0 0 0-1.1-1.8l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>
+          </g>
+          <line x1="12" y1="17" x2="12" y2="22"/>
+          <path d="M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.8a2 2 0 0 0-1.1-1.8l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>
+          <circle cx="17.6" cy="6.4" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+      <button id="plugin-min" title="Minimize" aria-label="Minimize">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.7">
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </g>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+          <circle cx="17.4" cy="10.2" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+      <button id="plugin-close" title="Close" aria-label="Close">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.7">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </g>
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+          <circle cx="15.6" cy="17.4" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+    </div>
+    <div id="results-container">
+      <div id="results-list"></div>
+    </div>
+  </div>
+  <script type="module" src="/plugin-window.ts"></script>
+</body>
+</html>
