@@ -196,6 +196,10 @@ const engine = new URL("bin/librespot.exe", dir).pathname;
 ```
 
 > **拿不准就别加依赖**：能纯 JS 实现的功能，写成单文件最省事也最不容易坏。
+>
+> `file` 依赖的地址必须是 **https + 免鉴权直链**。上游不发预编译包的东西（如 librespot），
+> 要么自己构建后挂到**公开仓库的 Release 资产**上（本仓官方插件就是这么做的：
+> `LythrumMoon/lunac-plugins` 的 `librespot-0.8.0`），要么改用纯 JS 方案。
 
 ## 6. 怎么把它装进 Lunac
 

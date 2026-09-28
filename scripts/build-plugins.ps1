@@ -35,10 +35,17 @@ $OutDir = "$Root\release\plugin-packages"
 # ── 插件元数据（清单内容 = 界面能搜到的一切）──────────────────────────
 # keywords 是搜索的关键（中文关键词会自动生成拼音 token）；dependencies 见
 # ai-spec §3.5「依赖随插件装」——**它才是 release 不再缺依赖的机制**。
-# 说明为什么 music 的 dependencies 目前是空数组：
-#   librespot 没有官方 Windows 二进制发行（上游只发 GitHub Actions 产物），
-#   所以它必须由**我们自己**挂到一个 https 直链上（Lunac 仓库的 Release 资产）。
-#   挂好之后在这里补一条 { type = "file"; url = "..."; dest = "bin/librespot.exe"; sha256 = "..." }。
+#
+# music 的 librespot（2026-09-28 挂上）：**上游不发 Windows 二进制**
+#   （v0.8.0 / v0.7.x 三个 release 的 assets 全是空数组，别再去上游找），
+#   所以那份 exe 是我们自己构建的，产物挂在**公开**插件仓库的 Release 资产上
+#   （终端用户要能免鉴权直链下载）。复现 / 换版本时照做：
+#     cargo install librespot --version 0.8.0 --locked --root release\deps\librespot
+#       （0.8.0 在 Windows 上不需要 OpenSSL / Bonjour / protoc，见 ai-spec §4.6）
+#     Get-FileHash release\deps\librespot\bin\librespot.exe -Algorithm SHA256
+#     gh release create librespot-0.8.0 <exe> -R LythrumMoon/lunac-plugins
+#   ⚠️ 下面的 sha256 必须与**上传的那一份**逐字节一致 —— 对不上时宿主会
+#      整包拒绝安装（这是有意的：宁可不装，也不装来路不明的二进制）。
 $Plugins = @{
   music = @{
     name         = "音乐"
@@ -47,7 +54,16 @@ $Plugins = @{
     icon         = "🎵"
     homepage     = "https://github.com/LythrumMoon/Lunac"
     permissions  = @()
-    dependencies = @()
+    # dest 落在插件目录内 ⇒ `<exe 根>\Modules\music\bin\librespot.exe`；
+    # 宿主 music.rs 的 find_librespot() 认这条路径，用户不必自己去填路径。
+    dependencies = @(
+      @{
+        type   = "file"
+        url    = "https://github.com/LythrumMoon/lunac-plugins/releases/download/librespot-0.8.0/librespot.exe"
+        dest   = "bin/librespot.exe"
+        sha256 = "7509c74b1be2bdcd8debcf6575e557f31db80ea0512f157872429b11e92a4c1a"
+      }
+    )
   }
 }
 

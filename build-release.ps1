@@ -1,4 +1,4 @@
-# Lunac Release Build Script
+﻿# Lunac Release Build Script
 # Usage: .\build-release.ps1 [-Version <x.y.z>] [-NoBump]
 #   .\build-release.ps1                   - 读 package.json 的版本，patch 自动 +1，并同步六处（含扩展与 lockfile）
 #   .\build-release.ps1 -Version 0.10.0   - 显式指定版本（不递增），并同步六处

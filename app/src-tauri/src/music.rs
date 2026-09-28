@@ -1653,7 +1653,7 @@ fn librespot_cache_dir() -> PathBuf {
     music_config_path().with_file_name("librespot-cache")
 }
 
-/// 找 librespot 可执行文件。顺序：**配置里填的 → 与 Lunac 同目录 → cargo 的 bin 目录**。
+/// 找 librespot 可执行文件。顺序：**配置里填的 → 与 Lunac 同目录 → 插件目录 → cargo 的 bin 目录**。
 ///
 /// 找不到**不是错**（面板据此把开关置灰并说明），所以这里回 `Option` 而不是 `Result`。
 /// 不扫 PATH：那是「静默拿到一个别的版本」的路子，宁可让用户填一次路径。
@@ -1669,6 +1669,17 @@ fn find_librespot(cfg: &MusicConfig) -> Option<PathBuf> {
             cands.push(dir.join("librespot.exe"));
         }
     }
+    // 市场装的音乐插件把它当**依赖**拉下来时落在插件目录里（清单 `dependencies` 的 dest，
+    // 见 plugin_market::install_dependencies）。这条是终端用户机器上的**正规落点** ——
+    // 没它的话「插件装好了、本机播放却找不到 exe」，用户只能自己去填路径。
+    // 排在 exe 同目录之后：那一份是随包发的（更可控），插件目录这份是后装的。
+    cands.push(
+        crate::plugin_market::plugins_dir()
+            .join("music")
+            .join("bin")
+            .join("librespot.exe"),
+    );
+
     // `cargo install librespot` 的标准落点（开发机上最省事的一条）
     if let Some(home) = std::env::var_os("USERPROFILE") {
         cands.push(PathBuf::from(home).join(".cargo").join("bin").join("librespot.exe"));

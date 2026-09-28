@@ -1,4 +1,4 @@
-; Lunac Installer Script
+﻿; Lunac Installer Script
 ; Built with NSIS 3.x
 ;
 ; Features:

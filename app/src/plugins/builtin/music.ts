@@ -2240,7 +2240,8 @@ export function stopMusicPolling() {
 // 音乐插件要能被**独立打包**成 `<exe 根>\Modules\music\` 下的磁盘插件（见
 // `app/vite.plugins.config.ts` + `scripts/build-plugins.ps1`）。磁盘插件的挂载只认
 // 入口模块导出的 `attach(root)` / `detach()`（`market.ts::pickAttach`），所以把这两个
-// 已有的函数转出去 —— 内置构建里多两个导出没有任何副作用（`attach.ts` 仍先走它那张硬编码表）。
+// 已有的函数转出去 —— 内置构建里多两个导出没有任何副作用（`attach.ts` 只在**磁盘上
+// 没有可用的一份**时才走它那张硬编码表，见那张表头上的「磁盘插件优先」）。
 export { attachMusicListeners as attach, stopMusicPolling as detach };
 
 // ── Plugin 定义 ───────────────────────────────────────────────────
@@ -2257,3 +2258,9 @@ export const musicPlugin: Plugin = {
     return { type: "html", content: shellHtml() };
   },
 };
+
+// 插件契约要求入口**默认导出**带 `execute` 的对象（`market.ts::pickExecute` 只认
+// 「默认导出是函数」/「默认导出对象上的 execute」/「具名导出 execute」三种形态）。
+// 只导 `musicPlugin` 这个名字的话，独立打包出来的包在市场里会报「没有可调用的 execute」
+//  —— 内置构建看不出来（那边直接 import 具名符号），所以这条必须在这里补上。
+export default musicPlugin;
