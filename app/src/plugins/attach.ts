@@ -16,11 +16,18 @@
 // 表里查不到就交给 `market.ts` 的 `externalAttach()` —— 它在插件入口模块里找具名/默认导出的
 // `attach`。这样「谁需要挂载」这件事由插件自己声明，宿主不必为每个外部插件改一次硬编码表
 // （Lunac 自己创建的插件也就跟着这条路走，不需要 dev 版与开发者环境）。
+//
+// **磁盘插件优先于这张硬编码表**（2026-09-28 补）：同一个 id 既编译进 bundle、又从市场装了
+// 一份时（内置双轨期的音乐 / OCR），**用户亲手装的那份必须赢**。否则「在市场上点了下载、
+// 装的却是 bundle 里的旧代码」—— 面板上显示新版本号，跑的却是旧的，用户无从察觉。
 
 import type { Plugin } from "./registry";
-import { externalAttach, externalDetach } from "./market";
+import { externalAttach, externalDetach, hasDiskPlugin } from "./market";
 
 export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): Promise<boolean> {
+  // 盘上有可用的一份 ⇒ 一律走插件自己的 `attach`，**不再往后回落内置表**：
+  // 用户装的那份若没导出 `attach`，语义是「它不需要挂载」（`false`），而不是「请用内置那份」。
+  if (hasDiskPlugin(plugin.id)) return await externalAttach(plugin.id, root);
   switch (plugin.id) {
     case "settings": {
       const m = await import("./builtin/settings");
@@ -61,6 +68,12 @@ export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): 
 /** 面板关闭时的收尾。模块内大多另有 `isConnected` 自停兜底，这里是显式一次 ——
  *  不依赖 DOM 时序（与 main.ts 的 closePluginView 同一条纪律）。 */
 export function detachPluginListeners(pluginId: string): void {
+  // 与 attach 对称：磁盘插件优先。装的是用户那份，收尾也该收它那份 ——
+  // 否则会去叫内置实现留下的全局钩子（收错了对象，用户那份的定时器还开着）。
+  if (hasDiskPlugin(pluginId)) {
+    externalDetach(pluginId);
+    return;
+  }
   switch (pluginId) {
     case "music":
       (window as any).__lunac_music_stop?.();
@@ -69,7 +82,8 @@ export function detachPluginListeners(pluginId: string): void {
       (window as any).__lunac_convert_stop?.();
       break;
     default:
-      // 磁盘插件：收掉它 attach 时注册的钩子（见 market.ts 的 externalDetach）
+      // 表里没有这个 id（`web-search` / `clipboard-history` / `ai-agent` 这类本来就不挂载的，
+      // 或真的没挂上过）—— 兜底收一次 externalDetach：没钩子时它是空操作。
       externalDetach(pluginId);
       break;
   }

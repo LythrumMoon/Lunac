@@ -176,6 +176,16 @@ function infoOf(id: string): MarketPluginInfo | undefined {
   return installed.find(p => p.id === id);
 }
 
+/** 磁盘上（`Modules\<id>\`）是否有一份**可用**的插件。
+ *
+ *  给 `attach.ts` 判「该用用户装的那份，还是用编译进 bundle 的内置那份」用。
+ *  **坏包不算**：`valid === false` 的目录顶不掉内置实现 —— 否则用户装坏一个包，
+ *  连内置的那份也跟着不能用了。 */
+export function hasDiskPlugin(id: string): boolean {
+  const info = infoOf(id);
+  return !!info && info.valid;
+}
+
 /** 用**磁盘插件模块自带的 `attach(root)`** 挂载（2026-09-28）。
  *
  *  成功返回 true —— 调用方（`attach.ts`）据此判定「这个插件自己会挂载，不用宿主那份硬编码表」。

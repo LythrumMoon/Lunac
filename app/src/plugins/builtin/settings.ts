@@ -1801,12 +1801,16 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
   const indexById = new Map(index.map(e => [e.id, e]));
 
   // ① 已装且能用（内置 + 第三方有效包），registry 的顺序照旧。
-  //    索引里若也有同 id，就顺带给一个「更新」入口 —— 版本号不同即视为有新版
-  //    （**不猜大小**：索引版本是作者写的自由文本，比大小只会比出误报）。
+  //    索引里若也有同 id，就顺带给一个下载 / 更新入口：
+  //      · `!l`（内置插件没有磁盘目录）⇒ 还没装成磁盘版 ⇒「下载」；
+  //      · `l` 且在、版本号不同 ⇒「更新」。
+  //    **版本号只判「不同」不判大小**：索引版本是作者写的自由文本，比大小只会比出误报。
+  //    这一条同时是「内置插件将来搬去市场」的通道 —— 否则同 id 被归进「已装」那一档，
+  //    连下载按钮都出不来，用户永远装不上市场版（2026-09-28 发现）。
   for (const p of pluginRegistry.getAll()) {
     const l = localById.get(p.id);
     const e = indexById.get(p.id);
-    const hasNewer = !!e && !!e.version && !!l?.version && e.version !== l.version;
+    const hasNewer = !!e && (!l || (!!e.version && !!l.version && e.version !== l.version));
     rows.push({
       id: p.id,
       name: pluginName(p.id, p.name),
@@ -1814,7 +1818,8 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       icon: (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "",
       version: l?.version || "",
       url: hasNewer ? e!.url : "",
-      update: hasNewer,
+      // 只有「盘上已有一份、且版本不同」才叫更新；内置那次安装仍是「下载」
+      update: hasNewer && !!l,
       deps: l?.dependencies?.length || 0,
       perms: l?.permissions || [],
       source: l?.homepage || "",
