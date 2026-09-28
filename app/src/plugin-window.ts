@@ -20,6 +20,8 @@ import { initI18n, loadSavedLanguage, pluginName, t } from "./i18n.js";
 import { pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { attachPluginListeners, detachPluginListeners } from "./plugins/attach";
+import { refreshMarketPlugins } from "./plugins/market";
+import { installHostBridge } from "./plugins/host";
 
 /** 主题变量事件：主窗口 → 所有窗口（见 main.ts 的 broadcastThemeVars）。 */
 const THEME_VARS_EVENT = "lunac-theme-vars";
@@ -138,7 +140,13 @@ function wireTitlebar() {
 (async () => {
   await initI18n();
   loadSavedLanguage();
+  // 磁盘插件的宿主桥：**必须在 registerBuiltinPlugins / refreshMarketPlugins 之前装好**，
+  // 否则插件模块一加载就 import 到未初始化的一份 i18n（见 plugins/host.ts 头注释）。
+  installHostBridge({ t, apiVersion: 1 });
   registerBuiltinPlugins();
+  // 插件可能只装在 `<exe 根>\Modules\` 里（第三方 / 用户自建）—— 不扫这一下，
+  // 悬浮窗遇到它们只会显示「未知插件」（主窗口本来就会扫，这里补上同一件事）
+  await refreshMarketPlugins();
   wireTitlebar();
 
   // 外观：先要一次，之后主窗口每次改主题都会广播（main.ts 的 applyAppearance 收尾）

@@ -13,8 +13,9 @@
 //     模型写的临时/草稿文件落在这里 —— 以前回退用户主目录，会堆到 C:\Users\<名> 根下，
 //     见 commands.rs 的 default_work_dir() 与 ai-spec §11 规则 34）
 //   - <exe_dir>\temp\logs、<exe_dir>\temp\tool-outputs（落盘日志与超长工具输出，见 log.rs）
-//   - <exe_dir>\skills、<exe_dir>\tools、<exe_dir>\plugins（**第三方插件**，L1 2026-09-21；
-//     每个插件一个子目录，内含 lunac-plugin.json + 已编译的 ESM 入口）、<exe_dir>\paddle-ocr
+//   - <exe_dir>\skills、<exe_dir>\tools、<exe_dir>\Modules（**插件**，2026-09-28 由 plugins\
+//     改名；每个插件一个子目录，内含 lunac-plugin.json + 已编译的 ESM 入口 + 它自己的依赖）、
+//     <exe_dir>\paddle-ocr
 //   - <exe_dir>\config（ai.json 凭据 / hotkey.json 热键 / hooks.json 权限 hooks /
 //     pricing.json 定价表 —— 都是「应用配置」，业务数据才进 ModuleData）
 // 旧版本数据曾放在 %LOCALAPPDATA%\Lunac(-dev)，首次启动由

@@ -1,4 +1,4 @@
-﻿; Lunac Installer Script
+; Lunac Installer Script
 ; Built with NSIS 3.x
 ;
 ; Features:
@@ -18,7 +18,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "0.9.5"
+!define PRODUCT_VERSION "0.9.6"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
 RequestExecutionLevel user
@@ -94,6 +94,15 @@ Section "Install"
   SetOutPath "$INSTDIR\tools"
   File /r "Lunac\tools\*"
   SetOutPath "$INSTDIR"
+
+  ; 插件目录（2026-09-28）：只装一份 README（插件开发规范）—— 既给用户看，也是
+  ; 「让 Lunac 自己写插件」的依据。插件本体由插件市场按需下载（含各自的依赖）。
+  ; **升级安装时不要清空这个目录**：用户已装的插件要留着（这里没有 RMDir，因此天然保留）。
+  !if /FileExists "Lunac\Modules\README.md"
+    SetOutPath "$INSTDIR\Modules"
+    File "Lunac\Modules\README.md"
+    SetOutPath "$INSTDIR"
+  !endif
 
   ; VSCode extension -- optional, auto-installed by the "Attach to VSCode" button
   ; if present alongside lunac.exe

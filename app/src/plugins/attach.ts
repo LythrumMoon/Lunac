@@ -8,12 +8,17 @@
 // 静态 import 会让没打开的插件也把模块跑起来（主窗口历史上就是这么做的）。
 //
 // **不在表里的插件**（有意）：
-//   · `ocr` —— 它的根是 `document` 且自带 detached 双栏布局，只在主窗口里有意义；
 //   · `ai-agent` —— 对话流就是主窗口本身，没有「挂载」这一步；
 //   · `web-search` / `clipboard-history` —— 一次性结果，没有监听器要挂。
 // 调用方拿到 `false` 应当视为「这个插件不需要挂载」，而不是错误。
+//
+// **磁盘插件（第三方 / 用户自建）走模块自带的 `attach(root)`**（2026-09-28 加）：
+// 表里查不到就交给 `market.ts` 的 `externalAttach()` —— 它在插件入口模块里找具名/默认导出的
+// `attach`。这样「谁需要挂载」这件事由插件自己声明，宿主不必为每个外部插件改一次硬编码表
+// （Lunac 自己创建的插件也就跟着这条路走，不需要 dev 版与开发者环境）。
 
 import type { Plugin } from "./registry";
+import { externalAttach, externalDetach } from "./market";
 
 export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): Promise<boolean> {
   switch (plugin.id) {
@@ -48,7 +53,8 @@ export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): 
       return true;
     }
     default:
-      return false;
+      // 磁盘插件：入口模块自带 `attach(root)` 就调它（没有则 false，同「不需要挂载」）
+      return await externalAttach(plugin.id, root);
   }
 }
 
@@ -63,6 +69,8 @@ export function detachPluginListeners(pluginId: string): void {
       (window as any).__lunac_convert_stop?.();
       break;
     default:
+      // 磁盘插件：收掉它 attach 时注册的钩子（见 market.ts 的 externalDetach）
+      externalDetach(pluginId);
       break;
   }
 }

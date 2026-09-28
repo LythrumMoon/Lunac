@@ -10,6 +10,7 @@ import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { attachPluginListeners } from "./plugins/attach";
 import { refreshMarketPlugins } from "./plugins/market";
+import { installHostBridge } from "./plugins/host";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
 
@@ -1699,8 +1700,11 @@ function forceResetPluginUI() {
   await initI18n();
   loadSavedLanguage();
   applyI18nToStaticUI();
+  // 磁盘插件的宿主桥：**必须在任何插件模块被加载之前装好** —— 插件里的 `t` 走的是它
+  //（见 plugins/host.ts：插件自带的 i18n 副本没初始化过，语言会退回 key）。
+  installHostBridge({ t, apiVersion: 1 });
   registerBuiltinPlugins();
-  // 第三方插件（L1）：扫 `<exe 根>\plugins\` 并注册进同一个 registry —— 放在状态行之前，
+  // 磁盘插件（L1）：扫 `<exe 根>\Modules\` 并注册进同一个 registry —— 放在状态行之前，
   // 让「插件 N」把第三方也算上（结果区能搜到的就是这一份）。失败不抛（只记控制台）。
   await refreshMarketPlugins();
   statusText.textContent = t("status.plugin_count", { count: String(pluginRegistry.getAll().length) });
@@ -6119,7 +6123,35 @@ function launchApp(path: string) {
 }
 
 // ── Execute plugin ───────────────────────────────────────────────
+/**
+ * 音乐插件**只以独立窗打开**（用户 2026-09-28：「从 Lunac 中进入音乐界面时自动展开成
+ * 独立界面，禁止进入到插件版本中的音乐界面」）。
+ *
+ * **拦截点选在 `executePlugin` 而不是逐个调用处**：它有二十来个调用方（搜索命中 /
+ * 设置里的插件总览 / 右键菜单 / 详情项 / 快速启动…），逐处加判断必然漏掉一处，
+ * 而漏掉的那一处就是「内嵌版音乐面板」的后门。独立窗自己的渲染走 `plugin-window.ts`
+ * （直接调 `plugin.execute`），不经过这里 —— 所以不会自打转。
+ *
+ * **先开窗、成功了再说**：开窗失败（id 非法 / 权限）时主窗口不该被清空，否则用户
+ * 既没有面板也没有窗口，只看到一句错误。已经开着别的插件面板时先把它收掉
+ * （同一时刻只该有一个插件界面）。这个分支**不设 `_execGuard`**：宿主那边
+ * `open()` 对同一个插件是「复用 + 置前」，重复调用不会开出第二个窗。
+ */
+async function openMusicWindow() {
+  if (pluginActive) await closePluginView();
+  try {
+    await invoke("open_plugin_window", { pluginId: "music", input: searchInput.value.trim() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    statusText.textContent = t("plugin.float_failed", { error: msg });
+  }
+}
+
 async function executePlugin(plugin: Plugin) {
+  if (plugin.id === "music") {
+    await openMusicWindow();
+    return;
+  }
   if (_execGuard) return;
   _execGuard = true;
   setTimeout(() => { _execGuard = false; }, 500); // longer: plugin execute can take time

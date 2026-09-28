@@ -40,6 +40,24 @@ export interface MarketPluginInfo {
   valid: boolean;
   /** `valid === false` 时的原因（原样显示，不猜） */
   error: string;
+  /** 这个插件声明的依赖（2026-09-28）。宿主在装插件时已顺带拉好；
+   *  界面上只用来提示「它会拉什么」—— 装完即已就位。 */
+  dependencies: MarketDependency[];
+  /** 这个插件声明的宿主能力（2026-09-28），如 `layout.takeover`。
+   *  **是「告知」不是沙箱**：插件是本机可执行代码，绕过桥直接 `invoke()` 照样能调宿主命令。
+   *  界面上如实列出来，让用户知道装的东西要什么（见 ai-spec §3.5）。 */
+  permissions: string[];
+}
+
+/** 与 Rust 侧 `plugin_market::PluginDependency` 一一对应（2026-09-28）。 */
+export interface MarketDependency {
+  /** `file`（缺省，下载到 dest）/ `npm`（走 npm install） */
+  type: string;
+  url: string;
+  package: string;
+  version: string;
+  dest: string;
+  sha256: string;
 }
 
 /** 市场索引里的一条（与 Rust 侧 `plugin_market::PluginIndexEntry` 一一对应）。
@@ -72,8 +90,16 @@ export async function fetchPluginIndex(): Promise<{ list: MarketIndexEntry[]; er
 /** 最近一次扫描的结果（设置面板渲染「插件目录」那一段时直接读它）。 */
 let installed: MarketPluginInfo[] = [];
 
-/** 已 import 过的模块缓存：`execute` 是懒加载的，但同一个插件只 import 一次。 */
-const modules = new Map<string, unknown>();
+/** 已 import 过的模块缓存：`execute` 是懒加载的，但同一个插件只 import 一次。
+ *
+ *  **带版本号**（2026-09-28）：升级装的是**同一个目录、同一个 entry 路径**，光看路径分不出
+ *  新旧代码 —— 缓存会把用户按回旧版。所以记下装载时的 `version`，`refreshMarketPlugins()`
+ *  发现版本变了就把它从缓存里摘掉（下次 `execute` 重新 import）。 */
+const modules = new Map<string, { version: string; mod: unknown }>();
+
+/** 磁盘插件的挂载钩子（模块里导出的 `attach` / `detach`）。
+ *  **只有真加载过模块的插件才有**：没打开过的插件没有钩子要收，这是有意的。 */
+const hooks = new Map<string, { detach?: () => void }>();
 
 export function installedMarketPlugins(): MarketPluginInfo[] {
   return installed;
@@ -81,7 +107,7 @@ export function installedMarketPlugins(): MarketPluginInfo[] {
 
 /** 扫描插件目录，并把有效插件（重新）注册进 registry。
  *
- *  安装 / 卸载后各调一次即可 —— **不必重启前端**（这与「技能改完要重启 agent」是两回事：
+ *  安装 / 卸载 / 升级后各调一次即可 —— **不必重启前端**（这与「技能改完要重启 agent」是两回事：
  *  技能是 agent 的能力、插件是前端的界面件）。失败只记控制台：插件目录出问题不该
  *  让整个搜索不可用。 */
 export async function refreshMarketPlugins(): Promise<MarketPluginInfo[]> {
@@ -93,6 +119,16 @@ export async function refreshMarketPlugins(): Promise<MarketPluginInfo[]> {
     return installed;
   }
   installed = list;
+  // 版本变了的、或已经不存在的 id ⇒ 丢掉模块缓存与挂载钩子：
+  // 前者是「升级后还在用旧代码」，后者是「卸载了但模块还占着内存（还可能留着定时器）」
+  const live = new Map(list.map(p => [p.id, p.version]));
+  for (const id of [...modules.keys()]) {
+    const v = live.get(id);
+    if (v === undefined || modules.get(id)!.version !== v) modules.delete(id);
+  }
+  for (const id of [...hooks.keys()]) {
+    if (!live.has(id)) hooks.delete(id);
+  }
   // 先摘后挂：registry 不去重，重复 register 会让结果区出现两行（见 `PluginRegistry.unregister`）
   for (const p of list) pluginRegistry.unregister(p.id);
   for (const p of list) {
@@ -110,6 +146,8 @@ function wrap(info: MarketPluginInfo): Plugin {
     description: info.description || "",
     // 图标留空是合法的：结果区会走 `pluginIconSvg()` 给主题图标，这里只是兜底
     icon: info.icon || "",
+    // 声明的宿主能力原样带过去（`layout.takeover` 这类要让 main.ts 判定的东西）
+    permissions: info.permissions || [],
     execute: async (input: string): Promise<PluginResult> => {
       const mod = await loadModule(info);
       const fn = pickExecute(mod);
@@ -124,13 +162,80 @@ function wrap(info: MarketPluginInfo): Plugin {
 
 async function loadModule(info: MarketPluginInfo): Promise<unknown> {
   const cached = modules.get(info.id);
-  if (cached) return cached;
+  if (cached) return cached.mod;
   // `/* @vite-ignore */` 让 Vite 不要把这一行当成「可分析的静态导入」——
   // 参数是运行时才拼出来的 asset URL，打包器无从分析（不写它 dev 下会报 warning）
   const url = convertFileSrc(info.entryPath);
   const mod = await import(/* @vite-ignore */ url);
-  modules.set(info.id, mod);
+  modules.set(info.id, { version: info.version, mod });
   return mod;
+}
+
+/** 按 id 找最近一次扫描到的插件信息（attach/detach 钩子要拿它去加载模块）。 */
+function infoOf(id: string): MarketPluginInfo | undefined {
+  return installed.find(p => p.id === id);
+}
+
+/** 用**磁盘插件模块自带的 `attach(root)`** 挂载（2026-09-28）。
+ *
+ *  成功返回 true —— 调用方（`attach.ts`）据此判定「这个插件自己会挂载，不用宿主那份硬编码表」。
+ *  没导出钩子 / 模块加载失败都返回 false（与「内置表未命中」同义：没有监听要挂）。
+ *  失败**只记控制台**：插件坏了不该让结果区整个渲染不出来。 */
+export async function externalAttach(id: string, root: HTMLElement): Promise<boolean> {
+  const info = infoOf(id);
+  if (!info) return false;
+  let mod: unknown;
+  try {
+    mod = await loadModule(info);
+  } catch (e) {
+    console.warn("[lunac] 插件模块加载失败，跳过挂载：", id, e);
+    return false;
+  }
+  const hook = pickAttach(mod);
+  if (!hook) return false;
+  try {
+    await hook.attach(root);
+  } catch (e) {
+    console.warn("[lunac] 插件 attach 失败：", id, e);
+    return false;
+  }
+  hooks.set(id, hook.detach ? { detach: hook.detach } : {});
+  return true;
+}
+
+/** 面板关闭时收尾（与 `externalAttach` 成对）。**同步**：调用方在关窗路径上，
+ *  不能等一个 await（见 main.ts / plugin-window.ts 的关闭流程）。 */
+export function externalDetach(id: string): void {
+  const h = hooks.get(id);
+  hooks.delete(id);
+  if (!h?.detach) return;
+  try {
+    h.detach();
+  } catch (e) {
+    console.warn("[lunac] 插件 detach 失败：", id, e);
+  }
+}
+
+/** 从模块里取挂载钩子：具名导出优先，其次默认导出的对象（与 `pickExecute` 同一套宽容度）。 */
+function pickAttach(
+  mod: unknown,
+): { attach: (root: HTMLElement) => unknown; detach?: () => void } | null {
+  const m = mod as { attach?: unknown; detach?: unknown; default?: unknown };
+  const def = m?.default as { attach?: unknown; detach?: unknown } | undefined;
+  const attach =
+    typeof m?.attach === "function"
+      ? (m.attach as (root: HTMLElement) => unknown)
+      : def && typeof def.attach === "function"
+        ? (def.attach as (root: HTMLElement) => unknown)
+        : null;
+  if (!attach) return null;
+  const detach =
+    typeof m?.detach === "function"
+      ? (m.detach as () => void)
+      : def && typeof def.detach === "function"
+        ? (def.detach as () => void)
+        : undefined;
+  return { attach, detach };
 }
 
 /** 从模块里取 `execute`：默认导出的对象 / 默认导出的函数 / 具名导出，三种都认。 */

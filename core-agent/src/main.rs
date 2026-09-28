@@ -1064,6 +1064,29 @@ fn env_block(cwd: &std::path::Path) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(not configured)".into());
+    // 插件（界面件）目录 + 写插件的规范文档（2026-09-28）。**必须在这里写明**：
+    // 模型不会凭空知道 Lunac 的插件放在哪、该照什么格式写 —— 不写这段，
+    // 「让 Lunac 自己做个插件」它只会去猜，然后写出一堆装不上的东西。
+    // 与 skills 那条同理：同为「应用自己的目录」，在 agent 进程生命周期内是常量 ⇒ 满足前缀缓存要求。
+    let modules_dir = std::env::var("LUNAC_MODULES_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(not configured)".into());
+    let modules_line = if modules_dir == "(not configured)" {
+        String::new()
+    } else {
+        format!(
+            "- Lunac's plugins (UI modules) live in: {} — each plugin is a folder with a manifest \
+             `lunac-plugin.json` plus an ESM entry (usually `index.js`). The authoring spec is in \
+             that folder's README.md ({}). To create or fix a plugin for the user, read that file \
+             first and follow it exactly; you can write there directly (no dev build needed).\n\
+             - The user sees new plugins after they open 设置 → 插件 → 重新扫描 (no restart needed).\n\
+             ",
+            modules_dir,
+            std::path::Path::new(&modules_dir).join("README.md").display()
+        )
+    };
     format!(
         "\n\nEnvironment:\n\
          - Host: Lunac, a Windows desktop launcher. You are Lunac's built-in agent — not a \
@@ -1072,11 +1095,13 @@ fn env_block(cwd: &std::path::Path) -> String {
          - Lunac's own skills live in: {} — each skill is a folder containing SKILL.md. When the \
          user says \"my skills\", \"我自己的 skills\" or similar, they mean the skills of this app \
          (the ones listed below, if any) or this directory.\n\
+         {}\
          - Other files on disk are ordinary files. If the workspace happens to contain another \
          agent/tool framework's repository, config or skills, do not treat it as Lunac's setup \
          and do not answer as if you were that product.",
         cwd.display(),
-        skills_dir
+        skills_dir,
+        modules_line
     )
 }
 
@@ -1903,6 +1928,16 @@ fn main() {
     // 会把它直接拒掉（不是弹审批，是拒），「改技能」那半就永远不会发生。
     // 与 `output_dir` 同理：进的是**应用自己的目录**，不是把用户的工作区边界放宽。
     if let Ok(dir) = std::env::var("LUNAC_SKILLS_DIR") {
+        let dir = PathBuf::from(dir.trim());
+        if !dir.as_os_str().is_empty() {
+            add_dirs.push(dir);
+        }
+    }
+    // 插件目录（<exe 根>\Modules，2026-09-28）同理进可访问范围：Lunac 要能**自己写插件**
+    // （写 `<id>\lunac-plugin.json` + `index.js`），而它在工作区之外 —— 不进这个名单，
+    // 工作区锁会直接拒掉写入，「自建插件」就永远做不成。
+    // 注意这只是**放行应用自己的目录**，没有放宽用户工作区的边界。
+    if let Ok(dir) = std::env::var("LUNAC_MODULES_DIR") {
         let dir = PathBuf::from(dir.trim());
         if !dir.as_os_str().is_empty() {
             add_dirs.push(dir);

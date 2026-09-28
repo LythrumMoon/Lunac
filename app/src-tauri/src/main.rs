@@ -185,6 +185,10 @@ fn main() {
     // 两个实例并发搬同一批目录会互相踩。
     crate::storage::migrate_legacy_localappdata();
 
+    // 插件目录改名（2026-09-28）：旧版装在 `<exe 根>\plugins\`，新版读 `<exe 根>\Modules\`。
+    // 在这里一次性把已装的搬过去（幂等；搬不动就留着旧目录并 warn，不删用户文件）。
+    crate::plugin_market::migrate_legacy_plugins_dir(&crate::storage::lunac_root_dir());
+
     // AI 凭据的唯一真相源：<exe 根>\config\ai.json（设置面板保存）→ 注入 env。
     // 没有该文件时才用 .env。**必须早于任何 start_cli**（也能早于 WebView2 起，
     // 反正只读一个文件）。以前这一步是前端拿 localStorage 回灌的，会在启动时
@@ -426,6 +430,10 @@ fn main() {
                     kill_port(5173);
 
                     agent_server::stop();
+
+                    // **本机播放（librespot）必须跟着走**：它是我们起的独立进程，
+                    // 留着的话下次开机它还占着那台设备（见 music.rs 的 kill_librespot）。
+                    music::kill_librespot();
                 }
                 _ => {}
             }
@@ -527,7 +535,28 @@ fn main() {
             music::spotify_status,
             music::spotify_control,
             music::lyrics_get,
-            music::lyrics_search,
+            // 歌单列 / 播放队列 / 随机三态（2026-09-27 加）
+            music::spotify_playlists,
+            music::spotify_playlist_tracks,
+            music::spotify_queue,
+            music::spotify_play_context,
+            music::spotify_play_uri,
+            music::spotify_set_play_mode,
+        // 「我喜欢的歌曲」（收藏夹，走 /me/tracks）/ 一次播一串 / 搜索（2026-09-27 加）
+        music::spotify_liked,
+        music::spotify_play_uris,
+        music::spotify_search,
+        // Library（专辑 / 歌手 / 电台）+ 条目的曲目 + 设备列表 / 转移（2026-09-28 加）
+        music::spotify_artists,
+        music::spotify_albums,
+        music::spotify_shows,
+        music::spotify_item_tracks,
+        music::spotify_devices,
+        music::spotify_transfer,
+        // 本机播放（librespot 子进程）—— 登入一次后不依赖 Spotify 桌面端出声
+        music::librespot_status,
+        music::librespot_start,
+        music::librespot_stop,
             // 文件转换插件（图片 / 音频 / 视频，走 ffmpeg）—— 见 src/convert.rs
             convert::convert_engine_status,
             convert::convert_probe,
@@ -538,7 +567,9 @@ fn main() {
             plugin_window::plugin_window_close,
             plugin_window::plugin_window_minimize,
             plugin_window::plugin_window_set_pin,
+            plugin_window::plugin_window_set_resizable,
             plugin_window::plugin_window_pin_state,
+            plugin_window::plugin_window_resize,
             hide_lunac,
             appearance::get_system_theme,
             appearance::list_themes,

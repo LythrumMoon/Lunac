@@ -684,7 +684,6 @@ html, body {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 6px 4px 12px;
   background: var(--surface-glass);
   border: 1px solid var(--border-glass);
   border-radius: var(--radius);
@@ -692,9 +691,62 @@ html, body {
   -webkit-backdrop-filter: blur(20px);
   flex-shrink: 0;
   pointer-events: auto;
-  min-height: 34px;
+  /* **关闭操作栏：高 40，且只在鼠标进入窗口时显示**（用户 2026-09-27 定）。
+     收起时高度**归 0**（不是 `visibility:hidden`）：窗口高度是按内容实测下发的，
+     归 0 才能让窗口真的缩回「长条 130」那一档；`overflow:hidden` 保证收起时
+     里面的按钮既不显示也点不到。
+     **高度不做过渡** —— 它一变就要重算窗口尺寸，补间期间量到的是中间值。 */
+  height: 0;
+  min-height: 0;
+  padding: 0 6px;
+  border-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.12s ease;
   margin: 0;
 }
+#app.detached:hover #plugin-titlebar {
+  height: 40px;
+  padding: 4px 6px 4px 12px;
+  border-width: 1px;
+  opacity: 1;
+}
+/* 音乐插件窗里，**关闭操作栏与长条同宽对齐（550）**：外层垫料已有 2 + 1 + 3 = 6，
+   这里再补 4 ⇒ 562 − 12 = 550。其它插件保持原样（它们的列宽不是 550）。
+   **播放态不需要这一条**（那条窗口本身就只有 550 宽，见下面播放态那组规则）。 */
+body:has(.music-root) #plugin-titlebar { margin: 0 4px; }
+
+/* ── 播放态：窗口就等于长条本身（2026-09-28）────────────────────────
+   用户报「音乐播放状态那个 **562×200** 的渲染窗口要你去掉」：窗口比长条大了一圈。
+   两处来源，两处都得治：
+     ① **高度** —— 宿主 `plugin_window_resize` 用通用的 `MIN_H = 200` 夹住了播放态实测的
+        159 ⇒ 窗口永远是 200（已改成音乐专用下限 `MUSIC_MIN_H`，见 plugin_window.rs）；
+     ② **外层垫料** —— `#app` padding 2 + `#results-container` 边框 1 + `#results-list`
+        padding 6 + `.plugin-result` padding 6（每侧 15、上下 29）。
+   这一条把播放态的外层垫料全部清零 ⇒ 窗口**正好等于长条 550×130**
+   （鼠标进窗时关闭操作栏浮出 = 550×170）。前端下发的宽度也相应从 562 变成 550
+   （music.ts 的 `MUSIC_W_BAR`）—— **两处必须一起改**，只改一边窗口就与内容差 12px。
+   **只对播放态生效**：默认态（歌单列）仍靠这层玻璃边框撑出面板观感。
+
+   选择器必须写得比收窄那条 `#app.detached #results-list .plugin-result:has(.music-root)`
+   更具体（它是 (0,2,3,0)），所以下面几条都把 `#app.detached` 带上 —— 否则收窄那条会赢、
+   垫料清不掉。`#results-container` 原有的两条带 `!important`，这里也必须带。 */
+body:has(.music-root.music-player-on) #app.detached { padding: 0; }
+body:has(.music-root.music-player-on) #app.detached #results-container {
+  border-width: 0 !important;
+  /* `margin-top: -1px` 是给**主窗口/其它插件**用的（去叠搜索栏那条边框），
+     在插件悬浮窗里没有搜索栏，靠的是容器自己的 1px 上边框来抵消 ——
+     上面 `border-width: 0` 一去掉，这 -1px 就变成实打实的溢出：
+     实测「列表比窗口还高 1px」⇒ `chrome = 内高 − 列表高` 量出 **-1**、
+     下发的高度就少 1px，卡片底下被裁掉一线、还可能诱出滚动条。所以这里必须一起归零。 */
+  margin-top: 0 !important;
+  /* 圆角必须等于 `.music-pv-card` 的 12px：容器是 14（--radius），差 2px 时
+     玻璃层的圆角会从长条的圆角外面露出来。 */
+  border-radius: 12px !important;
+}
+body:has(.music-root.music-player-on) #app.detached #results-list { padding: 0; }
+body:has(.music-root.music-player-on) #app.detached #results-list .plugin-result { padding: 0; }
+body:has(.music-root.music-player-on) #plugin-titlebar { margin: 0; }
 
 #plugin-title {
   flex: 1;
@@ -735,6 +787,9 @@ html, body {
 #plugin-close:hover {
   color: var(--red);
 }
+/* 播放态那个按钮其实是「← 回退」而不是关闭（图标由 music.ts 的 syncTitlebarClose
+   换掉）—— hover 不能再用警示红，否则用户会以为点下去要关掉整个悬浮窗。 */
+body:has(.music-root.music-player-on) #plugin-close:hover { color: var(--accent); }
 /* 置顶是**持续态**，不能只靠 hover 表达：常亮主题色 + 半透明底。
    初值由 plugin-window.ts 问宿主（plugin_window_pin_state）后写上 ——
    建窗时就是 always_on_top(true)，前端不许自己猜。 */
@@ -4158,7 +4213,13 @@ html, body {
   }
 }
 
-/* ── 音乐插件（歌词 + Spotify 播放控制，2026-09-27）───────────────
+/* ── 音乐插件（歌词 + Spotify 播放控制，2026-09-27 重构）───────────
+   这一版是**两态界面**：
+     · 默认界面 = 连接设置 + 歌单列（内容长了就滚）；
+     · 播放界面 = 定尺长条 **550×130**：封面 100×100 在左，右侧列 450 宽
+       （歌名 30 + 歌词 65 + 控制条 35 = 130）。
+   窗口高度由前端实测内容后经 `plugin_window_resize` 下发（见 music.ts 的 applyResize）。
+
    刻意**不写按钮底色**：`#app button:where(...)` 那条全局规则已经把所有按钮的
    常驻/tint/hover 底色统一到 `--btn-bg-*`（见上方「按钮底色全覆盖」），这里再写
    一份 `background` 只会与主题系统打架（特异性还低，写了也不生效）。本段只负责
@@ -4166,6 +4227,7 @@ html, body {
    滚动条走文件顶部那条全局 `::-webkit-scrollbar` —— 这里禁止再声明
    `scrollbar-width` / `scrollbar-color`（会把 WebView2 打回系统默认外观）。 */
 .music-root {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -4174,24 +4236,81 @@ html, body {
   color: var(--text);
 }
 
-.music-head {
+/* ── 顶部工具条（默认态）：头像 + 账号名 + 搜索框 + 两个按钮 ──────
+   仿 Spotify 的顶栏：圆头像在最左、账号名跟着，搜索框吃掉剩下的宽度。 */
+.music-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 0.7rem;
-  color: var(--text-dim);
+  min-width: 0;
+  /* 不参与压缩：这一条是默认面板的固定头，被压扁会让搜索框与按钮挤在一起。
+     （原先这里还有 `position: relative` —— 它是设备弹层的定位参照；2026-09-28
+     那个弹层随设备按钮一起搬到**底部控制栏右端**去了，参照改成了 `.music-bend`。） */
+  flex: 0 0 auto;
 }
-.music-head .music-status { flex: 0 0 auto; }
-.music-head .music-device {
-  flex: 1 1 auto;
+.music-avatar {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.08);
+}
+.music-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.music-acc {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 130px;
+  font-size: 0.74rem;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-align: right;
-  opacity: 0.75;
+}
+.music-search {
+  /* 宽度由外面的 `.music-search-wrap` 决定（它是那个弹性项），这里撑满壳即可。
+     `min-width: 0` 是必需的：flex 项默认最小宽 = 内容宽，输入框会被它的
+     placeholder 撑着不肯缩（窗口被拖窄时表现为搜索框顶掉右边的按钮）。 */
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px; /* 胶囊形 —— Spotify 的搜索框就是这个形状 */
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--ink-rgb), 0.05);
+  color: var(--text);
+  font-size: 0.72rem;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.music-search::placeholder { color: var(--text-muted); }
+.music-search:focus { border-color: var(--accent-border); }
+
+/* 搜索框的**定位壳**（2026-09-28）。两件事：
+   ① 让下拉预览能挂成「输入框正下方」的绝对定位层 —— 直接挂工具条上会与输入框错位；
+   ② 它才是那个吃剩余宽度的弹性项（输入框自己改成撑满壳）。
+   下拉**绝不能占布局**：占了窗口高就会跟着搜索结果条数抖（面板是定尺 1280×720）。 */
+.music-search-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 80px;
+  display: flex;
+}
+/* 状态文字（在搜索框右边、设备按钮左边）。**只是一行文字、不可点** ——
+   原先那条「无活跃设备」是被用户点名要去掉的独立提示行，设备信息改挂工具条按钮
+   （title + warn 态，见 renderStatus）。 */
+.music-status {
+  flex: 0 0 auto;
+  max-width: 240px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* 纯图标小按钮（复制 / 齿轮）—— 尺寸与 .memo-* 同族 */
+/* 纯图标小按钮（齿轮 / 返回 / 展开 / 复制）—— 方形容器，与 .memo-* 同族 */
 .music-ghost-btn {
   display: inline-flex;
   align-items: center;
@@ -4204,11 +4323,23 @@ html, body {
   cursor: pointer;
 }
 .music-ghost-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-icon-btn { padding: 4px 5px; }
+
+/* 两态容器：都留在 DOM 里，靠 .hidden 切 —— 这样窗口高度才量得准（display:none 不参与布局） */
+.music-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
 
 .music-setup {
   display: flex;
   flex-direction: column;
   gap: 7px;
+  /* 未连接时它就是整个面板：吃掉工具条以下的全部高度并自己滚
+     （连接之后它被 `.hidden` 顶掉，由 `.music-body` 接手）。 */
+  flex: 1 1 auto;
   overflow-y: auto;
   min-height: 0;
 }
@@ -4271,21 +4402,639 @@ html, body {
   color: var(--text-dim);
   opacity: 0.85;
 }
-
-.music-player { display: flex; flex-direction: column; gap: 8px; }
-.music-now { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.music-cover {
-  flex: 0 0 auto;
-  width: 52px;
-  height: 52px;
+/* 播放态：提示行**不占布局**（浮在长条底部）—— 用户要求播放态窗口严格 130 高。
+   它只在出错时出现 8 秒（music.ts 的 `MSG_TTL_MS`），压住控制条一会儿可以接受；
+   `pointer-events: none` 保证它不挡住底下的按钮。
+   ⚠️ **没字时不许着色**（2026-09-28 用户报的「播放态底下有个透明黑色蒙版」就是它）：
+   背景色挂在元素上，而元素自带 `min-height` + `padding` ⇒ 即使一个字都没有，
+   那条 `rgba(0,0,0,.62)` 也照样铺在控制条底部（`sweepMsg` 清空的是文本，不是元素）。
+   `:empty` 匹配「连文本节点都没有」的状态 —— 清空走的是 `textContent = ""`，正好命中。 */
+.music-root.music-player-on .music-msg {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 2px;
+  margin: 0;
+  padding: 2px 8px;
   border-radius: 6px;
+  background: rgba(0, 0, 0, calc(0.62 * var(--shade-scale)));
+  text-align: center;
+  pointer-events: none;
+}
+.music-root.music-player-on .music-msg:empty {
+  background: none;
+  padding: 0;
+  min-height: 0;
+}
+
+/* ── 小节标题（歌单列 / 播放列表共用）── */
+.music-sec-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.66rem;
+  color: var(--text-muted);
+}
+.music-sec-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+.music-sec-note {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  opacity: 0.7;
+}
+.music-empty {
+  padding: 6px 2px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+/* 展开歌单失败时，原因贴在那一块里（而不是渲染成「这个歌单是空的」把真因藏掉）。
+   用警示色 + 允许换行：这段话通常比较长，且必须与「就是没歌」区分开。 */
+.music-empty-err {
+  color: var(--red);
+  opacity: 1;
+  line-height: 1.5;
+  white-space: normal;
+}
+
+/* ── 左栏 / 主区共用的「条目行」（2026-09-28 两栏改造后只剩这一种行）────────
+   2026-09-28 之前这里还有 `.music-pls-wrap` / `.music-pls` / `.music-pl-head` /
+   `.music-pl-chev` / `.music-pl-tracks`（「歌单行内展开曲目」那一套）——
+   两栏改造把行内展开删掉了（曲目统一进主区），那几条规则随之作废，已删除。
+   **行里只有一个孩子**（`.music-pl-btn` 占满）：行尾那枚圆形播放键已按用户要求删掉，
+   播放整项改走「双击这一行」（见 music.ts 的 dblclick）。
+   **行本身不画框**（用户 2026-09-28：「取消外框，改成不明显的分界线」）——
+   相邻行之间一条极淡的横线就够了；`border: none` 之后要留意 `.playing` / `.on`
+   不能再靠 border-color 表达（改成文字提亮 + 一层更淡的底）。 */
+.music-pl {
+  display: flex;
+  align-items: center;
+  transition: background 0.12s ease;
+}
+/* 行间那条**不明显的分界线**（最后一行不画，免得贴着一块空白的底边突兀） */
+#music-side-list > .music-pl:not(:last-child) {
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.05);
+}
+/* Spotify 那种行 hover：一层很淡的底，不换色相 */
+.music-pl:hover { background: rgba(var(--ink-rgb), 0.05); }
+/* 正在播的就是这个歌单 / 专辑 / 歌手：**只提亮名字**（不再画强调色边） */
+.music-pl.playing .music-pl-name { color: var(--accent); }
+/* 主区正在看的那一项（选中态）。与 `.playing` 是两件事：选中 ≠ 在播。
+   底色刻意压得比 hover 还淡 —— 它只是「主区现在是谁」的标记，不是一块卡片。 */
+.music-pl.on { background: rgba(var(--ink-rgb), 0.06); }
+.music-pl.on .music-pl-name { color: var(--text); }
+/* 收藏夹读取失败（多半是缺 `user-library-read`）：原因已经在副标题那行写着，
+   这里把副标题染成警示色即可 —— 整行加红框比一行小字更像「这个面板坏了」。 */
+.music-pl.err .music-pl-sub { color: var(--red); opacity: 1; }
+.music-pl-btn {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 7px;
+  text-align: left;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-pl-btn:hover { color: var(--text); }
+.music-pl-cover {
+  flex: 0 0 auto;
+  width: 40px; /* Spotify 的歌单缩图就是 40 —— 比 28 更像它，也更好认封面 */
+  height: 40px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.06);
+}
+.music-pl-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 「我喜欢的歌曲」的封面：Spotify 那块是**渐变底 + 实心心**，不是图片。 */
+.music-pl-liked-cover {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  background: linear-gradient(135deg, #4a3aff 0%, #8f6bed 62%, #c8b6ff 100%);
+}
+.music-pl-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.music-pl-name {
+  font-size: 0.78rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-pl-sub {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 曲目行（歌单内 / 播放列表内共用一套） */
+.music-tr {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 8px;
+  text-align: left;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-tr:hover { color: var(--text); background: rgba(var(--ink-rgb), 0.05); }
+.music-tr.playing { color: var(--accent); }
+.music-tr-i {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: right;
+  font-size: 0.62rem;
+  color: var(--text-muted);
+}
+.music-tr-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.music-tr-n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.music-tr-a {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-tr-d { flex: 0 0 auto; font-size: 0.62rem; color: var(--text-muted); }
+
+/* ── 默认面板：Spotify 复刻的两栏布局（2026-09-28）────────────────────
+   用户要求「歌单列作为单独的一列可拉动」「中间大的大部分区域作为歌曲列表」，
+   于是这一态从「一列内容」变成**左栏 Library + 可拖分隔条 + 主区**。
+   窗口是**定尺 1280×720**（16:9，用户 2026-09-28 定），所以结构必须是
+   「撑满窗口 + 两栏各自内部滚动」，而不是让内容把面板顶高、再由 `#results-list`
+   统一滚 —— 那样左栏会跟着曲目列表一起滚走，两栏就白分了。
+   左栏宽度由 JS 写在 `--music-side-w` 上（music.ts 的 `applySideWidth`）。
+
+   ⚠️ `height: 100%` 那条**只能给默认态**：播放态要拿 `.plugin-result` 的实测高
+   反推窗口尺寸（music.ts 的 `applyResize`），给它 100% 就成了
+   「量高度 ← 窗口高 ← 量高度」的死循环。所以整组都带 `:not(:has(...-player-on))`。 */
+body:has(.music-root):not(:has(.music-player-on)) #app.detached #results-list { overflow: hidden; }
+body:has(.music-root):not(:has(.music-player-on)) #app.detached #results-list .plugin-result:has(.music-root) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  box-sizing: border-box;
+}
+body:has(.music-root):not(:has(.music-player-on)) .music-root {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.music-body {
+  display: flex;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ── 底部控制栏（2026-09-28，Spotify 复刻）────────────────────────────
+   用户要求「在默认面板下方添加 Spotify 那样的播放控制，并把一些按钮也移动到下方」。
+   三列：左 = 正在播放（点它 = 打开播放面板）、中 = 播放键组、
+   右 = 设备 / 音量 / 队列 / 展开。
+   **中间那组要真居中，只能用 `grid-template-columns: minmax(0,1fr) auto minmax(0,1fr)`
+   + `justify-self`** —— 用 flex 的话左右两簇宽度不等会把中间那组整体推偏，
+   而这正是「对齐 Spotify」唯一的硬判据（Spotify 那条栏就是三列等分）。
+   栏顶那条 2px 细进度线**绝对定位**（不占高），可点击 / 可拖动跳转。 */
+.music-nowbar {
+  position: relative;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  height: 54px;
+  margin-top: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  background: rgba(var(--ink-rgb), 0.03);
+}
+/* 细进度线：**2px、可拖**（Spotify 的那条就是 2px）。左右各让开 8px，
+   免得 2px 的直线从 10px 的圆角外面探出去。 */
+.music-bp {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(var(--ink-rgb), 0.14);
+  --seek-pct: 0%;
+  cursor: pointer;
+}
+/* 命中区：画出来只有 2px，可点可拖的范围上下各多 4px（不然几乎压不中） */
+.music-bp::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -4px;
+  bottom: -4px;
+}
+.music-bp-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--seek-pct);
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s linear;
+}
+.music-bp.music-dragging .music-bp-fill { transition: none; }
+/* 时间气泡：这条线在栏顶，气泡只能**往下**放（放在线上方会跑出窗口） */
+.music-bp .music-progress-tip { bottom: auto; top: calc(100% + 4px); }
+.music-bp:hover .music-progress-tip,
+.music-bp.music-dragging .music-progress-tip { opacity: 1; }
+
+/* 左：正在播放。整块是一个按钮 —— 「点它打开播放面板」比多画一枚图标更符合直觉。 */
+.music-bnow {
+  justify-self: start;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 6px;
+  border-radius: 8px;
+  text-align: left;
+  color: var(--text);
+  cursor: pointer;
+}
+.music-bnow:hover { background: rgba(var(--ink-rgb), 0.06); }
+.music-bnow-cover {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.06);
+}
+.music-bnow-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.music-bnow-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.music-bnow-n {
+  font-size: 0.75rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-bnow-a {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 中：播放键组（随机 / 上一首 / 播放暂停 / 下一首）。 */
+.music-bctl {
+  justify-self: center;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 右：设备 / 音量 / 队列 / 展开。**弹层的定位参照**（见 `.music-dd` 那两条向上弹的规则）。 */
+.music-bend {
+  justify-self: end;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ── 左栏（Library 四类）── */
+.music-side {
+  flex: 0 0 var(--music-side-w, 300px);
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.03);
+}
+.music-side-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 8px 8px 6px;
+}
+/* 页签做成**胶囊芯片**（Spotify 的筛选片就是这形状），而不是下划线 tab：
+   左栏只有 300 宽，四个中文页签用下划线会连成一条、看不出选中谁。 */
+.music-tab {
+  padding: 3px 10px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.music-tab:hover { color: var(--text); }
+.music-tab.on {
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.1);
+  border-color: var(--border-glass);
+}
+.music-side-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 6px 8px;
+}
+
+/* ── 分隔条（可拖动）──
+   条子本身只占 6px 宽、**不画线**：线在 ::before 上，这样鼠标有 6px 的热区；
+   真画一条 1px 的线，用户几乎压不中（实测拖动成功率极低）。 */
+.music-split {
+  flex: 0 0 6px;
+  position: relative;
+  cursor: col-resize;
+}
+.music-split::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border-glass);
+  transition: background 0.12s ease, width 0.12s ease;
+}
+.music-split:hover::before,
+body.music-resizing .music-split::before { width: 2px; background: var(--accent-border); }
+/* 拖动期间：光标锁成 col-resize、禁止选中。**用后代通配**——
+   指针离开那 6px 之后底下的元素各有各的 cursor，不锁就会看到光标一路闪回箭头。 */
+body.music-resizing { cursor: col-resize; user-select: none; }
+body.music-resizing * { cursor: col-resize !important; }
+
+/* ── 主区（标题头 + 曲目列表 / 卡片网格）── */
+.music-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 2px 8px 10px;
+}
+.music-page { display: flex; flex-direction: column; gap: 10px; }
+.music-page-head { display: flex; align-items: flex-end; gap: 14px; }
+.music-page-cover {
+  flex: 0 0 auto;
+  width: 120px;
+  height: 120px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.06);
+}
+.music-page-cover.round { border-radius: 50%; }
+.music-page-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.music-page-info { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+/* 搜索详细页没有封面，头就只剩两行字 */
+.music-page-info-flat { flex: 0 0 auto; gap: 2px; }
+.music-page-kind {
+  font-size: 0.62rem;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.music-page-name {
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-page-sub {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-page-actions { display: flex; gap: 6px; margin-top: 4px; }
+.music-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.music-list { display: flex; flex-direction: column; }
+
+/* 浏览用的竖卡（搜索详细页的歌手 / 专辑 / 歌单 / 电台）。 */
+.music-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  gap: 12px;
+}
+.music-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  padding: 8px;
+  border-radius: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.music-card:hover { background: rgba(var(--ink-rgb), 0.05); }
+.music-card-cover {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 5px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.06);
+}
+/* 歌手头像是圆的（Spotify 的做法），其余三类是方封面 */
+.music-card-cover.round { border-radius: 50%; }
+.music-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.music-card-n {
+  font-size: 0.75rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-card-s {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 浮层：搜索下拉预览 + 设备 / 队列弹层（都是绝对定位，**不占布局**）──
+   不占布局是硬要求：面板是定尺 1280×720，浮层若参与布局，窗口高会跟着
+   搜索结果条数抖。定位参照：搜索预览挂 `.music-search-wrap`（对齐输入框），
+   设备与队列弹层挂底部控制栏右边那一簇（`.music-bend`）并**向上弹** ——
+   那条栏贴着窗口下沿，`top: 100%` 会把它送到窗口外面去（`.music-dd` 的默认方向
+   是向下的，所以这两条必须把 `top` 清掉、改用 `bottom`）。 */
+.music-dd {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 30;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, calc(0.45 * var(--shade-scale)));
+}
+#music-search-dd { left: 0; right: 0; }
+#music-dev-dd {
+  top: auto;
+  bottom: calc(100% + 8px);
+  right: 0;
+  width: 300px;
+}
+/* 队列浮层：比设备弹层宽（要放「序号 + 歌名 + 歌手 + 时长」四列），
+   底边与设备弹层对齐。里面的行就是 `renderQueue` 那套 `play-uri` 行。 */
+#music-q-dd {
+  top: auto;
+  bottom: calc(100% + 8px);
+  right: 0;
+  width: 360px;
+  max-height: 320px;
+}
+.music-dd-head {
+  padding: 4px 8px 6px;
+  font-size: 0.62rem;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+/* 预览底部那条「查看全部」＝ 进主区的搜索详细页 */
+.music-dd-all {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 7px 8px 4px;
+  border-top: 1px solid var(--border-glass);
+  font-size: 0.7rem;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
+}
+.music-dd-all:hover { color: var(--text); }
+
+.music-dev-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  text-align: left;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.music-dev-row:hover { background: rgba(var(--ink-rgb), 0.05); color: var(--text); }
+/* 「正在用的那台」＝ Spotify 回的 active，或我们本机播放的 librespot 在跑 */
+.music-dev-row.on { color: var(--accent); }
+.music-dev-row.disabled { opacity: 0.6; cursor: default; }
+.music-dev-ico { flex: 0 0 auto; display: inline-flex; color: inherit; }
+.music-dev-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.music-dev-n {
+  font-size: 0.74rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-dev-s {
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 工具条上的设备按钮：**没有活跃设备**时点一下黄（那正是用户最需要知道的时候）。
+   实现在 renderStatus —— 它把原来的「无活跃设备」提示行换成了这个按钮的题注与态。 */
+#music-devices-btn.warn { color: var(--yellow); border-color: rgba(201, 184, 150, 0.45); }
+
+/* ── 播放界面：**550×130 的长条**（用户 2026-09-27 给的定尺）──────────
+   550 = 封面 100 + 右侧列 450；130 = 歌名 30 + 歌词 65 + 控制 35。
+   下面三个高度都用 `flex: 0 0 Npx` 钉死，**加起来必须正好 130** ——
+   改任何一个都要同步 music.ts 的 `MUSIC_W_BAR`（下发给宿主的宽度）与
+   宿主 plugin_window.rs 的 `MUSIC_MIN_H`（那一档的最小高度下限）
+   （见 ai-spec §4.6、预检 #39 ④）。 */
+.music-player { gap: 8px; }
+.music-pv-card {
+  display: flex;
+  align-items: center;
+  height: 130px;
+  border-radius: 12px;
+  /* **边框用 `box-shadow: inset` 而不是 `border`**（2026-09-27 实测）：`border` 会吃掉
+     内容盒（550→548），右侧列就被压成 448、连 `height: 130` 也会比内容盒高 2px 而溢出。
+     inset 阴影不参与布局，长条的**内容盒**才正好是 550×130。 */
+  box-shadow: inset 0 0 0 1px var(--border-glass);
+  background: rgba(0, 0, 0, calc(0.16 * var(--shade-scale)));
+  overflow: hidden;
+}
+.music-pv-cover {
+  flex: 0 0 100px;
+  width: 100px;
+  height: 100px;
+  border-radius: 8px;
   border: 1px solid var(--border-glass);
   background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
   overflow: hidden;
 }
-.music-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.music-meta { flex: 1 1 auto; min-width: 0; }
+.music-pv-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 右侧列：**450 宽、130 高**，三块竖向排满（30 + 65 + 35）。
+   **这里不留左右 padding**：留了就等于把用户定的 450 削掉（实测过：padding-left 10
+   会让三块变成 438）。文案的呼吸感放在三块**各自的内部 padding** 里，块宽仍是 450。 */
+.music-pv-col {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 130px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── 歌名模块 H30：歌名（亮）+ 歌手·专辑（暗）+ 时间 + 返回入口 ──
+   `padding-left: 10px` 是「封面用正方形分离在左侧」的呼吸（封面是整块贴左的图片，
+   不给点内缩，标题就贴在封面边缘上）。 */
+.music-name {
+  flex: 0 0 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 6px 0 10px;
+}
+.music-name-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
 .music-title {
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: 0.8rem;
   color: var(--text);
   overflow: hidden;
@@ -4293,50 +5042,137 @@ html, body {
   white-space: nowrap;
 }
 .music-sub {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 0.68rem;
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  margin-bottom: 5px;
-}
-.music-progress {
-  height: 3px;
-  border-radius: 2px;
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
-  overflow: hidden;
-}
-.music-progress-fill {
-  height: 100%;
-  width: 0;
-  background: var(--accent);
-  transition: width 0.35s linear;
 }
 .music-time {
+  flex: 0 0 auto;
   display: flex;
-  justify-content: space-between;
+  align-items: baseline;
+  gap: 2px;
   font-size: 0.62rem;
   color: var(--text-muted);
-  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
 }
-.music-controls { display: flex; align-items: center; gap: 8px; }
-.music-round-btn {
-  display: inline-flex;
+.music-time-sep { opacity: 0.55; }
+
+/* ── 控制面板 H35（进度条 + 按钮 + 音量 + 播放列表）─────────────
+   进度条**绝对定位叠在本块顶部**：不占高度 ⇒ 长条总高仍是 130。
+   所以本块要 `padding-top` 把按钮往下让 4px，否则居中的播放键会压在那条进度线上。 */
+.music-bar {
+  position: relative;
+  flex: 0 0 35px;
+  box-sizing: border-box;
+  display: flex;
   align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: 1px solid var(--border-glass);
-  color: var(--text-dim);
+  height: 35px;
+  padding-top: 4px;
+}
+.music-bar-main { display: flex; align-items: center; gap: 8px; margin: 0 auto; }
+/* 时间在控制块**最左端、进度条下方**（用户 2026-09-27 定）。
+   绝对定位 ⇒ 不参与四钮的居中计算（`.music-bar-main` 靠 `margin: 0 auto` 居中）。 */
+.music-bar > .music-time {
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 音量条（80px，用户定的）+ 播放列表按钮贴右端。**绝对定位** ⇒ 四钮的居中不受它影响。 */
+.music-bar-end {
+  position: absolute;
+  top: 4px;
+  bottom: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 进度条：宽 = 右侧列宽，贴在控制块最上沿。
+   **位置由一个 CSS 变量驱动**（`--seek-pct`，music.ts 只写这一个）：
+   填充 / 圆点 / 时间气泡三处都要跟着它走，写三遍 JS 迟早会漂移。
+   `padding` + `background-clip: content-box` 是**命中区**：画出来只有 3px，
+   但可点可拖的范围上下各 6px（圆点探出的部分也归它）。 */
+.music-progress {
+  position: absolute;
+  top: -6px;
+  left: 0;
+  right: 0;
+  height: 3px;
+  padding: 6px 0;
+  box-sizing: content-box;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background-clip: content-box;
+  --seek-pct: 0%;
   cursor: pointer;
 }
-.music-round-btn:hover { color: var(--text); border-color: var(--accent-border); }
-.music-play-btn { width: 34px; height: 34px; }
-.music-round-btn:disabled { opacity: 0.4; cursor: default; }
+.music-progress-fill {
+  height: 3px;
+  width: var(--seek-pct);
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.3s linear;
+}
+/* 拖动中：填充必须**逐帧跟手**，`.3s` 的补间会让它落后于指针 */
+.music-progress.music-dragging .music-progress-fill { transition: none; }
+/* 圆点：平时不出现，悬停 / 拖动时才浮出来（带一点放大动画） */
+.music-progress-dot {
+  position: absolute;
+  top: 6px;
+  left: var(--seek-pct);
+  width: 9px;
+  height: 9px;
+  margin: -3px 0 0 -4.5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--border-glass);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+.music-progress:hover .music-progress-dot,
+.music-progress.music-dragging .music-progress-dot { opacity: 1; transform: scale(1); }
+/* 时间气泡：显示在**圆点正上方**（短时浮在歌词区上，卡片没裁掉这块）
+   `bottom: 100%` 是相对命中区（15px 高）的底边 ⇒ 正好落在那条 3px 线上方。 */
+.music-progress-tip {
+  position: absolute;
+  bottom: 100%;
+  left: var(--seek-pct);
+  transform: translate(-50%, -2px);
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--accent-border);
+  background: var(--bg-panel, rgba(18, 18, 22, 0.94));
+  color: var(--text);
+  font-size: 0.6rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.music-progress:hover .music-progress-tip,
+.music-progress.music-dragging .music-progress-tip { opacity: 1; }
+
+/* 音量条：**80px**（用户定的宽度），排在下一首右侧、播放列表按钮左侧 */
+.music-vol-ico { flex: 0 0 auto; display: inline-flex; color: var(--text-muted); }
 .music-vol {
-  flex: 1 1 auto;
-  min-width: 60px;
+  flex: 0 0 80px;
+  width: 80px;
   height: 3px;
   -webkit-appearance: none;
   appearance: none;
@@ -4355,63 +5191,104 @@ html, body {
   border: none;
 }
 
-.music-lyrics-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  flex: 1 1 auto;
-  min-height: 0;
+/* ── 歌词模块 H65：正好两行（行高 32）─────────────────────────────
+   着色规则（用户 2026-09-27 定）：**已过 + 正在 = 亮，未到 = 暗**。
+   **这里不写 `scroll-behavior: smooth`** —— 滚动由 music.ts 的 rAF 缓动负责
+   （用户要求时长更长、阻尼更明显），CSS 平滑会接管每帧 scrollTop 赋值、
+   和 rAF 叠成两段动画。 */
+.music-lyr {
+  flex: 0 0 65px;
+  height: 65px;
+  overflow-y: auto;
+  padding: 0 6px 0 10px;
+  font-size: 0.78rem;
 }
-.music-lyrics-head { display: flex; align-items: center; gap: 6px; }
-.music-lyrics-title {
-  flex: 0 1 auto;
-  font-size: 0.66rem;
-  color: var(--text-muted);
+.music-lyr-lines { display: flex; flex-direction: column; padding-bottom: 33px; }
+/* 行内不换行：定尺窗口里换行会把「两行」的几何关系打乱（超长句截断显示） */
+.music-lyr-line {
+  height: 32px;
+  line-height: 32px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  color: var(--text-muted);   /* 未到：暗 */
+  opacity: 0.72;
+  transition: color 0.35s ease, opacity 0.35s ease;
+  cursor: pointer;            /* 点一行 = 跳到那一句 */
 }
-.music-lyrics-head input {
+/* 已过 + 正在：**色相不变、只提亮** —— 向 --ink-rgb（深色主题=白 / 浅色主题=黑）混合。
+   混中性色只改明度、不引入第二个色相；浅色主题下方向自动翻转（变深 = 更醒目），
+   所以不能写死 `filter: brightness()`（浅色主题下会把文字越调越淡）。 */
+.music-lyr-line.done {
+  opacity: 1;
+  color: color-mix(in srgb, var(--text-dim) 25%, rgb(var(--ink-rgb)));
+}
+.music-lyr-line:hover { color: var(--text); }
+.music-lyr-plain { white-space: pre-wrap; opacity: 0.85; }
+
+/* 播放列表（队列）面板：占「歌词那一格」，比歌词高一些（能看 5 首左右） */
+.music-q-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  height: 168px;
+  min-height: 0;
+}
+.music-q {
   flex: 1 1 auto;
-  min-width: 60px;
-  padding: 4px 8px;
-  font-size: 0.68rem;
-  color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
-  border: 1px solid var(--border-glass);
-  border-radius: 5px;
-  outline: none;
-  caret-color: var(--accent);
-}
-.music-lyrics {
-  /* 内嵌插件视图是固定高（360px）的滚动容器（`#results-list`），但 `.plugin-result`
-     本身高度是 auto ⇒ 这里的百分比高度**解析不出来**，所以用 max-height 把歌词盒
-     钉成一个「内部可滚」的定高块。给 `syncActiveLine()` 的居中滚动一个可用的滚动盒。 */
-  min-height: 60px;
-  max-height: 168px;
+  min-height: 0;
   overflow-y: auto;
-  padding: 4px 6px;
-  font-size: 0.74rem;
-  line-height: 1.7;
-  color: var(--text-dim);
-  border-top: 1px solid var(--border-glass);
-  scroll-behavior: smooth;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
 }
-.music-lrc-line { padding: 1px 0; transition: color 0.2s; }
-.music-lrc-line.active { color: var(--accent); }
-.music-lrc-plain { white-space: pre-wrap; }
-.music-lyric-empty { color: var(--text-muted); opacity: 0.8; padding: 6px 0; }
-.music-cands { display: flex; flex-direction: column; gap: 3px; }
-.music-cand {
-  text-align: left;
-  padding: 4px 8px;
-  font-size: 0.7rem;
+
+/* 控制面板里的圆钮。**尺寸受 35px 高度 + 顶部 3px 进度线双重约束**：
+   `.music-bar` 已 `padding-top: 4px` 把内容区下移，于是居中的 30px 播放键
+   落在 4.5–34.5，正好让开顶上那条进度线；写 32px 就会压上去。 */
+.music-round-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
   border: 1px solid var(--border-glass);
-  border-radius: 5px;
   color: var(--text-dim);
   cursor: pointer;
 }
-.music-cand:hover { color: var(--text); }
+.music-round-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-play-btn { width: 30px; height: 30px; }
+.music-round-btn:disabled { opacity: 0.4; cursor: default; }
+/* 三态按钮：关 = 暗、随机 / 单曲循环 = 主题色；单曲循环多一个小「1」 */
+.music-mode-btn { position: relative; }
+.music-mode-btn[data-mode="off"] { opacity: 0.5; }
+.music-mode-btn[data-mode="shuffle"],
+.music-mode-btn[data-mode="repeat_one"] {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  opacity: 1;
+}
+.music-mode-btn[data-mode="repeat_one"]::after {
+  content: "1";
+  position: absolute;
+  right: 1px;
+  bottom: 0;
+  font-size: 8px;
+  line-height: 1;
+  font-weight: 700;
+}
+/* 播放列表按钮的「按下」态。**选择器落在按钮上、不是 `.music-bar-end`** ——
+   2026-09-27 起 `.music-bar-end` 变成了**容器**（里面还有音量条），
+   而 `.on` 是 `syncPlayerBody()` 打在 `#music-queue-btn` 上的。 */
+#music-queue-btn.on { color: var(--accent); border-color: var(--accent-border); }
+
+/* 插件悬浮窗里的音乐插件：**默认态的内容正好 1280 宽**（用户 2026-09-28 定的定尺）。
+   外层能垫的只有这三处，全在这一条里收窄 —— 换掉任何一条都要回来改这里：
+     #app.detached padding 2×2 + #results-container 边框 1×2 + 本条 3×2 = 12
+   ⇒ 宿主 plugin_window.rs 的 MUSIC_W(1280) 是**窗口**宽，内容宽是它减 12。
+   **播放态不用这一条**：那一态窗口就等于长条本身（外层垫料全清零，见上方 728 行那组规则）。 */
+#app.detached #results-list .plugin-result:has(.music-root) { padding: 6px 3px; }
 
 /* ── 文件转换插件（图片 / 音频 / 视频，2026-09-27）─────────────────
    与音乐插件同一条纪律：**不写按钮底色**（`#app button:where(...)` 全局规则已统一），

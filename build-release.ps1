@@ -1,4 +1,4 @@
-﻿# Lunac Release Build Script
+# Lunac Release Build Script
 # Usage: .\build-release.ps1 [-Version <x.y.z>] [-NoBump]
 #   .\build-release.ps1                   - 读 package.json 的版本，patch 自动 +1，并同步六处（含扩展与 lockfile）
 #   .\build-release.ps1 -Version 0.10.0   - 显式指定版本（不递增），并同步六处
@@ -315,20 +315,25 @@ if (Test-Path "$AppDir\cli.exe") {
   throw "暂存目录里出现 cli.exe —— 上游 CLI 禁止随安装包分发（见 .gitignore / ai-spec §8.3）"
 }
 
-# ── 技能 / 工具模板（agent-templates\ → skills\ + tools\）─────────────
-# 装完就有的两个目录，用户照着 README 与 .example 抄自己的技能/工具。
+# ── 技能 / 工具 / 插件模板（agent-templates\ → skills\ + tools\ + Modules\）──
+# 装完就有的目录，用户照着 README 与 .example 抄自己的技能/工具。
 # 刻意只放「不可加载」的形态：
 #   · skills\ 下任何含 SKILL.md 的子目录都会被列进系统提示词
 #   · tools\  下任何 .json 都会被当工具加载
 # 所以模板一律用 .example 后缀，避免污染模型的工具清单与提示词。
+#
+# **Modules\**（2026-09-28）只有一份 README（插件开发规范）—— 它既给用户看，也是
+# 「让 Lunac 自己写插件」的依据（宿主把该目录与 README 的绝对路径都交给了 agent）。
+# 插件本体**不随安装包分发**：它们在插件市场里按需下载（含各自的依赖）。
 $TplDir = "$Root\agent-templates"
-foreach ($sub in @("skills", "tools")) {
+$TplMap = @{ "skills" = "skills"; "tools" = "tools"; "modules" = "Modules" }
+foreach ($sub in $TplMap.Keys) {
   $src = Join-Path $TplDir $sub
   if (-not (Test-Path $src)) {
     throw "agent-templates\$sub not found: $src"
   }
-  Copy-Item $src -Destination "$AppDir\$sub" -Recurse -Force
-  Write-Host "  $sub\ (README + .example templates)" -ForegroundColor DarkGray
+  Copy-Item $src -Destination "$AppDir\$($TplMap[$sub])" -Recurse -Force
+  Write-Host "  $($TplMap[$sub])\ (templates)" -ForegroundColor DarkGray
 }
 
 $totalMb = [math]::Round($TotalBinSize / 1MB, 1)

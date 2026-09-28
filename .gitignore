@@ -18,6 +18,8 @@ node_modules/
 # ── 构建产物 ──────────────────────────────────────────────────
 app/dist/
 ui/dist/
+# 磁盘插件（Modules\<id>\）的独立构建产物 —— 见 app/vite.plugins.config.ts + scripts/build-plugins.ps1
+app/plugin-dist/
 app/src-tauri/target/
 app/src-tauri/target-e2e/
 app/src-tauri/gen/

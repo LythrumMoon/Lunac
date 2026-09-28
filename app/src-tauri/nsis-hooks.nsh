@@ -10,6 +10,8 @@
   RMDir /r "$INSTDIR\temp"
   RMDir /r "$INSTDIR\skills"
   RMDir /r "$INSTDIR\tools"
+  ; 插件目录 2026-09-28 由 plugins\ 改名 Modules\ —— 旧目录也一并清（升级过来的人可能还留着）
+  RMDir /r "$INSTDIR\Modules"
   RMDir /r "$INSTDIR\plugins"
   RMDir /r "$INSTDIR\config"
   RMDir /r "$INSTDIR\paddle-ocr"

@@ -689,25 +689,31 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 文件位置 | `<exe 根>\config\persona.md`，与 `ai.json` / `hotkey.json` / `hooks.json` / `pricing.json` 同级（「应用配置」；业务数据才进 `ModuleData`） |
 | 实测（2026-09-21，`core-agent\target\hooktest\e2e-l2.ps1`，真 `agent.exe` + 假端点，**16 条断言全过**） | 两轮对照：**Run A** 把 `LUNAC_PERSONA_FILE` 指向含 `PERSONA-MARKER-42` 的文件 ⇒ 线上 `system` 字符串里 `## Personality` < `## User-defined persona` < `Environment:` 三个下标严格递增、marker 在场，且该问两次请求的 `system` 前缀哈希**同值**（逐字节不变）；**Run B** 指向空文件 ⇒ marker / 表头都不在，且前缀哈希与**未引入 L2 时的基线完全相同** ⇒「没配人格时不加任何字节」由实测坐实（不是靠代码里那句 `if` 说服自己） |
 
-**插件市场（L1，2026-09-21）**：`<exe 根>\plugins\<id>\` 下的第三方插件**在启动时被注册进同一个 `pluginRegistry`**，于是结果区渲染、拼音匹配、`pluginIconSvg()`、i18n 的 `plugin.<id>` 全部零改动。宿主侧实现：[app/src-tauri/src/plugin_market.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_market.rs)（扫描 / 解压 / 校验 / 卸载 / **索引解析**，9 条单测）+ [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 的五个命令；前端适配层 [app/src/plugins/market.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/market.ts)；可下载清单由本仓 [plugins/index.json](file:///d:/cc/claude-code-cli-master/plugins/index.json) 提供。要点：
+**插件市场（L1，2026-09-21；2026-09-28 迁目录 + 加依赖）**：`<exe 根>\Modules\<id>\` 下的第三方插件**在启动时被注册进同一个 `pluginRegistry`**，于是结果区渲染、拼音匹配、`pluginIconSvg()`、i18n 的 `plugin.<id>` 全部零改动。宿主侧实现：[app/src-tauri/src/plugin_market.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_market.rs)（扫描 / 解压 / 校验 / 卸载 / **索引解析** / **依赖安装**，12 条单测）+ [commands.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/commands.rs) 的五个命令；前端适配层 [app/src/plugins/market.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/market.ts)；可下载清单由本仓 [plugins/index.json](file:///d:/cc/claude-code-cli-master/plugins/index.json) 提供。要点：
 
 | 项 | 约定 |
 |---|---|
-| 包形状 | **https 的 zip**，包内（根目录或唯一一层子目录 —— GitHub 的 zip 会给一个顶层目录）必须有 `lunac-plugin.json` + **已编译好的 ESM 入口**（`entry`，默认 `index.js`）。清单字段：`id`（**同时是目录名**）/ `name` / `description` / `keywords` / `icon` / `version` / `entry` / `homepage` |
+| 包形状 | **https 的 zip**，包内（根目录或唯一一层子目录 —— GitHub 的 zip 会给一个顶层目录）必须有 `lunac-plugin.json` + **已编译好的 ESM 入口**（`entry`，默认 `index.js`）。清单字段：`id`（**同时是目录名**）/ `name` / `description` / `keywords` / `icon` / `version` / `entry` / `homepage` / **`dependencies`**（见下一条） |
 | 加载通道 | `convertFileSrc(entry)` → `import(/* @vite-ignore */ url)`。**CSP 必须含 `https://asset.localhost`（script-src）**—— 2026-09-21 已在 `tauri.conf.json` 加上。两条前提经 Tauri 源码核实（不是猜的）：`.js` / `.mjs` 在 asset 协议下被标成 **`text/javascript`**（`tauri-utils/src/mime_type.rs`），asset 响应一律带 **`Access-Control-Allow-Origin: <窗口 origin>`**（`tauri/src/protocol/asset.rs`）⇒ 跨 origin 的模块加载成立。**插件代码永远不能走 CDN**（同 §3.7 的 KaTeX 缺陷是同一条约束） |
 | 插件契约 | 入口**默认导出** `{ execute(input) => string \| { type, content } }`；也接受「默认导出就是函数」或「具名导出 execute」。入参是搜索栏原始文本（与内置插件一致）；`type: 'html'` 的结果会被 `innerHTML` 渲染 —— 与内置插件同路，所以**装谁 = 信任谁的代码**，界面上必须把「这是可执行代码 + 来源」写出来 |
-| 校验（比 tools / skills 先例更严，因为解压的是可执行代码） | ① **只收 https**（明文 http 的 zip 会被解压执行）；② 压缩包 ≤ 32MB、**解压后总量 ≤ 192MB**、条目 ≤ 4000（zip bomb）；③ 逐条拒绝绝对路径 / `..` / 空段 / 深度 > 16 / 以点或空格结尾的分段（路径穿越，判据收口在纯函数 `safe_join()`，有单测）；④ `id` 只允许 `[a-z0-9._-]` 且不以 `.` 开头（它直接当目录名）；⑤ `entry` 必须是相对路径且以 `.js` / `.mjs` 结尾；⑥ **同 id 已存在 ⇒ 拒绝**（不静默覆盖：无声换掉一个插件目录里的代码是最不该发生的事；用户要升级就先卸载）；⑦ 先解到 `.staging-*` 再改名进正式目录，**失败即清理**（不留半成品） |
+| **磁盘插件的挂载约定**（2026-09-28） | 内置插件的 attach 是 `app/src/plugins/attach.ts` 里一张**硬编码 switch**（要 import 各家模块、传各自参数）。磁盘插件不能改宿主源码，于是改成**插件自己声明**：入口里具名导出（或默认导出对象上的）`attach(root)` / `detach()`，`attach.ts` 的 `default` 分支转交 `market.ts::externalAttach()`。挂上的钩子存在 `market.ts` 的 `hooks` 表里，面板关闭时 `externalDetach()` 收掉。**没有 `attach` 就是「不需要挂载」**（与内置表未命中同义），不是错误。 |
+| **插件拿宿主能力走桥**（2026-09-28） | 插件是**独立打包的 ESM**，`import` 到的宿主模块（i18n 等）是**另一份未初始化的副本** ⇒ 插件自带 i18n 会让界面全是 `music.play` 这类 key。所以宿主把自己的 `t` 挂到 `globalThis.__lunac_host`（`app/src/plugins/host.ts` 的 `installHostBridge()`，main.ts 与 plugin-window.ts 启动时各装一次），插件 `import { t } from ".../host.js"` —— 同一份源码主 bundle 里是宿主实现、插件 bundle 里读全局。**桥只加不减**（`apiVersion` 当前 1），插件侧对 `undefined` 必须有兜底。 |
+| **依赖随插件装**（2026-09-28） | 清单 `dependencies[]` 由 `plugin_market::install_dependencies()` 在**插件落盘之后、同一次安装里**逐条拉好；**任一条失败 = 整次安装失败**（新版本删掉、旧版本搬回来）。两种形态：`file`（`url` 必须 https + `dest` 必须留在插件目录内 + 可选 `sha256`，**写了就必须对上**；先写 `.part` 再改名）与 `npm`（`npm install --prefix <插件目录> <包>@<版本>`，需要用户机器有 Node.js，**找不到就如实报错**）。单文件上限 512 MB、最多 32 条。**这是「release 缺 librespot / 缺 PaddleOCR」这类问题的根治办法**：依赖跟着用到它的插件走，不再由构建脚本塞进安装包（作者漏拷一次就只能等下一个版本）。 |
+| **Lunac 自己写插件**（2026-09-28） | `<exe 根>\Modules\README.md`（源文件 `agent-templates\modules\README.md`，由 `build-release.ps1` 第 6 步复制、NSI 安装，**升级安装不清空该目录**）既是给用户的文档，也是给 agent 的规范。宿主把 `LUNAC_MODULES_DIR` 交给 agent.exe（commands.rs）：core-agent ① 把它推进 `Ctx.add_dirs`（工作区锁生效时也写得进去）、② 在 `env_block()` 里写明「插件放这儿、规范是同目录的 README.md、写完后让用户去 设置→插件→重新扫描」。于是**自建插件 = 写两个纯文本文件**（`lunac-plugin.json` + `index.js`），不需要 dev 版、不需要前端构建环境。 |
+| 校验（比 tools / skills 先例更严，因为解压的是可执行代码） | ① **只收 https**（明文 http 的 zip 会被解压执行）；② 压缩包 ≤ 32MB、**解压后总量 ≤ 192MB**、条目 ≤ 4000（zip bomb）；③ 逐条拒绝绝对路径 / `..` / 空段 / 深度 > 16 / 以点或空格结尾的分段（路径穿越，判据收口在纯函数 `safe_join()`，有单测）；④ `id` 只允许 `[a-z0-9._-]` 且不以 `.` 开头（它直接当目录名）；⑤ `entry` 必须是相对路径且以 `.js` / `.mjs` 结尾；⑥ **同 id = 重装 / 升级**（2026-09-28 改，原为「已存在即拒绝」）：旧目录先改名成 `.old-*`，新包或依赖任一步失败就搬回来、成功才删备份 —— 一键升级与「不静默换代码」两条都要，靠回滚而不是靠拒绝；⑦ 先解到 `.staging-*` 再改名进正式目录，**失败即清理**（不留半成品） |
+| 目录改名（2026-09-28） | 插件根从 `<exe 根>\plugins\` 改为 **`<exe 根>\Modules\`**（用户指定；与 `ModuleData\` 是两回事 —— 那边是业务数据）。旧目录由 `plugin_market::migrate_legacy_plugins_dir()` 在 `main()` 里**一次性搬运**（幂等；同名冲突保留 `Modules\` 那份并 warn；搬不动就留着旧目录，绝不删用户文件）。 |
 | 安全边界要诚实 | 这里做的是**防事故**（写坏路径、把包塞爆、装重了），**不是防恶意** —— 插件是用户自己选择安装的可执行代码，装上即等同一份本机权限（与 `tools\` 的 shell handler 同族）。别把这条写成「已沙箱化」 |
-| 生效语义 | 装完 / 卸完**立即生效，不必重启 AI 也不必刷前端**：`refreshMarketPlugins()` 把旧 id `unregister` 掉再 `register` 新对象（registry 不去重，直接二次 register 会让结果区出现两行）。这与「技能改完要重启 agent」是两回事（技能是 agent 的能力、插件是前端的界面件） |
+| 生效语义 | 装完 / 卸完**立即生效，不必重启 AI 也不必刷前端**：`refreshMarketPlugins()` 把旧 id `unregister` 掉再 `register` 新对象（registry 不去重，直接二次 register 会让结果区出现两行）。**升级会按 `version` 清模块缓存**（2026-09-28）：升级装的是同一个目录、同一个 `entry` 路径，不清缓存会把用户按回旧代码；卸载掉 / 已不存在的 id 也一并清（连 `attach` 钩子一起）。**手工把文件夹写进 `Modules\` 的情况**（Lunac 自建插件、作者本机调试）走设置面板的「重新扫描」按钮 —— 语义比“每次打开设置都悄悄重注册”更清楚，也不会在用户没动作时换掉正开着的插件。这与「技能改完要重启 agent」是两回事（技能是 agent 的能力、插件是前端的界面件） |
 | 坏包必须可见 | 清单坏了、入口丢了的包**不进 registry**（用不了），但**必须列在面板上并写出原因** —— 否则用户只会看到插件莫名消失、手上没有任何线索。`list_installed_plugins` 因此返回 `valid` + `error` 两个字段 |
-| **索引 = 「去哪下」的清单**（2026-09-21 二次改版加的） | 面板要能列出「**没装但可以装**」的插件，而本地扫描只看得见「已经装了的」。索引放在本仓 `main` 分支：**`plugins/index.json`**（顶层是**数组**，一条 = `{ id, name, description, version, url, keywords?, icon?, homepage? }`；`url` 是 https 的插件 zip 地址）。地址是 **Rust 常量** `plugin_market::INDEX_URL`，**不由前端传** |
+| **索引 = 「去哪下」的清单**（2026-09-21 二次改版加的；2026-09-28 换到独立公开仓库） | 面板要能列出「**没装但可以装**」的插件，而本地扫描只看得见「已经装了的」。索引与插件包都在**公开仓库 `LythrumMoon/lunac-plugins`**：`main/index.json`（顶层是**数组**，一条 = `{ id, name, description, version, url, keywords?, icon?, homepage? }`；`url` 是 https 的插件 zip 直链，形如 `https://raw.githubusercontent.com/LythrumMoon/lunac-plugins/main/packages/<id>-<ver>.zip`）。地址是 **Rust 常量** `plugin_market::INDEX_URL`，**不由前端传**。**为什么必须公开**：主仓库 `LythrumMoon/Lunac` 是私有的，而 raw/Release 对私有仓库要鉴权 ⇒ 终端用户**永远拉不到**，索引与包都是死的（2026-09-28 查出来的既有缺陷）。发布链路：`scripts\build-plugins.ps1`（vite 库模式出单文件 ESM + 生成清单 + 打 zip）→ `scripts\publish-plugins.ps1`（拷进插件仓库的 `packages\`、生成 `index.json`、commit + push）。**主仓库里的 `plugins/index.json` 已删除** —— 索引只有一份，别留第二个真相源 |
 | 索引**由宿主去拉**，且**逐条再筛一遍** | 两条理由：① 前端 CSP 的 `default-src` 不含 github 域（没写 `connect-src` ⇒ 回落 default-src），前端 `fetch()` 会被直接拦掉；② 索引是**远端可改的文本**，谁写索引谁就影响了「前端能下什么」⇒ 必须按插件包的口径重新校验：`id` 过 `is_safe_id()`（它将来是目录名）、`url` 必须 `https://`、`name` 不能空。判据收口在纯函数 **`parse_index()`**（两条单测），坏条目**只丢自己**（`warn` 留痕）而不是丢整份索引 —— 这与「坏包必须可见」是两条不同的处置：那边是用户**已经装在盘上**的东西，消失了他找不到 |
 | 索引的传输闸 | 与插件包同一套：**只 https**、体积上限（`MAX_INDEX_BYTES` = 1 MB，Content-Length 先拦 + 按真实读到的字节再拦）、条目数上限（`MAX_INDEX_ENTRIES` = 500）；拉不到就**只提示一行**，市场退回「只有本机插件」的形态（等于这个功能不存在时的样子），**不静默变成空表** |
-| 界面形态（2026-09-21 二次改版） | 插件面板**只有一段**「插件市场」，一张表一行一个插件，按钮由**本机事实**（`pluginRegistry` + 插件目录扫描）决定，**不是索引自称的**：已装且能用 ⇒ 「打开」（第三方多一个两段式确认的「卸载」；内置编译进 bundle，没有目录、没得卸）；装了但包坏了 ⇒ 原因 + 「卸载」；没装而索引里有 ⇒ 「下载」。合并顺序**固定**：已装（registry 顺序照旧）→ 坏包 → 索引里还没装的。**下载与手工安装是同一条**宿主命令 `install_plugin_from_url` —— 索引只提供 URL，别在前端另开一条 |
+| 界面形态（2026-09-21 二次改版；2026-09-28 加「更新 / 重新扫描 / 依赖条数」） | 插件面板**只有一段**「插件市场」，一张表一行一个插件，按钮由**本机事实**（`pluginRegistry` + 插件目录扫描）决定，**不是索引自称的**：已装且能用 ⇒ 「打开」（第三方多一个两段式确认的「卸载」；内置编译进 bundle，没有目录、没得卸）；**已装而索引里版本不同 ⇒ 多一个「更新」**（同 id 重装 = 升级，走的就是那条安装命令 —— 版本号只做「不同即视为有新版」，**不猜大小**：索引版本是作者写的自由文本）；装了但包坏了 ⇒ 原因 + 「卸载」；没装而索引里有 ⇒ 「下载」。行内还会标出**依赖条数**（「安装时会一并下载 N 项依赖」）。表尾有**「重新扫描」**按钮（给「文件已经写进 `Modules\`」用，见生效语义那条）。合并顺序**固定**：已装（registry 顺序照旧）→ 坏包 → 索引里还没装的。**下载与手工安装是同一条**宿主命令 `install_plugin_from_url` —— 索引只提供 URL，别在前端另开一条 |
 | 面板取数**不在构建期** | 表格字符串（`buildPluginsPane`）是**整块设置面板**的一部分，而索引要走网络（差网络下能拖到超时）⇒ 那里一旦 `await`，**打开设置**就跟着卡住。所以列表在**挂载后**由 `renderMarket()` 填，且**先本机、后索引**两段画：本机扫描是毫秒级的，不该被一份可有可无的推荐清单拖住 |
-| 事件绑定用**委托**（只在挂载时绑一次） | 这三个按钮过去是「重绘完再逐个 `addEventListener`」，而挂载时没人调那次 render ⇒ **初始渲染出来的按钮全是死的**（2026-09-21 用户报的「卸载点了没反应」就是这个根因）。改成在列表容器上委托后，重绘只改 `innerHTML`、监听永不丢 —— 这一类 bug 从此不存在。**新加的按钮一律并入这份委托，不要在重绘路径里重新绑** |
+| 事件绑定用**委托**（只在挂载时绑一次） | 这三个按钮过去是「重绘完再逐个 `addEventListener`」，而挂载时没人调那次 render ⇒ **初始渲染出来的按钮全是死的**（2026-09-21 用户报的「卸载点了没反应」就是这个根因）。改成在列表容器上委托后，重绘只改 `innerHTML`、监听永不丢 —— 这一类 bug 从此不存在。**新加的按钮一律并入这份委托，不要在重绘路径里重新绑**。「重新扫描」按钮在**列表外面**（列表整块重绘，按钮不该跟着被换掉）⇒ 它的委托挂在**设置容器**上（2026-09-28）。 |
 | 模型资产（Live2D 等） | **安装包零第三方模型资产**：Lunac 只提供引擎与导入通道，模型由终端用户自备（他说下载时自己接受 Live2D 的协议）。版权四条线见 backlog **L1-B** —— 尤其：官方样例模型属 **No Redistribution**，**不得**随包分发 |
 | 实测（2026-09-21） | `cargo test --bins` src-tauri **73 passed / 0 failed / 1 ignored**（其中 `plugin_market` **9 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错 / **索引逐条筛（坏 id、明文 http、空名字、重复 id 各丢自己）/ 索引非 JSON 报错且接受 BOM 与空表**；`appearance` 增 **1 条**：**随包发货的主题包逐项校验**（清单能解析 + 声明的背景 / 花纹 / 图标真在盘上；2026-09-21 删掉魅魔包后只断言 `default`，`succubus` 那两条断言一并删除））、`tsc --noEmit` exit 0、`npm run build` exit 0 |
+| 实测（2026-09-28，目录改名 + 依赖 + 自建插件这一批） | `cargo test --bins plugin_market` **12 passed / 0 failed**（原 9 条 + 新增 3 条：**依赖字段逐条校验**（明文 http / dest 越界 / 缺 dest / npm 缺包名 / npm 包名带 `--` 注入 / 未知 type 各拒）/ **旧 `plugins\` 一次性搬到 `Modules\`**（同名冲突保留新的、幂等）/ **依赖 dest 越界在写盘前就被拦**）；原「同 id 拒绝」那条改为「**升级覆盖 + 入口缺失时旧版原样保留且无残渣**」；`cargo check --bins` exit 0、`npx tsc --noEmit` exit 0。界面侧的「更新 / 重新扫描 / 依赖条数」与磁盘插件的 `attach` 约定**尚未做实机回归**（本轮只做了编译与单测）。 |
 
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
 
@@ -868,9 +874,52 @@ searchInput (总端口)
 | `music_config_get` / `music_config_set` | 读写 `config\music.json`（Client ID / 回调端口 / 令牌）。**不回传令牌**给前端 |
 | `spotify_connect` | 起环回服务器并返回授权 URL（前端交给 `open()`）。**唯一不用 `run_blocking` 的命令**：它只 bind 端口就返回，accept + 换令牌在独立线程 |
 | `spotify_disconnect` | 清空本地令牌（等于「忘记账号」） |
-| `spotify_status` | `GET /me/player`；204 = 无活跃设备（不是错误） |
+| `spotify_status` | `GET /me/player`；204 = 无活跃设备（不是错误）。另回传 `shuffle` / `repeat` / `context_uri`（控制条三态与歌单高亮都靠它，**状态一律回读、不自记**） |
 | `spotify_control` | play / pause / next / previous / seek / volume |
-| `lyrics_get` / `lyrics_search` | LRCLIB 歌词（`/api/get` 精确 + `/api/search` 回落） |
+| `spotify_playlists` | `GET /me/playlists?limit=50` —— 歌单列（**不开分页**）。曲目数读 `items.total`（`tracks.total` 作兜底） |
+| `spotify_playlist_tracks` | `GET /playlists/{id}/items?limit=100` —— 展开某个歌单时的曲目（前端按歌单 id **缓存**，收起/展开不再打 API）。**必须是 `/items`，不是 `/tracks`**，见下面「端点改名」 |
+| `spotify_queue` | `GET /me/player/queue` —— 播放队列（当前曲 + 最多 20 条待播） |
+| `spotify_play_context` | `PUT /me/player/play` 带 `context_uri`（+ 可选 `offset.uri`）。点歌单里的某一首走它 ⇒ 队列就是整个歌单 |
+| `spotify_play_uri` | `PUT /me/player/play` 带 `uris:[uri]` —— 队列项「从这首开始播」（见下面「没有删除队列项的接口」） |
+| `spotify_set_play_mode` | 随机三态：`off` / `shuffle` / `repeat_one`（落到 `shuffle` + `repeat` 两个端点）。**没有「智能随机」这一档** |
+| `spotify_liked` | `GET /me/tracks?limit=50` —— **「我喜欢的歌曲」（收藏夹）**。见下面「收藏夹是独立资源」 |
+| `spotify_play_uris` | `PUT /me/player/play` 带 `uris:[…]`（最多 100 条）—— 收藏夹**没有可播的 `context_uri`**，只能走它 |
+| `spotify_search` | `GET /search?type=track,playlist,album,artist,show&limit=10` —— 顶部工具条那个搜索框（**下拉预览 + 主区详细页共用这一次请求**）。`q` 必须 `qenc` 转义 |
+| `spotify_artists` | `GET /me/following?type=artist&limit=50` —— 左栏「歌手」。**必须有 `user-follow-read`**，缺了就是 `403`（面板会如实把那句话显示成这一栏的内容） |
+| `spotify_albums` | `GET /me/albums?limit=50` —— 左栏「专辑」（走 `user-library-read`，不需要新 scope） |
+| `spotify_shows` | `GET /me/shows?limit=50` —— 左栏「电台」（同上） |
+| `spotify_item_tracks` | `kind + id` → 该条目的曲目：`playlist` `/playlists/{id}/items`、`album` `/albums/{id}/tracks`、`artist` `/artists/{id}/top-tracks?market=from_token`、`show` `/shows/{id}/episodes`。**歌手那条的数组键是 `tracks` 而不是 `items`**，专辑那条是 Simplified Track Object（**没有 `album` 字段**，行内封面为空是正常的） |
+| `spotify_devices` | `GET /me/player/devices` —— 设备弹层。**无活跃设备时它是空数组，不是错误** |
+| `spotify_transfer` | `PUT /me/player`（`device_ids` + `play`）—— 把播放转到某台设备 |
+| `librespot_status` / `librespot_start` / `librespot_stop` | 本机播放（librespot 子进程）的状态 / 起 / 停。见下面「本机播放」 |
+| `lyrics_get` | 歌词三源：LRCLIB 精确 → LRCLIB 搜索 → **网易云兜底**（见下） |
+
+> 另有一条**宿主命令**不在 `music.rs` 里但由本插件用：`plugin_window_set_resizable`（[plugin_window.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/plugin_window.rs)）—— 播放态关掉手动缩放，见下面「播放态禁用缩放」。
+
+**`SCOPES` 2026-09-28 扩到六项**：`user-read-playback-state` / `user-modify-playback-state` /
+`user-read-currently-playing`（播放控制与回读）、`playlist-read-private` / `playlist-read-collaborative`
+（歌单列要读私有与协作歌单）、**`user-library-read`**（收藏夹 + 专辑 + 电台）、
+**`user-follow-read`**（左栏「歌手」，2026-09-28 加）。
+**scope 变了 ⇒ 已授权的令牌不会自动带上新权限** —— 老用户必须**重新登录一次 Spotify**，否则受影响的
+那一栏会如实报 `403 Insufficient client scope`（实测就是这个措辞）。这不是 bug，是 OAuth 的规则。
+
+**收藏夹是独立资源，不在 `/me/playlists` 里**（2026-09-27 排查确认，`music.rs`）
+
+「我喜欢的歌曲」这一项**不是**某个歌单：实测 `/me/playlists` 只有 `total=8` 且**没有它**，
+它走 `GET /me/tracks`，**且必须有 `user-library-read`** —— 缺这一项直接 `403`
+（所以「歌单列里找不到收藏夹」的答案不是「Spotify 把它藏了」，而是**我们没申请那条权限**）。
+两条连带后果，都必须照做：
+
+1. **收藏夹那一行是前端合成的**（`likedHtml()`），不从歌单数组里筛 —— 它是 `likedHtml()` 拼在**最前面**的，
+   且**不随歌单请求的成败消失**（歌单拉失败时用户仍该看得见自己的收藏）。它的副标题是
+   「账号名 · 总数」，缩图是渐变 + 白心（Spotify 那块拼图的观感）。
+2. **收藏夹没有可播的 `context_uri`**（`spotify:collection` 不在合法上下文里）⇒ 播放只能走
+   `spotify_play_uris`。代价：`player.context_uri` 永远匹配不到它，于是**「正在播的就是这个歌单」那个高亮对它无效**
+   —— 不接受也得接受，这是 API 的形状。
+
+> **垃圾入参一律先拒**：`playlist_id` / `context_uri` / `track uri` 全走白名单函数（`is_safe_spotify_id` /
+> `is_safe_context_uri` / `is_safe_track_uri`）—— 它们会被拼进 URL 路径与请求体，是唯一的外部输入面。
+> 三条判据都有单测（`spotify_id_and_uri_whitelists_are_narrow`）。
 
 **凭据：内置 Client ID + 保留自填**（2026-09-27 加）——**两条路必须并存**。
 
@@ -901,6 +950,272 @@ Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `
    从后台线程定时抢焦点是最不该发生的事。另：开机自启（`--background`）时把「上一轮」
    预置成 `true`，于是「开机时 Spotify 已经在跑」不构成边沿，静默启动不会弹窗。
 
+**界面：两态 + 定尺**（2026-09-27 重构，2026-09-28 默认态重做成两栏）
+
+两态**都在 DOM 里**（靠 `.hidden` 切），理由不只是省事：播放态的窗口高度要按**当前那一态**的内容实测下发，
+`display:none` 的节点不参与布局、量出来是 0，切错了量到的就是另一态的高度。
+
+| 态 | 内容 | 窗口大小 |
+|---|---|---|
+| **默认态** | **工具条**（头像 / 账号 / 搜索 **+ 下拉预览** / 状态 / 设置）+ 连接设置（未登录时）+ **左栏 Library（四类页签，宽度可拖）+ 分隔条 + 主区（曲目列表 / 卡片网格）** + **底部控制栏**（正在播放 / 播放键组 / 设备 / 音量 / 队列 / 展开播放面板，见下） | **`1280×720`**（16:9，用户 2026-09-28 定）—— **定尺**，两栏各自内部滚动 |
+| **播放态** | **长条本身**（见下） | **`550×130`**；鼠标进窗时关闭操作栏浮出 ⇒ **`550×170`** |
+
+**两态怎么切：只由用户点**（2026-09-28 用户改口径，**取消了 2026-09-27 那套「在播就自动进播放界面、暂停就自动退回歌单列」**）。
+进：底部控制栏那块「正在播放」、或它右端的展开按钮（`#music-open-player`）。出：长条上的返回（只退一层、不停播）。
+停播 + 退回是标题栏那个 ← 的事。**别再把它改回自动** —— 那套要在换曲那一瞬防抖（`STOP_CONFIRM = 2`），
+且一旦写成「有曲目就进」+「没在播就退」就会每 tick 拉一次、以几秒为周期反复横跳。
+
+**进入音乐界面的唯一入口是独立窗**（2026-09-28 用户定：「从 Lunac 中进入音乐界面时自动展开成独立界面，
+禁止进入到插件版本中的音乐界面」）：宿主在 `main.ts` 的 `executePlugin()` **开头**拦掉 `id === "music"`
+（二十来个调用方——搜索命中 / 设置里的插件总览 / 右键菜单 / 详情项 / 快速启动——逐个判必漏一处，
+漏掉那处就是「内嵌版」的后门），改成调 `open_plugin_window`。独立窗自己的渲染走 `plugin-window.ts` 的
+`plugin.execute()`，**不经过** `executePlugin`，所以不会自打转。
+
+**播放态：窗口就等于长条**（2026-09-28 用户要求「把那个 562×200 的渲染窗口去掉」）。两处来源都得治，
+**只治一处等于没治**：
+
+1. **宽度** —— 默认态窗口 1280 是给两栏用的；播放态的垫料被 CSS 清零
+   （`styles.css` 的 `body:has(.music-root.music-player-on)` 那一组：`#app` padding、容器边框、
+   `#results-list` padding、`.plugin-result` padding 全部归零），所以**窗口就是 550**。
+   前端因此有**两个宽度常量**（`MUSIC_W = 1280` / `MUSIC_W_BAR = 550`），`applyResize` 按态选，
+   并把宽度也写进 `lastResize` 的键（只比高度会漏掉「高度巧合相同」的那次）。
+   ⚠️ **默认态不量内容**：它是定尺 1280×720（两栏各自内部滚动），只有播放态才实测下发。
+2. **高度** —— 宿主 `plugin_window_resize` 原来用**通用的 `MIN_H = 200`** 夹，而播放态实测只要
+   **159**（130 长条 + 29 外层）⇒ 窗口被顶到 200，用户看到的就是「长条下面多出一截」。
+   现在按插件取最小值（`plugin_window.rs` 的 `min_size()`：音乐插件有 `MUSIC_MIN_H = 120`），
+   **`min_size()` 与 `min_inner_size()` 必须同时用** —— 后者是系统级硬约束（Windows 走
+   `WM_GETMINMAXINFO`），只放开 clamp 不改它，`set_size` 照样被系统夹回去。
+   清零垫料后 `chrome` 恰好等于标题栏高度，实测 `130`（收起）/ `170`（hover），**不再有半像素偏差**。
+3. **顺带两个坑**：容器上那条 `margin-top: -1px`（为叠搜索栏边框）在垫料归零后会变成
+   「列表比窗口高 1px」⇒ `chrome` 量出 **-1**、下发高度少 1px 且可能诱出滚动条，所以也必须归零；
+   容器圆角要写成 **12px** 与 `.music-pv-card` 对齐（默认的 `--radius` 是 14，差 2px 时玻璃层的圆角会露出来）。
+
+
+**默认态 = Spotify 的复刻版**（2026-09-27 起两轮改造：先重做行样式 + 工具条，2026-09-28 再拆成两栏）
+
+布局（用户 2026-09-28 的要求逐条对应）：
+
+```
+┌─ 1280×720 ────────────────────────────────────────────────────────────────┐
+│ 头像 账号 [搜索框（下拉预览挂它下面）] 状态 ⚙设置                          │
+│ ┌─ 左栏 300（可拖 180–520）─┐ ┃ ┌─ 主区（吃掉剩下全部）───────────────────┐ │
+│ │ [歌单][专辑][歌手][电台]  │ ┃ │ 详情头：封面 120 + 类型/名字/副标题/播放全部│ │
+│ │ ─────────────────────────│ ┃ │ ─────────────────────────────────────────│ │
+│ │ ♥ 我喜欢的歌曲           │ ┃ │ 曲目列表（编号 / 歌名 / 歌手 / 时长）      │ │
+│ │ 歌单 / 专辑 / 歌手 / 电台 │ ┃ │                                        │ │
+│ │ （内部滚动）             │ ┃ │ （内部滚动）                            │ │
+│ └──────────────────────────┘ ┃ └────────────────────────────────────────┘ │
+│ ══════════════════ 细进度线 2px（可拖）═══════════════════════════════════ │
+│ ┌封面 歌名/歌手┐      ⤨ ◀◀ ▶ ▶▶ ↻       🔊── 🔊音量  ☰队列 ⤢展开 ⚙设备   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**底部控制栏**（用户 2026-09-28：「在默认面板下方添加 Spotify 下方的播放控制，并把一些按钮也移动到下方」）：
+三列 `grid-template-columns: minmax(0,1fr) auto minmax(0,1fr)` —— 左 = 正在播放（整块是一个按钮，点它进播放面板）、
+中 = 随机 / 上一首 / 播放暂停 / 下一首、右 = 设备 / 音量 / 队列 / 展开。**中间那组必须用 grid 的 `justify-self` 才真居中**
+（flex 会因为左右两簇宽度不等把中间整体推偏，而这是「对齐 Spotify」唯一的硬判据；实测两组中点都在 640）。
+栏顶那条 **2px 细进度线**绝对定位（不占高），与播放长条里那条**共用同一套拖动绑定**。
+两个弹层（设备 / 队列）都**向上弹**（`.music-dd` 默认是向下的，这两条把 `top` 清掉改用 `bottom` —— 栏贴着窗口下沿，
+向下弹会跑出窗口）；队列浮层与长条下面那块队列面板**同一份渲染**（`renderQueue` 写两处，同一批 `play-uri` 行）。
+两条栏上的按钮是同一件事的两个入口 ⇒ **只写一份处理函数、按 id 各挂一次**（`on([...])`），
+状态也**只由 `renderPlayer` 一处写两处**（图标 / 模式 / 音量 / `--seek-pct`；两处各记一份必然漂移）。
+
+- **左栏那四类只有一个渲染入口**（`renderSide` + `libRowHtml`）：`PlaylistDto` 用
+  `libItemOfPlaylist()` 归一成 `LibraryItemDto`，其余三类宿主直接回这个形状。**收藏夹是前端合成的**
+  （见上面「收藏夹是独立资源」），固定拼在「歌单」栏第一行。每类各自的列表**缓存**（`sideCache`），
+  切回来不重打 API；**失败不写空数组** —— 那会被渲染成「这一栏是空的」，把真因（`403` / 超时）藏掉。
+- **左栏宽度可拖**（用户：「歌单列作为单独的一列可拉动」）：`#music-split` 是 6px 的分隔条，
+  线画在它的 `::before` 上（真画 1px 的线，鼠标几乎压不中）。**宽度只有一处定义者** ——
+  JS 往 `.music-root` 写 `--music-side-w`，CSS 用 `flex: 0 0 var(--music-side-w, 300px)`；
+  拖动期间给 `body` 加 `.music-resizing`（锁 `col-resize` 光标 + 禁选中）。
+  用 `pointerdown` + window 上的 move/up（`setPointerCapture` 对合成事件会抛 `NotFoundError`）。
+- **主区三种内容互斥**：**搜索详细页 > 选中项详情 > 引导文案**。详情头 = 封面 120（歌手是圆头像）+
+  类型 / 名字 1.35rem / 副标题 / 「播放全部」；下面就是曲目列表（`.music-list`，主区与搜索页共用一套行）。
+- **搜索分两层**（用户 2026-09-28 要求）：工具条那个下拉是**速览预览**（歌曲 3 + 歌手/专辑/歌单各 2 +
+  底部「查看全部」），**回车或点「查看全部」⇒ 主区进详细页**（5 个页签：歌曲 / 歌手 / 专辑 / 歌单 / 电台，
+  非歌曲的用卡片网格）。预览与详细页**不互斥**：详细页开着时继续敲字，预览照样更新。
+  预览**绝对定位挂在 `.music-search-wrap` 下**（对齐输入框、不占布局 —— 占了布局，定尺窗口的高会跟着结果条数抖）。
+- **设备按钮在设置左边**（用户：「如果可以拉取这个功能就尽量作为控制设备的按钮放置在设置的左边」）：
+  它取代了旧版那条只能看、不能点的「无活跃设备」文本行。信息不丢 —— 挂在该按钮的 `title` 上，
+  且**没有活跃设备时给按钮加 `.warn`**（那正是用户最需要知道的时候）。
+- **条目行的选中态与「正在播」是两件事**：`.music-pl.on` = 主区正在看的那一项（前端记的），
+  `.music-pl.playing` / `.music-tr.playing` = `player.context_uri` / 当前曲目命中（每秒那轮 tick 重算，
+  只改 class —— 整块重建会把选中态和滚动位置打掉）。
+- **工具条**：头像（26px 圆，`/me` 的 `images[0]`，授权那一次抓的，见 `MusicConfigDto.avatar`）
+  + 账号名（`max-width:130px` 截断）+ **搜索框**（胶囊，占满余下宽度）+ 状态文字 + 设置。
+  **设备按钮与「展开播放面板」都在底部控制栏那一端**（2026-09-28 挪下去 —— Spotify 的顶栏本来就没有这两样）。
+- **头像 URL 会晚一步**：老配置文件里没有这个字段（`#[serde(default)]` ⇒ 空串），
+  **要等用户重新授权一次才填上** —— 空串时头像就是个素色圆，不是 bug。
+- **条目行照 Spotify 的样子**：缩图 **40px**、行 hover 加一层 `rgba(var(--ink-rgb),0.05)` 淡底、名字 0.78rem。
+  **行尾那枚「播放这一项」圆钮已删**（用户 2026-09-28：「删除左栏跟随歌单的按钮，以及搜索栏中跟随歌单的按钮，
+  功能挪到双击这一项」）⇒ 现在**双击左栏某一行 = 播它**（详细页头那个「播放全部」保留，所以「先看曲目再决定」这条路没断）。
+  为了让双击真的能触发，单次点击**不许重建左栏**（`syncSideSelection` 只改 class）—— 否则第二次 click 落在新节点上、
+  浏览器按 UI Events 的规矩**不会发 `dblclick`**（顺带也修好了「点第 20 行被弹回第一行」）。
+- **左栏行不着重画框**（用户 2026-09-28：「取消外框，改成不明显的分界线」）：`.music-pl` 没有 border / radius，
+  相邻行之间一条 `rgba(var(--ink-rgb),0.05)` 的细线（最后一行不画）。连带三处改成不靠 border 表达：
+  「正在播」只提亮名字、选中态用更淡的一层底、收藏夹读失败把**副标题**染红。
+
+- **搜索必须防抖**（`SEARCH_DEBOUNCE_MS = 450`）：每敲一个字打一次 Spotify 搜索既浪费又容易撞限流。
+  回调里要带「用户又改了词 ⇒ 这次结果作废」的守卫（`runSearch` 开头比对当前 `searchQuery`）。
+- **空搜索词直接清结果**，不发请求（`/search` 的空 `q` 是 400）。
+- **主区那两个滚动条各滚各的**：默认态整条链路是「撑满窗口」（`styles.css` 里
+  `body:has(.music-root):not(:has(.music-player-on))` 那一组把 `#results-list` 变 flex 容器、
+  `.plugin-result` 撑满、`.music-body` 吃余高）。**这组选择器必须排除播放态** —— 那一态要靠
+  `.plugin-result` 的**实测高**反推窗口尺寸，给它 `height: 100%` 就成了「量高度 ← 窗口高 ← 量高度」的死循环。
+
+播放态的长条是用户 2026-09-27 给的定尺，**每个数都一一对上**（dev 实例实测，见下）：
+
+```
+┌─ 长条 550×130（圆角矩形）────────────────────────────────┐
+│ ┌────────┐ ┌─ 右侧列 450×130 ────────────────────────┐ │
+│ │ 封面   │ │ 歌名模块  450×30                        │ │
+│ │ 100×100│ ├────────────────────────────────────────┤ │
+│ │        │ │ 歌词模块  450×65（两行，行高 32）        │ │
+│ │        │ ├────────────────────────────────────────┤ │
+│ │        │ │ 控制面板  450×35                        │ │
+│ │        │ │  ├ 进度条 450（**叠在顶部，不占高度**）  │ │
+│ │        │ │  ├ 时间 0:12/3:45（**最左端、条下方**）  │ │
+│ │        │ │  └ [随机][上一首][播放][下一首] 居中     │ │
+│ │        │ │     音量条 80 ─ 播放列表按钮（右端）     │ │
+│ └────────┘ └────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────┘
+```
+
+- **内容 550 是用户定的基准**，播放态靠「窗口 550 + 外层 0」凑齐它（见上面「播放态：窗口就等于长条」）。
+  **默认态不再需要凑 550** —— 它是 1280×720 的两栏，外层那 12px 玻璃垫料照旧留着（`#app.detached` padding 4 +
+  `#results-container` 边框 2 + `#app.detached #results-list .plugin-result:has(.music-root)` 的 3×2）。
+- **长条的边框必须用 `box-shadow: inset 0 0 0 1px`，不能用 `border`**：`border` 会吃掉内容盒
+  （实测 550→548），右侧列被压成 448、`height: 130` 还会比内容盒高 2px 而溢出。inset 阴影不参与布局。
+- **右侧列里不许留左右 padding**（`450` 是用户定的，留 10px 就变成 438，实测过）。文案的呼吸感
+  放在三块**各自的内部 padding** 里，块宽仍是 450。
+- **时间（当前 / 总）在控制块的最左端、进度条下方**（用户 2026-09-27 定）：`.music-bar > .music-time`
+  **绝对定位** `left:0`，于是**不参与四钮的居中计算**（写成普通 flex 子元素的话，四钮会被它挤得偏右）。
+  实测 `left` 与 `.music-bar` 的左边界**差 0**。
+- **关闭操作栏：高 40、宽 550，且只在鼠标进入窗口时显示**（用户 2026-09-27 定；见 [styles.css](file:///d:/cc/claude-code-cli-master/app/src/styles.css) 的 `#plugin-titlebar`）。
+  三条实现约束，改一条就会破：
+  1. **收起时高度归 0**，不是 `visibility:hidden` —— 窗口高度是按内容实测下发的，归 0 才能让窗口真的缩回
+     「长条 130」那一档；`overflow:hidden` 保证收起时按钮既不显示也点不到。
+  2. **高度不做过渡** —— 它一变就要重算窗口尺寸，补间期间量到的是中间值。
+  3. 尺寸联动手柄：`music.ts` 在 `document.body` 上听 `mouseenter` / `mouseleave` **立刻** `scheduleResize`
+     （不能等下一秒那轮 tick，否则那 40px 会先被裁掉一下才长回来）。多出来的高度由 `chrome` 现算，
+     **不需要**在这里加常量。
+- **播放态那个「×」其实是个「← 回退」**（用户 2026-09-28 定：**「将 × 改成向左的回退按钮 用来引导」**）。
+  为什么换：播放态是定尺长条、**缩放已经关掉**，那个位置上的 × 会**直接关掉整个悬浮窗** —— 用户的本意
+  往往只是「退出播放界面」，结果面板整个没了（要回主窗口重开）。同一位置两种语义就此分开：
+  **默认态的 × 真的关窗，播放态的 ← 只退一层（顺带停播）**。三条实现约束：
+  1. 图标在 **JS 里换**（`syncTitlebarClose()`）：那个 × 是 `plugin.html` 里写死的静态 SVG，
+     用 CSS 藏一半再画一半要赌 `:has()` 与伪元素尺寸。原样记在 `closeBtnOriginal` 里，换回来**逐字还原**
+     （`stopMusicPolling()` 里也还原一次 —— 悬浮窗会被复用去装别的插件）。
+  2. **点击在捕获阶段拦**（`document` 上的 `click` + `capture: true`）：那个按钮的关窗监听器在
+     `plugin-window.ts`（所有插件共用的入口，不能为一个插件改它）。捕获阶段先用 `stopPropagation()`
+     把事件掐掉，共用入口一行都不用动。
+  3. 退回去要做两件事：`spotify_control{action:"pause"}`（**Spotify Web API 根本没有 stop**）+ 回默认面板。
+     **不必再记「退掉的是哪一首」** —— 2026-09-28 起没有任何自动切态的逻辑（见上「两态怎么切」），
+     退回去它就一直停在默认面板上。
+- **播放态禁用窗口缩放**（用户 2026-09-28 定）：定尺长条手动拉一下只会被下一轮 tick 贴回去
+  （用户看到的就是「拉了没反应」，像坏了）。前端在 `renderMode` 里按态调一次
+  `plugin_window_set_resizable`（**只在态变化时发一次 IPC**，别放进每秒那轮 tick —— `set_resizable`
+  会打一次窗口消息）。默认态仍是可缩放的（用户拖大后不会被贴回去：`lastResize` 相同时 `applyResize`
+  直接返回，不去打架）。
+- **进度条叠在控制面板顶部**（绝对定位 `top: -6px` + `padding: 6px 0` + `background-clip: content-box`）：
+  画出来只有 3px，但可点可拖的范围上下各 6px，**不占长条高度**。所以 `.music-bar` 要 `padding-top: 4px`
+  把按钮下移，否则居中的播放键会压在那条线上（按钮 26px / 播放键 30px 就是按这个余量定的）。
+  位置**只写一个 CSS 变量 `--seek-pct`**（填充 / 圆点 / 时间气泡都由 CSS 从它取值）——
+  三处各自写 JS 迟早漂移。拖动中给 `.music-progress` 加 `.music-dragging`：填充关掉补间（要逐帧跟手）、
+  圆点与气泡浮出。**松手才真 seek**（拖动期间只画不发请求，否则一次拖动会打出几十个 seek）。
+- **队列面板挂在长条下方**，**不再与歌词互斥**（旧版那套「谁占封面下面那一格」是 450 宽旧布局的产物）：
+  长条是定尺 130，塞不进队列。开着时窗口按内容长高。
+- **高度由前端实测后经 `plugin_window_resize` 下发**（`WebviewWindow::set_size`）：`chrome`（标题栏 + 外层 padding +
+  边框）用「窗口内高 − `#results-list` 可视高」现算，所以外层 CSS 改了不用跟着改常量。**`applyResize` 里必须
+  `closest()` 往上找 `.plugin-result` / `#results-list`** —— 传进来的 `root` 是 `.music-root`，用 `querySelector`
+  往下找永远是 null（2026-09-27 就这么写错过一次，表现是「尺寸一次都没下发」，而且因为 catch 掉错误、页面毫无反应）。
+- **只在插件悬浮窗里下发尺寸**：判据是 `#plugin-titlebar` 存在（`plugin.html` 独有）。同一份 `music.ts` 也会
+  **内嵌在主窗口**的 `#results-list` 里跑，那时调这条命令会去改**主窗口**的尺寸。
+- **「没生效」由宿主回读尺寸判定，不看 `is_minimized()`**（2026-09-28 改）：
+  窗口最小化时 `set_size` 会返回 `Ok` 但可见几何一点不变（`inner_size()` 回的是最小化窗口那个退化的
+  `160×28`）—— 这种「命令成功、窗口没动」最难查。所以 `plugin_window_resize` 下发之后**回读实际尺寸**，
+  对不上就回 `ERR_SIZE_STUCK(...)`；前端**只有真的贴合了才记 `lastResize`**，并且每秒那轮 tick 会再
+  `scheduleResize` 一次 ⇒ 用户把窗口恢复出来时（≤1s）自动贴合。
+  ⚠️ 早先那条「`is_minimized()` 为真就直接拒」在 2026-09-28 的验收里表现成**静默失效**（窗口卡在默认态尺寸、
+  每轮都在重试但不留任何痕迹）；回读判定既覆盖那个场景、又给出数字（`160x28≠550x130`）。
+  容差 **2px**：`LogicalSize → PhysicalSize` 那一趟按 DPI 比例取整（1.25 缩放下 550 → 688 → 550.4）。
+- **歌词区正好两行**：行高 32px + 盒高 65px ⇒ 当前行贴顶、下面那行就是「接下来要唱的」；
+  行内 `nowrap + ellipsis`（定尺窗口里换行会打乱这条几何关系）。
+- **歌词着色：已过 + 正在 = 亮，未到 = 暗**（用户 2026-09-27 定，取代旧版「当前行 / 下一行」两档）。
+  「亮」是**色相不变、只提亮** —— 向 `--ink-rgb`（深色主题=白 / 浅色主题=黑）混合，两种主题下都朝
+  「更醒目」的方向走；**不能**用 `filter: brightness()`（浅色主题下会把文字越调越淡）。
+  着色只改**状态变化的那一段**的 class（正常播放就是 1 行）：整段重扫在几百行的长歌词里每秒跑一次纯属浪费，
+  多写 DOM 还会打断正在跑的滚动动画。
+- **滚动用 rAF 自己缓动（`glideTo`），`LYRIC_SCROLL_MS = 800` + `easeOutQuint`**（用户嫌原来的太快、
+  要求「阻尼调高」）。**因此 `.music-lyr` 上不能再写 `scroll-behavior: smooth`** —— CSS 平滑会接管
+  每一帧 `scrollTop` 的赋值，与 rAF 叠成两段动画（走起来一顿一顿的）。
+- **点某一行歌词 = 跳到那一句**（用户 2026-09-27 加）。**拖滚动条松手同样会发 `click`** ⇒ 用「指针位移
+  是否超过 4px」把两者分开，否则每拖一次都会跳进度。
+- **用户可以自己滚**（滚轮 / 拖滚动条）：只认 `wheel` 与 `pointerdown` 来挂起自动跟随，**不听 `scroll`** ——
+  程序化滚动同样会发 `scroll` 事件，听了就会自己把自己挂起。挂起后 4 秒自动回到当前行。
+  **挂起只影响滚动、不影响着色** —— 否则用户滚一下歌词，全篇颜色会跟着冻 4 秒。
+- **两态切换只由用户点**（2026-09-28 用户改口径，**取消了 2026-09-27 那套自动切态**）：
+  进 = 底部控制栏那块「正在播放」或它右端的展开按钮；出 = 长条上的返回（只退一层、不停播）。
+  历史留档：那套自动切态（`playing === true` 就进、`!playing` 连续两轮就退）在换曲那一刻必须防抖
+  （`STOP_CONFIRM = 2`），而且**两条判据必须互斥** —— 「有曲目就进」+「没在播就退」会每 tick 拉一次、
+  以几秒为周期反复横跳（歌单列一闪一闪）。用户嫌它吵，直接取消了；**要恢复的话这两条纪律一条都不能少**。
+- **状态行要区分「还没问过」与「问了、没设备」**（2026-09-27 修）：`player === null`（刚开窗、第一轮
+  轮询还没回来）说「无活跃设备」是冤枉。顺序是：未配置 → 未连接 → **读取播放状态…** → 无活跃设备 →
+  已暂停 → 正在播放。
+- **`#music-msg` 是一次性提示，必须自己回收**（2026-09-27 修）：它有七八处写入方（控制失败、歌单拉取失败、
+  歌词失败、连接成功…），原先**写进去就再没人清** —— 用户某次控制失败留下的「没有可控制的播放设备」
+  会一直挂在面板底部，于是「正在播放」与「没有设备」同屏出现（用户报的正是这个）。
+  做法是**看门狗 `sweepMsg()`**：在 `tick` 里统计「同一段文字挂了多久」（`MSG_TTL_MS = 8000`，
+  **按真实时间判、不按 tick 计数** —— tick 的真实周期是「轮询耗时 + 1000ms」，数 tick 会变成十几秒），
+  换字即归零。放在 tick 里而不是每个写入处加定时器：逐处加必然漏一处，漏掉的就是又一条永久假状态。
+- **播放态那行提示是绝对定位浮层 ⇒ 没字时必须不着色**（2026-09-28 用户报的「播放态底下有个
+  透明黑色蒙版」）：它在播放态被改成 `position:absolute` + `pointer-events:none` 才不占那 130 的高度，
+  但背景色挂在**元素**上、元素又自带 `min-height` + `padding` ⇒ 一个字都没有时照样铺出一条
+  `rgba(0,0,0,.62)` 的横条（`sweepMsg` 清的是文本，不是这个元素）。修法是
+  `.music-root.music-player-on .music-msg:empty { background:none; padding:0; min-height:0 }`
+  —— 清空走的是 `textContent = ""`，正好命中 `:empty`。
+
+
+**歌词：三个来源，缺一不可**（`lyrics_get`）
+
+1. `LRCLIB /api/get`（要 `track_name` + `artist_name`，`album_name` / `duration` 有就给）—— 精确命中最好；
+2. `LRCLIB /api/search` —— 精确拿不到时的回落（Spotify 报的时长与库里录音版本常有 1–3 秒差 ⇒ 直接 404）。
+   **LRCLIB 整条链路挂了（非 404 的错误 / 搜索请求失败）也要继续走第 3 级** —— 兜底的意义正在于此；
+3. **网易云**（用户 2026-09-27 选定）—— 非官方只读接口，搜索 `/api/search/get/web` 拿 song id，再
+   `/api/song/lyric?id=…&lv=-1&kv=-1&tv=-1` 取 `lrc.lyric`（`[mm:ss.xx]` 逐行）。
+   **两个请求都必须带 `Referer: https://music.163.com/`** —— 缺了直接 `{"msg":"参数错误","code":400}`
+   （2026-09-27 在目标机器实测，且与 UA 无关）。挑选顺序：歌名+歌手都对 → 只歌名对 → 第一条。
+   全程**失败即 `None`**，绝不把「主源没有、兜底也挂了」升级成一次报错。
+
+**前端不做手搜歌词**（2026-09-27 用户要求删掉搜索框与候选区）：歌词**只在换歌时自动抓一次**
+（`lyricsFor` 记曲目 id）。原来那条「用户手选后不再被自动抓覆盖」的路径一并删除。
+
+**端点改名（2026-09-27 实测，别再照记忆写）**
+
+| 老 | 新 | 不改的症状 |
+|---|---|---|
+| `GET /playlists/{id}/tracks` | **`GET /playlists/{id}/items`** | 老路径直接 `403 Forbidden`（**与 scope 无关**，重新授权也一样） |
+| 条目里 `{…, track:{…}}` | `{…, item:{…}}` | 取不到歌 ⇒ 展开后一首都没有 |
+| 歌单对象 `tracks.total` | `items.total` | 面板上每个歌单的曲目数恒为 0 |
+| `GET /me` 的 `product` / `country` | 已不返回 | **判不出账号是不是 Premium**，只能从错误里的 `Premium required` 反推 |
+
+判据一句话：**「歌单能列出来、点开一首都没有」= 端点改名了**，不是权限问题，别去折腾 scope。
+宿主机两个名字**都兜着读**（`.items` 优先、`.tracks` 回落），灰度期不会整块失效。
+
+**被 Spotify 拒了要落盘 + 说人话**（2026-09-27 加）
+
+- 宿主 `log_api_reject()` 在 `api_get_json` / `api_send` / `spotify_control` 三处统一记
+  `spotify: {动作} 被拒（{状态码}）{端点路径} → {响应体前 200 字}`（**不记令牌**：我们调的 URL 本来就不带）。
+  为什么必须落盘 —— 面板上那行小字会被下一轮轮询/重绘覆盖，用户报「操作被拒绝」时日志里**一个字都没有**，
+  只能靠猜（这正是 2026-09-27 那次排查的开局：日志只记了「已授权成功」）。
+- 前端 `errText()` 把 Spotify 的 `message` / `reason` 翻成**说清该做什么**的话（按**子串**判，不解析 JSON ——
+  那条消息被截断成 200 字且带格式化换行，正则解析只会变成新的失败点）：
+  `Insufficient client scope` → 去重新登录；`No active device` → 先在某台设备上播一次；
+  `Premium required` → 控制播放要 Premium（看歌词 / 封面不受影响）；
+  `Restriction violated` → 免费账号不能点播单曲 / 跳进度。
+- 展开歌单失败**不许渲染成「这个歌单是空的」**（那会把真因藏掉）：原因贴在那一块里（`.music-empty-err`），
+  下次点它会重试。本机音乐（`is_local`）没有 `spotify:` uri ⇒ 宿主机直接滤掉，面板不给「点了播不了」的死条目。
+
 **四条不得回退的约束**：
 
 1. **只走官方 OAuth（Authorization Code + PKCE + 环回地址）**。Spotify **没有**「账号密码异地登入」
@@ -920,13 +1235,60 @@ Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `
 
 **边界要诚实**（这一节直接决定用户会不会白折腾）：
 
-- 这个插件控制的是「当前活跃的 Spotify Connect 设备」（本机 Spotify 客户端即可），
-  **不是**在 Lunac 里发声；WebView2 内出声需要 Web Playback SDK（Premium + EME/Widevine DRM），
-  **不做**。所以「选 Web Playback SDK」这条路不必考虑 —— 桌面端控制的正解是 **Web API**
-  （`/me/player*` 那组端点），SDK 只能把网页自己变成一台播放器，控制不了已经开着的 Spotify 客户端。
+- 这个插件控制的是「当前活跃的 Spotify Connect 设备」（本机 Spotify 客户端即可）。
+  **在 Lunac 里出声**有两条路，我们都**不走 Web Playback SDK**：那条要 Premium + EME/Widevine DRM，
+  而 WebView2 里能不能过 DRM 一直不确定；桌面端控制的正解是 **Web API**（`/me/player*` 那组端点）。
+  我们选的是**另一条**：**librespot 独立进程**（见下）—— 它自己就是一台 Connect 接收器，
+  于是「登入一次后不必开 Spotify 桌面端也能出声」，而播放控制仍然全部走 Web API。
+- **librespot（非官方 Connect 接收器）= 「登入一次后脱离桌面端出声」的唯一现实路径；已实测能出声
+  （2026-09-28）**。要点（每条都是实测踩出来的，别照直觉写）：
+  1. **它必须走代理**。直连时日志刷 `Audio key response timeout` → `continuing without decryption`
+     → 一堆 `invalid mpeg audio header`（拿到的是**没解密**的字节）；**音频密钥走的是另一条到 AP 的 socket**，
+     那条路被挡就是这个现象。`-x/--proxy URL` 实测**连 AP 与密钥两条 socket 一起走**
+     （日志里 `librespot_core::socket] Using proxy "…"` 出现**两次**），挂上本机代理后
+     `Audio key response timeout` **0 次**、音频被正确解成 Ogg Vorbis、Web API 回读 `playing=true`
+     且进度按实时推进。⇒ **「密钥超时」是网络路径问题，不是账号或代码问题。**
+  2. 命令（凭据落盘后可复用，不必重新登录）：
+     `librespot --name "<名字>" -c <cache目录> -x http://127.0.0.1:7892 --bitrate 320`。
+     `-c` 指到上次那个缓存目录，它自己会 `credentials.json` 续用。
+  3. **构建**：0.8.0 在 Windows 上**不需要 OpenSSL / Bonjour / protoc**（默认特性 = `native-tls`(SChannel)
+     + `rodio`(WASAPI) + 纯 Rust mDNS）；`cargo install` **必须加 `--locked`**，不加会撞上游 `vergen`
+     双版本冲突（`error[E0277]: … vergen_lib::entries::Add`）。
+  4. **已接进 Lunac**（2026-09-28，用户选定「现在集成（脱离桌面端出声）」）：宿主 `music.rs` 管子进程
+     （`librespot_status` / `librespot_start` / `librespot_stop` + `kill_librespot()`），前端把它做成
+     设备弹层里的**第一行开关**（「本机播放」）。四条实现纪律：
+     ① **路径与代理都是配置项**（`librespot_path` / `librespot_proxy` 两个字段，留空 = 自动探测 / 直连）——
+     实测**直连有时也行**（取决于网络路径），所以「必须代理」不能写死；
+     ② **它挂了 / 应用退出必须立刻摘设备**：`librespot_stop` **先 pause 再 kill**，`main.rs` 的
+     `Destroyed` 分支调 `kill_librespot()` —— 半死状态仍占着会话，会诱发 `NO_ACTIVE_DEVICE`（2026-09-27 踩过），
+     而下次开机它还会以一台永远连不上的「Lunac」出现在设备列表里；
+     ③ **它是独立进程**，WebView 里起不了进程，只能由宿主起停；起进程要带 `CREATE_NO_WINDOW`（否则闪一个黑框），
+     并且 **stdout / stderr 两个管道都要排空**（塞满即双向死锁，与 `convert.rs` 预检 #36 ① 同一条纪律），
+     排空时顺手转进本仓日志 —— `Audio key response timeout` 是**唯一**能诊断「在跑但没声音」的线索；
+     ④ **凭据缓存是那条真正的门槛**（2026-09-28 实测）：`-c <dir>` 是**音频**缓存，`credentials.json`
+     跟着它落盘（`--system-cache` 未指定时默认取 `-c` 的值）。**一份空缓存 = librespot 静默连不上**：
+     进程在跑（`running=true`）、音频后端初始化完成、日志里一行错误都没有，但 `/me/player/devices`
+     **永远是空数组**。所以「本机播放」第一次用必须有一次**交互式登录**（`librespot -j/--enable-oauth`，
+     浏览器里授权一次，凭据落盘后就不必再来）。宿主现在的形态是「用已有凭据的缓存直接起设备」，
+     **首次登录那条流程还没做**（见下「已知缺口」）。
+     另：`-k/--access-token` 也能起，但 access token 一小时就过期 ⇒ 不适合当长驻设备。
+- **已知缺口（2026-09-28 验收时确认）**：
+  1. **librespot 的首次登录没有入口**：宿主不会带 `-j/--enable-oauth` 起它、也不会把那个授权 URL 交给用户，
+     所以在一台**从没登录过 librespot** 的机器上点「本机播放」只会得到一个「在跑但设备列表里没有它」的状态。
+     现在靠的是「把一份已有 `credentials.json` 放进配置里的缓存目录」—— 缓存目录默认是
+     `<exe 目录>\config\librespot-cache`。
+  2. **加了 `user-follow-read` ⇒ 必须重新登录一次 Spotify**，否则左栏「歌手」如实报
+     `403 Insufficient client scope`（面板会把这句翻成「请点『连接 Spotify』重新登录一次」）。
 - **控制播放（play / pause / next / previous / seek / volume）必须有 Premium**，
   这是 Spotify 的规则，与 Lunac 无关；**只看歌词 / 封面 / 正在播放则不需要 Premium**。
   文案里必须把这两件事分开说（`music.setup_builtin` / `music.setup_hint` 就是这么写的）。
+- **两条 API 硬限制（做不出来，也不假装能做）** —— 2026-09-27 查证 + 实测确认：
+  1. **没有「智能随机」（Smart Shuffle）接口**：`GET /me/player` 只给 `shuffle_state`(bool) +
+     `repeat_state`(off/context/track)，**读都读不到** —— 它是手机/桌面客户端的本地功能。
+     所以控制条那个三态按钮只能是 **关 / 随机（shuffle）/ 单曲循环（repeat=track）**（用户 2026-09-27 选定）。
+  2. **没有「删除队列项」接口**：队列只有 `GET /me/player/queue`（读）与 `POST /me/player/queue`（加到下一首）。
+     于是「播放列表里移除某一首」用 **「点它 = 从它开始播」** 代替（`spotify_play_uri`，等价于丢掉它之前的队列项）。
+     **文案必须写「从这首开始播」，不许写「移除」**（`music.play_from_here` 里带括号如实写明原因）。
 - **Development Mode 的硬限制**（2026-02-11 起，老应用宽限到 2026-03-09）：
   应用所有者**必须持有 Premium**（掉订阅就整个应用停摆）；**每个应用最多 5 个授权用户**
   （含所有者自己，要在仪表盘的 User Management 里逐个加白）；**搜索类端点每次最多 10 条**；
@@ -937,7 +1299,9 @@ Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `
 - **refresh token 会在用户首次授权后 6 个月硬过期**（刷新 access token 不会延长它），
   所以正式发出去的版本要预期「约每半年重新登录一次」，面板的报错要能被用户看懂。
 - 公开只读的歌词源是 LRCLIB（免费、无需 key，要求带 `User-Agent` 并遵守 429 的 `Retry-After`），
-  与 Spotify 的授权完全无关 —— 没登 Spotify 也能用歌词。
+  与 Spotify 的授权完全无关 —— 没登 Spotify 也能用歌词。**兜底源网易云是非官方接口**
+  （必须带 `Referer`，见上）⇒ 它随时可能失效，所以口径是「**拿不到就当没有歌词**」，
+  绝不让兜底的失败影响主流程（第 2 级那两条 LRCLIB 失败路径都写成 `unwrap_or_default()`）。
 
 ### 4.7 文件转换插件（图片 / 音频 / 视频，2026-09-27）
 

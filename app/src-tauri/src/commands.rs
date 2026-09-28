@@ -520,6 +520,14 @@ fn start_cli_process(
     // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
     // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
     envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
+    // 插件目录（<exe 根>\Modules）→ agent.exe（2026-09-28）：agent 靠它
+    //   ① 把 Modules 加进可访问目录（工作区锁生效时也写得进去，见 core-agent tools.rs 的 guard）；
+    //   ② 在环境块里告诉模型「插件放这儿、规范在同目录的 README.md」。
+    // 于是「让 Lunac 自己做一个插件」不需要 dev 版、也不需要开发者环境 —— 就是写几个文件。
+    envs.push((
+        "LUNAC_MODULES_DIR",
+        crate::plugin_market::plugins_dir().to_string_lossy().to_string(),
+    ));
     // 日志目录 → agent.exe：与宿主写同一份目录（<exe 根>\temp\logs），排障只需
     // 看一个地方。agent 没拿到该变量时会自行回退到 <agent.exe 目录>\temp\logs
     // （见 core-agent/src/log.rs）。
@@ -1913,11 +1921,13 @@ pub fn delete_skill(key: String) -> Result<String, String> {
 }
 
 // ── 插件市场（L1，2026-09-21）────────────────────────────────────
-// 落点 <exe 根>\plugins\<id>\（与 skills / tools 同级），包里必须带 `lunac-plugin.json`
-// 与**已编译好的 ESM 入口** —— 前端经 asset 协议 `import()` 它（CSP 是 script-src 'self'
-// + asset.localhost，插件代码不能走 CDN）。
-// 每一条校验的理由（https only / 大小上限 / 路径穿越 / 已存在拒绝 / staging 改名）见
+// 落点 <exe 根>\Modules\<id>\（2026-09-28 由 plugins\ 改名；与 skills / tools 同级），
+// 包里必须带 `lunac-plugin.json` 与**已编译好的 ESM 入口** —— 前端经 asset 协议 `import()` 它
+// （CSP 是 script-src 'self' + asset.localhost，插件代码不能走 CDN）。
+// 每一条校验的理由（https only / 大小上限 / 路径穿越 / 升级可回滚 / staging 改名）见
 // [plugin_market.rs](plugin_market.rs) 的头注释 —— 这里只做 Tauri 侧的薄封装。
+// **依赖随插件一起装**：清单里的 `dependencies[]` 由 `plugin_market::install_dependencies`
+// 在落盘后逐条拉取（https + 可选 sha256 + 落点限制在插件目录内）—— 这是「release 缺依赖」的根治。
 
 /// 列出已安装插件。**坏包也要列出来**（清单坏了、入口丢了都要让用户看见原因，
 /// 否则插件会「莫名其妙消失」，而用户手上没有任何线索）。
@@ -1934,7 +1944,8 @@ pub fn plugins_dir_path() -> String {
         .to_string()
 }
 
-/// 拉取**插件市场索引**（`plugin_market::INDEX_URL`，本仓 `main` 分支的 `plugins/index.json`）。
+/// 拉取**插件市场索引**（`plugin_market::INDEX_URL` = 公开仓库 `LythrumMoon/lunac-plugins`
+/// 的 `main/index.json`；2026-09-28 从主仓库挪出 —— 主仓库是私有的，raw 链接终端用户拉不到）。
 ///
 /// 由宿主去拉的两个理由：① 前端 CSP 的 `default-src` 不含 github 域（无 `connect-src` 声明
 /// ⇒ 回落 default-src），前端 `fetch()` 会被直接拦掉；② 索引里的每条 URL 都要**服务端先筛一遍**
@@ -1984,6 +1995,9 @@ fn fetch_plugin_index_blocking() -> Result<Vec<crate::plugin_market::PluginIndex
 }
 
 /// 从 https 的 zip URL 安装插件，返回插件 id。
+///
+/// **同 id 视为「重装 / 升级」**（2026-09-28 改）：旧版本先备份、新包或依赖失败即回滚 ——
+/// 详见 `plugin_market::install_from_bytes`。
 ///
 /// 走 `run_blocking`：内部是 120s 超时、逐块读的 `reqwest::blocking`，是本仓**最长的**
 /// 阻塞体 —— 留在主线程上，网络一慢整个窗口就「未响应」（2026-09-22）。

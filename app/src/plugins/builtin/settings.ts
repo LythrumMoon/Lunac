@@ -1731,8 +1731,9 @@ async function buildToolsSection(): Promise<string> {
  *
  *  **一段一张表**：每行一个插件，按钮由**本机事实**决定（不是索引自称的）——
  *    · 已装且能用   ⇒ 「打开」（第三方多一个「卸载」；内置是编译进来的，没得卸）
+ *    · 已装、索引里版本更高 ⇒ 多一个「更新」（同 id 重装 = 升级，宿主会先备份旧版，失败回滚）
  *    · 装了但包坏了 ⇒ **不藏**：连原因一起显示 + 「卸载」（否则用户只看到插件莫名消失）
- *    · 没装而索引里有 ⇒ 「下载」（https zip 装进 `<exe 根>\plugins\<id>\`，装完立即生效）
+ *    · 没装而索引里有 ⇒ 「下载」（https zip 装进 `<exe 根>\Modules\<id>\`，装完立即生效）
  *
  *  行数据的三个来源，合并顺序**固定**（顺序一抖，用户每次进来看到的东西都在跳）：
  *    ① `pluginRegistry.getAll()` —— 已装且能用的（内置 + 第三方有效包），顺序照旧；
@@ -1754,6 +1755,9 @@ function buildPluginsPane(): string {
       <div class="settings-plugin-list" id="settings-plugin-market">
         <div class="settings-plugin-empty">${t("settings.plugins_market_loading")}</div>
       </div>
+      <div class="settings-market-row" style="justify-content:flex-end;">
+        <button class="settings-install-btn" id="settings-plugin-rescan">${t("settings.plugins_market_rescan")}</button>
+      </div>
       <div class="settings-hint" id="settings-plugin-err"></div>
       <div class="settings-hint" id="settings-plugin-msg"></div>
       <div class="settings-hint">${t("settings.plugins_hint")}</div>
@@ -1772,6 +1776,12 @@ interface MarketRow {
   version: string;
   /** 远程索引里的 https zip 地址；空串 = 索引里没有这条（只可能「打开」或「卸载」） */
   url: string;
+  /** `url` 非空且装的版本比索引旧 ⇒ 这个按钮写「更新」而不是「下载」（同一条命令） */
+  update: boolean;
+  /** 依赖条数（清单里声明的；宿主在装的时候已一并拉好，这里只是提前告知） */
+  deps: number;
+  /** 声明的宿主能力（清单里的 permissions，原样显示 —— 读者是用户，不翻译） */
+  perms: string[];
   /** 来源（作者给的 homepage，没有就退回 zip 地址）—— 挂在行的 title 上：装谁 = 信任谁的代码，
    *  来源必须能查，但不必铺在界面上。 */
   source: string;
@@ -1788,17 +1798,25 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
   const rows: MarketRow[] = [];
   const seen = new Set<string>();
   const localById = new Map(local.map(p => [p.id, p]));
+  const indexById = new Map(index.map(e => [e.id, e]));
 
-  // ① 已装且能用（内置 + 第三方有效包），registry 的顺序照旧
+  // ① 已装且能用（内置 + 第三方有效包），registry 的顺序照旧。
+  //    索引里若也有同 id，就顺带给一个「更新」入口 —— 版本号不同即视为有新版
+  //    （**不猜大小**：索引版本是作者写的自由文本，比大小只会比出误报）。
   for (const p of pluginRegistry.getAll()) {
     const l = localById.get(p.id);
+    const e = indexById.get(p.id);
+    const hasNewer = !!e && !!e.version && !!l?.version && e.version !== l.version;
     rows.push({
       id: p.id,
       name: pluginName(p.id, p.name),
       description: pluginDesc(p.id, p.description),
       icon: (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "",
       version: l?.version || "",
-      url: "",
+      url: hasNewer ? e!.url : "",
+      update: hasNewer,
+      deps: l?.dependencies?.length || 0,
+      perms: l?.permissions || [],
       source: l?.homepage || "",
       installed: true,
       local: !!l,
@@ -1816,6 +1834,9 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       icon: p.icon || "",
       version: p.version,
       url: "",
+      update: false,
+      deps: p.dependencies?.length || 0,
+      perms: p.permissions || [],
       source: p.homepage,
       installed: false,
       local: true,
@@ -1833,6 +1854,9 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       icon: e.icon || "",
       version: e.version,
       url: e.url,
+      update: false,
+      deps: 0,
+      perms: [],
       source: e.homepage || e.url,
       installed: false,
       local: false,
@@ -1846,14 +1870,24 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
 /** 一行 HTML：名称（带版本）+ 描述（坏包换成原因）+ 该状态下的按钮。 */
 function marketRowHtml(r: MarketRow): string {
   const name = r.version ? `${r.name} · v${r.version}` : r.name;
+  const deps = r.deps > 0
+    ? ` <span class="settings-market-deps">${esc(t("settings.plugins_market_deps", { count: String(r.deps) }))}</span>`
+    : "";
+  // 声明的宿主能力：**原样列出**（不翻译成好意头的中文）—— 它的作用就是让用户看清
+  // 「这东西要动我的窗口/界面」，含糊的措辞还不如给能力名（见 ai-spec §3.5 的诚实边界那条）
+  const perms = r.perms.length > 0
+    ? ` <span class="settings-market-deps">${esc(t("settings.plugins_market_perms", { list: r.perms.join(", ") }))}</span>`
+    : "";
   const meta = r.broken
     ? `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: r.broken }))}</span>`
-    : `<span class="settings-plugin-desc">${esc(r.description)}</span>`;
+    : `<span class="settings-plugin-desc">${esc(r.description)}${deps}${perms}</span>`;
   const open = r.installed && !r.broken
     ? `<button class="settings-install-btn" data-open-plugin="${esc(r.id)}">${t("settings.skill_open")}</button>`
     : "";
   const download = r.url
-    ? `<button class="settings-install-btn" data-download-plugin="${esc(r.id)}" data-plugin-url="${esc(r.url)}">${t("settings.plugins_market_download")}</button>`
+    ? `<button class="settings-install-btn" data-download-plugin="${esc(r.id)}" data-plugin-url="${esc(r.url)}">${
+        r.update ? t("settings.plugins_market_update") : t("settings.plugins_market_download")
+      }</button>`
     : "";
   const remove = r.local
     ? `<button class="settings-skill-del-installed" data-uninstall-plugin="${esc(r.id)}">${t("settings.plugins_market_uninstall")}</button>`
@@ -1993,6 +2027,25 @@ function wirePluginMarket(container: HTMLElement) {
     if (dlBtn) return void download(dlBtn);
     const delBtn = target.closest<HTMLButtonElement>("[data-uninstall-plugin]");
     if (delBtn) return void uninstall(delBtn);
+  });
+
+  // 「重新扫描」按钮在**列表外面**（列表整块重绘，按钮不该跟着被换掉），所以委托挂在容器上。
+  // 它的用途：Lunac AI 或用户直接把插件文件夹写进 Modules\ 之后，不重启也能认出来。
+  container.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement | null)?.closest<HTMLButtonElement>("#settings-plugin-rescan");
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    void (async () => {
+      try {
+        const list = await refreshMarketPlugins();
+        await renderMarket(container);
+        showMsg(t("settings.plugins_market_rescanned", { count: String(list.length) }), "var(--green)");
+      } catch (e: any) {
+        showMsg(String(e), "var(--red)");
+      } finally {
+        btn.disabled = false;
+      }
+    })();
   });
 
   void renderMarket(container);
@@ -2324,6 +2377,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
       .settings-plugin-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
       .settings-plugin-name { font-size: 0.76rem; color: var(--text); display: flex; align-items: center; gap: 6px; }
       .settings-plugin-desc { font-size: 0.68rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      /* 依赖条数：比描述更弱一级（它是「装的时候会顺带拉什么」的附注，不是插件本身的说明） */
+      .settings-market-deps { color: var(--text-dim); opacity: 0.75; }
       .settings-plugin-empty { color: var(--text-dim); font-size: 0.75rem; padding: 8px 0; }
       .tool-badge { font-size: 0.58rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
       .tool-badge.valid { background: rgba(157,180,172,0.15); color: var(--green); }

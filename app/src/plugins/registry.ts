@@ -19,6 +19,19 @@ export interface Plugin {
   icon: string;              // emoji icon
   badge?: string;            // short badge label
   execute: (input: string) => Promise<PluginResult>;
+  /** 挂载钩子（可选，2026-09-28）。
+   *
+   *  **内置插件不走这里**：它们由 `attach.ts` 一张硬编码表按 id 分派（那份表要 import 各家
+   *  模块、要传各自的参数，写在插件对象上会让每个内置插件都得自己实现一遍）。
+   *  磁盘插件（第三方 / 用户自建）在入口模块里**具名导出 `attach(root)`** 即可被宿主调起来 ——
+   *  这是「插件自己管自己的定时器与监听」的唯一约定，见 `Modules\插件开发规范.md`。 */
+  attach?: (root: HTMLElement) => void | Promise<void>;
+  /** 面板关闭时的收尾（可选）。与 `attach` 成对；不导出也没关系 —— 插件自己的
+   *  `isConnected` 自停是兜底（与 main.ts 的 closePluginView 同一条纪律）。 */
+  detach?: () => void;
+  /** 插件声明的宿主能力（2026-09-28），如 `layout.takeover`。磁盘插件从清单带过来；
+   *  内置插件在对象上自己写。宿主桥只放行声明过的能力，界面也如实列出（**是告知不是沙箱**）。 */
+  permissions?: string[];
   /** Auto-generated pinyin tokens for Chinese keywords. Populated by register(). */
   _pinyinTokens?: string[];
 }
