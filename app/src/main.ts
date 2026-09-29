@@ -136,6 +136,8 @@ const detachedTitle = el("detached-title");
 const detachedBackBtn = el("detached-back-btn");
 const detachedCloseBtn = el("detached-close-btn");
 const detachedVscodeBtn = el("detached-vscode-btn");
+const detachedPinBtn = el("detached-pin-btn");
+const detachedMinBtn = el("detached-min-btn");
 const chatInputBar = el("chat-input-bar");
 const chatInput = el("chat-input") as HTMLTextAreaElement;
 const chatSendBtn = el("chat-send-btn");
@@ -3021,9 +3023,15 @@ function setDetached(on: boolean) {
     const plugin = pluginRegistry.getAll().find(p => p.id === activePluginId);
     detachedTitle.textContent = plugin ? pluginName(plugin.id) : t("detached.title_fallback");
 
-    // Show VSCode button only for AI Agent plugin
-    detachedVscodeBtn.classList.toggle("hidden", activePluginId !== "ai-agent");
-    if (activePluginId === "ai-agent") {
+    // 标题栏右侧那排按钮（2026-09-29）：
+    //   · VSCode —— 只给 AI 助手（主窗的老形态也用这条判据）；
+    //   · **置顶 / 最小化 —— 只给聊天独立窗**：主窗是呼出式的，置顶由热键与
+    //     失焦守卫管、最小化对一条 40px 高的搜索条没有意义。
+    const isAiHeader = activePluginId === "ai-agent";
+    detachedVscodeBtn.classList.toggle("hidden", !isAiHeader);
+    detachedPinBtn.classList.toggle("hidden", !IS_CHAT_WINDOW);
+    detachedMinBtn.classList.toggle("hidden", !IS_CHAT_WINDOW);
+    if (isAiHeader) {
       detachedVscodeBtn.title = t("detached.vscode");
     }
 
@@ -3079,6 +3087,30 @@ detachedCloseBtn.addEventListener("click", async () => {
 // Detached header: VSCode button → open/attach to VSCode
 detachedVscodeBtn.addEventListener("click", () => {
   invoke("open_in_vscode").catch((e) => console.error("VSCode launch failed:", e));
+});
+
+// Detached header: 置顶（只出现在聊天独立窗，2026-09-29）
+//
+// 复用插件窗那两条命令 —— `plugin-chat` 也落在 `plugin-*` 通配里，宿主按 label 找
+// **调用方那个窗口**（与 plugin-window.ts 走的是同一条路）。**初值必须问宿主**：
+// 建窗时就是 `always_on_top(true)`，前端自己猜会出现「按钮没亮、实际已置顶」的错位。
+detachedPinBtn.addEventListener("click", async () => {
+  const pinned = detachedPinBtn.dataset.pinned !== "1";
+  try {
+    await invoke("plugin_window_set_pin", { pinned });
+    detachedPinBtn.dataset.pinned = pinned ? "1" : "0";
+    detachedPinBtn.classList.toggle("active", pinned);
+  } catch (e) {
+    console.error("[lunac] set always-on-top failed:", e);
+  }
+});
+
+// Detached header: 最小化（只出现在聊天独立窗）
+//
+// 恢复有两条路：任务栏图标（聊天窗不进任务栏之外的处理与音乐插件一致），
+// 或者从搜索里再点一次 AI —— 宿主走复用路径 `unminimize + show + set_focus`。
+detachedMinBtn.addEventListener("click", () => {
+  void win.minimize();
 });
 
 // ── 印象派插件 icon（结果区）────────────────────────────────────
@@ -7223,6 +7255,8 @@ function applyI18nToStaticUI() {
   setTitle("chat-drawer-close", "tooltip.close_history");
   setTitle("detached-back-btn", "tooltip.restore");
   setTitle("detached-vscode-btn", "tooltip.vscode");
+  setTitle("detached-pin-btn", "tooltip.always_on_top");
+  setTitle("detached-min-btn", "tooltip.minimize");
   setTitle("detached-close-btn", "tooltip.close_plugin");
   renderMoreMenuLabels();
   renderChatModeSeg();
@@ -8565,6 +8599,14 @@ if (IS_CHAT_WINDOW) {
     // 必须在 startAIChat 之后 —— 那一步才把 `activePluginId` 置成 `ai-agent`，
     // 而标题栏里 VSCode 按钮的显隐正是按它判的（见 setDetached）。
     setDetached(true);
+    // 置顶按钮的初值**问宿主**（建窗时即 `always_on_top(true)`，前端不许自己猜 ——
+    // 同 plugin-window.ts 的做法）。
+    void invoke<boolean>("plugin_window_pin_state")
+      .then((pinned) => {
+        detachedPinBtn.dataset.pinned = pinned ? "1" : "0";
+        detachedPinBtn.classList.toggle("active", pinned);
+      })
+      .catch(() => {});
   })();
   // 窗口已经开着时宿主**不建新窗**，改推一条 `plugin-window-input` 把新入参送进来
   // （同 plugin-window.ts 的做法）—— 否则「第二次带话进来」会被静默丢掉。

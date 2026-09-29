@@ -113,6 +113,32 @@
           <circle cx="18" cy="17.6" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
         </svg>
       </button>
+      <!-- 置顶 / 最小化（2026-09-29）：只有**聊天独立窗**用得上（主窗是呼出式的，
+           置顶由热键与失焦守卫管；最小化对一条 40px 高的搜索条没有意义）。
+           位置固定在 VSCode 与关闭之间（用户指定）。显隐由 setDetached 按
+           IS_CHAT_WINDOW 控制，所以默认带 hidden。 -->
+      <button id="detached-pin-btn" class="hidden" title="Always on top" aria-label="Always on top">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+            <line x1="12" y1="17" x2="12" y2="22"/>
+            <path d="M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.8a2 2 0 0 0-1.1-1.8l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>
+          </g>
+          <line x1="12" y1="17" x2="12" y2="22"/>
+          <path d="M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.8a2 2 0 0 0-1.1-1.8l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>
+          <circle cx="17.4" cy="6.2" r="1" fill="currentColor" stroke="none"/>
+          <circle cx="6.6" cy="17.8" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+        </svg>
+      </button>
+      <button id="detached-min-btn" class="hidden" title="Minimize" aria-label="Minimize">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </g>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+          <circle cx="17.4" cy="10.2" r="1" fill="currentColor" stroke="none"/>
+          <circle cx="7.2" cy="13.8" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
+        </svg>
+      </button>
       <button id="detached-close-btn" title="Close plugin" aria-label="Close">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">

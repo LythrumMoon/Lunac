@@ -851,6 +851,8 @@ html.no-chrome #results-list {
 
 #detached-back-btn,
 #detached-vscode-btn,
+#detached-pin-btn,
+#detached-min-btn,
 #detached-close-btn {
   display: flex;
   align-items: center;
@@ -870,6 +872,8 @@ html.no-chrome #results-list {
 /* 大窗口（detached）顶栏的同族按钮（还原搜索栏 / 关闭插件）也走同一个 hover 浮层 */
 #detached-back-btn:hover,
 #detached-vscode-btn:hover,
+#detached-pin-btn:hover,
+#detached-min-btn:hover,
 #detached-close-btn:hover {
   opacity: 1;
   color: var(--text);
@@ -882,6 +886,16 @@ html.no-chrome #results-list {
 
 #detached-close-btn:hover {
   color: var(--red);
+}
+
+/* 置顶是**持续态**（2026-09-29，聊天独立窗）：不能只靠 hover 表达 —— 常亮主题色 +
+   半透明底，与 `#plugin-pin.active` 同一套语言。初值由 main.ts 问宿主
+   （`plugin_window_pin_state`）后写上；建窗时本就是 always_on_top(true)，
+   前端不许自己猜（否则会出现「按钮没亮、实际已置顶」的错位）。 */
+#detached-pin-btn.active {
+  opacity: 1;
+  color: var(--accent);
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
 #detached-title {
@@ -3941,6 +3955,8 @@ html.no-chrome #results-list {
 #plugin-bar-float,
 #detached-back-btn,
 #detached-vscode-btn,
+#detached-pin-btn,
+#detached-min-btn,
 #detached-close-btn,
 #plugin-pin,
 #plugin-min,
@@ -3956,6 +3972,8 @@ html.no-chrome #results-list {
 #plugin-bar-float:hover,
 #detached-back-btn:hover,
 #detached-vscode-btn:hover,
+#detached-pin-btn:hover,
+#detached-min-btn:hover,
 #detached-close-btn:hover,
 #plugin-pin:hover,
 #plugin-min:hover,
@@ -4047,12 +4065,12 @@ html.no-chrome #results-list {
    不会出现「hover 一下底色就没了」。与输入栏六个按钮的 hover 配方同源。
    **`:disabled` 只在 hover 这条里排除**：禁用按钮照旧有底色（外观一致），
    但不该给「点得动」的反馈。
-   **额外放行名单（只有这条有，见上方 ⚠ 说明）**：顶栏那五个纯图标按钮
-   （进入设置 / 退出设置·退出插件 / 大窗口的还原·VSCode·关闭）—— 它们的 hover
+   **额外放行名单（只有这条有，见上方 ⚠ 说明）**：顶栏那几个纯图标按钮
+   （进入设置 / 退出设置·退出插件 / 大窗口的还原·VSCode·置顶·最小化·关闭）—— 它们的 hover
    浮层由「风格 · 其他颜色」的 `--other-overlay-*` 统一控制，所以要点名让
    下面这条规则放过它们，否则它们的 id 规则永远被本规则压住。 */
 #app button:where(
-  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(#settings-btn):not(#plugin-bar-exit):not(#plugin-bar-float):not(#detached-back-btn):not(#detached-vscode-btn):not(#detached-close-btn):not(#plugin-pin):not(#plugin-min):not(#plugin-close):not(:disabled)
+  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(#settings-btn):not(#plugin-bar-exit):not(#plugin-bar-float):not(#detached-back-btn):not(#detached-vscode-btn):not(#detached-pin-btn):not(#detached-min-btn):not(#detached-close-btn):not(#plugin-pin):not(#plugin-min):not(#plugin-close):not(:disabled)
 ):hover {
   background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }

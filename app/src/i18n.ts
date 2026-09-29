@@ -3965,6 +3965,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "VSCode에서 열기",
     "en": "Open in VSCode",
   },
+  "tooltip.always_on_top": {
+    "zh-CN": "窗口置顶",
+    "zh-TW": "視窗置頂",
+    "ja": "常に最前面",
+    "ko": "항상 위",
+    "en": "Always on top",
+  },
+  "tooltip.minimize": {
+    "zh-CN": "最小化",
+    "zh-TW": "最小化",
+    "ja": "最小化",
+    "ko": "최소화",
+    "en": "Minimize",
+  },
   "tooltip.close_plugin": {
     "zh-CN": "关闭插件",
     "zh-TW": "關閉外掛",
