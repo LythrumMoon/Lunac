@@ -237,15 +237,69 @@ pub fn save_pricing_text(text: &str) -> Result<(), String> {
     fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
 }
 
-/// 缺文件时落一份**空骨架**（`models` 为空表）。
+/// 缺文件时落的**预置定价表**（2026-09-29 用户批准打破规则 63 的「不预置任何价格数字」）。
 ///
-/// 刻意**不预置任何价格数字**：本仓没有逐项核对过各家官方定价页，凭空填一行
-/// 「看起来很像」的数会被用户当成事实拿去对账 —— 那比留空更糟。空表时面板显示
-/// 「未设置价格」并引导点「更新价格」；填过价格的模型才参与金额计算。
+/// **为什么现在可以预置**：这些数字不是从官方页抄来的「看着很像」的值 —— 它们是**两处
+/// 独立证据逐项对上的**：① 官方定价页的峰谷表（美元/百万，峰 = 谷 × 2）；② 用户
+/// 2026-09-29 的真实账单 CSV 反算出的单价（元/百万）。两者的结构完全一致
+/// （命中 : 未命中 : 输出 = 0.02 : 1 : 4，峰档整体 ×2），折算汇率也自洽
+/// （0.15 USD → 1 CNY、0.6 USD → 4 CNY，同为 6.67）。
+///
+/// **时段规则同样有出处**（官方价目表脚注）：高峰 = **周一至周五**的北京时间
+/// **09:00–12:00** 与 **14:00–18:00**，其余全部（含整个周末）为谷时，谷价 = 峰价一半。
+/// 账单 CSV 的逐小时金额与之逐项吻合（12/13 点谷、14 点峰、17 点峰、18 点后谷）。
+///
+/// **只写一次**：`ensure_pricing_file` 仅在文件不存在时落这份；用户改过的一律不动。
+/// 预置的模型名是 **`deepseek-v4-flash`** —— 用户 `.env` 与实际用量日志里都是它（官方页
+/// 写明旧名 `deepseek-v4-flash` 与 `deepseek-flash` 同模型同价）。**没有实测依据的模型不预置**
+/// （如 pro：官方页只有美元价，折算汇率是本机假设 —— 宁可让面板显示「未定价」）。
+///
+/// 顶层 `updated_at` 这次填的是**这份价的核对日期**（不是文件写入时刻）—— 缺了它面板会显示
+/// 「—」，而预置价表明明有据可查。任何一次「确认候选价」都会把它盖回落盘日期，语义复原。
+const DEFAULT_PRICING_JSON: &str = r#"{
+  "updated_at": "2026-09-29",
+  "models": {
+    "deepseek-v4-flash": {
+      "input": 1,
+      "cache_read": 0.02,
+      "cache_write": 0,
+      "output": 4,
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "updated_at": "2026-09-29",
+      "time_windows": [
+        {
+          "days": [1, 2, 3, 4, 5],
+          "from": "09:00",
+          "to": "12:00",
+          "input": 2,
+          "cache_read": 0.04,
+          "cache_write": 0,
+          "output": 8
+        },
+        {
+          "days": [1, 2, 3, 4, 5],
+          "from": "14:00",
+          "to": "18:00",
+          "input": 2,
+          "cache_read": 0.04,
+          "cache_write": 0,
+          "output": 8
+        }
+      ]
+    }
+  }
+}
+"#;
+
+/// 缺文件时落一份**预置骨架**（见 `DEFAULT_PRICING_JSON`）。
+///
+/// 只在**文件不存在**时写：用户改过的价格一个字都不覆盖。预置内容本身也要过
+/// `validate_pricing_text`（守门单测 `default_pricing_json_is_valid`）—— 预置一份不合法的
+/// 价表比不预置更糟：面板要么整块算不出金额，要么提示「候选价不合法」而用户没动过任何东西。
 pub fn ensure_pricing_file() -> Result<PathBuf, String> {
     let path = pricing_config_path();
     if !path.exists() {
-        save_pricing_text("{\n  \"updated_at\": \"\",\n  \"models\": {}\n}\n")?;
+        save_pricing_text(DEFAULT_PRICING_JSON)?;
     }
     Ok(path)
 }
@@ -281,11 +335,50 @@ pub fn clear_pricing_pending(workdir: &Path) -> Result<(), String> {
     }
 }
 
+/// 解析定价表里的 `HH:MM`（本地墙钟）为「零点起的分钟数」。
+///
+/// 只认**严格**的 `HH:MM`：写 `9:00` / `09:0` / `09:00:00` 都判非法 —— 宽松解析会悄悄
+/// 把用户的意思读成另一个时刻，而这张表是用来对账的（宁可他当场看到报错）。
+fn parse_hhmm(s: &str) -> Option<u32> {
+    let b = s.as_bytes();
+    if b.len() != 5 || b[2] != b':' {
+        return None;
+    }
+    let digit = |i: usize| -> Option<u32> { b[i].is_ascii_digit().then(|| (b[i] - b'0') as u32) };
+    let h = digit(0)? * 10 + digit(1)?;
+    let m = digit(3)? * 10 + digit(4)?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// 一个「四类价格」条目（模型本体与它的每个时段）的公共校验。
+///
+/// 四类**缺一不可**：少一个字段在面板上的表现是「这一档的金额悄悄少算一块」，
+/// 比当场报错难查得多。非负 + 有限（挡住 `NaN` / `Infinity`）。
+fn validate_price_fields(
+    what: &str,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    for field in ["input", "cache_read", "cache_write", "output"] {
+        let num = entry
+            .get(field)
+            .ok_or_else(|| format!("{what} 缺少 `{field}`"))?
+            .as_f64()
+            .ok_or_else(|| format!("{what} 的 `{field}` 必须是数字"))?;
+        if !num.is_finite() || num < 0.0 {
+            return Err(format!("{what} 的 `{field}` 必须是非负数字"));
+        }
+    }
+    Ok(())
+}
+
 /// 校验一份定价表文本 —— **用户手写的文件与 agent 抓来的候选走同一处**。
 ///
-/// 底线只有三条：顶层是对象 / `models` 是对象 / 每个模型的四类价格都存在且是**非负数字**。
-/// 之所以连「缺字段」也算错：少一个字段在面板上的表现是「这个模型的金额悄悄少算一块」，
-/// 比当场判非法难查得多。未知字段一律忽略（用户想加注释字段随他）。
+/// 底线：顶层是对象 / `models` 是对象 / 每个模型的四类价格齐全且非负 /
+/// `time_windows`（可选）的每一条同样四类齐全，且时段写法与星期写法合法。
+/// 未知字段一律忽略（用户想加注释字段随他）。
 pub fn validate_pricing_text(text: &str) -> Result<(), String> {
     let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("语法错误：{e}"))?;
@@ -299,14 +392,55 @@ pub fn validate_pricing_text(text: &str) -> Result<(), String> {
         let entry = entry
             .as_object()
             .ok_or_else(|| format!("模型 `{name}` 的值必须是一个对象"))?;
-        for field in ["input", "cache_read", "cache_write", "output"] {
-            let num = entry
-                .get(field)
-                .ok_or_else(|| format!("模型 `{name}` 缺少 `{field}`"))?
-                .as_f64()
-                .ok_or_else(|| format!("模型 `{name}` 的 `{field}` 必须是数字"))?;
-            if !num.is_finite() || num < 0.0 {
-                return Err(format!("模型 `{name}` 的 `{field}` 必须是非负数字"));
+        validate_price_fields(&format!("模型 `{name}`"), entry)?;
+
+        // 时段价（2026-09-29）：`time_windows` 里的条目**覆盖**基础四类价。
+        // 命中的判定（本地时刻落在哪一条）在前端，这里只管「写得对不对」。
+        let Some(windows) = entry.get("time_windows") else {
+            continue;
+        };
+        let arr = windows
+            .as_array()
+            .ok_or_else(|| format!("模型 `{name}` 的 `time_windows` 必须是一个数组"))?;
+        for (i, w) in arr.iter().enumerate() {
+            let what = format!("模型 `{name}` 的 `time_windows[{i}]`");
+            let w = w.as_object().ok_or_else(|| format!("{what} 必须是一个对象"))?;
+            validate_price_fields(&what, w)?;
+            let from = w
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_hhmm)
+                .ok_or_else(|| format!("{what} 的 `from` 必须是 `HH:MM`（如 09:00）"))?;
+            let to = w
+                .get("to")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_hhmm)
+                .ok_or_else(|| format!("{what} 的 `to` 必须是 `HH:MM`（如 12:00）"))?;
+            if from >= to {
+                return Err(format!(
+                    "{what} 必须满足 `from` 早于 `to`（跨午夜请拆成两条，如 22:00-24:00 与 00:00-06:00）"
+                ));
+            }
+            if let Some(days) = w.get("days") {
+                let days = days
+                    .as_array()
+                    .ok_or_else(|| format!("{what} 的 `days` 必须是一个数组"))?;
+                if days.is_empty() {
+                    return Err(format!("{what} 的 `days` 不能是空数组（省略它表示每天）"));
+                }
+                let mut seen = [false; 8];
+                for d in days {
+                    let n = d
+                        .as_u64()
+                        .ok_or_else(|| format!("{what} 的 `days` 只能是 1–7 的整数"))?;
+                    if !(1..=7).contains(&n) {
+                        return Err(format!("{what} 的 `days` 只能是 1–7（1=周一 … 7=周日）"));
+                    }
+                    if seen[n as usize] {
+                        return Err(format!("{what} 的 `days` 里 `{n}` 重复了"));
+                    }
+                    seen[n as usize] = true;
+                }
             }
         }
     }
@@ -591,6 +725,65 @@ pub fn load_clipboard_history() -> Result<Vec<ClipEntry>, String> {
     }
 }
 
+/// 剪贴板历史上限，与前端插件的 `MAX_ITEMS` **同值**（30，两边一起改）。
+const MAX_CLIP_ITEMS: usize = 30;
+
+/// 「粘贴进搜索框时顺手记一条」——**宿主自己实现**（2026-09-29）。
+///
+/// 为什么不再由插件提供：剪贴板历史已归入**拓展插件**（不随安装包默认安装），
+/// 而「粘贴一下就记一条」是**主窗口**的行为 —— 它必须在插件没装时也照常工作，
+/// 更不该去 `import` 一个可能不存在的插件模块（那正是 `Modules\` 化要消掉的耦合）。
+///
+/// 语义与插件里的 `addClipboardEntry()` **逐条对齐**（去重 → 置顶 → 截断到 30 条）；
+/// 插件那份从此只读不写，两边不会各写一套。
+#[tauri::command]
+pub fn append_clipboard_entry(text: String) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    // 与前端 `trimmed.length > 2000` 同一口径：JS 的 `length` 数的是 **UTF-16 码元**，
+    // 用 `chars().count()` 会把 emoji 算少 ⇒ 同一段文本在两边可能一个收一个不收。
+    if trimmed.encode_utf16().count() > 2000 {
+        return Ok(());
+    }
+    let is_file = is_windows_path(trimmed);
+    let mut entries = load_clipboard_history()?;
+    // 去重：文件条目按「类型 + 全文」找，文本条目按全文找 —— 与插件那份一致
+    let dup = entries.iter().position(|e| {
+        if is_file {
+            e.clip_type == "file" && e.text == trimmed
+        } else {
+            e.text == trimmed
+        }
+    });
+    if let Some(i) = dup {
+        entries.remove(i);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    entries.insert(
+        0,
+        ClipEntry {
+            clip_type: if is_file { "file".into() } else { "text".into() },
+            text: trimmed.to_string(),
+            file_paths: if is_file { vec![trimmed.to_string()] } else { vec![] },
+            time: now,
+        },
+    );
+    entries.truncate(MAX_CLIP_ITEMS);
+    save_clipboard_history(entries)
+}
+
+/// `D:\...` / `C:/...` 这类「盘符 + 冒号 + 斜杠」开头的绝对路径
+/// —— 与前端正则 `^[A-Za-z]:[\\/]` 同义（ASCII 盘符，别用 `is_alphabetic()` 放中文进来）。
+fn is_windows_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
 // ── 用量日志（ModuleData\usage\usage-YYYY-MM-DD.jsonl，与平台对账用）────
 //
 // 每次用户提问一行。**口径**：一行 = 一次提问的合计（含提问内所有工具往返），
@@ -651,6 +844,30 @@ pub struct UsageRecord {
     /// 旧记录没有该字段，读时按空表。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requests: Vec<UsageRequest>,
+    /// 上面四类总量里**来自子代理 / 后台复盘**的部分（2026-09-29）。
+    ///
+    /// 与顶层同名同口径，但**是其中的一部分** —— 记账时**不得**再加一次（加了就是重复计费），
+    /// 它的用途是**归因**：「这一问的量有多少是子代理烧的」。此前这些 token 根本没进
+    /// `result.usage`（平台照收钱、本地账上看不见），本字段是修复后的观测面。
+    /// 旧记录没有该字段，读时按 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<UsageSubagent>,
+}
+
+/// `UsageRecord::subagent` 的形状（字段名与 agent 上报的原样一致，不做 camelCase 转换）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct UsageSubagent {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// 子代理 / 复盘自己发的请求条数（它们的每次请求也各占平台一行）
+    #[serde(default)]
+    pub requests: u64,
 }
 
 fn usage_dir() -> PathBuf {
@@ -711,6 +928,24 @@ pub fn read_usage_log(date: String) -> Result<Vec<UsageRecord>, String> {
 // 金额 = 各模型四类 token × 各自单价，所以汇总**必须分模型**：一天里换过模型的话，
 // 只按天合计就把两个模型的量混在一起了（单价还差十倍），算出来的钱没有意义。
 
+/// 某个模型在一天里**某一个本地小时**的合计（分时价用，2026-09-29）。
+///
+/// 为什么粒度停在「小时」而不是「每次请求」：一次提问的多次 API 请求在本地日志里是**一条**
+/// 记录（只有记录级的 `ts`），逐请求时刻根本没落盘。而分时价的时段边界都在整点或半点，
+/// 小时桶足够；跨小时的一次提问会被整条记在**它的 `ts` 所属**的那个小时里 —— 如实、不做插值。
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct UsageHourTotals {
+    /// 本地小时 0–23（用调用方传进来的时区偏移把 `ts` 换算成墙钟时刻）
+    pub hour: u32,
+    pub turns: u64,
+    pub input: u64,
+    pub output: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    #[serde(rename = "cacheCreate")]
+    pub cache_create: u64,
+}
+
 /// 某个模型在一天里的合计（决定用哪一档单价）
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct UsageModelTotals {
@@ -723,6 +958,11 @@ pub struct UsageModelTotals {
     pub cache_read: u64,
     #[serde(rename = "cacheCreate")]
     pub cache_create: u64,
+    /// 按本地小时拆开的同一批量（**与上面四个字段是同一批 token**，只是再切一刀）。
+    /// 价格表里该模型有 `time_windows` 时，前端必须用它逐桶计价；没有时段价时它与
+    /// 「总量 × 基础价」等价，前端可以只看上面四个字段。旧宿主不返回该字段 → 空表。
+    #[serde(default)]
+    pub hours: Vec<UsageHourTotals>,
 }
 
 /// 一天的合计（面板「按天表格」的一行）
@@ -740,13 +980,22 @@ pub struct UsageDay {
     pub models: Vec<UsageModelTotals>,
 }
 
-/// 读**多天**用量并汇总成「按天 + 按模型」的形状（A12 成本面板）。
+/// 读**多天**用量并汇总成「按天 + 按模型（+ 按本地小时）」的形状（A12 成本面板）。
 ///
 /// 日期一律由前端给（与 `append_usage_log` 同一套：Rust 侧没有 chrono），**升序**返回；
 /// 没有任何记录的天不返回（面板不显示全零行）。汇总放在宿主而不是让前端逐天 IPC：
 /// 30 天就是 30 次跨进程调用，这里一次读完。
+///
+/// `utc_offset_minutes` = 本地时区相对 UTC 的偏移（**东八区传 480**，即
+/// `-new Date().getTimezoneOffset()`）。`ts` 是 UTC epoch 毫秒，`Rust` 侧没有时区数据库，
+/// 所以「本地墙钟」这件事只能由调用方给一个偏移量 —— 分时价必须知道本地时刻。
+/// 夏令时切换日会偏 1 小时（本机与主要目标用户都在无 DST 的时区；如实记着，不做 DST 推断）。
 #[tauri::command]
-pub fn read_usage_range(dates: Vec<String>) -> Result<Vec<UsageDay>, String> {
+pub fn read_usage_range(
+    dates: Vec<String>,
+    utc_offset_minutes: i32,
+) -> Result<Vec<UsageDay>, String> {
+    let offset_ms = (utc_offset_minutes as i64) * 60_000;
     let mut days = Vec::new();
     for date in dates {
         let records = read_usage_log(date.clone())?;
@@ -759,6 +1008,10 @@ pub fn read_usage_range(dates: Vec<String>) -> Result<Vec<UsageDay>, String> {
         };
         let mut by_model: std::collections::BTreeMap<String, UsageModelTotals> =
             std::collections::BTreeMap::new();
+        let mut hours_by_model: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<u32, UsageHourTotals>,
+        > = std::collections::BTreeMap::new();
         for r in records {
             day.turns += 1;
             day.input += r.input;
@@ -774,6 +1027,27 @@ pub fn read_usage_range(dates: Vec<String>) -> Result<Vec<UsageDay>, String> {
             m.output += r.output;
             m.cache_read += r.cache_read;
             m.cache_create += r.cache_create;
+
+            // 本地小时 = (ts + 偏移) 的整点时刻对 24 取模（`rem_euclid` 保证非负）
+            let hour = ((r.ts as i64 + offset_ms).div_euclid(3_600_000)).rem_euclid(24) as u32;
+            let h = hours_by_model
+                .entry(r.model.clone())
+                .or_default()
+                .entry(hour)
+                .or_insert_with(|| UsageHourTotals {
+                    hour,
+                    ..Default::default()
+                });
+            h.turns += 1;
+            h.input += r.input;
+            h.output += r.output;
+            h.cache_read += r.cache_read;
+            h.cache_create += r.cache_create;
+        }
+        for m in by_model.values_mut() {
+            if let Some(buckets) = hours_by_model.remove(&m.model) {
+                m.hours = buckets.into_values().collect();
+            }
         }
         day.models = by_model.into_values().collect();
         days.push(day);
@@ -916,6 +1190,7 @@ mod tests {
             elided: 0,
             dropped: 0,
             requests: vec![],
+            subagent: None,
         }
     }
 
@@ -970,6 +1245,30 @@ mod tests {
         let mut r = rec(0);
         r.session_id = String::new();
         assert!(!serde_json::to_string(&r).unwrap().contains("sessionId"));
+    }
+
+    /// 子代理 / 复盘的归因字段（2026-09-29）：它是**总量的一部分**，只作归因 ——
+    /// 旧记录没有该键（读成 `None`），`None` 也不写回日志（不给旧格式添噪音）。
+    #[test]
+    fn usage_record_subagent_attribution_is_optional() {
+        let old = r#"{"ts":1,"model":"m","input":1,"output":1,"cacheRead":0,"cacheCreate":0}"#;
+        assert!(serde_json::from_str::<UsageRecord>(old).unwrap().subagent.is_none());
+
+        let mut r = rec(0);
+        r.subagent = Some(UsageSubagent {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 0,
+            requests: 2,
+        });
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(
+            line.contains(
+                r#""subagent":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":0,"requests":2}"#
+            ),
+            "{line}"
+        );
     }
 
     /// 每次 API 请求一行（对账粒度）—— `in` 是关键字，必须映射成 `in` 而不是 `input`
@@ -1027,11 +1326,10 @@ mod tests {
         append_usage_log(d2.into(), rec(7000)).unwrap();
 
         // 中间夹一天没记录 → 不返回（面板不显示全零行）
-        let days = read_usage_range(vec![
-            d1.into(),
-            "1970-01-05".into(),
-            d2.into(),
-        ])
+        let days = read_usage_range(
+            vec![d1.into(), "1970-01-05".into(), d2.into()],
+            0,
+        )
         .unwrap();
         assert_eq!(days.len(), 2, "空天必须被跳过：{days:?}");
 
@@ -1059,6 +1357,82 @@ mod tests {
         }
     }
 
+    /// 分时价的**时间维度**：同一模型同一天的 token 必须按**本地小时**拆开，
+    /// 否则前端根本没有「这一批发生在几点」可用于查时段价（2026-09-29）。
+    ///
+    /// `ts` 是 UTC epoch 毫秒，本地小时 = `(ts + 偏移)` 换算 —— 这里用**东八区（480）**
+    /// 与 **UTC（0）** 两组对同一份记录各跑一次，钉住「偏移真的参与了换算」。
+    #[test]
+    fn usage_range_buckets_by_local_hour() {
+        let d = "1970-01-06";
+        let _ = fs::remove_file(usage_log_path(d).unwrap());
+
+        // 1970-01-01T00:00:00Z 起 12 小时 = 43200_000 ms → UTC 12 点，东八区 20 点
+        let mut a = rec(10);
+        a.ts = 43_200_000;
+        a.input = 100;
+        append_usage_log(d.into(), a).unwrap();
+        // 再过 1 小时 → UTC 13 点，东八区 21 点
+        let mut b = rec(20);
+        b.ts = 46_800_000;
+        b.input = 200;
+        append_usage_log(d.into(), b).unwrap();
+
+        let utc = &read_usage_range(vec![d.into()], 0).unwrap()[0];
+        let hours: Vec<(u32, u64)> = utc.models[0]
+            .hours
+            .iter()
+            .map(|h| (h.hour, h.input))
+            .collect();
+        assert_eq!(hours, vec![(12, 100), (13, 200)], "UTC 桶");
+
+        let cn = &read_usage_range(vec![d.into()], 480).unwrap()[0];
+        let hours: Vec<(u32, u64)> = cn.models[0]
+            .hours
+            .iter()
+            .map(|h| (h.hour, h.input))
+            .collect();
+        assert_eq!(hours, vec![(20, 100), (21, 200)], "东八区桶（偏移参与换算）");
+
+        // 桶与总量是**同一批 token 再切一刀**，不是两批
+        assert_eq!(cn.models[0].input, 300);
+        assert_eq!(utc.models[0].input, 300);
+        let total: u64 = cn.models[0].hours.iter().map(|h| h.input).sum();
+        assert_eq!(total, 300, "逐桶之和必须等于总量");
+
+        let _ = fs::remove_file(usage_log_path(d).unwrap());
+    }
+
+    /// 预置定价表必须**自身合法**，且时段写法与官方规则一致（2026-09-29）。
+    ///
+    /// 预置一份不合法的价表比不预置更糟：面板要么整块算不出金额，要么弹「候选价不合法」
+    /// 而用户根本没动过任何东西。顺带钉住「谷价是基础价、峰价在 time_windows 里」
+    /// 这个约定 —— 反过来的话面板会把每天大部分时段算成峰价。
+    #[test]
+    fn default_pricing_json_is_valid() {
+        validate_pricing_text(DEFAULT_PRICING_JSON).expect("预置价表必须合法");
+        let v: serde_json::Value = serde_json::from_str(DEFAULT_PRICING_JSON).unwrap();
+        let m = &v["models"]["deepseek-v4-flash"];
+        assert_eq!(m["input"].as_f64(), Some(1.0), "基础价 = 谷价");
+        assert_eq!(m["output"].as_f64(), Some(4.0), "基础价 = 谷价");
+        let windows = m["time_windows"].as_array().expect("必须有峰时窗口");
+        assert_eq!(windows.len(), 2, "官方峰时是两段：09:00-12:00 与 14:00-18:00");
+        assert_eq!(windows[0]["from"].as_str(), Some("09:00"));
+        assert_eq!(windows[0]["to"].as_str(), Some("12:00"));
+        assert_eq!(windows[1]["from"].as_str(), Some("14:00"));
+        assert_eq!(windows[1]["to"].as_str(), Some("18:00"));
+        for w in windows {
+            // 峰 = 谷 × 2（官方注：谷价是峰价的一半）
+            assert_eq!(w["input"].as_f64(), Some(2.0));
+            assert_eq!(w["output"].as_f64(), Some(8.0));
+            assert_eq!(
+                w["days"].as_array().map(|a| a.len()),
+                Some(5),
+                "峰时只落在周一至周五"
+            );
+        }
+    }
+
     /// 定价表与「候选 → 确认」的落盘纪律（A12）：
     /// ① 校验基线是「四类价格齐全且非负」；② 候选不合法时**一个字都不写**；
     /// ③ 确认时才覆盖正式文件，并盖上落盘日期、删掉候选。
@@ -1077,12 +1451,31 @@ mod tests {
             r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0}}}"#,
             r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": "8"}}}"#,
             r#"{"models": {"m": {"input": -1, "cache_read": 0, "cache_write": 0, "output": 8}}}"#,
+            // 时段价（2026-09-29）：容器必须数组 / 每条四类齐全 / from<to / HH:MM / days 合法
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": {}}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "input": 2, "cache_read": 0.04, "cache_write": 0}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "9:00", "to": "12:00", "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "12:00", "to": "09:00", "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "25:00", "to": "26:00", "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [0], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [8], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [1, 1], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
         ] {
             assert!(validate_pricing_text(bad).is_err(), "should reject `{bad}`");
         }
         let good = r#"{"models": {"m": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8,
             "source_url": "https://example.com/pricing", "updated_at": "1970-01-01"}}}"#;
         assert!(validate_pricing_text(good).is_ok());
+        // 合法时段价：days 可省略（= 每天），也可是 1..=7 的不重复列表
+        let good_windows = r#"{"models": {"m": {"input": 1, "cache_read": 0.02, "cache_write": 0, "output": 4,
+            "time_windows": [
+                {"days": [1, 2, 3, 4, 5], "from": "09:00", "to": "12:00",
+                 "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8},
+                {"from": "00:00", "to": "06:00",
+                 "input": 0.5, "cache_read": 0.01, "cache_write": 0, "output": 2}
+            ]}}}"#;
+        assert!(validate_pricing_text(good_windows).is_ok());
         // 空骨架（还没有任何价格）算合法
         assert!(validate_pricing_text("{\"updated_at\": \"\", \"models\": {}}").is_ok());
 

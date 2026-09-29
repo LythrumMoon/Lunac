@@ -5,14 +5,69 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen, emit } from "@tauri-apps/api/event";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke, convertFileSrc } from "@tauri-apps/api/core";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { attachPluginListeners } from "./plugins/attach";
-import { refreshMarketPlugins } from "./plugins/market";
+import { refreshMarketPlugins, hasDiskPlugin } from "./plugins/market";
+import { isBasePlugin } from "./plugins/kinds";
 import { installHostBridge } from "./plugins/host";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
+import { loadUsageCost, renderUsageCostPanel } from "./usage-cost.js";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
+
+// ── 窗口角色：聊天独立窗 vs 主窗（2026-09-29，AI 聊天搬进独立界面）────
+//
+// 两个窗口跑的是**同一份 main.ts**（聊天窗由宿主 `plugin_window::open()` 加载
+// `index.html`，label = `plugin-chat`，见 ai-spec §4.8「聊天独立窗」）。分工：
+//
+//   | 归属 | 主窗（`main`） | 聊天窗（`plugin-chat`） |
+//   |---|---|---|
+//   | 搜索 / 插件面板 / 设置 / 详情 / 托盘 / 热键 / 剪贴板 | ✅ | ❌ |
+//   | `set_ui_mode` / `set_detached` / `set_query_state` / `hide_lunac` | ✅ | ❌ **绝不允许** |
+//   | AI 对话流（`cli-output` / `cli-status` / `cli-stderr`） | ❌ | ✅ |
+//
+// **为什么用窗口 label 同步判定**，不用 URL query：ai-spec §4.8 规则 4 —— `WebviewUrl::App`
+// 的路径要经 url join，把 `?view=chat` 塞进去是在赌它的拼接实现。label 是宿主给的、
+// 前端同步可读（`getCurrentWindow().label`），且 `plugin-chat` 落进 `plugin-*` 通配 ⇒
+// capabilities 授权、`on_window_event` 按 label 分流、`OPEN_WINDOWS` 失焦放行全部复用。
+
+/** 聊天窗的窗口 label（与 `plugin_window::CHAT_WINDOW_ID` 一致：`plugin-` + `chat`）。 */
+const CHAT_WINDOW_LABEL = "plugin-chat";
+/** 惰性缓存：`getCurrentWindow()` 每次调用都要过一层 IPC 绑定，而这个判断散落在多处。 */
+let chatWindowCache: boolean | null = null;
+/** 本窗口是不是 AI 聊天的独立界面。 */
+function isChatWindow(): boolean {
+  if (chatWindowCache === null) {
+    chatWindowCache = getCurrentWindow().label === CHAT_WINDOW_LABEL;
+  }
+  return chatWindowCache;
+}
+
+/** **只属于主窗口的宿主命令** —— Rust 侧它们全是**全局单值**：
+ *  `hotkey::UI_MODE` / `DETACHED` / `QUERY_EMPTY` / `MAIN_HWND`。
+ *  聊天窗发这些命令 = 两个窗口抢同一份全局状态（ai-spec §4.8 第 1 条硬约束，
+ *  那边记的教训是「关掉一个音乐小窗把整个 agent 后端清掉」）。 */
+const MAIN_WINDOW_ONLY_CMDS = new Set([
+  "set_ui_mode",      // 主窗界面层（搜索 / 插件 / 详情）
+  "set_detached",     // 主窗分离态
+  "set_query_state",  // 主窗查询是否为空（Rust 据此决定 Esc 是隐藏还是清空）
+  "hide_lunac",       // 直接 ShowWindow(SW_HIDE) 主窗
+  "set_chips_empty",  // 主窗搜索栏 chips 是否为空（同 Esc 判据）
+]);
+
+/** `invoke` 的**窗口感知包装**：聊天窗静默跳过主窗专属命令（返回已解决的空值），
+ *  其余命令**原样透传**（聊天窗照常读写配置、开 agent、存会话、用弹窗）。
+ *
+ *  **为什么收口在这里**：那些调用散在十来处（`syncUiMode` / `setPluginBar` /
+ *  `closePluginView` / `startAgentChat` / 详情面板…），逐个加 `if` 必然漏掉一处，
+ *  而漏掉的那一处就是「聊天窗把主窗的界面层改成 plugin」这类错位。 */
+function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (isChatWindow() && MAIN_WINDOW_ONLY_CMDS.has(cmd)) {
+    return Promise.resolve(undefined as T);
+  }
+  return tauriInvoke<T>(cmd, args);
+}
 
 // ── 全局错误上报 ─────────────────────────────────────────────────
 // release 下前端没有控制台、用户平时也不会开 DevTools，未捕获的错误必须送到
@@ -69,6 +124,9 @@ const statusBar = el("status-bar"); // 状态栏（面板最底，实测高度�
 const statusText = el("status-text");
 const statusHint = el("status-hint");
 const tokenDashboard = el("token-dashboard");
+/** 表盘的展开面板（2026-09-29）：里面是「用量与成本」的数据（逐日表格 + 价格表数据），
+ *  点表盘开关。细节见 `usage-cost.ts` 与 `refreshTokenUsagePanel`。 */
+const tokenUsagePanel = el("token-usage-panel");
 const settingsBtn = el("settings-btn");
 const pluginBarTitle = el("plugin-bar-title");
 const pluginBarExit = el("plugin-bar-exit");
@@ -177,6 +235,8 @@ let detailOpen = false;      // 是否处于详细搜索大界面
  *  （例如关掉插件后缓存仍是 plugin，再进插件时这一发被吞 → Rust 停在 main →
  *  Esc 在插件里变成隐藏窗口）。一次 bool 级 IPC 而已，去重的收益不值这个风险。 */
 function syncUiMode() {
+  // 聊天独立窗不碰主窗界面层（`invoke` 包装也会拦，这里提早退出、省一次判断）
+  if (IS_CHAT_WINDOW) return;
   const mode = detailOpen ? "detail" : pluginActive ? "plugin" : "main";
   invoke("set_ui_mode", { mode }).catch(() => {});
 }
@@ -487,7 +547,24 @@ function applyResultsMaxHeight() {
  *  宽度保持用户当前宽度（lastWindowWidth）。
  *  setSize 统一走 requestWindowHeight 串行化；搜索路径可改用 scheduleSearchResize
  *  懒化测量，避免快速键入时“同任务强制 layout + IPC 风暴”。 */
+/**
+ * 该插件是否声明「接管整个窗口」——`permissions: ["layout.takeover"]`（OCR 的双栏布局）。
+ *
+ * 2026-09-29 由 `plugin.id === "ocr"` 泛化而来：拓展插件要能独立打包分发，宿主写死的
+ * id 判断在磁盘插件上根本查不到那份代码（见 ai-spec §3.5「插件契约 / 权限声明」）。
+ */
+function isTakeoverPlugin(id: string | null): boolean {
+  if (!id) return false;
+  const p = pluginRegistry.getAll().find(x => x.id === id);
+  return !!p?.permissions?.includes("layout.takeover");
+}
+
 function applyWindowSize() {
+  // 聊天独立窗是**定尺窗**（1280×720，用户要求与音乐同档）：高度由窗口自己决定，
+  // 不该由内容驱动去 setSize —— 这套机制（`syncUiMode` / `measurePanelHeight` /
+  // 逐帧滑动）全是为主窗「按内容量高度」设计的，套在第二个窗口上只会把主窗的尺寸
+  // 逻辑搬过去。聊天区自己内部滚动（`#results-list` 本来就是 `overflow-y:auto`）。
+  if (IS_CHAT_WINDOW) return;
   // 插件/分离/详细搜索模式 #app 撑满窗口（CSS height:100%）；搜索模式内容驱动（height:auto）
   document.getElementById("app")!.classList.toggle("plugin-active", pluginActive);
 
@@ -496,8 +573,8 @@ function applyWindowSize() {
 
   let h: number;
   if (pluginActive) {
-    // OCR needs a wider two-panel layout in detached mode
-    if (detached && activePluginId === "ocr") {
+    // 接管型插件（OCR 双栏）在 detached 下需要更高的窗口
+    if (detached && isTakeoverPlugin(activePluginId)) {
       h = Math.round(520 * currentZoom);
     } else {
       h = Math.round((detached ? 600 : 360) * currentZoom);
@@ -702,11 +779,40 @@ function autoResizeChatTextarea() {
 // ── Window ───────────────────────────────────────────────────────
 const win = getCurrentWindow();
 
+/** 这个窗口是谁（2026-09-29，AI 聊天独立界面）。
+ *
+ *  **用窗口 label 同步判定**，不赌 URL query（ai-spec §4.8 规则 4：`WebviewUrl::App`
+ *  的路径要经 url join，把 `?view=chat` 塞进去是在赌它的拼接实现）。宿主把聊天窗的
+ *  label 定成 `plugin-chat`（`plugin_window::CHAT_WINDOW_ID`）⇒ 它落进 `plugin-*`
+ *  通配，`capabilities` 授权、`on_window_event` 按 label 分流、`OPEN_WINDOWS` 失焦
+ *  放行**全部自动复用**。
+ *
+ *  两个窗口跑的是**同一份 main.ts**（聊天窗加载 `index.html`），分工写在下面这张表里：
+ *
+ *  | 归属 | 主窗（`main`） | 聊天窗（`plugin-chat`） |
+ *  |---|---|---|
+ *  | 搜索 / 插件面板 / 设置 / 详情大界面 | ✅ | ❌（DOM 在、被 CSS 隐藏） |
+ *  | 剪贴板 / 热键 / Esc 清除 / 唤出重跑 | ✅ | ❌ |
+ *  | `set_ui_mode` / `set_detached` / `set_query_state` / `hide_lunac` | ✅ | ❌ **绝不允许** |
+ *  | AI 对话流（`cli-output` / `cli-status` / `cli-stderr`） | ❌ | ✅ |
+ *  | AI 入口（搜索命中 / 插件调用） | 只负责**开窗** | — |
+ *
+ *  为什么必须这么切：`hotkey::UI_MODE` / `DETACHED` / `QUERY_EMPTY` / `MAIN_HWND`
+ *  是**主窗专属的全局单值**（ai-spec §4.8 第 1 条硬约束），第二个窗口碰它们就是灾难；
+ *  而 `cli-output` 是**广播**（`Emitter::emit`），两个窗口同时消费会双渲染、双写会话。 */
+const IS_CHAT_WINDOW = isChatWindow();
+/** 给 CSS 一个窗口角色的钩子：`html[data-window-kind="chat"]` 收起搜索栏 / 详情面板 /
+ *  设置入口，让聊天区铺满整窗（见 styles.css 的「聊天独立窗」段）。 */
+document.documentElement.dataset.windowKind = IS_CHAT_WINDOW ? "chat" : "main";
+
 // ── 监听窗口尺寸变化（用户拖拽边缘）→ 重算 CSS zoom 等比缩放 ──────
 // 载荷即新尺寸(PhysicalSize)，用启动时快照的 BASE_DPR 换算回逻辑尺寸。
 // setSize() 触发的事件同样经过这里，宽度未变则 zoom 不变；高度与内容一致
 // 时 applyWindowSize 会跳过（乐观高度），无震荡。
 win.onResized(({ payload }) => {
+  // 聊天独立窗是定尺窗（1280×720）：不做 CSS zoom 重算、也不做「内容驱动高度」那一套
+  // ——它们是主窗「一列搜索结果撑高度」的配套（见 applyWindowSize 的注释）。
+  if (IS_CHAT_WINDOW) return;
   const p = payload as { width: number; height: number };
   if (p.width > 0) {
       const w = Math.round(p.width / BASE_DPR);
@@ -834,6 +940,32 @@ interface ChatDoneInfo {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   requests?: ChatDoneRequestUsage[];
+  /** 上述四类总量里**来自子代理 / 后台复盘**的部分（**已包含在总量里**，再报一份只为
+   *  归因：「这一问的钱有多少是子代理烧的」）。消费方**不得**把它再加一次。
+   *  旧 agent 不报该字段 → undefined（2026-09-29）。 */
+  subagent?: ChatDoneSubagentUsage;
+}
+interface ChatDoneSubagentUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  /** 子代理 / 复盘自己发的请求条数 */
+  requests: number;
+}
+/** `usage.subagent` 的解析（不可信输入：缺失 / 类型不对一律当「没有」）。
+ *  **只作归因**：金额口径仍只看四类总量，见 [usage-cost.ts](./usage-cost.ts)。 */
+function parseSubagentUsage(v: unknown): ChatDoneSubagentUsage | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  const n = (k: string) => (typeof o[k] === "number" ? (o[k] as number) : 0);
+  return {
+    input_tokens: n("input_tokens"),
+    output_tokens: n("output_tokens"),
+    cache_read_input_tokens: n("cache_read_input_tokens"),
+    cache_creation_input_tokens: n("cache_creation_input_tokens"),
+    requests: n("requests"),
+  };
 }
 
 // ── 用量统计（口径：**当前这次对话**）────────────────────────────
@@ -1921,7 +2053,8 @@ pluginBarExit.addEventListener("click", async () => {
 // ── 插件悬浮窗（2026-09-27）─────────────────────────────────────
 /**
  * 可悬浮的插件。判据是「面板本身是不是一列内容」：
- *  · **能悬浮** —— 音乐 / 转换 / 备忘录 / 剪贴板历史 / 快速启动 / 工具编辑 / 网页搜索，
+ *  · **能悬浮** —— 音乐 / 转换 / 备忘录 / 剪贴板历史 / 快速启动 / 工具编辑 / 网页搜索 /
+ *    翻译（2026-09-29 用户选的就是「可悬浮 + 主窗面板」：翻译常常要对着别的窗口看），
  *    它们的内容与宽度无关，塞进 420px 小窗照样成立；
  *  · **不悬浮** —— `settings`（按 800px 宽 + 左侧栏分类设计，小窗里会散架）、
  *    `ai-agent`（对话流就是主窗口本身，没有「搬进小窗」这一步）、
@@ -1936,6 +2069,11 @@ const FLOATABLE_PLUGINS = new Set([
   "quick-launch",
   "tool-editor",
   "web-search",
+  "translate",
+  // 桌宠（2026-09-29）：内嵌面板是**控制台**（导入形象 / 穿透 / 大小），
+  // 「显示桌宠」按它开出独立桌宠窗。它自己**没有**声明 `window.float`
+  // —— 所以点开时看到的是控制台而不是宠物本体（见 pet.ts 文件头）。
+  "pet",
 ]);
 
 /**
@@ -2639,6 +2777,12 @@ function addUsageToTotals(info: ChatDoneInfo) {
   usageTotals.total += miss + hit + info.output_tokens;
 }
 
+/** 表盘展开面板的开关与单飞状态。**必须声明在 `updateTokenDashboard` 之前**：
+ *  那个函数在模块求值时就可能被调到，`let` 有暂时性死区（TDZ），声明放后面会直接抛错。 */
+let usagePanelOpen = false;
+let usagePanelBusy = false;
+let usagePanelDirty = false;
+
 function updateTokenDashboard() {
   const { hit, miss, total, elided, dropped } = usageTotals;
   const inputTokens = hit + miss;
@@ -2655,6 +2799,10 @@ function updateTokenDashboard() {
     `</span>` +
     `<span class="tk-pct">${hitPct}%</span>` +
     `<span class="tk-total" title="${t("token.detail_tooltip", { hit: fmtTokens(hit), miss: fmtTokens(miss), out: fmtTokens(total - inputTokens), total: fmtTokens(total) })}${compactNote}">${fmtTokens(total)}</span>`;
+
+  // 表盘的展开面板里那张逐日表格要**跟着对话实时走**（用户 2026-09-29 要求）——
+  // 只在面板开着时才真去读盘重排（见 `refreshTokenUsagePanel`）。
+  if (usagePanelOpen) void refreshTokenUsagePanel();
 }
 
 /** `YYYY-MM-DD`（本地时区）—— 用量日志的文件名分片键 */
@@ -2690,6 +2838,8 @@ function appendUsageLog(info: ChatDoneInfo) {
       dropped: liveCompaction.dropped,
       // 每次 API 请求一行（对账粒度，与平台用量页逐行对齐）；旧 agent 缺该字段 → 不写
       requests: info.requests ?? [],
+      // 其中来自子代理 / 后台复盘的部分（只作归因，**不要**再计入金额）；旧 agent → undefined
+      subagent: info.subagent,
     },
   }).catch(() => {});
 }
@@ -2709,8 +2859,57 @@ function showTokenDashboard(show: boolean) {
   } else {
     tokenDashboard.classList.remove("visible");
     tokenDashboard.classList.add("hidden");
+    // 表盘收起来了，它那个展开面板不能独自留在屏幕上（2026-09-29）
+    setUsagePanelOpen(false);
   }
 }
+
+// ── 表盘的展开面板（用量与成本数据，2026-09-29 用户定）──────────────
+//
+// 形态：**点表盘 → 面板展开**。状态栏在窗口最底下（下方就是窗口边缘），所以面板只能
+// **贴着状态栏往上弹**，靠 `#token-usage-panel` 的绝对定位实现（见 styles.css）。
+//
+// 里面只放**数据**（价格表时间 / 未定价模型 / 候选文件路径 + 逐日表格含总计行），
+// **不放说明文字** —— 用户原话「只是移入数据，并不是移入说明」。设置里那一节因此只剩下
+// 「打开价格表 / 更新价格」与候选价格确认（见 settings.ts）。
+//
+// **对话进行中要同步 tokens**：每次用量落到表盘（`updateTokenDashboard`）都顺手刷一次，
+// 但**只在面板开着的时候**才真去读盘 + 重排 DOM —— 关着的时候刷它是纯浪费。
+
+async function refreshTokenUsagePanel(): Promise<void> {
+  if (!usagePanelOpen) return;
+  // 单飞 + 追最新：一轮还没画完又来一次，就只记「脏」，画完再补一轮（不排队、不叠加）
+  if (usagePanelBusy) {
+    usagePanelDirty = true;
+    return;
+  }
+  usagePanelBusy = true;
+  try {
+    do {
+      usagePanelDirty = false;
+      tokenUsagePanel.innerHTML = renderUsageCostPanel(await loadUsageCost());
+    } while (usagePanelDirty && usagePanelOpen);
+  } finally {
+    usagePanelBusy = false;
+  }
+}
+
+function setUsagePanelOpen(open: boolean): void {
+  usagePanelOpen = open;
+  tokenUsagePanel.classList.toggle("hidden", !open);
+  tokenDashboard.classList.toggle("expanded", open);
+  if (!open) return;
+  // 贴着状态栏往上弹：`bottom` 取状态栏实测高 + 6px（CSS 里那个 40px 只是兜底，
+  // 状态栏实际高度随字体 / 缩放变化，写死会错开一条缝或压住表盘）
+  tokenUsagePanel.style.bottom = `${Math.round(statusBar.getBoundingClientRect().height) + 6}px`;
+  void refreshTokenUsagePanel();
+}
+
+tokenDashboard.addEventListener("click", () => {
+  // 表盘只在有对话时可见（`.visible`）；点了就开关面板，别在没对话时空开一个面板
+  if (!tokenDashboard.classList.contains("visible")) return;
+  setUsagePanelOpen(!usagePanelOpen);
+});
 
 async function stopAIChat() {
   if (!isStreaming) return;
@@ -2805,11 +3004,15 @@ humanizeBtn.addEventListener("click", () => {
 
 // ── Detach mode — hide search bar, expand results panel ────────
 function setDetached(on: boolean) {
+  // **聊天独立窗也走这里**（2026-09-29）：它借的正是这段外观（`#app.detached` =
+  // padding 2px + `#results-container` 圆角玻璃底 + 撑满 + `#detached-header` 当窗口
+  // 标题栏，含 AI 专用的 VSCode 按钮）。Rust 侧的 `DETACHED` 是主窗的全局单值 ——
+  // 那条命令由 `invoke` 包装拦掉（见文件顶部 MAIN_WINDOW_ONLY_CMDS），所以这里安全。
   detached = on;
   // Sync with Rust foreground guard (prevents auto-hide on focus loss)
   invoke("set_detached", { detached: on }).catch(() => {});
-  // OCR is detached-only (点10/17): no "<" back-to-embedded button, keep "X" only
-  detachedBackBtn.classList.toggle("hidden", on && activePluginId === "ocr");
+  // 接管型插件是 detached-only（点10/17）：没有 "<" 回内嵌按钮，只留 "X"
+  detachedBackBtn.classList.toggle("hidden", on && isTakeoverPlugin(activePluginId));
   if (on) {
     document.getElementById("app")!.classList.add("detached");
     statusHint.textContent = t("detached.click_restore");
@@ -2863,6 +3066,12 @@ detachedBackBtn.addEventListener("click", () => {
 
 // Detached header: close button → exit plugin entirely
 detachedCloseBtn.addEventListener("click", async () => {
+  // 聊天独立窗的 × = **关掉这个窗口**（主窗那套语义是「退出插件、回到搜索栏」，
+  // 在独立窗里没有搜索栏可回）。窗口关掉后再从哪里进？搜索命中 AI 会重新开一个。
+  if (IS_CHAT_WINDOW) {
+    await win.close();
+    return;
+  }
   if (detached) setDetached(false);
   if (pluginActive) await closePluginView();
 });
@@ -2889,6 +3098,9 @@ const PLUGIN_ICON_PATHS: Record<string, string> = {
   // 文件转换（2026-09-27）：双向箭头 —— 「换格式」最直白的图形
   "convert": `<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>`,
   "clipboard-history": `<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
+  // 翻译（2026-09-29）：语言符号 —— 「文」与「A」相对。**刻意不用地球**：
+  // 那个图形已经是 `web-search` 的，两行图标一样会让用户认错插件。
+  "translate": `<path d="M2 5h10"/><path d="m6 2v3"/><path d="m3 8 4 5 4-5"/><path d="M12 22l4-9 4 9"/><path d="M13.5 19h5"/>`,
 };
 
 /** 当前主题包提供的插件图标（插件 id → 已 convertFileSrc 的 URL）。
@@ -3208,6 +3420,8 @@ async function refreshQuickLaunchPanel() {
 // 3. 空白且无插件 → Rust 直接 hide_window()，不经过前端
 
 listen("lunac-esc-clear", async () => {
+  // Esc 清除/关闭面板是**主窗**的语义（Rust 端只认 MAIN_HWND，这里再兜一道）
+  if (IS_CHAT_WINDOW) return;
   handleEscClear();
 });
 
@@ -3284,6 +3498,7 @@ async function closePluginView() {
 }
 
 listen("lunac-esc-cancel-rec", () => {
+  if (IS_CHAT_WINDOW) return; // 录音链路是主窗的
   (window as any).__lunac_cancel_recording?.();
 });
 
@@ -5242,6 +5457,9 @@ function clearPermissionCards() {
 }
 
 listen<{ line: string }>("cli-output", (event) => {
+  // **对话流只归聊天独立窗**（2026-09-29：AI 聊天整体搬进独立界面）。
+  // `Emitter::emit` 是**广播**，两个窗口都消费会双渲染、双写会话 ⇒ 主窗直接不看。
+  if (!IS_CHAT_WINDOW) return;
   try {
     const data: CliEventLine = JSON.parse(event.payload.line);
 
@@ -5443,6 +5661,8 @@ listen<{ line: string }>("cli-output", (event) => {
             cache_read_input_tokens: (u.cache_read_input_tokens as number) ?? 0,
             cache_creation_input_tokens: (u.cache_creation_input_tokens as number) ?? 0,
             requests: Array.isArray(u.requests) ? (u.requests as ChatDoneRequestUsage[]) : [],
+            // 子代理 / 后台复盘那部分（仅归因；旧 agent 不报 → undefined）
+            subagent: parseSubagentUsage(u.subagent),
           }
         : undefined;
       // Finalize turn (Pi: turn_end)
@@ -5477,6 +5697,8 @@ listen<{ line: string }>("cli-output", (event) => {
 let cliCurrentInstance: number | null = null;
 
 listen<{ state: string; message: string; instance?: number }>("cli-status", (event) => {
+  // 与 cli-output 同一条纪律：agent 的启停状态只服务聊天界面
+  if (!IS_CHAT_WINDOW) return;
   if (event.payload.state === "starting") {
     cliReady = false;
     statusText.textContent = t("status.ai", { mode: currentModeLabel() });
@@ -5523,6 +5745,7 @@ listen<{ state: string; message: string; instance?: number }>("cli-status", (eve
 // CLI stderr — log for debugging; keep the last line for exit diagnostics
 let lastCliStderr = "";
 listen<string>("cli-stderr", (event) => {
+  if (!IS_CHAT_WINDOW) return; // 同上：只服务聊天界面
   lastCliStderr = event.payload;
   console.warn("[cli-stderr]", event.payload);
   appendRuntimeNote(event.payload);
@@ -6137,10 +6360,10 @@ function launchApp(path: string) {
  * （同一时刻只该有一个插件界面）。这个分支**不设 `_execGuard`**：宿主那边
  * `open()` 对同一个插件是「复用 + 置前」，重复调用不会开出第二个窗。
  */
-async function openMusicWindow() {
+async function openPluginWindow(pluginId: string) {
   if (pluginActive) await closePluginView();
   try {
-    await invoke("open_plugin_window", { pluginId: "music", input: searchInput.value.trim() });
+    await invoke("open_plugin_window", { pluginId, input: searchInput.value.trim() });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     statusText.textContent = t("plugin.float_failed", { error: msg });
@@ -6148,8 +6371,29 @@ async function openMusicWindow() {
 }
 
 async function executePlugin(plugin: Plugin) {
-  if (plugin.id === "music") {
-    await openMusicWindow();
+  // 拓展插件必须**盘上有可用的一份**才能打开（2026-09-29 用户要求：没装 = 完全不存在于本应用）。
+  // 基础插件随安装包走，永远可用。判据取本机事实（`hasDiskPlugin`），不看 registry 里有没有 ——
+  // 过渡期 bundle 里可能还留着一份，那份不该让「已卸载」的插件重新开出来。
+  if (!isBasePlugin(plugin.id) && !hasDiskPlugin(plugin.id)) {
+    statusText.textContent = t("plugin.not_installed", { name: pluginName(plugin.id, plugin.name) });
+    return;
+  }
+  // 「一律在悬浮窗里打开」由插件**自己声明**（`permissions: ["window.float"]`），宿主不再按 id 认 ——
+  // 拓展插件要能独立打包分发，宿主写死的 id 表在磁盘插件上根本查不到（见 ai-spec §3.5）。
+  //
+  // **过渡兜底（2026-09-29，重发 music 包后删掉）**：市场里已发布的 `music-0.9.6` 清单是
+  // `permissions: []`（`build-plugins.ps1` 刚补上这条声明，包还没重发），而磁盘那份优先于 bundle
+  // ⇒ 今天从市场装的音乐若不兜底，点开就退化成内嵌面板（用户 2026-09-28 明确禁止过内嵌版）。
+  // AI 助手：主窗**一律开独立聊天窗**（2026-09-29 用户定：AI 插件只在独立界面里）。
+  // 必须在 `plugin.execute` 之前返回 —— ai-agent 的 execute 只是转调 `startAIChat`，
+  // 而面板那一套初始化（pluginActive / setPluginBar / 结果区）已经做了一半，
+  // 不停在这里主窗会留下一个空的 AI 面板。
+  if (plugin.id === "ai-agent") {
+    await openChatWindow(searchInput.value.trim());
+    return;
+  }
+  if (plugin.permissions?.includes("window.float") || plugin.id === "music") {
+    await openPluginWindow(plugin.id);
     return;
   }
   if (_execGuard) return;
@@ -6162,7 +6406,10 @@ async function executePlugin(plugin: Plugin) {
   // Mark plugin as active (ESC will close it, not hide the window)
   pluginActive = true;
   activePluginId = plugin.id;
-  setPluginBar(pluginName(plugin.id));
+  // 兜底要带 `plugin.name`（2026-09-29）：宿主词典里只有**官方**插件的 `plugin.<id>`，
+  // 第三方 / 新插件没有条目 ⇒ 原来的 `pluginName(id)` 会把**原始 id** 当标题显示
+  // （「桌宠」这条就是被它显示成 `pet` 的）。搜索列表一直用的是两参数写法，这里对齐。
+  setPluginBar(pluginName(plugin.id, plugin.name));
   invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
 
   // Allow native select dropdowns to overflow the container (no clipping)
@@ -6174,12 +6421,14 @@ async function executePlugin(plugin: Plugin) {
   // attribute is NOT serialized in innerHTML, so cached HTML always shows OFF.
   // AI agent never restores cached HTML — conversations go to history,
   // the dialog should always start fresh.
-  // OCR never restores — the two-panel detached UI is rebuilt fresh each time,
-  // and the image path changes between sessions. Old cached HTML would show
-  // a "bubble" wrapper in detached mode with mismatched element IDs.
+  // 接管型插件（OCR）never restores —— 双栏 detached UI 每次重建，图片路径也会变；
+  // 缓存的 HTML 在 detached 下只会留一个错位的空壳（元素 id 还对不上）。
   // Quick-launch never restores — 面板 = 注册表的实时视图（重开必须重列，
   // 否则缓存 HTML 会让“新添加的注册项消失”）。
-  const skipRestore = plugin.id === "settings" || plugin.id === "ai-agent" || plugin.id === "ocr" || plugin.id === "memo" || plugin.id === "quick-launch" || plugin.id === "music" || plugin.id === "convert";
+  // 翻译 never restores — 它的面板带**来自搜索栏的待译内容**（`翻译 hello` 点开就该译 hello）。
+  // 缓存 HTML 会把上一次的输入框原样抬回来、把这次查询悄悄丢掉：第一次开有预填、
+  // 第二次开没有，用户看到的是“同一个动作两种结果”。（2026-09-29）
+  const skipRestore = plugin.id === "settings" || plugin.id === "ai-agent" || isTakeoverPlugin(plugin.id) || plugin.id === "memo" || plugin.id === "quick-launch" || plugin.id === "music" || plugin.id === "convert" || plugin.id === "translate";
   const saved = skipRestore ? undefined : pluginStates.get(plugin.id);
   if (saved?.html) {
     resultsList.innerHTML = saved.html;
@@ -6204,20 +6453,6 @@ async function executePlugin(plugin: Plugin) {
           m.attachToolEditorListeners()
         ), 50);
     }
-    if (plugin.id === "ocr") {
-      setDetached(true);
-      setTimeout(() =>
-        import("./plugins/builtin/ocr").then(m => {
-          m.attachOcrListeners(document);
-          const imgPath = (window as any).__lunac_ocr_image as string | undefined;
-          if (imgPath) {
-            delete (window as any).__lunac_ocr_image;
-            m.ocrImageFile(imgPath);
-          } else {
-            m.autoStartClipboardOcr();
-          }
-        }), 50);
-    }
     applyWindowSize();
     return;
   }
@@ -6225,21 +6460,13 @@ async function executePlugin(plugin: Plugin) {
   try {
     const result = await plugin.execute(q);
     if (result.type === "html") {
-      // OCR uses its own full-height detached layout (no plugin-result wrapper)
-      if (plugin.id === "ocr") {
+      // 接管型插件（`layout.takeover`，如 OCR 双栏）：**不套 `.plugin-result`**，
+      // 面板 HTML 直接铺满结果区并切成 detached；挂载时 root 传**文档根**，
+      // 因为这类插件的控件按 id 在整篇文档里取（见 plugins/builtin/ocr.ts 的 attach）。
+      const takeover = isTakeoverPlugin(plugin.id);
+      if (takeover) {
         resultsList.innerHTML = result.content;
         setDetached(true);
-        setTimeout(() =>
-          import("./plugins/builtin/ocr").then(m => {
-            m.attachOcrListeners(document);
-            const imgPath = (window as any).__lunac_ocr_image as string | undefined;
-            if (imgPath) {
-              delete (window as any).__lunac_ocr_image;
-              m.ocrImageFile(imgPath);
-            } else {
-              m.autoStartClipboardOcr();
-            }
-          }), 50);
       } else {
         resultsList.innerHTML = `
           <div class="plugin-result">
@@ -6251,7 +6478,7 @@ async function executePlugin(plugin: Plugin) {
       // 就会出现「内嵌能用、悬浮窗是死的」。这里仍保留 50ms 延时：面板 HTML 刚写进
       // resultsList，部分插件的挂载要读到已渲染的节点。
       setTimeout(() => {
-        void attachPluginListeners(plugin, resultsList);
+        void attachPluginListeners(plugin, takeover ? document.body : resultsList);
       }, 50);
     } else {
       resultsList.innerHTML = `
@@ -6822,7 +7049,36 @@ function appendUserMsg(text: string, idx?: number) {
   resultsList.scrollTop = resultsList.scrollHeight;
 }
 
+/** 打开（或前置）AI 聊天的**独立窗口**。
+ *
+ *  `pluginId: "chat"` 是宿主 `plugin_window::CHAT_WINDOW_ID` —— 它**不是**市场里的插件，
+ *  宿主为它特判了两件事：页面加载 `index.html`（聊天的界面与逻辑就是主界面那一份，
+ *  不必把这套界面搬进 `plugin-window.ts`）、尺寸 1280×720（用户 2026-09-29：「独立界面
+ *  尺寸设置成与音乐插件相同的」）。窗口 label 因此是 `plugin-chat`，落进 `plugin-*`
+ *  通配 ⇒ capabilities 授权、`on_window_event` 按 label 分流、`OPEN_WINDOWS` 失焦放行
+ *  全部复用插件窗那一套。
+ *
+ *  窗口已经开着时宿主走**复用路径**（`unminimize + show + set_focus`）并推一条
+ *  `plugin-window-input` ⇒ 聊天窗把它当成「又送来一句话」（见聊天窗那条监听）。 */
+async function openChatWindow(query = "") {
+  try {
+    await invoke("open_plugin_window", { pluginId: "chat", input: query });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    statusText.textContent = t("plugin.float_failed", { error: msg });
+  }
+}
+
 async function startAIChat(query: string, files?: string[]) {
+  // **主窗不再跑聊天**（2026-09-29 用户定：AI 插件只在独立界面里，主窗的内嵌小窗与
+  // detached 600 大窗都要去掉）。任何「进入 AI」的入口 —— 搜索命中 AI 条目 / 插件
+  // `execute` / 右键「问 AI」/ 历史抽屉 / 去痕迹按钮 —— 一律改成**开聊天独立窗**。
+  //
+  // 收口在这一处而不是逐个调用点：调用点有十几处，漏掉一处就是「主窗又长出一个内嵌聊天」。
+  if (!IS_CHAT_WINDOW) {
+    await openChatWindow(query);
+    return;
+  }
   const fileArr = files && files.length > 0 ? files : attachedFiles;
   const hasAttach = fileArr.length > 0;
   // Allow file-only queries (no text) — files alone are a valid AI request.
@@ -6926,6 +7182,11 @@ async function startAIChat(query: string, files?: string[]) {
   if (pluginActive) { await closePluginView(); await new Promise(r => setTimeout(r, 50)); }
   const p = pluginRegistry.getAll().find(pl => pl.id === id);
   if (p) { resultsContainer.classList.remove("hidden"); searchBar.classList.add("has-results"); await executePlugin(p); }
+};
+// 卸载插件后收掉它在主窗口的面板（2026-09-29，与 __lunac_open_plugin 对称）。
+// 设置面板只负责「卸载 + 重扫」，界面状态的收尾是主界面的职责；不是当前插件就是空操作。
+(window as any).__lunac_close_plugin_if = (id: string) => {
+  if (pluginActive && activePluginId === id) void closePluginView();
 };
 // 设置 → 用量与成本：「更新价格」把抓取任务交给 agent（A12）。
 // 设置面板自己不能发消息（那要动结果区 / 搜索栏状态，是主界面的职责），所以走桥：
@@ -8163,15 +8424,13 @@ function processClipboardText(text: string) {
         addFileChip(trimmed);
         hasFiles = true;
       }
-      import("./plugins/builtin/clipboard-history").then(m => {
-        m.addClipboardEntry(trimmed);
-      }).catch(() => {});
+      // 记进剪贴板历史：走**宿主命令**，不 import 插件模块（2026-09-29）——
+      // 剪贴板历史已是拓展插件，可能根本没装，而「粘贴就记一条」是主窗口自己的行为。
+      void invoke("append_clipboard_entry", { text: trimmed }).catch(() => {});
     } else {
       // 普通文本 → 存入剪切板历史
       if (trimmed.length < 2000) {
-        import("./plugins/builtin/clipboard-history").then(m => {
-          m.addClipboardEntry(trimmed);
-        }).catch(() => {});
+        void invoke("append_clipboard_entry", { text: trimmed }).catch(() => {});
       }
       hasText = true;
     }
@@ -8194,6 +8453,8 @@ function processClipboardText(text: string) {
 
 // Primary: Rust has already read clipboard, text arrives directly via event
 win.listen<string>("lunac-clipboard", (event) => {
+  // 剪贴板链路是**主窗**职责（ai-spec §4.8 第 1 条：第二个窗口绝不注册剪贴板）
+  if (IS_CHAT_WINDOW) return;
   if (event.payload) {
     processClipboardText(event.payload);
   }
@@ -8255,6 +8516,8 @@ function triggerJSClipboardRead() {
 // and would cause unwanted clipboard reads.
 // 同时进入「抑制滑动」期：唤出瞬间窗口应完整展开，而不是被结果区逐帧撑开。
 win.listen("lunac-window-shown", () => {
+  // 「主窗被唤出」是**主窗**事件（尺寸重断言 / 重跑搜索 / 读剪贴板），聊天窗不参与
+  if (IS_CHAT_WINDOW) return;
   suppressResizeAnimBriefly();
   // 强制重新断言高度：隐藏期间窗口高可能已被改动，而 `requestedHeight` 缓存会让
   // 本轮测量被静默跳过（2026-09-19，见 forceHeightReassert 的注释）。
@@ -8280,10 +8543,40 @@ win.listen("lunac-window-shown", () => {
 
 // 启动即自报一次界面层：脚本刚跑完 = 一定是简洁搜索，而 Rust 进程可能还是上一次
 // 会话残留的 plugin / detail（前端刷新但进程没重启就会错位）。这是最便宜的自愈点。
-syncUiMode();
-
-// Also try reading clipboard on initial startup
-setTimeout(triggerJSClipboardRead, 800);
+//
+// **聊天独立窗**（`plugin-chat`）走另一条启动路径（2026-09-29）：开局就把聊天界面立起来
+// （不必先搜一次「ai」），并且**不做**主窗那两件事 —— 界面层是主窗的全局单值，
+// 剪贴板读取也是主窗职责（见本文件顶部那张分工表）。
+if (IS_CHAT_WINDOW) {
+  // 聊天窗：开局即立起聊天界面，并带上宿主在建窗**之前**存好的那句话
+  // （用户从搜索栏点 AI 条目 / 右键「问 AI」时那句）。`plugin_window_init` 是
+  // take 语义（取走即删），没有待取载荷（比如窗口是被复用开出来的）就当空白开聊。
+  void (async () => {
+    let seed = "";
+    try {
+      const init = await invoke<{ plugin_id: string; input: string }>("plugin_window_init");
+      seed = (init?.input ?? "").trim();
+    } catch {
+      /* 没有待取载荷 —— 正常，空白开聊 */
+    }
+    await startAIChat(seed);
+    // 借主窗「分离态」那套外观当本窗口的壳：`#app.detached` = padding 2px +
+    // `#results-container` 圆角玻璃底 + 撑满 + `#detached-header` 当窗口标题栏。
+    // 必须在 startAIChat 之后 —— 那一步才把 `activePluginId` 置成 `ai-agent`，
+    // 而标题栏里 VSCode 按钮的显隐正是按它判的（见 setDetached）。
+    setDetached(true);
+  })();
+  // 窗口已经开着时宿主**不建新窗**，改推一条 `plugin-window-input` 把新入参送进来
+  // （同 plugin-window.ts 的做法）—— 否则「第二次带话进来」会被静默丢掉。
+  void win.listen<string>("plugin-window-input", (e) => {
+    const q = typeof e.payload === "string" ? e.payload.trim() : "";
+    if (q) void startAIChat(q);
+  });
+} else {
+  syncUiMode();
+  // Also try reading clipboard on initial startup
+  setTimeout(triggerJSClipboardRead, 800);
+}
 
 // ══════════════════════════════════════════════════════════════════
 // 详细搜索大界面（双击搜索栏进入）

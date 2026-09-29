@@ -23,7 +23,8 @@
    | utility / network.mojom.NetworkService | 6.2 MB |
    | utility / storage.mojom.StorageService | 5.0 MB |
 
-4. **三项决定（2026-09-18 用户拍板，全部已落地）**：
+4. **第二份 WebView2（第二个窗口）的边际成本（2026-09-29 实测，dev 0.9.6）**：**只多 1 个 `msedgewebview2.exe`（renderer）**，**不是**「再起一整个实例」—— Tauri 复用同一个 WebView2 environment（同一 `--user-data-dir` ⇒ 同一个 browser 进程，browser / gpu / utility / crashpad 全部共用）。工作集 **413.7 → 523.0 MB（+109.3）**、私有 **312.0 → 366.1 MB（+54.1）**；窗口销毁后**进程与内存都退回基线**。⚠️ 这与第 3 条那个「5 进程 / 50.4 MB」**不是同一个口径**：那是**整个实例**的固定成本，这是**第二个窗口**的边际成本 —— 拿前者估后者会同时高估进程数、低估内存。详见 **§6.2**。
+5. **三项决定（2026-09-18 用户拍板，全部已落地）**：
 
    | # | 决定 | 落点 |
    |---|---|---|
@@ -31,8 +32,8 @@
    | 2 | **`HKCU` 里的 `--remote-debugging-port=9222` 长期保留** —— 合并语义天然保留它 | §4.2 / §4.4 |
    | 3 | **`--js-flags=--scavenger_max_new_space_capacity_mb=8` 纳入** —— 官方旗标，只降内存 | §4.5 |
 
-5. **同时修掉一个真 bug**：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 被外部预设时，原实现的 `is_err()` 守卫会让**我们自己的旗标全部静默失效** —— 权限弹窗抑制、剪贴板 API 禁用一直是摆设。详见 §4.2。
-6. **净结果**：渲染层不变；**进程数与内存量都没有实质变化**（本决策只采纳了一个降内存旗标）。这一点必须诚实看待 —— 本决策的主要产出是**修好一个一直没生效的注入**，以及**用实测数据关掉了「推倒重来」这条路**。
+6. **同时修掉一个真 bug**：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 被外部预设时，原实现的 `is_err()` 守卫会让**我们自己的旗标全部静默失效** —— 权限弹窗抑制、剪贴板 API 禁用一直是摆设。详见 §4.2。
+7. **净结果**：渲染层不变；**进程数与内存量都没有实质变化**（本决策只采纳了一个降内存旗标）。这一点必须诚实看待 —— 本决策的主要产出是**修好一个一直没生效的注入**，以及**用实测数据关掉了「推倒重来」这条路**。
 
 ---
 
@@ -199,7 +200,9 @@ removed or altered at any time」。它属于 Chromium 私有旗标、未经 Web
 
 ---
 
-## 6. 现存工具：A/B 实测脚本
+## 6. 实测记录
+
+### 6.1 A/B 实测脚本（2026-09-18 起，长期保留）
 
 **用途已转变**：§4.3 的决定已经做出，脚本**不再是「等结论」的判据**，而是**将来要试旗标时的现成工具**
 （例：WebView2 大版本更新后想复测 `--disable-gpu`，或想试别的官方旗标）。
@@ -223,10 +226,53 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\lunac-ab.ps1"
 | R3 | R1 + `--in-process-gpu` | **已判定不采用**（§4.3）；保留用于将来复测 |
 | R4 | R1 + `--js-flags=…` | **已纳入生产**（§4.5） |
 
-**仍未复核的一点（低优先 → backlog M1-3）**：`disable-feat` 字段里**两个 `--disable-features` 是否逗号合并**
-（WebView2 自带的 `msWebOOUI,msPdfOOUI,msSmartScreenProtection` 与我们的 `PermissionPrompt,ClipboardContentRead`
-应同时在场）。§4.2 的代码注释按「Chromium 逗号合并重复 switch」写的；**若实测发现我们的串挤掉了 WebView2 自带的那份**，
-合并策略要改成「并入同一个 switch 的值」。ai-spec 规则 38 已登记该待验证项。
+**已复核（2026-09-29 定论）：两个 `--disable-features` 逗号合并、五项同时在场。**
+取证方式是读宿主进程树里 WebView2 浏览器进程的 `CommandLine`（`Get-CimInstance Win32_Process | ? { $_.Name -like '*webview2*' }`）：父进程是本应用 `lunac.exe` 的那个 browser 进程拿到的是
+
+```
+--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,PermissionPrompt,ClipboardContentRead
+--js-flags=--scavenger_max_new_space_capacity_mb=8
+```
+
+即 WebView2 自带的 `msWebOOUI,msPdfOOUI,msSmartScreenProtection` 与我们的 `PermissionPrompt,ClipboardContentRead` **同时在场**（它的子进程里顺序会重排成 `ClipboardContentRead,PermissionPrompt,msPdfOOUI,msSmartScreenProtection,msWebOOUI`，同一个集合 —— Chromium 按 feature 集合归一，顺序无意义）。
+
+⇒ §4.2 按「Chromium 逗号合并重复 switch」实现的写法**是对的，保持不动**（**不要**改成「并入同一个 switch 的值」）。ai-spec §11 规则 38 里登记的待验证项据此关闭，backlog 的 M1-3 已删除。
+
+### 6.2 多窗口：第二份 WebView2 的边际成本与「隐藏不省电」（2026-09-29 实测）
+
+**为什么要量**：`plugin_window.rs` 已能给插件开独立窗（2026-09-27），而 backlog 的 **L1 Live2D 桌宠**要的正是「再多一个常驻透明置顶窗」。L1-A 的形态行当时写的是「一份 WebView2 ≈ **5 个 `msedgewebview2.exe` / ~50MB**」—— 那个数取自 §0 第 3 条的**整实例**基线，**不能**拿去估「第二个窗口」。
+
+**① 边际成本**（dev 0.9.6 + `plugin.html`，Vite dev server + source map，故 renderer 偏大）：
+
+| 态 | webview2 进程数 | 工作集 | 私有 |
+|---|---|---|---|
+| 只有主窗口 | 6 | 413.7 MB | 312.0 MB |
+| 主窗口 + 1 个插件窗 | 7 | 523.0 MB | 366.1 MB |
+| 关掉那个插件窗之后 | 6 | 425.0 MB | 306.1 MB |
+
+- **边际进程 = +1，且是 `--type=renderer`**。browser / gpu / utility / crashpad 全部共用 ⇒ **不是 +5**。
+- **边际内存 = 工作集 +109 MB / 私有 +54 MB**。⇒ 「~50MB」这个数只对**私有**口径成立，按工作集算是它的两倍；**报数必须带口径**。
+- **销毁即回收**：关窗后进程数回到 6、内存回到基线（残差约 10 MB 是主窗口自身波动）。⇒ 桌宠「收起」用**销毁窗口**是可行的，不必常驻隐藏。
+
+**② 「最小化/隐藏时会不会自动暂停」—— 实测：不会。** 在一个 `plugin.html` 窗口里挂一个**空 rAF 循环**（只计数、不画东西），再点它自己的最小化按钮（`IsIconic` 已确认为真）：
+
+| 态 | rAF 速率 | 该 renderer 的 CPU |
+|---|---|---|
+| 可见 | ~170 fps（= 本机显示器 170Hz 刷新率） | ~6.5% 单核 |
+| **已最小化** | **仍 ~170 fps** | **~5.3% 单核** |
+| 最小化 + 掐断 rAF 链 | 0 | **0.00%**（8 s 内 0 秒 CPU） |
+
+- **`document.visibilityState` 全程是 `"visible"`** —— Win32 的 `IsWindowVisible()` 对**最小化**窗口返回**真**，WebView2 据此判定「可见」⇒ 连 `visibilitychange` 事件都不会给。
+- ⇒ **插件不能指望浏览器替自己省电**：桌宠这类带常驻动画的插件，「收起」要么**销毁窗口**（已验证可回收），要么由**宿主显式下发一个「已隐藏」事件**让插件自己停掉 rAF 与物理。**空循环就已经 ~5% 单核**，真挂上 Live2D 只会更高。
+- 这与 §4.3「不启用 `--disable-gpu`」是同一类取舍：观感 / 功能优先，**性能只能自己兜**。
+
+**③ 透明窗确实透明（观感项，同一轮实测）**：把插件页整棵 `body` 子节点 `display:none`、`html` / `body` 背景置为 `rgba(0,0,0,0)`，再截该窗口矩形内的屏幕像素。**若窗口不透明，这一区域必然是一块纯色**（WebView2 的默认底色）。实测该区域 **7374 种颜色**、最大单色占比仅 **19.1%**（对照：同一时刻一块确定是桌面的补丁 **5843 种 / 16.9%**）⇒ 桌面透出来了，`.transparent(true)` 生效，**桌宠的非矩形轮廓成立**。
+
+> ⚠️ **本轮未验、但桌宠一定要的一件**：**鼠标穿透**（`set_ignore_cursor_events`）。现在 `plugin_window.rs` 没有这条命令，且 `.resizable(true)` 的窗口四边都有可拖拽区 —— 桌宠需要的是「不透明像素吃掉鼠标、透明像素把鼠标还给桌面」，那是新建窗口时要定的能力，**不是调一个参数**。
+
+**（2026-09-29 当天补）上面那个缺口已经补上了**，另外「最小化不省电」也按实测改成了宿主显式下发：
+`plugin_window_set_click_through(ignore)`（**只认 `plugin-` 前缀的窗口** —— 主窗口一旦被穿就点不回来）+ 事件 `plugin-window-visibility {visible}`（`Resized` 与 `open()` 复用路径两处触发、只在翻转时发）。
+落地契约、实机取证与单测结果见 ai-spec §4.8 与 ai-spec 文末的实测表。**桌宠插件的下一步只剩插件本体**（backlog L1）。
 
 ---
 

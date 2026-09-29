@@ -19,11 +19,27 @@ let _unlistenHotkeyRecorded: (() => void) | null = null; // Tauri event (for Alt
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
 import { refreshMarketPlugins, fetchPluginIndex, type MarketPluginInfo, type MarketIndexEntry } from "../market";
+import { isBasePlugin, showsInMarket, basePluginOrder } from "../kinds";
+import { detachPluginListeners } from "../attach";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import { t, setLanguage, resetToSystemLanguage, pluginName, pluginDesc } from "../../i18n.js";
-import { installOcrEngine } from "./ocr.js";
+import { installOcrEngine } from "../../ocr-engine.js";
+// 用量与成本的数据层 / 渲染层（2026-09-29 起与主界面表盘的展开面板共用一份，
+// 逐日表格与价格表数据都搬到了那个面板里，见 usage-cost.ts 顶部注释）。
+import {
+  COST_RANGE_DAYS,
+  costDateKey,
+  lastNDates,
+  localUtcOffsetMinutes,
+  modelLabel,
+  parsePricing,
+  type PricingEntry,
+  type PricingFile,
+  type PricingState,
+  type UsageDay,
+} from "../../usage-cost.js";
 
 /** 打开**本地路径**（目录 / 文件）—— 一律走宿主命令 `open_path`。
  *
@@ -1162,130 +1178,50 @@ async function buildAIPane(provider: string, baseUrl: string, model: string, api
 
 // ── 用量与成本（A12）──────────────────────────────────────────────
 //
-// 面板只做三件事：把**本地用量日志**按天汇总、按 `config\pricing.json` 里的单价算钱、
-// 以及**确认 agent 抓回来的候选价格**。三条纪律：
-//  ① 价格不写进代码。各家单价差十倍、官方还会调价，写死一个数字等于把错误金额当事实
-//     展示；价格表是用户可编辑的文件，面板只读它。
-//  ② 「更新价格」不由面板自己抓（它没有网络能力也没有模型），而是把任务交给 agent；
-//     agent 只能写**候选文件**，面板上列出「旧值 → 新值」，用户点确认才覆盖正式价格。
-//  ③ 金额一律在前端算：价格表是用户随时会改的，改完即时重算，不必再跑一趟 IPC。
+// **这一节现在只剩两件事**（2026-09-29 用户定）：打开价格表、把「更新价格」交给 agent；
+// 外加**候选价格的确认 / 放弃**（那两行的数据只在这里有意义，它属于「写凭据」类操作）。
+// 「逐日用量表格 + 价格表状态 / 未定价 / 候选路径」四行说明与表格**整体搬到了
+// 主界面表盘的展开面板**（点 `#token-dashboard` 展开，见 main.ts 与 `usage-cost.ts`）——
+// 那里能在对话进行中实时刷新，而设置面板打开着的时候看不见对话。
+//
+// 三条纪律（与 usage-cost.ts 顶部一致）：价格不写进代码 / 「更新价格」不由前端自己抓 /
+// 金额一律在前端算。
 
-/** 汇总区间（天）。日志按天分片，这里是 30 个文件、一次 IPC 读完（`read_usage_range`）。 */
-const COST_RANGE_DAYS = 30;
-
-interface UsageModelTotals {
-  model: string;
-  turns: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheCreate: number;
-}
-interface UsageDay {
-  date: string;
-  turns: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheCreate: number;
-  models: UsageModelTotals[];
-}
-interface PricingEntry {
-  input?: number;
-  cache_read?: number;
-  cache_write?: number;
-  output?: number;
-  source_url?: string;
-  updated_at?: string;
-}
-interface PricingFile {
-  updated_at?: string;
-  models?: Record<string, PricingEntry>;
-}
-interface PricingState {
-  path: string;
-  text: string;
-  pendingPath: string;
-  pendingText: string;
+/** 「用量与成本」分块（内层容器在确认 / 放弃后会整体重渲染，见 wireUsageCost） */
+async function buildUsageCostSection(): Promise<string> {
+  return `<div id="settings-usage-cost">${await renderUsageCostBody()}</div>`;
 }
 
-/** 本地日期 `YYYY-MM-DD`（与 main.ts 的用量日志分片键同一套口径） */
-function costDateKey(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-/** 近 n 天的本地日期，升序（宿主按同样的顺序读回来） */
-function lastNDates(n: number): string[] {
-  const today = new Date();
-  const out: string[] = [];
-  for (let i = n - 1; i >= 0; i--) {
-    out.push(costDateKey(new Date(today.getFullYear(), today.getMonth(), today.getDate() - i)));
-  }
-  return out;
-}
-
-function parsePricing(text: string): PricingFile | null {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return null;
+async function renderUsageCostBody(): Promise<string> {
+  let state: PricingState | null = null;
   try {
-    const v = JSON.parse(trimmed) as PricingFile;
-    return v && typeof v === "object" ? v : null;
-  } catch {
-    return null; // 语法坏 = 没有价格（面板按「未定价」处理，不去猜）
-  }
+    state = await invoke<PricingState>("get_pricing_state");
+  } catch {}
+
+  const pricing = state ? parsePricing(state.text) : null;
+  const pending = state ? parsePricing(state.pendingText) : null;
+
+  const pendingBlock = pending ? `
+    <div class="cost-pending">
+      <div class="cost-pending-title">${t("settings.cost_pending_title")}</div>
+      <table class="cost-table"><tbody>${pricingPreviewRows(pricing, pending)}</tbody></table>
+      <div class="settings-row">
+        <button type="button" class="settings-btn" id="settings-cost-confirm">${t("settings.cost_confirm")}</button>
+        <button type="button" class="settings-btn" id="settings-cost-discard">${t("settings.cost_discard")}</button>
+      </div>
+    </div>` : "";
+
+  return `
+    <div class="settings-row">
+      <button type="button" class="settings-btn" id="settings-cost-open">${t("settings.cost_open")}</button>
+      <button type="button" class="settings-btn" id="settings-cost-update">${t("settings.cost_update")}</button>
+      <span class="settings-hint" id="settings-cost-msg" style="margin-left:8px;"></span>
+    </div>
+    ${pendingBlock}`;
 }
 
-function priceOf(pricing: PricingFile | null, model: string): PricingEntry | null {
-  const e = pricing?.models?.[model];
-  return e && typeof e === "object" ? e : null;
-}
-
-/** 一天的金额。**必须逐模型算**：一天里换过模型的话，只按天合计就把两个模型的量
- *  混在一起了（单价差十倍）。`exact=false` 表示这天有模型没价格，金额只是已知部分 ——
- *  面板要如实标出来，不要假装它是个准确值。 */
-function dayCost(day: UsageDay, pricing: PricingFile | null): { amount: number; exact: boolean } {
-  let amount = 0;
-  let exact = true;
-  for (const m of day.models) {
-    const p = priceOf(pricing, m.model);
-    if (!p) {
-      exact = false;
-      continue;
-    }
-    amount += (
-      (m.input || 0) * (p.input || 0)
-      + (m.cacheRead || 0) * (p.cache_read || 0)
-      + (m.cacheCreate || 0) * (p.cache_write || 0)
-      + (m.output || 0) * (p.output || 0)
-    ) / 1e6;
-  }
-  return { amount, exact };
-}
-
-/** 金额显示：单价是「元 / 百万 token」，单次提问常常只有几厘 —— 太小就多给两位小数，
- *  否则一律显示 0.00，等于把「花了很少」和「没花钱」显示成同一个样子。 */
-function fmtMoney(v: number): string {
-  if (!(v > 0)) return "0.00";
-  return v < 0.01 ? v.toFixed(4) : v.toFixed(2);
-}
-
-/** token 数显示（表格里用 k / M 缩写，与主界面表盘同风格） */
-function fmtTokenCount(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
-  return String(n);
-}
-
-/** 模型名显示：早期用量日志的模型名是空的（前端当时没记），显示成 `—` 而不是空单元格
- *  —— 空名字看起来像渲染坏了，而它确实会被算进「未定价」。 */
-function modelLabel(model: string): string {
-  return model ? model : "—";
-}
-
-/** 「旧值 → 新值」逐行列出候选价格。**只列变化的**（没变的模型不占版面），
- *  另外单列「新增」与「确认后失去价格」两类 —— 后者是整体覆盖的必然结果，
- *  不写出来用户会以为旧价格还在。 */
+/** 「旧值 → 新值」逐行列出候选价格。**只列变化的**：
+ *  新模型整条列出四项；已有模型只在数值变化时列出那一项。 */
 function pricingPreviewRows(current: PricingFile | null, next: PricingFile): string {
   const fields: { key: keyof PricingEntry; label: string }[] = [
     { key: "input", label: t("settings.cost_col_input") },
@@ -1316,6 +1252,17 @@ function pricingPreviewRows(current: PricingFile | null, next: PricingFile): str
         parts.push(`${f.label} ${a} → ${b}`);
       }
     }
+    // 时段价（分时价）：**只改了时段价**的候选也必须让用户看见 —— 否则预览会显示成
+    // 「无变化」，用户以为点确认没影响（2026-09-29）。比较用序列化签名：条数与内容
+    // 任一变化都算变化（只看条数会漏掉「改时段 / 改档位」）。
+    const wOld = Array.isArray(old?.time_windows) ? old!.time_windows! : [];
+    const wNew = Array.isArray(entry.time_windows) ? entry.time_windows : [];
+    if (JSON.stringify(wOld) !== JSON.stringify(wNew)) {
+      parts.push(t("settings.cost_pending_windows", {
+        old: String(wOld.length),
+        new: String(wNew.length),
+      }));
+    }
     const badge = old ? "" : ` <span class="cost-new">${t("settings.cost_pending_added")}</span>`;
     const src = entry.source_url ? `<div class="cost-src">${esc(entry.source_url)}</div>` : "";
     const cell = parts.length
@@ -1331,108 +1278,6 @@ function pricingPreviewRows(current: PricingFile | null, next: PricingFile): str
     }
   }
   return rows.join("");
-}
-
-/** 「用量与成本」分块（内层容器在确认 / 放弃后会整体重渲染，见 wireUsageCost） */
-async function buildUsageCostSection(): Promise<string> {
-  return `<div id="settings-usage-cost">${await renderUsageCostBody()}</div>`;
-}
-
-async function renderUsageCostBody(): Promise<string> {
-  let state: PricingState | null = null;
-  try {
-    state = await invoke<PricingState>("get_pricing_state");
-  } catch {}
-  let days: UsageDay[] = [];
-  try {
-    days = await invoke<UsageDay[]>("read_usage_range", { dates: lastNDates(COST_RANGE_DAYS) });
-  } catch {}
-
-  const pricing = state ? parsePricing(state.text) : null;
-  const pending = state ? parsePricing(state.pendingText) : null;
-  const models = pricing?.models || {};
-  const hasPrices = Object.keys(models).length > 0;
-
-  const totals = { turns: 0, input: 0, hit: 0, write: 0, output: 0, amount: 0, exact: true };
-  const unpriced = new Set<string>();
-  for (const d of days) {
-    totals.turns += d.turns;
-    totals.input += d.input;
-    totals.hit += d.cacheRead;
-    totals.write += d.cacheCreate;
-    totals.output += d.output;
-    const c = dayCost(d, pricing);
-    totals.amount += c.amount;
-    if (!c.exact) totals.exact = false;
-    for (const m of d.models) if (!priceOf(pricing, m.model)) unpriced.add(m.model);
-  }
-  const hitRate = totals.hit + totals.input > 0
-    ? Math.round((totals.hit / (totals.hit + totals.input)) * 100)
-    : 0;
-
-  const summary = days.length === 0
-    ? `<div class="settings-hint">${t("settings.cost_no_usage", { days: String(COST_RANGE_DAYS) })}</div>`
-    : `<div class="cost-summary">${t("settings.cost_summary", {
-        days: String(COST_RANGE_DAYS),
-        turns: String(totals.turns),
-        input: fmtTokenCount(totals.input),
-        hit: fmtTokenCount(totals.hit),
-        write: fmtTokenCount(totals.write),
-        output: fmtTokenCount(totals.output),
-        rate: String(hitRate),
-        cost: hasPrices ? `${totals.exact ? "" : "≥ "}¥${fmtMoney(totals.amount)}` : "—",
-      })}</div>`;
-
-  const unpricedNote = unpriced.size > 0
-    ? `<div class="settings-hint cost-warn">${esc(t("settings.cost_unpriced", { models: [...unpriced].map(modelLabel).join(", ") }))}</div>`
-    : "";
-
-  const head = `<tr>${[
-    "settings.cost_col_date",
-    "settings.cost_col_turns",
-    "settings.cost_col_input",
-    "settings.cost_col_hit",
-    "settings.cost_col_write",
-    "settings.cost_col_output",
-    "settings.cost_col_amount",
-  ].map(k => `<th>${t(k)}</th>`).join("")}</tr>`;
-
-  // 新的在上：看用量几乎总是先看最近几天
-  const body = days.slice().reverse().map(d => {
-    const c = dayCost(d, pricing);
-    const amount = !hasPrices ? "—" : `${c.exact ? "" : "≥ "}¥${fmtMoney(c.amount)}`;
-    return `<tr><td>${d.date}</td><td>${d.turns}</td><td>${fmtTokenCount(d.input)}</td>` +
-      `<td>${fmtTokenCount(d.cacheRead)}</td><td>${fmtTokenCount(d.cacheCreate)}</td>` +
-      `<td>${fmtTokenCount(d.output)}</td><td>${amount}</td></tr>`;
-  }).join("");
-
-  const status = hasPrices
-    ? t("settings.cost_updated_at", { date: pricing?.updated_at || "—" })
-    : t("settings.cost_empty");
-
-  const pendingBlock = pending ? `
-    <div class="cost-pending">
-      <div class="cost-pending-title">${t("settings.cost_pending_title")}</div>
-      <table class="cost-table"><tbody>${pricingPreviewRows(pricing, pending)}</tbody></table>
-      <div class="settings-row">
-        <button type="button" class="settings-btn" id="settings-cost-confirm">${t("settings.cost_confirm")}</button>
-        <button type="button" class="settings-btn" id="settings-cost-discard">${t("settings.cost_discard")}</button>
-      </div>
-      <div class="settings-hint">${esc(t("settings.cost_pending_hint", { path: state?.pendingPath || "" }))}</div>
-    </div>` : "";
-
-  return `
-    <div class="settings-row">
-      <button type="button" class="settings-btn" id="settings-cost-open">${t("settings.cost_open")}</button>
-      <button type="button" class="settings-btn" id="settings-cost-update">${t("settings.cost_update")}</button>
-      <span class="settings-hint" id="settings-cost-msg" style="margin-left:8px;"></span>
-    </div>
-    <div class="settings-hint" title="${esc(state?.path || "")}">${esc(status)}</div>
-    <div class="settings-hint">${esc(t("settings.cost_hint"))}</div>
-    ${pendingBlock}
-    ${summary}
-    ${unpricedNote}
-    ${days.length > 0 ? `<table class="cost-table"><thead>${head}</thead><tbody>${body}</tbody></table>` : ""}`;
 }
 
 /** 绑定「用量与成本」分块里的按钮。分块内部重渲染之后**必须再调一次**
@@ -1473,7 +1318,10 @@ function wireUsageCost(container: HTMLElement): void {
       const st = await invoke<PricingState>("get_pricing_state");
       // 要让 agent 查的模型 = 有用量记录的模型 + 当前配置的模型（还没用过就也该有价格）
       const wanted = new Set<string>();
-      const days = await invoke<UsageDay[]>("read_usage_range", { dates: lastNDates(COST_RANGE_DAYS) });
+      const days = await invoke<UsageDay[]>("read_usage_range", {
+        dates: lastNDates(COST_RANGE_DAYS),
+        utcOffsetMinutes: localUtcOffsetMinutes(),
+      });
       for (const d of days) for (const m of d.models) wanted.add(m.model);
       try {
         const cfg = await invoke<{ model?: string }>("get_ai_config");
@@ -1792,22 +1640,26 @@ interface MarketRow {
   broken: string;
 }
 
-/** 三个来源合并成一张表。顺序：已装且能用 → 坏包 → 索引里还没装的。 */
+/** 三个来源合并成一张表。顺序：基础插件（按用户定的清单顺序）→ 拓展插件（已装 → 坏包 → 索引里还没装的）。 */
 function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): MarketRow[] {
   const rows: MarketRow[] = [];
   const seen = new Set<string>();
-  const localById = new Map(local.map(p => [p.id, p]));
+  const anyById = new Map(local.map(p => [p.id, p]));
   const indexById = new Map(index.map(e => [e.id, e]));
 
-  // ① 已装且能用（内置 + 第三方有效包），registry 的顺序照旧。
+  // ① 注册表里有这个 id（内置 + 已装且有效的第三方）。
+  //    **「已装」判据按分类分**（2026-09-29 用户要求）：基础插件编译进 bundle ⇒ 永远已装；
+  //    拓展插件**盘上有可用的一份才算已装** —— 卸载之后它必须整个消失，
+  //    所以不能拿「registry 里有」当已装（bundle 里那份对拓展插件没有意义）。
   //    索引里若也有同 id，就顺带给一个下载 / 更新入口：
-  //      · `!l`（内置插件没有磁盘目录）⇒ 还没装成磁盘版 ⇒「下载」；
-  //      · `l` 且在、版本号不同 ⇒「更新」。
+  //      · `!l`（盘上还没有）⇒「下载」； · `l` 且在、版本号不同 ⇒「更新」。
   //    **版本号只判「不同」不判大小**：索引版本是作者写的自由文本，比大小只会比出误报。
-  //    这一条同时是「内置插件将来搬去市场」的通道 —— 否则同 id 被归进「已装」那一档，
-  //    连下载按钮都出不来，用户永远装不上市场版（2026-09-28 发现）。
   for (const p of pluginRegistry.getAll()) {
-    const l = localById.get(p.id);
+    if (!showsInMarket(p.id)) continue;             // 已并入别的插件（工具编辑器 → AI 助手）不单独占行
+    const lAny = anyById.get(p.id);                  // 盘上那份（可能是坏包）
+    const l = lAny && lAny.valid ? lAny : undefined; // 可用那份
+    const base = isBasePlugin(p.id);
+    const installed = base || !!l;
     const e = indexById.get(p.id);
     const hasNewer = !!e && (!l || (!!e.version && !!l.version && e.version !== l.version));
     rows.push({
@@ -1815,22 +1667,23 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       name: pluginName(p.id, p.name),
       description: pluginDesc(p.id, p.description),
       icon: (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "",
-      version: l?.version || "",
+      version: l?.version || lAny?.version || "",
       url: hasNewer ? e!.url : "",
-      // 只有「盘上已有一份、且版本不同」才叫更新；内置那次安装仍是「下载」
+      // 只有「盘上已有一份、且版本不同」才叫更新；盘上没有那次安装仍是「下载」
       update: hasNewer && !!l,
-      deps: l?.dependencies?.length || 0,
-      perms: l?.permissions || [],
-      source: l?.homepage || "",
-      installed: true,
-      local: !!l,
-      broken: "",
+      deps: (l ?? lAny)?.dependencies?.length || 0,
+      perms: (l ?? lAny)?.permissions || [],
+      source: (l ?? lAny)?.homepage || "",
+      installed,
+      local: !!lAny,
+      // 盘上那份坏了 ⇒ 原因照原样带出来（坏包必须可见，见 ai-spec §3.5）
+      broken: l ? "" : (lAny?.error || ""),
     });
     seen.add(p.id);
   }
   // ② 目录里有、registry 里没有 —— 坏包必须可见（`valid === false` 时 `error` 非空）
   for (const p of local) {
-    if (seen.has(p.id)) continue;
+    if (seen.has(p.id) || !showsInMarket(p.id)) continue;
     rows.push({
       id: p.id,
       name: pluginName(p.id, p.name || p.id),
@@ -1850,7 +1703,7 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
   }
   // ③ 索引里本机还没有的 —— 市场里唯一能「下载」的那批
   for (const e of index) {
-    if (seen.has(e.id)) continue;
+    if (seen.has(e.id) || !showsInMarket(e.id)) continue;
     rows.push({
       id: e.id,
       name: pluginName(e.id, e.name || e.id),
@@ -1868,7 +1721,17 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
     });
     seen.add(e.id);
   }
-  return rows;
+  // 排序：基础插件在前（按清单顺序），拓展插件保持上面那三段原有的相对顺序。
+  return rows
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => {
+      const ka = isBasePlugin(a.r.id) ? 0 : 1;
+      const kb = isBasePlugin(b.r.id) ? 0 : 1;
+      if (ka !== kb) return ka - kb;
+      if (ka === 0) return basePluginOrder(a.r.id) - basePluginOrder(b.r.id);
+      return a.i - b.i;
+    })
+    .map(x => x.r);
 }
 
 /** 一行 HTML：名称（带版本）+ 描述（坏包换成原因）+ 该状态下的按钮。 */
@@ -1885,15 +1748,18 @@ function marketRowHtml(r: MarketRow): string {
   const meta = r.broken
     ? `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: r.broken }))}</span>`
     : `<span class="settings-plugin-desc">${esc(r.description)}${deps}${perms}</span>`;
+  // 基础插件随安装包走，**用户既不能装也不能卸**（2026-09-29 用户定）⇒ 只留「打开」。
+  // 拓展插件才按「盘上事实」出下载 / 更新 / 卸载。
+  const base = isBasePlugin(r.id);
   const open = r.installed && !r.broken
     ? `<button class="settings-install-btn" data-open-plugin="${esc(r.id)}">${t("settings.skill_open")}</button>`
     : "";
-  const download = r.url
+  const download = !base && r.url
     ? `<button class="settings-install-btn" data-download-plugin="${esc(r.id)}" data-plugin-url="${esc(r.url)}">${
         r.update ? t("settings.plugins_market_update") : t("settings.plugins_market_download")
       }</button>`
     : "";
-  const remove = r.local
+  const remove = !base && r.local
     ? `<button class="settings-skill-del-installed" data-uninstall-plugin="${esc(r.id)}">${t("settings.plugins_market_uninstall")}</button>`
     : "";
   return `
@@ -1905,6 +1771,21 @@ function marketRowHtml(r: MarketRow): string {
         </div>
         ${open}${download}${remove}
       </div>`;
+}
+
+/** 整张表：按「基础插件 / 拓展插件」分成两段（2026-09-29 用户要求）。
+ *  段标题只在**这一段有内容时**才画 —— 空标题比没有标题更让人困惑。 */
+function marketRowsHtml(rows: MarketRow[]): string {
+  const groups: Array<[string, MarketRow[]]> = [
+    [t("settings.plugins_group_base"), rows.filter(r => isBasePlugin(r.id))],
+    [t("settings.plugins_group_ext"), rows.filter(r => !isBasePlugin(r.id))],
+  ];
+  return groups
+    .filter(([, rs]) => rs.length > 0)
+    .map(([title, rs]) =>
+      `<div class="settings-group-title settings-market-group">${esc(title)}</div>` +
+      rs.map(marketRowHtml).join(""))
+    .join("");
 }
 
 /** 读本机的插件目录：扫描结果 + 目录绝对路径；失败时把原因**原样**带回界面（不猜、不吞）。 */
@@ -1920,6 +1801,14 @@ async function readLocalPlugins(): Promise<{ list: MarketPluginInfo[]; dir: stri
   }
 }
 
+/** 市场列表的绘制代次 —— 迟到的旧快照**不许**覆盖新结果（2026-09-29 加）。
+ *
+ *  为什么需要：`renderMarket` 中间要 `await fetchPluginIndex()`（走 GitHub，差网络下可能几十秒），
+ *  期间用户完全可能再点一次「重新扫描」或「卸载」。两次绘制并发时，**先发起的那次可能后返回**，
+ *  于是把「卸载前」的本地快照重新写回 DOM —— 表现为「卸完了那行还挂着卸载按钮」。
+ *  每次绘制领一个号，写 DOM 前对一下号，不是最新就整段放弃。 */
+let marketRenderGen = 0;
+
 /** 把整个市场画出来（两段，理由见下）。
  *
  *  **先本机、后索引**：插件目录扫描是本机调用（毫秒级），索引要走 GitHub（差网络下可能要等到
@@ -1928,12 +1817,15 @@ async function readLocalPlugins(): Promise<{ list: MarketPluginInfo[]; dir: stri
 async function renderMarket(container: HTMLElement) {
   const listEl = container.querySelector<HTMLElement>("#settings-plugin-market");
   if (!listEl) return;
+  const myGen = ++marketRenderGen;
   const local = await readLocalPlugins();
-  listEl.innerHTML = mergeMarketRows([], local.list).map(marketRowHtml).join("");
+  if (myGen !== marketRenderGen) return; // 期间又画过一次 ⇒ 本次作废
+  listEl.innerHTML = marketRowsHtml(mergeMarketRows([], local.list));
   writeMarketFooter(container, local.dir, local.error ? [t("settings.plugins_market_failed", { err: local.error })] : []);
 
   const idx = await fetchPluginIndex();
-  listEl.innerHTML = mergeMarketRows(idx.list, local.list).map(marketRowHtml).join("");
+  if (myGen !== marketRenderGen) return; // 同上：旧快照不许盖掉新结果
+  listEl.innerHTML = marketRowsHtml(mergeMarketRows(idx.list, local.list));
   writeMarketFooter(
     container,
     local.dir,
@@ -2008,6 +1900,14 @@ function wirePluginMarket(container: HTMLElement) {
     }
     try {
       await invoke("uninstall_plugin", { id });
+      // **卸载必须收干净**（2026-09-29 用户要求：卸载后这个插件要完全不存在于本应用）：
+      // ① 先收它的定时器与监听（磁盘那份走模块自带的 `detach`，内置那份走硬编码表）；
+      // ② 关掉它的悬浮窗 —— 不关的话窗口还在、还能操作，用户会以为没卸掉；
+      // ③ 主窗口若正开着它的面板，一并关掉；
+      // ④ 再重扫 + 重绘（`refreshMarketPlugins` 会顺手丢掉它的模块缓存与挂载钩子）。
+      detachPluginListeners(id);
+      await invoke("close_plugin_window", { pluginId: id }).catch(() => {});
+      (window as any).__lunac_close_plugin_if?.(id);
       await refreshMarketPlugins();
       await renderMarket(container);
       showMsg(t("settings.plugins_market_uninstalled", { id }), "var(--yellow)");
@@ -2230,13 +2130,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       /* ── 用量与成本（A12）────────────────────────────────────────
          数字一律右对齐、用等宽字体：金额与 token 是拿来逐行比对的，
-         比例字体下位数对不齐就看不出「哪天异常」。 */
-      .cost-summary {
-        padding: 2px 0 8px;
-        font-size: 0.72rem;
-        line-height: 1.5;
-        color: var(--text);
-      }
+         比例字体下位数对不齐就看不出「哪天异常」。
+         这里只剩**候选价格的新旧对照**（cost-pending 那一块）——
+         逐日表格与价格表数据已整体搬到表盘展开面板（2026-09-29）。 */
       .cost-table {
         width: 100%;
         border-collapse: collapse;

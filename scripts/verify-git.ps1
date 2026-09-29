@@ -119,7 +119,7 @@ if ($busy) {
 # ── 7. 数据目录 ─────────────────────────────────────────────────
 Write-Host "[7/8] 数据目录（便携模式）" -ForegroundColor Cyan
 Ok "根目录 = exe 所在目录；dev 落在 app\src-tauri\target\debug\ 旁，release 落在安装根"
-Note "子目录: temp\（缓存）ModuleData\（历史/备忘录/自定义启动项）skills\ tools\ config\ paddle-ocr\"
+Note "子目录: temp\（缓存）ModuleData\（历史/备忘录/自定义启动项）skills\ tools\ Modules\（插件）config\ paddle-ocr\"
 
 # ── 8. 脚本编码（.ps1 / .nsi 的 UTF-8 BOM）──────────────────────
 # 这条不是洁癖：含中文的 .ps1 / .nsi 一旦丢了 BOM，PS 5.1 与 makensis 会按 ANSI(GBK)

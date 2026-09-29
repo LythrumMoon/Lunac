@@ -30,6 +30,9 @@ const THEME_REQ_EVENT = "lunac-theme-request";
 interface PluginWindowInit {
   plugin_id: string;
   input: string;
+  /** 要不要顶部那根标题栏（清单 `window.chrome`，缺省 `true`）。
+   *  桌宠那类「窗口就是那片画面本身」的插件写 `false`，见 styles.css 的 `html.no-chrome`。 */
+  chrome: boolean;
 }
 
 const root = document.getElementById("results-list") as HTMLElement;
@@ -163,6 +166,9 @@ function wireTitlebar() {
   // 宿主在**建窗之前**就把载荷写好了（前端可能比命令返回更快），所以这里直接取
   try {
     const init = await invoke<PluginWindowInit>("plugin_window_init");
+    // **渲染之前**先定形态：`no-chrome` 会同时收起标题栏与结果区那层玻璃底，
+    // 放到 render() 之后就会出现「先闪一下毛玻璃小窗、再变透明」。
+    document.documentElement.classList.toggle("no-chrome", init.chrome === false);
     await render(init.plugin_id, init.input);
   } catch (e) {
     console.error("[lunac plugin-window] init failed:", e);

@@ -179,6 +179,9 @@ const LYRIC_SCROLL_MS = 800;
  *  **它不是状态，是「刚才那次操作的结果」** —— 不抹就会出现「正在播放」与
  *  「没有可控制的播放设备」同屏挂着（2026-09-27 用户报的正是这个）。 */
 const MSG_TTL_MS = 8000;
+/** 进度条本地插值的周期。**必须明显短于 `.music-progress-fill` 的 `0.3s` 补间**，
+ *  补间才能首尾相接、看起来连续（见 `paintProgressSmooth`）。 */
+const PROGRESS_TICK_MS = 200;
 
 // ── 线性 SVG（docs/icon-style.md §1：stroke currentColor，不嵌 emoji）──
 const SVG = {
@@ -288,6 +291,12 @@ let closeBtnOriginal = "";
 
 let pollTimer: number | undefined;
 let pollBusy = false;
+/** 进度条本地插值的定时器（见 `paintProgressSmooth`）。与 `pollTimer` 同生共死。 */
+let progressTimer: number | undefined;
+/** 进度条插值的基准：`progressBaseMs` 是在 `progressBaseAt` 这一刻从宿主读到的位置。
+ *  两次轮询之间按真实流逝时间在它之上外推（渲染时由 `renderPlayer` 重新对齐）。 */
+let progressBaseMs = 0;
+let progressBaseAt = 0;
 let unlistenAuth: (() => void) | null = null;
 let currentRoot: HTMLElement | null = null;
 /** 运行代次：attach 每次递增，旧回调据此丢弃自己的结果（防「关了又开」时的串扰）。 */
@@ -480,7 +489,7 @@ function shellHtml(): string {
         <div class="music-bend">
           <button class="music-ghost-btn music-icon-btn" id="music-devices-btn" title="${esc(t("music.devices"))}">${SVG.speaker}</button>
           <span class="music-vol-ico">${SVG.volume}</span>
-          <input class="music-vol" id="music-b-vol" type="range" min="0" max="100" step="5" value="50" title="${esc(t("music.volume"))}">
+          <input class="music-vol" id="music-b-vol" type="range" min="0" max="100" step="1" value="50" title="${esc(t("music.volume"))}">
           <button class="music-round-btn" id="music-b-queue" title="${esc(t("music.queue"))}">${SVG.list}</button>
           <button class="music-ghost-btn music-icon-btn hidden" id="music-open-player" title="${esc(t("music.open_player"))}">${SVG.expand}</button>
           <div class="music-dd music-dev-dd hidden" id="music-dev-dd"></div>
@@ -536,7 +545,7 @@ function shellHtml(): string {
             </div>
             <div class="music-bar-end">
               <span class="music-vol-ico">${SVG.volume}</span>
-              <input class="music-vol" id="music-vol" type="range" min="0" max="100" step="5" value="50" title="${esc(t("music.volume"))}">
+              <input class="music-vol" id="music-vol" type="range" min="0" max="100" step="1" value="50" title="${esc(t("music.volume"))}">
               <button class="music-round-btn" id="music-queue-btn" title="${esc(t("music.queue"))}">${SVG.list}</button>
             </div>
           </div>
@@ -1413,6 +1422,10 @@ function renderPlayer(root: HTMLElement) {
   const dur = track?.duration_ms ?? 0;
   const pos = Math.min(player?.progress_ms ?? 0, dur || Number.MAX_SAFE_INTEGER);
   const pct = dur > 0 ? Math.max(0, Math.min(100, (pos / dur) * 100)) : 0;
+  // 记下插值基准：这一轮轮询的 `pos` 是在「现在」读到的，
+  // 之后由 `paintProgressSmooth` 按真实流逝时间在它之上外推（见那里的说明）。
+  progressBaseMs = pos;
+  progressBaseAt = Date.now();
   // 拖动进度条期间**不覆盖**：用户手指下的位置不能被下一秒的轮询拽回去。
   // 位置只写 `--seek-pct` 一个变量 —— 填充 / 圆点 / 时间气泡都由 CSS 从它取值。
   if (seekRatio < 0) {
@@ -1449,6 +1462,27 @@ function renderPlayer(root: HTMLElement) {
     if (b.id === "music-devices-btn" || b.id === "music-open-player" || b.id === "music-bnow") return;
     b.disabled = disabled;
   });
+}
+
+/** 按**真实流逝时间**把进度条推到「此刻应有的位置」—— 一次网络都不打。
+ *
+ *  **为什么需要这层本地插值**（用户 2026-09-29 报「进度条一跳一跳」）：
+ *  宿主那轮轮询的真实周期是「Web API 往返 + 1000ms」，实测被网络拉到 ~1.7s ⇒
+ *  只靠它写 `--seek-pct`，用户看到的是「跳一格、僵一两秒、再跳一格」。
+ *  这里用一个 200ms 的本地定时器（明显快于 CSS 的 `0.3s` 补间，于是补间首尾相接）
+ *  在两次轮询之间把位置推着走；每轮轮询回来由 `renderPlayer` 重新对齐基准。
+ *  **纯本地计算，不增加任何 Web API 调用** —— 提速不提负载。
+ *
+ *  只在「正在播 + 有曲目 + 没在拖」时推：暂停 / 拖动时位置本就该定住。 */
+function paintProgressSmooth(root: HTMLElement) {
+  if (!root.isConnected) return;
+  if (!player?.playing || seekRatio >= 0) return;
+  const dur = player.track?.duration_ms ?? 0;
+  if (dur <= 0) return;
+  const pos = Math.min(progressBaseMs + (Date.now() - progressBaseAt), dur);
+  const pct = Math.max(0, Math.min(100, (pos / dur) * 100));
+  for (const el of seekBars) el.style.setProperty("--seek-pct", `${pct}%`);
+  setText(root.querySelector("#music-pv-pos"), fmtMs(pos));
 }
 
 function playMode(): "off" | "shuffle" | "repeat_one" {
@@ -1681,6 +1715,10 @@ function stopPolling() {
     window.clearTimeout(pollTimer);
     pollTimer = undefined;
   }
+  if (progressTimer !== undefined) {
+    window.clearInterval(progressTimer);
+    progressTimer = undefined;
+  }
   gen++;          // 让在飞的回调失效
   pollBusy = false;
 }
@@ -1689,6 +1727,8 @@ function startPolling(root: HTMLElement) {
   stopPolling();
   const myGen = gen;
   pollTimer = window.setTimeout(() => void tick(root, myGen), 200);
+  // 进度条本地插值：与轮询同生共死，但不打网络（见 `paintProgressSmooth`）。
+  progressTimer = window.setInterval(() => paintProgressSmooth(root), PROGRESS_TICK_MS);
 }
 
 // ── 窗口尺寸（只对插件悬浮窗下发）─────────────────────────────────
@@ -2108,9 +2148,34 @@ export async function attachMusicListeners(root: HTMLElement) {
   on(["music-prev", "music-b-prev"], () => void control("previous"));
   on(["music-next", "music-b-next"], () => void control("next"));
   on(["music-play", "music-b-play"], () => void control(player?.playing ? "pause" : "play"));
+  // 音量条：**拖动过程中就要跟手**（2026-09-29 用户要求）。
+  //
+  // 以前只听 `change` —— 那是「松手」才触发的事件，所以拖动全程音量不动，用户看到的是
+  // 「拖完了才跳一下」。改成听 `input`（拖动时连续触发）。
+  //
+  // 但每次都要走一条 `spotify_control`（Web API），高频 `input` 直接发会把请求打爆，
+  // 所以做「**单飞 + 追最新**」：同时只允许一个请求在飞；飞的过程中用户又拖了，就记下
+  // 最新值，落地后补发一次。**最终值一定会发出去**，中间值允许被合并掉（那正是我们要的节流）。
+  // `step` 也从 5 改到 1 —— 21 档拖起来是「一段一段跳」的，101 档才叫渐进。
+  let volTarget: number | null = null;
+  let volInFlight = false;
+  const pushVolume = async (v: number) => {
+    volTarget = v;
+    if (volInFlight) return;
+    volInFlight = true;
+    try {
+      while (volTarget !== null) {
+        const next = volTarget;
+        volTarget = null;
+        await control("volume", next);
+      }
+    } finally {
+      volInFlight = false;
+    }
+  };
   for (const id of ["music-vol", "music-b-vol"]) {
-    q<HTMLInputElement>(`#${id}`)?.addEventListener("change", (ev) => {
-      void control("volume", Number((ev.target as HTMLInputElement).value));
+    q<HTMLInputElement>(`#${id}`)?.addEventListener("input", (ev) => {
+      void pushVolume(Number((ev.target as HTMLInputElement).value));
     });
   }
 
@@ -2253,6 +2318,11 @@ export const musicPlugin: Plugin = {
   description: "歌词自动抓取 (LRCLIB + 网易云兜底) + Spotify 播放控制 / 歌单 / 队列",
   icon: "🎵",
   badge: "music",
+  // 「本插件一律在**悬浮窗**里打开」（2026-09-29 从 main.ts 的硬编码 `id === "music"` 改成声明）。
+  // 为什么要声明而不是让宿主按 id 判：音乐已归入**拓展插件**，要能从市场独立打包分发
+  // —— 磁盘插件的代码宿主没法写死，行为只能由插件自己声明（见 ai-spec §3.5「插件契约」）。
+  // 这也是「用户 2026-09-28 定的：从 Lunac 进音乐界面时自动展开成独立界面」那条的执行点。
+  permissions: ["window.float"],
 
   async execute(): Promise<PluginResult> {
     return { type: "html", content: shellHtml() };

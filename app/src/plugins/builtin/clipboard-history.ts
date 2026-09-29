@@ -34,41 +34,6 @@ async function saveHistory(entries: ClipEntry[]) {
   }
 }
 
-export async function addClipboardEntry(text: string) {
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.length > 2000) return;
-  const isFile = /^[A-Za-z]:[\\/]/.test(trimmed);
-  const history = await loadHistory();
-
-  if (isFile) {
-    // File entry: dedupe by path, group adjacent file entries
-    const idx = history.findIndex(e =>
-      e.clip_type === "file" && e.text === trimmed
-    );
-    if (idx >= 0) history.splice(idx, 1);
-    history.unshift({
-      clip_type: "file",
-      text: trimmed,
-      file_paths: [trimmed],
-      time: Date.now(),
-    });
-  } else {
-    const idx = history.findIndex(e => e.text === trimmed);
-    if (idx >= 0) history.splice(idx, 1);
-    history.unshift({ clip_type: "text", text: trimmed, time: Date.now() });
-  }
-  await saveHistory(history);
-}
-
-export async function getClipboardPreview(): Promise<string | null> {
-  const history = await loadHistory();
-  if (history.length > 0) {
-    const latest = history[0].text;
-    return latest.length > 60 ? latest.slice(0, 60) + "…" : latest;
-  }
-  return null;
-}
-
 function esc(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
           .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -192,3 +157,11 @@ function formatRelative(ms: number): string {
   const days = Math.floor(hours / 24);
   return t("clipboard.d_ago", { d: String(days) });
 }
+
+// ── 磁盘插件契约（2026-09-29）────────────────────────────────────────
+// 剪贴板历史已归入**拓展插件**：不再随安装包默认安装，改为从市场装进 `Modules\clipboard-history\`。
+// 它是「一次性结果」型插件（渲染完就没有监听要挂），所以**不导出** `attach`/`detach` ——
+// 契约里那两条是可选的，缺了等于「这个插件不需要挂载」（见 `attach.ts` 的说明）。
+// 「粘贴时顺手记一条」也不再由本插件提供：主窗口行为，改走宿主命令 `append_clipboard_entry`
+// （见 src-tauri/src/storage.rs）—— 插件没装时它照样工作，插件这边只读不写。
+export default clipboardHistoryPlugin;

@@ -21,6 +21,7 @@ mod windows_ocr;
 mod paddle_ocr;
 mod music;
 mod convert;
+mod translate;
 mod plugin_window;
 mod cli_bridge;
 mod agent_server;
@@ -435,6 +436,19 @@ fn main() {
                     // 留着的话下次开机它还占着那台设备（见 music.rs 的 kill_librespot）。
                     music::kill_librespot();
                 }
+                // 插件窗的最小化 / 还原 —— **Windows 上唯一能观察到它的地方**（2026-09-29）。
+                // tao 把 `WM_SIZE`（含 `SIZE_MINIMIZED`）统一发成 `Resized`，而
+                // `WindowEvent` 里**没有** `Minimized` 这一项；插件窗自己的
+                // `document.visibilityState` 又永远是 `visible`（原因见
+                // plugin_window.rs 的 `VISIBLE_EVENT`）。所以「该不该停动画」只能
+                // 由宿主在这条路上显式告诉前端（桌宠要它）。
+                // 只在翻转时发数（记账在 plugin_window.rs），拖拽缩放时的连续
+                // `Resized` 不会变成一串重复事件。
+                WindowEvent::Resized(_) => {
+                    if is_plugin_window {
+                        plugin_window::announce_visibility(window.app_handle(), window.label());
+                    }
+                }
                 _ => {}
             }
         })
@@ -486,6 +500,7 @@ fn main() {
             storage::load_chat_sessions,
             storage::save_clipboard_history,
             storage::load_clipboard_history,
+            storage::append_clipboard_entry,
             storage::append_usage_log,
             storage::read_usage_log,
             storage::read_usage_range,
@@ -561,12 +576,17 @@ fn main() {
             convert::convert_engine_status,
             convert::convert_probe,
             convert::convert_run,
+            // 翻译插件（2026-09-29）：词典底座 + 模型补漏，译文落 SQLite（见 translate.rs）
+            translate::translate_lookup,
+            translate::translate_ai,
             // 插件悬浮窗（多窗口基础设施）—— 见 src/plugin_window.rs
             plugin_window::open_plugin_window,
             plugin_window::plugin_window_init,
             plugin_window::plugin_window_close,
+            plugin_window::close_plugin_window,
             plugin_window::plugin_window_minimize,
             plugin_window::plugin_window_set_pin,
+            plugin_window::plugin_window_set_click_through,
             plugin_window::plugin_window_set_resizable,
             plugin_window::plugin_window_pin_state,
             plugin_window::plugin_window_resize,

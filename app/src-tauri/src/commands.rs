@@ -663,7 +663,11 @@ fn start_cli_process(
 
 /// 解析 AI 凭据（`.env` 由 main.rs 载入进程环境）。
 /// 返回 (api_url, api_key, model)。
-fn ai_credentials() -> Result<(String, String, String), String> {
+///
+/// `pub(crate)`：翻译插件的「模型补漏」要用同一份凭据（translate.rs）——
+/// 它绝不能自己再读一遍 `config\ai.json`，否则「agent 用的 key」与「翻译用的 key」
+/// 会变成两份各执一词的真相（2026-09-15 那次 401 就是这么来的，见 storage.rs 顶部）。
+pub(crate) fn ai_credentials() -> Result<(String, String, String), String> {
     let api_url = env::var("AI_API_URL")
         .or_else(|_| env::var("DEEPSEEK_URL"))
         .unwrap_or_else(|_| "https://api.deepseek.com".into());
@@ -778,7 +782,9 @@ pub fn apply_saved_ai_config() {
 /// api_url 若带末尾 `/v1`（OpenAI 兼容风格的地址栏/预设），先剥离再拼
 /// 供应商的兼容路由 `/anthropic`（外部路由，非本项目命名），避免出现
 /// `/v1/anthropic` 双重路径；explicit 优先（`AI_AGENT_URL`）。
-fn agent_endpoint(api_url: &str, explicit: Option<&str>) -> String {
+/// `pub(crate)`：翻译插件的「模型补漏」要按**同一套规则**算端点（translate.rs）——
+/// 自己拼一个 URL 会让「agent 能连上、翻译连不上」变成两处各执一词。
+pub(crate) fn agent_endpoint(api_url: &str, explicit: Option<&str>) -> String {
     if let Some(a) = explicit {
         let a = a.trim();
         if !a.is_empty() {
@@ -1954,6 +1960,11 @@ pub fn plugins_dir_path() -> String {
 ///
 /// 三条闸沿用插件包的口径：**只 https**（地址是常量）、**体积上限**（Content-Length 先拦 +
 /// 按真实读到的字节再拦）、**失败如实上报**（面板上显示原因，不静默退回空市场）。
+/// 超时也**与插件包同档（120s）**（2026-09-29 从 30s 提上来）：实测本机到
+/// `raw.githubusercontent.com` 这段链路抖动极大 —— 同一台机器同一个 URL，同一轮会话里
+/// 三次全失败（19.2s / 19.4s / 30.0s）、换个时间点却 961ms 就成功；索引正文只有几百字节，
+/// 慢的从来不是传输而是**建连**，30s 对首字节来说太紧，而这条一旦失败用户看到的是
+/// 「市场列表只剩一行错误」—— 首字节慢一点也用不着让整个列表陪葬。
 #[tauri::command]
 pub async fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
     run_blocking(fetch_plugin_index_blocking).await
@@ -1963,7 +1974,8 @@ pub async fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginInde
 fn fetch_plugin_index_blocking() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
     let limit = crate::plugin_market::MAX_INDEX_BYTES;
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        // 与 `install_plugin_from_url_blocking` 同档；理由见上面 `fetch_plugin_index` 的注释。
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| format!("Client error: {e}"))?;
     let mut resp = client

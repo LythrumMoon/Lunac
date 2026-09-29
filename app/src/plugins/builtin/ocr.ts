@@ -17,42 +17,13 @@
 
 import type { Plugin, PluginResult } from "../registry";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { t } from "../../i18n.js";
+import { installOcrEngine } from "../../ocr-engine.js";
 
 // ── 引擎部署（按需下载）───────────────────────────────────────────
 // PaddleOCR-json 引擎体积大（解压后约 300MB），不随发行包分发（见 .gitignore）。
 // 运行时若缺失，由前端触发从 GitHub Release 下载到 `<exe 根>\paddle-ocr`。
-
-/** 触发引擎下载安装。进度经 `ocr-engine-progress`/`ready`/`error` 事件回传。
- *  返回 Promise<boolean>：true = 安装成功。供 OCR 面板与设置面板共用。 */
-export function installOcrEngine(
-  onProgress?: (info: { percent: number; mb: number }) => void,
-): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const unlisteners: Array<() => void> = [];
-    const cleanup = () => {
-      for (const fn of unlisteners) { try { fn(); } catch { /* ignore */ } }
-    };
-    void (async () => {
-      unlisteners.push(await listen("ocr-engine-progress", (ev) => {
-        const { downloaded, total } = ev.payload as { downloaded: number; total: number };
-        onProgress?.({
-          percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
-          mb: downloaded / 1048576,
-        });
-      }));
-      unlisteners.push(await listen("ocr-engine-ready", () => { cleanup(); resolve(true); }));
-      unlisteners.push(await listen("ocr-engine-error", () => { cleanup(); resolve(false); }));
-      try {
-        await invoke("ocr_engine_install");
-      } catch {
-        cleanup();
-        resolve(false);
-      }
-    })();
-  });
-}
+// 「装引擎」那个小封装在宿主侧 `src/ocr-engine.ts`（设置面板也要用同一份）。
 
 /** 引擎缺失时在状态行内联「下载并安装」按钮。 */
 function renderEngineInstallPrompt(statusEl: HTMLElement | null) {
@@ -168,6 +139,9 @@ export const ocrPlugin: Plugin = {
   description: "OCR 图片文字识别 (PaddleOCR · 离线高精度)",
   icon: "\uD83D\uDD0D",
   badge: "AI",
+  // 接管整个窗口（双栏：左图右文）。宿主据此决定「不套 .plugin-result、直接 detach、
+  // 把 attach 的 root 传成文档根」—— 见 main.ts 的 isTakeoverPlugin()。
+  permissions: ["layout.takeover"],
 
   async execute(input: string): Promise<PluginResult> {
     // Always return the detached two-panel HTML skeleton.
@@ -371,3 +345,26 @@ export function attachOcrListeners(doc: Document) {
     });
   });
 }
+
+// ── 磁盘插件契约（2026-09-29）────────────────────────────────────────
+// OCR 已归入**拓展插件**：不再随安装包默认安装，改为从市场装进 `Modules\ocr\`。
+// 独立打包的入口必须**默认导出**带 `execute` 的对象，并具名导出 `attach(root)`。
+//
+// 它是**接管型**（`permissions: ["layout.takeover"]`）：宿主把面板 HTML 原样写进结果区、
+// 切成 detached，再把 `attach` 的 root 传成**文档根**（`document.body`）—— 本插件的控件 id
+// 全局唯一，直接用 `document` 取即可，所以 root 参数不参与取值。
+//
+// 「预置图片 / 自动识别剪贴板」原先写在 main.ts 的 post-execute 回调里（那是写死的 `id === "ocr"`），
+// 现在收进这里：宿主不再需要知道任何 OCR 细节。
+export async function attach(_root: HTMLElement) {
+  attachOcrListeners(document);
+  const imgPath = (window as any).__lunac_ocr_image as string | undefined;
+  if (imgPath) {
+    delete (window as any).__lunac_ocr_image;
+    await ocrImageFile(imgPath);
+  } else {
+    await autoStartClipboardOcr();
+  }
+}
+
+export default ocrPlugin;

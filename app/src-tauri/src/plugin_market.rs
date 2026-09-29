@@ -52,7 +52,7 @@ pub const MAX_PERMISSIONS: usize = 16;
 /// 宿主当前**认识**的能力（2026-09-28）。**只加不减**（旧插件会带着老名字装在盘上），
 /// 清单里出现不认识的名字**只 warn、不拒绝安装** —— 那可能是给更新版宿主声明的能力，
 /// 在旧宿主上装不上反而是坏事（它只是拿不到那个能力，与「装不上」是两回事）。
-pub const KNOWN_PERMISSIONS: &[&str] = &["layout.takeover", "window.resize"];
+pub const KNOWN_PERMISSIONS: &[&str] = &["layout.takeover", "window.resize", "window.float"];
 /// id 长度上限（同时是目录名长度上限）。
 const MAX_ID_CHARS: usize = 48;
 
@@ -75,6 +75,87 @@ pub const INDEX_URL: &str =
 pub const MAX_INDEX_BYTES: u64 = 1024 * 1024;
 /// 索引条目数上限（防「十万条空条目」把面板拖死）。
 pub const MAX_INDEX_ENTRIES: usize = 500;
+
+/// 清单里的 `window` 段：插件对自己**悬浮窗形态**的参数声明（2026-09-29 加，为桌宠 L1）。
+///
+/// **为什么是清单字段、不是 `permissions` 里的一条**：`permissions` 回答的是「这个插件
+/// 被允许动什么」（声明 + 告知语义），而这一段是**建窗参数**（多大、要不要标题栏、
+/// 进不进任务栏）。把尺寸塞进能力名里只会逼出 `window.size.280x380` 这种怪东西，
+/// 而且它并不比一个 JSON 对象表达得更多。注意：**「能不能开独立窗」仍然只认
+/// `window.float`**，这一段只在该插件已经在开窗时生效。
+///
+/// **缺省值逐项等于加这个字段之前的行为**（`open()` 里那三个 `.xxx()` 的历史取值），
+/// 所以没写这一段的老插件建出来的窗与 2026-09-29 之前完全一致。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWindowShape {
+    /// 初始宽度（逻辑像素）。`0` = 用宿主按 id 给的那一档缺省值。
+    #[serde(default)]
+    pub width: f64,
+    /// 初始高度。`0` = 同上。
+    #[serde(default)]
+    pub height: f64,
+    /// 最小宽度。`0` = 同上。
+    #[serde(default)]
+    pub min_width: f64,
+    /// 最小高度。`0` = 同上。
+    #[serde(default)]
+    pub min_height: f64,
+    /// 能不能手动缩放。缺省 `true`（与历史行为一致）。
+    #[serde(default = "default_true")]
+    pub resizable: bool,
+    /// 进不进任务栏。缺省 `false`（= 进），与历史行为一致。
+    #[serde(default)]
+    pub skip_taskbar: bool,
+    /// 建窗即置顶。缺省 `true`，与历史行为一致。
+    #[serde(default = "default_true")]
+    pub always_on_top: bool,
+    /// 带不带宿主那根标题栏（置顶 / 最小化 / 关闭三个按钮）。缺省 `true`。
+    /// 桌宠这一类「窗口就是那片画面本身」的插件写 `false`，前端据此收起标题栏。
+    #[serde(default = "default_true")]
+    pub chrome: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 窗口尺寸的合法区间（逻辑像素）。下限挡住「误写到 0.5」，上限挡住「把窗口顶出屏幕
+/// 且用户抓不回来」—— 与 `plugin_window::plugin_window_resize` 的 clamp 口径同源。
+const MIN_WINDOW_SIDE: f64 = 100.0;
+const MAX_WINDOW_SIDE: f64 = 4000.0;
+
+/// 校验 `window` 段。口径：**能静态判定的一律拒绝整包**（同清单其它字段）。
+///
+/// 只校验「数值是不是人写的」这一类事实，不替插件决定该多大 —— 尺寸本身是它的自由，
+/// 0（= 用宿主缺省）也是合法写法。
+fn validate_window_shape(shape: &PluginWindowShape) -> Result<(), String> {
+    let sides = [
+        ("width", shape.width),
+        ("height", shape.height),
+        ("minWidth", shape.min_width),
+        ("minHeight", shape.min_height),
+    ];
+    for (name, v) in sides {
+        if !v.is_finite() {
+            return Err(format!("window.{name} 不是有限数：{v}"));
+        }
+        if v != 0.0 && !(MIN_WINDOW_SIDE..=MAX_WINDOW_SIDE).contains(&v) {
+            return Err(format!(
+                "window.{name} = {v} 超出允许区间（0 或 {MIN_WINDOW_SIDE}~{MAX_WINDOW_SIDE}）"
+            ));
+        }
+    }
+    // 「最小 > 默认」在建窗那一刻会被系统夹一次，表现为「命令成功、窗口没动」。
+    // 两处都给过的时候才发现问题就太晚了，这里直接拒。
+    if shape.min_width != 0.0 && shape.width != 0.0 && shape.min_width > shape.width {
+        return Err("window.minWidth 大于 window.width".into());
+    }
+    if shape.min_height != 0.0 && shape.height != 0.0 && shape.min_height > shape.height {
+        return Err("window.minHeight 大于 window.height".into());
+    }
+    Ok(())
+}
 
 /// 插件清单。除 `id` 外全部有默认值：缺字段的包也能装，但至少要能读出 id 与入口。
 ///
@@ -111,6 +192,12 @@ pub struct PluginManifest {
     /// 它真正挡住的是「不小心用了没声明的东西」与「用户不知道装的东西要什么权限」。
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// 悬浮窗形态（2026-09-29，见 `PluginWindowShape`）。不写这一段 = 宿主缺省形态。
+    ///
+    /// 由**宿主**在建窗时读（`plugin_window::declared_shape()`），不进前端契约 ——
+    /// 前端不需要知道窗口多大，它只管往 `#results-list` 里画东西。
+    #[serde(default)]
+    pub window: Option<PluginWindowShape>,
 }
 
 fn default_entry() -> String {
@@ -364,6 +451,9 @@ pub fn parse_manifest(text: &str) -> Result<PluginManifest, String> {
                 m.id
             ));
         }
+    }
+    if let Some(shape) = &m.window {
+        validate_window_shape(shape)?;
     }
     Ok(m)
 }
@@ -1142,6 +1232,41 @@ mod tests {
         let many = (0..(MAX_PERMISSIONS + 1)).map(|i| format!("\"cap{i}\"")).collect::<Vec<_>>().join(",");
         let text = format!(r#"{{"id":"demo","entry":"index.js","permissions":[{many}]}}"#);
         assert!(parse_manifest(&text).is_err());
+    }
+
+    /// 窗口形态（2026-09-29，为桌宠 L1）：合法写法照收，**静态能判定的矛盾整包拒**。
+    #[test]
+    fn manifest_validates_window_shape() {
+        // 不写这一段完全合法（= 宿主缺省形态）
+        let none = r#"{"id":"demo","entry":"index.js"}"#;
+        assert!(parse_manifest(none).unwrap().window.is_none());
+
+        // 桌宠那种写法：定尺 + 禁缩放 + 不进任务栏 + 不要标题栏
+        let pet = r#"{"id":"pet","entry":"index.js","window":{"width":260,"height":380,
+            "minWidth":120,"minHeight":160,"resizable":false,"skipTaskbar":true,"chrome":false}}"#;
+        let s = parse_manifest(pet).unwrap().window.unwrap();
+        assert_eq!(s.width, 260.0);
+        assert!(!s.resizable);
+        assert!(s.skip_taskbar);
+        assert!(!s.chrome);
+        // 缺省：`alwaysOnTop` 没写 ⇒ true（与建窗历史行为一致）
+        assert!(s.always_on_top);
+
+        // `0` = 用宿主缺省那一档，合法（不是错误写法）
+        let zero = r#"{"id":"demo","entry":"index.js","window":{"width":0,"height":0}}"#;
+        assert!(parse_manifest(zero).is_ok());
+
+        // 静态能判定的坏值：整包拒（否则建出一个用户抓不回来的窗口）
+        for bad in [
+            r#"{"width":-5}"#,
+            r#"{"width":0.5}"#,
+            r#"{"height":99999}"#,
+            r#"{"width":300,"minWidth":400}"#,
+            r#"{"height":300,"minHeight":400}"#,
+        ] {
+            let text = format!(r#"{{"id":"demo","entry":"index.js","window":{bad}}}"#);
+            assert!(parse_manifest(&text).is_err(), "应被拒：{bad}");
+        }
     }
 
     /// 旧 `plugins\` 目录一次性搬到 `Modules\`（2026-09-28 改名）。

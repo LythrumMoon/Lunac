@@ -53,7 +53,9 @@ $Plugins = @{
     keywords     = @("music", "音乐", "歌词", "music 音乐", "spotify", "lyrics", "lrclib")
     icon         = "🎵"
     homepage     = "https://github.com/LythrumMoon/Lunac"
-    permissions  = @()
+    # `window.float`（2026-09-29）：本插件一律在**悬浮窗**里打开。
+    # 宿主不再按 id 认「音乐要开窗」—— 拓展插件要能独立打包分发，宿主写死的 id 表在磁盘插件上查不到。
+    permissions  = @("window.float")
     # dest 落在插件目录内 ⇒ `<exe 根>\Modules\music\bin\librespot.exe`；
     # 宿主 music.rs 的 find_librespot() 认这条路径，用户不必自己去填路径。
     dependencies = @(
@@ -65,6 +67,67 @@ $Plugins = @{
       }
     )
   }
+  # 剪贴板历史（2026-09-29 从 bundle 摘出）：无权限、无依赖 —— 纯前端 + 宿主存储命令。
+  # 「复制时顺手记一条」由宿主命令 append_clipboard_entry 负责（主窗口行为，插件没装也要工作）。
+  "clipboard-history" = @{
+    name         = "剪贴板历史"
+    description  = "剪贴板历史管理 —— 复制自动记录"
+    keywords     = @("clipboard", "history", "paste", "剪切板", "历史", "剪贴板", "粘贴", "复制")
+    icon         = "📋"
+    homepage     = "https://github.com/LythrumMoon/Lunac"
+    permissions  = @()
+    dependencies = @()
+  }
+  # OCR（2026-09-29 从 bundle 摘出）：`layout.takeover` = 接管整个窗口（双栏：左图右文），
+  # 宿主在 main.ts 的 isTakeoverPlugin() 里认这条声明，不再按 id 写死。
+  # 引擎（PaddleOCR-json，约 300MB）**不作为依赖**：它装在 <exe 根>\paddle-ocr、由宿主命令
+  # `ocr_engine_install` 按需下载（设置 → OCR 引擎 / 插件内的「下载并安装」都能触发）。
+  ocr = @{
+    name         = "OCR 文字识别"
+    description  = "OCR 图片文字识别 (PaddleOCR · 离线高精度)"
+    keywords     = @("ocr", "识别", "文字识别", "图像识别", "图片转文字", "截图识别", "图识字", "文字提取")
+    icon         = "🔍"
+    homepage     = "https://github.com/LythrumMoon/Lunac"
+    permissions  = @("layout.takeover")
+    dependencies = @()
+  }
+  # 文件转换（2026-09-29 从 bundle 摘出）：引擎是本机 ffmpeg（宿主的 convert.rs 自己找），
+  # 所以同样无依赖。
+  convert = @{
+    name         = "文件转换"
+    description  = "图片 / 音频 / 视频格式互转 (Image / Audio / Video converter · ffmpeg)"
+    keywords     = @("转换", "格式转换", "转格式", "convert", "格式", "转码", "提取音频", "图片转换", "视频转换", "音频转换")
+    icon         = "🔄"
+    homepage     = "https://github.com/LythrumMoon/Lunac"
+    permissions  = @()
+    dependencies = @()
+  }
+  # 桌宠（L1，2026-09-29）：**第一个用 `window` 段声明自己形态的插件**。
+  # 无权限（`permissions` 是空的）：它不是「一律开悬浮窗」那一类 —— 搜索打开的是
+  # **控制台**面板，桌宠窗由控制台里的「显示桌宠」按钮开（理由见 pet.ts 文件头：
+  # 穿透开着时桌宠窗收不到鼠标事件，开关必须落在另一个窗口里）。
+  pet = @{
+    name         = "桌宠"
+    description  = "桌宠 —— 独立透明置顶的桌面形象窗（形象由你自己导入）"
+    keywords     = @("桌宠", "宠物", "桌面宠物", "pet", "desktop pet", "live2d", "看板娘", "吉祥物")
+    icon         = "🐾"
+    homepage     = "https://github.com/LythrumMoon/Lunac"
+    permissions  = @()
+    dependencies = @()
+    # `chrome = $false` ⇒ 前端收起标题栏、结果区去玻璃底（styles.css 的 `html.no-chrome`）；
+    # `skipTaskbar = $true` ⇒ 不进任务栏（桌宠在任务栏里出现一个条目是纯噪音）；
+    # `resizable = $false` ⇒ 禁手动缩放（尺寸由形象与控制台决定）。
+    # 三个缺省值反过来的写法（不写这一段）就是历史上所有插件的样子 —— 别把这一段复制给它们。
+    window       = @{
+      width       = 300
+      height      = 400
+      minWidth    = 160
+      minHeight   = 200
+      resizable   = $false
+      skipTaskbar = $true
+      chrome      = $false
+    }
+  }
 }
 
 # ── 版本号：与 app\package.json 同源（市场上「更新」按钮靠它判断有没有新版）──
@@ -75,19 +138,31 @@ function Get-AppVersion {
 }
 
 # ── ① 构建 ─────────────────────────────────────────────────────────
+# **一个入口一次 vite build**（2026-09-29）：多个入口放一起会让 Rollup 把共享模块提到
+# `plugin-dist/<chunk 名>/` 这种跨插件的公共 chunk 里，而插件包只搬走自己那个目录 ⇒
+# 那份 chunk 丢失、插件打开即失败。逐个入口各起一次就没有共享 chunk，产物单文件自包含。
+$Version = Get-AppVersion
+$Ids = if ($Plugin.Count -gt 0) { $Plugin } else { @($Plugins.Keys) }
+foreach ($id in $Ids) {
+  if (-not $Plugins.ContainsKey($id)) { throw "元数据表里没有插件 '$id'（见本脚本顶部的 `$Plugins）" }
+}
+
 if (-not $NoBuild) {
-  Write-Host "[1/3] 构建插件包（vite lib 模式）..." -ForegroundColor Yellow
+  Write-Host "[1/3] 构建插件包（vite lib 模式，逐个入口）..." -ForegroundColor Yellow
   Push-Location $AppDir
   try {
-    & npx vite build --config vite.plugins.config.ts
-    if ($LASTEXITCODE -ne 0) { throw "vite 插件构建失败（exit $LASTEXITCODE）" }
-  } finally { Pop-Location }
+    foreach ($id in $Ids) {
+      $env:LUNAC_PLUGIN = $id
+      & npx vite build --config vite.plugins.config.ts
+      if ($LASTEXITCODE -ne 0) { throw "vite 插件构建失败（$id，exit $LASTEXITCODE）" }
+    }
+  } finally {
+    Remove-Item Env:\LUNAC_PLUGIN -ErrorAction SilentlyContinue
+    Pop-Location
+  }
 } else {
   Write-Host "[1/3] 跳过构建（-NoBuild）" -ForegroundColor DarkGray
 }
-
-$Version = Get-AppVersion
-$Ids = if ($Plugin.Count -gt 0) { $Plugin } else { @($Plugins.Keys) }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
@@ -113,6 +188,11 @@ foreach ($id in $Ids) {
     permissions  = $meta.permissions
     dependencies = $meta.dependencies
   }
+  # `window` 段只有声明了形态的插件才写（见 plugin_market::PluginWindowShape）。
+  # 不写 = 全部走宿主缺省（420×560 / 可缩放 / 进任务栏 / 有标题栏），
+  # 也就是这一段加进来之前所有插件的样子 —— **别给它们补一个空对象**，
+  # 空对象与不写在这里是等价的，写了只会让人以为是必需的。
+  if ($meta.window) { $manifest.window = $meta.window }
   # UTF-8 无 BOM：Rust 侧读清单时对 BOM 有容错，但**别依赖容错**
   $json = $manifest | ConvertTo-Json -Depth 6
   [IO.File]::WriteAllText((Join-Path $dir "lunac-plugin.json"), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -122,7 +202,7 @@ foreach ($id in $Ids) {
 # ── ③ 打 zip ───────────────────────────────────────────────────────
 # 用 ZipFile::CreateFromDirectory：包内是**目录内容**（lunac-plugin.json 在 zip 根），
 # 这正是 install_from_bytes 认的形状之一。
-Write-Host "[3/3] 打包 zip..." -ForegroundColor Yellow
+Write-Host "[3/4] 打包 zip..." -ForegroundColor Yellow
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 foreach ($id in $Ids) {
   $zip = Join-Path $OutDir "$id-$Version.zip"
@@ -133,6 +213,21 @@ foreach ($id in $Ids) {
   )
   $kb = [math]::Round((Get-Item $zip).Length / 1KB, 1)
   Write-Host "  $zip  ($kb KB)" -ForegroundColor Green
+}
+
+# ── ④ 给安装包暂存一份「解开的插件目录」─────────────────────────────
+# 用途：`scripts\lunac-installer.nsi` 的「拓展插件」勾选段直接从 release\ext-plugins\<id>\
+# 拷进 `$INSTDIR\Modules\<id>\`（用户要求：拓展插件不默认装，但安装包里要有勾选项）。
+# 用**解开**的目录而不是 zip：安装器没法解压；而且这份形状与「市场装完」的盘上形状一致。
+$StageDir = "$Root\release\ext-plugins"
+Write-Host "[4/4] 暂存给安装包（release\ext-plugins）..." -ForegroundColor Yellow
+foreach ($id in $Ids) {
+  $src = Join-Path $DistDir $id
+  $dst = Join-Path $StageDir $id
+  if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+  New-Item -ItemType Directory -Path $dst -Force | Out-Null
+  Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force
+  Write-Host "  release\ext-plugins\$id" -ForegroundColor DarkGray
 }
 
 Write-Host ""

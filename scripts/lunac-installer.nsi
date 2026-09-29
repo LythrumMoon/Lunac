@@ -33,6 +33,9 @@ Var CreateDesktopShortcut
 ; ── Pages ─────────────────────────────────────────────────────────
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
+; 拓展插件勾选页（2026-09-29，用户要求）：拓展插件**默认不装**，勾了才装 ——
+; 对应的 Section 见下面「拓展插件（勾选才装）」那一段。
+!insertmacro MUI_PAGE_COMPONENTS
 
 ; Custom options page (before INSTFILES so Section can read checkbox state)
 Page custom FinishOptions FinishOptionsLeave
@@ -52,7 +55,7 @@ Function FinishOptions
   ${EndIf}
 
   ; Heading
-  ${NSD_CreateLabel} 0 0 100% 14u "Select additional install options:"
+  ${NSD_CreateLabel} 0 0 100% 14u "Startup & shortcuts:"
   Pop $0
   CreateFont $1 "$(^Font)" "$(^FontSize)" "700"
   SendMessage $0 ${WM_SETFONT} $1 1
@@ -75,8 +78,9 @@ Function FinishOptionsLeave
   ${NSD_GetState} $CreateDesktopShortcut $1
 FunctionEnd
 
-; ── Install Section ───────────────────────────────────────────────
-Section "Install"
+; ── Install Section（核心：永远装，用户在组件页上取消不掉）─────────────
+Section "Install" SecCore
+  SectionIn RO
   SetOutPath "$INSTDIR"
 
   ; Main application
@@ -146,6 +150,59 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "DisplayVersion" "${PRODUCT_VERSION}"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "NoRepair" 1
+SectionEnd
+
+; ── 拓展插件（勾选才装，2026-09-29 用户要求）───────────────────────
+; 规则：拓展插件**不随安装包默认安装**，但安装包里要有勾选项。下面四段都带 `/o`
+; （unselected）⇒ 默认全不装；勾了的会在 `$INSTDIR\Modules\<id>\` 落一份**完整插件**
+; （index.js + lunac-plugin.json），形状与「从市场装过一遍」完全一致 —— 启动后
+; `refreshMarketPlugins()` 扫盘即认，用户不必再点一次下载。
+;
+; 插件包由 `scripts\build-plugins.ps1` 暂存到 `release\ext-plugins\<id>\`；
+; 没暂存过（例如只打了主程序）时 `!if /FileExists` 会整段跳过，makensis 不会因缺文件失败。
+;
+; **升级安装只 add、不删**：这里没有 RMDir，用户已勾过 / 已从市场装的插件不会被清掉。
+;
+; 音乐为什么多一段 librespot：它的本机播放引擎是个独立 exe（上游不发 Windows 二进制，
+; 那份是我们自己构建后挂到插件仓库 Release 上的，见 build-plugins.ps1 顶部说明）。
+; 走**市场**安装时由清单的 `dependencies[]` 自动下载；走**安装包**安装没有那一步，
+; 所以这里顺手把本机已构建好的那份一起放进去 —— 否则装完是个「找不到 librespot」的残废插件。
+
+Section /o "Clipboard history" SecExtClipboard
+  !if /FileExists "ext-plugins\clipboard-history\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\clipboard-history"
+    File /r "ext-plugins\clipboard-history\*"
+    SetOutPath "$INSTDIR"
+  !endif
+SectionEnd
+
+Section /o "OCR (PaddleOCR, offline)" SecExtOcr
+  !if /FileExists "ext-plugins\ocr\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\ocr"
+    File /r "ext-plugins\ocr\*"
+    SetOutPath "$INSTDIR"
+  !endif
+SectionEnd
+
+Section /o "File converter (ffmpeg)" SecExtConvert
+  !if /FileExists "ext-plugins\convert\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\convert"
+    File /r "ext-plugins\convert\*"
+    SetOutPath "$INSTDIR"
+  !endif
+SectionEnd
+
+Section /o "Music & lyrics (librespot)" SecExtMusic
+  !if /FileExists "ext-plugins\music\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\music"
+    File /r "ext-plugins\music\*"
+    SetOutPath "$INSTDIR"
+  !endif
+  !if /FileExists "deps\librespot\bin\librespot.exe"
+    SetOutPath "$INSTDIR\Modules\music\bin"
+    File "deps\librespot\bin\librespot.exe"
+    SetOutPath "$INSTDIR"
+  !endif
 SectionEnd
 
 ; ── Uninstall Section ─────────────────────────────────────────────

@@ -675,6 +675,26 @@ html, body {
   display: flex !important;
 }
 
+/* ── 聊天独立窗（`plugin-chat`，2026-09-29）─────────────────────────
+   AI 聊天的界面从主窗搬进一个**独立的无边框窗口**（用户 2026-09-29：「ai 插件也需要
+   独立界面状态……去除小窗口和大窗口，独立界面尺寸设置成与音乐插件相同的」）。
+   它加载的仍是 `index.html`（**同一份 DOM**），窗口角色由
+   `html[data-window-kind="chat"]` 标出 —— main.ts 在模块顶部按窗口 label 写入，
+   据此跳过主窗专有的初始化与事件（见那边的分工表）。
+
+   所以这里只需要「收起主窗专有的入口」：布局、圆角、玻璃底、标题栏全部复用
+   `#app.detached` 那一套（聊天窗启动时 `setDetached(true)`，见 main.ts）。
+   聊天区自己的样式一行都不用改。 */
+html[data-window-kind="chat"] #detached-back-btn,
+html[data-window-kind="chat"] #status-hint {
+  /* 本窗口就是独立界面，没有「内嵌面板」可回；Esc 提示属于主窗搜索态 */
+  display: none !important;
+}
+html[data-window-kind="chat"] #detail-panel {
+  /* 详细搜索大界面是主窗的（本窗口没有搜索栏，进不去）—— 留着只是防御性收口 */
+  display: none !important;
+}
+
 /* ── 插件悬浮窗标题栏（2026-09-27，plugin.html 专用）──────────────
    独立窗口没有系统边框（decorations:false + transparent），所以要自己画一条：
    拖拽区 + 标题 + 置顶 / 最小化 / 关闭三个按钮。
@@ -797,6 +817,36 @@ body:has(.music-root.music-player-on) #plugin-close:hover { color: var(--accent)
   opacity: 1;
   color: var(--accent);
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
+}
+
+/* ── 无标题栏形态（清单 `window.chrome = false`，2026-09-29）───────────
+   给桌宠（L1）这一类「窗口就是那片画面本身」的插件用。宿主在
+   `plugin_window_init` 里告知这个形态，plugin-window.ts 在 `<html>` 上挂 `no-chrome`：
+     · 标题栏整条不显示（含 hover 展开 —— 桌宠没有那三个按钮，最小化/关闭走右键菜单）；
+     · 结果区的玻璃底 / 描边 / 圆角 / 毛玻璃全部去掉，**整窗真的透明**
+       （`html, body` 本来就是 `transparent`，唯一的色块是 `#results-container::before`）；
+     · 外层垫料归零，画布铺满整窗。
+   ⚠️ 这几条只认 `html.no-chrome`，不会影响普通插件窗与音乐窗。 */
+html.no-chrome #app.detached {
+  padding: 0;
+}
+html.no-chrome #plugin-titlebar,
+html.no-chrome #app.detached:hover #plugin-titlebar {
+  display: none !important;
+}
+html.no-chrome #results-container {
+  border: none !important;
+  border-radius: 0 !important;
+  margin: 0;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+html.no-chrome #results-container::before {
+  display: none;
+}
+html.no-chrome #results-list {
+  padding: 0;
+  overflow: hidden;
 }
 
 #detached-back-btn,
@@ -1291,6 +1341,89 @@ body:has(.music-root.music-player-on) #plugin-close:hover { color: var(--accent)
 }
 #token-dashboard.visible {
   display: flex;
+}
+/* 表盘可点：点它展开「用量与成本」的数据面板（2026-09-29） */
+#token-dashboard.visible {
+  cursor: pointer;
+}
+#token-dashboard.expanded {
+  color: var(--text);
+}
+
+/* ── 表盘的展开面板：用量与成本的数据 ─────────────────────────────
+   状态栏在窗口最底下（再往下就是窗口边缘），所以面板**只能贴着状态栏往上弹** ——
+   `bottom` 由 JS 按状态栏实测高覆盖（见 main.ts 的 setUsagePanelOpen）。
+   里面只放数据，不放说明文字（用户 2026-09-29 定）。 */
+#token-usage-panel {
+  position: fixed;
+  right: 14px;
+  bottom: 40px;
+  z-index: 40;
+  box-sizing: border-box;
+  max-width: min(560px, calc(100vw - 28px));
+  max-height: 56vh;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background-color: var(--surface-glass);
+  background-image: var(--glass-sheen-image);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--border-glass);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+#token-usage-panel.hidden {
+  display: none;
+}
+/* 面板里的「数据」一行（价格时间 / 未定价 / 候选路径） */
+#token-usage-panel .cost-data {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-bottom: 8px;
+}
+#token-usage-panel .cost-kv {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+#token-usage-panel .cost-k {
+  opacity: 0.7;
+}
+#token-usage-panel .cost-v {
+  color: var(--text);
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 逐日表格 + 总计行（数字列右对齐，第一列左对齐） */
+#token-usage-panel table.cost-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+#token-usage-panel table.cost-table th,
+#token-usage-panel table.cost-table td {
+  padding: 3px 6px;
+  text-align: right;
+  white-space: nowrap;
+}
+#token-usage-panel table.cost-table th:first-child,
+#token-usage-panel table.cost-table td:first-child {
+  text-align: left;
+}
+#token-usage-panel table.cost-table th {
+  font-weight: 600;
+  color: var(--text);
+  border-bottom: 1px solid var(--border-glass);
+}
+#token-usage-panel tr.cost-total-row td {
+  font-weight: 700;
+  color: var(--text);
+  border-top: 1px solid var(--border-glass);
 }
 
 /* Mini cache-hit ratio bar */
@@ -5421,5 +5554,134 @@ body.music-resizing * { cursor: col-resize !important; }
   font-size: 0.72rem;
   color: var(--text-muted);
   border-top: 1px solid var(--border-glass);
+}
+
+/* ── 翻译插件（xl-，2026-09-29）────────────────────────────────────
+   面板是一列内容（输入 → 译文 → 释义 → 例句），与备忘录 / 快速启动同族：
+   内嵌在主窗里，也能被搬到独立悬浮窗（FLOATABLE_PLUGINS 里有它）。
+   样式写在这里而不是插件自带的 <style>：内置插件共用宿主这份主题变量，
+   悬浮窗（plugin.html）也链接同一份 styles.css。 */
+.xl-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.xl-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  background: rgba(var(--ink-rgb), 0.06);
+  color: var(--text);
+  font-size: 0.8rem;
+  font-family: inherit;
+  line-height: 1.5;
+}
+.xl-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
+}
+.xl-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.xl-select {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  background: rgba(var(--ink-rgb), 0.06);
+  color: var(--text);
+  font-size: 0.74rem;
+}
+.xl-arrow {
+  color: var(--text-dim);
+  font-size: 0.74rem;
+}
+.xl-go {
+  margin-left: auto;
+  padding: 5px 14px;
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  border-radius: 8px;
+  background: rgba(var(--accent-rgb), 0.12);
+  color: var(--text);
+  font-size: 0.76rem;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.xl-go:hover {
+  background: rgba(var(--accent-rgb), 0.2);
+}
+.xl-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* 译文是这块面板的主角：给足字号与行高，其他都是注解 */
+.xl-trans {
+  font-size: 1.05rem;
+  line-height: 1.5;
+  color: var(--text);
+  word-break: break-word;
+}
+.xl-phonetic {
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+.xl-explains {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 0.76rem;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.xl-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 2px;
+}
+.xl-ex {
+  padding-left: 8px;
+  border-left: 2px solid var(--border-glass);
+}
+.xl-ex-src {
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+.xl-ex-dst {
+  font-size: 0.74rem;
+  color: var(--text);
+}
+.xl-meta {
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  opacity: 0.8;
+}
+.xl-hint {
+  font-size: 0.76rem;
+  color: var(--text-dim);
+}
+.xl-err {
+  color: var(--red);
+}
+/* 「用 AI 翻译 / 重译」—— 花钱的动作，样式上与主按钮分开（它是一次额外出账） */
+.xl-ai {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+  background: rgba(var(--ink-rgb), 0.06);
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.xl-ai:hover {
+  background: rgba(var(--ink-rgb), 0.12);
+  color: var(--text);
 }
 

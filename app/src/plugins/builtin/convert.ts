@@ -374,3 +374,10 @@ export const convertPlugin: Plugin = {
     return { type: "html", content: shellHtml() };
   },
 };
+
+// ── 磁盘插件契约（2026-09-29）────────────────────────────────────────
+// 文件转换已归入**拓展插件**：不再随安装包默认安装，改为从市场装进 `Modules\convert\`。
+// 独立打包的入口必须**默认导出**带 `execute` 的对象，并具名导出 `attach(root)` / `detach()`
+// —— 与 music 同一套（见 ai-spec §3.5「插件契约」、`vite.plugins.config.ts`、预检 #32 ⑨）。
+export { attachConvertListeners as attach, stopConvertWatch as detach };
+export default convertPlugin;

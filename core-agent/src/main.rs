@@ -931,10 +931,19 @@ fn pin_summary_of_dropped(cfg: &Cfg, history: &mut Vec<Value>, dropped: &[Value]
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
 /// 技能清单（P4）在 main() 里追加到本提示词之后，见 skills::listing()。
+///
+/// **2026-09-29 加「批量化」那句**（L6 压请求次数）：一次提问实测 7~10 次请求，每次
+/// 「模型→工具→模型」往返都要重发一遍前缀。而 `plan_tool_batches()` 早就能把**连续**的
+/// 只读调用放进**同一个响应**里并发执行（上限 `TOOL_PARALLELISM`）——**一次请求带 N 个
+/// `tool_use`**，不是发 N 份请求。省的是往返次数，不是并发度：原先只差一句提示词，
+/// 模型每轮只发一个调用，白跑了好几趟。
 const SYSTEM_PROMPT: &str = "You are Lunac's built-in assistant, running inside a Windows desktop launcher. \
 Answer in the user's language and keep it concise. \
 You can inspect and modify the local machine with the provided tools: prefer Read/Glob/Grep \
 before editing, make the smallest change that solves the problem, and say what you changed. \
+Batch independent lookups: when several reads or searches do not depend on one another, issue \
+them as multiple tool calls in the SAME response instead of one per turn -- they run \
+concurrently and each saved round-trip is a re-sent prefix you do not pay for. \
 Relative paths resolve against your working directory.";
 
 /// 固定的「人格 + 文风」块 —— 系统提示词的第二段（2026-09-17，方案 B）。
@@ -958,7 +967,8 @@ You are "Lunac", a sharp, fast desktop AI assistant built into a launcher. Stay 
 - Always reply in the user's language.
 
 ## Output Style
-Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions."#;
+Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions.
+Spend output tokens only on the answer (2026-09-29, L6): no preamble before tool calls, no announcing what you are about to do, no restating the plan, no recap of what you just read. Answer only what was asked -- skip extra findings and unrequested analysis. Never paste back content the user can already see. Keep the closing note to what changed, in one line."#;
 
 /// 用户人格 / 自定义提示词的来源文件（宿主注入的绝对路径，L2，2026-09-21）。
 ///
@@ -1393,6 +1403,63 @@ fn emit_api_retry(attempt: usize, status: Option<u16>, delay_ms: u64, reason: &s
 
 // ── 运行配置 ─────────────────────────────────────────────────────
 
+/// 子代理 / 后台复盘 fork 的累计用量（跨线程共享，2026-09-29）。
+///
+/// **为什么必须补记**：子代理（`Agent` 工具、fork 技能）与后台复盘各自发自己的 API 请求，
+/// 平台照常计费，但 `run_subagent` 的返回值只带最终文本 ⇒ 它们的 token **从来没进过
+/// `result.usage`**。实测证据（`usage_data_2026-09-29`）：平台同一 key 记 24 次请求，
+/// 本地 `usage-*.jsonl` 只有 17 次 ⇒ 本地账系统性偏低，拿它判断「改哪儿能省钱」是在错的
+/// 基数上做决定。
+///
+/// **为什么挂在 `Cfg` 上而不是往返回值里塞**：`run_subagent` 的三条路径
+/// （`Agent` 工具 / fork 技能 / 后台复盘）都只拿得到 `&Cfg`；改签名要一路穿到
+/// `run_agent_tool` / `run_forked_skill` / 并行批。而并行子代理批里每个子代理跑的是各自的
+/// `Cfg::detached()` 副本 ⇒ 这个字段必须是 `Arc` 才跨得过线程（`detached()` 克隆它）。
+///
+/// **归并时机**：`run_query` 成功收尾时**取走并归零**（与 `result.usage`「本次提问的绝对值」
+/// 同一口径）。后台复盘在提问之间跑完，其用量因此落在「收尾时已经跑完的那一问」或下一问上
+/// —— 复盘本来就没有更细的归属，记进某一问比丢掉它准。
+#[derive(Default)]
+struct SubagentUsage {
+    input: AtomicU64,
+    cache_read: AtomicU64,
+    cache_create: AtomicU64,
+    output: AtomicU64,
+    /// 逐请求明细，每条形态与 `result.usage.requests[]` 一致
+    requests: Mutex<Vec<Value>>,
+}
+
+impl SubagentUsage {
+    /// 记一轮子代理请求（`run_subagent` 每轮解析出 `usage` 后调用一次）
+    fn record(&self, input: u64, cache_read: u64, cache_create: u64, output: u64) {
+        self.input.fetch_add(input, Ordering::Relaxed);
+        self.cache_read.fetch_add(cache_read, Ordering::Relaxed);
+        self.cache_create.fetch_add(cache_create, Ordering::Relaxed);
+        self.output.fetch_add(output, Ordering::Relaxed);
+        if let Ok(mut v) = self.requests.lock() {
+            v.push(json!({
+                "in": input, "read": cache_read, "create": cache_create, "out": output,
+            }));
+        }
+    }
+
+    /// 取走累计值并归零，返回 `(input, cache_read, cache_create, output, requests)`。
+    /// 锁毒化时只丢明细、不让主循环跟着崩 —— 明细是归因用的，不该有这种否决权。
+    fn take(&self) -> (u64, u64, u64, u64, Vec<Value>) {
+        let reqs = match self.requests.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(_) => Vec::new(),
+        };
+        (
+            self.input.swap(0, Ordering::Relaxed),
+            self.cache_read.swap(0, Ordering::Relaxed),
+            self.cache_create.swap(0, Ordering::Relaxed),
+            self.output.swap(0, Ordering::Relaxed),
+            reqs,
+        )
+    }
+}
+
 struct Cfg {
     client: reqwest::blocking::Client,
     endpoint: String,
@@ -1406,6 +1473,9 @@ struct Cfg {
     /// 上次压缩时的实测体积 —— 滞回基准（见 `COMPACT_MIN_GROWTH`）。
     /// 0 表示本进程还没压缩过。
     last_compact: Cell<u64>,
+    /// 子代理 / 后台复盘的累计用量（见 `SubagentUsage`）。`Arc` 是刻意的：
+    /// `detached()` 出来的副本必须与主循环**记同一本账** —— 并行子代理批正是用副本跑的。
+    sub: Arc<SubagentUsage>,
 }
 
 impl Cfg {
@@ -1437,6 +1507,7 @@ impl Cfg {
             thinking: Cell::new(Thinking::from_env()),
             last_input: Cell::new(0),
             last_compact: Cell::new(0),
+            sub: Arc::new(SubagentUsage::default()),
         })
     }
 
@@ -1450,6 +1521,8 @@ impl Cfg {
     /// `thinking` 取**当前已跑通并缓存**的那个形态（400 降级的结果）：复盘不必再走一遍
     /// 降级链 —— 能问到第 10 轮，说明主请求至少成功过一次（同子代理的做法）。
     /// 两个 `Cell` 归零是对的：复盘是独立的短对话，没有「上一轮实测体积」可言。
+    /// `sub` 是**唯一被共享的字段**（`Arc::clone`）：子代理与复盘烧的 token 是同一笔账，
+    /// 各记各的等于把它们的用量丢在副本里（2026-09-29）。
     fn detached(&self) -> Result<Cfg, String> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
@@ -1464,6 +1537,7 @@ impl Cfg {
             thinking: Cell::new(self.thinking.get()),
             last_input: Cell::new(0),
             last_compact: Cell::new(0),
+            sub: Arc::clone(&self.sub),
         })
     }
 }
@@ -2734,10 +2808,16 @@ fn run_subagent(
         // 用量累计：命中缓存的也算真实吞吐（它同样占预算，只是单价低）
         if let Some(u) = parsed.get("usage") {
             let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-            spent += n("input_tokens")
-                + n("output_tokens")
-                + n("cache_read_input_tokens")
-                + n("cache_creation_input_tokens");
+            let (r_in, r_out, r_read, r_create) = (
+                n("input_tokens"),
+                n("output_tokens"),
+                n("cache_read_input_tokens"),
+                n("cache_creation_input_tokens"),
+            );
+            spent += r_in + r_out + r_read + r_create;
+            // 同时记进**主循环那本账**（2026-09-29）：子代理的 token 平台照收钱，
+            // 此前却完全没进 `result.usage` ⇒ 本地用量日志与账单对不上。
+            cfg.sub.record(r_in, r_read, r_create, r_out);
         }
 
         // 拆包：只要 text 与 tool_use —— thinking 等块**不回灌**（回灌会 400，
@@ -4578,6 +4658,25 @@ fn run_query(
         }
     }
 
+    // 子代理 / 后台复盘的用量并入本次提问（2026-09-29）。**不归并 = 本地账少一截**：
+    // 平台照收它们的钱，而 `result.usage` 此前只有主循环那几轮（实测平台 24 次请求
+    // vs 本地 17 次）。`take()` 顺带归零，保证「本次提问的绝对值」这个口径不被带到下问。
+    // 顺序说明：它们在提问内并发完成，追加到 `requests[]` 末尾的先后由线程调度决定；
+    // 平台对账按「条数 + 合计」对齐，不依赖顺序。
+    let (sub_in, sub_read, sub_create, sub_out, sub_reqs) = cfg.sub.take();
+    let sub_requests = sub_reqs.len();
+    if sub_in + sub_read + sub_create + sub_out > 0 {
+        log::info(format!(
+            "子代理/复盘用量并入本次提问 in={sub_in} read={sub_read} create={sub_create} \
+             out={sub_out} 请求={sub_requests}"
+        ));
+    }
+    in_tokens += sub_in;
+    cache_read += sub_read;
+    cache_create += sub_create;
+    out_tokens += sub_out;
+    req_log.extend(sub_reqs);
+
     emit(json!({
         "type": "result",
         "subtype": "success",
@@ -4592,6 +4691,15 @@ fn run_query(
             "output_tokens": out_tokens,
             "cache_read_input_tokens": cache_read,
             "cache_creation_input_tokens": cache_create,
+            // **其中**来自子代理 / 后台复盘的部分 —— 已包含在上面四个数里，再报一份只为
+            // 归因（「这问的钱有多少是子代理烧的」）。消费者**不得**把它再加一次。
+            "subagent": {
+                "input_tokens": sub_in,
+                "output_tokens": sub_out,
+                "cache_read_input_tokens": sub_read,
+                "cache_creation_input_tokens": sub_create,
+                "requests": sub_requests,
+            },
             // 每次 API 请求一行（顺序 = 请求顺序）。前端写进本地用量日志，
             // 与 DeepSeek 平台用量页按请求对账；旧消费者忽略即可。
             "requests": req_log,
@@ -4677,6 +4785,41 @@ mod tests {
         assert_eq!(common_prefix_len(&[7, 8], &[42, 8]), 0);
         // cur 比 prev 短（裁剪 / 丢弃）也必须如实报，不许当真前缀
         assert_eq!(common_prefix_len(&[7, 8, 9], &[7]), 1);
+    }
+
+    /// 子代理用量账本：累加正确、`take()` 取走即归零（2026-09-29）。
+    ///
+    /// 钉两件事：① 多轮累加不丢；② `take()` 之后归零 —— `result.usage` 的口径是
+    /// 「本次提问的绝对值」，归零漏了就会把上一问的子代理用量重复计进下一问。
+    #[test]
+    fn subagent_usage_accumulates_and_take_resets() {
+        let u = SubagentUsage::default();
+        assert_eq!(u.take(), (0, 0, 0, 0, Vec::new()));
+
+        u.record(100, 200, 0, 300);
+        u.record(1, 2, 3, 4);
+        let (input, read, create, output, reqs) = u.take();
+        assert_eq!((input, read, create, output), (101, 202, 3, 304));
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1], json!({"in": 1, "read": 2, "create": 3, "out": 4}));
+
+        // 取走即归零（下一问从空账开始）
+        assert_eq!(u.take(), (0, 0, 0, 0, Vec::new()));
+    }
+
+    /// `detached()` 必须**共享**子代理用量账本（2026-09-29）。
+    ///
+    /// 并行子代理批里每个子代理跑的是 `Cfg::detached()` 出来的副本（见 `run_query` 的
+    /// `BatchKind::Subagent` 分支）；这个字段若跟着副本各建一份，并行那批的用量就永远回不到
+    /// 主循环 —— 账面上看着「修好了」，实际只在串行路径生效。这条钉的就是那个沉默的失效。
+    #[test]
+    fn detached_shares_the_subagent_usage_ledger() {
+        let cfg = cfg_pointing_at("http://127.0.0.1:1/v1/messages");
+        let copy = cfg.detached().expect("detached");
+        copy.sub.record(1, 2, 3, 4);
+        let (input, read, create, output, reqs) = cfg.sub.take();
+        assert_eq!((input, read, create, output), (1, 2, 3, 4));
+        assert_eq!(reqs.len(), 1);
     }
 
     /// 系统提示词的**前缀缓存不变量**（2026-09-17 方案 B 的守门测试）。
@@ -5230,6 +5373,7 @@ mod tests {
             thinking: Cell::new(Thinking::Disabled),
             last_input: Cell::new(0),
             last_compact: Cell::new(0),
+            sub: Arc::new(SubagentUsage::default()),
         }
     }
 

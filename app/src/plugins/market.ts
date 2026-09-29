@@ -22,6 +22,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { t } from "../i18n.js";
 import { pluginRegistry, type Plugin, type PluginResult } from "./registry";
+import { isBasePlugin } from "./kinds";
 
 /** 与 Rust 侧 `plugin_market::InstalledPlugin` 一一对应（字段名由 serde 直接序列化，改动要两边一起改）。 */
 export interface MarketPluginInfo {
@@ -101,6 +102,15 @@ const modules = new Map<string, { version: string; mod: unknown }>();
  *  **只有真加载过模块的插件才有**：没打开过的插件没有钩子要收，这是有意的。 */
 const hooks = new Map<string, { detach?: () => void }>();
 
+/** **本层注册过**的拓展插件 id（只增删于 `refreshMarketPlugins`，非本层注册的绝不动）。
+ *
+ *  为什么需要单独记一份：`refreshMarketPlugins` 拿到的是**当前**扫描结果，
+ *  「卸载后」那个 id 已经**不在**结果里了 —— 光遍历结果去 `unregister` 永远摘不掉它，
+ *  于是卸载完插件还留在 registry 里、还能被搜到（2026-09-29 实测：卸了 OCR 搜索里还有它）。
+ *  有了这份名单才能算出「上次有、这次没了」并摘干净 —— 这是「卸载 = 完全不存在于本应用」的
+ *  最后一环，见 ai-spec §3.5。 */
+const marketRegistered = new Set<string>();
+
 export function installedMarketPlugins(): MarketPluginInfo[] {
   return installed;
 }
@@ -129,10 +139,23 @@ export async function refreshMarketPlugins(): Promise<MarketPluginInfo[]> {
   for (const id of [...hooks.keys()]) {
     if (!live.has(id)) hooks.delete(id);
   }
-  // 先摘后挂：registry 不去重，重复 register 会让结果区出现两行（见 `PluginRegistry.unregister`）
-  for (const p of list) pluginRegistry.unregister(p.id);
+  // ① 先摘「上次注册过、这次盘上没有」的 —— 卸载后必须从 registry 里消失，
+  //    否则它还能被搜到（判据见 `marketRegistered` 的注释）。
+  const usable = new Set(list.filter(p => p.valid).map(p => p.id));
+  for (const id of [...marketRegistered]) {
+    if (!usable.has(id)) {
+      pluginRegistry.unregister(id);
+      marketRegistered.delete(id);
+    }
+  }
+  // ② 再挂上这次盘上可用的（先摘后挂：registry 不去重，重复 register 会出两行）。
+  // **基础插件以 bundle 为准**：盘上就算被人塞了一份同名目录（`Modules\memo\`），也不许顶掉
+  // 内置实现 —— 用户要求「基础插件不能安装 / 卸载」，见 kinds.ts 的 BASE_PLUGIN_IDS。
   for (const p of list) {
-    if (p.valid) pluginRegistry.register(wrap(p));
+    if (isBasePlugin(p.id) || !p.valid) continue;
+    pluginRegistry.unregister(p.id);
+    pluginRegistry.register(wrap(p));
+    marketRegistered.add(p.id);
   }
   return list;
 }

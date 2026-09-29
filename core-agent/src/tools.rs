@@ -81,6 +81,9 @@ const SEARCH_SNIPPET_CHARS: usize = 400;
 /// 抓取类兜底源的 UA：Bing / 百度只对浏览器 UA 返回正常结果页（非浏览器 UA 给降级空壳）
 const SCRAPE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// 抓取类兜底源共用的 `Accept` —— 用浏览器那一串。**百度会拿它判「是不是浏览器」**：
+/// 少一个 `Accept` 就回 1488 字节的验证页（见 `scrape_get` 的注释）。
+const SCRAPE_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
 
 /// 目录遍历时跳过的常见重目录（避免 Glob/Grep 卡在依赖上）
 const SKIP_DIRS: [&str; 13] = [
@@ -1455,17 +1458,34 @@ fn scraped_search(query: &str, count: usize) -> Result<(&'static str, Vec<Search
     Err(errs.join("；"))
 }
 
-/// GET 一个结果页并按上限读回（抓取类兜底源共用）。浏览器 UA + `Accept-Language`
-/// 是必须的 —— Bing / 百度对非浏览器 UA 会返回降级空壳。
-fn scrape_get(url: &str, params: &[(&str, &str)]) -> Result<String, String> {
+/// GET 一个结果页并按上限读回（抓取类兜底源共用）。
+///
+/// 浏览器 UA + `Accept-Language` + `Accept` 是必须的 —— Bing / 百度对非浏览器请求
+/// 都会返回降级空壳；`referer` 给定时再带上它。
+///
+/// **这一套头必须凑齐（2026-09-29 实测，百度解析「失效」的真正原因）**：
+/// 百度对「像浏览器的请求」才发结果页，对不像的**回一页 1488 字节的
+/// `百度安全验证`（mkdjump 跳转页，正文只有「网络不给力，请稍后重试」）——
+/// **HTTP 200、status 检查拦不住**，正文里却一个结果块都没有 ⇒ 解析器报「疑似改版或被反爬」，
+/// 看起来像百度改版了，其实是我们自己少带了头。而且它认的是**组合**：
+/// 只补 `Accept` 或只补 `Referer` 实测仍是那 1488 字节的跳转页，两种一起带才稳定出结果
+/// （连跑 3 次都是 5 条）。判据一句话：**正文 ≈ 1488 字节 = 被反爬，别去改解析正则**。
+fn scrape_get(
+    url: &str,
+    params: &[(&str, &str)],
+    referer: Option<&str>,
+) -> Result<String, String> {
     let client = http_client(SEARCH_TIMEOUT_SECS)?;
-    let resp = client
+    let mut rb = client
         .get(url)
         .header(reqwest::header::USER_AGENT, SCRAPE_USER_AGENT)
         .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-        .query(params)
-        .send()
-        .map_err(|e| e.to_string())?;
+        .header(reqwest::header::ACCEPT, SCRAPE_ACCEPT)
+        .query(params);
+    if let Some(r) = referer {
+        rb = rb.header(reqwest::header::REFERER, r);
+    }
+    let resp = rb.send().map_err(|e| e.to_string())?;
 
     let status = resp.status();
     let (body, _) = read_body_capped(resp, SEARCH_MAX_BYTES)?;
@@ -1484,7 +1504,7 @@ fn scrape_get(url: &str, params: &[(&str, &str)]) -> Result<String, String> {
 /// 比抓 HTML 稳得多：干净 XML、`<link>` 直接就是真实 URL（没有跳转壳）、字段固定。
 fn bing_rss_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
     throttle_scrape();
-    let body = scrape_get(BING_SEARCH_ENDPOINT, &[("q", query), ("format", "rss")])?;
+    let body = scrape_get(BING_SEARCH_ENDPOINT, &[("q", query), ("format", "rss")], None)?;
     if !body.contains("<item") {
         return Err("响应里没有 <item>（疑似改版或被反爬）".into());
     }
@@ -1545,7 +1565,7 @@ fn xml_text(s: &str) -> String {
 /// 结构是 `<li class="b_algo">` 里 `<h2><a href="…">标题</a></h2>` + `b_caption` 的 `<p>` 摘要。
 fn bing_html_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
     throttle_scrape();
-    let body = scrape_get(BING_SEARCH_ENDPOINT, &[("q", query)])?;
+    let body = scrape_get(BING_SEARCH_ENDPOINT, &[("q", query)], None)?;
     if !body.contains("b_algo") {
         return Err("响应里没有 b_algo（疑似改版或被反爬）".into());
     }
@@ -1592,7 +1612,12 @@ fn parse_bing_html(html: &str, count: usize) -> Vec<SearchHit> {
 /// （实测 `c-abstract` 命中 0），所以**只给标题与 URL，不编摘要**。
 fn baidu_search(query: &str, count: usize) -> Result<Vec<SearchHit>, String> {
     throttle_scrape();
-    let body = scrape_get(BAIDU_SEARCH_ENDPOINT, &[("wd", query), ("rn", "10")])?;
+    // 百度认「像浏览器的一整套头」，见 `scrape_get` 的注释（少带就回 1488 字节的验证页）。
+    let body = scrape_get(
+        BAIDU_SEARCH_ENDPOINT,
+        &[("wd", query), ("rn", "10")],
+        Some("https://www.baidu.com/"),
+    )?;
     if !body.contains("result c-container") {
         return Err("响应里没有 result c-container（疑似改版或被反爬）".into());
     }

@@ -237,7 +237,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 工具卡片 | `main.ts` `agentNewBlock("tool")` / `agentToolArgsDelta` / `agentToolResult` | `content_block_start(tool_use)` + `input_json_delta` 流式展开参数，`tool_result` 内联成功/失败（P1 起真正生效） |
 | 工作区设置 | `main.ts` AI 对话输入栏 ⋯ 菜单（`#chat-more-menu`）内的「工作区」行 | 行内显示当前路径 + 「选择目录 / 清除」→ `invoke("set_workspace")` + 重启 CLI；默认=`<exe 根>\temp\transStorage`（整个系统可访问，见 §11 规则 34）。**独立的 `#chat-workspace-btn` 已不存在**（2026-09 并入 ⋯ 菜单，见 agent-ui-spec §5.3） |
 | 思考开关 | `main.ts` `#chat-mode-seg`（输入栏 ⋯ 菜单内）+ `set_thinking_mode` | `on` / `off` 两档 → `LUNAC_THINKING` → agent 侧 `Thinking`（见 §3.5「思考开关跨模型自适应」）；切换重启 agent |
-| Token 仪表盘 | `main.ts` `addUsageToTotals` / `updateTokenDashboard` / `appendUsageLog` | 计费口径：Hit=缓存读取，Miss=普通输入+缓存写入，Total=四类 token 之和。**数值 = 「当前对话」的累计**（每次提问落一行 JSONL，见 §3.5「用量与对账」），可与供应商平台按天对账 |
+| Token 仪表盘 | `main.ts` `addUsageToTotals` / `updateTokenDashboard` / `appendUsageLog`；**点表盘展开面板**见 [usage-cost.ts](file:///d:/cc/claude-code-cli-master/app/src/usage-cost.ts) | 计费口径：Hit=缓存读取，Miss=普通输入+缓存写入，Total=四类 token 之和。**数值 = 「当前对话」的累计**（每次提问落一行 JSONL，见 §3.5「用量与对账」），可与供应商平台按天对账。**点表盘（`#token-dashboard`，仅 `.visible` 时）向上弹出 `#token-usage-panel`**：里面是近 30 天逐日用量 + 金额（**含总计行**）与价格表状态 —— **只放数据，不放说明文字**；对话进行中每次落用量都顺带刷新（关着时不刷） |
 
 ### 3.5 自研 agent 核心 `core-agent/`（2026-09，已接线）
 
@@ -432,10 +432,10 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 回落语义 | 未选服务商 / 未配 key / 服务商名未知 / 主源报错 / 主源 0 结果 → 走抓取兜底，结果尾部附 `[fallback] <原因>`；兜底三家按 **Bing RSS → Bing HTML → 百度** 顺序试，全失败则整条 `Err`（进 `is_error=true` 的 `tool_result`，原因含三家各自的报错），**不编造结果** |
 | 抓取限流 | 进程内 `OnceLock<Mutex<Instant>>` 强制两次抓取间隔 ≥1.1s；HTTP 202 / 429 视为限流并显式报错（区分「被限流」与「没结果」）；响应里连结果容器（`<item>` / `b_algo` / `result c-container`）都没有时**报错**而不是返回空列表 —— 不把「改版/被反爬」说成「没搜到」 |
 | 解析要点 | Bing RSS 是首选（干净 XML、`<link>` 就是真实 URL、无跳转壳），先切 `<item>` 块再在块内取字段（通道级同名标签会串）；Bing HTML 取 `<h2><a href>` + 就近 2KB 内的 `b_caption` 摘要；百度取 `class="result c-container"` 容器的 `mu="真实URL"`（**不必跟 `baidu.com/link?url=` 的 302**）+ 块内 `<h3>` 标题，摘要字段不稳定故留空 |
-| 抓取 UA | 主源一律用 `Lunac/<版本>`；**抓取类兜底源用浏览器 UA + `Accept-Language: zh-CN`** —— Bing / 百度对非浏览器 UA 只返回降级空壳（实测数据即用浏览器 UA 取得），这是抓取结果页的必要条件，不代表身份伪装 |
+| 抓取请求头 | 主源一律用 `Lunac/<版本>`；**抓取类兜底源必须凑齐浏览器那一套头：`User-Agent` + `Accept-Language: zh-CN` + `Accept`，百度再额外带 `Referer: https://www.baidu.com/`** —— Bing / 百度对非浏览器请求只返回降级空壳（实测数据即用浏览器 UA 取得），这是抓取结果页的必要条件，不代表身份伪装。**2026-09-29 实测：百度认的是「组合」** —— 只补 `Accept` 或只补 `Referer`，它照样回一页 **1488 字节**的 `百度安全验证`（mkdjump 跳转页，正文只有「网络不给力，请稍后重试」，**HTTP 200**，`status` 检查拦不住、也没有任何结果容器）⇒ 解析器报「疑似改版或被反爬」，看着像百度改版，其实是少带了头。两种一起带才稳定出结果（连跑 3 次各 5 条）。**判据：正文 ≈ 1488 字节 = 被反爬，去补请求头，别去改解析正则** |
 | 审批 | 在 `needs_approval` 与 `gated_in_read_only` 里（查询词是外部出口），**plan 档同样弹审批**；前端工具黑名单候选名单同步补 `WebSearch` |
 | 不新增依赖 | 解析全部用既有 `regex` + `serde_json`（`head_chars()` 按 UTF-8 边界截断，避免中文页面切片 panic） |
-| 验证口径（2026-09-17 用户定） | **四家付费主源的「成功」路径不作为验收项** —— 预算原因拿不到可用 key，只保「请求形状 + 错误透传 + 回落」正确（已验）。**真正要守的是兜底链**（它才是「未配 key 也能搜」这句话的支撑）：`cd core-agent && cargo test fallback_scrapers -- --ignored --nocapture` —— 全仓**唯一联网**用例，故意标 `#[ignore]`（依赖外网与对方页面结构，进常规 `cargo test` 会让离线/CI 随机挂），但必须保持可一键重跑。它断言两件事：① 三级至少一级可用（等价于 `scraped_search()` 能出结果）；② **Bing RSS 必须单独活着** —— 它是链的首选，不单独钉的话「它挂了但百度还在」会被 ① 掩盖成静默降级。**2026-09-17 实测：三级全部 OK 各 5 条**（2.84s，含两次 1.1s 节流）。**对方改版后必须重跑这一条** |
+| 验证口径（2026-09-17 用户定） | **四家付费主源的「成功」路径不作为验收项** —— 预算原因拿不到可用 key，只保「请求形状 + 错误透传 + 回落」正确（已验）。**真正要守的是兜底链**（它才是「未配 key 也能搜」这句话的支撑）：`cd core-agent && cargo test fallback_scrapers -- --ignored --nocapture` —— 全仓**唯一联网**用例，故意标 `#[ignore]`（依赖外网与对方页面结构，进常规 `cargo test` 会让离线/CI 随机挂），但必须保持可一键重跑。它断言两件事：① 三级至少一级可用（等价于 `scraped_search()` 能出结果）；② **Bing RSS 必须单独活着** —— 它是链的首选，不单独钉的话「它挂了但百度还在」会被 ① 掩盖成静默降级。**2026-09-17 实测：三级全部 OK 各 5 条**（2.84s，含两次 1.1s 节流）。**对方改版后必须重跑这一条**。**2026-09-29 复跑（用户报「三家全挂」）：只有百度是结构性失效**（1488 字节验证页，见上「抓取请求头」一行），Bing 两家只是**偶发**（连续跑三次里有一两次某一家因限流/连接失败，属正常抖动）；补齐请求头后三级各 5 条、可复现 |
 
 **思考开关跨模型自适应**（2026-09；2026-09-15 由「fast/think/deep 三档」收敛为**开 / 关**）：开关由 src-tauri 的 `LUNAC_THINKING` 在 spawn 时传入（`off` = 关，其余含未设置 = 开）。
 
@@ -523,27 +523,35 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 口径映射 | 平台「输入（命中缓存）」= `cache_read_input_tokens`；「输入（未命中缓存）」= `input_tokens`（DeepSeek 走自动缓存，实测 `cache_creation_input_tokens` 恒为 0，Anthropic 原生端点才有值）；「输出」= `output_tokens`；平台的「合计」= 三者之和 |
 | 粒度差 | 平台**按每次 API 请求**记一行，本地**按每次提问**记一行 —— 一次带工具的提问在平台上就是多行（system prompt + tools 前缀每次重发）。**2026-09 起这个差已被抹平**：`result.usage.requests[]` 把每次请求的明细带上，本地日志里也逐条落盘，可直接与平台逐行对账 |
 | 每次请求明细 | `result.usage.requests` = `[{in, read, create, out}]`（顺序 = 请求顺序；`in` = 该次未命中输入、`read` = 该次命中、`create` = 缓存写入、`out` = 该次输出）。agent 在每条 `message_stop` 推一条（`message_delta.output_tokens` 是**该条消息的累计值**，故用赋值而非累加）。**旧 agent 不报该字段 → 前端写空数组**；`UsageRecord.requests` 为空时**不写该键**（旧记录读时按空表） |
-| 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, sessionId?, input, output, cacheRead, cacheCreate, elided, dropped, requests?}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init`。`sessionId` = 产生这一行的 **agent 运行**（A11，见 §3.5「会话 id 与 rewind」）；**空值不写该键**，旧记录读成空串（`serde(default)`）—— 对账口径仍是 `ts` + `model`，它只做归因 |
+| **子代理 / 复盘的用量必须并入（2026-09-29）** | `run_subagent`（`Agent` 工具 / fork 技能 / 后台复盘）的每轮用量**并入** `result.usage` 的四类总量，其请求明细追加进 `requests[]` 末尾。此前它只累进自己的 `spent`（预算熔断用）而**从未上报** ⇒ **平台照收钱、本地账看不见**（实测：平台同一 key 24 次请求 vs 本地 `usage-*.jsonl` 17 次）。实现是 `Cfg.sub: Arc<SubagentUsage>`：`detached()` **共享同一本账**（并行子代理批跑的是副本，各建一份就等于只在串行路径生效 —— 有守门单测 `detached_shares_the_subagent_usage_ledger`），`run_query` 成功收尾时 `take()` 取走并归零。推入 `requests[]` 的先后由线程调度决定（并发完成），平台对账按「条数 + 合计」对齐，**不依赖顺序**。**错误路径（`finish_error`）不归并** ⇒ 被放弃那一问的子代理用量会落进下一问（量级受一问的子代理预算封顶） |
+| **四类总量里来自子代理的部分** | `result.usage.subagent = {input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, requests}` —— 它是**上面四类的子集**（已含在里面），只为**归因**（「这一问的钱有多少是子代理烧的」）。消费者**不得**把它再加一次；`usage-cost.ts` 的金额算式**只看四类总量**，一个字都没为此改。落盘 `UsageRecord.subagent`（`Option`：旧记录读成 `None`，`None` 不写回日志） |
+| 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, sessionId?, input, output, cacheRead, cacheCreate, elided, dropped, requests?, subagent?}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init`。`sessionId` = 产生这一行的 **agent 运行**（A11，见 §3.5「会话 id 与 rewind」）；**空值不写该键**，旧记录读成空串（`serde(default)`）—— 对账口径仍是 `ts` + `model`，它只做归因 |
 | 读写命令 | [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs) `append_usage_log(date, record)` / `read_usage_log(date)` / `read_usage_range(dates)`（后者一次读多天并汇总成「按天 + 按模型」，成本面板用）；`date` 只接受严格 `YYYY-MM-DD`（文件名来自前端，必须挡路径拼串）；读取时单行损坏只跳过该行 |
-| 表盘数值 | token 仪表盘 = **当前这次对话**（新建会话 / 切到别的会话即归零），提问结束实时累加；按天用量与金额改到设置面板的「用量与成本」分块（A12，读 `read_usage_range`，见 §3.5「定价表与成本面板」）。发生过压缩时，命中率 tooltip 会追加「本对话压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
+| 表盘数值 | token 仪表盘 = **当前这次对话**（新建会话 / 切到别的会话即归零），提问结束实时累加；按天用量与金额在**表盘展开面板**里（点 `#token-dashboard`，A12，读 `read_usage_range`，见 §3.5「定价表与成本面板」）。发生过压缩时，命中率 tooltip 会追加「本对话压缩 N 次瘦身 / M 条丢弃」—— **这是解释命中率的归因口径**：压缩是「断裂型」失效，其余偏低才是「自然未命中」 |
 | 计算口径 | Hit = `cacheRead`；Miss = `input + cacheCreate`（Anthropic 的 `input_tokens` **不含**缓存两项，故不能拿它减 `cache_read`）；Total = Miss + Hit + `output` |
 
-**定价表与成本面板（A12，2026-09-20）**：把「这些提问花了多少钱」从本地用量日志算出来。**价格不写进代码** —— 各家单价差十倍以上、官方还会调价，写死一个数字等于把错误金额当事实展示。实现在 [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs)（定价表 / 候选文件 / 按天汇总）+ [settings.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts)（面板与金额计算）。要点：
+**定价表与成本面板（A12，2026-09-20）**：把「这些提问花了多少钱」从本地用量日志算出来。**价格不写进代码** —— 各家单价差十倍以上、官方还会调价，写死一个数字等于把错误金额当事实展示。实现在 [storage.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/storage.rs)（定价表 / 候选文件 / 按天汇总）+ [usage-cost.ts](file:///d:/cc/claude-code-cli-master/app/src/usage-cost.ts)（**数据层 + 渲染层，表盘面板与设置面板共用一份**）+ [settings.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/settings.ts)（只剩按钮与候选确认）。要点：
 
 | 项 | 约定 |
 |---|---|
+| **界面落点（2026-09-29 定）** | **表格与价格表数据整体在表盘展开面板里**（主界面点 `#token-dashboard` → 面板在表盘上方展开）；**设置里那一节只剩**「打开价格表 / 更新价格」两个按钮与候选价格的确认 / 放弃。理由有二：① 设置面板打开着的时候看不见对话，而这些数字恰恰要在对话**进行中**看；② 面板里的东西是**数据**（价格表时间 / 未定价模型 / 候选文件路径 + 逐日表格），**不是说明文字** —— 用户原话「只是移入数据，并不是移入说明」，别把解释性文案再塞回去 |
+| **算法只许一份** | 金额、合计、格式化的唯一实现在 `usage-cost.ts`（`dayCost` / `sumUsageCost` / `fmtMoney` / `renderUsageCostTable`）。**两处宿主都 import 它，不许各写一份** —— 同预检 #39 ⑩：同一个值只写一处，否则两边会慢慢漂移成两个数 |
 | 价格表 | `<exe 根>\config\pricing.json`，**用户可编辑**（与 `ai.json` / `hooks.json` 同级）。单位**元 / 百万 token**，四类分别计价：`input`（未命中缓存的输入）/ `cache_read`（命中缓存）/ `cache_write`（缓存写入）/ `output`（输出）—— 字段名与用量日志的四类 token **一一对应** |
-| 出处必须可核 | 每个模型可带 `source_url` / `updated_at`；顶层 `updated_at` 由**宿主**在落盘那一刻盖上（表示「这份文件什么时候写进去的」，**不是**「官方什么时候调的价」）。**不预置任何价格数字** —— 本仓没有逐项核对过官方定价页，凭空填一行「看着很像」的数会被用户当事实拿去对账 |
-| 校验 | `validate_pricing_text`：顶层是对象 / `models` 是对象 / 每个模型的四类价格**齐全且为非负数字**。**缺字段也算非法**：「少一个字段」在面板上的表现是金额悄悄少算一块，比当场报错难查得多。未知字段忽略（允许用户自己加注释字段） |
-| 「更新价格」 | 面板自己**不抓**（它既没有网络也没有模型），把任务交给 agent：注入一条提示词让它用 `WebSearch` / `WebFetch` 查官方定价页，再用 `Write` 落**候选文件**；抓不到就如实报错并保留原值。安全档位为「只读」时按钮直接说明原因（`write_blocked` 会拦住 Write） |
-| 候选文件 | = **agent 工作目录**下的 `lunac-pricing.pending.json`（`effective_workdir()`，与 `start_cli_process` 同一套判据）。**刻意不放 `config\`**：配了工作区时 agent 的文件工具被硬锁在工作区内（`tools::guard()`，越界直接拒、连审批卡都没有），写 `config\` 必然失败。面板列出「旧值 → 新值」（只列变化的 + 新增 + 「确认后失去价格」）——**确认前一个字都不动正式价格** |
+| **时段价（分时价，2026-09-29）** | 模型条目可带 `time_windows`：数组，每条 `{days?, from, to, input, cache_read, cache_write, output}`。语义 = **基础四类价是缺省价（谷价），命中的那一条覆盖它**；`days` 省略 = 每天，给了就是 **ISO 周几**（1=周一 … 7=周日）；`from`/`to` 是**本地** `HH:MM`，区间 `[from, to)`，**`from` 必须早于 `to`**（跨午夜拆两条）。**列表里第一条命中的生效**（顺序即优先级）。写法与星期都必须严格：`9:00` / `days: []` / `days: [1,1]` / `from >= to` 一律判非法（这张表是拿来对账的，宁可他当场看到报错）。**官方 DeepSeek 就用这套表达**：基础价 = 谷价，`time_windows` = 周一至周五 09:00–12:00 与 14:00–18:00 的峰价（峰 = 谷 × 2） |
+| 出处必须可核 | 每个模型可带 `source_url` / `updated_at`；顶层 `updated_at` 由**宿主**在落盘那一刻盖上（表示「这份文件什么时候写进去的」，**不是**「官方什么时候调的价」）。**2026-09-29 起改为「预置但有据可核」**（用户批准，见规则 63 第一条）：`ensure_pricing_file` 在**文件不存在**时落一份 `DEFAULT_PRICING_JSON`（`deepseek-v4-flash` 的官方峰谷价，带 `source_url`），**只在文件不存在时写**，用户改过的一个字都不覆盖；没有实测依据的模型（如 pro）**不预置** —— 宁可让面板显示「未定价」 |
+| 校验 | `validate_pricing_text`：顶层是对象 / `models` 是对象 / 每个模型的四类价格**齐全且为非负数字** / `time_windows`（可选）是数组且每条同样四类齐全、时段与星期写法合法。**缺字段也算非法**：「少一个字段」在面板上的表现是金额悄悄少算一块，比当场报错难查得多。未知字段忽略（允许用户自己加注释字段） |
+| 「更新价格」 | 面板自己**不抓**（它既没有网络也没有模型），把任务交给 agent：注入一条提示词让它用 `WebSearch` / `WebFetch` 查官方定价页，再用 `Write` 落**候选文件**；抓不到就如实报错并保留原值。安全档位为「只读」时按钮直接说明原因（`write_blocked` 会拦住 Write）。**提示词里已写明**：官方页有峰谷 / 分时价时照现有 `config\pricing.json` 的 `time_windows` 写法补上（基础四类价填谷价） |
+| 候选文件 | = **agent 工作目录**下的 `lunac-pricing.pending.json`（`effective_workdir()`，与 `start_cli_process` 同一套判据）。**刻意不放 `config\`**：配了工作区时 agent 的文件工具被硬锁在工作区内（`tools::guard()`，越界直接拒、连审批卡都没有），写 `config\` 必然失败。面板列出「旧值 → 新值」（只列变化的 + 新增 + 「确认后失去价格」+ **「时段价已变更（旧条数 → 新条数）」**）——**确认前一个字都不动正式价格**。时段价那一行是必需的：只改时段价的候选若不显示，预览会变成「无变化」而用户以为点确认没影响 |
 | 确认 / 放弃 | `commit_pricing_pending(workdir, today)`：**先校验后覆盖**，校验不过**一个字都不写**；成功后盖顶层 `updated_at` 并删候选文件。「放弃」只删候选文件。写文件本身由用户点按钮触发，不经 agent |
-| 汇总粒度 | `read_usage_range(dates)` 一次读多天，返回**按天 + 按模型**（`UsageDay{date,turns,input,output,cacheRead,cacheCreate,models[]}`）。**必须分模型**：一天里换过模型的话，只按天合计就把两模型的量混在一起了（单价差十倍），算出来的钱没有意义。没有任何记录的天不返回 |
-| 金额计算 | 在**前端**算（价格表是用户随时会改的，改完即时重算，不必再跑一趟 IPC）：`(input*p.input + cacheRead*p.cache_read + cacheCreate*p.cache_write + output*p.output) / 1e6` |
-| 未定价 | 没价格的模型**只标「未定价」并单列提示，绝不当 0 计**；此时金额前缀 `≥` —— 面板显示的必须是「已知部分的合计」，不是假装准确的总数。历史记录里模型名为空（见下条）同样落进这一档 |
+| 汇总粒度 | `read_usage_range(dates, utc_offset_minutes)` 一次读多天，返回**按天 + 按模型**（`UsageDay{date,turns,input,output,cacheRead,cacheCreate,models[]}`），每个模型再带一份**按本地小时**的同一批量（`UsageModelTotals.hours[] = {hour,turns,input,output,cacheRead,cacheCreate}`，`hour` 是 0–23，只含非零桶、升序）。**必须分模型**：一天里换过模型的话，只按天合计就把两模型的量混在一起了（单价差十倍），算出来的钱没有意义。**分时价还要求分小时**：桶是**同一批 token 再切一刀**（逐桶之和恒等于总量），不做插值 —— 一次提问整条记在它 `ts` 所属的那个小时里。`utc_offset_minutes` = 本地时区偏移（东八区 **480**，前端传 `-new Date().getTimezoneOffset()`）：`ts` 是 UTC epoch，**Rust 侧没有时区库**，本地墙钟只能由调用方给。没有任何记录的天不返回 |
+| 金额计算 | 在**前端**算（价格表是用户随时会改的，改完即时重算，不必再跑一趟 IPC）。**有 `hours` 桶就逐桶算**：对每个桶取 `priceAt(价格表, 模型, 该天的星期, 桶的小时)`（基础价 + 第一条命中的时段价），再 `(input*p.input + cacheRead*p.cache_read + cacheCreate*p.cache_write + output*p.output) / 1e6` 累加；`hours` 缺失（旧宿主）才退回「总量 × 基础价」。**桶的粒度是整点**：用该小时的起点去比时段，边界都在整点时无损，写成半点最多让一小时的量按基础价算（偏保守）。星期由 `weekdayOf(day.date)` 从日期串算，与桶同属本地时区 |
+| **总计行** | 逐日表格的 `<tfoot>` 里给一行 `settings.cost_total`（问数 / 输入 / 命中 / 写入 / 输出 / 金额），与逐日行**同一套列**、同一套 `fmtTokenCount` / `amountText` 格式化。它由 `sumUsageCost()` 一次算出（**不是**在渲染时把已渲染的字符串再加一遍）。新的天数在上（先看最近几天） |
+| 未定价 | 没价格的模型**只标「未定价」并单列，绝不当 0 计**；此时金额前缀 `≥` —— 面板显示的必须是「已知部分的合计」，不是假装准确的总数。历史记录里模型名为空（见下条）同样落进这一档，但**列名字面必须与「值缺失」区分开**：空模型名显示成 `settings.cost_model_unknown`（「未记录模型名」），**不许**走 `modelLabel` 而渲染成 `—` —— 那会写成「未定价：—」，读起来正好是反的 |
 | 区间 | 默认近 **30** 天。日期列表由前端按**本地日期**算好传给宿主（`YYYY-MM-DD`，与 `append_usage_log` 同一套：Rust 侧没有 chrono） |
-| `model` 字段 | 用量日志的 `model` 取自 `system/init`（见上表）。**2026-09-20 之前它一直是空串**：前端声明了 `agentModel` 却没在 init 分支赋值 ⇒ 历史记录没有模型名（面板显示 `—` 并计入未定价），本次一并修好 —— 分模型计价是这个面板成立的前提 |
+| `model` 字段 | 用量日志的 `model` 取自 `system/init`（见上表）。**2026-09-20 之前它一直是空串**：前端声明了 `agentModel` 却没在 init 分支赋值 ⇒ 历史记录没有模型名（面板显示「未记录模型名」并计入未定价），本次一并修好 —— 分模型计价是这个面板成立的前提 |
 | 实测（2026-09-20） | 宿主侧：`cargo test`（`usage_range_groups_by_day_and_model` / `pricing_candidate_is_validated_before_commit`）+ 拿**真实日志**跑一次 `read_usage_range`（2026-09-17 / 09-18：按天分片、四类 token 汇总与分组均正确）。agent 侧真机（`core-agent\target\hooktest\e2e-a12.ps1`，5 条断言全过）：工作区锁开着时，写**工作目录内**的候选文件成功（按 JSON 读回，`input=2`），写**工作目录外**被拒（`Access denied: … outside the workspace`）—— 候选文件放工作目录的理由由实测坐实 |
+| 实测（2026-09-29，表盘展开面板） | `npx tsc --noEmit` = 0；dev 实例（9222）CDP 探针在**干净 reload 后**实测主窗：点 `#token-dashboard` → `#token-usage-panel` 的 `hidden` 摘掉、`#token-dashboard` 加 `expanded`、`panel.style.bottom = 34px`（状态栏实测高 28 + 6），面板里 `table.cost-table` + `tr.cost-total-row` 都在、5 个逐日行，总计行文案 `合计 73 2.4k 2.39M 0 80.4k ≥ ¥0.35`；再点一次收起（`hidden` 回来、`expanded` 摘掉）。**探针必须在 reload 之后跑**：HMR 重跑 `main.ts` 会叠加 `#token-dashboard` 的 click 监听器，一次点击被 toggle 两次 ⇒ 面板看着「没打开」（dev-only 假象，不是代码问题） |
+| **对账基线（2026-09-29）** | 工具 = [reconcile-usage.ps1](file:///d:/cc/claude-code-cli-master/scripts/reconcile-usage.ps1)（唯一落点，别再往别处抄一份对账算法）。它把本地 `usage-*.jsonl` 按**本地小时**（`ts` + `-UtcOffsetMinutes`，默认 **480**）聚合四类 token，再用 `pricing.json` **逐桶**计价（`priceAt` 口径：基础价 + 第一条命中的时段价），打印逐小时表 + 合计；给 `-Csv <平台导出>` 时做逐小时对照 —— 表头**模糊识别**（时间列与金额列**必需**，四类 token 列能认多少认多少），**认不出就打印实际表头并 `exit 2`**（不许静默当空数据），金额差绝对值 > `0.0001` 元标 `DIFF`（`exit 1`）。**本地账的精度上限**：一行只带**开始时刻** `ts`，跨小时边界的提问会被整条算进开始时那一小时（≤1 小时归属偏移）；脚本会把这句话印在表下面，不要把它当成分钟级证据。**已实测**：`2026-09-29` 的 14:00 桶 = **0.07521104 元**，与手工核算（`8402*2 + 66176*0.04 + 6970*8`）逐位一致；合成 CSV 对照 0 差异（`exit 0`）、改掉一行 0.01 元 ⇒ 一行 `DIFF`（`exit 1`）、乱写表头 ⇒ `exit 2`。**跨源基线（本地 vs 平台）待用户提供平台导出的 CSV** —— 本仓不存供应商账单 |
 
 **会话 id 与 rewind（A11，2026-09-20）**：`session_id` 从恒为 `""` 改成**真值**，回退点从「用户轮」扩到**任意消息**。规则清单见 §11 规则 64，这里是形态与实测。
 
@@ -707,7 +715,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 坏包必须可见 | 清单坏了、入口丢了的包**不进 registry**（用不了），但**必须列在面板上并写出原因** —— 否则用户只会看到插件莫名消失、手上没有任何线索。`list_installed_plugins` 因此返回 `valid` + `error` 两个字段 |
 | **索引 = 「去哪下」的清单**（2026-09-21 二次改版加的；2026-09-28 换到独立公开仓库） | 面板要能列出「**没装但可以装**」的插件，而本地扫描只看得见「已经装了的」。索引与插件包都在**公开仓库 `LythrumMoon/lunac-plugins`**：`main/index.json`（顶层是**数组**，一条 = `{ id, name, description, version, url, keywords?, icon?, homepage? }`；`url` 是 https 的插件 zip 直链，形如 `https://raw.githubusercontent.com/LythrumMoon/lunac-plugins/main/packages/<id>-<ver>.zip`）。地址是 **Rust 常量** `plugin_market::INDEX_URL`，**不由前端传**。**为什么必须公开**：主仓库 `LythrumMoon/Lunac` 是私有的，而 raw/Release 对私有仓库要鉴权 ⇒ 终端用户**永远拉不到**，索引与包都是死的（2026-09-28 查出来的既有缺陷）。发布链路：`scripts\build-plugins.ps1`（vite 库模式出单文件 ESM + 生成清单 + 打 zip）→ `scripts\publish-plugins.ps1`（拷进插件仓库的 `packages\`、生成 `index.json`、commit + push）。**主仓库里的 `plugins/index.json` 已删除** —— 索引只有一份，别留第二个真相源 |
 | 索引**由宿主去拉**，且**逐条再筛一遍** | 两条理由：① 前端 CSP 的 `default-src` 不含 github 域（没写 `connect-src` ⇒ 回落 default-src），前端 `fetch()` 会被直接拦掉；② 索引是**远端可改的文本**，谁写索引谁就影响了「前端能下什么」⇒ 必须按插件包的口径重新校验：`id` 过 `is_safe_id()`（它将来是目录名）、`url` 必须 `https://`、`name` 不能空。判据收口在纯函数 **`parse_index()`**（两条单测），坏条目**只丢自己**（`warn` 留痕）而不是丢整份索引 —— 这与「坏包必须可见」是两条不同的处置：那边是用户**已经装在盘上**的东西，消失了他找不到 |
-| 索引的传输闸 | 与插件包同一套：**只 https**、体积上限（`MAX_INDEX_BYTES` = 1 MB，Content-Length 先拦 + 按真实读到的字节再拦）、条目数上限（`MAX_INDEX_ENTRIES` = 500）；拉不到就**只提示一行**，市场退回「只有本机插件」的形态（等于这个功能不存在时的样子），**不静默变成空表**。**⚠️ 已知缺陷（2026-09-29 实测，未改）**：这条用的是 reqwest **30s** 超时，而插件包那条是 120s —— 在到 `raw.githubusercontent.com` 很慢的网络上（本机实测索引单次 19–30s、包体 235s），**索引三次全失败、包却能装上**，用户看到的是「市场列表只有一行错误、但手工下载能用」。要么把这条超时提到与包体同档，要么给索引加直链兜底（`cdn.jsdelivr.net`） |
+| 索引的传输闸 | 与插件包同一套：**只 https**、体积上限（`MAX_INDEX_BYTES` = 1 MB，Content-Length 先拦 + 按真实读到的字节再拦）、条目数上限（`MAX_INDEX_ENTRIES` = 500）；拉不到就**只提示一行**，市场退回「只有本机插件」的形态（等于这个功能不存在时的样子），**不静默变成空表**。**⚠️ 缺陷与加固（2026-09-29，已按用户决定修）**：这条原先用 reqwest **30s** 超时，而插件包那条是 120s。同一台机器同一 URL 的实测结论是**抖动极大**：同一轮会话里索引**三次全失败**（19.2s / 19.4s / 30.0s），换个时间点再测**961ms 就成功**（拿到 1 条 `music 0.9.6`）⇒ 慢的是**建连、不是正文**（索引只有几百字节），30s 对首字节太紧，而这条一旦失败用户看到的是「市场列表只剩一行错误」—— 已**把超时提到与包体同档的 120s**（`commands.rs::fetch_plugin_index_blocking`）。**没做**的是「加直链兜底（`cdn.jsdelivr.net`）」—— 该选项被否（不值得为此多挂一条外部 CDN 依赖） |
 | 界面形态（2026-09-21 二次改版；2026-09-28 加「更新 / 重新扫描 / 依赖条数」） | 插件面板**只有一段**「插件市场」，一张表一行一个插件，按钮由**本机事实**（`pluginRegistry` + 插件目录扫描）决定，**不是索引自称的**：已装且能用 ⇒ 「打开」（第三方多一个两段式确认的「卸载」；内置编译进 bundle，没有目录、没得卸）；**已装而索引里版本不同 ⇒ 多一个「更新」**（同 id 重装 = 升级，走的就是那条安装命令 —— 版本号只做「不同即视为有新版」，**不猜大小**：索引版本是作者写的自由文本）；装了但包坏了 ⇒ 原因 + 「卸载」；没装而索引里有 ⇒ 「下载」。行内还会标出**依赖条数**（「安装时会一并下载 N 项依赖」）。表尾有**「重新扫描」**按钮（给「文件已经写进 `Modules\`」用，见生效语义那条）。合并顺序**固定**：已装（registry 顺序照旧）→ 坏包 → 索引里还没装的。**下载与手工安装是同一条**宿主命令 `install_plugin_from_url` —— 索引只提供 URL，别在前端另开一条 |
 | 面板取数**不在构建期** | 表格字符串（`buildPluginsPane`）是**整块设置面板**的一部分，而索引要走网络（差网络下能拖到超时）⇒ 那里一旦 `await`，**打开设置**就跟着卡住。所以列表在**挂载后**由 `renderMarket()` 填，且**先本机、后索引**两段画：本机扫描是毫秒级的，不该被一份可有可无的推荐清单拖住 |
 | 事件绑定用**委托**（只在挂载时绑一次） | 这三个按钮过去是「重绘完再逐个 `addEventListener`」，而挂载时没人调那次 render ⇒ **初始渲染出来的按钮全是死的**（2026-09-21 用户报的「卸载点了没反应」就是这个根因）。改成在列表容器上委托后，重绘只改 `innerHTML`、监听永不丢 —— 这一类 bug 从此不存在。**新加的按钮一律并入这份委托，不要在重绘路径里重新绑**。「重新扫描」按钮在**列表外面**（列表整块重绘，按钮不该跟着被换掉）⇒ 它的委托挂在**设置容器**上（2026-09-28）。 |
@@ -715,9 +723,17 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 实测（2026-09-21） | `cargo test --bins` src-tauri **73 passed / 0 failed / 1 ignored**（其中 `plugin_market` **9 条**：越界路径被拒 / zip bomb 被拦 / 正常往返 + 同 id 拒绝 + 入口缺失拒绝且不留 staging 残渣 / 接受 GitHub 的单层顶层目录 / 坏包如实上报 / 清单与 entry 校验 / BOM 容错 / **索引逐条筛（坏 id、明文 http、空名字、重复 id 各丢自己）/ 索引非 JSON 报错且接受 BOM 与空表**；`appearance` 增 **1 条**：**随包发货的主题包逐项校验**（清单能解析 + 声明的背景 / 花纹 / 图标真在盘上；2026-09-21 删掉魅魔包后只断言 `default`，`succubus` 那两条断言一并删除））、`tsc --noEmit` exit 0、`npm run build` exit 0 |
 | 实测（2026-09-28，目录改名 + 依赖 + 自建插件这一批） | `cargo test --bins plugin_market` **12 passed / 0 failed**（原 9 条 + 新增 3 条：**依赖字段逐条校验**（明文 http / dest 越界 / 缺 dest / npm 缺包名 / npm 包名带 `--` 注入 / 未知 type 各拒）/ **旧 `plugins\` 一次性搬到 `Modules\`**（同名冲突保留新的、幂等）/ **依赖 dest 越界在写盘前就被拦**）；原「同 id 拒绝」那条改为「**升级覆盖 + 入口缺失时旧版原样保留且无残渣**」；`cargo check --bins` exit 0、`npx tsc --noEmit` exit 0。界面侧的「更新 / 重新扫描 / 依赖条数」与磁盘插件的 `attach` 约定**尚未做实机回归**（本轮只做了编译与单测）。 |
 | 实测（2026-09-28 晚，依赖落地的第一批：librespot） | librespot 0.8.0 用 `cargo install librespot --version 0.8.0 --locked --root release\deps\librespot` 构建成功（3m16s；`librespot.exe` 36637180 字节，`--version` 自报 `librespot 0.8.0`）；产物挂成公开仓库 `LythrumMoon/lunac-plugins` 的 Release 资产（tag `librespot-0.8.0`）—— **免鉴权** HEAD 200 + `application/octet-stream` + 36637180 字节，下载回来的 sha256 与本地 `Get-FileHash`、与 GitHub 自报的 `digest` **三者一致**。重打的 `music-0.9.6.zip`（16811 字节，sha256 `06abd4b2…38d6`）与线上下载的字节**完全相同**，`index.json` HTTP 200。同时修掉一个静默洞：**独立打包的 music 包没有可调用的 `execute`**（源码只导具名 `musicPlugin`，内置构建看不出来）⇒ 补 `export default musicPlugin;`。`npx tsc --noEmit` exit 0、`cargo check --bins` exit 0（19 条既有 warning）。**「市场里装音乐 + 磁盘插件 `attach` 生效 + 依赖真的落进 `Modules\music\bin\`」仍未做实机回归。** |
-| 实测（2026-09-29，dev 实例 + CDP 探针把上面那条补上了） | 上一轮列的「仍未做实机回归」**这次全跑通了**（探针：`node` 直连 9222 的 CDP，表达式写成文件、`Runtime.evaluate` 求值；`%TEMP%` 下两个一次性文件，不进仓库）。逐条：① **依赖真的落盘** —— `install_plugin_from_url` 端到端成功（`Modules\music\` 里有 `index.js` / `lunac-plugin.json` / **`bin\librespot.exe` 36637180 字节**，sha256 `7509c74b…4c1a`，与公开 Release 资产**逐字节一致**）；② **`find_librespot()` 新增的那条兜底生效** —— 把配置里指的 exe 临时改名后，`librespot_status` 回报的 path 变成 `…\target\debug\Modules\music\bin\librespot.exe`（验完原样还原）；③ **磁盘插件优先是真的** —— 音乐窗（`plugin.html`）的资源列表里只有 `asset.localhost/…/Modules/music/index.js`，那个模块导出 `attach` / `detach` / `default.execute` 齐全；④ **面板**：11 个内置插件只有「打开」，从市场装进来的 music 那一行多出**「卸载」**（判据就是「盘上有没有 `Modules\<id>\`」—— 这也解释了「内置插件为什么没有卸载按钮」，不是 bug），行内还标出「安装时会一并下载 1 项依赖」。**新发现的缺陷（未改）**：`fetch_plugin_index` 的 30s 超时在慢网下不够 —— 同一台机器同一个 URL，走索引那条**三次全失败**（19.2s / 19.4s / 30.0s），走 `install_plugin_from_url`（120s 超时）**21.3s 就成功**；插件包那条更是耗时 **235 秒**。现网表现就是「市场列表拉不出来（只有一行错误），但手工下载能用」。**另一件事故**：一次批量重存把这 4 个脚本（`build-plugins.ps1` / `lunac-installer.nsi` / `publish-plugins.ps1` / `build-release.ps1`）各写成 **4 份 BOM**，而自检旧判据只认「第 4 字节是不是 EF」⇒ 报的是「有两份」（数字不对）—— 已按 1 份归一化（`git checkout` 恢复后确认字节数与 `Parser::ParseFile` 均正常），并把自检改成**数全部 BOM + 写明份数**（造一个 4 份 BOM 的文件做反向验证，确认报「**4 份**」并阻断）。`npx tsc --noEmit` exit 0、`npm run verify` 8/8（唯一提醒是 5173 被 dev 实例占用）。 |
+| 实测（2026-09-29，dev 实例 + CDP 探针把上面那条补上了） | 上一轮列的「仍未做实机回归」**这次全跑通了**（探针：`node` 直连 9222 的 CDP，表达式写成文件、`Runtime.evaluate` 求值；`%TEMP%` 下两个一次性文件，不进仓库）。逐条：① **依赖真的落盘** —— `install_plugin_from_url` 端到端成功（`Modules\music\` 里有 `index.js` / `lunac-plugin.json` / **`bin\librespot.exe` 36637180 字节**，sha256 `7509c74b…4c1a`，与公开 Release 资产**逐字节一致**）；② **`find_librespot()` 新增的那条兜底生效** —— 把配置里指的 exe 临时改名后，`librespot_status` 回报的 path 变成 `…\target\debug\Modules\music\bin\librespot.exe`（验完原样还原）；③ **磁盘插件优先是真的** —— 音乐窗（`plugin.html`）的资源列表里只有 `asset.localhost/…/Modules/music/index.js`，那个模块导出 `attach` / `detach` / `default.execute` 齐全；④ **面板**：11 个内置插件只有「打开」，从市场装进来的 music 那一行多出**「卸载」**（判据就是「盘上有没有 `Modules\<id>\`」—— 这也解释了「内置插件为什么没有卸载按钮」，不是 bug），行内还标出「安装时会一并下载 1 项依赖」。**新发现的缺陷（同日已修）**：`fetch_plugin_index` 那条链路**抖动极大** —— 同一台机器同一个 URL，同一轮里**三次全失败**（19.2s / 19.4s / 30.0s），而走 `install_plugin_from_url`（120s 超时）**21.3s 就成功**、包体耗时 **235 秒**；但**当天稍后复测只用 961ms 就成功**（1 条 `music 0.9.6`）⇒ 慢的是**建连、不是正文**，30s 对首字节太紧。现网表现是「市场列表偶发拉不出来（只剩一行错误），但手工下载能用」。**按用户决定已修**：索引超时从 30s 提到**与包体同档的 120s**（`commands.rs::fetch_plugin_index_blocking`）；「加 `cdn.jsdelivr.net` 直链兜底」这一选项被否（不值得多挂一条外部 CDN）。**同日第二次实机回归（用户重启 dev 实例后）**：面板三类改动逐条对上 —— ① 提示区第一行是「插件是 Lunac 专用的拓展功能模块。」，正文里搜不到「已安装的直接」（整行已删）；② 11 行内置只有「打开」，`音乐歌词 · v0.9.6` 那行带**「卸载」**；③ 音乐窗资源仍是 `asset.localhost/…/Modules/music/index.js`，导出 `attach` / `detach` / `default.execute` 齐全（磁盘优先复现）；盘上 `bin\librespot.exe` 36637180 字节、sha256 与清单声明**逐字节一致**（13:51:19 落包、13:51:30 落依赖）。**另一件事故**：一次批量重存把这 4 个脚本（`build-plugins.ps1` / `lunac-installer.nsi` / `publish-plugins.ps1` / `build-release.ps1`）各写成 **4 份 BOM**，而自检旧判据只认「第 4 字节是不是 EF」⇒ 报的是「有两份」（数字不对）—— 已按 1 份归一化（`git checkout` 恢复后确认字节数与 `Parser::ParseFile` 均正常），并把自检改成**数全部 BOM + 写明份数**（造一个 4 份 BOM 的文件做反向验证，确认报「**4 份**」并阻断）。`npx tsc --noEmit` exit 0、`npm run verify` 8/8（唯一提醒是 5173 被 dev 实例占用）。 |
+| **事故与实测（2026-09-29，「OCR 插件凭空消失」）** | **症状**：用户报「好像丢失了 OCR 插件」。**根因不在代码，在发布链路漏了一步**：当天把 4 个拓展插件（`ocr` / `clipboard-history` / `convert` / `music`）从 bundle 摘出（`builtin/index.ts` 只注册 `BASE_PLUGIN_IDS`），但**市场索引还停在 2026-09-28 那一份**（只有 1 条 `music`）⇒ OCR **既不在 bundle（已摘出）、也不在市场（索引里没有）**，在真机上等于凭空消失。**证据链**（逐条可核）：线上 `index.json` 只有 `music` 一条；`gh api …/contents/packages` 只有 `music-0.9.6.zip`（另三个包从没推上去过）；本机 `app\plugin-dist\ocr\` 与 `release\plugin-packages\ocr-0.9.6.zip` **一直是好的**（18:43 就建成了）—— 所以「丢」的不是产物，是**分发**；dev 实例 `target\debug\Modules\` 里同样只有 `clipboard-history` / `convert` / `music`（那三个先前装过）。**处置**：重跑 `scripts\build-plugins.ps1`（4 个包 + 清单 + zip + `release\ext-plugins\` 暂存）→ `scripts\publish-plugins.ps1`（拷包、生成 **4 条**索引、commit `5785685`、push 到 `LythrumMoon/lunac-plugins`）。**实机回归（走真实入口，非手工解压）**：设置 → 插件 → 市场里 `ocr` 那行是「**下载**」⇒ 点它 ⇒ 状态行「**插件 ocr 已安装，立即可用**」⇒ 该行按钮变「**卸载**」⇒ `Modules\ocr\` 落盘 `index.js`（10470 字节）+ `lunac-plugin.json`（737 字节）⇒ `__lunac_open_plugin("ocr")` 打开接管型面板（`searchBar` 带 `plugin-locked`；`ocr-image-preview` / `ocr-clipboard-btn` / `ocr-file-btn` / `ocr-status-line` / `ocr-copy-btn` / `ocr-result` 六个节点齐）⇒ **`layout.takeover` 那条「插件自己声明能力、宿主不按 id 写死」的通道成立**。**要记住的两条**：① `build-plugins.ps1`（产 zip）与 `publish-plugins.ps1`（发市场）是**两步、后者不自动** —— 摘插件的那次改动必须**同一批把索引发出去**，否则用户看到的是「插件凭空消失」而不是「还没发」（已写成预检 #43）；② 用户端 `raw.githubusercontent.com` 有 CDN 缓存，索引 push 完**不是立刻可见**（本机实测约 1 分钟，其间 `index.json` 仍只有 1 条）—— 验收前先 `Invoke-WebRequest` 确认能看到新条目。另外，探针第一次跑时 `fetch_plugin_index` 报了 `Download failed: error sending request`（见上一行的抖动记录）——**重试即成功**，与系统代理 `127.0.0.1:7892` 无关（`curl -x` 走它 0.7s 通、直连 5/5 通）。 |
 
+| **实测（2026-09-29，宿主侧两个前置：鼠标穿透 + 「可见吗」下发）** | **背景**：给 backlog **L1 桌宠**铺路。桌宠的两条实测见 [architecture-rendering.md](./architecture-rendering.md) §6.2，本轮只补**宿主侧**缺的那两件（用户 2026-09-29 选的走法）——契约与实现理由写进 §4.8。① **`plugin_window_set_click_through(ignore)`**（新命令）：**收成宿主命令而不是放开 `core:window:allow-set-ignore-cursor-events`** —— 后者按窗口授，而 `capabilities` 的 `windows` 含 `main`，主窗口一旦被穿**就再也点不回来**（只能杀进程）。② **`plugin-window-visibility` `{visible}`**（新事件）：`WindowEvent::Resized`（tao 把 `WM_SIZE` 含 `SIZE_MINIMIZED` 统一发成它）+ `open()` 复用路径（`show()` 不产生 `WM_SIZE`）两处触发，`LAST_VISIBLE` 记账、**只在翻转时发**。**验证**：`cargo check --bins` exit 0（19 条既有 warning，**无新增**）；`cargo test --bins` **103 passed / 0 failed / 1 ignored**（含新增 `plugin_window::tests::visibility_event_fires_only_on_flip`）。**实机**（dev 0.9.6，CDP 探针 + `user32` 取证）：穿透前 `exStyle=0x40118`、`WindowFromPoint` 命中插件窗自己（root 的 class = `Tauri Window`、title = `memo`）；调命令回 `true` 后 `exStyle=0xC0138`（`WS_EX_TRANSPARENT\|WS_EX_LAYERED`）、**同一点命中它下面的 Chrome 窗口**；关掉后 exStyle 与命中点**全部复原**；主窗口调该命令回 `ERR_NOT_PLUGIN_WINDOW`；穿透开/关两次窗口截图 mean \|dRGB\| = **3.64**（渲染未被穿透破坏）。可见性事件：插件窗订阅后跑两轮「最小化 → 还原」，恰好收到 `false,true,false,true` **四条**（中间那些 `Resized` 没被转发）。⚠️ 跑 `cargo test` 前**必须先停掉 dev 实例** —— 运行中的 `lunac.exe` 锁着 `target\debug`，`tauri-build` 会以 `os error 32` 失败（不是代码错）。 |
+
+| **实测（2026-09-29，桌宠 L1 前半程：清单声明窗口形态 + 桌宠插件本体）** | **背景**：上一行把宿主侧两个前置做完了，这一轮做**桌宠插件本体**。**新增**：清单 `window` 段（见 §4.8「窗口形态由插件清单声明」）、`plugin-window-visibility` 载荷补 `label`、`plugin_window_init` 回 `chrome`、`styles.css` 的 `html.no-chrome`、插件 `Modules\pet\`（源码 `app/src/plugins/builtin/pet.ts`，进 `vite.plugins.config.ts` 的 `pluginEntries` 与 `build-plugins.ps1` 的元数据表，并加进 `main.ts` 的 `FLOATABLE_PLUGINS`）。**编译与单测**：`cargo check --bins` exit 0（19 条既有 warning，无新增）；`cargo test --bins` **107 passed / 0 failed / 1 ignored**（上一轮 103 ⇒ +4：`manifest_validates_window_shape` / `declared_window_shape_overrides_defaults` / `partial_window_shape_keeps_the_other_side_at_default` / `min_size_never_exceeds_default_size`）；`npx tsc --noEmit` exit 0；`npm run verify` **8/8（0 项提醒）**。**实机**（dev 0.9.6，CDP 探针 + `user32` + UI Automation）：清单形态**逐项生效** —— 窗实测 **300×400**（清单值）、`#plugin-titlebar` 的 `display:none`（`chrome:false`）、`html` 的 class = `no-chrome`、`#results-container::before` 的 `display:none`、`body` 背景 `rgba(0,0,0,0)`；`GWL_STYLE` 无 `WS_THICKFRAME`（**禁缩放生效**，主窗口同项有）；`GWL_EXSTYLE` 含 `WS_EX_TOPMOST`（置顶）；**任务栏对照**：只开桌宠窗时任务栏无 Lunac 条目，开一个没声明 `window` 段的窗（音乐）立刻出现 `Lunac - 1 个运行窗口`（⚠️ **不能看 `WS_EX_APPWINDOW`**，那条永远在，见 §4.8）；**透明性**（同矩形前后对照）内容整块藏起时 `504 种色 / 最大单色 92.4%`、最小化后同矩形 `486 种 / 92.7%`。**导入通道**：`localStorage` 里写一个绝对路径 → 图片经 `convertFileSrc` 载入成功（`naturalWidth/Height = 256`）。**可见性停摆**：可见时 `transform` 两次采样不同（呼吸动画在跑），**最小化后两次采样完全相同**（rAF 已停），再从主窗口 `open_plugin_window` 拉回来**立刻恢复**。**控制台 → 桌宠窗**：控制台勾选「鼠标穿透」→ 桌宠窗 `exStyle` `0x40118 → 0xC0138`，取消勾选复原。**顺带修一处**：`executePlugin` 的插件栏标题原来写 `pluginName(plugin.id)`（无兜底）⇒ 宿主词典里没有的插件**把原始 id 当标题显示**（桌宠显示成 `pet`），改成 `pluginName(plugin.id, plugin.name)` 后实测显示 `桌宠`。**踩到的坑**：文本替换改 `scripts\build-plugins.ps1` 会**把 BOM 抹掉**，PS 5.1 立刻按 GBK 解码、在首个中文行报解析错（`npm run verify` 第 ⑧ 节能查出来，已补进 §6 的编码纪律）。**仍未做**：Live2D 引擎（见 backlog L1 的两条硬障碍）。 |
 **构建**：`powershell -ExecutionPolicy Bypass -File scripts\build-core.ps1`（等价 `cd core-agent; cargo build --release`）→ `core-agent\target\release\agent.exe`，约 2.5MB（P1 引入 glob/regex 后从 1.5MB 增长）。打包链路（**实际生效的那条**）：`build-release.ps1` **[6/9]** 步把 `lunac.exe` + `agent.exe` + `WebView2Loader.dll` 拷进暂存目录 `release\Lunac\`，再由 `release\lunac-installer.nsi` 的 `File` 指令打进安装包。注意两点：①脚本走的是 `cargo build --release` + 手写 NSI，**不跑 `tauri build`**，所以 `tauri.conf.json` 的 `bundle.resources` 在本流程里并不生效（它只在 Tauri 自带打包器下起作用，别把它当打包依据）；②**[4/9]** 步必须在 Rust 构建之前跑，因为同一步的产物 `agent.exe` 是 **[6/9]** 步要拷的文件。
+
+| **实测（2026-09-29，成本归因第一刀：子代理 / 复盘用量并入 `result.usage`）** | **背景**：backlog **L6** 的第一刀，归因见 §9.1 难点 3。**改动**：`core-agent` 新增 `SubagentUsage`（原子量 + 明细 `Mutex`）并挂在 `Cfg.sub: Arc<…>` 上，`run_subagent` 每轮 `record()`；`detached()` **克隆同一个 `Arc`**（并行子代理批跑的是副本，各建一份就只在串行路径生效）；`run_query` 成功收尾时 `take()` 取走并归零，并入四类总量 + `requests[]`，另**额外上报** `usage.subagent`（**四类总量的子集**，只作归因）；宿主 `UsageRecord.subagent: Option<UsageSubagent>`；前端 `ChatDoneInfo.subagent` + `parseSubagentUsage()`；**`usage-cost.ts` 的金额算式一个字没动**（避免重复计费）。**编译与单测**：`cargo test`（core-agent）**107 passed / 0 failed / 2 ignored**（+2：`subagent_usage_accumulates_and_take_resets` / `detached_shares_the_subagent_usage_ledger`）；`cargo test --bins`（宿主）**108 passed / 0 failed / 1 ignored**（+1：`usage_record_subagent_attribution_is_optional`；同时核过 `usage_record_json_shape` 的**逐字节期望串没被新字段破坏** —— `None` 不写键）；`npx tsc --noEmit` exit 0。**真机**（`core-agent\target\hooktest\e2e-ab-thinking.ps1`，真实端点 flash）：① **子代理链路端到端通过**（`Agent` 工具真的派了一次子代理）—— `turns=2` 而 **`requests=4`**（主 2 + 子代理 2），`subagent: requests=2 in=2448 read=2048 out=179`，答案 `4` 正确；**修好前这一问只会报 2 次请求**；② 顺带量出思考档 A/B（三组，数据见 §9.1 难点 3 结论 6）。**踩到的坑**：用 PS 5.1 驱动 `agent.exe` 时**不要走 .NET 的 `Process.StandardInput`** —— 本机 `Console.InputEncoding` 是带 BOM 的 UTF-8，那 3 字节前导会落在子进程 stdin 头部，而 agent 的读取端只做 `line.trim()`（BOM 不是 Rust 的空白字符）⇒ 每轮报 `忽略非法 JSON 输入行: expected value at line 1 column 1`；`ProcessStartInfo.StandardInputEncoding` 在 .NET Framework 上**不存在**，直接写 `BaseStream`（哪怕用 `Encoding.ASCII`）**也照样带 BOM**（`_probe-stdin.ps1` 三种写法实测均以 `efbbbf` 开头）⇒ 正解 = `cmd /c … < q.json` 喂**无 BOM 文件**且 `RedirectStandardInput = $false`。**仍未做**：面板金额与平台账单的逐小时对账（要等价格表支持分时价，见 L6 第 1 条）。 |
+
+| **实测（2026-09-29，L6① 价格表支持时段价 + 预置官方峰谷价）** | **背景**：backlog **L6** 第 ① 条。归因见 §9.1 难点 3 结论 1 —— 那两档价是 DeepSeek 的**官方峰谷定价**（工作日 09:00–12:00 + 14:00–18:00 峰、其余含周末谷、谷 = 峰 ÷ 2），不是「临时调价」。**改动**：① `pricing.json` 支持 `time_windows`（每条 `{days?, from, to, 四类价}`；**基础四类价 = 缺省（谷）价**，第一条命中的时段覆盖它）；② `validate_pricing_text` 加**严格**时段/星期校验（`9:00` / `from >= to` / `days: []` / `days: [1,1]` / `days: [0]` / `days: [8]` / 时段缺字段 全部判非法）；③ `ensure_pricing_file` 从「空骨架」改成**预置** `DEFAULT_PRICING_JSON`（`deepseek-v4-flash` 官方峰谷价，**只在文件不存在时写**，用户改过的一个字都不覆盖 —— 规则 63 第一条当天按用户批准由「不预置」修订为「预置但有据可核」）；④ `read_usage_range(dates, utc_offset_minutes)` 新增**按本地小时**的桶（`models[].hours[]` = 同一批 token 再切一刀，逐桶之和恒等于总量）；⑤ 前端 `priceAt()` / `weekdayOf()` / `dayCost()` 逐桶计价（`hours` 缺失才退回总量法），`usage-cost.ts` 仍是**唯一**的算法实现（规则 63「算法只许一份」不变）；⑥ 候选预览加「时段价已变更（旧条数 → 新条数）」—— 只改时段价的候选否则会显示成「无变化」；⑦「更新价格」提示词（5 语言）补上「官方页有峰谷价时照 `time_windows` 写法补」。**编译与单测**：`cargo test --bins` **110 passed / 0 failed / 1 ignored**（+2：`usage_range_buckets_by_local_hour` —— 同一份记录用偏移 0 与 480 各跑一次，钉住「偏移真的参与换算」且逐桶之和 == 总量；`default_pricing_json_is_valid` —— 预置表自身合法 + 谷价在基础位、峰价在窗口位、峰 = 谷 × 2、`days` 是 5 天）；`pricing_candidate_is_validated_before_commit` 非法样例 +9 条、新增一条合法时段价样例；`npx tsc --noEmit` = 0。**前端计价用真源码验证**（本仓没有前端测试框架 ⇒ 用 esbuild 把 `app/src/usage-cost.ts` 打成 ESM、把 tauri/i18n 两个 import 换成 stub，再跑断言 —— **17 条全过**）：周二 10/14 点命中峰价、13/18/22 点与周六/周日走谷价、未定价仍 `null`、`weekdayOf("2026-09-29") == 2`；**与账单逐分对账** —— 本地记录 1（`ts=1790662817758` = 北京周二 14:20 峰时，`in=8402 / read=66176 / out=6970`）算出 **0.07521104 元**，与平台 CSV 该窗口的金额**完全相同**；同一批 token 放谷时窗口**只有一半**（旧单档口径因此高估 2 倍）。**dev 环境实测**：2026-09-29 那天，分时口径 **0.136858 元**（峰 0.075211 + 谷 0.061647）vs 旧单档口径 **0.198505 元** ⇒ **面板原本高估 45%**；`target\debug\config\pricing.json` 已按新格式更新为峰谷价。**未做**：重启 dev 后看面板实际渲染的数字（`read_usage_range` 多了一个参数，**旧宿主会忽略它**、面板安静退回单档口径而**不报错** —— 所以不重启也看不出坏，只是数字还是旧的）。 |
 
 ### 3.6 数学公式渲染
 
@@ -766,7 +782,7 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
 
 **C. 消息流交互细节**
 - 流式文本带右侧光标闪烁指示；发送后输入框立即清空。
-- 状态栏展示：就绪/运行中/AI·模式/热键提示/token 仪表盘（恒为真实计费口径：Hit=缓存读、Miss=输入+缓存写、Total=四类之和；数值为**今日累计**，取自本地用量日志）。
+- 状态栏展示：就绪/运行中/AI·模式/热键提示/token 仪表盘（恒为真实计费口径：Hit=缓存读、Miss=输入+缓存写、Total=四类之和；数值为**当前这次对话**的累计，与 §3.5「用量与对账」同一口径）。**点表盘**（`#token-dashboard`，有对话时才可点）在其上方展开 `#token-usage-panel`：近 30 天逐日用量与金额（含总计行）+ 价格表状态（见 §3.5「定价表与成本面板」）。
 - 代码块、公式（KaTeX）保留渲染；错误消息统一前缀 `⚠`。
 
 **D. VSCode 插件 = Trae 右侧 AI 窗口形态**
@@ -851,6 +867,50 @@ searchInput (总端口)
 
 ### 4.5 插件清单（前端）
 
+**分类是硬约束**（2026-09-29 用户定）：插件分**基础**与**拓展**两类，判据的唯一真相源是
+[app/src/plugins/kinds.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/kinds.ts) 的
+`BASE_PLUGIN_IDS` —— 前端任何地方判「是不是基础插件」都必须调它，不许各自再抄一份名单。
+
+| 分类 | 名单 | 随安装包 | 能装 / 能卸 | 代码在哪 |
+|---|---|---|---|---|
+| **基础** | quick-launch / settings / web-search / ai-agent / memo / **translate** | ✅ 一定装 | ❌ 都不行（市场上只有「打开」） | 编译进 bundle（`builtin/index.ts` 静态 import） |
+| **拓展** | clipboard-history / ocr / music / convert（**今后新增的默认都按拓展处理**） | ❌ 默认不装（安装包里有勾选项，见下） | ✅ 市场下载 / 卸载 | 独立打包成 ESM，落在 `<exe 根>\Modules\<id>\` |
+
+`translate` 是 2026-09-29 用户**点名**加进来的基础插件（原话：「词典做底座 + 模型补漏 +
+译文存数据库（避免二次翻译），作为基础插件」）—— 它不推翻「今后新增的一律按拓展处理」，
+因为那是「默认」，而这是一个显式指定。它排在清单最后：用户没给位置，
+插在中间会打乱他定的那 5 个展示顺序（顺序就是面板顺序，见 `kinds.ts`）。
+
+`tool-editor` 归在「AI 助手」名下（`kinds.ts` 的 `MERGED_INTO`）：仍是一个独立、可被搜到的
+插件，但市场上不单独占一行。
+
+**拓展插件必须真的「在 bundle 之外」** —— 这是「卸载 = 完全不存在于本应用」的前提：
+
+- 主 bundle 里**不许**留任何对拓展插件模块的 import / 动态 import。`attach.ts` 的硬编码表、
+  `main.ts` 里的 `id === "xxx"` 分支都算耦合。宿主需要的能力改由两条路提供：
+  **宿主命令**（剪贴板历史的写入 = `append_clipboard_entry`）或
+  **声明式权限**（OCR 的接管布局 = `permissions: ["layout.takeover"]`，宿主判据
+  `main.ts::isTakeoverPlugin()`；悬浮窗 = `window.float`）。
+- 卸载要一次收干净：detach 监听 → 关它的悬浮窗（宿主命令 `close_plugin_window`）→
+  关主窗口里它的面板 → `refreshMarketPlugins()` 重扫。**重扫必须顺手摘掉「上次注册过、
+  这次盘上没有」的 id**（`market.ts` 的 `marketRegistered`）—— 只遍历当次扫描结果去
+  `unregister` 永远摘不掉它，表现为「卸完了搜索里还能搜到」（2026-09-29 实测踩到）。
+- 市场列表的两次绘制（先本地、后索引）有并发：`renderMarket` 用代次号 `marketRenderGen`
+  保证**迟到的旧快照不许覆盖新结果**，否则会看到「卸完了那行还挂着卸载按钮」。
+
+**插件包必须单文件自包含**：`app/vite.plugins.config.ts` **一次只打一个入口**（由
+`scripts/build-plugins.ps1` 逐入口各调一次，用环境变量 `LUNAC_PLUGIN=<id>` 指定打谁）。
+多入口同批构建时 Rollup 会把共享模块提到 `plugin-dist/<chunk 名>/chunk-*.js`，而插件包只搬走
+自己那个目录 ⇒ 那份 chunk 丢失、`import` 404、插件打开即失败（2026-09-29 实测踩到）。
+（Vite 的 CLI **不支持**一个配置文件导出多份配置，别往那个方向改。）
+
+安装包侧的勾选项在 `scripts/lunac-installer.nsi`：核心段 `SectionIn RO`（组件页上取消不掉），
+四个拓展插件各一段 `/o`（**默认不勾**），包体来自 `build-plugins.ps1` 暂存的
+`release\ext-plugins\<id>\`。音乐那段额外带上 `deps\librespot\bin\librespot.exe` ——
+走市场安装时这一步由清单的 `dependencies[]` 自动下载，走安装包安装没有那一步。
+
+下表是各插件的图标与触发关键词（与分类无关）：
+
 | ID | 图标 | 触发关键词 |
 |----|------|-----------|
 | quick-launch | 🚀 | open, launch, run, app, start, 打开, 启动, 运行 |
@@ -863,6 +923,10 @@ searchInput (总端口)
 | memo | 📝 | 备忘录, memo, 便签, 笔记, 记事本 |
 | music | 🎵 | 音乐, 歌词, 歌曲, 正在播放, music, lyrics, spotify, 播放控制, 暂停, 下一首 |
 | convert | 🔄 | 转换, 格式转换, 转格式, convert, 格式, 转码, 提取音频, 图片转换, 视频转换, 音频转换 |
+| translate | 🔤 | translate, translation, dict, dictionary, meaning, word, 翻译, 词典, 字典, 查词, 释义, 译文, 中英 |
+
+> `translate` 的行内图标是**语言符号**（「文」与「A」相对，`PLUGIN_ICON_PATHS`），
+> **刻意不用地球** —— 那个图形已经是 `web-search` 的，两行图标一样会让用户认错插件。
 
 ### 4.6 音乐插件（歌词 + Spotify 播放控制，2026-09-27）
 
@@ -1176,6 +1240,22 @@ Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `
   `rgba(0,0,0,.62)` 的横条（`sweepMsg` 清的是文本，不是这个元素）。修法是
   `.music-root.music-player-on .music-msg:empty { background:none; padding:0; min-height:0 }`
   —— 清空走的是 `textContent = ""`，正好命中 `:empty`。
+- **轮询要快：宿主三处缓存 + 前端本地插值**（2026-09-29，用户报「每次动作到功能延迟长、进度条一跳一跳」）。
+  口径是**先只提速、不删 Web API**（librespot 本地没有控制接口，删不掉它）。三条缺一不可：
+  1. `music.rs` 的 `http()` **必须复用同一个进程级 client**（`static HTTP_CLIENT: OnceLock<Result<…>>`）。
+     每次 `Client::builder().build()` 都是**一个全新的连接池** ⇒ 每个动作、每秒那轮轮询都要重做一次
+     TCP + TLS 握手。这是「每次动作到功能之间那段延迟」里最大的一块。
+  2. `load_config()` **必须走内存缓存**（`static CONFIG_CACHE: Mutex<Option<MusicConfig>>`）：
+     它在 `spotify_status` 那条每秒路径上被反复调到，原先是「读盘 + 反序列化」× 30 处。
+     **`save_config()` 写盘成功后必须同步这份缓存** —— 否则同一进程内立刻读到旧值
+     （刚登录完 token 还是空的，等于把「登录状态丢了」这个最难查的 bug 请回来）。
+  3. 进度条**必须本地插值**：那轮轮询的真实周期是「Web API 往返 + 1000ms」（实测被网络拉到 ~1.7s），
+     只靠它写 `--seek-pct`，用户看到的就是「跳一格、僵一两秒、再跳一格」。`music.ts` 用一个
+     `PROGRESS_TICK_MS = 200` 的 `setInterval` 调 `paintProgressSmooth()`，按**真实流逝时间**
+     （`progressBaseMs + (Date.now() - progressBaseAt)`，夹到总时长）在两次轮询之间外推；
+     `renderPlayer()` 每轮回来重新对齐基准。**纯本地计算，不增加任何 Web API 调用** —— 提速不提负载。
+     只在「正在播 + 有曲目 + 没在拖（`seekRatio < 0`）」时推（暂停 / 拖动时位置本就该定住），
+     定时器与 `pollTimer` 同生共死（`stopPolling()` 里一起 `clearInterval`）。
 
 
 **歌词：三个来源，缺一不可**（`lyrics_get`）
@@ -1370,10 +1450,60 @@ Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `
 | `plugin_window_init` | 窗口自己来取启动载荷（`{plugin_id, input}`） |
 | `plugin_window_close` / `plugin_window_minimize` | 关 / 最小化自己 |
 | `plugin_window_set_pin` / `plugin_window_pin_state` | 置顶开关 / 读当前置顶态（前端**不许猜**初始值） |
+| `plugin_window_set_click_through(ignore)` | 切**鼠标穿透**（2026-09-29）。**只认 `plugin-` 前缀的窗口** —— 理由见下 |
+| 事件 `plugin-window-visibility` `{label, visible}` | 宿主 → 插件窗：这个窗**现在可见吗**（2026-09-29）。**只在翻转时发**，且**必须带 `label`** —— `Emitter::emit` 是广播，同时开两个插件窗时不给 label 会让另一个窗把别人的事当成自己的 |
 
-**窗口形态**：`label = plugin-<id>`、420×560（最小 300×200）、`decorations:false` +
-`transparent` + `always_on_top`、可缩放、进任务栏。前端入口是**独立的 `plugin.html` +
-`plugin-window.ts`**（vite 多页入口），不是把 `main.ts` 跑两遍。
+**为桌宠补的两个前置（2026-09-29，实测数据与取证方式见 [architecture-rendering.md](./architecture-rendering.md) §6.2）**：
+
+1. **鼠标穿透必须走宿主命令，不能直接放开 core 权限。** `core:window:allow-set-ignore-cursor-events` 是**按窗口**授的，而 `capabilities/default.json` 的 `windows` 里含 `main` —— 一旦放开，任何一处前端 bug 都能把**主窗口**变成穿透的，而穿透后的窗口**收不到鼠标**，用户没有任何办法点回来（只能去杀进程）。所以收成一条只认 `LABEL_PREFIX` 的命令。回值 = **本次下发的值**，不是回读（tao 没有 `is_ignore_cursor_events()`）。
+   实测（`WindowFromPoint` + `GWL_EXSTYLE`）：开之前 `exStyle=0x40118`、命中点落在插件窗自己；开之后 `0x40138`（`WS_EX_TRANSPARENT|WS_EX_LAYERED`）、**同一个点落在它下面的另一个应用的窗口**；关掉即全部复原；主窗口调用回 `ERR_NOT_PLUGIN_WINDOW`。开/关两次的窗口截图 mean |dRGB| = 3.64（**渲染没有被穿透破坏**，差异只是毛玻璃实时抖动）。
+2. **「现在可见吗」WebView2 报不出来，只能由宿主显式下发。** Win32 的 `IsWindowVisible()` 对**最小化**窗口返回**真** ⇒ `document.visibilityState` 永远是 `visible`、`visibilitychange` **永不触发**、rAF 在最小化后仍按刷新率满速跑（实测 ~170fps / **~5% 单核**）。落点是 `plugin_window::announce_visibility()`，**两个触发点缺一不可**：① `main.rs` 的 `WindowEvent::Resized`（tao 把 `WM_SIZE`（含 `SIZE_MINIMIZED`）统一发成它 —— `WindowEvent` 里**没有** `Minimized` 这一项）；② `open()` 的**复用路径**（`show()` 不产生 `WM_SIZE`，所以「插件自己 hide ⇒ 宿主再打开」这一声必须由主动方经 `announce_visibility_now()` **无条件**喊，否则插件恢复不了动画）。
+   **只在翻转时发**：拖拽缩放时 `Resized` 每移动一像素来一条，记账在 `LAST_VISIBLE`（`note_destroyed()` 里清）。实测两轮「最小化 → 还原」恰好收到 `false,true,false,true` 四条。
+
+**窗口形态**：`label = plugin-<id>`、默认 420×560（最小 300×200）、`decorations:false` +
+`transparent` + `always_on_top`、可缩放、进任务栏，**这几项可被插件清单的 `window` 段覆盖**
+（见下）。前端入口是**独立的 `plugin.html` + `plugin-window.ts`**（vite 多页入口），
+不是把 `main.ts` 跑两遍。
+
+#### 窗口形态由插件清单声明（2026-09-29，桌宠 L1）
+
+**要解决的问题**：`open()` 原先对所有插件用同一套建窗参数（420×560 / 可缩放 / 进任务栏 /
+带标题栏）。桌宠要的是「定尺 + 禁缩放 + **不进任务栏** + **没有标题栏**」，而宿主**不允许按 id 写死**
+（拓展插件要能独立打包，宿主在真机上不认识它们）。
+
+| 落点 | 内容 |
+|---|---|
+| 清单字段 | `PluginManifest.window: Option<PluginWindowShape>`（`plugin_market.rs`）—— `width/height/minWidth/minHeight/resizable/skipTaskbar/alwaysOnTop/chrome`，**全部有缺省值，缺省值逐项等于加这个字段之前的行为** |
+| 校验 | `validate_window_shape()`：尺寸必须是 `0`（= 用宿主缺省）或 100~4000；`min > 初始` 直接**拒整包**（那种清单在建窗时会被系统夹一次，表现是「命令成功、窗口没动」） |
+| 建窗 | `plugin_window::declared_shape()` 读 `<exe 根>\Modules\<id>\lunac-plugin.json`（**读不到 = 没声明**，不报错：编译进主程序的插件盘上本来没有目录）；`default_size()` / `min_size()` 收 `Option<&PluginWindowShape>`，只写一半时另一半仍走宿主缺省 |
+| 标题栏 | 形状里的 `chrome: false` 由 `plugin_window_init` 回给前端（新增 `chrome` 字段），`plugin-window.ts` 在 `<html>` 上挂 `no-chrome`；`styles.css` 的 `html.no-chrome` 那组规则**收起标题栏 + 去掉结果区玻璃底/描边/毛玻璃 + 垫料归零** —— 那层 `#results-container::before` 是整个窗唯一的色块，去掉它才是真透明 |
+
+**⚠️ 两条实测出来的坑，别按直觉写**：
+
+1. **`skip_taskbar` 不能靠 `GWL_EXSTYLE` 判**。tao 的 `with_skip_taskbar(true)` 落在
+   `ITaskbarList::DeleteTab(hwnd)`（tao `window.rs:1334` → `set_skip_taskbar`），
+   而 `WS_EX_APPWINDOW` 是它给**无父窗口**无条件加上的（`window.rs:1164` 的
+   `WindowFlags::ON_TASKBAR`）—— 两者互不影响，只看 exStyle 会得出「没生效」的错误结论。
+   **正确判据**是查任务栏本身（本仓用 UI Automation 列 `Shell_TrayWnd` 下的按钮名，
+   实测：只开桌宠窗时任务栏**没有** Lunac 条目；开一个没声明 `window` 段的窗（音乐）
+   立刻出现 `Lunac - 1 个运行窗口` —— 对照成立）。
+2. **透明性要用「同一矩形的前后对照」证，不能用别处的桌面色当对照**——桌面上不同位置的
+   颜色分布差得非常远（实测同一屏内一块 300×400 是 `14950` 种色 / 最大单色 29.7%，
+   另一块是 `486` 种 / 92.7%）。做法：记下窗口矩形 → **把它最小化**（或先别开）→ 截同一矩形
+   拿到「它背后真正是什么」→ 恢复后再截一次 → 两组统计一致才算透明。实测（内容整块藏起时）
+   `504 种色 / 最大单色 92.4%`，最小化后同矩形 `486 种 / 92.7%` ⇒ 窗内像素几乎逐点等于
+   「没有这个窗」时的画面。
+
+**第一个消费者：桌宠插件（`Modules\pet\`，2026-09-29）**。它的形态是
+`{width:300, height:400, minWidth:160, minHeight:200, resizable:false, skipTaskbar:true, chrome:false}`，
+并且**刻意不声明 `window.float`** —— 搜索打开的是它的**控制台**面板（导入形象 / 穿透开关 /
+形象大小），桌宠窗由控制台里的「显示桌宠」开。**这不是设计偏好**：穿透开着时桌宠窗
+**收不到任何鼠标事件**（那正是它的用途），开关若只放在桌宠窗自己的右键菜单里，
+用户一按下去就再也关不掉（只能去杀进程）。⇒ 分工固定为「**桌宠窗负责做**（所有窗口操作
+只能由它自己发，命令拿的是调用方那个窗口）、**控制台负责说**（写配置 + 广播一条
+`pet-control`）」。回归口径：控制台勾选「鼠标穿透」→ 桌宠窗 `GWL_EXSTYLE` 从 `0x40118`
+变 `0xC0138`（`WS_EX_TRANSPARENT|WS_EX_LAYERED`）；取消勾选即复原。
+
 
 **五条不得回退的约束**：
 
@@ -1404,15 +1534,159 @@ Spotify 桌面端**从「没在跑」变成「在跑」**的那一刻自动开 `
    否则悬浮窗会留着上一个主题的值。
 
 **可悬浮的插件是一份显式清单**（`main.ts` 的 `FLOATABLE_PLUGINS`）：音乐 / 转换 /
-备忘录 / 剪贴板历史 / 快速启动 / 工具编辑 / 网页搜索。**不含** `settings`
-（按 800px 宽 + 左侧栏分类设计，小窗里会散架）、`ai-agent`（对话流就是主窗口本身）、
-`ocr`（detached 双栏，同 settings 的理由）。
+备忘录 / 剪贴板历史 / 快速启动 / 工具编辑 / 网页搜索 / 翻译。**不含** `settings`
+（按 800px 宽 + 左侧栏分类设计，小窗里会散架）、`ocr`（detached 双栏，同 settings 的
+理由），以及 `ai-agent` —— 它走**专用通道**：不进 `FLOATABLE_PLUGINS`、也不走
+`plugin.execute` 的渲染，而是由 `openChatWindow()` 直接开**聊天独立窗**（见下一条）。
+
+**聊天独立窗（2026-09-29，用户定：「ai 插件也需要独立界面状态……并去除小窗口和大窗口，
+独立界面尺寸设置成与音乐插件相同的」）**：AI 聊天的界面**整体搬进一个独立的无边框窗口**，
+主窗里的内嵌小面板（360）与 detached 600 大窗**两态都去掉**。
+
+| 项 | 约定 |
+|---|---|
+| 窗口身份 | `pluginId = "chat"`（`plugin_window::CHAT_WINDOW_ID`）⇒ label **`plugin-chat`**。**刻意落在 `plugin-*` 通配里**：`capabilities` 授权、`on_window_event` 按 label 分流、`OPEN_WINDOWS` 失焦放行、`Destroyed` 不跑全局清理 —— 插件窗那一整套基础设施**全部自动复用**，一条都不用重写 |
+| 尺寸 | **1280×720**（与音乐默认态同档，用户原话「与音乐插件相同的」），最小 **720×420**（这条界面有输入栏 + 历史抽屉 + 工具卡，缩到通用那档 300 宽会散架）。落在 `default_size()` / `min_size()` 的一档特例里 |
+| 加载哪个页面 | **`index.html`**（不是 `plugin.html`）—— **这是本条最关键的选择**：聊天的界面（`#results-list` 的对话流、输入栏、历史抽屉、任务抽屉、审批卡）与逻辑（流式渲染、会话、审批回传）就是主界面那一份，**一行都不用搬进 `plugin-window.ts`**。`open()` 里按 id 选页面，别的插件仍是 `plugin.html` |
+| 前端怎么知道自己是谁 | `getCurrentWindow().label === "plugin-chat"`（**同步**）。**不许改用 URL query** —— 规则 4 明写了 `WebviewUrl::App` 的路径要经 url join，塞 `?view=chat` 是在赌它的拼接实现 |
+| **分工（硬约束）** | 两个窗口跑**同一份 `main.ts`**，按钮由 `IS_CHAT_WINDOW` 判定切分：**主窗** = 搜索 / 插件面板 / 设置 / 详情 / 托盘 / 热键 / 剪贴板 / `set_ui_mode` / `set_detached` / `set_query_state` / `hide_lunac`；**聊天窗** = `cli-output` / `cli-status` / `cli-stderr`（对话流）与聊天界面。**`emit` 是广播**：`cli-*` 只能一个窗口消费，否则双渲染、双写会话 |
+| 收口点（四处，都是「漏一处就出错」的地方） | ① **`invoke` 包装**（`MAIN_WINDOW_ONLY_CMDS` = `set_ui_mode` / `set_detached` / `set_query_state` / `hide_lunac` / `set_chips_empty`）—— 那些调用散在十来处，逐个加 `if` 必漏；② `applyWindowSize()` / `syncUiMode()` 开头早退（尺寸驱动与界面层都是主窗的）；③ `onResized` 早退（聊天窗定尺，不做 zoom 与内容驱动高度）；④ 7 条事件归属：`cli-*` 三条只聊天窗收，`lunac-clipboard` / `lunac-window-shown` / `lunac-esc-clear` / `lunac-esc-cancel-rec` 四条只主窗收 |
+| 入口（主窗侧） | ① `executePlugin()` 里 `plugin.id === "ai-agent"` **在调 `plugin.execute` 之前**转 `openChatWindow()`（否则会先在主窗长出一个空面板）；② `startAIChat()` 开头分流 —— **主窗调用一律转开窗**。这一处覆盖全部入口（搜索命中 / 右键「问 AI」/ 历史抽屉 / 去痕迹…），调用点有十几处，收口在这里才不漏 |
+| 传参 | 开窗时宿主把「那句话」写进 `PENDING`，聊天窗启动后 `plugin_window_init` 取走（take 语义）；**窗口已开着**时宿主不建新窗、改推 `plugin-window-input`，聊天窗监听它并 `startAIChat(q)` |
+| 外观 | 聊天窗启动时 `setDetached(true)` —— **借主窗「分离态」那套外观**（`#app.detached` = padding 2px + `#results-container` 圆角玻璃底 + 撑满 + `#detached-header` 当窗口标题栏）。`set_detached` 那条命令由 `invoke` 包装拦掉，所以不会污染 Rust 的 `DETACHED`。**VSCode 按钮**（用户要求「装入独立界面状态」）就是 `#detached-header` 里的 `#detached-vscode-btn`，`setDetached` 里按 `activePluginId === "ai-agent"` 显示 —— 不必新写一个按钮 |
+| 关闭语义 | 窗口标题栏的 × = **关掉这个窗口**（主窗那套是「退出插件、回到搜索栏」，独立窗没有搜索栏可回）。再进来：搜索命中 AI 重新开一个 |
+
+**不得回退的四条**：① `cli-*` 只由聊天窗消费（广播禁令）；② 聊天窗**绝不**发 `set_ui_mode` /
+`set_detached` / `set_query_state` / `hide_lunac`（全靠 `invoke` 包装那一道闸）；③ 聊天窗**绝不**注册
+剪贴板 / 热键 / 搜索链路；④ 主窗**绝不再长回**内嵌聊天（所有「进入 AI」的入口必须汇到
+`openChatWindow()`）。
+
+**已知代价（第一版刻意保留）**：聊天窗跑的是同一份 `main.ts`，因此主窗那些**与全局单值状态
+无关**的初始化（注册内置插件、扫插件目录、拉市场索引）也会跟着跑一遍 —— 功能上无害，只是多一次
+开销。**清理它们属于后续优化**：第一版优先保证「聊天行为与它在主窗里逐字节一致」，多跑几步初始化
+换「零搬迁」是划算的；要紧的是**没有**多注册剪贴板 / 热键 / 对话流那几条（那几条才是会互相抢的）。
+
+**实测（2026-09-29，第一版）**：`npx tsc --noEmit` **exit 0**；宿主 `cargo check --bins` exit 0、
+`cargo test --bins` **112 passed / 0 failed / 1 ignored**（新增两条守门单测：`chat` 那一档的
+尺寸与「最小 ≤ 默认」、以及**「只有聊天窗加载 `index.html`」**）。**实机回归未做** —— 逐条验收项见
+[backlog](./agent-feature-backlog.md) **L7**（开窗 / 窗内聊天与审批 / `×` 关窗后重开 /
+**与音乐窗并存互不串扰**）。
 
 **挂载只有一处**（[plugins/attach.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/attach.ts)）：
 主窗口的内嵌面板与悬浮窗共用同一份 `attachPluginListeners(plugin, root)` 映射。
 分两份写的话，加了插件只改一边就会出现「内嵌能用、悬浮窗是死的」。
 好消息是**内置插件模块都不依赖 `main.ts`**（只依赖 registry / i18n / Tauri API），
 独立入口因此不需要把 main.ts 拆开。
+
+### 4.9 翻译插件（词典 + 模型补漏 + 译文缓存，2026-09-29）
+
+用户 2026-09-29 的第三条需求：「**词典做底座 + 模型补漏 + 译文存数据库（避免二次翻译）**，
+作为基础插件」。实现在
+[app/src-tauri/src/translate.rs](file:///d:/cc/claude-code-cli-master/app/src-tauri/src/translate.rs)（宿主：联网 + 缓存 + 模型）
+与 [app/src/plugins/builtin/translate.ts](file:///d:/cc/claude-code-cli-master/app/src/plugins/builtin/translate.ts)（面板）。
+
+**为什么联网必须在宿主**：前端插件在 WebView 里，CSP 是 `default-src 'self'
+https://asset.localhost`，插件里的 `fetch()` 会被直接拦掉（与音乐歌词 / 插件市场索引同一条，
+见 §11 规则 67 的第 ⑥ 条）。
+
+| 层 | 端点 / 落点 | 给什么 | 花钱 |
+|---|---|---|---|
+| **① 缓存** | `<exe 根>\ModuleData\translate\cache.db` 的 `translations` 表 | 同一 (源语言, 目标语言, 原文) 只查一次外部接口 | 否 |
+| **② 词典底座：译文** | `api.mymemory.translated.net/get`（免 key） | 主译文（整句 / 短语 / 单词都行） | 否 |
+| **② 词典底座：词条** | `dict.youdao.com/jsonapi`（免 key，**非官方只读**） | 音标（英 / 美）、释义行、双语例句；**整句**查询时它的 `ec.word[0].trs` 也是译文候选 | 否 |
+| **③ 模型补漏** | `{agent_endpoint}/v1/messages`（与 core-agent 同一套形状） | 上面两层都没有结果时，**由用户点按钮**才发起 | **是** |
+
+**免 key 源是实测选出来的，不是照记忆写的**（2026-09-29，本机**直连**、不走系统代理）：
+
+| 候选 | 结果 |
+|---|---|
+| `translate.googleapis.com/translate_a/single`（免 key 的 Google） | **不通**（curl 000，直连与经代理都一样）⇒ **不实现**：写成「首选 + 失败降级」只会让每次查询先白等一个超时 |
+| `api.mymemory.translated.net/get` | 200；`hello`→你好、`你好，今天天气不错`→英文、139 字整段无截断 |
+| `dict.youdao.com/jsonapi` | 200（`hello` 54 KB / `give up` 21 KB 词条详情） |
+
+**语言判定在本地做，不用对方的能力**：MyMemory 的 `langpair=Autodetect|…` 实测**不可靠**
+（`hello world` 被原样返回，等于没翻译）⇒ `detect_lang()` 只判「含不含 CJK 字符」
+（中日韩 vs 其余），够用且完全确定、不引依赖。用户显式选了源语言就**不猜**（`resolve_from`）。
+
+**译文缓存表**（`IF NOT EXISTS` 幂等，与 `chat_db.rs` 同一套做法，无 `user_version` 簿记）：
+
+```sql
+CREATE TABLE IF NOT EXISTS translations (
+    key        TEXT PRIMARY KEY,   -- "源语言\u{1}目标语言\u{1}原文"
+    src        TEXT NOT NULL,
+    dst        TEXT NOT NULL,
+    source     TEXT NOT NULL,      -- dict | ai
+    payload    TEXT NOT NULL,      -- TranslateResult 的 JSON
+    created_at INTEGER NOT NULL
+);
+```
+
+- **独立库、不塞进 `chat.db`**：`chat.db` 是「对话历史」，把词条缓存混进去会让
+  「history 里到底存了什么」变得说不清。业务数据都在 `ModuleData\` 下，这里另开一个目录。
+- **缓存键不做大小写 / 全半角归一**：归一会让 `Hello` 与 `hello` 共用一份译文，
+  而它们的词典释义常有差别（有道自己就分条），省下的那点空间不值一次「查的词和返回的词
+  不是一个」的困惑。
+- **只缓存有内容的结果**：把「查不到」也写进去的话，一个还没收录的词会被永久钉死成查不到
+  —— 而那正是下次可能查到的那个词。
+
+**两条命令**（`Result<_, String>`，均 `async` + `run_blocking`，见 §11 规则 68）：
+
+| 命令 | 何时调 | 失败语义 |
+|---|---|---|
+| `translate_lookup(text, from, to)` | 用户点「翻译」 | **除空输入 / 超长外永不 Err**：网络故障、被反爬、额度用尽都只是「这次没查到」⇒ 返回 `source: "none"`，由面板提示走模型。**不许**把它变成一行红色错误（那会把「对方今天不通」说成「你这个词有问题」） |
+| `translate_ai(text, from, to)` | **只在用户点「用 AI 翻译 / 重译」时** | 真实报错（用户主动点的动作必须可见），但**只给「用户能做什么」**：`401/403`→「凭据无效，请到设置里检查」、`404`→「端点或模型名不对」、`429`→「请求太频繁」、`5xx`→「暂时不可用」，**状态码与响应体只进日志**（预检 #40 ③） |
+
+返回形状 `TranslateResult{ text, from, to, source, cached, translation, phonetic, explains[], examples[] }`：
+
+- `source` = `dict` / `ai` / `none`（**三层真实来源**，`cached` 另用一个布尔标「这次没碰网络」）。
+- 同一句问第二次走缓存 ⇒ `cached: true`（实测 6~7 ms 返回，不再出网）。
+- 命中缓存时**不跳过**用户主动点的「用 AI 重译」：缓存里已是 AI 结果才直接复用
+  （拿旧的词典结果把他挡回去等于按钮没反应）。
+
+**界面**（用户 2026-09-29 选的是「**可悬浮 + 主窗面板**」，所以它进了 `FLOATABLE_PLUGINS`）：
+
+- 主窗内嵌面板 = 输入框 + 源语言 / 目标语言 + 译文（大字）+ 音标 + 释义列表 + 例句；
+  Enter 翻译、Shift+Enter 换行。
+- 悬浮窗（420×560）走 `plugin-window.ts`，与内嵌版共用 `attach.ts` 那一份挂载表。
+- **花钱的动作只在结果出来之后出现**：词典查不到 → 「用 AI 翻译」；词典查到了 →
+  「用 AI 重新翻译」。绝不自动替用户出网去问模型。
+- 来源只用一行小字自明（来自词典 / 来自 AI / 来自本地缓存），**不弹提示**（预检 #40）。
+
+**搜索栏带过来的待译内容（预填）**：`execute(input)` 把搜索栏那串文字当待译内容预填进输入框，
+但**先剥掉开头的调用词**（`stripInvocation`：`^(翻译|translate|词典|字典|查词|dict)(\s+|$)`）——
+用户敲「翻译」是在**调起插件**，不是要把「翻译」两个字译出来。规则只有两条：
+
+- 整个查询就是调用词（`翻译` / `translate`）⇒ 预填**空**；
+- 前缀不是调用词（`translator`）⇒ **原样保留**（正则结尾的 `\s+|$` 就是为它写的：
+  否则 `translator` 会被切成 `or`）。
+
+> **多词查询今天搜不到这个插件**（实测：`翻译 hello` 不出现 translate 那一行）。
+> 那是 `registry.ts` 的通用匹配规则（关键词是整词比对 / 子序列模糊，带空格外加字母的查询
+> 匹配不上 `翻译`），**不是翻译插件的缺陷**，也**不要**为一个插件去改全局匹配 ——
+> 上面那条 `\s+` 分支留作防御：宿主把「调用词 + 待译内容」整串传进来时照样正确。
+
+**重开面板不恢复缓存 HTML**（`main.ts` 的 `skipRestore` 里加了 `translate`）：翻译面板带着
+**来自搜索栏的待译内容**，若按别家的做法把上一次的 HTML 抬回来，这次的查询就被悄悄丢掉 ——
+第一次点开有预填、第二次没有，同一个动作两种结果。
+
+**实测（2026-09-29，dev 实例 + CDP 探针，逐字）**：
+
+- `translate_lookup("hello")` → 2688 ms，`你好` + `英 həˈləʊ  美 həˈloʊ` + 3 条释义 + 3 条例句；
+  再查一次 → **7 ms、`cached: true`**。
+- `translate_lookup("how are you doing today")` → 658 ms，`你今天过得怎么样`（有道的 `trs` 兼作译文）。
+- `translate_lookup("你好，今天天气不错", to:"en")` → 786 ms，`Hello, it's a nice day today`。
+- `translate_lookup("zzzzqqqqxyznotaword")` → 671 ms，`source: "none"`、不报错。
+- `translate_ai("The early bird catches the worm.")` → 1293 ms，`早起的鸟儿有虫吃。`；
+  再点一次 → **6 ms、`cached: true`**（不重复花钱）。
+- 面板侧：语言下拉五语言正确、查询后 `dictTrans=你好`、`explains=3`、`examples=3`、
+  小字「来自本地缓存」；点「用 AI 重新翻译」→ 小字变「来自 AI」；
+  点悬浮按钮 → 主窗回到搜索态、悬浮窗（420×560，标题「翻译」）里 `give up` → `放弃`。
+- 市场面板：基础插件组里 `翻译` 只有「打开」（与备忘录 / AI 助手 / 网页搜索 / 设置 /
+  快速启动 并列），拓展插件组里的三个仍带「卸载」。
+- 预填（走真实入口：搜索栏派发 `input` → 点结果区那一行 → 读 `#xl-input`）：
+  `翻译` ⇒ `""`、`translate` ⇒ `""`、`translator` ⇒ `"translator"`（**没被切成 `or`**）、
+  `翻译 hello` ⇒ 不出现 translate 那一行（多词查询匹配不上关键词，见上）。
+  三个查询**连续开合**都拿到各自的值 ⇒ `skipRestore` 那一处修对了。
 
 ## 5. 关键设计决策
 
@@ -1509,7 +1783,7 @@ build-release.ps1                    # 一键打包（仓库根，见 §8.2）
 > 所有 ps1 脚本必须用 `$PSScriptRoot` / `Split-Path -Parent $PSScriptRoot` 推导仓库根，**禁止硬编码本机绝对路径**；统一包管理器为 `npm`。
 > **含中文的 `.ps1` 与 `.nsi` 必须以 UTF-8 with BOM 保存** —— Windows PowerShell 5.1 与 makensis 对无 BOM 文件按 ANSI(GBK) 解码，中文字符会把紧随其后的引号/换行吞进双字节：ps1 报「字符串缺少终止符」，NSI 报 `Bad text encoding: <file>:<line>`（行号指向**首个非 ASCII 行**，不是真正出问题的那一行，极易误判）。已知触发源：`download-paddle-ocr.ps1` / `build-release.ps1`（PS 侧），以及**用会丢 BOM 的编辑器/批量替换工具改 `scripts\lunac-installer.nsi`**（实测：一次文本替换就把 BOM 抹掉，makensis 立刻在第 14 行中文注释处报 `Bad text encoding`，整个打包链路直接断掉）。`build-release.ps1` 第 ⑨ 步每次都会用 `UTF8Encoding($true)` 重写 NSI，所以**从仓库新鲜克隆的 NSI 有没有 BOM 取决于最后一次提交** —— 提交前请确认首三字节是 `EF BB BF`。
 >
-> **2026-09-21 补一种更隐蔽的坏法：两份 BOM（实测坏掉的就是 `build-release.ps1`）。** 一次批量文本编辑把文件按「BOM + 原文」（原文自己已带 BOM）重存 ⇒ 首六字节 `EF BB BF EF BB BF`。PS 5.1 只吃掉**第一份** BOM，剩下的 `U+FEFF` 让**首行**（`# Lunac Release Build Script`）变成一条命令 ⇒ 第 18 行的 `param()` 不再是「首语句」⇒ **脚本参数全部不绑定**（`$Version` / `$NoBump` 全成 `$null`），而报错是「无法将 `?#` 项识别为 cmdlet」+「无法将 `param` 项识别为 cmdlet」这种与真实原因**毫不相干**的东西，最后停在「版本号必须形如 x.y.z，收到： False」（`$Version` 在消息里显示成字符串 `False`）—— 只看报错完全猜不到根因。**判据**：首三字节 `EF BB BF` **且第四字节不是 `EF`**（两份 BOM 时 PS 报不出「BOM」这个词，所以必须主动查字节）。**修法**是「以 UTF-8 with BOM **重存**」（等价于去掉多余 BOM），不是「再加一份 BOM」。**自动守卫**：`npm run verify` 第 ⑧ 节扫全仓 `.ps1` / `.nsi`，两种坏法都报 FAIL —— ① 开头有两份 BOM；② 含中文却没有 BOM（这一条同时把 `docs\parse-minidump.ps1` 的旧违规修掉）。两个分支都做过反向验证（临时造坏文件，确认真的报 FAIL 并让 `verify` 以 1 退出）。
+> **2026-09-21 补一种更隐蔽的坏法：两份 BOM（实测坏掉的就是 `build-release.ps1`）。** 一次批量文本编辑把文件按「BOM + 原文」（原文自己已带 BOM）重存 ⇒ 首六字节 `EF BB BF EF BB BF`。PS 5.1 只吃掉**第一份** BOM，剩下的 `U+FEFF` 让**首行**（`# Lunac Release Build Script`）变成一条命令 ⇒ 第 18 行的 `param()` 不再是「首语句」⇒ **脚本参数全部不绑定**（`$Version` / `$NoBump` 全成 `$null`），而报错是「无法将 `?#` 项识别为 cmdlet」+「无法将 `param` 项识别为 cmdlet」这种与真实原因**毫不相干**的东西，最后停在「版本号必须形如 x.y.z，收到： False」（`$Version` 在消息里显示成字符串 `False`）—— 只看报错完全猜不到根因。**判据**：首三字节 `EF BB BF` **且第四字节不是 `EF`**（两份 BOM 时 PS 报不出「BOM」这个词，所以必须主动查字节）。**修法**是「以 UTF-8 with BOM **重存**」（等价于去掉多余 BOM），不是「再加一份 BOM」。**自动守卫**：`npm run verify` 第 ⑧ 节扫全仓 `.ps1` / `.nsi`，两种坏法都报 FAIL —— ① 开头有两份 BOM；② 含中文却没有 BOM（这一条同时把 `docs\parse-minidump.ps1` 的旧违规修掉）。两个分支都做过反向验证（临时造坏文件，确认真的报 FAIL 并让 `verify` 以 1 退出）。**2026-09-29 又踩到一次同类**：用文本替换改 `scripts\build-plugins.ps1`（加一个插件条目）时，工具把 BOM **整个抹掉**（首字节变成 `23 20` = `# `），PS 5.1 立刻按 GBK 解码，报的是 `Missing argument in parameter list` + 一串 `Unexpected token '鏋勫缓鎻掍欢鍖咃紙vite'` 这种**与真实原因毫不相干**的乱码报错。**判据与修法同上**（首三字节必须是 `EF BB BF`）：`[IO.File]::ReadAllBytes()` 读出来前面补 `EF BB BF` 再写回即可。⇒ **改 `.ps1` / `.nsi` 之后一律跑一次 `npm run verify`**（第 ⑧ 节就是为这一类坏法设的守卫）。
 
 ## 7. 开发命令
 
@@ -1619,7 +1893,7 @@ git diff --cached --name-only | ForEach-Object { Get-Item $_ -EA SilentlyContinu
 
 > **纪律**：问题修完**只留规则与代码注释**，不再往本节追加「✅ 已完成」的流水账 —— 已完成项堆积会把真正的待办淹掉。新增的未解决问题写 §9.1（疑难点）或 backlog。
 
-### 9.1 疑难点（两个都已定位，只剩两项待实测）
+### 9.1 疑难点（三个都已定位，只剩两项待实测）
 
 > 本节曾登记两个「没有定论」的硬骨头。**两个都已定位完毕**，剩下的只是复现与实测，已挪进 [agent-feature-backlog.md](./agent-feature-backlog.md) §3 的 **M1**。这里只留结论与证据，避免下次重新调研。
 
@@ -1698,22 +1972,85 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
 
 **验收口径**：实际生效机制可在落盘日志里查证（`grep auto_start`）；开机后「登录完成 → 热键首次可响应」的时长与手动启动的差值不超过 OS 触发时机本身的差异；自启实例在运行时再双击**不产生第二个进程**，且能把已有窗口唤出（2026-09-15 已实测）。
 
+#### 难点 3：API 消费金额归因（2026-09-29 结案）—— 「是 Trae 的 10 倍」不是计价贵
+
+**现象**：用户口径「Lunac 的 API 消费金额基本是 Trae 的 10 倍」。
+
+**数据**（`D:\Downs\usage_data_2026-09-29_2026-09-29.zip` → 解出 `amount-*.csv` / `cost-*.csv`）：
+
+- 两个 key 同属**一个账号**（`user_id` 相同）：`flash -trae`（`sk-209a8…`）与 `test  for lunac gith`（`sk-9842b…` = Lunac `.env` 的 key）。
+- 全日：trae 12.908 元 / 1,372 请求；Lunac 0.181 元 / 24 请求。
+
+**结论 1：不是计价档位差，是官方的峰谷定价。** 同一天**同一个 key** 也出现两档价（miss `1e-6↔2e-6`、hit `2e-8↔4e-8`、output `4e-6↔8e-6`，整体 2 倍），落在 14:00 与 17:00 两个窗口。
+
+**2026-09-29 已查明（当天晚些时候补做）**：这不是「临时调价」也不是「后端版本混用」，而是 **DeepSeek 2026-08-17 起生效的峰谷定价** —— 高峰 = **周一至周五**的北京时间 **09:00–12:00** 与 **14:00–18:00**，其余全部（含整个周末与中国法定节假日）为谷时，**谷价 = 峰价的一半**。逐小时核对完全吻合：CSV 里 12/13 点谷、**14 点峰**、**17 点峰**、18 点起谷。单价也与官方价目表对得上（命中 : 未命中 : 输出 = `0.02 : 1 : 4`，折算汇率自洽）。⇒ **首轮拿 14:00 那一行去比 12:00 那一行得出的「两个 key 差 2 倍」是误读，已纠正**；同时这也解释了「面板金额比账单高约 2 倍」—— `pricing.json` 当时只有单档（峰）价。**处置**：价格表已支持时段价并预置官方峰谷价，详见 §3.5 与规则 63。
+
+**结论 2：11.2 倍 = 命中率差 × token 结构差，两个独立因子。**
+
+| | flash -trae | test for lunac gith |
+|---|---|---|
+| 请求数 | 1,372 | 24 |
+| 输入 hit | 202,709,504（**98.30%**） | 205,440（**89.14%**） |
+| 输入 miss | 3,526,785 | 25,023 |
+| 输出 | 1,029,619 | 28,514 |
+| 输出 / 输入 | **0.50%** | **12.4%** |
+| 元 / 百万 token | 0.0623 | **0.698（11.2×）** |
+
+拆开算：只用 Lunac 自己的命中率、换上 trae 的 token 结构 ⇒ **3.09×**；再叠上 token 结构差 ⇒ **3.63×**；3.09 × 3.63 ≈ 11.2×。
+
+**结论 3：「元 / 百万 token」不能当 KPI。** 它奖励的是「堆缓存命中」，会把「上下文很长但几乎全命中」判成先进（trae 那 2 亿输入里绝大部分正是每请求重发的 ~150k 静息上下文，单价只有 miss 的 1/50）。**该用「每次提问成本」或「每个有效产出的成本」。** 换成「元 / 请求」，Lunac（0.00753）其实**低于** trae（0.00941）。
+
+**结论 4：除命中率外的影响因子分五层**（可供复查的清单）：
+
+| 层 | 因子 | 实测 / 依据 |
+|---|---|---|
+| 0 单价 | 模型档位；**峰谷时段价**（官方规则，实测 2×）；面板价格表口径 | 已查明是官方峰谷定价（见结论 1）⇒ 价格表**已支持时段价并预置官方峰谷价**（§3.5 + 规则 63）。修复前 `pricing.json` 只有单档（峰）价，面板对谷时用量**高估约 2 倍**：dev 环境 2026-09-29 那天，分时口径 **0.136858 元** vs 旧单档口径 **0.198505 元** |
+| 1 每请求 token 构成 | **输出**（单价 = miss × 4 = hit × 200）；**思考 token 按输出计价**；miss 输入；hit 输入 | Lunac 当天 **78.5% 的成本是输出**（0.1419 / 0.1808）。**2026-09-29 已动手**：输出纪律进 `PERSONA_AND_STYLE` ⇒ 稳态每次提问成本 **-41%**（4854 → 2843 miss 等价，结论 7） |
+| 2 请求次数 | **agent 工具循环**（一次提问实测 7~10 次请求，上限 `MAX_TOOL_ROUNDS` = 16）；**子代理**（`MAX_SUBAGENT_ROUNDS` = 8）与**后台复盘 fork**（`MAX_REVIEW_ROUNDS` = 4）各是完整对话；Drop / Force 档额外一次摘要请求 | `usage-2026-09-29.jsonl` 两条记录分别 10 / 7 次请求。**2026-09-29 结案**：这是**模型自己的往返节奏**，不是本侧并行没做 —— `TOOL_PARALLELISM` = 「同响应多 `tool_use`」（结论 8），提示词层引导**未能**改变它（结论 7）。子代理的账已并入（结论 5） |
+| 3 前缀重建 | agent 冷启动（system 块全 miss；**往期会话索引含相对时间标签**，跨天 / 跨会话必变）；压缩 / 摘要 / 任务快照 / 相位注记插回 history；切模型 / 切思考档 / 换工作区 ⇒ 重启 | 同规则 23 的断裂源清单 |
+| 4 计量口径 | `result.usage` = 本次提问绝对值；**子代理 / 复盘此前完全没进账**（见结论 5）；DeepSeek 无 cache write 费（`cacheCreate` 恒 0 **不是 bug**） | 平台同一 key **24 次**请求 vs 本地 `usage-*.jsonl` **17 次** |
+
+**结论 5：真因之一是本地账漏计。** 「平台 24 次 vs 本地 17 次」这条差额的主因是 `run_subagent` 的用量**从来没进过 `result.usage`**（只累进它自己的预算熔断 `spent`）。**已修**，契约见 §3.5「用量与对账」里那两条 2026-09-29 行。
+
+真机端到端（2026-09-29，`e2e-ab-thinking.ps1` 的 subagent 模式，真实端点）：一次提问 `turns=2`、**`requests=4`**（主循环 2 + 子代理 2），子代理吃掉 `in 2448 / 2917 = 84%` 的未命中输入、`out 179 / 350 = 51%` 的输出 —— **修好之前这一问的账面上只有 2 次请求**。⇒ 在修好之前，任何「改哪儿能省钱」的判断都建立在偏低的基数上。
+
+**结论 6：思考档不是主因（A/B 实测，2026-09-29）。** 探针 `core-agent\target\hooktest\e2e-ab-thinking.ps1`（同一任务、各自全新进程 ⇒ 两次都是冷启动），真实端点 flash：
+
+| 任务 | thinking=on | thinking=off | 输出比 | 价格加权成本（miss 等价） |
+|---|---|---|---|---|
+| 单文件摘要（2 请求） | out=127 | out=103 | 1.23× | 3,756 vs 3,728 = **1.01×** |
+| 三文件读取 + 计数（2 请求，第 1 次） | out=185 | out=122 | 1.52× | 1,268 vs 965 = **1.31×** |
+| 三文件读取 + 计数（2 请求，第 2 次） | out=122 | out=121 | 1.01× | 1,014 vs 960 = **1.06×** |
+
+三次的**最终答案逐字相同** ⇒ 差额就是**思考 token**（原始流里确有 `thinking_delta` 块，且按 output 计价）。三次都落在 1.0~1.3× ⇒ 思考档是一个 **1.0~1.3× 的乘数**，随任务难度浮动，**不是 10 倍级的主因**；真正的乘数是「输出总量 × 请求数」。
+
+**结论 7：能动的两条提示词，一条生效一条不生效（2026-09-29，探针 `core-agent\target\hooktest\e2e-l6-cost.ps1`）。** 固定任务（读工作目录里全部 `.md` → 报最多 / 最少行数 + 2~3 句用途）、固定模型（flash）、固定思考档（默认 on）、每次**全新进程**：
+
+| 轮次 | 请求数 | `out` | 答案字符 | 思考字符 | 首请求 `in / read` | miss 等价 |
+|---|---|---|---|---|---|---|
+| 改前基线 | 4 | 936 | 1156 | 887 | 841 / 2944 | 4854 |
+| 改后第 1 次（前缀刚变 ⇒ 端点侧无此单元） | 4 | 788 | 701 | 811 | 4002 / 0 | 7369 |
+| 改后第 2 次（前缀已入缓存） | 4 | **488** | **474** | 476 | 612 / 3198 | **2843** |
+
+- **输出纪律生效**：`PERSONA_AND_STYLE` 的 Output Style 段新增「只把输出 token 花在答案上」—— 无开场白、不预告「接下来我要做什么」、不复述计划、不复述刚读到的内容、只答被问的、不把用户已经能看到的正文贴回来、结尾只留一行「改了什么」。两次改后采样的答案字符（701 / 474）都低于基线 1156，`out`（788 / 488）都低于 936；第 2 次采样里那三段过程旁白（`I'll list…` / `Read all four…`）**彻底消失**。两边都处于「前缀已缓存」的稳态时：**4854 → 2843，每次提问成本 -41%**。
+- **改后第 1 次的 7369 不是回退**，别误读：那是「固定前缀刚被改写 ⇒ 端点侧还没有对应单元」的一次性代价（`in=4002 / read=0`），第 2 次就回到 612 / 3198。⇒ **改固定前缀这件事，成本是「每台机器每套前缀各一次」**，不是每次提问都付。
+- **批量化没生效（如实记，别再往这个方向使劲）**：`SYSTEM_PROMPT` 新增「互不依赖的读 / 搜放进**同一次响应**」之后，三次采样的 `requests` **全是 4**，工具序列也逐字相同（`Glob, Read×4, Bash`）。⇒ 在这个任务上模型本来就按「一轮一个调用」走，**一句提示词没有改变它的往返节奏**。「一次提问 7~10 次请求」是**模型自己的节奏**，不是本侧把并行做丢了 —— `plan_tool_batches()` 那条路的语义已经查清（见结论 8）。要压这个数只能从「让模型少问几轮」入手，**不要**去改并行实现。
+- **对照口径（本探针的坑）**：改前那次首请求 `read=2944` 起步，是因为端点侧**早就存着同一份前缀**（此前跑过同类探针）；改后第 1 次是冷前缀。⇒ `miss 等价` 只在**双方都处于已缓存稳态**时才可比（对照「改前基线」与「改后第 2 次」两行），别把冷前缀那一行读成回退。
+
+**结论 8：`TOOL_PARALLELISM` 的语义已核实（回答 backlog L6 的那个疑问）。** 它是**同一个响应里带 N 个 `tool_use` 块、由本侧并发执行**（`plan_tool_batches()` 切批 → 只读批内 `TOOL_PARALLELISM = 4` 条并发），**不是**「并发发 N 份请求」。请求数恒等于「模型轮数」，与并行度无关；探针抓到的线上请求数（4）与工具数（6）正好说明这一点。
+
+**遗留**（→ backlog §3 的 **L6**）：~~① 价格表要能表达**分时价**~~ **（2026-09-29 已完成：`time_windows` + 逐桶计价 + 预置官方峰谷价，契约见 §3.5 与规则 63，实测见文末）**；~~② 输出瘦身~~ **（2026-09-29 已完成：输出纪律进 `PERSONA_AND_STYLE`，稳态每次提问成本 -41%，见结论 7）**；~~③ 压请求次数~~ **（2026-09-29 已结案：确认 `TOOL_PARALLELISM` 是「同响应多 `tool_use`」（结论 8）；提示词层的批量化引导实测**未改变**请求数，如实记为「已排除本侧实现嫌疑」而非「已降本」）**；④ 建立「每次提问 × 真实峰谷单价」的对账基线 —— **本地侧口径与工具已就绪**（`scripts\reconcile-usage.ps1`，见 §3.5），**待平台导出 CSV 才能出跨源基线**。
+
+
+**踩过的坑（实测，别再犯）**：用 PowerShell 5.1 驱动 `agent.exe` 时**不要走 .NET 的 `Process.StandardInput`** —— 本机 `Console.InputEncoding` 是带 BOM 的 UTF-8，那 3 字节前导会落在子进程 stdin 头部；而 agent 的读取端只做 `line.trim()`（BOM **不是** Rust 的空白字符）再 `serde_json::from_str`，于是每轮都报 `忽略非法 JSON 输入行: expected value at line 1 column 1`。`ProcessStartInfo.StandardInputEncoding` 在 .NET Framework 上**不存在**；把字节直接写进 `BaseStream`（哪怕用 `Encoding.ASCII`）**也照样带 BOM**（`_probe-stdin.ps1` 三种写法实测均以 `efbbbf` 开头）。正解 = 让 `cmd` 用 `< q.json` 重定向喂**无 BOM 的文件**，并保持 `RedirectStandardInput = $false`，即**根本不让 .NET 建 stdin writer**。
+
 ---
 
-## 10. 待办的落点（本节已并入 backlog，仅留指针）
+## 10. 待办的落点（仅留指针）
 
-**本节已于 2026-09-19 整体并入 [agent-feature-backlog.md](./agent-feature-backlog.md)**（唯一待办真相源）。
+**唯一待办真相源 = [agent-feature-backlog.md](./agent-feature-backlog.md)**。规范正文只写「是什么 / 为什么这么做 / 不得怎么做」—— **新增待办一律登记到 backlog**，不要再往正文里插「待办 / 路线 / 待实现」小节。
 
-原因：待办原先散落在四处（本节、§13 参考设计、§19.6 待实现清单、§20 路径 2，外加 backlog 自己），同一件事常在两三个地方各写一遍、完成状态还不同步 —— 读的人不知道信哪一份。现在**只留一处**：
-
-| 原位置 | 处理 |
-|---|---|
-| 本节「待办路线」20 条 | 已全部完成或已挪走 ⇒ **条目删除**。未完成的（插件市场、调试状态栏…）在 backlog §1 / §2 / §3 —— 其中**AI 人格**（2026-09-21 L2 ⇒ 规则 66）与**成本面板**（A12 ⇒ 规则 63）**均已落地**，不再是待办 |
-| §13「参考设计」（**未落地**） | 两个设计思路都**不排期**，压缩为一行指针 + 与现状的区分说明 |
-| §19.6「待实现清单」 | 已按实测拆解：Humanizer 按钮与安全警告块**其实早已落地**（本文此前漏标，已纠正）；调试阶段状态栏挪进 backlog L4 |
-| §20「路径 2 插件市场」 | 挪进 backlog L1（含三条硬约束：CSP / 资产授权 / 常驻开销） |
-
-> **维护纪律**：新增待办一律登记到 **backlog**，**不要**再往规范正文里插「待办 / 路线 / 待实现」小节。规范只写「是什么 / 为什么这么做 / 不得怎么做」。
+> 为什么只留一处（2026-09-19 整理的实测教训）：待办原先散在四处（本节、§13 参考设计、§19.6 待实现清单、§20 路径 2，外加 backlog 自己），同一件事写两三遍、**完成状态还不同步** —— 整理时发现 Humanizer 按钮与安全警告块其实早已落地，文档却一直标着「待实现」。
 
 ---
 
@@ -1806,7 +2143,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **思考开关不直接进前缀**：thinking 只进 `display`、**不进 history**（回灌会 400）；其 400 降级只改 `thinking` 形态与 `max_tokens` 两个生成参数（`Thinking` / `max_tokens_for`），是否掉缓存取决于端点侧 hash 口径（本仓库无法自证）。但**切思考开关会重启 agent ⇒ history 清空 ⇒ 缓存必然重建**，这是「切换后命中率骤降」的合理解释，属预期行为。
     - **思考只有开 / 关两态（2026-09-15，不得回退）**：端点**没有**思考力度旋钮（`budget_tokens` 不被 enforce、`effort` 字段被静默忽略，实测见 §3.5），因此**禁止**再把档位做成「快速 / 思考 / 深度」这类深度分级、也禁止把 `budget_tokens` 暴露给用户 —— 那是在承诺端点做不到的事。开关值只有 `on` / `off`（`LUNAC_THINKING`），`budget_tokens` 退化为单一常量 `THINKING_BUDGET`。
     - **注入提示的「固定 / 条件」位置纪律（2026-09-17，方案 B，不得回退）**：给模型的行为约束按「是否随请求变化」分成两类，**落点不同**：
-      - **固定块**（人格 / 文风 —— 每次都要生效、内容与请求无关）**必须放进 agent 的系统提示词**（`core-agent/src/main.rs` 的 `PERSONA_AND_STYLE`，与 `SYSTEM_PROMPT` 拼接）。它是固定前缀的一部分 ⇒ 永远命中缓存。**2026-09-21 起这一段是两截**：内置常量 `PERSONA_AND_STYLE` + 用户在设置里写的那段（`config\persona.md`，**启动时读一次**，见 §3.5「人格 / 自定义提示词」/ §11 规则 66）—— 「可配置」与「进固定前缀」这两件事必须同时成立，别为了让用户能改就把它挪进消息侧。
+      - **固定块**（人格 / 文风 —— 每次都要生效、内容与请求无关）**必须放进 agent 的系统提示词**（`core-agent/src/main.rs` 的 `PERSONA_AND_STYLE`，与 `SYSTEM_PROMPT` 拼接）。它是固定前缀的一部分 ⇒ 永远命中缓存。**2026-09-21 起这一段是两截**：内置常量 `PERSONA_AND_STYLE` + 用户在设置里写的那段（`config\persona.md`，**启动时读一次**，见 §3.5「人格 / 自定义提示词」/ §11 规则 66）—— 「可配置」与「进固定前缀」这两件事必须同时成立，别为了让用户能改就把它挪进消息侧。**2026-09-29（L6 降本）在这两块各加了一条**：`PERSONA_AND_STYLE` 加「输出纪律」（只把输出 token 花在答案上：无开场白 / 不预告工具调用 / 不复述刚读到的内容 / 只答被问的 / 不贴回用户已能看到的正文），`SYSTEM_PROMPT` 加「批量化」（互不依赖的读 / 搜放进**同一次响应**）。两条都是**与请求无关的常量** ⇒ 位置纪律不变、仍进固定前缀；实测见 §9.1 结论 7（**输出纪律 -41%，批量化未生效**）。改这两块会**打掉一次端点侧缓存**（每台机器每套前缀各一次，不是每次提问都付）—— 别因为怕掉缓存就把新句子挪进用户消息。
       - **条件块**（`## Debugging Methodology` / `## TDD Requirement` / `## Code Review Pipeline` —— 按 query 关键词命中）**只能留在用户消息里**，因为随 query 变；搬进系统提示词会让提示词每轮都变、把整个固定前缀打掉（比不搬更糟）。
       - **为什么这条是硬约束**：原本两块固定文案（1153 字符 ≈ 288 token）由前端 `buildSystemPromptHint()` 拼在**每条用户消息最前面**，位置决定了它**每次提问都必然未命中**（新用户消息天生不在上一轮缓存前缀里）。实测纯问答类提问的首请求未命中量 `in = 236 / 289 / 313` token 与它几乎相等 ⇒ **首请求未命中的约 90% 就是这两块**。搬进系统提示词后它们进入固定前缀，从此零未命中。
       - 守门测试：`core-agent` 的 `system_prompt_is_stable_and_carries_persona`（同一 cwd 下逐字节可复现 + 两块文案确实在提示词里）。**前端 `buildSystemPromptHint()` 返回空串是合法状态**（不含关键词的提问就是空），`wrappedQuery` 与 `cleanUserContent()` 都按「没有 `\n\n---\n\n` 分隔符」处理。
@@ -1925,7 +2262,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **明确不加的旗标**：`--disable-gpu`（会去掉 gpu-process 省 ~11 MB，但代价是软件光栅化，而本 UI 有 10 处 `backdrop-filter: blur()`）、`--single-process`（WebView2 不支持）、`--in-process-gpu`（**不在** Microsoft 官方旗标表里）。三者的评估记录见 [architecture-rendering.md](./architecture-rendering.md) §4.3。
     - **为什么**：这类变量**极易被外部预设**，而 `is_err()` 守卫会让注入**完全静默地失效**。实测（2026-09-18）：`HKCU\Environment` 里存在 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = --remote-debugging-port=9222`，于是浏览器进程命令行里**只有** WebView2 自带的 `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`，我们的 `--disable-features=PermissionPrompt,ClipboardContentRead` **根本不在** ⇒ 剪贴板权限弹窗抑制、`navigator.clipboard.read()` 禁用**一直是摆设**，且日志、界面、退出码**全都没有任何异常**。
     - **与规则 36 的区别**：`WEBVIEW2_USER_DATA_FOLDER` 是「一旦被预设就整体接管、无法合并」，所以那里的正确做法是**告警留痕**；命令行参数**可以拼接**，所以必须拼接。两条规则合起来是同一句话：**外部预设 env 时，既不能静默失效，也不能假装无事发生**。
-    - **Chromium 侧的依据**：解析 argv 时重复的 `--disable-features` 逐项逗号合并（union），所以追加同名 switch 不会挤掉 WebView2 自带的那份。**这一条必须靠实测复核**（见 architecture-rendering.md §6 的 `disable-feat` 字段）：若发现我们的串**挤掉了** WebView2 自带值 ⇒ 改为「并入同一个 switch 的值」。
+    - **Chromium 侧的依据 + 已实测复核（2026-09-29）**：解析 argv 时重复的 `--disable-features` 逐项逗号合并（union），所以追加同名 switch **不会**挤掉 WebView2 自带的那份。**实测取证**（dev 实例 `lunac.exe` → WebView2 浏览器进程，读 `Win32_Process.CommandLine`）：浏览器进程拿到的 `--disable-features` 是 **`msWebOOUI,msPdfOOUI,msSmartScreenProtection,PermissionPrompt,ClipboardContentRead`** —— 五条**全在**（子进程里顺序会重排成 `ClipboardContentRead,PermissionPrompt,msPdfOOUI,msSmartScreenProtection,msWebOOUI`，同一个集合），同一命令行上 `--js-flags=--scavenger_max_new_space_capacity_mb=8` 也在。⇒ **合并语义成立，不必改成「并入同一个 switch 的值」**（原登记的待复核项已据此关闭）。复跑判据：`Get-CimInstance Win32_Process | ? { $_.Name -like '*webview2*' }` 看 `CommandLine` 里的 `--disable-features`。
     - **顺带的能力**：合并语义使 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 成为一个**免编译的 A/B 入口** —— 在普通 shell 里设成 `--disable-gpu` 再启动即可试旗标，不必重新构建。**注意 Trae 沙箱会拦掉 `D:\Lunac\temp\*` 的写入**，`WebView2` 环境创建直接失败（表现为「进程数为 0」），所以 A/B 必须在**普通 PowerShell** 里跑。
     - **任何时候都要留痕**：合并后 `log::info` 记最终值（对照规则 36 的埋点纪律）。
 39. **摘要式压缩：只在丢弃档触发、失败必须降级（2026-09-18，原 backlog §8.2 —— 已完成）**：机械压缩（瘦身 / 丢弃）**不额外调模型**，是默认且无条件执行的那条路；摘要压缩是它的**可选补强** —— 当丢弃档真的扔掉一大段历史时，花**一次** API 调用把它压成摘要钉回历史开头，而不是只留一句 `TRIMMED_MARKER`。实现：`render_dropped_for_summary()` / `summarize_dropped()` / `pin_summary_of_dropped()`，提示词常量 `SUMMARY_PROMPT`。
@@ -2320,13 +2657,16 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **必须与 `dangerous` / `opaque` 自洽**：命中危险或判不出来的命令**一律**拿不到 `readonly:true`（`is_provably_readonly` 第一件事就是 `rep.is_clean()`）。这条是纵深防御 —— 前端另有优先级，但结论之间不许互相矛盾。
     - **前端缺字段按不放行处理**：只认显式的 `true`（旧 agent 不带该字段）。**不许**退回「缺字段就用本地前缀表兜底」—— 那会把已经修掉的误放行原样还回来。
 
-63. **定价表与成本面板（A12，2026-09-20）**：契约与实测见 §3.5「定价表与成本面板」。**六条不得回退**：
-    - **价格不得写进代码**：单位、币种、四类分档、每个模型一条 —— 全部落在用户可编辑的 `config\pricing.json` 里；**不预置任何价格数字**。要「开箱就有数」的冲动必须压住：填错的单价会把面板变成错误信息的来源，而用户是拿它对账的。
+63. **定价表与成本面板（A12，2026-09-20）**：契约与实测见 §3.5「定价表与成本面板」。**九条不得回退**：
+    - **价格不得写进代码**：单位、币种、四类分档、每个模型一条 —— 全部落在用户可编辑的 `config\pricing.json` 里。**2026-09-29 修订（用户批准）**：原先「**不预置任何价格数字**」的理由是「本仓没逐项核对过官方定价页，凭空填一行看着很像的数会被用户当事实拿去对账」—— **这个前提已经消失**：`DEFAULT_PRICING_JSON` 里的 `deepseek-v4-flash` 峰谷价是**两处独立证据逐项对上的**（官方定价页的峰谷表 × 用户 2026-09-29 真实账单 CSV 反算的单价，结构与汇率都自洽）。所以改成「**预置但有据可核**」，且三条边界不得放松：① **只在文件不存在时写**（`ensure_pricing_file`），用户改过的一个字都不覆盖；② 每个预置模型必须带 `source_url`，并在常量注释里写明依据；③ **没有实测依据的模型不预置**（如 `deepseek-v4-pro`：官方页只有美元价，折算汇率是本机假设）—— 宁可让面板显示「未定价」。预置内容本身也要过 `validate_pricing_text`（守门单测 `default_pricing_json_is_valid`）：预置一份不合法的价表比不预置更糟。
+    - **时段价（分时价，2026-09-29）**：模型条目可带 `time_windows`（数组，每条 `{days?, from, to, 四类价}`），语义是「**基础四类价 = 缺省（谷）价，第一条命中的时段覆盖它**」。**三条不得回退**：① **`from`/`to`/`days` 一律严格校验**（`HH:MM` 两位、`from < to`、`days` 是 1–7 且不重复不空）—— 宽松解析会把用户的意思读成另一个时刻，而这张表是拿来对账的；② **计价必须逐桶**：`read_usage_range` 返回的 `models[].hours[]` 是「同一批 token 按本地小时再切一刀」（逐桶之和恒等于总量），前端的 `priceAt()` 逐桶取价，**不许**拿总量乘某一个价（那等于把分时价抹平）；③ **本地时刻靠调用方给的 `utc_offset_minutes`**（东八区 480）—— Rust 侧没有时区库，**不许**为此引入 chrono，也不许把 `ts` 当本地时间直接用。
     - **金额必须逐模型算**：`read_usage_range` 的返回带 `models[]`，绝不能只按天合计（一天里换过模型 = 两个单价被混算）。任何「反正只有几厘，按天算就行」的简化都是错的。
-    - **没价格就不算，不许当 0**：未定价的模型只标「未定价」并单列提示、金额前缀 `≥`。**禁止**用当前模型的单价代替缺失模型的单价，也禁止把缺失当 0 —— 两种都会让面板显示一个看起来很确定的假数字。
+    - **没价格就不算，不许当 0**：未定价的模型只标「未定价」并单列提示、金额前缀 `≥`。**禁止**用当前模型的单价代替缺失模型的单价，也禁止把缺失当 0 —— 两种都会让面板显示一个看起来很确定的假数字。**空模型名（历史记录）要显示成「未记录模型名」**，不许复用 `modelLabel` 的 `—`：那与「值缺失」的占位符同形，`未定价：—` 读起来正好是反的。
     - **候选与正式必须分成两个文件**：agent 只能写候选（`lunac-pricing.pending.json`），确认动作**只由用户在面板上点**。**不许**让 agent 直接改 `config\pricing.json`（提示词里也明写了这条），也不许给「自动确认」留开关。
     - **候选文件的落点是 agent 的工作目录**，不是 `config\`：配了工作区时写 `config\` 会被 `tools::guard()` 直接拒（实测见 §3.5）。改这个落点前必须先确认「agent 在工作区锁下仍写得进去」。
     - **校验不过一个字都不写**：`commit_pricing_pending` 先 `validate_pricing_text` 再覆盖；「缺字段」也算非法（金额会悄悄少算一块）。候选文件缺失时**报错**，不许静默当成「没有变化」。
+    - **表格与数据只在表盘展开面板里，设置里只剩按钮**（2026-09-29 定）：逐日表格（含总计行）+ 价格表时间 / 未定价 / 候选路径全部落在 `#token-usage-panel`（点主界面 `#token-dashboard` 向上弹出）；设置面板那一节只留「打开价格表 / 更新价格」与候选价格确认。**别把这些数字搬回设置**：设置打开时看不见对话，而这些数字要在对话进行中刷新（`updateTokenDashboard` → `refreshTokenUsagePanel`，单飞 + 追最新）。面板里**只放数据不放说明文字**（用户原话「只是移入数据，并不是移入说明」）。
+    - **算法只许一份，总计行由它算出来**：金额 / 合计 / 格式化只有 [usage-cost.ts](file:///d:/cc/claude-code-cli-master/app/src/usage-cost.ts) 一份实现，两个宿主都 import 它；逐日表格的 `<tfoot>` 总计行取 `sumUsageCost()`（**禁止**在渲染时把已渲染的行再加一遍 —— 那是同一个值的第二份实现，迟早会与逐日行对不上）。
 
 64. **会话 id 与 rewind（A11，2026-09-20）**：契约与实测见 §3.5「会话 id 与 rewind」。`session_id` 从**恒为 `""`** 改成**真值**，回退点从「用户轮」扩到**任意消息**。**六条不得回退**：
     - **`session_id` 的语义是「一次 agent 运行」，不是「一段对话」**：形态 `sess_<pid>_<启动时刻 epoch 毫秒>`，`OnceLock` 进程内恒定（不引 chrono / uuid）。宿主每次重启 agent（换模型 / 换思考档 / 换工作区 / 回退时取消流式）就是**新会话**。**禁止**把它当会话持久化的键：对话仍由前端 `chatHistory` + `chat.db` 决定，上下文仍由 `set_history` 灌（规则 30）—— 这个 id **只负责归因**。
@@ -2370,6 +2710,16 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **搬出主线程后要让「共享资源」自己排队**：主线程天然串行的东西，搬走后会变成真并发，于是暴露出原本被串行掩盖的竞态。本仓实测（2026-09-22）：`get_app_icon` 搬走当天，**新进程里第一批并发图标请求只回来 1/6**（同一批之后再跑 4 次都是 6/6），而搬走前的同步版本新进程第一批就是 6/6 ⇒ 是并发踩的，不是路径的问题。修法**不是退回主线程**，而是在共享资源的**唯一入口**加进程内串行闸（`icon_extractor::ICON_LOCK`，同时管住 `get_app_icon` 与 `get_file_thumbnail` 的图标回落）—— 请求在阻塞池里排队，主线程照样不被占。同类资源（GDI / 剪贴板 / 单实例句柄）搬之前先问一句「这东西并发调用安全吗」。
     - **唯一的例外要写明理由**：`run_ocr` 是 WinRT（`Windows.Media.Ocr`）调用，WinRT 的激活与 `IAsyncOperation::get()` 要求调用线程**先初始化过套间**，而 windows 0.58 没提供 `initialize_mta()` ⇒ 它留在主线程（且前端当前不调它，图片识别走 `run_paddle_ocr`）。**新增例外必须在命令头注释里写清「为什么不能搬」，否则按本条处理。**
     - **回归口径**：同一场景下用探针看**页面心跳无一次 > 120ms**（探针口径见 §9.1 与本条实测行）。只跑 `cargo test` 绿**不算**通过 —— 单测跑在测试线程里，天然看不见「主线程被冻住」。
+
+69. **翻译插件（2026-09-29）**：契约与实测见 §4.9。用户要的是「**词典做底座 + 模型补漏 + 译文存数据库（避免二次翻译）**」。**八条不得回退**：
+    - **免 key 源必须实测选，不许照记忆写**：Google 的免 key 端点在本机**不通**（curl 000）⇒ 不实现，写成「首选 + 失败降级」只会让每次查询先白等一个超时。当前实现是 MyMemory（译文）+ 有道 jsonapi（词条详情）。**加新源之前先跑一次真机 `curl`**，并把结果写回 §4.9 那张表。
+    - **源语言判定在本地做**，不用对方的 `Autodetect`（实测不可靠：`hello world` 被原样返回）。`detect_lang()` 只判「含不含 CJK」，用户显式选了源语言就不猜。
+    - **`translate_lookup` 除空输入 / 超长外永不 Err**：网络故障、被反爬、额度用尽都只是「这次没查到」⇒ 返回 `source: "none"`。**禁止**把它变成一行红色错误 —— 那会把「对方今天不通」说成「你这个词有问题」。HTTP 200 + 正文极短的判据同预检 #41（**别去改解析正则**）。
+    - **花钱的动作只能由用户点**：`translate_ai` 只挂在结果出来后那两个按钮上（查不到→「用 AI 翻译」，查到了→「用 AI 重新翻译」），**不许**做成「词典没有就自动问模型」。
+    - **模型报错只给「用户能做什么」**：`401/403`→凭据、`404`→端点或模型名、`429`→太频繁、`5xx`→稍后再试；**状态码与响应体只进日志**（预检 #40 ③）。
+    - **缓存键含语言对、且只缓存有内容的结果**：`"源语言\u{1}目标语言\u{1}原文"` —— 只按原文做键会把 `hello` 的英译中结果当成它的中译英原文查回来。查不到的**不写缓存**：写进去等于把一个还没收录的词永久钉死成查不到。
+    - **模型补漏用的是 agent 的凭据与端点**（`commands::ai_credentials()` / `commands::agent_endpoint()`，两处都是 `pub(crate)` 共用）—— **禁止**在 translate.rs 里自己再读一遍 `config\ai.json` 或自己拼 URL，那会造出第二份「AI 配置是什么」的真相（2026-09-15 那次 401 的成因）。
+    - **每次打开都按搜索栏那串查询重建面板**（`main.ts` 的 `skipRestore` 里必须留着 `translate`）：面板带着「待译内容」，若随别家一起恢复缓存 HTML，这次的查询会被悄悄丢掉 —— 第一次点开有预填、第二次没有。预填写进输入框前要剥掉开头的调用词（整串就是调用词 ⇒ 空；`translator` 这类前缀**不是**调用词 ⇒ 原样留）。
 
 ## 12. Agent Plan 模式规范
 
@@ -2499,7 +2849,7 @@ git add ... && git commit -m "feat: ..."
 - **成本与误报的闸门**：`RegexSet` 先跑一遍（绝大多数内容一个 pattern 都不命中 ⇒ 零额外成本返回）；通用赋值规则要**同时**满足「键名含 key/secret/token/passwd/password/credential + 赋值到行尾 + 值不是占位符」三道闸；单次最多**报** 5 条、每条规则最多**采集** 200 条、超 512 KB 只扫前段并在文案里**如实上报**「只扫了前 512 KB」。
 - **展示通道**：审批卡的 `analysis.secrets`（`[{rule, line}]`，与危险命令的 `analysis.dangerous` 同一字段家族，见 §11 规则 26 与规则 58）。前端 `classifyRequest()` 把它当**「必须人看」**这一档：不自动放行、不给「始终允许」、任何档位（含「自动」）都弹卡，并在卡片正文里**可见地**列出命中项（不是只放 tooltip）。
 - **两个方向别混**：`bash_safety.rs` 扫**命令**、在**执行前**判定；`content_safety.rs` 扫**文件内容**、在**写入前**判定。规则集互不通用。
-- **仍未做的部分**：`tool_result` 侧的警告渲染层（`securityWarnings` 色块）—— 现在只有审批卡这一条通道，工具返回文本里只有一句给**模型**看的提示（`tools.rs` 的 `secret_note()`，见 §19.4）。
+- **仍未做的部分**：`tool_result` 侧的警告渲染层（`securityWarnings` 色块）—— 现在只有审批卡这一条通道，工具返回文本里只有一句给**模型**看的提示（`tools.rs` 的 `secret_note()`，见 §19.2）。
 
 ### 13.2 会话文件清理服务（设想：`track` / `quick` / `cleanupSession`）
 
@@ -2790,60 +3140,34 @@ Agent 输出面向用户的文本时自动应用：发布说明、PR 描述、�
 
 ---
 
-## 18. 插件发现架构参考（**未落地**，只记要点）
+## 18. 插件发现架构（已落地，正文不在此）
 
-*来源：Hermes Agent 的 `context_engine/__init__.py` 与 `cron_providers/__init__.py` 的插件加载模式。*
-
-Hermes 那边的做法（Python 专属细节已省略）：**双目录扫描**（内置 `bundled-plugins/` 优先 + 用户 `plugins/`）→ 每个插件目录有入口文件与 `register(ctx)` → 优先函数式注册、回退类实例化 → 用虚拟 `sys.modules` 条目让插件内的相对导入可用 → 预加载子模块避免运行时 `ImportError`。
-
-**Lunac 的对应现状**：前端插件系统（`app/src/plugins/registry.ts`）只有**关键词匹配 + 评分排序 + 内置注册** —— **没有**动态加载、没有用户插件目录、没有生命周期钩子。
-
-> 这套模式是 [backlog](./agent-feature-backlog.md) **L1 插件市场**的参考之一。真要做时**先设计 Lunac 自己的落点**（TS 模块的入口约定、CSP 下的依赖打包方式、生命周期钩子的边界），**不要照搬** Python 的 `sys.modules` 手法。
+Lunac 的插件加载**不是** Hermes 那种「双目录 + `register(ctx)` + `sys.modules` 手法」。真实形态：目录扫描（`<exe 根>\Modules\<id>\` + `lunac-plugin.json`）→ 已编译的 ESM 入口经 **asset 协议** `import()` → 插件自己导出 `attach` / `detach`。**契约见 §3.5「插件市场」，纪律见 §11 规则 67。**
 
 ---
 
-## 19. Hermes 方法论的前端接入（现状）
+## 19. Hermes 方法论的前端接入（**只剩两项没做完**）
 
-> 本节原先是一份「前端集成规范」，其中多数条目**早已落地**，但文档一直没标 —— 2026-09-19 逐条实测后按「已落地 / 未落地」重写。**未落地的两项已挪进 [backlog](./agent-feature-backlog.md)。**
+> 本节原是一份「前端集成规范」，其中**已落地的三项**（上下文感知提示词注入 / Humanizer 按钮 / 会话清理）**已从正文删除** —— 规范正文只写「未做完什么」（§10）。它们的正文与纪律在 §11 规则 18 / 23（提示词注入与缓存）、§17（humanize 写作文法）、§13.2（临时产物清理）。
 
-### 19.1 ✅ 上下文感知提示词注入（**部分落地**）
-
-`main.ts` 的 `buildSystemPromptHint(query)` **已实现**：按 query 关键词（debug / TDD / review）拼「调试方法论 / TDD 要求 / 代码审查管道 / 输出风格」四段提示，在构造首条消息时拼进**消息**。
-
-两点提醒（避免误判成「全做完了」）：
-
-- 它是「进**消息**」而**不是**「进系统提示词」—— 正确做法正是如此：系统提示词**必须固定**，否则每轮都变、把固定前缀缓存整个打掉（§11 规则 18 / 23）。
-- 「当前打开的插件 / 当前选中的文件」两类上下文**仍未注入** ⇒ [backlog](./agent-feature-backlog.md) **L3**。工作目录 / 宿主 / 技能目录已由 agent 侧 `env_block()` 拼进系统提示词。
-
-### 19.2 ❌ 调试阶段状态栏（**未落地**）
+### 19.1 ❌ 调试阶段状态栏（**未做**）
 
 原设计：按 `tool_result` 失败推进 `debugPhase`（根因 → 模式 → 假设 → 实现），连续 3 次修复失败后注入一条「停下来质疑架构」的消息。
 
 - **「3 次修复失败警告」部分已落地**（2026-07-21，见 §11 规则 15 系列）。
 - **分阶段调试状态栏未做**（全仓无 `debugPhase` / 阶段栏代码）⇒ [backlog](./agent-feature-backlog.md) **L4**。
 
-### 19.3 ✅ Humanizer 按钮（**已落地**）
+### 19.2 ⚠️ `tool_result` 侧的安全告警渲染（**未做**，唯一缺口）
 
-`#humanize-btn` 位于 `#chat-input-bar`，仅 Agent 模式下可见；点击后取最后一条助手正文、拼 humanize 提示词、作为新消息发出 —— **真的发起一轮 agent 请求，不是本地空转**。写作文法见 §17。
+**扫描器与审批卡通道都已落地**：`core-agent/src/content_safety.rs` 扫写入内容，命中项经 `analysis.secrets` 进审批卡正文（明细行 + 卡片标题上的命中标记），见 §13.1 与 §11 规则 58。
 
-### 19.4 ⚠️ 「安全告警渲染」—— **两个东西必须分清**
-
-| 东西 | 状态 |
-|---|---|
-| 审批卡的**命令静态安全分析**告警（`agent.static_danger` + `.approval-danger-inline`，数据来自 agent 的 `can_use_tool.analysis`） | ✅ **已落地** |
-| `tool_result` 里**文件内容安全扫描**的警告块（`securityWarnings` 带色块渲染） | ⚠️ **部分落地** —— 扫描器已落地（§13.1 的 `core-agent/src/content_safety.rs`，原 backlog **A6**），但它只接在**审批卡**这条通道上（`analysis.secrets` → 卡片正文的 🔑 明细行 + 卡片标题的 🔑 标记）。`tool_result` 侧**没有**专门的 `securityWarnings` 色块组件；工具返回文本里另有一句**纯文本**提示（`tools.rs` 的 `secret_note()`，既给模型看、也照常显示在工具卡上）。 |
-
-### 19.5 ✅ 会话清理状态（**已落地**）
-
-`closePluginView()` 在会话结束时调 `cleanup_session`（失败静默）。临时产物的整体清理策略与「为什么不需要分类清理服务」见 §13.2。
-
-> **19.6「待实现清单」已撤下**：4 条里 **Humanizer 按钮与安全警告块实测早已落地**（此前漏标，这里更正），另 2 条（调试阶段状态栏 / 上下文注入的剩余子集）已挪进 [backlog](./agent-feature-backlog.md) L3 / L4。**规范正文不再保留待办清单**（见 §10 的维护纪律）。
+**缺的是 `tool_result` 侧那块色块**：工具返回文本里现在只有一句给**模型**看的纯文本提示（`tools.rs` 的 `secret_note()`，也照常显示在工具卡上），前端**没有** `securityWarnings` 组件 ⇒ 工具卡上不会把命中项显式标出来。
 
 ---
 
 ## 20. 用户自定义 Agent 工具 / 技能
 
-> **本节原为「双路径执行计划」，2026-09-19 收敛**：路径 1 已落地、不再需要计划；路径 2 挪进 [backlog](./agent-feature-backlog.md) **L1**。
+> **本节原为「双路径执行计划」，2026-09-19 收敛**：**两条路径都已落地** —— 路径 1 = MCP 桥接层（见 20.1，其中「仍未做的」见下），路径 2 = 前端插件市场（见 §3.5「插件市场」/ §11 规则 67，本节不再复述）。
 > 原文里两类路径**一律作废**：① `core/...` 一类 —— `core/` 是**本机参考用的旧 CLI 源码**（被 `.gitignore` 排除、**不在仓库里**，`git clone` 下来不会有），所以凡以 `core/plugins/...` 为落点的写法都只表示「参考它的设计、在新宿主重建」，**不是可直接引用的仓库文件**；仓库里真正存在的是 `app/`（前端 + src-tauri）、`core-agent/`（自研 agent 后端）、`vscode-extension/`、`scripts/`、`docs/`、`agent-templates/`；② `%LOCALAPPDATA%\Lunac\...` —— 本项目是**便携式**的，用户资产根 = **exe 所在目录**。若在别处见到 `%LOCALAPPDATA%\Lunac`，它只出现在「删除旧版本遗留目录」的卸载清理里（§11 规则 12），**不是运行时路径**。
 
 ### 20.1 ✅ 路径 1：声明式用户自定义工具（MCP 桥接层）—— **已落地**
@@ -2861,16 +3185,12 @@ Hermes 那边的做法（Python 专属细节已省略）：**双目录扫描**�
 
 **仍未做的**：远程传输（sse / http / ws）、prompts / roots / elicitation / OAuth、`.mcp.json` ⇒ [backlog](./agent-feature-backlog.md) **A13**。
 
-**技能（`skills\`）**：inline 模式已落地（`LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`，渐进披露 + `$ARGUMENTS` 替换）；**fork 模式 2026-09-20 已落地**（frontmatter `context: fork` + `allowed-tools:`，走 `run_subagent()`，见 §3.5 与 §11 规则 57）；**remote 已定论不移植**（旧 CLI 源码在磁盘上不存在 + 依赖 `akiBackend`），剩余缺口只剩「技能自带脚本 / 资源」⇒ backlog **A5**。格式与生效方式见 [agent-implementation.md](./agent-implementation.md) §5。
+**技能（`skills\`）**：inline 模式已落地（`LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`，渐进披露 + `$ARGUMENTS` 替换）；**fork 模式 2026-09-20 已落地**（frontmatter `context: fork` + `allowed-tools:`，走 `run_subagent()`，见 §3.5 与 §11 规则 57）；**remote 已定论不移植**（旧 CLI 源码在磁盘上不存在 + 依赖 `akiBackend`）；**技能自带脚本 / 资源已落地**（调用 `Skill` 时随返回值一并附上）。格式与生效方式见 [agent-implementation.md](./agent-implementation.md) §5。
 
-### 20.2 ❌ 路径 2：插件市场 —— **未落地**
+### 20.2 ✅ 路径 2：插件市场（**已落地**）
 
-方向与**三条硬约束**（CSP `script-src 'self'` / Cubism 资产授权 / 常驻画布开销）见 [backlog](./agent-feature-backlog.md) **L1**。
+前端插件市场（`Modules\` 扫盘 + `lunac-plugin.json` + asset 协议 `import()` + 市场索引与 zip 安装）：**正文见 §3.5「插件市场」、纪律见 §11 规则 67**，本节不再复述。三条硬约束（CSP `script-src 'self'` / Cubism 资产授权 / 常驻画布开销）在讨论**桌宠**时仍然适用 —— 那一条还挂在 [backlog](./agent-feature-backlog.md) **L1**。
 
-**当前社区扩展的唯一可用形态**就是 20.1 的 MCP 桥 + `agent-templates/`（`skills/` 与 `tools/` 各一份 `.example` 模板）—— 用户手工放进 `<exe 根>\skills\` / `tools\`。
-
----
-
-*本文件整理说明（2026-09-19）：撤下 §9 的「已关闭问题」存档、§9.1 的长篇调研叙事（结论保留）、§10 待办路线、§13 的落点设想表、§18 的 Python 实现细节、§19.6 待实现清单、§20 的双路径详细计划。**未完成项全部并入 [agent-feature-backlog.md](./agent-feature-backlog.md)（唯一待办真相源）**；§11–§17 的**原有规则一条未删、未改**，只在 §11 末尾**新增规则 51（新增按钮必须有主题样式）与规则 52（文档结构纪律）**。*
+**另一条社区扩展形态**（一直可用、与插件市场并存）：20.1 的 MCP 桥 + `agent-templates/`（`skills/` 与 `tools/` 各一份 `.example` 模板），用户手工放进 `<exe 根>\skills\` / `tools\`。
 
 

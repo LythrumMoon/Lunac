@@ -26,6 +26,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
@@ -120,11 +121,24 @@ fn qenc(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, QUERY_ENC).to_string()
 }
 
+/// 进程内共用的 HTTP 客户端。**必须复用**：
+///
+/// 每次 `Client::builder().build()` 都是一个**全新的连接池**（新 TLS 会话、新握手），
+/// 而音乐面板的每个动作 / 每秒那轮进度轮询都要打一次 Web API ——
+/// 2026-09-29 实测延迟里很大一块就是反复重建客户端与 TLS 握手。
+/// 复用一个进程级 client 后，同域名的连接会被池子接走（keep-alive），
+/// 顺带把「每次动作到功能之间那段延迟」压下来。
+static HTTP_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+
 fn http() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| format!("HTTP client: {e}"))
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(12))
+                .build()
+                .map_err(|e| format!("HTTP client: {e}"))
+        })
+        .clone()
 }
 
 // ── 配置（<exe 根>\config\music.json）─────────────────────────────
@@ -214,22 +228,44 @@ impl MusicConfig {
     }
 }
 
+/// 配置的内存缓存（进程内唯一真相源之一，另一个是真磁盘文件）。
+///
+/// **为什么必须有**：`load_config()` 在音乐模块里被调 30+ 次，其中大半在每秒那轮
+/// 进度轮询的路径上（`spotify_status` → 取 token → `load_config`）。每次读盘 + 反序列化
+/// 在「每次动作都很慢」体感里是实打实的一份。这里读一次就记住，
+/// **`save_config` 写盘成功后同步更新缓存** —— 否则同一进程内会读到旧值。
+static CONFIG_CACHE: Mutex<Option<MusicConfig>> = Mutex::new(None);
+
 fn load_config() -> MusicConfig {
-    match std::fs::read_to_string(music_config_path()) {
+    if let Ok(guard) = CONFIG_CACHE.lock() {
+        if let Some(cfg) = guard.as_ref() {
+            return cfg.clone();
+        }
+    }
+    let cfg = match std::fs::read_to_string(music_config_path()) {
         Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_default(),
         Err(_) => MusicConfig::default(),
+    };
+    if let Ok(mut guard) = CONFIG_CACHE.lock() {
+        *guard = Some(cfg.clone());
     }
+    cfg
 }
 
 /// 落盘。**凭据类文件写失败必须如实报错** —— 否则会重演「面板看着保存成功、
 /// 重启后登录状态没了」这种最难查的问题（与 `set_ai_config` 同一条纪律）。
+/// 写成功后**同步内存缓存**（见 `CONFIG_CACHE`）。
 fn save_config(cfg: &MusicConfig) -> Result<(), String> {
     let path = music_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("写不进 {}：{e}", path.display()))
+    std::fs::write(&path, json).map_err(|e| format!("写不进 {}：{e}", path.display()))?;
+    if let Ok(mut guard) = CONFIG_CACHE.lock() {
+        *guard = Some(cfg.clone());
+    }
+    Ok(())
 }
 
 /// 面板可见的配置视图。**绝不回传令牌**（前端不需要，也就没有泄露面）。
@@ -2250,6 +2286,11 @@ mod win_proc {
 ///    `true`，于是「开机时 Spotify 已经在跑」不构成边沿 —— 那一刻用户并没有在用
 ///    Lunac，弹出窗口与「静默自启」的设计相冲（见 main.rs 里 `--background` 的说明）。
 ///    Spotify 之后关掉再开仍是一次真边沿，照常弹。
+/// 4. **插件没装就不弹**（2026-09-29 加）：音乐已改成**拓展插件**（不随安装包默认安装），
+///    卸载之后 `Modules\music\` 就不在了 —— 这时再自动弹窗只会开出一个没有内容的空壳，
+///    用户看到的是「明明卸了还在弹」。
+///    判据取本机事实：盘上有没有那个目录（不要求清单有效 —— 坏包也仍然该弹，
+///    它的面板会如实写出包坏在哪，比静默什么都不发生有用）。
 pub fn spawn_spotify_watcher(app: AppHandle, silent_start: bool) {
     SPOTIFY_WAS_RUNNING.store(silent_start, Ordering::SeqCst);
     std::thread::spawn(move || loop {
@@ -2257,6 +2298,9 @@ pub fn spawn_spotify_watcher(app: AppHandle, silent_start: bool) {
         let running = spotify_desktop_running();
         let was = SPOTIFY_WAS_RUNNING.swap(running, Ordering::SeqCst);
         if !running || was {
+            continue;
+        }
+        if !music_plugin_installed() {
             continue;
         }
         if crate::plugin_window::is_open(&app, MUSIC_PLUGIN_ID) {
@@ -2267,6 +2311,17 @@ pub fn spawn_spotify_watcher(app: AppHandle, silent_start: bool) {
             Err(e) => crate::log::warn(&format!("spotify: 自动打开音乐插件窗失败（{e}）")),
         }
     });
+}
+
+/// 音乐插件是否装在盘上（`<exe 根>\Modules\music\`）。
+///
+/// 只判**目录在不在**，不解析清单：这条判据的用途是「该不该自动弹窗」，
+/// 而坏包也该弹（面板会写出坏在哪，比静默更诚实）；真正「能不能跑」由前端与
+/// `librespot_status` 各自判定。见 `spawn_spotify_watcher` 第 4 条。
+fn music_plugin_installed() -> bool {
+    crate::plugin_market::plugins_dir()
+        .join(MUSIC_PLUGIN_ID)
+        .is_dir()
 }
 
 // ── 单元测试 ──────────────────────────────────────────────────────

@@ -33,7 +33,7 @@
 | 工具结果 | `.tool-row.tool-ok`（可折叠 `<details>`，正文截 600 字符）/ `.tool-error`（`main.ts` L2654-2680）；连续 3 次失败追加 `.tool-warn` |
 | 回合汇总 | `.turn-footer` + `.turn-tool-count`（成功/失败计数，`main.ts` L4410-4421） |
 | 审批卡 | 已相当完整：批量卡 `.approval-batch-card`、危险命令 `classifyRequest`（L2734）+ `CMD_BLACKLIST`（L2701）高亮并**移除「始终允许」**、只读命令自动放行（**agent 侧 `analysis.readonly`**（A10，2026-09-20 起取代 `BUILTIN_SAFE_PREFIXES`）+ 用户白名单 localStorage `lunac-approve-whitelist`）、连续简单命令合并（L2796/L2819/L2913）、`AskUserQuestion` 专属卡片 |
-| 安全档位 | **后端已就绪、前端零入口**：`set_security_profile`（`commands.rs` L710）无人调用，默认恒为 `project`（ai-spec L241 已记为缺口） |
+| 安全档位 | **已落地到设置面板**（AI 分区，见 §4.4）：面板只广播 `lunac-security-profile-changed`，由 `main.ts` 的 `setSecurityProfile()` 调 `set_security_profile`（`commands.rs`）—— 下发点唯一，与运行方式共用同一条 IPC |
 | 「沙箱」 | 前端不存在该概念与文案 |
 | 主题 | **仅一套固定深色**：`:root` 变量（`styles.css` L4-23）`--surface-glass / --border-glass / --text / --text-dim / --text-muted / --accent / --accent-bg / --accent-border / --green / --red / --yellow / --blue / --radius`；无 `data-theme`、无浅色、无 `prefers-color-scheme` |
 | 图标 | 已遵循 icon-style.md（内联线性 SVG）。emoji 仅作装饰前缀：`💭`(思考) `🔧`(工具) `📋`(待办) `💬`(历史) |
@@ -245,9 +245,9 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 |---|---|---|
 | 写类工具先审批 | `can_use_tool` + 前端审批卡（`--permission-prompt-tool stdio`） | 询问，非隔离 |
 | 工作区锁 | `LUNAC_WORKSPACE_LOCKED=1`，路径词法规范化后越界即拒（审批通过也不放行） | 硬边界（仅文件类工具） |
-| 安全档位 | `security_profile` = `safe`(plan/只读) / `project`(默认) / `full`(忽略工作区锁) | 后端已就绪、前端缺 UI |
+| 安全档位 | `security_profile` = `safe`(plan/只读) / `project`(默认) / `full`(忽略工作区锁) | 策略级；后端与设置面板都已就绪（§4.4） |
 | 危险命令拦截 | `CMD_BLACKLIST` 正则 + 强制手动确认 | 拦截，可绕过 |
-| 命令白名单 | `BUILTIN_SAFE_PREFIXES` + localStorage 白名单 | 提高便利性 |
+| 命令白名单 | 用户 localStorage 白名单（`lunac-approve-whitelist`）；自动放行的判据是 **agent 侧的 `analysis.readonly`** | 便利性。**前端前缀表 `BUILTIN_SAFE_PREFIXES` 2026-09-20 已废弃**（字符串匹配看不见重定向与管道，见 §4.2 末） |
 
 因此 UI 与文案中 **禁止使用「沙箱」一词**，统一叫 **「命令运行方式」** 与 **「文件边界」**。理由：把策略级边界包装成隔离沙箱，会让用户对 `full` 档产生「反正有沙箱兜底」的误判 —— 这是安全承诺的失真。
 
@@ -285,7 +285,7 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 
 ### 4.4 安全档位（补前端入口）
 
-**已落地（2026-09）**：设置面板「AI」分区有**安全档位**下拉（只读 / 项目 / 完全）。下发点是唯一的 —— 面板只广播 `lunac-security-profile-changed`，由 `main.ts` 的 `setSecurityProfile()` 调 `set_security_profile`（见 ai-spec §11 规则 21），与运行方式共用同一条 IPC，避免一次切换重启两遍 agent。与运行方式的关系写成一句说明，避免两个控件语义打架：
+设置面板「AI」分区有**安全档位**下拉（只读 / 项目 / 完全）。下发点是唯一的 —— 面板只广播 `lunac-security-profile-changed`，由 `main.ts` 的 `setSecurityProfile()` 调 `set_security_profile`（见 ai-spec §11 规则 21），与运行方式共用同一条 IPC，避免一次切换重启两遍 agent。与运行方式的关系写成一句说明，避免两个控件语义打架：
 
 - 运行方式 = **问不问**（频率）；
 - 安全档位 = **允不允许**（边界）：只读档直接拒绝写类工具，完全档忽略工作区锁。
@@ -451,8 +451,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 | `hook_event` / `tool_name` / `items` = `[{kind, text, command}]` | `system/hook_note` | **权限 hooks**（A9）的裁决 / 输出 / 失败：`kind` ∈ `block`（拦下）/ `allow`（放行）/ `info`（补充信息）/ `error`（hook 崩了 / 超时 / 输出看不懂 —— **它没有拦任何东西**）。字段名是 `hook_event` 而不是 `event`（后者已被 `stream_event` 占用，形状是对象）。见 ai-spec §3.5「权限 hooks」/ §11 规则 61 | `renderHookNote()`：追加 `details.sys-note`，`block` / `error` 加 `.sys-note-warn` 并**自动展开**（必须看见 —— 静默会让用户「以为装了保护、其实没跑」），`info` / `allow` 中性色、默认折叠；标题 `t("agent.hook_note", {event, n})`、正文逐条 `[kind] text — command`（一个事件挂多个 hook 时靠 `command` 才分得清是谁）。**`items` 为空 ⇒ 什么都不画** |
 | ~~设置面板「权限 hooks」行~~ → **UI 已移除（2026-09-21）** | 无（开发者选项，**常驻可用**） | 开关 = `config\hooks.json` 的 `enabled` 字段（`get_hooks_config` / `set_hooks_enabled`；**缺省即视为 true**，用户不改配置文件就是开着的）。宿主三命令（含 `hooks_file_path`）**保留**，但前端**不得**再接线 | 设置面板里**没有** hooks 分块、没有「打开 hooks.json」按钮（用户原话：「hooks 是作为开发者的一个选项并不需要展示给用户…是否可以常驻开启」）。要看 / 改直接开 `config\hooks.json`；agent 按 mtime 热重载，改完即时生效。上述 `system/hook_note` 的裁决提示**照旧**渲染 —— 不显示开关 ≠ 不告诉用户被拦了 |
 | 「人格 / 自定义提示词」（L2，**2026-09-21 搬到输入栏 ⋯ 菜单**） | 输入栏「更多设置」（`⋯`）下拉的**最后一块**（在工具黑名单之后） | 数据来自 `get_persona`（返回 `{path, text, maxChars}`，`path` = `config\persona.md` 的绝对路径、`text` 缺文件时为空串、`maxChars` = 8000）；保存走 `set_persona(text)`（宿主侧先校验后写，失败返回 `{err}`） | 默认收起 —— 只有 `#chat-persona-label` + 一个「编辑」（`#chat-persona-edit`，`settings.persona_edit`）；点开才显示 `#chat-persona-box`（host 是懒装载：**第一次展开才 `get_persona`**，避免每次开菜单都读盘）。框内：`#chat-persona-hint`（**一句话**）· `#chat-persona-text`（`maxlength` = `maxChars`）· 三个按钮「保存 / 恢复内置 / 重启 AI」（`-save` / `-reset` / `-restart`，后者复用 `window.__lunac_reload_agent`）· 提示行 `#chat-persona-msg`。**不再显示字数计数**（`settings.persona_count` / `persona_path` 两条 i18n 已删）。**提示行每次现查节点**。文案见 ai-spec §3.5「人格 / 自定义提示词」/ §11 规则 66 |
-| 设置面板「用量与成本」分块（A12） | 设置 · AI 分块的**第四块**（在「工具 (MCP)」之后，同样用 `.settings-group-title`） | 数据来自 `get_pricing_state`（正式 + 候选两份定价表的**原文**）与 `read_usage_range(dates)`（近 30 天，日期列表由前端按本地日期算）。金额在**前端**按 `config\pricing.json` 算，分模型计价 | ① 「打开 pricing.json」= `pricing_file_path`（缺文件落空骨架）+ **宿主命令 `open_path()`**（**不是** shell 的 `open()` —— 本地路径会被它的 scope 正则拒掉，见 §3.10）；② 「更新价格」把提示词经 `__lunac_agent_task` 发给 agent（设置面板不自己发消息），安全档位为「只读」时**不发**并说明原因；③ 有候选文件时显示 `.cost-pending` 预览卡（旧值 → 新值 / 新增 / 「确认后失去价格」）+ 确认 / 放弃两个按钮，确认走 `commit_pricing_pending(today)`、放弃走 `discard_pricing_pending`，两者都**重渲染本块**；④ 汇总行 + 按天表格（新的在上）；未定价的模型单列一行黄色提示、金额前缀 `≥`。契约与纪律见 ai-spec §3.5「定价表与成本面板」/ §11 规则 63 |
-| 设置面板「插件」分区的市场段（L1，2026-09-21） | 设置 · 插件分区第二块（`.settings-group-title` = 第三方插件），在只读总览之后 | `list_installed_plugins()`（含坏包：`valid=false` + `error`）与 `plugins_dir_path()`；安装走 `install_plugin_from_url(url)`（**只收 https 的 zip**）、卸载走 `uninstall_plugin(id)`。这些是**自定义 `#[tauri::command]`，不需要 `capabilities/default.json`**（同 §9 末条） | URL 输入框 `#settings-plugin-url` + 安装按钮 `#settings-plugin-install` + 目录列表 `#settings-plugin-dir`（每行 `.settings-market-row`：名称 · 版本 / 来源 / 卸载）+ 提示行 `#settings-plugin-msg` + 目录路径行。卸载是**两段式确认**（复用 `.settings-skill-del-installed` 与 `[data-armed=1]` 红色确认态）。装完 / 卸完要**同时重画两处**：`#settings-plugin-overview`（registry 镜像）+ `#settings-plugin-dir`（目录镜像）。契约与纪律见 ai-spec §3.5「插件市场」/ §11 规则 67 |
+| 设置面板「用量与成本」分块（A12；**2026-09-29 改：设置里只剩两个按钮，数据搬进表盘展开面板**） | 设置 · AI 分块里只有「打开 pricing.json」`#settings-cost-open` + 「更新价格」`#settings-cost-update`；**汇总与逐日表格整体落在主界面「表盘展开面板」**（点状态栏的 token 表盘 → `#token-usage-panel` 在表盘上方展开，见 §3.9 与 ai-spec §3.5「定价表与成本面板」预检 ⑥） | 数据来自 `get_pricing_state`（正式 + 候选两份定价表的**原文**）与 `read_usage_range(dates)`（近 30 天，日期列表由前端按本地日期算；**算法只有一份** = `usage-cost.ts`）。金额在**前端**按 `config\pricing.json` 算，分模型计价 | 设置侧：① 「打开 pricing.json」= `pricing_file_path`（缺文件落空骨架）+ **宿主命令 `open_path()`**（**不是** shell 的 `open()` —— 本地路径会被它的 scope 正则拒掉，见 §3.10）；② 「更新价格」把提示词经 `__lunac_agent_task` 发给 agent（设置面板不自己发消息），安全档位为「只读」时**不发**并说明原因；③ 有候选文件时显示 `.cost-pending` 预览卡（旧值 → 新值 / 新增 / 「确认后失去价格」）+ 确认 / 放弃两个按钮，确认走 `commit_pricing_pending(today)`、放弃走 `discard_pricing_pending`。**面板侧只放数据、不放说明**（用户原话「只是移入数据，并不是移入说明」）：总计行由 `sumUsageCost()` 算，未定价的模型单列一行、金额前缀 `≥`。纪律见 ai-spec §11 规则 63 |
+| 设置面板「插件」分区的市场段（L1；**2026-09-21 二次改版 → 2026-09-29 收敛为一段**） | 设置 · 插件分区**只有一段**「插件市场」（`#settings-plugin-market`，行用 `.settings-market-row`），在只读总览之后 | `list_installed_plugins()`（含坏包：`valid=false` + `error`）与 `plugins_dir_path()` / `fetch_plugin_index()`；安装走 `install_plugin_from_url(url)`（**只收 https 的 zip**）、卸载走 `uninstall_plugin(id)`。这些是**自定义 `#[tauri::command]`，不需要 `capabilities/default.json`**（同 §9 末条） | 每行按钮由**本机事实**决定：已装且能用 ⇒ `[data-open-plugin]`「打开」（第三方多一个 `[data-uninstall-plugin]`；内置没有目录、不给卸载）；装了但包坏 ⇒ 原因行 `.settings-market-broken` + 卸载；没装而索引里有 ⇒ `[data-download-plugin]`「下载」。**内部目录里不得再出现 `#settings-plugin-url` / `#settings-plugin-install` 这个「粘 URL 安装」输入框**（见 §8 复核清单；装机能力保留在宿主 `install_plugin_from_url`，只由市场条目触发）。卸载是**两段式确认**（复用 `.settings-skill-del-installed` 与 `[data-armed=1]` 红色确认态）；装完 / 卸完**立即生效**并重画本表。表在**挂载后**由 `renderMarket()` 填（先本机、后索引），三个按钮**一律事件委托**。契约与纪律见 ai-spec §3.5「插件市场」/ §11 规则 67 |
 - 新增前端 → 后端的调用（如 `set_security_profile` 已有、`log_frontend` 已有）必须参数名与 Rust 签名逐一对齐（code-rules §3.1），并确认是否需要 `capabilities/default.json`（自定义 `#[tauri::command]` 不需要，插件 API 需要）。
 
 ---
