@@ -3336,13 +3336,6 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "플러그인",
     "en": "Plugins",
   },
-  "settings.plugins_hint": {
-    "zh-CN": "已安装的直接「打开」；没装的点「下载」从市场安装。AI 模型 / 技能 / 工具在左侧「AI」。",
-    "zh-TW": "已安裝的直接「開啟」；沒安裝的按「下載」從市場安裝。AI 模型 / 技能 / 工具在左側「AI」。",
-    "ja": "インストール済みは「開く」、未インストールは「ダウンロード」で市場から導入します。AI モデル・スキル・ツールは左の「AI」にあります。",
-    "ko": "설치된 것은 '열기', 설치되지 않은 것은 '다운로드'로 마켓에서 설치합니다. AI 모델·스킬·도구는 왼쪽 'AI'에 있습니다.",
-    "en": "Installed ones open directly; the rest download from the market. AI model, Skills and Tools live under the AI category.",
-  },
   "settings.plugins_market": {
     "zh-CN": "插件市场",
     "zh-TW": "外掛市集",
@@ -3470,11 +3463,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Plugin folder: {path}",
   },
   "settings.plugins_market_hint": {
-    "zh-CN": "插件是可执行代码，装它等于在本机运行它 —— 只装信任来源。下载完立即生效，不必重启 AI。",
-    "zh-TW": "外掛是可執行程式碼，安裝它等於在本機執行它 —— 只安裝信任來源。下載完立即生效，不必重啟 AI。",
-    "ja": "プラグインは実行可能なコードで、入れる = 本機で動かすことです。信頼できる配布元のみ。入れた直後から有効（AI の再起動は不要）。",
-    "ko": "플러그인은 실행 코드이며 설치하면 이 컴퓨터에서 실행됩니다. 신뢰할 수 있는 배포처만 설치하세요. 설치 즉시 적용됩니다(AI 재시작 불필요).",
-    "en": "A plugin is executable code — installing it means running it on this machine, so only install from sources you trust. It takes effect immediately; no AI restart needed.",
+    "zh-CN": "插件是 Lunac 专用的拓展功能模块。",
+    "zh-TW": "外掛是 Lunac 專用的擴充功能模組。",
+    "ja": "プラグインは Lunac 専用の拡張機能モジュールです。",
+    "ko": "플러그인은 Lunac 전용 확장 기능 모듈입니다.",
+    "en": "Plugins are extension modules made specifically for Lunac.",
   },
   "settings.plugins_market_no_execute": {
     "zh-CN": "插件 {id} 的入口没有导出 execute 函数",

@@ -135,16 +135,22 @@ $encFiles = Get-ChildItem -Path $root -Recurse -File -Include *.ps1, *.nsi -Erro
 $encBad = 0
 foreach ($f in $encFiles) {
   $b = [IO.File]::ReadAllBytes($f.FullName)
-  $bom = $b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF
-  $doubleBom = $bom -and $b.Length -ge 6 -and $b[3] -eq 0xEF -and $b[4] -eq 0xBB -and $b[5] -eq 0xBF
+  # 数**全部**开头连着的 BOM，不是只判「有没有两份」（2026-09-29 实测踩到 4 份：
+  # 一次批量重存把 4 个脚本各写成 4 份 BOM，而原判据只认「第 4 字节是不是 EF」，
+  # 报出来的话是「有两份」—— 数字不对，读者会以为自己只多了一份）。
+  $bomCount = 0
+  while ($bomCount * 3 + 2 -lt $b.Length -and
+         $b[$bomCount * 3] -eq 0xEF -and $b[$bomCount * 3 + 1] -eq 0xBB -and $b[$bomCount * 3 + 2] -eq 0xBF) {
+    $bomCount++
+  }
   $nonAscii = $false
   foreach ($x in $b) { if ($x -gt 0x7F) { $nonAscii = $true; break } }
   $rel = $f.FullName.Replace("$root\", "")
-  if ($doubleBom) {
-    Bad "$rel 开头有**两份** BOM"
+  if ($bomCount -gt 1) {
+    Bad "$rel 开头有**$bomCount 份** BOM（正确是 1 份）"
     Note "修复: 以 UTF-8 with BOM 重存（首三字节 EF BB BF，第四字节不能又是 EF）"
     $encBad++
-  } elseif ($nonAscii -and -not $bom) {
+  } elseif ($nonAscii -and $bomCount -eq 0) {
     Bad "$rel 含中文但没有 BOM"
     Note "修复: 以 UTF-8 with BOM 重存"
     $encBad++

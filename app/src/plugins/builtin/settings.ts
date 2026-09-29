@@ -1760,7 +1760,6 @@ function buildPluginsPane(): string {
       </div>
       <div class="settings-hint" id="settings-plugin-err"></div>
       <div class="settings-hint" id="settings-plugin-msg"></div>
-      <div class="settings-hint">${t("settings.plugins_hint")}</div>
       <div class="settings-hint" id="settings-plugin-dir-path"></div>
     </div>`;
 }
