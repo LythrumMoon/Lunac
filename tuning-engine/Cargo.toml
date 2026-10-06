@@ -1,0 +1,32 @@
+[package]
+name = "tuning-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Lunac tuning 插件的 DSP 引擎内核 —— 离线可单测的 WAV→DSP→WAV（契约见 docs/ai-spec.md §4.10）"
+
+# 库 + 二进制两个目标：测试打的是 **库**（`src/lib.rs`），CLI 只是一层薄壳。
+# 这条是为了让「引擎内核」能被单测钉死 —— 与 core-agent 那种「全是 bin」的形态不同，
+# 这里的算法必须能从测试里直接调（见 ai-spec §16 的 TDD 铁律）。
+[lib]
+name = "tuning_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tuning-engine"
+path = "src/main.rs"
+
+[dependencies]
+# 只依赖 serde / serde_json（配置格式自立为 JSON，见 backlog L5）。
+# **刻意不引 FFT / DSP crate**：`src/fft.rs` 是手写的 radix-2，正确性由「对拍朴素 DFT」
+# 钉住 —— 少一条供应链、且这条链路的每个数字都能在测试里追到源头（与 ai-spec §3.5
+# 「可单测的纯函数」同一条纪律）。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# **与 core-agent 不同**：那边是 `opt-level = "z"`（体积优先，产物要随安装包走）。
+# 这里跑的是逐样本的 DSP 内环，性能就是功能 ⇒ 用 O3 + LTO。
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
