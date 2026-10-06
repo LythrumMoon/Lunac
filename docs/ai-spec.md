@@ -3246,13 +3246,13 @@ powershell -ExecutionPolicy Bypass -File build-release.ps1 -NoBump           # �
 
 ### 8.3 开源发布 / 仓库卫生（2026-09）
 
-**当前状态：仓库为 public（`LythrumMoon/Lunac`，2026-09-30 复核）。** 下面几条红线仍然有效（`core/` 与 `cli.exe` 的分发禁令、`.env` 不入库），公开只是让更新源与插件市场的直链变得可用。README 作为对外「详细页」不展示 CLI 相关实现细节。
+**当前状态：仓库为 public（`LythrumMoon/Lunac`，2026-09-30 复核）。** 下面几条红线仍然有效（上游 CLI 源码（`_reference/core/`）与 `cli.exe` 的分发禁令、`.env` 不入库），公开只是让更新源与插件市场的直链变得可用。README 作为对外「详细页」不展示 CLI 相关实现细节。
 
 **红线（违反会造成密钥泄露或侵权，且不可撤销）**：
 
-1. **`core/` 绝不入库** —— `core/` 是上游 Claude Code 源码（`core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。**自研 `core-agent/` 已上线，构建与运行都不再依赖它**，该目录仅作历史参考保留在本地（已 gitignore）。
-2. **`.env` 绝不入库** —— `core/.env` 与 `app/src-tauri/.env`（`AI_API_KEY` 等）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
-3. **大二进制不入库** —— GitHub 单文件硬上限 100MB、仓库 >1GB 告警。以下均已 gitignore：`core/`、`core-agent/target`、`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
+1. **上游 CLI 源码绝不入库** —— 现在的位置是 **`_reference/core/`**（2026-10-06 从仓库根 `core/` 归档进来，分类：⑧ 参考学习目录）。它是上游 Claude Code 源码（`_reference/core/package.json` → `"name": "claude-code-cli"`），公开分发会触发 DMCA。**自研 `core-agent/` 已上线，构建与运行都不再依赖它**，该目录仅作历史参考保留在本地（`_reference/` 整目录已 gitignore）。
+2. **`.env` 绝不入库** —— `_reference/core/.env` 与 `app/src-tauri/.env`（`AI_API_KEY` 等）含真实凭据。密钥一旦进过 commit，即使后续删除仍留在历史中，必须立即作废换新。仅提交 `.env.example` 模板。
+3. **大二进制不入库** —— GitHub 单文件硬上限 100MB、仓库 >1GB 告警。以下均已 gitignore：`_reference/`（含 `core/`）、`core-agent/target`、`app/src-tauri/target`、`target-e2e`、`binaries`、`app/dist`、`ui/dist`、`vscode-extension/out`、`node_modules`、`mingw64`、`paddle-ocr`、`release`、`local-models`。
 4. **上游 `cli.exe` 绝不进安装包** —— `release\Lunac\cli.exe` 是上游 Claude Code CLI 的 bun 编译产物（121MB，VersionInfo：Product=Bun / Company=Oven），与第 1 条同源：**只允许留在本机作历史参考，不得随任何发行包分发**。已发布的 **0.4.0–0.9.0 安装包全都含它**（NSI 曾写 `File "Lunac\cli.exe"`），公开仓库前必须重新打包替换掉这些资产；`build-release.ps1` 已加打包前后双校验（见 §8.2）。
 
 **README 对外页面纪律**：不出现上游 CLI / `cli.exe` 相关说明，不设「快速开始」栏目（构建与自检步骤仅在 `docs/` 与本规范内维护）。
@@ -4020,7 +4020,7 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **做完就删，不标 ✅ 留原地**：「为什么这么做、踩了什么坑」写进 §11 规则 / 代码注释 / Git 记录，**不由待办条目承载**。反例：§9 曾有一张 17 行的「已关闭问题」存档表，纯属噪声。
     - **规范正文只写「是什么 / 为什么 / 不得怎么做」**；现状（已实现能力）归 `agent-implementation.md`，界面规范归 `agent-ui-spec.md`。
     - **§ 号变更靠对照表换算**：backlog 重排后，代码注释与规范里残留的旧编号（如 `backlog §8.3`）**不必逐处回改** —— backlog 头部有「§ 号变更对照」表，按表换算即可。
-    - **`core/` 的含义**：它是**被 `.gitignore` 排除的旧 CLI 参考源码，不在仓库里**（`git clone` 下来不会有）。文档里凡以 `core/...` 为落点的路径，一律理解为「参考它的设计、在新宿主重建」，**别照它去找代码**。
+    - **`core/` 的含义**：它是**被 `.gitignore` 排除的旧 CLI 参考源码，不在仓库里**（`git clone` 下来不会有）。**2026-10-06 起实际位置是 `_reference/core/`**（原先在仓库根 `core/`，已归档进参考资料目录；`_reference/` 整目录 gitignore）。文档里凡以 `core/...` 为落点的路径，一律理解为「参考它的设计、在新宿主重建」，**别照它去找代码**。
 
 53. **往期会话检索与「往期会话索引」注入（2026-09-19，原 backlog A2）**：会话库（`ModuleData\history\chat.db`）的 FTS5 索引**从建库起一直没有调用方**，本轮接上 —— 内置工具 `SessionSearch` + 启动时注入一段索引。契约、通道与实测数据见 §3.5「往期会话检索」。**六条不得回退**：
     - **注入必须是冻结快照、且固定注在 history 开头**：只在 agent 启动时取一次、进程内逐字节不变（规则 18 / 23），2026-10-06 起作为 history **开头的一条 `user` 消息**注入（此前在系统提示词固定段 —— 那样会让每次重启后 system 前缀整个变掉、端点缓存从第 0 个 token 起全 miss）。**禁止**改成「每轮重建」「保存会话后就刷新提示词」或「注在消息尾」（末尾动块结构会踩 `TOOL_BUDGET_HINT` 那条实测红线）—— 代价远大于这点信息量。**幂等判据 = 表头前缀**（`is_context_block_msg`）：`set_history`（回退 / 恢复会话）会整份换掉 history，注过的那条随之消失 ⇒ 下一问必须认出并补回。

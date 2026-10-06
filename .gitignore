@@ -32,8 +32,12 @@ app/src-tauri/binaries/
 # VS Code 扩展的编译输出（源在 vscode-extension/src/）
 vscode-extension/out/
 
-# ── 上游 / 第三方（不随本仓库分发）────────────────────────────
-# core/ = Claude Code CLI 源码与 cli.exe（Anthropic 版权，禁止再分发）
+# ── 参考资料（不随本仓库分发）──────────────────────────────────
+# _reference/ = 学习 / 参考用的第三方源码，**整目录忽略** —— 参考材料不进发行链路。
+#   目前只有 core/（Claude Code CLI 上游源码 + cli.exe；Anthropic 版权，禁止再分发）。
+#   2026-10-06 从仓库根 `core/` 归到这里（分类：⑧ 参考学习目录）。
+_reference/
+# 双保险：任何层级的 core/ 都不许入库（上游 CLI 那份曾经就在仓库根）
 core/
 # 离线 OCR 引擎与模型（体积大）→ 已不随安装包分发：装 `ocr` 插件时由宿主下到
 # <exe 根>\Modules\ocr\paddle-ocr\（见 ai-spec §3.5）。仓库根这一份只给 dev 用

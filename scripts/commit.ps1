@@ -1,4 +1,4 @@
-﻿﻿# scripts/commit.ps1
+﻿# scripts/commit.ps1
 # 本地一键提交：暂存全部变更 → 安全检查 → 提交（可选推送）。
 #
 # 用法:
