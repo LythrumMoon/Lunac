@@ -147,8 +147,11 @@ $Plugins = @{
   # 备份/退出还原 + 5 条命令），本插件只是补上**界面**；librespot 的代理走宿主新命令
   # `librespot_set_proxy`（代理是启动参数，改了要重起进程）。
   # permissions 只有 `layout.takeover`（接管型面板，与 OCR 同一条路）。
+  # ⚠️ **改了这个插件的源码就必须 +1 这里的 version**（预检 #43 ④ / #65 ④）：市场与安装器
+  # 判「有没有更新」只比**不同**。2026-10-06 踩过一次 —— proxy 源码改过之后没动版本号，
+  # 结果「市场里是新内容、装在机器上的还是旧的」而用户端**收不到更新提示**（同一版本号）。
   proxy = @{
-    version      = "0.9.1"
+    version      = "0.9.2"
     name         = "代理"
     description  = "系统代理管理 + 让本机播放（librespot）走代理"
     keywords     = @("代理", "proxy", "系统代理", "梯子", "vpn", "socks5", "http proxy", "clash")
