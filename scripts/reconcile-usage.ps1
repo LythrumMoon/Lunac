@@ -11,7 +11,10 @@
 # 金额口径与仓库唯一实现 app\src\usage-cost.ts 的 priceAt()/dayCost() 完全一致：
 #   ① 本地时刻 = ts + UtcOffsetMinutes（东八区 = 480）；
 #   ② **逐小时桶计价**，绝不「总量 × 某一个价」；
-#   ③ 模型未定价 ⇒ 该桶不算金额、标「未定价」、不计入合计（**不当 0**，不借别的模型单价）。
+#   ③ 模型未定价 ⇒ 该桶不算金额、标「未定价」、不计入合计（**不当 0**，不借别的模型单价）；
+#   ④ **法定节假日全天按基础价（谷价）**：价目表顶层（或模型级覆盖）的 `holidays` 命中的
+#      那一天，`time_windows`（高峰价）一律不适用 —— 官方脚注是「周一至周五**不含中国法定
+#      节假日**才算高峰」。2026-10-02（国庆、周五）实测：漏了这条会把全天按峰价高估。
 #
 # 退出码：0 = 无差异；1 = 存在 DIFF；2 = 用法错误 / 文件读不到 / CSV 表头认不出。
 
@@ -85,13 +88,29 @@ function Get-ModelEntry($pricing, [string]$model) {
     if ($null -eq $prop) { return $null }
     return $prop.Value
 }
-# 该模型在「本地周几 + 本地小时」这一格实际生效的价（分时价：第一条命中覆盖基础价）。
-# 未定价返回 $null；窗口只认整点起点（与本仓库 priceAt 一致）。
-function Get-PriceAt($pricing, [string]$model, [int]$weekday, [int]$hour) {
+# 某模型可用到的**法定节假日集合**（`YYYY-MM-DD`）：模型级 `holidays` 优先，缺省回落顶层。
+# 命中 ⇒ 当天**全天按基础价（谷价）**，时段窗一律不适用（官方脚注：周一至周五**不含中国
+# 法定节假日**才算高峰；2026-10-02 国庆实测就是全天谷价）。返回 Hashtable 便于 O(1) 查。
+function Get-HolidaySet($pricing, $entry) {
+    $src = $null
+    if ($null -ne $entry) { $src = $entry.holidays }
+    if ($null -eq $src -and $null -ne $pricing) { $src = $pricing.holidays }
+    $h = @{}
+    if ($null -ne $src) {
+        foreach ($d in @($src)) { if ($null -ne $d) { $h[[string]$d] = $true } }
+    }
+    return $h
+}
+# 该模型在「本地日期 + 本地小时」这一格实际生效的价（分时价：第一条命中覆盖基础价）。
+# **法定节假日全天直接回基础价**（见 Get-HolidaySet）。未定价返回 $null；窗口只认整点起点
+# （与本仓库 usage-cost.ts 的 priceAt 一致 —— 两边是同一套口径，改一处必须改另一处）。
+function Get-PriceAt($pricing, [string]$model, [string]$date, [int]$hour) {
     $entry = Get-ModelEntry $pricing $model
     if ($null -eq $entry) { return $null }
     $wins = @($entry.time_windows)
-    if ($wins.Count -gt 0) {
+    $hols = Get-HolidaySet $pricing $entry
+    if ($wins.Count -gt 0 -and -not $hols.ContainsKey($date)) {
+        $weekday = Get-IsoWeekday $date
         $mins = $hour * 60
         foreach ($w in $wins) {
             if ($null -eq $w) { continue }
@@ -228,11 +247,9 @@ if ($badLines -gt 0) {
 }
 
 $sorted = @($localBuckets.Values | Sort-Object date, hour, model)
-$weekdayCache = @{}
 foreach ($b in $sorted) {
-    if (-not $weekdayCache.ContainsKey($b.date)) { $weekdayCache[$b.date] = Get-IsoWeekday $b.date }
-    $wd = $weekdayCache[$b.date]
-    $p = Get-PriceAt $pricingFile $b.model $wd $b.hour
+    # 传**日期**而不是周几：法定节假日要按「具体哪一天」判（见 Get-PriceAt）
+    $p = Get-PriceAt $pricingFile $b.model $b.date $b.hour
     if ($null -eq $p) { $b.amt = $null; $b.src = "未定价" }
     else { $b.amt = Calc-Amount $p $b.input $b.cRead $b.cCreate $b.output; $b.src = $p.src }
 }

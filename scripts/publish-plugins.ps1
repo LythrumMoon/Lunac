@@ -48,6 +48,21 @@ if ($LASTEXITCODE -ne 0) { throw "gh 未登录 —— 先跑：`"$gh`" auth logi
 $zips = @(Get-ChildItem $PkgDir -Filter *.zip -ErrorAction SilentlyContinue)
 if ($zips.Count -eq 0) { throw "没有可发布的包（$PkgDir 是空的）—— 先跑 scripts\build-plugins.ps1" }
 
+# 每个插件**只发最高版本的那个包**（2026-10-01 补）：`build-plugins.ps1` 不删旧 zip，
+# 于是换版本后 `plugin-packages\` 里会同时躺着 pet-0.9.8 与 pet-0.9.9。全部拷过去会让
+# `index.json` 出现同一个 id 的两条 —— 用户的市场列表里就是两个「桌宠」，一个有更新一个没有。
+# 判据是**文件名里的版本**（与 build-plugins.ps1 的 `<id>-<x.y.z>.zip` 命名约定绑定）。
+$zips = @($zips |
+  Group-Object { $_.BaseName -replace '-[\d.]+$', '' } |
+  ForEach-Object {
+    $_.Group | Sort-Object { [version]($_.BaseName -replace '^.*-', '') } -Descending | Select-Object -First 1
+  })
+$stale = @(Get-ChildItem $PkgDir -Filter *.zip -ErrorAction SilentlyContinue) |
+  Where-Object { $zips.Name -notcontains $_.Name }
+foreach ($s in $stale) {
+  Write-Host "  跳过旧包 $($s.Name)（已有更新的版本）" -ForegroundColor DarkGray
+}
+
 # ── 1. 克隆 / 更新目标仓库 ─────────────────────────────────────────
 if (Test-Path (Join-Path $WorkDir ".git")) {
   Write-Host "[1/4] 更新已有克隆：$WorkDir" -ForegroundColor Yellow

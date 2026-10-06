@@ -23,7 +23,7 @@ skills\
 - **不跟随符号链接**（既不递归进去也不列出）—— 这样「报出来的路径一定在这个技能目录内」。
 - 这份清单**不进系统提示词**（它有变就会让端点侧的前缀缓存整段作废），只在调用技能时按需附上。
 
-> 想让脚本能被直接执行：正文里写清调用方式（例：`python scripts/run.py <file>`）。执行命令仍走 `Bash` / `PowerShell`，照常弹审批卡。
+> 想让脚本能被直接执行：正文里写清调用方式（例：`python scripts/run.py <file>`）。执行命令仍走 `Cmd` / `PowerShell`，照常弹审批卡。
 
 ## SKILL.md 格式
 
@@ -56,13 +56,26 @@ allowed-tools: Read, Glob, Grep      # 逗号分隔；不写 = 子代理的全�
 所以缺什么信息要写在这儿，或者从 `$ARGUMENTS` 传进去。
 ```
 
-`allowed-tools` 只能从子代理本来就有的内置工具里挑（`Read` / `Write` / `Edit` / `Bash` / `PowerShell` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `AskUserQuestion` / `TodoWrite` / `Skill`）；写了但一个都对不上就是**一件也不给**。系统提示词里这类技能会带 `[subagent]` 标记。
+`allowed-tools` 只能从子代理本来就有的内置工具里挑（`Read` / `Write` / `Edit` / `Cmd` / `PowerShell` / `Glob` / `Grep` / `WebSearch` / `WebFetch` / `AskUserQuestion` / `TodoWrite` / `Skill`）；写了但一个都对不上就是**一件也不给**。系统提示词里这类技能会带 `[subagent]` 标记。
 
 ## 生效方式
 
 - 在 Lunac 设置 ·「技能扩展」面板里增删改 → 面板会自动重启 agent，立即生效。
 - 直接改这个目录的文件 → 需要重启 Lunac（或切换一次思考开关）让 agent 重新扫描。
 - 技能清单**按目录名排序**后拼进提示词（顺序抖动会整段作废端点侧的前缀缓存）。
+
+## 内置技能（出厂就在）
+
+下面这几个是**随安装包发出去**的技能，装完就在 `<exe 根>\skills\` 里、**开箱即可用**（`SKILL.md` 是真名，会被加载）：
+
+| 目录 | 做什么 | 模式 |
+|---|---|---|
+| `code-review\` | 读当前 diff + 相关上下文，出结构化的代码审查问题清单 | fork（派子代理执行，中间过程不进主对话） |
+| `debug\` | 系统化调试：先复现取证、再提假设最小验证、最后改根因 | inline |
+| `commit\` | 读状态与 diff，按仓库既有风格起草并执行一次 git commit | inline |
+| `stuck-guard\` | 命令疑似卡住时的自检与处置：判「在干活 vs 挂了」、该继续还是中止、核对日志 | inline |
+
+它们和用户自己放的技能**完全同等**：不想要就删掉那个目录（升级安装会把它补回来）。`debug` / `commit` 的正文也可以直接改，改成你自己的口味。
 
 ## 关于本目录里的示例
 

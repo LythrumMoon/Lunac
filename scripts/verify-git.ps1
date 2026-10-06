@@ -95,6 +95,8 @@ if (Test-Path $envFile) {
 }
 
 # ── 5. 离线 OCR 引擎（可选）────────────────────────────────────
+# 2026-09-30 起引擎**不随安装包分发**，也不再由宿主自下载：它是 `ocr` 插件清单里的
+# 一条 archive 依赖，装插件时落到 <exe 根>\Modules\ocr\paddle-ocr\（见 ai-spec §3.5）。
 Write-Host "[5/8] 离线 OCR 引擎 paddle-ocr\（可选）" -ForegroundColor Cyan
 $paddleExe = Get-ChildItem -Path (Join-Path $root "paddle-ocr") -Recurse -Filter "PaddleOCR-json.exe" -ErrorAction SilentlyContinue |
   Select-Object -First 1
@@ -102,7 +104,7 @@ if ($paddleExe) {
   Ok "已找到 OCR 引擎: $($paddleExe.FullName)"
 } else {
   Warn "未找到 OCR 引擎（不影响启动）"
-  Note "首次使用 OCR 时界面会提示「下载并安装」；也可先跑 scripts\download-paddle-ocr.ps1"
+  Note "首次使用 OCR 时插件面板会提示「下载并安装」（引擎随插件依赖一起下）；也可以手动解压到 <exe 根>\Modules\ocr\paddle-ocr\"
 }
 
 # ── 6. 开发端口 ─────────────────────────────────────────────────

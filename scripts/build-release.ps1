@@ -12,8 +12,11 @@
 #   5. Build Rust binary (cargo build --release)
 #   6. Copy binaries to release/Lunac/
 #   7. Package VSCode extension (.vsix)
-#   8. Stage PaddleOCR-json for offline OCR
-#   9. Update NSI version + run makensis → Setup.exe
+#   8. Update NSI version + run makensis → Setup.exe
+#
+# 注：PaddleOCR-json **不再随安装包分发**（2026-09-30）—— 引擎改成 `ocr` 插件清单里的
+#     `dependencies[]`（`type = "archive"`），装插件时由宿主下载解压到
+#     `Modules\ocr\paddle-ocr\`（见 plugin_market.rs）。
 
 param(
   [string]$Version = "",
@@ -21,7 +24,30 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $PSCommandPath
+
+# ── BOM 自愈守卫（2026-10-04，见 ai-spec §11 规则 82）──────────────────
+# 开头多一份 BOM 时 PS 5.1 只剥第一份，剩下的 U+FEFF 把首行 `# 注释` 顶成一条命令
+# ⇒ `param()` 不再是脚本首语句 ⇒ **参数静默不绑定**（`-Version` / `-NoBump` 全读成空值），
+# 而报错是「无法将"?#"项识别为 cmdlet」这种看不懂的东西。这种文件**仍能跑到这里**
+# （首行那个错误是非终止的），所以守卫跑得到：就地把自己修回一份 BOM，然后中止。
+# **必须拦在版本同步之前** —— 带着未绑定的 $Version 往下走，六处载体会被写成字符串 "False"。
+$selfPath = $PSCommandPath
+$selfBytes = [IO.File]::ReadAllBytes($selfPath)
+$bomN = 0
+while ($bomN * 3 + 2 -lt $selfBytes.Length -and
+       $selfBytes[$bomN * 3] -eq 0xEF -and $selfBytes[$bomN * 3 + 1] -eq 0xBB -and $selfBytes[$bomN * 3 + 2] -eq 0xBF) { $bomN++ }
+if ($bomN -gt 1) {
+  $fixed = New-Object byte[] ($selfBytes.Length - $bomN * 3 + 3)
+  [Array]::Copy([byte[]](0xEF, 0xBB, 0xBF), 0, $fixed, 0, 3)
+  [Array]::Copy($selfBytes, $bomN * 3, $fixed, 3, $selfBytes.Length - $bomN * 3)
+  [IO.File]::WriteAllBytes($selfPath, $fixed)
+  throw "build-release.ps1 开头有 $bomN 份 BOM（正确是 1 份）—— 已自动修正，请**重新运行**一次（命令行参数要靠重跑才恢复绑定）。"
+}
+# 本脚本住在 `scripts\`，所以仓库根是**再往上一层**（与 build-plugins / publish-plugins /
+# publish-release 三处同一写法）。**只能上跳一次会把 `$Root` 落成 `scripts\`** ——
+# 于是所有 `$Root\app\...` / `$Root\core-agent\...` 全部指到 `scripts\` 底下，
+# 第一步读版本就抛 "package.json not found at …\scripts\app\package.json"。
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # ── makensis 定位（NSIS 可能装在 x64 / x86 Program Files，或已在 PATH 中）──
@@ -42,6 +68,61 @@ Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Lunac Release Build"                    -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+
+# ── 插件暂存守卫（2026-09-30 新增 / 2026-10-01 改成「新鲜度」判据）──────
+# `scripts\lunac-installer.nsi` 的「拓展插件」勾选段用
+# `!if /FileExists "ext-plugins\<id>\lunac-plugin.json"` 读 `release\ext-plugins\`，
+# 而它由 `scripts\build-plugins.ps1` 暂存、`release\` 整体被 gitignore ⇒ 两道**静默**失灵：
+#   ① 忘了先跑 build-plugins.ps1 ⇒ 那些 `!if` 全为假 ⇒ 安装包少掉全部插件勾选项，makensis 不报错；
+#   ② 改了插件源码但没重跑 ⇒ 打进安装包的是**上一版**的插件清单。
+# ② 就是 2026-09-30 用户报的「release 里下载不了 paddle-ocr」：0.9.7 包里的 ocr 清单还是 0.9.6、
+# `dependencies` 为空 ⇒ 装完插件宿主那条命令读到空依赖、立刻返回成功、一个字节都不下。
+#
+# ⚠️ **判据不再比较版本号**（2026-10-01 改）：插件版本已与应用版本解耦（各带各的 version，
+# 见 `scripts\build-plugins.ps1` 的 Get-PluginVersion），所以「暂存 version == 本次构建版本」
+# 这条已经恒不成立。改判**新鲜度**：插件的**源码输入**里只要有比暂存清单更新的文件，
+# 就说明 build-plugins.ps1 没跟上 ⇒ 当场 throw（宁可不打，也不打错）。
+# 这同时覆盖 ① 与 ②，而且与版本号涨不涨**完全无关** —— 正是解耦之后该有的形态。
+#
+# ⚠️ **必须排在「版本同步」之前**（2026-10-03 挪位）：版本同步会**写六处文件**，而它原先在守卫
+# 之前 ⇒ 守卫 throw 时版本号已经被 +1 了 —— 一次失败的构建也把版本偷偷涨了（用户连跑两次
+# 守卫失败，六处版本从 0.9.26 自己涨到 0.9.28）。守卫是纯只读的**前置检查**，没有理由排在写之前。
+# **别把它挪回版本同步之后**（除非同时改成「先算不写、最后统一写」）。
+$StagePlugins = "$Root\release\ext-plugins"
+$PluginSrcRoots = @(
+  "$Root\app\src\plugins",        # 每个插件的源码 + 共用的 host / kinds / registry 等
+  "$Root\app\src\i18n.ts",        # 会被内联进每个 index.js
+  "$Root\app\src\styles.css",     # 同上
+  "$Root\app\vite.plugins.config.ts"
+)
+$PluginSources = @()
+foreach ($sr in $PluginSrcRoots) {
+  if (-not (Test-Path $sr)) { continue }
+  if ((Get-Item $sr).PSIsContainer) {
+    $PluginSources += @(Get-ChildItem -Path $sr -Recurse -File -Include *.ts, *.tsx, *.css -ErrorAction SilentlyContinue)
+  } else {
+    $PluginSources += @(Get-Item $sr)
+  }
+}
+$StagedManifests = @()
+if (Test-Path $StagePlugins) {
+  $StagedManifests = @(Get-ChildItem -Path $StagePlugins -Filter "lunac-plugin.json" -Recurse -File -ErrorAction SilentlyContinue)
+}
+if ($StagedManifests.Count -eq 0) {
+  throw "release\ext-plugins\ 里没有任何插件清单 —— 安装包的拓展插件勾选段会被静默跳过。先运行：powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1"
+}
+$OldestStage = ($StagedManifests | Sort-Object LastWriteTime | Select-Object -First 1).LastWriteTime
+$NewerSources = @($PluginSources | Where-Object { $_.LastWriteTime -gt $OldestStage })
+if ($NewerSources.Count -gt 0) {
+  $names = ($NewerSources | Sort-Object LastWriteTime -Descending | Select-Object -First 8 | ForEach-Object { $_.Name }) -join '、'
+  throw "release\ext-plugins\ 比插件源码旧（最旧的暂存清单 $($OldestStage.ToString('yyyy-MM-dd HH:mm:ss')) 之后又改过源码：$names）—— 会把**上一版**的插件静默打进安装包。先运行：powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1"
+}
+# 版本号只在日志里**如实报出**（它就是市场判「有没有更新」的判据，各插件可以各不相同）
+$vsum = ($StagedManifests | ForEach-Object {
+  ([IO.File]::ReadAllText($_.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json).version
+}) -join ' / '
+Write-Host "  ext-plugins: $($StagedManifests.Count) 个插件，版本 $vsum（不随应用版本）" -ForegroundColor DarkGray
+Write-Host ""
 
 # ── Version：自动递增 + **六处**同步 + 读回确认（2026-09-21 扩）────────
 # 版本号在**六处**各写了一份，只改一处就会产出「安装包叫 0.9.1、exe 属性里还是 0.9.0」
@@ -168,7 +249,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Tool checks ────────────────────────────────────────────────────
-Write-Host "[1/9] Pre-flight checks..." -ForegroundColor Yellow
+Write-Host "[1/8] Pre-flight checks..." -ForegroundColor Yellow
 
 $Checks = @{
   "cargo"    = { cargo --version 2>&1 | Out-Null; $LASTEXITCODE -eq 0 }
@@ -209,7 +290,7 @@ Write-Host ""
 # 2. Kill existing processes (they may hold file locks)
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[2/9] Killing running processes..." -ForegroundColor Yellow
+Write-Host "[2/8] Killing running processes..." -ForegroundColor Yellow
 $Killed = $false
 foreach ($name in @("lunac", "agent")) {
   $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
@@ -228,7 +309,7 @@ Write-Host ""
 # 3. Build web assets (TypeScript + Vite)
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[3/9] Building web assets (tsc + vite)..." -ForegroundColor Yellow
+Write-Host "[3/8] Building web assets (tsc + vite)..." -ForegroundColor Yellow
 Push-Location "$Root\app"
 try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -245,7 +326,7 @@ Write-Host ""
 #    指向 core-agent\target\release\agent.exe，缺文件会让打包失败。
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[4/9] Building agent.exe (cargo build --release, core-agent)..." -ForegroundColor Yellow
+Write-Host "[4/8] Building agent.exe (cargo build --release, core-agent)..." -ForegroundColor Yellow
 Push-Location "$Root\core-agent"
 try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -260,7 +341,7 @@ Write-Host ""
 # 5. Build Rust release binary (lunac.exe)
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[5/9] Building Rust binary (cargo build --release)..." -ForegroundColor Yellow
+Write-Host "[5/8] Building Rust binary (cargo build --release)..." -ForegroundColor Yellow
 Push-Location "$Root\app\src-tauri"
 try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -275,7 +356,7 @@ Write-Host ""
 # 6. Verify & copy binaries to release/Lunac/
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[6/9] Copying binaries to release/Lunac/..." -ForegroundColor Yellow
+Write-Host "[6/8] Copying binaries to release/Lunac/..." -ForegroundColor Yellow
 
 $ReleaseDir = "$Root\release"
 $AppDir     = "$ReleaseDir\Lunac"
@@ -316,11 +397,12 @@ if (Test-Path "$AppDir\cli.exe") {
 }
 
 # ── 技能 / 工具 / 插件模板（agent-templates\ → skills\ + tools\ + Modules\）──
-# 装完就有的目录，用户照着 README 与 .example 抄自己的技能/工具。
-# 刻意只放「不可加载」的形态：
-#   · skills\ 下任何含 SKILL.md 的子目录都会被列进系统提示词
-#   · tools\  下任何 .json 都会被当工具加载
-# 所以模板一律用 .example 后缀，避免污染模型的工具清单与提示词。
+# 装完就有的目录。这里有两类内容，判据是「有没有用真实文件名」：
+#   · **内置技能**（agent-templates\skills\<key>\SKILL.md，2026-10-01 起）：真名 ⇒ 会被
+#     加载、进模型的技能清单。它们本身就是随包送出去的能力（code-review / debug / commit）。
+#   · **模板**（*.example）：故意不叫真名（`_example\SKILL.md.example` /
+#     `example-tool.json.example`），用户照着抄，不会被加载、也不污染工具清单与提示词。
+# tools\ 那一侧**至今只有模板**：任何 .json 都会被当成真实工具加载。
 #
 # **Modules\**（2026-09-28）只有一份 README（插件开发规范）—— 它既给用户看，也是
 # 「让 Lunac 自己写插件」的依据（宿主把该目录与 README 的绝对路径都交给了 agent）。
@@ -350,7 +432,7 @@ Write-Host ""
 $VsixSrc = "$Root\vscode-extension"
 $VsixOut = "$AppDir\lunac.vsix"
 
-Write-Host "[7/9] VSCode extension (.vsix)..." -ForegroundColor Yellow
+Write-Host "[7/8] VSCode extension (.vsix)..." -ForegroundColor Yellow
 
 if (Test-Path $VsixSrc) {
   try {
@@ -421,16 +503,17 @@ if (Test-Path $VsixOut) {
 Write-Host ""
 
 # ═══════════════════════════════════════════════════════════════════
-# 8. Stage PaddleOCR-json (offline OCR engine)
+# 注：PaddleOCR-json 不再打进安装包（2026-09-30）
 # ═══════════════════════════════════════════════════════════════════
-# Priority: 1) copy from local paddle-ocr/  2) download from GitHub
-# Always does a fresh copy — no stale/partial copies from previous builds.
-
-Write-Host "[8/9] PaddleOCR-json (offline OCR)..." -ForegroundColor Yellow
-$PaddleDir = "$AppDir\paddle-ocr"
+# 引擎（`.7z` 约 88MB / 解压约 300MB）改成**插件的依赖**：装 `ocr` 拓展插件时，宿主按清单的
+# `dependencies[]`（`type = "archive"`）下载并解压到 `Modules\ocr\paddle-ocr\`
+# （见 `plugin_market.rs` 的 install_archive_dependency）。两条理由：
+#   · 不为少数人的功能让**所有**用户多下 70MB（压缩后）；
+#   · 卸载插件 = 引擎一起清掉，不再留 300MB 在安装根目录里。
+# 本节现在只剩第 ⑨ 步包内容校验要用的 `Find-SevenZip`，没有任何 staging 动作。
 
 # 定位 7z.exe：优先 Program Files 两处，其次 PATH。找不到返回 $null
-# （步骤 8 解 .7z 与步骤 9 校验包内容都用它）。
+# （第 ⑨ 步用它列包内清单做内容校验 —— NSIS 的文件表是 LZMA 压缩的，扫字节不可靠）。
 function Find-SevenZip {
   $candidates = @(
     "$env:ProgramFiles\7-Zip\7z.exe",
@@ -444,99 +527,15 @@ function Find-SevenZip {
   return $exe
 }
 
-# 解压 .7z：优先 7z.exe，其次系统自带 bsdtar（Windows 10 1803+）。
-# PowerShell 的 Expand-Archive 不支持 7z，而 PaddleOCR-json 的 Windows 资产是 .7z。
-function Expand-SevenZip {
-  param([string]$Archive, [string]$Destination)
-  $exe = Find-SevenZip
-  if ($exe) {
-    & $exe x $Archive "-o$Destination" -y | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "7z exited with code $LASTEXITCODE" }
-    return
-  }
-  & tar -xf $Archive -C $Destination
-  if ($LASTEXITCODE -ne 0) {
-    throw "解压 $Archive 失败：请安装 7-Zip 后重试（tar 返回 $LASTEXITCODE）"
-  }
-}
 
-# Always start clean — remove any stale/partial copy from previous builds.
-# The "Already staged" shortcut was unreliable: if a previous build was
-# interrupted after copying the exe but before models/DLLs, the partial
-# copy would be skipped on next run, producing a broken release folder.
-if (Test-Path $PaddleDir) {
-  Remove-Item -Recurse -Force $PaddleDir
-  Write-Host "  Removed previous paddle-ocr/ (fresh build)" -ForegroundColor DarkGray
-}
 
-# Priority 1: copy from local source (dev repo already has PaddleOCR-json)
-$LocalPaddle = "$Root\paddle-ocr\PaddleOCR-json\PaddleOCR-json_v1.4.1"
-if (Test-Path (Join-Path $LocalPaddle "PaddleOCR-json.exe")) {
-  Write-Host "  Copying from local paddle-ocr/..."
-  # Copy directory CONTENTS (not the wrapper folder itself) to produce flat structure:
-  #   release/Lunac/paddle-ocr/PaddleOCR-json.exe  (not .../PaddleOCR-json_v1.4.1/...)
-  New-Item -ItemType Directory -Path $PaddleDir -Force | Out-Null
-  Copy-Item "$LocalPaddle\*" -Destination $PaddleDir -Recurse -Force
-
-  # Verify key files were copied (exe + models config + core runtime DLLs)
-  $paddleSize = [math]::Round((Get-ChildItem $PaddleDir -Recurse | Measure-Object Length -Sum).Sum / 1MB, 1)
-  $exeExists = Test-Path (Join-Path $PaddleDir "PaddleOCR-json.exe")
-  $modelsExist = Test-Path (Join-Path $PaddleDir "models\config_chinese.txt")
-  $dllExists = Test-Path (Join-Path $PaddleDir "paddle_inference.dll")
-  if ($exeExists -and $modelsExist -and $dllExists) {
-    Write-Host "  Copied ($paddleSize MB) — verified OK" -ForegroundColor Green
-  } else {
-    throw "PaddleOCR-json copy incomplete: exe=$exeExists models=$modelsExist paddle_inference.dll=$dllExists"
-  }
-} else {
-  # Priority 2: download from GitHub releases
-  # NOTE: the v1.4.1 Windows asset is a .7z (no .zip); Expand-Archive cannot read it.
-  $PaddleVersion = "v1.4.1"
-  $PaddleArchive = "PaddleOCR-json_v1.4.1_windows_x64.7z"
-  $PaddleUrl = "https://github.com/hiroi-sora/PaddleOCR-json/releases/download/$PaddleVersion/$PaddleArchive"
-  $TempArchive = "$env:TEMP\$PaddleArchive"
-  $TempExtract = "$env:TEMP\paddle-ocr-extract"
-
-  try {
-    Write-Host "  Downloading $PaddleVersion from GitHub..."
-    Invoke-WebRequest -Uri $PaddleUrl -OutFile $TempArchive -UseBasicParsing
-    Write-Host "  Download complete." -ForegroundColor DarkGray
-
-    if (Test-Path $TempExtract) { Remove-Item -Recurse -Force $TempExtract }
-    New-Item -ItemType Directory -Path $TempExtract -Force | Out-Null
-    Expand-SevenZip -Archive $TempArchive -Destination $TempExtract
-
-    # The archive contains a PaddleOCR-json_v1.4.1/ folder; copy its contents flat
-    New-Item -ItemType Directory -Path $PaddleDir -Force | Out-Null
-    $innerDir = Get-ChildItem -Path $TempExtract -Directory | Select-Object -First 1
-    if ($innerDir) {
-      Copy-Item "$($innerDir.FullName)\*" -Destination $PaddleDir -Recurse -Force
-    } else {
-      Copy-Item "$TempExtract\*" -Destination $PaddleDir -Recurse -Force
-    }
-
-    # Verify
-    $paddleSize = [math]::Round((Get-ChildItem $PaddleDir -Recurse | Measure-Object Length -Sum).Sum / 1MB, 1)
-    if (-not (Test-Path (Join-Path $PaddleDir "PaddleOCR-json.exe"))) {
-      throw "PaddleOCR-json.exe not found after extract"
-    }
-    Write-Host "  Installed ($paddleSize MB) — verified OK" -ForegroundColor Green
-  } catch {
-    Write-Warning "  PaddleOCR-json download failed: $_"
-    Write-Warning "  OCR will not be available in this build."
-    if (Test-Path $PaddleDir) { Remove-Item -Recurse -Force $PaddleDir -ErrorAction SilentlyContinue }
-  } finally {
-    Remove-Item -Recurse -Force $TempExtract -ErrorAction SilentlyContinue
-    Remove-Item $TempArchive -ErrorAction SilentlyContinue
-  }
-}
-Write-Host ""
+# 引擎的下载与解压现在归 `plugin_market.rs` 的 `install_archive_dependency`（插件依赖）。
 
 # ═══════════════════════════════════════════════════════════════════
-# 9. Update NSI version + run makensis → Setup.exe
+# 8. Update NSI version + run makensis → Setup.exe
 # ═══════════════════════════════════════════════════════════════════
 
-Write-Host "[9/9] Running makensis..." -ForegroundColor Yellow
+Write-Host "[8/8] Running makensis..." -ForegroundColor Yellow
 
 # NSI 位于 scripts\（已入库；release\ 整体被 gitignore，放那儿换个克隆就跑不了）。
 # NSI 内部用 `!cd ${__FILEDIR__}\..\release` 自己锚定了源文件目录 —— makensis 解析

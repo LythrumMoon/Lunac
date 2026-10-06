@@ -1,4 +1,4 @@
-﻿# scripts/commit.ps1
+﻿﻿# scripts/commit.ps1
 # 本地一键提交：暂存全部变更 → 安全检查 → 提交（可选推送）。
 #
 # 用法:
@@ -35,6 +35,43 @@ try {
   # ── 0. 必须位于 git 仓库 ────────────────────────────────────────
   git rev-parse --is-inside-work-tree 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail "不是 git 仓库: $Root" }
+
+  # ── 0.5 BOM 归一（2026-10-04，见 ai-spec §11 规则 82）─────────────
+  # 入库前把 scripts\*.ps1 / *.nsi 的 BOM 修成**恰好一份**：编辑工具（含 AI 的
+  # SearchReplace / Write）会反复往上叠 BOM，而多一份就让 `param()` 不再是脚本首语句
+  # ⇒ 参数静默不绑定（build-plugins / build-release / publish-release 三个脚本都这么
+  # 坏过）。这里是整条链路里**唯一**能自动愈合的点 —— 修完照常提交，坏文件不进库。
+  $bomFixed = @()
+  foreach ($f in @(Get-ChildItem (Join-Path $Root "scripts") -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Extension -in ".ps1", ".nsi" })) {
+    $b = [IO.File]::ReadAllBytes($f.FullName)
+    $n = 0
+    while ($n * 3 + 2 -lt $b.Length -and
+           $b[$n * 3] -eq 0xEF -and $b[$n * 3 + 1] -eq 0xBB -and $b[$n * 3 + 2] -eq 0xBF) { $n++ }
+    if ($n -eq 0) {
+      # 少一份同样致命（PS 5.1 / makensis 按 ANSI(GBK) 解码中文 ⇒ 解析失败）——
+      # 只在**含非 ASCII** 时才补：纯 ASCII 的脚本加不加都对。
+      $hasNonAscii = $false
+      foreach ($x in $b) { if ($x -gt 0x7F) { $hasNonAscii = $true; break } }
+      if (-not $hasNonAscii) { continue }
+      $fixed = New-Object byte[] ($b.Length + 3)
+      [Array]::Copy([byte[]](0xEF, 0xBB, 0xBF), 0, $fixed, 0, 3)
+      [Array]::Copy($b, 0, $fixed, 3, $b.Length)
+    } elseif ($n -eq 1) {
+      continue
+    } else {
+      $fixed = New-Object byte[] ($b.Length - $n * 3 + 3)
+      [Array]::Copy([byte[]](0xEF, 0xBB, 0xBF), 0, $fixed, 0, 3)
+      [Array]::Copy($b, $n * 3, $fixed, 3, $b.Length - $n * 3)
+    }
+    [IO.File]::WriteAllBytes($f.FullName, $fixed)
+    $bomFixed += ("{0}（{1} 份 → 1 份）" -f $f.Name, $n)
+  }
+  if ($bomFixed.Count -gt 0) {
+    Write-Host "已自动归一脚本 BOM（见 ai-spec §11 规则 82）：" -ForegroundColor Yellow
+    $bomFixed | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+    Write-Host ""
+  }
 
   # ── 1. 有无变更 ────────────────────────────────────────────────
   $porcelain = @(git status --porcelain)

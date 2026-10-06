@@ -1,5 +1,11 @@
-﻿# Download PaddleOCR-json v1.4.1 for release packaging
-# Called by tauri-build.ps1 → extracts to release/Lunac/paddle-ocr/
+﻿# Download PaddleOCR-json v1.4.1 —— **仅供本机开发用**（2026-09-30 改）
+#
+# ⚠️ 引擎已经**不随安装包分发**：它是 `ocr` 插件清单里的 archive 依赖，装插件时由宿主
+#    下载解压到 `<exe 根>\Modules\ocr\paddle-ocr\`（见 app/src-tauri/src/plugin_market.rs
+#    的 install_archive_dependency 与 ai-spec §3.5）。**打包流程不再调用本脚本**。
+#
+# 那它还有什么用：手工把引擎放到**仓库根**的 `paddle-ocr/`，让 dev 模式下的 OCR 不必先装插件
+# （`paddle_ocr::paddle_ocr_dir` 的第三条查找路径会认 `<repo>\paddle-ocr\`）。
 #
 # NOTE: the v1.4.1 Windows asset is a .7z (there is NO .zip for Windows x64).
 # PowerShell's Expand-Archive cannot read 7z, so use 7-Zip when available and

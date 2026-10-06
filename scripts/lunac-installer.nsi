@@ -10,6 +10,7 @@
 
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
+!include "LogicLib.nsh"
 
 ; ── 源文件解析基准 ────────────────────────────────────────────────
 ; makensis 把 File / OutFile 的相对路径按**本脚本所在目录**解析（不是调用方的 CWD），
@@ -18,9 +19,14 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "0.9.6"
+!define PRODUCT_VERSION "0.9.32"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
+; 升级 / 重装时自动定位**上一版的安装目录**（2026-09-30）：从卸载注册表的
+; `InstallLocation` 读回来；读不到（全新安装，或旧版本没写过这个值）才用上面的缺省。
+; 没有这一条，上次装在 `D:\Lunac` 的用户重装会被装到 `%LOCALAPPDATA%\Lunac`
+; —— 变成**两份安装**、新目录里一份旧数据都没有（历史遗留洞，见 ai-spec §6「升级安装」）。
+InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor lzma
 
@@ -83,6 +89,17 @@ Section "Install" SecCore
   SectionIn RO
   SetOutPath "$INSTDIR"
 
+  ; ── 覆盖前先停掉正在运行的实例（2026-09-30）─────────────────────
+  ; `lunac.exe` 是常驻托盘的，一直在跑；文件被占用时 `File` 写不进去，弹出
+  ; 「Error opening file for writing」。手动装还能点「重试」，**静默更新直接失败** ——
+  ; 所以这一条是自更新链路（updater.rs 拉起 `Setup.exe /S`）的前置条件。
+  ; `Sleep` 是必须的：taskkill 返回时句柄未必已释放，立刻覆盖照样会失败。
+  ; agent.exe 一起杀：它是 lunac 的子进程，但 `/im` 只杀匹配名，不会跟着父进程走。
+  DetailPrint "Stopping running Lunac..."
+  nsExec::ExecToLog 'taskkill /f /im lunac.exe'
+  nsExec::ExecToLog 'taskkill /f /im agent.exe'
+  Sleep 1200
+
   ; Main application
   ; 只有 lunac.exe + 自研 agent.exe —— **不要**把上游 cli.exe 放进来：
   ; 自研 agent 已完全替代它，且它是 Anthropic 版权的编译产物（见 .gitignore），
@@ -91,8 +108,8 @@ Section "Install" SecCore
   File "Lunac\agent.exe"
   File "Lunac\WebView2Loader.dll"
 
-  ; 技能 / 工具目录：README + .example 模板，供用户照抄（见 agent-templates\）。
-  ; 只装模板不装可加载文件 —— *.json 与 SKILL.md 会被 agent 当成真实工具/技能。
+  ; 技能 / 工具目录：内置技能（真 SKILL.md，会被加载）+ README 与 .example 模板（供用户照抄）。
+  ; 判据 = 文件名：`SKILL.md` / `*.json` 会被 agent 当成真实技能 / 工具，`.example` 不会（见 agent-templates\）。
   SetOutPath "$INSTDIR\skills"
   File /r "Lunac\skills\*"
   SetOutPath "$INSTDIR\tools"
@@ -114,13 +131,10 @@ Section "Install" SecCore
     File "Lunac\lunac.vsix"
   !endif
 
-  ; PaddleOCR-json (offline OCR engine) -- auto-downloaded by build-release.ps1 Step 8
-  ; Installed to $INSTDIR\paddle-ocr\ subdirectory (matched by paddle_ocr.rs Priority 1)
-  !if /FileExists "Lunac\paddle-ocr\PaddleOCR-json.exe"
-    SetOutPath "$INSTDIR\paddle-ocr"
-    File /r "Lunac\paddle-ocr\*"
-    SetOutPath "$INSTDIR"
-  !endif
+  ; PaddleOCR-json 引擎**不再随安装包分发**（2026-09-30）：它现在是 `ocr` 插件清单里的一条
+  ; `dependencies[]`（`type = "archive"`），由宿主在装插件时下载解压到 `Modules\ocr\paddle-ocr\`
+  ; （见 plugin_market.rs）。安装包里既不放引擎、这里也不再拷贝。
+  ; **卸载清理要留着**：装过引擎的老版本用户升级后仍需 `nsis-hooks.nsh` 那份 RMDir 清干净。
 
   ; Write uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -145,6 +159,8 @@ Section "Install" SecCore
   ; Registry for Add/Remove Programs
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "DisplayName" "Lunac"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "UninstallString" "$INSTDIR\uninstall.exe"
+  ; 给下一次升级 / 重装定位用（见文件头的 `InstallDirRegKey`）—— 少了它，重装就找不到这儿
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "DisplayIcon" "$INSTDIR\lunac.exe,0"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "Publisher" "Lunac"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "DisplayVersion" "${PRODUCT_VERSION}"
@@ -153,7 +169,7 @@ Section "Install" SecCore
 SectionEnd
 
 ; ── 拓展插件（勾选才装，2026-09-29 用户要求）───────────────────────
-; 规则：拓展插件**不随安装包默认安装**，但安装包里要有勾选项。下面四段都带 `/o`
+; 规则：拓展插件**不随安装包默认安装**，但安装包里要有勾选项。下面五段都带 `/o`
 ; （unselected）⇒ 默认全不装；勾了的会在 `$INSTDIR\Modules\<id>\` 落一份**完整插件**
 ; （index.js + lunac-plugin.json），形状与「从市场装过一遍」完全一致 —— 启动后
 ; `refreshMarketPlugins()` 扫盘即认，用户不必再点一次下载。
@@ -204,6 +220,36 @@ Section /o "Music & lyrics (librespot)" SecExtMusic
     SetOutPath "$INSTDIR"
   !endif
 SectionEnd
+
+; 桌宠（2026-09-30 补）：无依赖（形象由用户自己在控制台里导入，见 ai-spec §4.8），
+; 所以这一段就是纯拷贝。窗口形态由插件清单的 `window` 段声明，安装器不必知道。
+Section /o "Desktop pet" SecExtPet
+  !if /FileExists "ext-plugins\pet\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\pet"
+    File /r "ext-plugins\pet\*"
+    SetOutPath "$INSTDIR"
+  !endif
+SectionEnd
+
+; 代理（2026-10-02 补）：无依赖。它管系统代理与本机播放（librespot）的代理 —— 代理软件
+; 本身由用户自备，插件只是把系统 / librespot 指过去（契约见 ai-spec §4.11）。
+Section /o "Proxy (system + librespot)" SecExtProxy
+  !if /FileExists "ext-plugins\proxy\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\proxy"
+    File /r "ext-plugins\proxy\*"
+    SetOutPath "$INSTDIR"
+  !endif
+SectionEnd
+
+; ── 静默安装 = 自更新：装完把用户带回应用（2026-09-30）───────────────
+; 交互式安装**不**自动拉起（用户自己点「完成」决定要不要开）。`${Silent}` 由 LogicLib
+; 提供（展开成 `IfSilent`，见 NSIS\Include\LogicLib.nsh）；`/S` 由 updater.rs 传入。
+; 放在 `.onInstSuccess` 而不是某个 Section 里：它保证**所有** Section 都写完了才执行。
+Function .onInstSuccess
+  ${If} ${Silent}
+    Exec "$INSTDIR\lunac.exe"
+  ${EndIf}
+FunctionEnd
 
 ; ── Uninstall Section ─────────────────────────────────────────────
 Section "Uninstall"
