@@ -16,6 +16,57 @@ let _onRecordingCaptured: ((e: Event) => void) | null = null;
 let _onRecordingCancelled: (() => void) | null = null;
 let _unlistenHotkeyRecorded: (() => void) | null = null; // Tauri event (for Alt+Space via WndProc)
 
+// ── 软件更新（2026-09-30）─────────────────────────────────────────
+// 与宿主 `src/updater.rs` 的返回结构一一对应（serde 直接序列化，改名要两边一起改）。
+interface UpdateConfig { checkOnStartup: boolean; autoInstall: boolean; }
+interface UpdateStatus { current: string; hasUpdate: boolean; latest: string; notes: string; size: number; }
+interface UpdateProgress { phase: string; downloaded: number; total: number; }
+
+/** 进度要写的那几个节点 —— 每次挂载重指一次（面板关了节点就作废）。
+ *  **监听器只在模块级挂一次**：设置面板每次打开都会重跑 `attachSettingsListeners`，
+ *  在那里 `listen()` 会越叠越多（code-rules §3.3）。 */
+let updateUi: {
+  row: HTMLElement | null;
+  label: HTMLElement | null;
+  /** 环形进度的容器（里面那圈由 `ringHtml()` 画，更新走 `updateRing()`） */
+  ring: HTMLElement | null;
+  speed: HTMLElement | null;
+} | null = null;
+let updateListenerStarted = false;
+/** 速度要跨事件累加（两次上报的差值），所以必须活在监听器外面 —— 放函数里每次都从零算。 */
+const updateMeter = new DownloadMeter();
+
+/** 进度事件：`downloading`（带百分比）→ `verifying` → `installing`。 */
+function ensureUpdateProgressListener(): void {
+  if (updateListenerStarted) return;
+  updateListenerStarted = true;
+  void listen<UpdateProgress>("update-progress", (e) => {
+    const ui = updateUi;
+    if (!ui) return;
+    const p = e.payload;
+    ui.row?.classList.remove("hidden");
+    if (p.phase === "downloading") {
+      const s = updateMeter.push(p.downloaded, p.total);
+      if (ui.ring) updateRing(ui.ring, s.percent);
+      if (ui.speed) ui.speed.textContent = formatSpeed(s.speed);
+      if (ui.label) {
+        ui.label.textContent = s.percent >= 0
+          ? t("settings.update_downloading", { percent: String(s.percent) })
+          : t("settings.update_downloading_unknown", { mb: (p.downloaded / 1048576).toFixed(1) });
+      }
+    } else if (p.phase === "verifying") {
+      // 校验 / 安装这两段没有「进度」可言：把环画满、速度清掉，只留文字说明在干什么
+      if (ui.ring) updateRing(ui.ring, 100);
+      if (ui.speed) ui.speed.textContent = "—";
+      if (ui.label) ui.label.textContent = t("settings.update_verifying");
+    } else if (p.phase === "installing") {
+      if (ui.ring) updateRing(ui.ring, 100);
+      if (ui.speed) ui.speed.textContent = "—";
+      if (ui.label) ui.label.textContent = t("settings.update_installing");
+    }
+  });
+}
+
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
 import { refreshMarketPlugins, fetchPluginIndex, type MarketPluginInfo, type MarketIndexEntry } from "../market";
@@ -23,9 +74,10 @@ import { isBasePlugin, showsInMarket, basePluginOrder } from "../kinds";
 import { detachPluginListeners } from "../attach";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-shell";
 import { t, setLanguage, resetToSystemLanguage, pluginName, pluginDesc } from "../../i18n.js";
-import { installOcrEngine } from "../../ocr-engine.js";
+// 下载进度（小圆圈 + 中间数字 + 实时速度）。**零依赖的公共件** —— OCR 插件那份单独打包的
+// ESM 也要用（见 download-progress.ts 顶部说明）。
+import { DownloadMeter, formatSpeed, ringHtml, updateRing } from "../../download-progress.js";
 // 用量与成本的数据层 / 渲染层（2026-09-29 起与主界面表盘的展开面板共用一份，
 // 逐日表格与价格表数据都搬到了那个面板里，见 usage-cost.ts 顶部注释）。
 import {
@@ -46,8 +98,8 @@ import {
  *  **不能用 `@tauri-apps/plugin-shell` 的 `open()`**：那个命令的入参要过 shell 插件的
  *  open scope 正则，而默认 scope 只放行 URL scheme（`mailto:` / `http(s):` / `tel:`），
  *  本地路径一律被拒 —— 报错原文 `scoped command argument at position 0 was found but
- *  failed regex validation`。此前四处调用点（主题目录 / hooks.json / pricing.json /
- *  技能目录）都把异常吞进 console，用户看到的就是「点了没反应」（2026-09-21 修）。
+ *  failed regex validation`。此前几处调用点（主题目录 / hooks.json / pricing.json）
+ *  都把异常吞进 console，用户看到的就是「点了没反应」（2026-09-21 修）。
  *  走宿主侧还有一条好处：不必放宽 shell 的 open scope ⇒ 第三方插件（它们也能调 `open()`）
  *  仍然只能开 URL。**URL 仍走 `open()`**（那条路本来就能过）。
  *
@@ -139,13 +191,39 @@ function buildGeneralPane(hotkey: string, autoStart: boolean, autoStartStale: bo
         <span class="settings-label">${t("settings.language")}</span>
         ${langSelectHtml}
       </div>
+      <!-- 「安装 OCR 引擎」那一行 2026-09-30 删除（用户要求）：引擎改成 ocr 插件清单里的
+           一条依赖，装插件时由宿主一并下好；补装则在插件面板里点（见 plugins/builtin/ocr.ts）。
+           设置里再留一个人工入口等于同一件事有两个真相源。 -->
+      <!-- 软件更新（2026-09-30）：检查 / 下载 / 静默安装。安装完成会**重启应用**，
+           所以这里不提供「取消」——走到 install 那一步就已经交棒给安装器了。
+           状态文字、环形进度与速度在 attachSettingsListeners 里异步补。 -->
       <div class="settings-row">
-        <span class="settings-label">${t("settings.ocr_engine")}</span>
+        <span class="settings-label">${t("settings.update")}</span>
         <div class="settings-bg-actions">
-          <span id="settings-ocr-status" style="font-size:0.72rem;color:var(--text-dim);margin-right:8px;"></span>
-          <button id="settings-ocr-install" class="settings-btn">${t("ocr.engine_download")}</button>
+          <span id="settings-update-status" class="settings-inline-status"></span>
+          <button id="settings-update-check" class="settings-btn">${t("settings.update_check")}</button>
+          <button id="settings-update-install" class="settings-btn hidden">${t("settings.update_install")}</button>
         </div>
       </div>
+      <!-- 下载进度：小圆圈 + 中间数字 + 实时速度（2026-09-30 换掉了原来的横条） -->
+      <div class="settings-row hidden" id="settings-update-progress">
+        <span class="settings-label" id="settings-update-progress-label"></span>
+        <div class="settings-bg-actions">
+          <span class="dl-speed" id="settings-update-progress-speed">—</span>
+          <span id="settings-update-progress-ring">${ringHtml(-1)}</span>
+        </div>
+      </div>
+      <!-- 自动更新（2026-10-05 合并）：原「启动时自动检查更新」与「自动下载并安装」两个
+           开关合成一个 —— 对普通用户来说这两件事本就是一件事。开 = 启动静默检查 + 发现
+           新版自动下载安装（会拉起安装器并重启应用）；关 = 都不做。默认**开**。 -->
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.update_auto")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="settings-update-auto">
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.update_auto_hint")}</div>
       <!-- 自定义背景已于 2026-09-19 移到「风格」分区（含三项滑块与主题色）。 -->
     </div>`;
 }
@@ -929,7 +1007,17 @@ async function buildSearchPane(): Promise<string> {
 // buildAIPane 与 attachSettingsListeners 共用，避免两处漂移。
 // 接口地址默认不带 /v1 —— 与主流供应商文档一致；agent 端点由
 // agent.exe 启动时在 base 上派生（commands.rs 已处理 /v1 双重路径）。
-interface ModelPreset { name: string; default_model: string; default_url: string; }
+interface ModelPreset {
+  name: string;
+  default_model: string;
+  default_url: string;
+  /** 该供应商的**出图模型**（2026-10-05 由「出图模型 / 出图端点」两个独立字段合并而来）。
+   *  非空 ⇒ 选中该供应商时自动启用 `ImageGen`；空 / 缺省 ⇒ 不出图。 */
+  image_model?: string;
+  /** 出图端点。**与文本端点不同**（出图走 DashScope 专有多点编辑端点），空则由 agent
+   *  用内置默认端点（见 core-agent/src/image.rs 的 `DEFAULT_ENDPOINT`）。 */
+  image_url?: string;
+}
 const PROVIDER_PRESETS: Record<string, ModelPreset> = {
   "openai":       { name: "OpenAI",         default_model: "gpt-5.5",            default_url: "https://api.openai.com" },
   "deepseek":     { name: "DeepSeek",       default_model: "deepseek-flash",     default_url: "https://api.deepseek.com" },
@@ -937,7 +1025,10 @@ const PROVIDER_PRESETS: Record<string, ModelPreset> = {
   "google":       { name: "Google Gemini",  default_model: "gemini-3.6-flash",   default_url: "https://generativelanguage.googleapis.com/v1beta/openai" },
   "zhipu":        { name: "Zhipu GLM",      default_model: "glm-5",              default_url: "https://open.bigmodel.cn/api/paas/v4" },
   "moonshot":     { name: "Moonshot Kimi",  default_model: "kimi-k3",            default_url: "https://api.moonshot.cn" },
-  "qwen":         { name: "Qwen (Tongyi)",  default_model: "qwen3.8-max",        default_url: "https://dashscope.aliyuncs.com/compatible-mode" },
+  // Qwen / DashScope：文本走 compatible-mode；出图走多点编辑端点。key 复用同一把。
+  "qwen":         { name: "Qwen (Tongyi)",  default_model: "qwen3.8-max",        default_url: "https://dashscope.aliyuncs.com/compatible-mode",
+                    image_model: "qwen-image-3.0-pro",
+                    image_url: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation" },
   "siliconflow":  { name: "SiliconFlow",    default_model: "Qwen/Qwen3-235B-A22B", default_url: "https://api.siliconflow.cn" },
   "custom":       { name: "Custom",         default_model: "",                   default_url: "" },
 };
@@ -987,10 +1078,17 @@ function belongsToOtherProvider(model: string, provider: string): boolean {
   return false;
 }
 
-/** AI 模型这一块的**内部内容**（不含 pane 外壳与分块标题）——
- *  由 buildAIPane 组装进「AI」分类。2026-09-19 批 9 起 AI 分类下有三个分块
- *  （AI 模型 / 技能 / 工具），每个分块用与「风格」相同的 .settings-group-title。 */
-function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): string {
+/** AI 模型分块（2026-10-05 精简）。**只剩**：供应商 / 模型 / Base URL / API Key + 保存。
+ *
+ *  用户口径「对 AI 零基础用户做减法」，砍掉：搜索服务商 + 搜索 API 密钥（进阶，WebSearch
+ *  未配时本就会回落免 key 源）、安全档位（改到输入栏「更多设置」⋯ 菜单）、回合自动折叠
+ *  （**固定默认开**）、模型支持图片输入（**固定默认开**，让模型自己判断）、出图模型 /
+ *  出图端点（**并入供应商预设**，见 `PROVIDER_PRESETS` 的 `image_model` / `image_url`：
+ *  选了带出图的供应商就自动带上，不再单列两个字段）。
+ *
+ *  保存时：`search_provider` / `search_key` **原样透传现有值**（界面上没了入口，但不去
+ *  删用户已配的 key）；`vision` 恒 `true`；`image_model` / `image_url` 由所选供应商预设推导。 */
+function buildAIModelSection(provider: string, baseUrl: string, model: string, apiKey: string): string {
   const masked = apiKey ? apiKey.slice(0, 4) + "\u2022\u2022\u2022\u2022" + apiKey.slice(-4) : "";
 
   // Filter out built-in providers the user deleted (persisted hidden-list)
@@ -1065,37 +1163,6 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
     modelOptions.push({ value: "__custom__", label: t("settings.custom_model"), selected: false });
     const modelSelectHtml = renderCustomSelect("settings-model", modelOptions, true);
 
-  // WebSearch 主源服务商（值为 agent 读的 LUNAC_SEARCH_PROVIDER；空 = 只用免 key 兜底源）。
-  // 品牌名不翻译；「不使用」走 i18n。
-  const searchProvSelectHtml = renderCustomSelect("settings-search-provider",
-    [
-      { value: "", label: t("settings.search_provider_none") },
-      { value: "bocha", label: "博查 Bocha" },
-      { value: "tavily", label: "Tavily" },
-      { value: "exa", label: "Exa" },
-      { value: "firecrawl", label: "Firecrawl" },
-    ].map(o => ({ ...o, selected: o.value === searchProvider })));
-
-  // 安全档位（文件边界）：与「运行方式」（问不问）正交，这里是「允不允许」。
-  // 真实下发在 main.ts（单一 invoke 点），本面板只广播选择，见 agent-ui-spec §4.4。
-  let securityProfile = "project";
-  try {
-    const p = localStorage.getItem("lunac-security-profile");
-    if (p === "safe" || p === "full") securityProfile = p;
-  } catch {}
-  const profileSelectHtml = renderCustomSelect("settings-security-profile",
-    [
-      { value: "safe", label: t("settings.security_profile_ro") },
-      { value: "project", label: t("settings.security_profile_project") },
-      { value: "full", label: t("settings.security_profile_full") },
-    ].map(o => ({ ...o, selected: o.value === securityProfile })));
-
-  // 回合结束自动折叠（main.ts 每次都现读，故这里只写 localStorage、不广播）
-  let autofoldOn = true;
-  try {
-    autofoldOn = localStorage.getItem("lunac-agent-autofold") !== "0";
-  } catch {}
-
   return `
       <div class="settings-row">
         <span class="settings-label">${t("settings.provider")}</span>
@@ -1113,57 +1180,25 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         <span class="settings-label">${t("settings.api_key")}</span>
         <input type="password" id="settings-apikey" class="settings-input" autocomplete="off" value="${esc(apiKey)}" placeholder="${masked || 'sk-...'}">
       </div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.search_provider")}</span>
-        ${searchProvSelectHtml}
-      </div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.search_key")}</span>
-        <input type="password" id="settings-searchkey" class="settings-input" autocomplete="off" value="${esc(searchKey)}" placeholder="${esc(t("settings.search_key_hint"))}" title="${esc(t("settings.search_key_hint"))}">
-      </div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.security_profile")}</span>
-        ${profileSelectHtml}
-      </div>
-      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.security_profile_hint")}</div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.agent_autofold")}</span>
-        <label class="settings-toggle">
-          <input type="checkbox" id="settings-autofold" ${autofoldOn ? "checked" : ""}>
-          <span class="settings-toggle-slider"></span>
-        </label>
-      </div>
-      <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.agent_autofold_hint")}</div>
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.ai_vision")}</span>
-        <label class="settings-toggle">
-          <input type="checkbox" id="settings-vision" ${vision ? "checked" : ""}>
-          <span class="settings-toggle-slider"></span>
-        </label>
-      </div>
       <div class="settings-row" style="justify-content: flex-end;">
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
         <span id="settings-save-msg" class="settings-save-msg"></span>
       </div>`;
 }
 
-// ── AI 分类（2026-09-19 批 9：三个分块合成一个分类）────────────────
-/** AI 分类 = **AI 模型 + 技能（Skills）+ 工具（Tools / MCP）+ 用量与成本（A12）**。
- *  用户要求：「将 skills 和 tools 和 ai模型 分类到 ai 分类里，各个分块采用跟
- *  风格里的分块一样」—— 所以各块都用 .settings-group-title（与「风格」的
- *  背景 / 主题颜色 / 主题包 完全同款），侧栏项只剩「AI」这一个。
- *  人格（L2）2026-09-21 已搬出本面板 → 输入栏「更多设置」的 ⋯ 菜单（见 main.ts）。 */
-async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string, searchProvider: string, searchKey: string, vision: boolean): Promise<string> {
-  const [skillsHtml, toolsHtml, costHtml] = await Promise.all([buildSkillsSection(), buildToolsSection(), buildUsageCostSection()]);
+// ── AI 分类（2026-09-19 批 9：多个分块合成一个分类）────────────────
+/** AI 分类 = **AI 模型 + 用量与成本（A12）**。
+ *  2026-10-05 用户要求删掉本分类下的 **技能（Skill Store）** 与 **工具（Tools / MCP）**
+ *  两个分块 —— 它们是给进阶用户看的入口，对 AI 零基础用户只会造成「这个该怎么用」的
+ *  困扰。skill / 工具改为**由 AI 在运行时按需查找或生成**（动手前提醒用户），不再在设置里
+ *  暴露入口。人格（L2）2026-09-21 已搬出本面板 → 输入栏「更多设置」的 ⋯ 菜单（见 main.ts）。 */
+async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string): Promise<string> {
+  const costHtml = await buildUsageCostSection();
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
-      ${buildAIModelSection(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision)}
-      <div class="settings-group-title">${t("settings.skills")}</div>
-      ${skillsHtml}
-      <div class="settings-group-title">${t("settings.group_tools")}</div>
-      ${toolsHtml}
+      ${buildAIModelSection(provider, baseUrl, model, apiKey)}
       <div class="settings-group-title">${t("settings.cost_title")}</div>
       ${costHtml}
     </div>`;
@@ -1363,213 +1398,6 @@ function wireUsageCost(container: HTMLElement): void {
       showMsg(t("settings.cost_failed", { err: String(e) }));
     }
   });
-}
-
-// ── Skill Store (技能扩展) ─────────────────────────────────────
-
-/** 推荐的国内可直连技能/智能体平台入口 */
-const SKILL_SITES: { name: string; desc: string; url: string }[] = [
-  { name: "Coze 扣子", desc: "字节跳动 AI 智能体 / 技能平台", url: "https://www.coze.cn/" },
-  { name: "智谱清言智能体广场", desc: "智谱 AI 智能体 / 技能市场", url: "https://bigmodel.cn/marketplace/index/agent" },
-  { name: "百度文心智能体平台", desc: "百度智能体创作与发布平台", url: "https://agents.baidu.com/" },
-  { name: "腾讯元器", desc: "腾讯智能体创作平台", url: "https://yuanqi.tencent.com/" },
-  { name: "Coze 技能页示例", desc: "xiaping.coze.com — Coze 技能页面", url: "http://xiaping.coze.com/" },
-];
-
-function loadSkillSites(): { name: string; url: string }[] {
-  try {
-    const raw = localStorage.getItem("lunac-skill-sites");
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr.filter((s: any) => s && s.url) : [];
-  } catch { return []; }
-}
-
-function saveSkillSites(list: { name: string; url: string }[]) {
-  try { localStorage.setItem("lunac-skill-sites", JSON.stringify(list)); } catch {}
-}
-
-function skillEntryHtml(name: string, desc: string, url: string, removable: boolean): string {
-  return `
-    <div class="settings-marketplace-item">
-      <div class="settings-marketplace-info">
-        <span class="settings-marketplace-name">${esc(name)}</span>
-        <span class="settings-marketplace-desc">${esc(desc)}</span>
-      </div>
-      <div style="display:flex;gap:6px;flex-shrink:0;">
-        <button class="settings-skill-open" data-url="${esc(url)}">${t("settings.skill_open")}</button>
-        ${removable ? `<button class="settings-skill-del" data-url="${esc(url)}" data-name="${esc(name)}">${t("settings.skill_remove")}</button>` : ""}
-      </div>
-    </div>`;
-}
-
-/** 新建技能编辑器的默认 SKILL.md 模板。 */
-const SKILL_TEMPLATE = `---
-name: my-skill
-description: Describe what this skill does and when it should be used.
----
-
-Write the concrete instructions/steps of this skill here.
-`;
-
-/** 已安装技能行 HTML（buildSkillsPane 初次渲染与操作后重渲染共用）。 */
-function installedSkillRowHtml(s: { name: string; description: string; dir: string; key: string }): string {
-  return `
-    <div class="settings-marketplace-item">
-      <div class="settings-marketplace-info">
-        <span class="settings-marketplace-name">${esc(s.name)}</span>
-        <span class="settings-marketplace-desc">${esc(s.description || s.dir)}</span>
-      </div>
-      <div style="display:flex;gap:6px;flex-shrink:0;">
-        <button class="settings-skill-open" data-dir="${esc(s.dir)}" title="${esc(s.dir)}">${t("settings.skill_open")}</button>
-        <button class="settings-skill-edit" data-key="${esc(s.key)}">${t("settings.edit")}</button>
-        <button class="settings-skill-del-installed" data-key="${esc(s.key)}">${t("settings.skill_remove")}</button>
-      </div>
-    </div>`;
-}
-
-/** 技能（Skill Store）分块的内部内容 —— 组装进 AI 分类（见 buildAIPane）。
- *  2026-09-19 批 9：不再是独立侧栏分类，块内的次级标题仍用
- *  .settings-marketplace-title（与分块标题 .settings-group-title 区分层级）。 */
-async function buildSkillsSection(): Promise<string> {
-  const recommendedHtml = SKILL_SITES.map(r => skillEntryHtml(r.name, r.desc, r.url, false)).join("");
-  const custom = loadSkillSites();
-  const customHtml = custom.length === 0
-    ? `<div class="settings-plugin-empty">${t("settings.skill_empty")}</div>`
-    : custom.map(s => skillEntryHtml(s.name, s.url, s.url, true)).join("");
-
-  // ── 已安装技能（Lunac 数据根 <exe 所在目录>\skills）—— 具体 skill 的前端体现 ──
-  let installedHtml = "";
-  try {
-    const skills: Array<{ name: string; description: string; dir: string; key: string }> =
-      await invoke("list_installed_skills");
-    installedHtml = skills.length === 0
-      ? `<div class="settings-plugin-empty">${t("settings.skills_none")}</div>`
-      : skills.map(s => installedSkillRowHtml(s)).join("");
-  } catch {
-    installedHtml = `<div class="settings-plugin-empty">${t("settings.load_error")}</div>`;
-  }
-
-  return `
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.skills_installed")}</div>
-        <div class="settings-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${t("settings.skills_installed_hint")}</div>
-        <div class="settings-skill-list" id="settings-skill-installed">${installedHtml}</div>
-      </div>
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.skill_install")}</div>
-        <div class="settings-marketplace-row" style="flex-wrap:wrap;">
-          <input type="text" id="settings-skill-install-url" class="settings-input" autocomplete="off" placeholder="${t("settings.skill_install_url_ph")}" style="flex:1 1 180px;max-width:none;">
-          <button id="settings-skill-install-url-btn" class="settings-install-btn">${t("settings.skill_install_url")}</button>
-          <button id="settings-skill-new-btn" class="settings-install-btn">${t("settings.skill_new")}</button>
-        </div>
-        <div id="settings-skill-op-msg" style="font-size:0.7rem;color:var(--text-dim);margin-top:4px;display:none;"></div>
-        <div id="settings-skill-editor" style="display:none;margin-top:6px;">
-          <textarea id="settings-skill-editor-text" class="settings-input" spellcheck="false" style="flex:none;width:100%;max-width:100%;height:170px;font-family:ui-monospace,Consolas,monospace;font-size:0.68rem;resize:vertical;line-height:1.4;"></textarea>
-          <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px;">
-            <button id="settings-skill-editor-save" class="settings-install-btn">${t("settings.save")}</button>
-            <button id="settings-skill-editor-cancel" class="settings-btn">${t("settings.cancel")}</button>
-          </div>
-        </div>
-      </div>
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.skill_add_url")}</div>
-        <div class="settings-marketplace-row">
-          <input type="text" id="settings-skill-url" class="settings-input" autocomplete="off" placeholder="https://xxx.coze.com/" style="max-width:100%;">
-          <button id="settings-skill-add" class="settings-install-btn">${t("settings.skill_add")}</button>
-        </div>
-        <div id="settings-skill-msg" style="font-size:0.7rem;color:var(--text-dim);margin-top:4px;display:none;"></div>
-      </div>
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.skill_recommended")}</div>
-        ${recommendedHtml}
-      </div>
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.skill_custom")}</div>
-        <div class="settings-skill-list" id="settings-skill-custom">${customHtml}</div>
-      </div>`;
-}
-
-/** 工具（Tools / MCP）分块的内部内容 —— 组装进 AI 分类（见 buildAIPane）。
- *  2026-09-19 批 9：此前它被挂在「插件」分类下，用户指出「这个应该是 tools」
- *  —— 它是 AI Agent 的自定义工具（MCP 桥），与 Lunac 插件是两回事。 */
-async function buildToolsSection(): Promise<string> {
-  let toolsHtml = "";
-  let communityHtml = "";
-  try {
-    const tools: Array<{ filename: string; name: string; description: string; valid: boolean }> =
-      await invoke("list_tool_files");
-    if (tools.length === 0) {
-      toolsHtml = `<div class="settings-plugin-empty">${t("settings.no_tools")}</div>`;
-    } else {
-      for (const t of tools) {
-        const badge = t.valid
-          ? '<span class="tool-badge valid">✓</span>'
-          : '<span class="tool-badge invalid">✗</span>';
-        toolsHtml += `
-          <div class="settings-plugin-item">
-            <div class="settings-plugin-info">
-              <span class="settings-plugin-name">${esc(t.name || t.filename)} ${badge}</span>
-              <span class="settings-plugin-desc">${esc(t.description || t.filename)}</span>
-            </div>
-          </div>`;
-      }
-    }
-
-    // ── Community preset tools (inside try so 'tools' is in scope) ──
-    const communityTools = [
-      { name: "Get Weather", desc: "Query wttr.in for city weather", cmd: "curl -s \"wttr.in/{{city}}?format=3\"" },
-      { name: "Web Search", desc: "Search the web via Google", cmd: "curl -s \"https://www.google.com/search?q={{query}}\"" },
-      { name: "System Info", desc: "Get Windows system information", cmd: "systeminfo | findstr /B /C:\"OS Name\" /C:\"Total Physical Memory\" /C:\"System Type\"" },
-      { name: "List Files", desc: "List files in a directory", cmd: "dir \"{{path}}\" /b"},
-    ];
-
-    const installedNames = new Set(tools.map(t => t.filename));
-    communityHtml = `<div class="settings-marketplace-title">${t("settings.community_plugins")}</div>`;
-    for (const ct of communityTools) {
-      const expectedFn = ct.name.replace(/\s/g, "-").toLowerCase() + ".json";
-      const installed = installedNames.has(expectedFn);
-      communityHtml += `
-        <div class="settings-marketplace-item">
-          <div class="settings-marketplace-info">
-            <span class="settings-marketplace-name">${esc(ct.name)}</span>
-            <span class="settings-marketplace-desc">${esc(ct.desc)}</span>
-          </div>
-          <button class="settings-install-btn${installed ? ' installed' : ''}"
-            data-name="${esc(ct.name.replace(/\s/g, '-').toLowerCase())}"
-            data-cmd="${esc(ct.cmd)}" data-desc="${esc(ct.desc)}"
-            ${installed ? 'disabled' : ''}>${installed ? t("settings.installed_btn") : t("settings.install")}</button>
-        </div>`;
-    }
-  } catch {
-    toolsHtml = `<span class="settings-plugin-empty">${t("settings.load_error")}</span>`;
-    communityHtml = `<span class="settings-plugin-empty">${t("settings.marketplace_error")}</span>`;
-  }
-
-  return `
-      <!-- Install from URL -->
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.install_from_url")}</div>
-        <div class="settings-marketplace-row">
-          <input type="text" id="settings-tool-url" class="settings-input" autocomplete="off" placeholder="https://example.com/tool.json" style="max-width:100%;">
-          <button id="settings-install-url" class="settings-install-btn">${t("settings.install")}</button>
-        </div>
-        <div id="settings-install-msg" style="font-size:0.7rem;color:var(--text-dim);margin-top:4px;display:none;"></div>
-      </div>
-
-      <!-- Installed tools -->
-      <div class="settings-marketplace-section">
-        <div class="settings-marketplace-title">${t("settings.installed")}</div>
-        <div class="settings-plugin-list">${toolsHtml}</div>
-      </div>
-
-      <!-- Community tools -->
-      <div class="settings-marketplace-section">
-        ${communityHtml}
-      </div>
-
-      <div class="settings-pane-footer">
-        <button id="settings-open-tools" class="settings-tool-btn">${t("settings.open_tool_editor")}</button>
-      </div>`;
 }
 
 /** 「插件」分类 = **插件市场**（2026-09-19 批 9 建立，2026-09-21 二次改版为用户要的形态）。
@@ -1874,6 +1702,54 @@ function wirePluginMarket(container: HTMLElement) {
     if (!url) return;
     btn.disabled = true;
     showMsg(t("settings.plugins_market_installing"), "var(--text-dim)");
+
+    // ── 行内进度：小圆圈 + 中间数字 + 实时速度 ────────────────────
+    // 插在**那一行**上（不是弹窗）：用户点的是哪一行，进度就该出现在哪一行。
+    // 监听是**这一次下载自己的**、`finally` 里收掉 —— 事件是全局的（另一个窗口也可能在装），
+    // 谁发起谁自己听（见 download-progress.ts 顶部）。
+    const row = btn.closest<HTMLElement>(".settings-market-row");
+    const meter = new DownloadMeter();
+    const prog = document.createElement("div");
+    prog.className = "dl-inline settings-market-progress";
+    prog.innerHTML =
+      ringHtml(-1) +
+      `<span class="dl-meta">
+         <span class="dl-phase">${t("settings.plugins_market_downloading")}</span>
+         <span class="dl-speed">—</span>
+       </span>`;
+    row?.classList.add("is-installing");
+    row?.appendChild(prog);
+    const phaseEl = prog.querySelector<HTMLElement>(".dl-phase");
+    const speedEl = prog.querySelector<HTMLElement>(".dl-speed");
+    let unlisten: (() => void) | undefined;
+    // 阶段键：`download#0`（插件包本体）→ `download#1`（第 1 条依赖）→ `extract#1` …
+    // 变了就重置速度基线 —— 不同文件之间的字节数不连续，不重置会算出一个荒唐的速度。
+    let segKey = "";
+    try {
+      unlisten = await listen("plugin-install-progress", (ev) => {
+        const p = ev.payload as {
+          phase: string;
+          downloaded: number;
+          total: number;
+          index: number;
+        };
+        const key = `${p.phase}#${p.index}`;
+        if (key !== segKey) {
+          segKey = key;
+          meter.reset();
+        }
+        const extracting = p.phase === "extract";
+        const s = meter.push(p.downloaded, p.total);
+        updateRing(prog, extracting ? -1 : s.percent);
+        if (phaseEl) {
+          phaseEl.textContent = extracting
+            ? t("settings.plugins_market_extracting")
+            : t("settings.plugins_market_downloading");
+        }
+        if (speedEl) speedEl.textContent = extracting ? "—" : formatSpeed(s.speed);
+      });
+    } catch { /* 挂不上监听不该拦住安装本身 */ }
+
     try {
       const id = await invoke<string>("install_plugin_from_url", { url });
       await refreshMarketPlugins();
@@ -1882,6 +1758,11 @@ function wirePluginMarket(container: HTMLElement) {
     } catch (e: any) {
       showMsg(t("settings.plugins_market_install_failed", { err: String(e) }), "var(--red)");
       btn.disabled = false;
+      // 失败要把这一行恢复原样（重绘没发生，环还挂在上面）
+      row?.classList.remove("is-installing");
+      prog.remove();
+    } finally {
+      try { unlisten?.(); } catch { /* ignore */ }
     }
   };
 
@@ -2033,6 +1914,15 @@ export async function attachSettingsListeners(container: HTMLElement) {
         overflow: visible;
       }
 
+      /* 更新（2026-09-30）：一行内的次要状态文字。
+         进度本身是一枚环形（小圆圈 + 中间数字）+ 实时速度，形状与样式见
+         src/download-progress.ts 与 styles.css 的 dl- 段（换掉了原来的横条）。 */
+      .settings-inline-status {
+        font-size: 0.72rem;
+        color: var(--text-dim);
+        margin-right: 8px;
+      }
+
       /* Panes */
       .settings-pane {
         display: none;
@@ -2112,6 +2002,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
         transition: background 0.1s;
       }
       .settings-market-row:hover { background: rgba(var(--ink-rgb), 0.04); }
+      /* 正在装这一行：把按钮收起来，位置让给行内进度（环 + 数字 + 速度）。
+         用 class 而不是直接 display:none 按钮 —— 失败时要能原样恢复（见 download()）。 */
+      .settings-market-row.is-installing > button { display: none; }
+      .settings-market-row.is-installing { background: rgba(var(--ink-rgb), 0.04); }
+      .settings-market-progress { margin-left: auto; }
       .settings-market-broken { color: var(--yellow); font-size: 0.68rem; }
       .settings-btn {
         flex-shrink: 0;
@@ -2876,35 +2771,91 @@ export async function attachSettingsListeners(container: HTMLElement) {
   if (apBridge) attachAppearanceControls(container, apBridge);
   else console.warn("[lunac settings] appearance bridge unavailable — 风格分区控件不生效");
 
-  // ── OCR 引擎（按需下载，不随发行包分发）──────────────────────
-  const ocrInstallBtn = container.querySelector("#settings-ocr-install") as HTMLButtonElement | null;
-  const ocrStatusEl = container.querySelector("#settings-ocr-status") as HTMLElement | null;
-  if (ocrInstallBtn) {
-    const syncOcrEngineState = async () => {
-      let installed = false;
-      try { installed = await invoke<boolean>("ocr_engine_status"); } catch { /* 查询失败按未安装显示 */ }
-      ocrInstallBtn.disabled = installed;
-      ocrInstallBtn.textContent = installed ? t("ocr.engine_installed") : t("ocr.engine_download");
-      if (ocrStatusEl) ocrStatusEl.textContent = installed ? "" : t("ocr.engine_missing");
+  // ── 软件更新（检查 / 下载并静默安装）──────────────────────────
+  // 宿主侧见 src/updater.rs。**`update_install` 在成功路径上永远不会 resolve** ——
+  // 它会拉起 `Setup.exe /S` 然后让应用退出，装完由 NSI 重新拉起一个新的进程。
+  // 所以那里只能 `.catch()` 处理失败，不能等「完成」（见 updater.rs 的 handover）。
+  const updateStatusEl = container.querySelector("#settings-update-status") as HTMLElement | null;
+  const updateCheckBtn = container.querySelector("#settings-update-check") as HTMLButtonElement | null;
+  const updateInstallBtn = container.querySelector("#settings-update-install") as HTMLButtonElement | null;
+  const updateProgressRow = container.querySelector("#settings-update-progress") as HTMLElement | null;
+  const updateProgressLabel = container.querySelector("#settings-update-progress-label") as HTMLElement | null;
+  const updateProgressRing = container.querySelector("#settings-update-progress-ring") as HTMLElement | null;
+  const updateProgressSpeed = container.querySelector("#settings-update-progress-speed") as HTMLElement | null;
+  const updateAuto = container.querySelector("#settings-update-auto") as HTMLInputElement | null;
+  if (updateCheckBtn && updateStatusEl) {
+    updateUi = {
+      row: updateProgressRow,
+      label: updateProgressLabel,
+      ring: updateProgressRing,
+      speed: updateProgressSpeed,
     };
-    void syncOcrEngineState();
-    ocrInstallBtn.addEventListener("click", async () => {
-      if (ocrInstallBtn.disabled) return;
-      ocrInstallBtn.disabled = true;
-      ocrInstallBtn.textContent = t("ocr.engine_downloading").replace("{percent}", "0");
-      const ok = await installOcrEngine(({ percent, mb }) => {
-        ocrInstallBtn.textContent = percent > 0
-          ? t("ocr.engine_downloading").replace("{percent}", String(percent))
-          : t("ocr.engine_downloading_unknown").replace("{mb}", mb.toFixed(1));
-      });
-      if (ok) {
-        ocrInstallBtn.textContent = t("ocr.engine_installed");
-        if (ocrStatusEl) ocrStatusEl.textContent = t("ocr.engine_ready");
-      } else {
-        ocrInstallBtn.disabled = false;
-        ocrInstallBtn.textContent = t("ocr.engine_retry");
-        if (ocrStatusEl) ocrStatusEl.textContent = t("ocr.engine_failed");
+    ensureUpdateProgressListener();
+
+    let updCfg: UpdateConfig = { checkOnStartup: true, autoInstall: true };
+    void (async () => {
+      try { updCfg = await invoke<UpdateConfig>("update_config_get"); } catch { /* 读不到就用默认值 */ }
+      // 合并语义：**两个都为真才算「自动更新」开**（旧配置里 autoInstall=false 的，
+      // 面板会如实显示成「关」，用户点一下才开）。
+      if (updateAuto) updateAuto.checked = updCfg.checkOnStartup && updCfg.autoInstall;
+      try {
+        const current = await invoke<string>("update_current_version");
+        updateStatusEl.textContent = t("settings.update_current", { version: current });
+      } catch { /* 拿不到版本号就不显示，别把这一行留成空白字样 */ }
+    })();
+
+    const persistUpdCfg = async () => {
+      // 一个开关 → 两个后端字段同时写（合并语义，见 buildGeneralPane 的注释）。
+      const on = updateAuto ? updateAuto.checked : true;
+      updCfg = { checkOnStartup: on, autoInstall: on };
+      try { await invoke("update_config_set", { config: updCfg }); }
+      catch (e) { console.warn("[lunac settings] 保存更新设置失败", e); }
+    };
+    updateAuto?.addEventListener("change", () => void persistUpdCfg());
+
+    updateCheckBtn.addEventListener("click", async () => {
+      if (updateCheckBtn.disabled) return;
+      updateCheckBtn.disabled = true;
+      updateInstallBtn?.classList.add("hidden");
+      updateProgressRow?.classList.add("hidden");
+      updateStatusEl.textContent = t("settings.update_checking");
+      try {
+        const st = await invoke<UpdateStatus>("update_check");
+        if (st.hasUpdate) {
+          updateStatusEl.textContent = t("settings.update_available", { version: st.latest });
+          if (updateInstallBtn) {
+            updateInstallBtn.classList.remove("hidden");
+            updateInstallBtn.title = st.notes || "";
+          }
+        } else {
+          updateStatusEl.textContent = t("settings.update_latest");
+        }
+      } catch (e) {
+        // 宿主给的就是「用户能做什么」（状态码 / URL / 响应体只进日志），原样显示即可
+        updateStatusEl.textContent = String(e);
+      } finally {
+        updateCheckBtn.disabled = false;
       }
+    });
+
+    updateInstallBtn?.addEventListener("click", () => {
+      updateInstallBtn.disabled = true;
+      updateCheckBtn.disabled = true;
+      updateStatusEl.textContent = "";
+      updateProgressRow?.classList.remove("hidden");
+      // 换一次下载就重置速度基线：不重置会把上一轮的最后字节数当成本轮起点，
+      // 第一个进度事件就会报出一个荒唐的速度（见 download-progress.ts 的 reset）
+      updateMeter.reset();
+      if (updateProgressRing) updateRing(updateProgressRing, -1);
+      if (updateProgressSpeed) updateProgressSpeed.textContent = "—";
+      if (updateProgressLabel) updateProgressLabel.textContent = t("settings.update_checking");
+      // 不 await 成功：成功 = 应用退出（见本节开头的说明）
+      void invoke("update_install").catch((e) => {
+        updateStatusEl.textContent = String(e);
+        updateInstallBtn.disabled = false;
+        updateCheckBtn.disabled = false;
+        updateProgressRow?.classList.add("hidden");
+      });
     });
   }
 
@@ -2914,7 +2865,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
   // 否则二次切换仍操作已被移除的旧节点（parentElement 为 null → 模型下拉卡死不更新）。
   let modelDD = container.querySelector("#settings-model") as HTMLElement | null;
   const searchEngineDD = container.querySelector("#settings-search-engine") as HTMLElement | null;
-  const searchProviderDD = container.querySelector("#settings-search-provider") as HTMLElement | null;
   const baseUrlInput = container.querySelector("#settings-baseurl") as HTMLInputElement | null;
   const apiKeyInput = container.querySelector("#settings-apikey") as HTMLInputElement | null;
 
@@ -3121,11 +3071,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
     });
   }
 
-  // Search provider dropdown（WebSearch 主源；值由「保存」按钮统一读取持久化）
-  if (searchProviderDD) {
-    setupCustomDropdown(searchProviderDD, () => {});
-  }
-
   // Model dropdown init + inline edit. 供应商切换会用新节点 replaceWith 重建，
   // 每个新节点都必须重新绑定（下拉逻辑 + 双击标签编辑自定义模型）。
   const setupModelDropdown = (dd: HTMLElement) => {
@@ -3245,18 +3190,24 @@ export async function attachSettingsListeners(container: HTMLElement) {
       const model = modelOpt?.getAttribute("data-value") || "";
       const baseUrl = (container.querySelector("#settings-baseurl") as HTMLInputElement)?.value || "";
       const apiKey = (container.querySelector("#settings-apikey") as HTMLInputElement)?.value || "";
-      // WebSearch 主源（服务商 + 密钥）。每次回传当前值，空串 = 清除
-      // （后端按删除处理，agent 回落到免 key 的 Bing / 百度兜底源）。
-      const searchProvider = container.querySelector("#settings-search-provider .custom-select-option.selected")?.getAttribute("data-value") || "";
-      const searchKey = (container.querySelector("#settings-searchkey") as HTMLInputElement)?.value || "";
-      // 图片输入开关（A8）：与模型一起存进 ai.json。**默认关** —— 发给不支持视觉的
-      // 端点会 400，所以只有用户明确断言「这个模型能看图」时才打开。
-      const vision = (container.querySelector("#settings-vision") as HTMLInputElement)?.checked || false;
-      // Preserve existing agent_url if set (don't overwrite with empty)
+      // 2026-10-05：搜索服务商 / 密钥、图片输入、出图模型 / 端点都从面板上拿掉了。
+      //  · search_provider / search_key：**原样透传现有值** —— 界面没了入口，但不去删
+      //    用户已在 ai.json 里配好的 key（删掉等于静默清空，比留着更坏）。
+      //  · vision：**恒 true**（用户口径「让模型自己判断，不做应用侧开关」）。
+      //  · image_model / image_url：由所选**供应商预设**推导（见 PROVIDER_PRESETS）——
+      //    选了带出图的供应商就自动启用 ImageGen，否则空 = 不出图。
+      const preset = PROVIDER_PRESETS[provider];
+      const imageModel = preset?.image_model || "";
+      const imageUrl = preset?.image_url || "";
+      // Preserve existing agent_url / search 配置（不要在界面上没入口时把它们清掉）。
       let agentUrl = "";
+      let searchProvider = "";
+      let searchKey = "";
       try {
-        const cur = await invoke<{ agent_url?: string }>("get_ai_config");
+        const cur = await invoke<{ agent_url?: string; search_provider?: string; search_key?: string }>("get_ai_config");
         agentUrl = cur.agent_url || "";
+        searchProvider = cur.search_provider || "";
+        searchKey = cur.search_key || "";
       } catch {}
       await invoke("set_ai_config", {
         provider,
@@ -3266,7 +3217,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
         agent_url: agentUrl,
         search_provider: searchProvider,
         search_key: searchKey,
-        vision,
+        vision: true,
+        image_model: imageModel,
+        image_url: imageUrl,
       });
       // 落盘由后端完成（<exe 根>\config\ai.json，唯一真相源）。
       // 这里**不要**再写 localStorage —— 旧的 localStorage 回灌会在启动时覆盖
@@ -3318,29 +3271,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
   // 重渲染完它会再调自己一次。
   wireUsageCost(container);
 
-  // ── AI 安全档位（文件边界）─────────────────────────────────────
-  // 单独一个下拉，不跟 provider/model 那条保存链路混：切换立即生效（会重启 agent）。
-  const profileDD = container.querySelector("#settings-security-profile") as HTMLElement | null;
-  if (profileDD) {
-    setupCustomDropdown(profileDD, (value) => {
-      // 由 main.ts 统一 invoke set_security_profile 并同步输入栏胶囊显示；
-      // 这里只广播，避免两个 invoke 点各自重启一次 agent。
-      window.dispatchEvent(new CustomEvent("lunac-security-profile-changed", {
-        detail: { profile: value },
-      }));
-    });
-  }
-
-  // ── 回合自动折叠开关 ──────────────────────────────────────────
-  const autofoldCheck = container.querySelector("#settings-autofold") as HTMLInputElement | null;
-  if (autofoldCheck) {
-    autofoldCheck.addEventListener("change", () => {
-      try {
-        localStorage.setItem("lunac-agent-autofold", autofoldCheck.checked ? "1" : "0");
-      } catch { /* 存不了就只在本次会话生效 */ }
-    });
-  }
-
   // ── Language selector ─────────────────────────────────────────
   const langDD = container.querySelector("#settings-language") as HTMLElement | null;
   if (langDD) {
@@ -3360,283 +3290,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
     });
   }
 
-  // ── Open Tool Editor ─────────────────────────────────────────
-  const openToolsBtn = container.querySelector("#settings-open-tools");
-  if (openToolsBtn) {
-    openToolsBtn.addEventListener("click", () => {
-      (window as any).__lunac_execute_tool_editor?.();
-    });
-  }
-
-  // ── Install from URL ─────────────────────────────────────────
-  const installUrlBtn = container.querySelector("#settings-install-url");
-  const toolUrlInput = container.querySelector("#settings-tool-url") as HTMLInputElement | null;
-  const installMsg = container.querySelector("#settings-install-msg") as HTMLElement | null;
-  if (installUrlBtn && toolUrlInput && installMsg) {
-    installUrlBtn.addEventListener("click", async () => {
-      const url = toolUrlInput.value.trim();
-      if (!url) { showMsg(t("settings.enter_url")); return; }
-      try {
-        new URL(url); // validate URL format
-      } catch { showMsg(t("settings.invalid_url")); return; }
-
-      installMsg.style.display = "block";
-      installMsg.style.color = "var(--yellow)";
-      installMsg.textContent = t("settings.downloading");
-      try {
-        const fn = await invoke<string>("download_tool_from_url", { url });
-        showMsg(t("settings.installed_ok", { name: fn }), "var(--green)");
-        toolUrlInput.value = "";
-        // Reload settings to refresh tool list
-        const evt = new CustomEvent("lunac-reload-settings");
-        document.dispatchEvent(evt);
-      } catch (e: any) {
-        showMsg(t("settings.install_error", { err: String(e) }), "var(--red)");
-      }
-    });
-  }
-  function showMsg(text: string, color?: string) {
-    if (!installMsg) return;
-    installMsg.style.display = "block";
-    if (color) installMsg.style.color = color;
-    installMsg.textContent = text;
-    setTimeout(() => { if (installMsg) installMsg.style.display = "none"; }, 4000);
-  }
-
-  // ── Community tool install buttons ───────────────────────────
-  container.querySelectorAll(".settings-install-btn[data-cmd]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const name = (btn as HTMLElement).dataset.name!;
-      const cmd = (btn as HTMLElement).dataset.cmd!;
-      const desc = (btn as HTMLElement).dataset.desc!;
-      const toolJson = JSON.stringify({
-        name,
-        description: desc || name,
-        inputSchema: { type: "object", properties: {}, required: [] },
-        handler: { type: "shell", command: cmd },
-      }, null, 2);
-
-      try {
-        const fn = name + ".json";
-        await invoke("save_tool_file", { filename: fn, content: toolJson });
-        (btn as HTMLElement).textContent = t("settings.installed_btn");
-        (btn as HTMLElement).classList.add("installed");
-        (btn as HTMLElement).setAttribute("disabled", "true");
-        // Reload settings
-        const evt = new CustomEvent("lunac-reload-settings");
-        document.dispatchEvent(evt);
-      } catch (e: any) {
-        showMsg(t("settings.install_failed", { err: String(e) }), "var(--red)");
-      }
-    });
-  });
-
-  // ── Skill Store ──────────────────────────────────────────────
-  const skillUrlInput = container.querySelector("#settings-skill-url") as HTMLInputElement | null;
-  const skillAddBtn = container.querySelector("#settings-skill-add") as HTMLElement | null;
-  const skillMsg = container.querySelector("#settings-skill-msg") as HTMLElement | null;
-  if (skillMsg) {
-    const showSkillMsg = (text: string, color?: string) => {
-      skillMsg.style.display = "block";
-      if (color) skillMsg.style.color = color;
-      skillMsg.textContent = text;
-      setTimeout(() => { skillMsg.style.display = "none"; }, 4000);
-    };
-
-    // (Re)render the "My Additions" list with open/remove bindings
-    const renderCustomSkillList = () => {
-      const listEl = container.querySelector("#settings-skill-custom");
-      if (!listEl) return;
-      const list = loadSkillSites();
-      listEl.innerHTML = list.length === 0
-        ? `<div class="settings-plugin-empty">${t("settings.skill_empty")}</div>`
-        : list.map(s => skillEntryHtml(s.name, s.url, s.url, true)).join("");
-      listEl.querySelectorAll(".settings-skill-open").forEach(btn => {
-        btn.addEventListener("click", () => {
-          const u = (btn as HTMLElement).dataset.url || "";
-          if (u) open(u).catch(() => {});
-        });
-      });
-      listEl.querySelectorAll(".settings-skill-del").forEach(btn => {
-        btn.addEventListener("click", () => {
-          const u = (btn as HTMLElement).dataset.url || "";
-          const n = (btn as HTMLElement).dataset.name || u;
-          saveSkillSites(loadSkillSites().filter(s => s.url !== u));
-          renderCustomSkillList();
-          showSkillMsg(t("settings.skill_removed", { name: n }), "var(--yellow)");
-        });
-      });
-    };
-
-    // Recommended entries: open in default browser
-    container.querySelectorAll(".settings-skill-open[data-url]").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const u = (btn as HTMLElement).dataset.url || "";
-        if (u) open(u).catch(() => {});
-      });
-    });
-
-    // ── 已安装技能：打开 / 编辑 / 删除 / URL 安装 / 新建 ──
-    const installedListEl = container.querySelector("#settings-skill-installed") as HTMLElement | null;
-    const installUrlInput = container.querySelector("#settings-skill-install-url") as HTMLInputElement | null;
-    const installUrlBtn = container.querySelector("#settings-skill-install-url-btn") as HTMLButtonElement | null;
-    const newSkillBtn = container.querySelector("#settings-skill-new-btn") as HTMLButtonElement | null;
-    const opMsg = container.querySelector("#settings-skill-op-msg") as HTMLElement | null;
-    const editorEl = container.querySelector("#settings-skill-editor") as HTMLElement | null;
-    const editorText = container.querySelector("#settings-skill-editor-text") as HTMLTextAreaElement | null;
-    const editorSave = container.querySelector("#settings-skill-editor-save") as HTMLButtonElement | null;
-    const editorCancel = container.querySelector("#settings-skill-editor-cancel") as HTMLButtonElement | null;
-    let skillEditorKey = ""; // "" = 新建（粘贴导入），否则为已有技能 key（覆盖保存）
-
-    const showOp = (text: string, color?: string) => {
-      if (!opMsg) return;
-      opMsg.style.display = "block";
-      if (color) opMsg.style.color = color;
-      opMsg.textContent = text;
-      setTimeout(() => { opMsg.style.display = "none"; opMsg.style.color = ""; }, 4000);
-    };
-
-    const openSkillEditor = (key: string, content: string) => {
-      if (!editorEl || !editorText) return;
-      skillEditorKey = key;
-      editorText.value = content;
-      editorEl.style.display = "block";
-      editorText.focus();
-    };
-    const closeSkillEditor = () => { if (editorEl) editorEl.style.display = "none"; skillEditorKey = ""; };
-
-    /** 技能目录只在 agent.exe 启动时扫描一次，所以技能增删改之后必须重启它才生效
-     *  （与「工具黑名单」同一套流程：先存会话，再 stop_cli → start_cli）。
-     *  返回是否真的重启了 —— 没接到桥（旧前端）时不谎称「已生效」。 */
-    const applySkillChange = async (): Promise<boolean> => {
-      const fn = (window as any).__lunac_reload_agent;
-      if (typeof fn !== "function") return false;
-      try { await fn(); return true; } catch { return false; }
-    };
-
-    const bindInstalledRowActions = () => {
-      // 打开技能目录（Explorer）
-      installedListEl?.querySelectorAll<HTMLElement>(".settings-skill-open").forEach(btn => {
-        btn.addEventListener("click", () => { const d = btn.dataset.dir || ""; if (d) openLocalPath(d).catch(() => {}); });
-      });
-      // 编辑（读取 SKILL.md 全文 → 内联编辑器）
-      installedListEl?.querySelectorAll<HTMLElement>(".settings-skill-edit").forEach(btn => {
-        btn.addEventListener("click", async () => {
-          const key = btn.dataset.key || "";
-          try {
-            const content = await invoke<string>("read_skill_file", { key });
-            openSkillEditor(key, content);
-          } catch (e: any) { showOp(String(e), "var(--red)"); }
-        });
-      });
-      // 删除（两段式确认：WebView2 下原生 confirm 不可靠）
-      installedListEl?.querySelectorAll<HTMLButtonElement>(".settings-skill-del-installed").forEach(btn => {
-        btn.addEventListener("click", async () => {
-          const key = btn.dataset.key || "";
-          if (btn.dataset.armed !== "1") {
-            btn.dataset.armed = "1";
-            btn.textContent = t("settings.skill_del_confirm");
-            setTimeout(() => { btn.dataset.armed = ""; btn.textContent = t("settings.skill_remove"); }, 3000);
-            return;
-          }
-          try {
-            await invoke("delete_skill", { key });
-            await renderInstalledSkills();
-            showOp(t("settings.skill_removed", { name: key }), "var(--yellow)");
-          } catch (e: any) { showOp(String(e), "var(--red)"); }
-        });
-      });
-    };
-
-    const renderInstalledSkills = async () => {
-      if (!installedListEl) return;
-      try {
-        const list: Array<{ name: string; description: string; key: string; dir: string }> =
-          await invoke("list_installed_skills");
-        installedListEl.innerHTML = list.length === 0
-          ? `<div class="settings-plugin-empty">${t("settings.skills_none")}</div>`
-          : list.map(s => installedSkillRowHtml(s)).join("");
-        bindInstalledRowActions();
-      } catch {
-        installedListEl.innerHTML = `<div class="settings-plugin-empty">${t("settings.load_error")}</div>`;
-      }
-    };
-
-    // URL 安装 raw SKILL.md
-    const installSkillFromUrl = async () => {
-      const url = (installUrlInput?.value || "").trim();
-      if (!url) { showOp(t("settings.enter_url")); return; }
-      try {
-        const key = await invoke<string>("install_skill_from_url", { url });
-        if (installUrlInput) installUrlInput.value = "";
-        await renderInstalledSkills();
-        const restarted = await applySkillChange();
-        showOp(t("settings.skill_installed_ok", { name: key }) + (restarted ? t("settings.skill_applied") : ""), "var(--green)");
-      } catch (e: any) { showOp(String(e), "var(--red)"); }
-    };
-    if (installUrlBtn) installUrlBtn.addEventListener("click", installSkillFromUrl);
-    if (installUrlInput) {
-      installUrlInput.addEventListener("keydown", (e: KeyboardEvent) => {
-        if (e.key === "Enter") { e.preventDefault(); installSkillFromUrl(); }
-      });
-    }
-
-    // 新建（粘贴导入 SKILL.md 全文）
-    if (newSkillBtn) newSkillBtn.addEventListener("click", () => openSkillEditor("", SKILL_TEMPLATE));
-
-    // 编辑器：保存（覆盖已有 / 导入新建）、取消
-    if (editorSave) {
-      editorSave.addEventListener("click", async () => {
-        const content = editorText?.value || "";
-        if (!content.trim()) { showOp(t("settings.skill_editor_empty")); return; }
-        try {
-          if (skillEditorKey) {
-            await invoke("save_skill_file", { key: skillEditorKey, content });
-          } else {
-            await invoke("import_skill_content", { content });
-          }
-          closeSkillEditor();
-          await renderInstalledSkills();
-          const restarted = await applySkillChange();
-          showOp(t("settings.saved_ok") + (restarted ? t("settings.skill_applied") : ""), "var(--green)");
-        } catch (e: any) { showOp(String(e), "var(--red)"); }
-      });
-    }
-    if (editorCancel) editorCancel.addEventListener("click", closeSkillEditor);
-
-    // buildSkillsPane 已内联渲染初始列表 → 这里绑定其行操作
-    bindInstalledRowActions();
-
-    const addSkillSite = () => {
-      if (!skillUrlInput) return;
-      let url = skillUrlInput.value.trim();
-      if (!url) return;
-      if (!/^https?:\/\//i.test(url)) url = "https://" + url;
-      try { new URL(url); } catch { showSkillMsg(t("settings.skill_invalid_url"), "var(--red)"); return; }
-      if (loadSkillSites().some(s => s.url === url) || SKILL_SITES.some(s => s.url === url)) {
-        showSkillMsg(t("settings.skill_duplicate"), "var(--yellow)");
-        return;
-      }
-      let name = url;
-      try { name = new URL(url).hostname.replace(/^www\./, ""); } catch {}
-      const list = loadSkillSites();
-      list.push({ name, url });
-      saveSkillSites(list);
-      skillUrlInput.value = "";
-      renderCustomSkillList();
-      showSkillMsg(t("settings.skill_added", { name }), "var(--green)");
-    };
-
-    if (skillAddBtn) skillAddBtn.addEventListener("click", addSkillSite);
-    if (skillUrlInput) {
-      skillUrlInput.addEventListener("keydown", (e: KeyboardEvent) => {
-        if (e.key === "Enter") { e.preventDefault(); addSkillSite(); }
-      });
-    }
-
-    // Initial binding for the custom list rendered by buildSkillsPane
-    renderCustomSkillList();
-  }
 }
 
 // ── Plugin definition ────────────────────────────────────────────
@@ -3784,10 +3437,6 @@ export const settingsPlugin: Plugin = {
     let baseUrl = "";
     let model = "";
     let apiKey = "";
-    let searchProvider = "";
-    let searchKey = "";
-    // 当前模型是否支持图片输入（A8）：跟着 ai.json 走，由用户在 AI 面板显式打开。
-    let vision = false;
 
     try {
       hotkey = await invoke<string>("get_hotkey_combo");
@@ -3806,16 +3455,11 @@ export const settingsPlugin: Plugin = {
     } catch {}
 
     try {
-      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string; search_provider: string; search_key: string; vision?: boolean }>("get_ai_config");
+      const aiCfg = await invoke<{ provider: string; base_url: string; model: string; api_key: string }>("get_ai_config");
       provider = aiCfg.provider || "";
       baseUrl = aiCfg.base_url || "";
       model = aiCfg.model || "";
       apiKey = aiCfg.api_key || "";
-      searchProvider = aiCfg.search_provider || "";
-      searchKey = aiCfg.search_key || "";
-      // 图片输入开关（A8）：**必须回读**，否则面板每次都显示「关」，
-      // 而用户一按保存就把这个开着的功能静默关掉了。
-      vision = !!aiCfg.vision;
     } catch {}
 
     // 权限 hooks（A9）**不再取开关状态**：面板上不暴露它（开发者选项，见 attachSettingsListeners
@@ -3829,7 +3473,7 @@ export const settingsPlugin: Plugin = {
 
     const generalPane = buildGeneralPane(hotkey, autoStart, autoStartStale);
     const appearancePane = await buildAppearancePane();
-    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey, searchProvider, searchKey, vision);
+    const aiPane = await buildAIPane(provider, baseUrl, model, apiKey);
     const pluginsPane = buildPluginsPane();
     const searchPane = await buildSearchPane();
 

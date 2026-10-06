@@ -21,8 +21,11 @@
 import type { Plugin } from "./registry";
 import { externalAttach, externalDetach } from "./market";
 
-export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): Promise<boolean> {
-  switch (plugin.id) {
+/** 按 id 调**基础插件**那套挂载监听。**内置插件与磁盘插件的 `reuse` 共用这一份映射** ——
+ *  只写一处，别让「内置怎么挂」和「复用怎么挂」两份漂移。返回是否真的挂上了
+ *  （不是基础插件 / 没有对应监听 ⇒ false）。 */
+async function attachBaseListeners(id: string, root: HTMLElement): Promise<boolean> {
+  switch (id) {
     case "settings": {
       const m = await import("./builtin/settings");
       await m.attachSettingsListeners(root);
@@ -49,9 +52,26 @@ export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): 
       return true;
     }
     default:
-      // 拓展插件：入口模块自带 `attach(root)` 就调它（没有则 false，同「不需要挂载」）
-      return await externalAttach(plugin.id, root);
+      return false;
   }
+}
+
+export async function attachPluginListeners(plugin: Plugin, root: HTMLElement): Promise<boolean> {
+  // 基础插件：直接走那一份映射
+  if (await attachBaseListeners(plugin.id, root)) return true;
+  // 拓展插件：先调它自己入口模块导出的 `attach(root)`（没有则 false = 不需要挂载）
+  const selfAttached = await externalAttach(plugin.id, root);
+  // 再按清单里的 `reuse` **追加**挂基础插件那套监听（2026-10-05 用户要求：自定义插件
+  // 按钮失效时允许「复用内置插件监听」）。这样 AI 生成的插件只要声明 `reuse: ["settings"]`
+  // 之类，并照搬对应基础插件的面板 HTML，按钮就能真的工作 —— 而不是「只有后端有反应」。
+  // 认不出的 id 只忽略并 warn（不因为一个笔误让整块面板挂掉）。
+  let reused = false;
+  for (const id of plugin.reuse ?? []) {
+    if (id === plugin.id) continue;
+    if (await attachBaseListeners(id, root)) reused = true;
+    else console.warn(`[lunac] 插件 ${plugin.id} 声明了 reuse:${id}，但宿主里没有这个基础插件的监听，已忽略`);
+  }
+  return selfAttached || reused;
 }
 
 /** 面板关闭时的收尾。模块内大多另有 `isConnected` 自停兜底，这里是显式一次 ——

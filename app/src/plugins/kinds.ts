@@ -32,13 +32,22 @@ export const BASE_PLUGIN_IDS: readonly string[] = [
 
 const BASE = new Set<string>(BASE_PLUGIN_IDS);
 
-/** 已并入别的插件的条目：仍是独立的 `Plugin`（可被搜索到、可被别的面板调起），
- *  但**不单独占市场表的一行** —— 否则用户会以为「工具编辑器」是要单独装/卸的东西，
- *  而用户 2026-09-29 定的是「AI 助手插件应该包括工具编辑器插件」。
+/** 已并入别的插件的条目：仍是独立的 `Plugin`（**面板仍可被调起**，例如设置页那条
+ *  「打开工具编辑器」与 `__lunac_execute_tool_editor` 桥），但
+ *  ① **不单独占市场表的一行** —— 否则用户会以为「工具编辑器」是要单独装/卸的东西，
+ *     而用户 2026-09-29 定的是「AI 助手插件应该包括工具编辑器插件」；
+ *  ② **不出现在搜索结果里**（2026-10-02 用户要求）—— 它带着 `工具 / mcp / 插件 / 扩展`
+ *     这些关键词，任何相关查询都会冒出一条独立条目，看起来就像还没合并。
+ *     `registry.search()` 靠下面的 `isMergedPlugin()` 一并挡掉。
  *  key = 被并进去的 id，value = 并到哪个 id 上。 */
 export const MERGED_INTO: Readonly<Record<string, string>> = {
   "tool-editor": "ai-agent",
 };
+
+/** 已并入别的插件（⇒ 不占市场行、不进搜索结果）。 */
+export function isMergedPlugin(id: string): boolean {
+  return id in MERGED_INTO;
+}
 
 /** 是不是基础插件。白名单之外的**一律**是拓展插件。 */
 export function isBasePlugin(id: string): boolean {

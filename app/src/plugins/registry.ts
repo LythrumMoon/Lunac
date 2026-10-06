@@ -10,6 +10,7 @@
 //    e.g. "jisuan" / "js" → matches "计算" (jì suàn)
 
 import { pinyin } from "pinyin-pro";
+import { isMergedPlugin } from "./kinds";
 
 export interface Plugin {
   id: string;
@@ -32,6 +33,14 @@ export interface Plugin {
   /** 插件声明的宿主能力（2026-09-28），如 `layout.takeover`。磁盘插件从清单带过来；
    *  内置插件在对象上自己写。宿主桥只放行声明过的能力，界面也如实列出（**是告知不是沙箱**）。 */
   permissions?: string[];
+  /** **复用哪些内置（基础）插件的挂载监听**（2026-10-05，仅磁盘插件从清单带过来）。
+   *  `attach.ts` 在磁盘插件自己的 `attach(root)` 之外，会逐个调这些 id 对应的
+   *  `attachXxxListeners(root)` —— 让 AI 生成的插件照搬某个基础插件的面板 HTML 时，
+   *  按钮能真的工作。只认 `BASE_PLUGIN_IDS` 里且在 `attach.ts` 有监听的那些，其余忽略。 */
+  reuse?: string[];
+  /** **自带本机进程**（2026-10-06，仅磁盘插件从清单带过来）。前端只用它的 `autostart`：
+   *  面板打开时是否自动起进程（真正的起 / 收 / 信任门在 `plugins/sidecar.ts` 与 Rust 侧）。 */
+  sidecar?: { autostart?: boolean };
   /** Auto-generated pinyin tokens for Chinese keywords. Populated by register(). */
   _pinyinTokens?: string[];
 }
@@ -168,12 +177,20 @@ class PluginRegistry {
   /** Search plugins by query. Uses fuzzy matching + keyword index + pinyin. */
   search(query: string): Plugin[] {
     const q = query.toLowerCase().trim();
-    if (!q) return this.plugins.slice(0, 6);
+    // 已并入别的插件的条目**不再单独出现在搜索结果里**（2026-10-02 用户要求）。
+    // 「工具编辑器」并进 AI 助手已经有一阵子了，但它仍带着 `工具 / mcp / 插件 / 扩展`
+    // 这些关键词 ⇒ 任何相关查询都会冒出一条独立的「工具编辑器」，看起来就像**还没合并**
+    // （用户原话：「现在在搜索栏中依旧能搜索到工具编辑器这个插件但是我们已经将其合并到
+    // ai 插件中」）。判据用 `isMergedPlugin()`，与市场表那侧（`showsInMarket`）同源 ——
+    // 它**仍然注册在 registry 里**（设置页那条入口与 `__lunac_execute_tool_editor` 桥
+    // 要靠它），所以只在这里挡，不动注册。
+    const pool = this.plugins.filter(p => !isMergedPlugin(p.id));
+    if (!q) return pool.slice(0, 6);
 
     const scored: { plugin: Plugin; score: number }[] = [];
     const seen = new Set<string>();
 
-    for (const plugin of this.plugins) {
+    for (const plugin of pool) {
       if (seen.has(plugin.id)) continue;
 
       let score = 0;

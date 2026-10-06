@@ -17,13 +17,20 @@
 
 import type { Plugin, PluginResult } from "../registry";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { t } from "../../i18n.js";
 import { installOcrEngine } from "../../ocr-engine.js";
+import { formatSpeed, ringHtml, updateRing } from "../../download-progress.js";
 
-// ── 引擎部署（按需下载）───────────────────────────────────────────
-// PaddleOCR-json 引擎体积大（解压后约 300MB），不随发行包分发（见 .gitignore）。
-// 运行时若缺失，由前端触发从 GitHub Release 下载到 `<exe 根>\paddle-ocr`。
-// 「装引擎」那个小封装在宿主侧 `src/ocr-engine.ts`（设置面板也要用同一份）。
+// ── 引擎部署（随插件依赖一起装）───────────────────────────────────
+// PaddleOCR-json 引擎体积大（压缩后约 88MB / 解压约 300MB），**不随安装包分发**，也不再由
+// 宿主自下载：它是本插件清单 `lunac-plugin.json` 里的一条 `archive` 依赖（2026-09-30 改）。
+// 从**市场**装插件时宿主会顺带把它下好（见 plugin_market.rs 的 install_archive_dependency），
+// 落点是 `<exe 根>\Modules\ocr\paddle-ocr\`。
+//
+// 那这里的提示是给谁用的：**从安装包（或手工解压）装进来的插件不带引擎** —— 安装包里
+// 不能放引擎（见 ai-spec §3.5），所以首次使用要补一次。补的动作仍走插件的依赖清单
+// （`install_plugin_dependencies("ocr")`），只是不再单开一个「设置 → OCR 引擎」入口。
 
 /** 引擎缺失时在状态行内联「下载并安装」按钮。 */
 function renderEngineInstallPrompt(statusEl: HTMLElement | null) {
@@ -35,15 +42,47 @@ function renderEngineInstallPrompt(statusEl: HTMLElement | null) {
   btn.textContent = t("ocr.engine_download");
   btn.addEventListener("click", async () => {
     btn.disabled = true;
-    btn.textContent = t("ocr.engine_downloading").replace("{percent}", "0");
-    const ok = await installOcrEngine(({ percent, mb }) => {
-      btn.textContent = percent > 0
-        ? t("ocr.engine_downloading").replace("{percent}", String(percent))
-        : t("ocr.engine_downloading_unknown").replace("{mb}", mb.toFixed(1));
+    // 点下去就把按钮换成进度（小圆圈 + 数字 + 实时速度）：88MB 的包若只留一个禁用的按钮，
+    // 用户看到的是「卡住了」。形状与样式见 download-progress.ts / styles.css 的 dl- 段。
+    const prog = document.createElement("span");
+    prog.className = "dl-inline";
+    prog.style.marginLeft = "6px";
+    prog.innerHTML =
+      ringHtml(-1) +
+      `<span class="dl-meta">
+         <span class="dl-phase">${t("ocr.engine_downloading_unknown").replace("{mb}", "0")}</span>
+         <span class="dl-speed">—</span>
+       </span>`;
+    btn.replaceWith(prog);
+    const phaseEl = prog.querySelector<HTMLElement>(".dl-phase");
+    const speedEl = prog.querySelector<HTMLElement>(".dl-speed");
+    const ok = await installOcrEngine(({ percent, speed, downloaded }) => {
+      updateRing(prog, percent);
+      if (phaseEl) {
+        phaseEl.textContent = percent >= 0
+          ? t("ocr.engine_downloading").replace("{percent}", String(percent))
+          : t("ocr.engine_downloading_unknown").replace("{mb}", (downloaded / 1048576).toFixed(1));
+      }
+      if (speedEl) speedEl.textContent = formatSpeed(speed);
     });
-    statusEl.textContent = ok
-      ? `${t("ocr.engine_ready")}`
-      : `${t("ocr.engine_failed")}`;
+    prog.remove();
+    // **「没抛异常」≠「引擎到位」**（2026-09-30 修的 bug，用户报的「release 里下不了引擎」就是这个）：
+    // 宿主那条命令读的是**已装插件自己的清单**，清单里没有依赖时它会立刻返回成功、一个字节都不下
+    // （0.9.6 那批插件包的 `dependencies` 就是空的）。只看返回值会把「什么都没下」写成「引擎已就绪」。
+    // 所以真相只认一个：装完**再查一次** `ocr_engine_status`（与 ensureEngineReady 同一条判据）。
+    let ready = false;
+    if (ok) {
+      try { ready = await invoke<boolean>("ocr_engine_status"); } catch { ready = false; }
+    }
+    if (ready) {
+      statusEl.textContent = t("ocr.engine_ready");
+    } else if (ok) {
+      // 命令成功但引擎还是不在 ⇒ 插件包没声明引擎依赖（旧包），或依赖装到了别处。
+      // 别报「网络失败」——那会把用户引到错的方向。
+      statusEl.textContent = t("ocr.engine_not_declared");
+    } else {
+      statusEl.textContent = t("ocr.engine_failed");
+    }
   });
   statusEl.appendChild(btn);
 }
@@ -119,7 +158,7 @@ async function ocrFromDataUrl(dataUrl: string): Promise<OcrResult> {
 // ── File path → data URL (for image preview) ─────────────────────
 // WebView2's CSP `img-src` has no `file:` scheme, so a plain `file:///`
 // URL is silently blocked. `convertFileSrc` maps the local path to the
-// Tauri asset protocol (`https://asset.localhost/...`, whitelisted), which
+// Tauri asset protocol (`http://asset.localhost/...` on Windows, whitelisted), which
 // is how local images render reliably (点16/17).
 
 async function fileToDataUrl(filePath: string): Promise<string> {
@@ -162,6 +201,9 @@ function buildDetachedPanelHtml(): string {
           <span class="ocr-image-placeholder">${t("ocr.no_image")}</span>
         </div>
         <div class="ocr-image-actions">
+          <button id="ocr-screen-btn" class="ocr-action-btn">
+            ${t("ocr.screen_btn")}
+          </button>
           <button id="ocr-clipboard-btn" class="ocr-action-btn ocr-primary-btn">
             ${t("ocr.clipboard_btn")}
           </button>
@@ -260,9 +302,79 @@ export async function ocrImageFile(imagePath: string) {
   }
 }
 
+// ── 截屏识别（2026-10-06）─────────────────────────────────────────
+//
+// 框选**不在本插件里画**：宿主会开一扇铺满整块虚拟桌面的无边框置顶覆盖窗
+//（`shot-overlay`，见 src-tauri/src/screenshot.rs），用户在那扇窗里拖框。
+// 这里只负责「发起 → 等结果 → 送去 OCR」。
+//
+// 为什么改成这样：一改是在本插件（`layout.takeover`，面板内嵌在主窗里）铺一层
+// `position: fixed; inset: 0` 的 overlay —— 它只能盖住**主窗**，「全屏框选」名不副实；
+// 且整屏截图要先缩进窗口才显示（4K 上精度也差）。用户口径「改成 ShareX 那种截屏形式」。
+
+/** OCR 一份已经裁好的图（data URL），把结果写回面板。 */
+async function ocrCropped(
+  cropped: string,
+  statusEl: HTMLElement | null,
+  resultEl: HTMLTextAreaElement | null,
+  previewEl: HTMLElement | null,
+) {
+  if (previewEl) {
+    previewEl.innerHTML = `<img src="${cropped}" class="ocr-preview-img" alt="Screen capture" />`;
+  }
+  if (resultEl) resultEl.value = "";
+  if (!(await ensureEngineReady(statusEl))) return;
+  if (statusEl) statusEl.textContent = t("ocr.recognizing");
+  try {
+    const result = await ocrFromDataUrl(cropped);
+    if (statusEl) statusEl.textContent = t("ocr.done");
+    if (resultEl) {
+      resultEl.value = result.text || t("ocr.no_text");
+      resultEl.style.height = "auto";
+      resultEl.style.height = Math.max(resultEl.scrollHeight, 120) + "px";
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = `${t("ocr.failed")}${e}`;
+  }
+}
+
 // ── Event listeners ──────────────────────────────────────────────
 
 export function attachOcrListeners(doc: Document) {
+  // "截屏识别" button：宿主开覆盖窗框选 → 拿裁剪结果 → OCR（2026-10-06）
+  doc.getElementById("ocr-screen-btn")?.addEventListener("click", async () => {
+    const s = doc.getElementById("ocr-status-line");
+    const r = doc.getElementById("ocr-result") as HTMLTextAreaElement | null;
+    const previewEl = doc.getElementById("ocr-image-preview");
+    if (s) s.textContent = t("ocr.shot_capturing");
+
+    // **先挂监听、再发起**：覆盖窗可能比这条命令返回得更快，事件漏掉就没有第二次。
+    const unlisten: Array<() => void> = [];
+    const cleanup = () => {
+      for (const un of unlisten) un();
+      unlisten.length = 0;
+    };
+    unlisten.push(
+      await listen<{ dataUrl: string }>("screenshot-overlay-done", ev => {
+        cleanup();
+        void ocrCropped(ev.payload.dataUrl, s, r, previewEl);
+      }),
+    );
+    unlisten.push(
+      await listen("screenshot-overlay-cancelled", () => {
+        cleanup();
+        if (s) s.textContent = t("ocr.default_status");
+      }),
+    );
+
+    try {
+      await invoke("screenshot_overlay_begin");
+    } catch (e) {
+      cleanup();
+      if (s) s.textContent = `${t("ocr.shot_failed")}${e}`;
+    }
+  });
+
   // "识别剪贴板" button
   doc.getElementById("ocr-clipboard-btn")?.addEventListener("click", async () => {
     const s = doc.getElementById("ocr-status-line");

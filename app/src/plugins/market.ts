@@ -5,9 +5,11 @@
 // 两者必须能被同一套东西消费 —— 结果区的渲染、拼音匹配、`pluginIconSvg()`、i18n 的
 // `plugin.<id>` 全都只认 `Plugin` 接口，所以这里做的事就是「磁盘包 → 普通 Plugin 对象」。
 //
-// **加载通道**：CSP 是 `script-src 'self' 'unsafe-inline' https://asset.localhost`
+// **加载通道**：CSP 的 `script-src` 同时放行 `http://asset.localhost` 与 `https://asset.localhost`
 // （见 `app/src-tauri/tauri.conf.json`），所以插件代码**只能经 asset 协议** import
-// （`convertFileSrc` 把绝对路径变成 `https://asset.localhost/...`）——
+// （`convertFileSrc` 把绝对路径变成 `http://asset.localhost/D%3A%5C...` —— **Windows 上是 `http`**；
+//   只写 `https://` 会让 `import()` 被 CSP 拦掉、报「Failed to fetch dynamically imported module」，
+//   详见 ai-spec §3.5「加载通道」）——
 // 不能走 CDN、也不能用 `file:`。这也是「插件必须自带依赖」的原因。
 //
 // **插件的模块契约**（写插件的人只需要记住这一条）：
@@ -48,6 +50,31 @@ export interface MarketPluginInfo {
    *  **是「告知」不是沙箱**：插件是本机可执行代码，绕过桥直接 `invoke()` 照样能调宿主命令。
    *  界面上如实列出来，让用户知道装的东西要什么（见 ai-spec §3.5）。 */
   permissions: string[];
+  /** 这个插件要**复用哪些内置（基础）插件的挂载监听**（2026-10-05）。
+   *  由 `attach.ts` 逐个调对应的 `attachXxxListeners(root)`；认不出的 id 只忽略并 warn。 */
+  reuse: string[];
+  /** 这个插件声明的**本机进程**（2026-10-06，L12 档 1，见 `Modules\README.md`）。
+   *  `null` = 没有 sidecar（字段由 serde 直出，Rust 侧是 `Option<SidecarSpec>`）。 */
+  sidecar: MarketSidecar | null;
+}
+
+/** 与 Rust 侧 `plugin_market::SidecarSpec` 一一对应（2026-10-06）。 */
+export interface MarketSidecar {
+  command: string;
+  args: string[];
+  /** `""` / `stdio` / `http` / `both` */
+  transport: string;
+  /** `http` / `both`：`0` = 进程自选并经握手行上报 */
+  port: number;
+  protocol: string;
+  cwd: string;
+  env: Record<string, string>;
+  autostart: boolean;
+  /** `""` / `never` / `on-failure` */
+  restart: string;
+  sha256: string;
+  allowLocalPorts: number[];
+  allowLocalAny: boolean;
 }
 
 /** 与 Rust 侧 `plugin_market::PluginDependency` 一一对应（2026-09-28）。 */
@@ -171,6 +198,10 @@ function wrap(info: MarketPluginInfo): Plugin {
     icon: info.icon || "",
     // 声明的宿主能力原样带过去（`layout.takeover` 这类要让 main.ts 判定的东西）
     permissions: info.permissions || [],
+    // 复用声明（2026-10-05）：让磁盘插件能挂上某个基础插件的监听，见 attach.ts
+    reuse: info.reuse || [],
+    // sidecar（2026-10-06）：面板打开时若声明了 autostart，宿主会自动起进程（见 sidecar.ts）
+    sidecar: info.sidecar ?? undefined,
     execute: async (input: string): Promise<PluginResult> => {
       const mod = await loadModule(info);
       const fn = pickExecute(mod);
