@@ -17,6 +17,9 @@ glob = "0.3"
 regex = "1"
 # A8 图片附件：把按路径读出来的图片字节转成端点要的 base64（与 src-tauri 同版本）
 base64 = "0.22"
+# MCP OAuth（2026-10-01）：PKCE 的 S256 挑战要 SHA-256；code_verifier / state 要不可预测的随机数
+sha2 = "0.10"
+getrandom = "0.2"
 
 [profile.release]
 opt-level = "z"

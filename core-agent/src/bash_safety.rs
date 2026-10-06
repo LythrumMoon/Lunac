@@ -71,7 +71,7 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
     }
 }
 
-/// 入口：分析一条命令（Bash 工具的 `command` 或 PowerShell 工具的 `command`）。
+/// 入口：分析一条命令（Cmd 工具的 `command` 或 PowerShell 工具的 `command`）。
 pub fn analyze(command: &str) -> Report {
     let mut rep = Report::default();
     analyze_into(command, &mut rep, 0);

@@ -1,13 +1,17 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / Bash / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
+// 内置工具：Read / Write / Edit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
 //
-// 工具名保持 PascalCase —— 前端 main.ts 对 "Bash" / "PowerShell" 有专门的
+// 工具名保持 PascalCase —— 前端 main.ts 对 "Cmd" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
-// findLastBashGroup），改名会破坏既有 UI 契约。
+// findLastCmdGroup），改名会破坏既有 UI 契约。
+//
+// **2026-10-05 改名（用户要求）**：原 `Bash` 改名成 `Cmd` —— 它在 Windows 上本来就是
+// `cmd /C`（见 `cmd()`），叫 `Bash` 是误导。旧名**不再注册** ⇒ 用户 `hooks.json` 里写
+// `"matcher": "Bash"` 的钩子、以及 `--disallowedTools Bash` 都会失效，需改成 `Cmd`。
 //
 // 权限策略（P1 无审批通道，按启动参数静态裁决；P2 接入 can_use_tool 后
 // 改为「先问前端，再执行」）：
-//   · --permission-mode plan      → 只读：Write / Edit / Bash / PowerShell 直接拒绝
+//   · --permission-mode plan      → 只读：Write / Edit / Cmd / PowerShell 直接拒绝
 //   · 其余档位（默认 acceptEdits）→ 内置工具全开
 //   · LUNAC_WORKSPACE_LOCKED=1    → 文件类工具限制在工作区内，越界拒绝
 //   · --dangerously-skip-permissions → 忽略工作区锁
@@ -17,7 +21,7 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -45,9 +49,24 @@ const MAX_ENTRIES: usize = 200;
 const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 /// 子进程 stdout/stderr 的捕获上限
 const MAX_PIPE_BYTES: usize = 512 * 1024;
-/// Bash 默认/最大超时（毫秒）
-const BASH_TIMEOUT_MS: u64 = 120_000;
-const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
+/// Cmd 默认/最大超时（毫秒）
+const CMD_TIMEOUT_MS: u64 = 120_000;
+const CMD_MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// **Read 读到图片时的哨兵**（2026-10-05，用户要求「Read 遇图不要返回乱码」）。
+///
+/// 形态：`哨兵 + 绝对路径 + '\n' + 人/模型可读的说明`。`read()` 只负责贴这个头；
+/// 真正把它换成 `image` 块的是上层 `main.rs` 的 `tool_result_block`（同一份常量，
+/// 两处**共用这个 `pub const`**，不许各写一份字面量 —— 那是典型的必然漂移）。
+pub const IMAGE_SENTINEL: &str = "[[lunac-image]]\n";
+
+/// **子进程退出之后**，再等读线程把管道读干（EOF）的宽限期（2026-10-03）。
+///
+/// 正常情况下子进程一退出、写端就关了，EOF 立刻到、读线程几毫秒内结束。但如果命令里
+/// **detached 启动了一个常驻进程**（ComfyUI / 后台服务），那个进程会继承写端 ⇒ EOF 永不
+/// 到来。此时**绝不能无限等**：宽限期一到就按「转后台」移交（见 `run_shell` 末段与
+/// `join_within`）。3 秒足够把 OS 管道缓冲里剩下的那点输出读完。
+pub const OUTPUT_JOIN_GRACE: Duration = Duration::from_secs(3);
 /// Glob 递归深度上限
 const MAX_DEPTH: usize = 12;
 /// WebFetch：单次抓取的响应体积上限、超时、重定向上限、URL 长度上限
@@ -122,6 +141,105 @@ pub struct Ctx {
     /// 要重启 agent 才变，且只读档下写类工具**永远**被拒；计划相位是**模型自己**的临时承诺，
     /// 进程内即时生效，`ExitPlanMode` 被批准后立刻解除。两者的**拒**共用同一个出口。
     pub plan_phase: Arc<AtomicBool>,
+    /// **实时输出回调**（2026-09-30，用户要求「命令卡的输出能边跑边看到」）：
+    /// 命令类工具（Cmd / PowerShell）把 stdout / stderr 的分片**边跑边**交给宿主
+    /// （宿主逐行转发成 `cli-output`，前端追加到命令卡上）。
+    ///
+    /// 只有 `run_one_tool` 会为**某一次调用**装上它 —— 闭包里绑死那次调用的
+    /// `tool_use_id`（见 main.rs 的 `tool_output_sink`）。其余构造点（单测、后台复盘
+    /// fork、子代理）一律保持 `None`，行为与改造前逐字节一致（**不新增任何事件**）。
+    ///
+    /// 类型必须 `Send + Sync`：drain 是在**独立线程**上读管道的，回调要跨线程持有。
+    pub tool_output: Option<ToolOutputSink>,
+    /// **本次调用的实时控制块**（2026-10-01，用户要求「命令卡上加后台运行 / 停止」）。
+    ///
+    /// 只有 `Cmd` / `PowerShell` 会被装上：`run_one_tool` 为每一次调用建一个并登记进
+    /// `main::SHELL_CONTROLS`（键 = `tool_use_id`），用户在前端点按钮时由 stdin 上的
+    /// `tool_control` 消息按 id 找到它、置位标志；`run_shell` 的**轮询每一拍**都看这两个
+    /// 标志 —— 这是运行中的工具**唯一**能被协作式中断的地方。
+    ///
+    /// 其余构造点（单测 / 子代理 / 后台复盘）一律 `None`，行为与改造前逐字节一致
+    /// —— 与 `tool_output` 同一条纪律：**不给它就不新增任何能力**（也顺带防住「子代理
+    /// 里的命令被主对话的按钮误杀」这种串台）。
+    pub shell_control: Option<Arc<ShellControl>>,
+}
+
+/// 实时输出回调：`(stream, chunk)`，`stream ∈ {"stdout", "stderr"}`。
+pub type ToolOutputSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// 「这条命令还能不能被打断」的控制块（2026-10-01）。
+///
+/// **两个独立 `AtomicBool`，不是一个枚举**：两者由不同的按钮置位、在 `run_shell`
+/// 循环的**不同位置**消费，而且「转后台」一旦生效就要把 `Child` 的所有权移走、
+/// 「停止」则就地 kill —— 各自独立最好读，也不会出现「谁先谁后」的歧义。
+///
+/// 置位方只有一处（main.rs 的 `route_tool_control`），消费方只有一处（`run_shell`）；
+/// 两个标志都**只置位、不复位** —— 一次调用对应一个控制块，用完即弃。
+#[derive(Default)]
+pub struct ShellControl {
+    /// 这次调用的 `tool_use_id`。**带着它一起走**（而不是让调用方另记一份）：
+    /// 转后台之后 `run_shell` 已经不在了，后台线程要拿它去登记「后台命令列表」、
+    /// 并在完成时按它找回前端那张卡片。
+    pub tool_use_id: String,
+    /// 用户点了「后台运行」⇒ `run_shell` 把 `Child` 与两个读线程移交出去、立刻返回
+    /// （**不 kill** —— 那正是「后台」的意思）。
+    pub background: AtomicBool,
+    /// 用户点了「停止」⇒ `run_shell`（或接管后的后台线程）kill 子进程，并如实回一句。
+    pub stop: AtomicBool,
+    /// **已经移交给后台**（`run_shell` 亲手置位，就在它 `return` 之前）。
+    ///
+    /// 存在的唯一理由：`run_one_tool` 收尾时要决定**要不要把这条从
+    /// `SHELL_CONTROLS` 里注销** —— 跑完 / 被停的必须注销（否则表里留僵尸），
+    /// 而转后台的**绝不能**注销（命令还在跑，用户仍要从待办清单里取消它，
+    /// 而取消走的就是那张表）。注销它的是后台收尾线程。
+    pub handed_off: AtomicBool,
+    /// **交互式输入通道**（2026-10-05，用户要求「命令卡改成可键入的 cmd/PowerShell 终端」）：
+    /// 子进程的 stdin 写端。只有装了控制块（= 有前端在看着那次调用）时才会是 `Some`
+    /// —— 单测 / 子代理 / 后台复盘的子进程 stdin 仍是 `Stdio::null()`，行为逐字节不变。
+    ///
+    /// 前端在终端里键入的字符经 `tool_control`（`action:"stdin"`）流到这里，由
+    /// `write_stdin` 落笔。`Mutex` 是必须的：写方在**主循环线程**（`route_tool_control`），
+    /// 而读/移交方在**工具线程**（`run_shell`）—— 两边都要碰它。
+    ///
+    /// **不做行编辑**：这里只是把字节原样灌进管道，没有 ConPTY，所以方向键 / Tab 补全 /
+    /// 退格这类由控制台完成的编辑动作**不会**生效（前端只做本地回显）。这是本轮明确选定的
+    /// 边界（用户选「stdin 转发」而非「真 ConPTY」）。
+    pub stdin: Mutex<Option<ChildStdin>>,
+}
+
+impl ShellControl {
+    pub fn new(tool_use_id: &str) -> Self {
+        Self { tool_use_id: tool_use_id.to_string(), ..Default::default() }
+    }
+
+    /// 装上子进程的 stdin 写端（`run_shell` spawn 成功之后立刻调用一次）。
+    pub fn set_stdin(&self, w: ChildStdin) {
+        if let Ok(mut g) = self.stdin.lock() {
+            *g = Some(w);
+        }
+    }
+
+    /// 把用户键入的字节写给子进程。返回是否真的送达。
+    ///
+    /// 进程已退出（管道写端已关）时返回 `false` 并**丢掉写端**，避免后续每次按键都撞墙。
+    /// 注意：这是**同步写**，若用户粘贴的量超过管道缓冲（Windows 约 64KB）且子进程不读，
+    /// 调用方会短暂阻塞 —— 手敲字符的量级不受影响。
+    pub fn write_stdin(&self, data: &[u8]) -> bool {
+        use std::io::Write;
+        if data.is_empty() {
+            return false;
+        }
+        if let Ok(mut g) = self.stdin.lock() {
+            if let Some(w) = g.as_mut() {
+                if w.write_all(data).is_ok() {
+                    let _ = w.flush();
+                    return true;
+                }
+                *g = None;
+            }
+        }
+        false
+    }
 }
 
 /// 「写类操作现在能不能做」的统一判据（两档共用一个出口，差别只在措辞）。
@@ -149,7 +267,7 @@ pub fn write_blocked(ctx: &Ctx, what: &str) -> Option<String> {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 十三个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 十七个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -195,8 +313,8 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "Bash",
-            "description": "Run a shell command (cmd /C on Windows) in the working directory \
+            "name": "Cmd",
+            "description": "Run a Windows cmd.exe command (cmd /C) in the working directory \
                 and return its combined output. Long-running commands are killed on timeout.",
             "input_schema": {
                 "type": "object",
@@ -210,7 +328,7 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
         json!({
             "name": "PowerShell",
             "description": "Run a PowerShell command (powershell -NoProfile -Command) in the working \
-                directory and return its combined output. Use this instead of Bash on Windows when \
+                directory and return its combined output. Use this instead of Cmd on Windows when \
                 you need cmdlets or .ps1 syntax. Long-running commands are killed on timeout.",
             "input_schema": {
                 "type": "object",
@@ -407,7 +525,7 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
         json!({
             "name": "EnterPlanMode",
             "description": "Switch to PLAN MODE for the rest of this task: from now on every \
-                write-class tool (Write / Edit / Bash / PowerShell / Agent / MCP tools) is \
+                write-class tool (Write / Edit / Cmd / PowerShell / Agent / MCP tools) is \
                 REFUSED, so you can only read and reason. Use it when the user asks for a \
                 plan first (\"先给我计划\", \"don't change anything yet\", \"plan this out\"), \
                 or when the task is large enough that agreeing on an approach up front is \
@@ -444,6 +562,33 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["plan"]
             }
         }),
+        json!({
+            "name": "ListPeers",
+            "description": "List the sibling subagents currently running alongside you in the same \
+                parallel batch, as their task id + description. Your own entry is marked `(you)`. \
+                Use it to see who else is working, and to get the exact id that SendMessage needs. \
+                Only agents launched together in one message are visible; an agent that has already \
+                finished is gone from the list. When you are the main agent (not a subagent) this is \
+                normally empty.",
+            "input_schema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "SendMessage",
+            "description": "Send a short text note to a sibling subagent, addressed by the task id \
+                from ListPeers. It is delivered to that agent at the start of its next round and read \
+                as a user message. Use it to hand off a finding so a sibling does not redo the same \
+                work, or to ask it to narrow its scope. The note must be self-contained — the sibling \
+                cannot see your conversation. It fails if the target has already finished (there is \
+                no mailbox for a dead agent).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Target task id, exactly as ListPeers shows it (e.g. task-2)" },
+                    "content": { "type": "string", "description": "The note to deliver. Keep it short and self-contained." }
+                },
+                "required": ["to", "content"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -473,10 +618,12 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 ///   ② `subagent_tool_defs()` 要把它们剔掉（子代理不接桥 ⇒ 留着就是保证失败）；
 ///   ③ 启动时的条件注册。
 /// **新增这类工具只改这个数组**，别在三处分别硬编码字符串。
-pub const BRIDGE_TOOLS: [&str; 4] = [
+pub const BRIDGE_TOOLS: [&str; 6] = [
     "SessionSearch",
     "ListMcpResourcesTool",
     "ReadMcpResourceTool",
+    "ListMcpPromptsTool",
+    "GetMcpPromptTool",
     "Remember",
 ];
 
@@ -558,20 +705,69 @@ pub fn read_resource_tool() -> Value {
     })
 }
 
+/// `ListMcpPromptsTool` 的 schema（A13）。**不进 `defs()`** —— 由 `main.rs` 在
+/// 「桥接上了用户工具」时条件追加（理由同 resources 读侧：没桥就必然失败）。
+///
+/// prompts 与 resources 的区别：**resources 是「给模型看的资料」，prompts 是
+/// 「用户写好的提示词模板」**（`<exe 根>\prompts\*.md`）。后者被取用时展开成一段
+/// 可直接执行的指令文本 —— 相当于用户预先备好的 slash 命令。
+pub fn list_prompts_tool() -> Value {
+    json!({
+        "name": "ListMcpPromptsTool",
+        "description": "List the MCP prompts (reusable prompt templates) this app exposes. \
+            They come from the user's own prompt files (`prompts\\*.md`) and are ready-made \
+            instructions the user prepared for tasks they repeat. Use it to discover what is \
+            available, then GetMcpPromptTool to render one into concrete instructions. \
+            Read-only and local: it never touches the network. Returns an empty list when \
+            the user has no prompt templates.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    })
+}
+
+/// `GetMcpPromptTool` 的 schema（A13）。同上，条件注册。
+pub fn get_prompt_tool() -> Value {
+    json!({
+        "name": "GetMcpPromptTool",
+        "description": "Render one MCP prompt (get its name from ListMcpPromptsTool) into \
+            concrete instructions, filling any `{{placeholders}}` with the `arguments` you \
+            pass. Use this when the user asks for a task that matches one of the available \
+            prompts — the returned text is the user's own prepared instructions. Read-only \
+            and local.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Prompt name, exactly as returned by ListMcpPromptsTool."
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Values for the prompt's `{{placeholders}}` (key → string). Omit or pass {} when the prompt has none."
+                }
+            },
+            "required": ["name"]
+        }
+    })
+}
+
 /// 是否需要先过用户审批（P2 的 `can_use_tool`）。
 ///
 /// 只读四件（`Read`/`Glob`/`Grep`/`WebFetch`）里的前三件不需要 —— 工作区锁
 /// 已是硬边界；`WebFetch` 不算，它是**唯一会把数据发往外部**的内置工具，
 /// 由前端 `classifyRequest()` 决定「白名单自动放行」还是「弹卡片」。
-/// 写类四件（`Write`/`Edit`/`Bash`/`PowerShell`）一律先问 —— 前端会自行处理
+/// 写类四件（`Write`/`Edit`/`Cmd`/`PowerShell`）一律先问 —— 前端会自行处理
 /// 「白名单 / 内置安全前缀自动放行」与「危险命令只给手动确认」，所以 agent
 /// 侧不做二次判断，问就完了。
 /// `AskUserQuestion` 也必须问：**交互本身就是它的功能**（答案经审批卡的
 /// `updatedInput` 回传，不问就拿不到答案）。
 /// `TodoWrite` **不问**：它只改前端那块待办面板，不碰本机任何东西。
-/// 走桥的两件只读工具（`SessionSearch` / resources 读侧）**也不问** —— 它们只读本机
-/// 自己的数据（会话库 / 用户的工具定义文件），与 `Read`/`Grep` 同级；**不构成先例**：
-/// 判据仍是「执行会不会改变本机或把数据带出」。
+/// 走桥的只读工具（`SessionSearch` / resources 读侧 / prompts 读侧）**也不问** —— 它们只读
+/// 本机自己的数据（会话库 / 用户写的工具定义与提示词模板），与 `Read`/`Grep` 同级；
+/// **不构成先例**：判据仍是「执行会不会改变本机或把数据带出」。
 ///
 /// `plan` 档下的例外见 [`gated_in_read_only`]。
 pub fn needs_approval(name: &str) -> bool {
@@ -579,7 +775,7 @@ pub fn needs_approval(name: &str) -> bool {
         name,
         "Write"
             | "Edit"
-            | "Bash"
+            | "Cmd"
             | "PowerShell"
             | "WebSearch"
             | "WebFetch"
@@ -599,6 +795,10 @@ pub fn needs_approval(name: &str) -> bool {
             // 拒绝 = 留在计划相位继续改）。它**没有任何本机副作用**，走审批通道与
             // `Skill` fork 同型：**为的是那个「允许 / 拒绝」的裁决点，不是因为有危害**。
             | "ExitPlanMode"
+            // `ImageGen`（A13，2026-10-03）**要问**：① 它把 prompt 与参考图发往外部服务
+            // （与 `WebFetch` 同类的外部数据出口），② 它写本机文件，③ **按张计费** ——
+            // 花的是用户的钱，更该在花之前让用户看见。
+            | "ImageGen"
     )
 }
 
@@ -632,7 +832,7 @@ pub fn gated_in_read_only(name: &str) -> bool {
 ///   · `TodoWrite` —— 只回一段待办清单文本，不碰本机
 ///
 /// 以下**一律串行**，别往这里加：
-///   · `Write` / `Edit` / `Bash` / `PowerShell` —— 有副作用，且「写文件 → 读该文件」
+///   · `Write` / `Edit` / `Cmd` / `PowerShell` —— 有副作用，且「写文件 → 读该文件」
 ///     的相对顺序必须保持（并行批绝不允许跨越它们，见 `plan_tool_batches`）
 ///   · `Skill` —— **两种模式一读一写，按最坏的那种算**（2026-09-20 A5）：
 ///     inline 技能确实只读 `SKILL.md`，但 `context: fork` 的技能会派生一个**能写文件、
@@ -641,15 +841,22 @@ pub fn gated_in_read_only(name: &str) -> bool {
 ///   · MCP 工具 —— 副作用未知，且共用一条 stdio JSON-RPC 通道
 ///   · `SessionSearch` —— **只读，但同样串行**：它也走那条 stdio 通道
 ///     （`Bridge::request` 是单线程「发一条、按 id 等一条」，并发只会互相排队甚至错配）。
-///     同理还有 resources 读侧的 `ListMcpResourcesTool` / `ReadMcpResourceTool`
-///     与写入侧的 `Remember`
+///     同理还有 resources / prompts 读侧的 `ListMcpResourcesTool` / `ReadMcpResourceTool`
+///     / `ListMcpPromptsTool` / `GetMcpPromptTool` 与写入侧的 `Remember`
 ///     —— **判据是「要不要走桥」，不是「是不是只读」**（见 [`BRIDGE_TOOLS`]）。
 ///   · `AskUserQuestion` —— 要等人回答，并发弹问没有意义
 ///   · `ExitPlanMode` —— 同 `AskUserQuestion`：它的结果**就是**用户的那一次裁决，
 ///     并发弹两张计划卡只会让「批准了哪一份」变得无法回答；顺带它还会改 `plan_phase`
 ///     这个全局标志（2026-09-20 A7）
 pub fn parallel_safe(name: &str) -> bool {
-    matches!(name, "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "TodoWrite")
+    matches!(
+        name,
+        "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "TodoWrite"
+        // `ListPeers`（A13，2026-10-05）：纯读进程内的 peer 登记处，不写盘、不发请求 ⇒
+        // 收进白名单。`SendMessage` **刻意不收** —— 它会改共享的收件箱（有副作用），
+        // 与白名单「只收纯读工具」的口径不符。
+        | "ListPeers"
+    )
 }
 
 // ── 分发 ─────────────────────────────────────────────────────────
@@ -661,7 +868,7 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "Read" => read(ctx, input),
         "Write" => write(ctx, input),
         "Edit" => edit(ctx, input),
-        "Bash" => bash(ctx, input),
+        "Cmd" => cmd(ctx, input),
         "PowerShell" => powershell(ctx, input),
         "Glob" => glob(ctx, input),
         "Grep" => grep(ctx, input),
@@ -669,6 +876,17 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "WebFetch" => webfetch(input),
         "AskUserQuestion" => ask_user_question(input),
         "TodoWrite" => todo_write(input),
+        // 多代理通信（A13，2026-10-05）：**无本机副作用** —— 只读写进程内的 peer 登记处，
+        // 因此免审批、只读档放行（`needs_approval` / `gated_in_read_only` 里都没有它们）。
+        "ListPeers" => list_peers(input),
+        "SendMessage" => send_message(input),
+        // ImageGen（A13，2026-10-03）：**写类** —— 它往 `temp\images\` 落图。
+        // 只读档 / 计划相位的拦法与 Write 同源（`write_blocked`），但**不**进
+        // `gated_in_read_only`：只读档下它该被**拒绝**，而不是「问了再做」。
+        "ImageGen" => match write_blocked(ctx, "ImageGen") {
+            Some(why) => Err(why),
+            None => crate::image::run(input),
+        },
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -725,7 +943,8 @@ fn guard(ctx: &Ctx, path: &Path) -> Result<(), String> {
     let inside = std::iter::once(&ctx.cwd)
         .chain(ctx.add_dirs.iter())
         .any(|root| path.starts_with(root));
-    if inside {
+    // 技能目录是**用户明确要 AI 能写**的那一个例外（见 `inside_skills_dir`）。
+    if inside || inside_skills_dir(path) {
         Ok(())
     } else {
         Err(format!(
@@ -734,6 +953,37 @@ fn guard(ctx: &Ctx, path: &Path) -> Result<(), String> {
             ctx.cwd.display()
         ))
     }
+}
+
+/// 路径是否落在**技能目录**之内（`LUNAC_SKILLS_DIR` = `<exe 根>\skills`）。
+///
+/// **为什么单独开这道口子**（2026-10-06，q3 第 5 步）：用户 2026-10-05 明确要
+/// 「让 AI 在运行时自行查找或生成 skill，**动手前提醒用户**」。未锁工作区时这本来就成立
+/// （工作区之外的 `Write` 照旧弹审批卡）；但**设了工作区**之后 `guard` 会**硬拒**
+/// （不是弹卡）⇒ AI 连问都问不到，只剩一句干巴巴的 `Access denied`，与用户的诉求正好相反。
+///
+/// ⚠️ 这里**只放行、不代替审批**：`Write` / `Edit` 在 [`needs_approval`] 里**恒真**
+/// （与路径无关），所以写技能文件照常走审批卡 —— 用户点头才落盘。这正是「动手前提醒」
+/// 的落点；**不许**把它改成静默写入。
+///
+/// 判据与 `guard` 主路径同一条口径：**词法规范化后按组件比**。`resolve` 已经去过 `.` / `..`，
+/// 所以 `<exe 根>\skills\..\config\ai.json` 会先被化成 `<exe 根>\config\ai.json`，落不进这里。
+fn inside_skills_dir(path: &Path) -> bool {
+    let Ok(raw) = std::env::var("LUNAC_SKILLS_DIR") else {
+        return false;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    path_is_within(path, Path::new(raw))
+}
+
+/// 「`path` 是否在 `root` 之内」的**纯判据**（抽出来是为了能单测，且不碰进程级环境变量）。
+/// 两边都过 [`normalize`]；空 `root` 一律 false（没配就等于不开这道口子）。
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let root = normalize(root);
+    !root.as_os_str().is_empty() && path.starts_with(&root)
 }
 
 // ── Read ─────────────────────────────────────────────────────────
@@ -751,13 +1001,24 @@ fn read(ctx: &Ctx, input: &Value) -> Result<String, String> {
     }
     if meta.len() > MAX_TEXT_BYTES {
         return Err(format!(
-            "{} is too large ({} bytes, limit {MAX_TEXT_BYTES}) — read a slice with Bash instead",
+            "{} is too large ({} bytes, limit {MAX_TEXT_BYTES}) — read a slice with Cmd instead",
             path.display(),
             meta.len()
         ));
     }
 
     let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // 图片不能按 UTF-8 读 —— PNG/JPEG 会变成一整片 `�PNG…` 乱码（2026-10-05 用户报的问题）。
+    // 只贴「哨兵 + 绝对路径」，图片本身由 `main.rs` 的 `tool_result_block` 换成 image 块
+    // 交给视觉模型（复用 A8 的魔术字节判定与体积上限，见 `IMAGE_SENTINEL`）。
+    if let Some(media) = crate::image_media_type(&bytes) {
+        return Ok(format!(
+            "{IMAGE_SENTINEL}{}\n[image {media}, {} KB] The picture itself is attached to this \
+             tool result as an image block — look at it directly; this line is only metadata.\n",
+            path.display(),
+            bytes.len() / 1024,
+        ));
+    }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
 
@@ -870,13 +1131,13 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     ))
 }
 
-// ── Bash / PowerShell ────────────────────────────────────────────
+// ── Cmd / PowerShell ────────────────────────────────────────────
 //
 // 两个工具除了「怎么起进程」之外完全一样：并发读干管道防死锁、超时 kill、
 // 结果拼成「exit code + stdout + stderr」再走同一个上限截断，故共用 run_shell。
 
-fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
-    if let Some(why) = write_blocked(ctx, "Bash") {
+fn cmd(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    if let Some(why) = write_blocked(ctx, "Cmd") {
         return Err(why);
     }
     let command = str_arg(input, "command")?;
@@ -900,7 +1161,7 @@ fn bash(ctx: &Ctx, input: &Value) -> Result<String, String> {
         c.arg("-c").arg(&command);
         c
     };
-    run_shell(ctx, &mut cmd, timeout)
+    run_shell(ctx, &mut cmd, timeout, &command)
 }
 
 fn powershell(ctx: &Ctx, input: &Value) -> Result<String, String> {
@@ -916,7 +1177,7 @@ fn powershell(ctx: &Ctx, input: &Value) -> Result<String, String> {
     // ANSI 码页输出（中文 Windows = GBK），而我们把管道当 UTF-8 解码，
     // 不切 UTF-8 的话中文输出会整片变成替换字符。
     //
-    // **这里刻意用 `arg` 而不是 `raw_arg`**：与 `Bash` 的 `cmd /C` 不同，
+    // **这里刻意用 `arg` 而不是 `raw_arg`**：与 `Cmd` 的 `cmd /C` 不同，
     // `powershell.exe` 的解析器认得 MSVC 那套 `\"` 转义（`Write-Output "a b"`
     // 实测输出正确），改成 raw_arg 反而要自己拼整条命令行、徒增风险。
     // 断言见单测 `quoted_shell_arguments_survive_the_command_line`。
@@ -927,22 +1188,29 @@ fn powershell(ctx: &Ctx, input: &Value) -> Result<String, String> {
         .arg(format!(
             "$OutputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;{command}"
         ));
-    run_shell(ctx, &mut cmd, timeout)
+    run_shell(ctx, &mut cmd, timeout, &command)
 }
 
 fn timeout_arg(input: &Value) -> u64 {
     input
         .get("timeout")
         .and_then(Value::as_u64)
-        .unwrap_or(BASH_TIMEOUT_MS)
-        .min(BASH_MAX_TIMEOUT_MS)
+        .unwrap_or(CMD_TIMEOUT_MS)
+        .min(CMD_MAX_TIMEOUT_MS)
 }
 
 /// 起进程 → 读干输出 → 超时 kill → 拼结果文本。
-fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, String> {
+/// `label` = 命令原文（截断后给「待办清单」里的后台区显示）—— 只用于转后台那一条路，
+/// 其余情况一个字都不用。传进来而不是从 `cmd` 反推：`cmd` 是拼好的 `Command`，
+/// 从它取原文要跨平台拆引号，得不偿失。
+fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64, label: &str) -> Result<String, String> {
     let prog = cmd.get_program().to_string_lossy().to_string();
+    // 交互式终端（2026-10-05）：只有装了控制块（= 有前端在看着这次调用）才把 stdin
+    // 接成管道，让用户能把键入送进子进程；否则保持 `Stdio::null()`，与改造前逐字节一致
+    //（单测 / 子代理 / 后台复盘都走后者）。
+    let interactive = ctx.shell_control.is_some();
     cmd.current_dir(&ctx.cwd)
-        .stdin(Stdio::null())
+        .stdin(if interactive { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // CREATE_NO_WINDOW —— GUI 宿主下不加会闪黑框
@@ -952,8 +1220,10 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
         cmd.creation_flags(0x0800_0000);
     }
 
+    // 三者都包一层 `Option`：转后台时要把**所有权移走**（交给后台注册表），而
+    // 借用检查器不认识「移走之后不会再走回来」这件事 ⇒ 直接 move 会被判 use-after-move。
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(c) => Some(c),
         Err(e) => {
             // spawn 失败（解释器不存在 / 被拦）是最需要事后取证的一类错误
             let msg = format!("spawn failed: {e}");
@@ -961,21 +1231,67 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
             return Err(msg);
         }
     };
-    let out_pipe: Option<ChildStdout> = child.stdout.take();
-    let err_pipe = child.stderr.take();
-    // 必须并发读干管道，否则子进程写满缓冲区后会卡死
-    let h_out = thread::spawn(move || drain(out_pipe));
-    let h_err = thread::spawn(move || drain(err_pipe));
+    let out_pipe: Option<ChildStdout> = child.as_mut().and_then(|c| c.stdout.take());
+    let err_pipe = child.as_mut().and_then(|c| c.stderr.take());
+    // 交互式终端（2026-10-05）：把子进程 stdin 的写端交给控制块 —— 前端键入经
+    // `tool_control` 找到它、由 `write_stdin` 落笔。不装控制块时 stdin 是 null，
+    // `take()` 得到 `None`，这里整段是空操作。
+    if let (Some(ctl), Some(w)) = (ctx.shell_control.as_ref(), child.as_mut().and_then(|c| c.stdin.take()))
+    {
+        ctl.set_stdin(w);
+    }
+    // 必须并发读干管道，否则子进程写满缓冲区后会卡死。
+    // 实时回传（2026-09-30）：`ctx.tool_output` 只在 `run_one_tool` 里装上（见 Ctx 注释），
+    // 没有它时 drain 的行为与改造前完全一致 —— 只是多一个恒为 None 的参数。
+    let sink_out = ctx.tool_output.clone();
+    let sink_err = ctx.tool_output.clone();
+    let mut h_out = Some(thread::spawn(move || drain(out_pipe, sink_out, "stdout")));
+    let mut h_err = Some(thread::spawn(move || drain(err_pipe, sink_err, "stderr")));
 
     let started = Instant::now();
     let mut timed_out = false;
+    let mut stopped_by_user = false;
+    let mut backgrounded: Option<String> = None;
     let status = loop {
-        match child.try_wait() {
+        // ── 用户实时指令（2026-10-01）──────────────────────────────
+        // **每一拍**都看这两个标志 —— 这是运行中的命令**唯一**能被协作式中断的地方。
+        // 控制块只在 `run_one_tool` 里装（见 `Ctx::shell_control`）：单测 / 子代理 /
+        // 后台复盘拿到的都是 `None`，走不到这里，行为与改造前逐字节一致。
+        if let Some(ctl) = &ctx.shell_control {
+            if ctl.stop.load(Ordering::Relaxed) {
+                if let Some(c) = child.as_mut() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                stopped_by_user = true;
+                break None;
+            }
+            if ctl.background.load(Ordering::Relaxed) {
+                // 转后台 = 把 `Child` 与两个读线程**移交**出去（本函数从此不再持有它们），
+                // 这里立刻返回。**不 kill** —— 那正是「后台」的意思。
+                // 先置「已移交」，再交出去 —— `run_one_tool` 收尾时按它决定**不注销**
+                // 这张登记（见 `ShellControl::handed_off`）。
+                ctl.handed_off.store(true, Ordering::Relaxed);
+                backgrounded = Some(crate::hand_off_to_background(crate::BackgroundJob {
+                    child: child.take().expect("转后台时 child 必然还在"),
+                    h_out: h_out.take(),
+                    h_err: h_err.take(),
+                    prog: prog.clone(),
+                    label: label.to_string(),
+                    ctl: Arc::clone(ctl),
+                }));
+                break None;
+            }
+        }
+        let Some(c) = child.as_mut() else {
+            break None;
+        };
+        match c.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
                 if started.elapsed() > Duration::from_millis(timeout) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = c.kill();
+                    let _ = c.wait();
                     timed_out = true;
                     break None;
                 }
@@ -985,16 +1301,96 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
         }
     };
 
-    let stdout = h_out.join().unwrap_or_default();
-    let stderr = h_err.join().unwrap_or_default();
+    // ── 等读线程收尾：**有界**，且这一等期间仍然响应「停止 / 后台」（2026-10-03 修）────
+    // 子进程退出 **≠** 输出读完：`drain` 要等管道 **EOF**。若命令里 **detached 启动了一个
+    // 常驻进程**（ComfyUI / 后台服务），它会继承写端 ⇒ EOF 永不到来，而原先那句无条件
+    // `h.join()` 会**永久阻塞**。更糟的是：上面那个控制循环此时已经退出 ⇒「停止 / 后台」
+    // 两个标志**再没人看** —— 用户点了「后台运行」也毫无反应。
+    // 实测（2026-10-03）：`tool_control: … 转后台` 06:43:57 就置了位，命令一直到 06:44
+    // 被重启都没反应，工具调用永远不返回。
+    // ⇒ 这一等循环同时看三件事：**读线程结束没有 / 用户控制 / 宽限期**。
+    let join_start = Instant::now();
+    let mut hand_off_now = false;
+    loop {
+        if let Some(ctl) = &ctx.shell_control {
+            if ctl.stop.load(Ordering::Relaxed) {
+                stopped_by_user = true;
+                break;
+            }
+            if ctl.background.load(Ordering::Relaxed) {
+                hand_off_now = true;
+                break;
+            }
+        }
+        let out_done = match &h_out {
+            Some(h) => h.is_finished(),
+            None => true,
+        };
+        let err_done = match &h_err {
+            Some(h) => h.is_finished(),
+            None => true,
+        };
+        if out_done && err_done {
+            break;
+        }
+        if join_start.elapsed() >= OUTPUT_JOIN_GRACE {
+            // 管道被别的进程攥着（或输出迟迟读不完）⇒ 按「转后台」移交，模型先被放走。
+            hand_off_now = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if hand_off_now {
+        // 子进程**已退出**，这里移交的是「还没读完的两个读线程」（`child` 仍在手上、
+        // 但 `try_wait` 已见过它退出，交给后台只是让收尾线程按同一套逻辑收口）。
+        if let (Some(child), Some(ctl)) = (child.take(), ctx.shell_control.clone()) {
+            ctl.handed_off.store(true, Ordering::Relaxed);
+            backgrounded = Some(crate::hand_off_to_background(crate::BackgroundJob {
+                child,
+                h_out: h_out.take(),
+                h_err: h_err.take(),
+                prog: prog.clone(),
+                label: label.to_string(),
+                ctl,
+            }));
+        }
+    }
+
+    // 转后台：`child` / 两个读线程的所有权已经交出去了 ⇒ **不能再 join、也不能拼结果**
+    //（拼了就是两份输出，而且这一份必然是空壳）。如实告诉模型「它还在跑、别等它」。
+    if let Some(id) = backgrounded {
+        crate::log::info(format!("shell[{prog}] 已转后台 id={id}"));
+        return Ok(format!(
+            "Command moved to the background (id={id}). It is still running; its output will be \
+             delivered to you automatically once it finishes. Do NOT wait or poll for it — \
+             carry on with other work. The user can cancel it from the task list."
+        ));
+    }
+
+    // 走到这里：要么两个读线程都结束了，要么是「用户停止」/宽限期（那两个分支不会继续等）。
+    // **只 join 已经结束的** —— 没结束的（管道被别的进程攥着）绝不能再阻塞。
+    let stdout = match h_out {
+        Some(h) if h.is_finished() => h.join().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let stderr = match h_err {
+        Some(h) if h.is_finished() => h.join().unwrap_or_default(),
+        _ => String::new(),
+    };
 
     let mut out = String::new();
+    // 「用户停止」与「超时」**必须分开报**：前者是用户的决定（模型该换个做法，或者
+    // 先问一句再动手），后者是命令自己的问题（该去查为什么慢）。混成一句话会让模型
+    // 诊断错方向 —— 它会把「用户不要这么干」读成「这条命令有毛病，我再试一次」。
+    if stopped_by_user {
+        out.push_str("(stopped by the user — process killed; do not retry this command as-is)\n");
+    }
     if timed_out {
         out.push_str(&format!("(timed out after {timeout} ms — process killed)\n"));
     }
     match status.and_then(|s| s.code()) {
         Some(code) => out.push_str(&format!("exit code: {code}\n")),
-        None if !timed_out => out.push_str("exit code: (none)\n"),
+        None if !timed_out && !stopped_by_user => out.push_str("exit code: (none)\n"),
         None => {}
     }
     if !stdout.trim().is_empty() {
@@ -1015,9 +1411,10 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
     // （命令行本身由 main.rs 的 run_tool 在调用前后记录，这里补执行结果）
     let code = status.and_then(|s| s.code());
     crate::log::info(format!(
-        "shell[{prog}] exit={} timeout={} stdout={}B stderr={}B",
+        "shell[{prog}] exit={} timeout={} stopped={} stdout={}B stderr={}B",
         code.map_or_else(|| "-".into(), |c| c.to_string()),
         timed_out,
+        stopped_by_user,
         stdout.len(),
         stderr.len()
     ));
@@ -1028,24 +1425,102 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64) -> Result<String, Strin
     Ok(out)
 }
 
+/// **有界**地收一个读线程的结果：`grace` 内结束就返回它的输出，否则返回空串（绝不阻塞）。
+///
+/// 存在的理由只有一条：`JoinHandle::join` 等的是**管道 EOF**，而写端可能被**别的进程**
+/// 攥着（命令里 detached 启动的常驻进程）⇒ 无条件 `join()` 会永久挂住。后台收尾线程用
+/// 它来防止「一条后台命令把收尾线程永远占住」（见 `main.rs::hand_off_to_background`）。
+pub fn join_within(h: Option<thread::JoinHandle<String>>, grace: Duration) -> String {
+    let Some(h) = h else { return String::new() };
+    let deadline = Instant::now() + grace;
+    while !h.is_finished() {
+        if Instant::now() >= deadline {
+            return String::new();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    h.join().unwrap_or_default()
+}
+
 /// 把管道读干（超上限后继续读但丢弃，防止子进程阻塞）
-fn drain<R: Read>(pipe: Option<R>) -> String {
+///
+/// `sink` 非空时**边读边回传**（实时输出，2026-09-30）：命令还在跑，前端就能看到输出。
+/// 回传上限同样是 `MAX_PIPE_BYTES`（与最终结果一份口径）—— 再多的部分既不进结果也不进
+/// 实时流，避免一条 `Get-Content` 巨型文件把 webview 灌爆。
+fn drain<R: Read>(pipe: Option<R>, sink: Option<ToolOutputSink>, stream: &'static str) -> String {
     let Some(mut pipe) = pipe else {
         return String::new();
     };
     let mut buf: Vec<u8> = Vec::new();
+    let mut sent = 0usize;
+    // 跨 read 的分片会让多字节字符被劈成两半 —— 用这个夹具把「半截字符」留到下一片，
+    // 避免实时流里出现一片替换字符（最终结果不受影响，它走 buf 整块解码）。
+    let mut carry = Utf8Carry::default();
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if let Some(cb) = &sink {
+                    if sent < MAX_PIPE_BYTES {
+                        let text = carry.push(&chunk[..n]);
+                        if !text.is_empty() {
+                            sent += text.len();
+                            cb(stream, &text);
+                        }
+                    }
+                }
                 if buf.len() < MAX_PIPE_BYTES {
                     buf.extend_from_slice(&chunk[..n]);
                 }
             }
         }
     }
+    if let Some(cb) = &sink {
+        let tail = carry.flush();
+        if !tail.is_empty() {
+            cb(stream, &tail);
+        }
+    }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// UTF-8 分片夹具：只吐「确定收全了」的那部分，半截多字节字符留到下一片。
+#[derive(Default)]
+struct Utf8Carry {
+    pending: Vec<u8>,
+}
+
+impl Utf8Carry {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        match std::str::from_utf8(&self.pending) {
+            Ok(s) => {
+                let out = s.to_string();
+                self.pending.clear();
+                out
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                let out = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+                self.pending.drain(..valid);
+                // ≥4 字节还凑不出一个完整字符 ⇒ 不是「半截」，是真乱码：老实吐替换字符，
+                // 否则这段字节会一直卡在夹具里把后续输出也堵住。
+                if self.pending.len() >= 4 {
+                    let lossy = String::from_utf8_lossy(&self.pending).into_owned();
+                    self.pending.clear();
+                    return out + &lossy;
+                }
+                out
+            }
+        }
+    }
+
+    fn flush(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        out
+    }
 }
 
 // ── Glob ─────────────────────────────────────────────────────────
@@ -2032,6 +2507,45 @@ fn todo_write(input: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// `ListPeers`（A13 多代理通信，2026-10-05）：列出**同批并发**的兄弟子代理。
+///
+/// 主代理调用时通常为空 —— 子代理批期间主循环被阻塞（见 `peers.rs` 的模块注释），
+/// 所以「主代理看谁在跑」这个窗口只存在于没有子代理在跑的轮次。
+fn list_peers(_input: &Value) -> Result<String, String> {
+    let me = crate::peers::current();
+    let peers = crate::peers::bus().list();
+    if peers.is_empty() {
+        return Ok("No peer subagents are currently running.".into());
+    }
+    let mut out = String::from("Sibling subagents currently running:");
+    for (id, desc) in peers {
+        let you = if me.as_deref() == Some(id.as_str()) {
+            " (you)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("\n- {id}{you} — {desc}"));
+    }
+    Ok(out)
+}
+
+/// `SendMessage`（A13 多代理通信，2026-10-05）：把一段文本投给某个存活兄弟。
+///
+/// `from` 取线程本地的当前 peer（主循环线程上是 `None` ⇒ 记作 `main`），投递语义与
+/// 拒绝条件（目标不存在 / 收件箱满 / 内容为空）全在 `peers::PeerBus::send` 一处收口。
+fn send_message(input: &Value) -> Result<String, String> {
+    let to = input.get("to").and_then(Value::as_str).unwrap_or("").trim();
+    if to.is_empty() {
+        return Err("缺少 to 参数：目标代理的 task id（先调 ListPeers 查）".into());
+    }
+    let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+    let from = crate::peers::current().unwrap_or_else(|| "main".to_string());
+    let n = crate::peers::bus().send(&from, to, content)?;
+    Ok(format!(
+        "Message delivered to {to} ({n} chars). That agent will read it at the start of its next round."
+    ))
+}
+
 /// 递归收集文本文件（跳过 SKIP_DIRS，深度与数量封顶）
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH || out.len() >= MAX_ENTRIES * 5 {
@@ -2242,15 +2756,63 @@ mod tests {
             read_only: false,
             locked: false,
             plan_phase: Arc::new(AtomicBool::new(false)),
+            // 单测不装实时回传：drain 的行为回到「只读干管道」。
+            // 实时控制（后台运行 / 停止）同样不装 —— `None` 时 `run_shell` 的循环里那
+            // 两个标志一次都不会被读到，行为与改造前逐字节一致。
+            tool_output: None,
+            shell_control: None,
         }
     }
 
-    /// Windows 下 `Bash` **必须用 `raw_arg` 原样拼命令行**。
+    /// `join_within` 是「不无限等管道 EOF」的那把闸（2026-10-03）。三条都要钉住：
+    /// ① 线程很快结束时**如实拿到它的输出**；② 线程迟迟不结束时在宽限期附近返回空串
+    ///（绝不阻塞到线程结束）——这正是「detached 常驻进程攥着管道」的形态；
+    /// ③ `None` 直接空串（子进程退出后才转后台时可能已经丢了一个读线程）。
+    #[test]
+    fn join_within_bounds_the_wait_and_keeps_fast_results() {
+        let fast = thread::spawn(|| "done".to_string());
+        assert_eq!(join_within(Some(fast), Duration::from_secs(1)), "done");
+
+        let slow = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+            "late".to_string()
+        });
+        let t0 = Instant::now();
+        let got = join_within(Some(slow), Duration::from_millis(100));
+        let dt = t0.elapsed();
+        assert_eq!(got, "", "宽限期内没结束应当返回空串");
+        assert!(dt < Duration::from_secs(2), "只该等宽限期，实际等了 {dt:?}");
+
+        assert_eq!(join_within(None, Duration::from_millis(10)), "");
+    }
+
+    /// 实时输出（2026-09-30）：管道分片把多字节字符劈成两半时，**不许**吐替换字符 ——
+    /// 半截字符要留到下一片（`Utf8Carry`）。劈开的地方在真实场景里必然发生：一次
+    /// `read` 只拿 8192 字节，中文输出随时会落在字符中间。
+    #[test]
+    fn utf8_carry_never_splits_a_character() {
+        let bytes = "进度：50%".as_bytes();
+        // 在「进」这个 3 字节字符的中间切开
+        let (a, b) = bytes.split_at(4);
+        let mut carry = Utf8Carry::default();
+        let first = carry.push(a);
+        assert!(!first.contains('\u{FFFD}'), "第一片不许出现替换字符：{first:?}");
+        let second = carry.push(b);
+        assert_eq!(format!("{first}{second}"), "进度：50%");
+        assert_eq!(carry.flush(), "");
+
+        // 收尾：真的收不全的残字节由 flush 兜住（宁可吐替换字符也不能把它丢掉）
+        let mut carry = Utf8Carry::default();
+        let _ = carry.push(&"进".as_bytes()[..1]);
+        assert_eq!(carry.flush().chars().next(), Some('\u{FFFD}'));
+    }
+
+    /// Windows 下 `Cmd` **必须用 `raw_arg` 原样拼命令行**。
     ///
     /// `Command::arg` 会按 MSVC 的引号规则把参数里的 `"` 转义成 `\"`，而 `cmd /C`
     /// 的引号语义是 `cmd` 自己解释的、**不认这个转义** ⇒ 命令含空格 + 引号时整条变形
     /// （`echo "a b"` 会原样吐出 `\"a b\"`，多一层的反斜杠直接进了结果）。
-    /// 这是 A9 在 hooks 上踩到的坑，复查后确认 `Bash` 同样中招。
+    /// 这是 A9 在 hooks 上踩到的坑，复查后确认 `Cmd` 同样中招。
     ///
     /// **`PowerShell` 实测不受影响**（它的解析器认 `\"`）—— 所以那边刻意**不**改成
     /// `raw_arg`：改它就得自己重新拼一遍完整命令行，白白引入新风险。这条断言一并钉住，
@@ -2260,9 +2822,9 @@ mod tests {
     fn quoted_shell_arguments_survive_the_command_line() {
         let ctx = test_ctx();
 
-        let out = bash(&ctx, &json!({ "command": "echo \"a b\"" })).expect("Bash 应当能跑");
-        assert!(out.contains("a b"), "Bash 的引号参数被改写：{out}");
-        assert!(!out.contains("\\\""), "Bash 的输出里出现了 MSVC 转义痕迹：{out}");
+        let out = cmd(&ctx, &json!({ "command": "echo \"a b\"" })).expect("Cmd 应当能跑");
+        assert!(out.contains("a b"), "Cmd 的引号参数被改写：{out}");
+        assert!(!out.contains("\\\""), "Cmd 的输出里出现了 MSVC 转义痕迹：{out}");
 
         let out = powershell(&ctx, &json!({ "command": "Write-Output \"a b\"" }))
             .expect("PowerShell 应当能跑");
@@ -2283,7 +2845,10 @@ mod tests {
             names(&all).contains(&"Agent".to_string()),
             "Agent 必须在内置工具表里"
         );
-        assert_eq!(total, 15, "内置工具应为 15 件（12 件原有 + Agent + 计划相位两件）");
+        assert_eq!(
+            total, 17,
+            "内置工具应为 17 件（15 件原有 + ListPeers + SendMessage，A13 多代理通信）"
+        );
 
         let cut = defs(&["Agent".to_string()]);
         assert!(
@@ -2291,6 +2856,29 @@ mod tests {
             "disallowed 必须能裁掉 Agent"
         );
         assert_eq!(cut.len(), total - 1);
+    }
+
+    /// 多代理通信两件（A13，2026-10-05）的口径：
+    ///   · 都在 `defs()` 里（无条件注册 —— 与 `Agent` 同族，模型要先看得到才可能在
+    ///     子代理里用；子代理工具集由 `subagent_tool_defs()` 从主池推导 ⇒ 必须在主池里）；
+    ///   · **都免审批**（只读写进程内的 peer 登记处，不碰本机、不发请求）；
+    ///   · `ListPeers` 并行（纯读）、`SendMessage` 串行（改共享收件箱）；
+    ///   · 都能被 `--disallowedTools` 裁掉；
+    ///   · 都**不在** `gated_in_read_only` 里（只读档放行，与 `SessionSearch` 同级）。
+    #[test]
+    fn peer_tools_are_registered_and_ungated() {
+        let all = defs(&[]);
+        let ns = names(&all);
+        for n in ["ListPeers", "SendMessage"] {
+            assert!(ns.contains(&n.to_string()), "{n} 必须在内置工具表里");
+            assert!(!needs_approval(n), "{n} 免审批（只读/纯内存，无本机副作用）");
+            assert!(!gated_in_read_only(n), "{n} 只读档放行");
+            assert!(!needs_bridge(n), "{n} 不走桥");
+            let cut = defs(&[n.to_string()]);
+            assert!(!names(&cut).contains(&n.to_string()), "disallowed 必须能裁掉 {n}");
+        }
+        assert!(parallel_safe("ListPeers"), "ListPeers 是纯读，进只读并行白名单");
+        assert!(!parallel_safe("SendMessage"), "SendMessage 改共享收件箱，不并行");
     }
 
     /// 计划相位两件（A7）的口径：
@@ -2347,7 +2935,7 @@ mod tests {
 
         ctx.plan_phase.store(false, Ordering::Relaxed);
         ctx.read_only = true;
-        let why = write_blocked(&ctx, "Bash").expect("只读档必须拦住写类");
+        let why = write_blocked(&ctx, "Cmd").expect("只读档必须拦住写类");
         assert!(
             why.contains("settings") && why.contains("project"),
             "只读档的拒因要指向「去设置里改档位」，实际是：{why}"
@@ -2361,6 +2949,42 @@ mod tests {
         ctx.plan_phase.store(true, Ordering::Relaxed);
         let why = write_blocked(&ctx, "Edit").expect("两档叠加仍是拒");
         assert!(why.contains("settings"), "两档叠加时应报只读档，实际是：{why}");
+    }
+
+    /// 技能目录是工作区锁下**唯一**的放行例外（2026-10-06，q3 第 5 步）——
+    /// 用户要「AI 运行时自建 skill，动手前提醒」，而锁下硬拒会让它连问都问不到。
+    /// 四条判据：① 目录内放行；② **同前缀但不是子目录**（`skills-evil`）不放行；
+    /// ③ `..` 绕过被 `normalize` 挡掉；④ 空 root 等于不开这道口子。
+    #[test]
+    fn skills_dir_is_the_only_workspace_lock_exception() {
+        let root = Path::new(r"D:\lunac\skills");
+        assert!(path_is_within(
+            &normalize(Path::new(r"D:\lunac\skills\pomodoro\SKILL.md")),
+            root
+        ));
+        assert!(path_is_within(&normalize(root), root), "目录本身也算在内");
+        assert!(
+            !path_is_within(
+                &normalize(Path::new(r"D:\lunac\skills-evil\x.md")),
+                root
+            ),
+            "同前缀但不是子目录 ⇒ 必须拒（按组件比，不是字符串前缀）"
+        );
+        assert!(
+            !path_is_within(
+                &normalize(Path::new(r"D:\lunac\skills\..\config\ai.json")),
+                root
+            ),
+            "`..` 绕出 skills 之后不能还算是技能目录（resolve 已经 normalize 过）"
+        );
+        assert!(
+            !path_is_within(&normalize(Path::new(r"D:\lunac\config\ai.json")), root),
+            "完全不相干的路径不能过"
+        );
+        assert!(
+            !path_is_within(Path::new(r"D:\lunac\skills\x.md"), Path::new("")),
+            "没配技能目录 ⇒ 不开这道口子"
+        );
     }
 
     /// `Agent` 的审批 / 并行 / 只读三条口径（A1 约束③；**A14 起「并行」一条已改**）：
@@ -2377,12 +3001,17 @@ mod tests {
         assert!(!gated_in_read_only("Agent"), "只读档不放行 Agent");
     }
 
-    /// resources 读侧两件（A3）的口径：**不在 `defs()` 里**（条件注册）、**必须走桥**、
-    /// 免审批、必须串行。
+    /// 走桥的只读两族（A3 resources / A13 prompts）口径：**不在 `defs()` 里**（条件注册）、
+    /// **必须走桥**、免审批、必须串行。
     #[test]
-    fn mcp_resource_tools_are_bridge_only_and_conditional() {
+    fn mcp_read_side_tools_are_bridge_only_and_conditional() {
         let all = defs(&[]);
-        for n in ["ListMcpResourcesTool", "ReadMcpResourceTool"] {
+        for n in [
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            "ListMcpPromptsTool",
+            "GetMcpPromptTool",
+        ] {
             assert!(
                 !names(&all).contains(&n.to_string()),
                 "{n} 不该出现在 defs() 里：它是条件注册的（用户没有工具文件时，它在固定前缀里纯占位）"
@@ -2392,7 +3021,12 @@ mod tests {
             assert!(!parallel_safe(n), "{n} 走单线程 stdio 桥，必须串行");
         }
         // 条件注册用的 schema 必须是一等公民形状
-        for t in [list_resources_tool(), read_resource_tool()] {
+        for t in [
+            list_resources_tool(),
+            read_resource_tool(),
+            list_prompts_tool(),
+            get_prompt_tool(),
+        ] {
             assert!(t.get("name").and_then(Value::as_str).is_some(), "缺 name");
             assert!(t.get("description").and_then(Value::as_str).is_some(), "缺 description");
             assert!(t.get("input_schema").map_or(false, Value::is_object), "缺 input_schema");
@@ -2436,7 +3070,7 @@ mod tests {
     #[test]
     fn under_budget_is_untouched() {
         let s = "ok".repeat(1_000); // 2000 字符 < 12k
-        assert_eq!(apply_budget("Bash", s.clone()), s);
+        assert_eq!(apply_budget("Cmd", s.clone()), s);
     }
 
     /// 超预算：头尾都留、省略量算得对、多字节字符不许切在半路（切错会 panic）
@@ -2464,7 +3098,7 @@ mod tests {
     #[test]
     fn spill_file_name_is_sanitized() {
         assert_eq!(safe_name("mcp__my-tool"), "mcp__my-tool");
-        assert_eq!(safe_name("Bash"), "Bash");
+        assert_eq!(safe_name("Cmd"), "Cmd");
         assert_eq!(safe_name("a/b:c*d"), "a_b_c_d");
     }
 
@@ -2477,7 +3111,7 @@ mod tests {
         for n in [
             "Write",
             "Edit",
-            "Bash",
+            "Cmd",
             "PowerShell",
             "AskUserQuestion",
             // 技能按最坏模式算：fork 会派生能写文件、发 API 的子代理（A5）。
@@ -2511,7 +3145,7 @@ mod tests {
     #[test]
     fn spill_writes_the_full_body_into_the_output_dir() {
         let body: String = "行\n".repeat(SPILL_THRESHOLD); // 远超内联预算
-        let out = apply_budget("Bash", body.clone());
+        let out = apply_budget("Cmd", body.clone());
         let dir = output_dir();
 
         let path = fs::read_dir(&dir)
