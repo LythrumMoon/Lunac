@@ -22,6 +22,7 @@ import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { attachPluginListeners, detachPluginListeners } from "./plugins/attach";
 import { refreshMarketPlugins } from "./plugins/market";
 import { installHostBridge } from "./plugins/host";
+import { createSidecarBridge, activatePluginSidecar, deactivatePluginSidecar, maybeAutoStartSidecar } from "./plugins/sidecar";
 
 /** 主题变量事件：主窗口 → 所有窗口（见 main.ts 的 broadcastThemeVars）。 */
 const THEME_VARS_EVENT = "lunac-theme-vars";
@@ -72,8 +73,13 @@ function applyThemeVars(vars: Record<string, string>) {
 async function render(pluginId: string, input: string) {
   const myGen = ++renderGen;
   // 换插件前先把上一个插件的定时器/监听收掉（同一个窗口可以被复用去装另一个插件）
-  if (currentPluginId && currentPluginId !== pluginId) detachPluginListeners(currentPluginId);
+  if (currentPluginId && currentPluginId !== pluginId) {
+    detachPluginListeners(currentPluginId);
+    // 换插件 ⇒ 收掉上一个的 sidecar（绑定面板，见 plugins/sidecar.ts）
+    void invoke("plugin_sidecar_stop", { pluginId: currentPluginId }).catch(() => {});
+  }
   currentPluginId = pluginId;
+  activatePluginSidecar(pluginId);
 
   const plugin = pluginRegistry.getAll().find(p => p.id === pluginId);
   titleEl.textContent = plugin ? pluginName(plugin.id) : pluginId;
@@ -83,6 +89,9 @@ async function render(pluginId: string, input: string) {
     root.innerHTML = `<div class="plugin-result"><div class="plugin-result-content">${esc(t("plugin.float_unknown", { id: pluginId }))}</div></div>`;
     return;
   }
+
+  // 清单声明了 sidecar.autostart ⇒ 面板一出来就起进程（首次仍会先弹信任卡）
+  maybeAutoStartSidecar(!!plugin.sidecar?.autostart);
 
   try {
     const result = await plugin.execute(input);
@@ -123,6 +132,8 @@ function wireTitlebar() {
 
   btn("plugin-close")?.addEventListener("click", () => {
     detachPluginListeners(currentPluginId);
+    // 面板关了 ⇒ sidecar 一起收掉（宿主侧在窗口 Destroyed 也会再收一次，双保险）
+    deactivatePluginSidecar();
     void invoke("plugin_window_close").catch(() => {});
   });
 
@@ -145,12 +156,20 @@ function wireTitlebar() {
   loadSavedLanguage();
   // 磁盘插件的宿主桥：**必须在 registerBuiltinPlugins / refreshMarketPlugins 之前装好**，
   // 否则插件模块一加载就 import 到未初始化的一份 i18n（见 plugins/host.ts 头注释）。
-  installHostBridge({ t, apiVersion: 1 });
+  installHostBridge({ t, apiVersion: 2, sidecar: createSidecarBridge() });
   registerBuiltinPlugins();
   // 插件可能只装在 `<exe 根>\Modules\` 里（第三方 / 用户自建）—— 不扫这一下，
   // 悬浮窗遇到它们只会显示「未知插件」（主窗口本来就会扫，这里补上同一件事）
   await refreshMarketPlugins();
   wireTitlebar();
+
+  // ── 禁掉默认右键菜单（2026-10-02 用户要求）─────────────────────────
+  // 主窗口（`index.html` + `main.ts`）早就全局 `preventDefault` 了这一条，但**悬浮窗走的是
+  // 另一个入口**（`plugin.html` + 本文件，不 import main.ts）⇒ 插件窗里右键会弹出
+  // WebView2 的浏览器默认菜单（「刷新 / 另存为 / 检查」那一套），与本应用的观感完全不搭。
+  // 判据与主窗口一致，落点放在**所有插件窗共用**的这一处：一处挡住全部插件，
+  // 不必每个插件自己绑一次（桌宠 `pet.ts` 那种自己绑的仍有效，只是变成冗余）。
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
 
   // 外观：先要一次，之后主窗口每次改主题都会广播（main.ts 的 applyAppearance 收尾）
   void listen<Record<string, string>>(THEME_VARS_EVENT, ev => {

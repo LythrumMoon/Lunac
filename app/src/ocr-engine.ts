@@ -2,46 +2,64 @@
 // 2026-09-29：从 `plugins/builtin/ocr.ts` 搬到这里。
 //
 // **为什么搬**：OCR 已归入**拓展插件**（见 `plugins/kinds.ts`），它的模块会被打包成
-// 独立 ESM 投进 `Modules\ocr\`，不再随主 bundle 编译。但「设置 → OCR 引擎」那一节
-// 仍由**基础插件 settings** 渲染 —— 若 settings 继续 `import("./ocr.js")`，整份 OCR
+// 独立 ESM 投进 `Modules\ocr\`，不再随主 bundle 编译。而「设置 → OCR 引擎」那一节
+// 当时仍由**基础插件 settings** 渲染 —— 若 settings 继续 `import("./ocr.js")`，整份 OCR
 // 代码又会被拖回 bundle（正是 `Modules\` 化要消掉的耦合）。
 //
-// 引擎本身是**宿主资源**（下载到 `<exe 根>\paddle-ocr`，由 `src-tauri` 的 OCR 命令使用），
-// 与「插件装没装」无关，所以这个「装引擎」的小封装放在宿主侧最合适：
-// settings 与 ocr 插件各自 import 它，谁都不会因此把对方打进自己的包。
+// **2026-09-30 改**：引擎不再由宿主自下载（`paddle_ocr::install_engine` 已删），
+// 它成为 `ocr` 插件清单里的一条 `archive` 依赖。所以这里不再调什么「装引擎」命令，
+// 而是调**通用的依赖安装** `install_plugin_dependencies` —— 引擎怎么来的只有一条路：
+// 插件清单的 `dependencies[]`（见 ai-spec §3.5 与 plugin_market.rs）。
 //
-// 依赖的命令与事件都在宿主（见 `src-tauri/src/ocr*.rs`）：`ocr_engine_install`、
-// `ocr-engine-progress` / `ocr-engine-ready` / `ocr-engine-error`。
+// 谁还用这份封装：`plugins/builtin/ocr.ts`（插件内的「引擎缺失 → 下载」提示）。
+// 设置面板那节已删（用户要求：动作移进插件的依赖里，不再单开一个入口）。
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { DownloadMeter, type DownloadSample } from "./download-progress.js";
 
-/** 触发引擎下载安装。进度经 `ocr-engine-progress`/`ready`/`error` 事件回传。
- *  返回 Promise<boolean>：true = 安装成功。 */
+/** 进度回调收到的东西：`sample` 是百分比 + 速度，`phase` 是宿主当前在干什么。 */
+export type OcrEngineProgress = DownloadSample & { phase: string };
+
+/**
+ * 触发 `ocr` 插件的依赖安装（= 引擎）。
+ *
+ * 返回 Promise<boolean>：true = 装好了。进度经 `plugin-install-progress` 事件回传，
+ * 只认 `id === "ocr"` 的那几条（插件包本体那一段的 id 是空串，与这里无关）。
+ *
+ * 用 `try/finally` 收监听：这个封装可能被连点两次，漏收一个监听就会越挂越多。
+ */
 export function installOcrEngine(
-  onProgress?: (info: { percent: number; mb: number }) => void,
+  onProgress?: (info: OcrEngineProgress) => void,
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
-    const unlisteners: Array<() => void> = [];
-    const cleanup = () => {
-      for (const fn of unlisteners) { try { fn(); } catch { /* ignore */ } }
-    };
+    let unlisten: (() => void) | undefined;
+    const meter = new DownloadMeter();
     void (async () => {
-      unlisteners.push(await listen("ocr-engine-progress", (ev) => {
-        const { downloaded, total } = ev.payload as { downloaded: number; total: number };
-        onProgress?.({
-          percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
-          mb: downloaded / 1048576,
-        });
-      }));
-      unlisteners.push(await listen("ocr-engine-ready", () => { cleanup(); resolve(true); }));
-      unlisteners.push(await listen("ocr-engine-error", () => { cleanup(); resolve(false); }));
       try {
-        await invoke("ocr_engine_install");
+        unlisten = await listen("plugin-install-progress", (ev) => {
+          const p = ev.payload as {
+            id: string;
+            phase: string;
+            downloaded: number;
+            total: number;
+          };
+          if (p.id !== "ocr") return;
+          onProgress?.({ ...meter.push(p.downloaded, p.total), phase: p.phase });
+        });
       } catch {
-        cleanup();
-        resolve(false);
+        /* 监听挂不上不该拦住安装本身 —— 大不了没有进度 */
       }
+      let ok = false;
+      try {
+        await invoke("install_plugin_dependencies", { id: "ocr" });
+        ok = true;
+      } catch {
+        ok = false;
+      } finally {
+        try { unlisten?.(); } catch { /* ignore */ }
+      }
+      resolve(ok);
     })();
   });
 }

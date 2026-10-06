@@ -634,6 +634,25 @@ html, body {
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
+/* 有可用更新（2026-09-30）：齿轮右上角点一个点。
+   这是「启动时静默检查」**唯一**的可见提示 —— 不弹窗、不抢焦点，因为检查更新只是背景信息；
+   点开设置就能在「常规」里看到「有新版本 vX」与「下载并安装」。
+   类由 main.ts 的 `startUpdateCheckOnBoot()` 加（见那里的三条纪律）。 */
+#settings-btn.has-update {
+  position: relative;
+  opacity: 1;
+}
+#settings-btn.has-update::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgb(var(--accent-rgb));
+}
+
 .hidden { display: none !important; }
 
 /* ── Detached panel mode (double-click search bar) ────────────── */
@@ -736,6 +755,71 @@ html[data-window-kind="chat"] #detail-panel {
    **播放态不需要这一条**（那条窗口本身就只有 550 宽，见下面播放态那组规则）。 */
 body:has(.music-root) #plugin-titlebar { margin: 0 4px; }
 
+/* ── 标题栏里的「三段切换」（2026-10-01 用户口径）────────────────────
+   用户要求：把「本地音乐」与「调音」两个入口**收成一枚切换按钮**，放到标题栏里
+   那段文字（`#plugin-title`，音乐插件的名字就叫「音乐歌词」）的位置上，
+   **那段文字删掉**。
+   · 文字用 CSS 藏（不是删 DOM）：`#plugin-title` 的文本由 plugin-window.ts 写、
+     每个插件共用，窗口还会被复用去装别的插件 —— 藏 + `:has(.music-root)` 限定，
+     换个插件自动就回来了。
+   · 三段 = 在线歌单 / 本地音乐 / 调音（当前段由 music.ts 的 renderTitlebarSwitch
+     按 mode + localPage 现算，不另存状态）。
+   · 控件**不写死在这里**（由 music.ts 的 placeSwitcher 造并插进来）：插件被嵌在
+     主窗口里时根本没有这条标题栏，那时它会退到工具条上。 */
+body:has(.music-root) #plugin-title { display: none; }
+.music-tb-switch {
+  /* 2026-10-01 用户第二轮口径：「这个按钮的背景太大了、放置在最左端、
+     整体限制在 220」。原来写的是 `flex: 1 1 auto` —— 它会被标题栏**拉满**
+     （实测宽 1140px），于是那层底色看起来就是「整条标题栏都上了色」。
+     改成 `flex: 0 0 auto`：宽度只由内容决定；再靠 `margin-right: auto`
+     贴到最左端、把右侧那三个窗口按钮推到右端去。220px 是**上限**，不是目标宽。 */
+  flex: 0 0 auto;
+  max-width: 220px;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: rgba(var(--ink-rgb), 0.05);
+}
+/* 「推到最左端」只在**长在标题栏里**时成立：内嵌形态它退回工具条，
+   那一条上没有需要被推走的窗口三键，套上去反而会把齿轮挤到边上。 */
+#plugin-titlebar .music-tb-switch { margin-right: auto; }
+.music-tb-seg {
+  flex: 0 1 auto;
+  min-width: 0;
+  /* 每段收窄（16 → 10）：三段并排要放得进上面那 220px 的上限里。 */
+  padding: 3px 10px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-radius: 5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.music-tb-seg:hover { color: var(--text); }
+/* 当前那段：只靠一层更实的底 + 文字提亮（与左栏页签 `.music-tab` 同一套语言，
+   不给它画描边 —— 标题栏那 40px 里再加框线会显得很吵）。 */
+.music-tb-seg[aria-pressed="true"] {
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.1);
+}
+
+/* 小窗态（远端 / 本地两条长条）里**不显示三段切换**（2026-10-01 用户口径：
+   「在小窗播放模式下不能有这个切换分页的按钮」）。两条理由：
+   · 小窗是定尺 550 的长条，标题栏那 40px 里再挤三段文字，右边那三个窗口按钮
+     会被压掉；
+   · 三段各自的去向（在线歌单 / 本地音乐 / 调音）在小窗里都没有对应的内容可切。
+
+   ⚠️ 用 `visibility: hidden` 而**不是 `display: none`**：标题栏是 flex，
+   `#plugin-title`（那段插件名）在音乐插件里已经被藏掉了，这个切换器是**唯一**
+   把右侧三个窗口按钮推向右端的东西（靠它自己的 `margin-right: auto`）。
+   用 `display: none` 把它整个抽走，置顶 / 最小化 / 关闭 三个键会一起**跳到左边**。
+   `visibility: hidden` 的元素不响应指针事件，所以「按钮不能有」这件事照样成立。 */
+body:has(.music-root.music-player-on) .music-tb-switch { visibility: hidden; }
+
 /* ── 播放态：窗口就等于长条本身（2026-09-28）────────────────────────
    用户报「音乐播放状态那个 **562×200** 的渲染窗口要你去掉」：窗口比长条大了一圈。
    两处来源，两处都得治：
@@ -760,9 +844,10 @@ body:has(.music-root.music-player-on) #app.detached #results-container {
      实测「列表比窗口还高 1px」⇒ `chrome = 内高 − 列表高` 量出 **-1**、
      下发的高度就少 1px，卡片底下被裁掉一线、还可能诱出滚动条。所以这里必须一起归零。 */
   margin-top: 0 !important;
-  /* 圆角必须等于 `.music-pv-card` 的 12px：容器是 14（--radius），差 2px 时
-     玻璃层的圆角会从长条的圆角外面露出来。 */
-  border-radius: 12px !important;
+  /* 圆角必须等于 `.music-pv-card` 的 6px（2026-10-01 用户第 3 条铺开后由 12px
+     收到 6px）：容器是 14（--radius），差 2px 时玻璃层的圆角会从长条的圆角外面
+     露出来。**两处是一对，改一处必须改另一处。** */
+  border-radius: 6px !important;
 }
 body:has(.music-root.music-player-on) #app.detached #results-list { padding: 0; }
 body:has(.music-root.music-player-on) #app.detached #results-list .plugin-result { padding: 0; }
@@ -969,6 +1054,79 @@ html.no-chrome #results-list {
   flex-shrink: 0;
 }
 
+/* ── 截屏框选的**覆盖窗**（2026-10-06，二改）─────────────────────────
+   这一份样式属于**独立的一页**（`src/screenshot.html` → `shot-overlay` 窗），
+   不是插件面板的一部分：那扇窗铺满整块虚拟桌面、无边框置顶，只负责拖一个框
+   （形态抄 ShareX 的 `RegionCaptureForm`；见 src-tauri/src/screenshot.rs 注释）。
+
+   挑选逻辑：整张截图 `width/height: 100%` **拉满整窗** —— 窗的物理尺寸与截图的
+   物理像素一一对应，所以屏幕上是 1:1；`.shot-box` 用 `fixed` + `clientX/clientY`，
+   坐标不必换算。暗幕靠**框外面那一圈巨大阴影**做（拖起来时把整块暗幕收掉），
+   这样框内天然是原亮度，不必再叠一层「挖洞」的遮罩。 */
+.shot-body {
+  margin: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+#shot-root {
+  position: fixed;
+  inset: 0;
+  cursor: crosshair;
+}
+
+#shot-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* 还没开拖时的整屏暗幕。**必须 `pointer-events: none`** ——
+   它盖在 `#shot-img` 上面，不放开的话会把 `mousedown` 全吃掉，
+   表现就是「覆盖窗出来了，但怎么也拖不出框」（2026-10-06 实测踩到）。 */
+#shot-dim {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+#shot-box {
+  position: fixed;
+  border: 1px solid var(--accent);
+  background: transparent;
+  /* 框外压暗、框内保持原亮度（一个 9999px 的 spread 就是那块「挖洞」） */
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+#shot-size {
+  position: fixed;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+#shot-hint {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 0.76rem;
+  pointer-events: none;
+}
+
 .ocr-action-btn {
   flex: 1;
   padding: 6px 10px;
@@ -1079,6 +1237,87 @@ html.no-chrome #results-list {
   flex-shrink: 0;
   pointer-events: auto;
   overflow: visible; /* allow mode dropdown to extend above */
+  /* 「提问节点」右栏是 `position:absolute; height:100%`（2026-10-02）——
+     输入框必须抬到它上面，否则右栏一开就把它盖住、用户没法打字。
+     同理见下面 `#todo-drawer`。两处都是**加定位**而不是改尺寸，不动既有布局。 */
+  position: relative;
+  z-index: 20;
+}
+
+/* ── 待发送队列（2026-09-30）────────────────────────────────────
+   生成中入队的消息列在输入框上方：一行标题 + 若干条（每条 = 文本 + 立即发送 / 移除）。
+   内容高时自己滚动（最多 3 行高度），不把输入框越顶越高。 */
+#chat-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px 0 10px;
+  pointer-events: auto;
+}
+
+#chat-queue.hidden {
+  display: none;
+}
+
+#chat-queue-head {
+  display: flex;
+  align-items: center;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
+#chat-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 78px;
+  overflow-y: auto;
+}
+
+.chat-queue-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) * 0.6));
+}
+
+.chat-queue-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.74rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-queue-btn {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  border-radius: 5px;
+  /* 图标跟「按钮线条」，与聊天输入栏那六个动作按钮同一口径
+     （ai-spec §3.5「按钮配色纪律」）；hover 只抬透明度与底纹，不新开 accent 例外。 */
+  color: rgb(var(--btn-line-rgb));
+  opacity: 0.55;
+  cursor: pointer;
+  transition: opacity 0.1s, background 0.1s;
+}
+
+.chat-queue-btn:hover {
+  opacity: 1;
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
 /* Chat file chips — same style as search bar chips */
@@ -1107,6 +1346,40 @@ html.no-chrome #results-list {
 #results-container.ai-chat #chat-input-bar {
   display: flex !important;
 }
+
+/* ── 审批停靠位（2026-10-02，用户要求「权限卡 / 计划卡停靠输入框位置」）────────
+   权限卡 / 计划卡不再挂在对话流里（会随滚动跑掉），而是挂进 `#approval-dock`
+   —— 就在输入栏**上方**、输入栏让位后正好占住那一格。
+   两个 body 开关由 main.ts 的 `syncApprovalChrome()` 统一切换：
+     · `body.approval-open` ⇒ 有待审批的卡：输入栏**整条藏起来**（卡片替代它，回答完自动回来）；
+     · `body.plan-open`     ⇒ 有待批准的计划：任务抽屉（待办 + 文件更改）一起藏 ——
+                              那些是上一轮的残留，计划待批时只会干扰阅读。
+   两条都必须 `!important`：上面那条 `#results-container.ai-chat #chat-input-bar` 自己就是
+   `display: flex !important`，不加根本压不住。 */
+#approval-dock {
+  flex-shrink: 0;
+  pointer-events: auto;
+  /* 抬到输入栏（z-index 20）与「提问节点」右栏（18）之上：两者交接的那一帧不留错位。 */
+  position: relative;
+  z-index: 21;
+  /* 停靠位是**唯一**的滚动容器：卡片很高（计划卡可到 62vh）时由它自己滚 ——
+     不这么写，卡片会把 `#results-container`（overflow:hidden）撑出裁剪，而
+     停靠位恰好在最底部 ⇒ 底部按钮直接被裁掉、点不到。 */
+  max-height: 62vh;
+  overflow-y: auto;
+}
+/* 卡片在停靠位里**不再自己限高/滚动** —— 嵌套双滚动是本项目明令禁止的
+   （见 `.approval-cmd-box` 那段教训），滚动统一交给上面的 #approval-dock。 */
+#approval-dock .approval-batch-card .approval-batch-body {
+  max-height: none;
+  overflow: visible;
+}
+body.approval-open #results-container.ai-chat #chat-input-bar {
+  display: none !important;
+}
+body.plan-open #todo-drawer {
+  display: none !important;
+}
 /* (The old `#results-container.ai-chat { overflow: visible }` was removed —
    it defeated #results-list scrolling so long chats were clipped by the
    window with no way to scroll. The mode dropdown it existed for is gone;
@@ -1121,9 +1394,10 @@ html.no-chrome #results-list {
    判据（ai-spec 规则 45/48）：这个绿表达的是「可点的动作」还是「状态」？
    这里是动作按钮 ⇒ 走 accent 系（底色 --accent-bg / 边框 --accent-border / 图标 --accent，
    图标走内联 SVG 的 currentColor，按规则 45 允许保留 --accent）。
-   ⚠ 批量替换时**不要**把语义绿一起换掉：`.tool-row.auto-approved` / `.tool-row.tool-ok` /
-   `.approval-allow` / `.tool-refusal-allow` / `.agent-status.ready` / `.memo-save-edit` 那些
-   表达「成功/放行/有效」，按规范必须保持固定。 */
+   ⚠ 批量替换时**不要**把语义绿一起换掉：`.tool-row.tool-ok` / `.approval-allow` /
+   `.tool-refusal-allow` / `.agent-status.ready` / `.memo-save-edit` 那些
+   表达「成功/放行/有效」，按规范必须保持固定。
+   （`.tool-row.auto-approved` 已于 2026-10-01 整条删除，见下方同名注释 —— 别再把它加回这张表。） */
 #chat-add-file-btn {
   display: flex;
   align-items: center;
@@ -1235,29 +1509,6 @@ html.no-chrome #results-list {
 }
 #chat-stop-btn:hover {
   background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
-}
-
-/* ── Humanize button — same style as other chat row buttons ──── */
-#humanize-btn {
-  width: 30px;
-  height: 30px;
-  font-size: 0.85rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  opacity: 0.55;
-  background: none;
-  border: none;
-  color: var(--text-dim);
-  cursor: pointer;
-  border-radius: 6px;
-  transition: opacity 0.1s, color 0.1s, background 0.1s;
-}
-#humanize-btn:hover {
-  opacity: 1;
-  color: var(--accent);
-  background: var(--accent-bg);
 }
 
 /* Security warning block — yellow border + semi-transparent bg */
@@ -1391,12 +1642,32 @@ html.no-chrome #results-list {
 #token-usage-panel.hidden {
   display: none;
 }
-/* 面板里的「数据」一行（价格时间 / 未定价 / 候选路径） */
+/* 面板顶部一行（2026-10-06）：左边是数据（价格表时间 / 未定价 / 候选路径），右边是时间范围下拉框 */
+#token-usage-panel .cost-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+#token-usage-panel .cost-range {
+  flex: 0 0 auto;
+}
+#token-usage-panel .cost-range-select {
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--ink-rgb), 0.05);
+  color: var(--text);
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+/* 面板里的「数据」一行（价格表时间 / 未定价 / 候选路径）。下边距归 `.cost-head` 管。 */
 #token-usage-panel .cost-data {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 16px;
-  margin-bottom: 8px;
+  min-width: 0;
 }
 #token-usage-panel .cost-kv {
   display: inline-flex;
@@ -1546,37 +1817,8 @@ html.no-chrome #results-list {
   color: var(--green);
 }
 
-/* 「以管理员身份运行」盾牌（详细搜索 · 仅可提权的行有）—— 2026-09-19 新增。
-   刻意比 badge 弱一档：它是**次要**动作，默认不抢视线，hover / 行选中时才点亮。
-   只在这一个文件里定义，不要在 HTML 里写内联样式（见 docs/code-rules.md 的样式纪律）。 */
-.result-item-elevate {
-  flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  font-size: 0.78rem;
-  line-height: 1;
-  cursor: pointer;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-dim);
-  opacity: 0.55;
-  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
-}
-
-.result-item:hover .result-item-elevate,
-.result-item.selected .result-item-elevate {
-  opacity: 1;
-}
-
-.result-item-elevate:hover {
-  background: var(--accent-bg);
-  color: var(--accent);
-}
+/* 「以管理员身份运行」盾牌样式已删（2026-10-05）：结果行上那个重复的盾牌按钮按用户要求
+   移除，提权统一走「选项」菜单与 Shift+Enter（`detail.elevate_title`）。 */
 
 /* 提示行的临时反馈（提权被拒 / 无提权形态）—— 必须一眼可见，否则等于静默失败 */
 .detail-hint-error {
@@ -1795,6 +2037,13 @@ html.no-chrome #results-list {
 
 .think-content {
   margin-top: 4px;
+  /* 展开后的思考正文给一块**自己的底色**（2026-10-01 用户要求「思考过程的展开要有
+     更清楚的前端展示」）：原先它只有一条左边线，几十行灰字糊在对话流里，
+     与上下文分不开。色值取 0.22 —— 比 `.tool-body`(0.26) 浅一档，
+     因为它是叙述性正文而不是机器输出。 */
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
   color: var(--text-dim);
   font-size: 11px;
   line-height: 1.55;
@@ -1826,10 +2075,9 @@ html.no-chrome #results-list {
   opacity: 0.8;
 }
 
-.tool-row.auto-approved {
-  color: var(--green);
-  background: rgba(157, 180, 172, 0.08);
-}
+/* `.tool-row.auto-approved` 已删（2026-10-01）：自动放行不再往流里落一行提示
+   （见 main.ts `showPermissionCard` 的 `cls.auto` 分支）—— 一轮里能刷十几行纯噪音，
+   而「这条走没走审批」看**有没有审批卡**就够了。 */
 
 .tool-row.tool-ok {
   color: var(--text-dim);
@@ -1901,8 +2149,17 @@ html.no-chrome #results-list {
   white-space: nowrap;
 }
 .cmd-group[open] > .cmd-group-head { margin-bottom: 3px; }
-/* 卡片进组后由组提供间距，自己那 3px 外边距去掉，并缩进一档表示从属关系 */
-.cmd-group-body { display: flex; flex-direction: column; }
+/* 卡片进组后由组提供间距，自己那 3px 外边距去掉；
+   **组与卡片的从属关系靠「缩进一档 + 一条垂线」表达**（2026-10-01 用户要求
+   「展开要有更清楚的层级」）。三层深度分别是：组头浮层 0.14 → 卡片 0.18 →
+   卡内正文 0.26（见 `.tool-body`），逐层加深。 */
+.cmd-group-body {
+  display: flex;
+  flex-direction: column;
+  margin-left: 1px;
+  padding-left: 8px;
+  border-left: 2px solid rgba(var(--ink-rgb), 0.10);
+}
 .cmd-group-body > .tool-card { margin: 2px 0 0 0; }
 
 /* ── AI 命令执行卡片（参照 Trae 侧栏，见 docs/agent-ui-spec.md §3.3）──
@@ -1963,7 +2220,7 @@ html.no-chrome #results-list {
 
 /* 卡片正文里的**完整命令**（2026-09-27 加）。头部的 `.tool-cmd` 活在单行 summary 里，
    被 `text-overflow: ellipsis` 截断 —— 展开卡片也看不到全文是第三处缺陷，这里是它的落点。
-   只在命令类工具（Bash / PowerShell）上写值：Write/Edit 的入参里有整个文件内容。 */
+   只在命令类工具（Cmd / PowerShell）上写值：Write/Edit 的入参里有整个文件内容。 */
 .tool-card .tool-cmd-full {
   margin: 4px 0 0 0;
   padding: 4px 6px;
@@ -1991,9 +2248,128 @@ html.no-chrome #results-list {
 .tool-card.failed .tool-state { color: var(--red); }
 .tool-card.failed { background: rgba(192, 138, 138, 0.08); }
 
+/* 用户点了「停止」（2026-10-01）：点下去那一刻是**乐观**置上（等 agent 收尾），
+   结果回来时 `fillToolCard` 按结果文本再判一次、并写状态文字（`agent.tool_stopped`）。
+   取黄色而非红色：它不是失败，是「这轮没跑完」，同 `timeout` 一档。 */
+.tool-card.stopped { background: rgba(198, 168, 106, 0.08); }
+.tool-card.stopped .tool-state { color: var(--yellow); }
+
 .tool-body {
   padding: 0 8px 6px 8px;
   border-top: 1px solid rgba(var(--ink-rgb), 0.06);
+  /* 卡内正文再深一档（0.26 > 卡片自身的 0.18）—— 「卡头 → 卡内」的层次由
+     **底色深度**表达，不再只靠一条内边线（2026-10-01 用户要求）。
+     圆角跟着卡片收底，否则加深的底色会从卡片圆角外面露出来。 */
+  background: rgba(0, 0, 0, calc(0.26 * var(--shade-scale)));
+  border-radius: 0 0 6px 6px;
+}
+
+/* 写入内容的凭据告警（A17，2026-10-01）：`.tool-body` 里的第一块，随 `fillToolCard` 插入。
+   审批卡上那份是**执行前**看的，而用户可能压根没看那张卡（自动档 / 顺手点了允许）⇒
+   这里再显式标一次，并把卡片摊开（见 fillToolCard）。
+   用**红系**（同 `.tool-card.failed`）而不是黄系：黄系表达「没跑完 / 退出码非零」，
+   这一条是「看见了正面证据」，与审批卡的「必须人看」同一档。 */
+.tool-secret-warn {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 2px solid var(--red);
+  border-radius: 0 4px 4px 0;
+  background: rgba(192, 138, 138, 0.10);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.tool-secret-warn strong { color: var(--red); font-weight: 600; }
+.tool-secret-warn ul { margin: 3px 0 0 0; padding-left: 16px; }
+.tool-secret-warn li { color: var(--text); }
+.tool-secret-warn-note { display: block; margin-top: 3px; color: var(--text-muted); }
+
+/* 出图结果（A13，2026-10-03）：`ImageGen` 工具卡里把生成的图真正渲染出来。
+   一组图横向排、窄屏自动折行；单张限制高度，避免竖图把卡片撑到屏幕外。 */
+.tool-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 2px 0;
+}
+.tool-image {
+  max-height: 220px;
+  max-width: 100%;
+  border-radius: 4px;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  background: rgba(0, 0, 0, calc(0.2 * var(--shade-scale)));
+}
+/* ── 正在执行的命令：实时控制（2026-10-01，用户要求「命令卡上加后台运行 / 停止」）──
+   只长在**运行中**的命令卡上；命令一返回就整块撤掉（见 `agentToolResult`），
+   转后台的则换成一行状态（见 `markCardBackground`）。
+   放在卡内**最上面**：它是「对这条命令下指令」，与下面的输出不是一类东西。 */
+.tool-live {
+  display: flex;
+  gap: 6px;
+  padding-top: 6px;
+}
+.tool-live.hidden {
+  display: none;
+}
+.tool-live-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(var(--ink-rgb), 0.06);
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.tool-live-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: rgba(var(--ink-rgb), 0.28);
+}
+.tool-live-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.tool-live-btn.danger:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+}
+.tool-live-state {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* 待办抽屉里的「后台运行」区（2026-10-01）：一行一条命令 + 右侧一颗「取消」。
+   底色比普通待办行重一档 —— 它描述的是**正在占用机器的东西**，不该和待办一样轻。 */
+.todo-item.bg-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+}
+.todo-item.bg-cmd .bg-cmd-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+}
+.todo-item.bg-cmd .bg-cmd-cancel {
+  flex: none;
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(var(--ink-rgb), 0.06);
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.todo-item.bg-cmd .bg-cmd-cancel:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+}
+.todo-item.bg-cmd .bg-cmd-cancel:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .tool-meta {
@@ -2015,6 +2391,17 @@ html.no-chrome #results-list {
   max-height: 180px;
   overflow-y: auto;
   color: var(--text-dim);
+}
+
+/* 命令类工具（Cmd / PowerShell）的终端视图（2026-10-05，用户要求「命令执行显示改成
+   cmd/PowerShell 终端」）。xterm 实例挂在 `.tool-term` 上：这里只给容器定高 / 圆角 /
+   底色，内部（`.xterm` / `.xterm-viewport`）由 xterm 自带的 CSS 与 JS 里的 theme 接管。 */
+.tool-card .tool-term {
+  margin: 4px 0 0 0;
+  height: 220px;
+  background: #0b0b0c;
+  border-radius: 5px;
+  overflow: hidden;
 }
 
 .tool-actions {
@@ -2099,6 +2486,9 @@ html.no-chrome #results-list {
   user-select: none;
 }
 .sys-note > summary::-webkit-details-marker { display: none; }
+/* 「一行系统旁注」（上下文压缩提示这类）：复用 `.sys-note` 的容器形态，但它没有
+   `<summary>`，所以单独定一个次要文字色 —— 不写就继承正文色，看起来像模型说的话。 */
+.sys-note-line { color: var(--text-dim); }
 .sys-note > summary:hover { color: var(--text); }
 .sys-note-error > summary { color: var(--red); opacity: 0.85; }
 /* 附件未能发送（A8）：与 error 同级但**不是错误** —— 图片没发出去多半是格式 / 体积 /
@@ -2152,6 +2542,9 @@ html.no-chrome #results-list {
   font-size: 11px;
   flex-shrink: 0;
   pointer-events: auto;
+  /* 与 `#chat-input-bar` 同一条理由：抬到「提问节点」右栏（z-index 18）之上。 */
+  position: relative;
+  z-index: 20;
 }
 #todo-drawer-head {
   display: flex;
@@ -2230,15 +2623,200 @@ html.no-chrome #results-list {
   font-size: 10.5px;
 }
 
+/* ── U1 代码变更 diff 卡（2026-10-06）─────────────────────────────────
+   「更改文件」列表的审阅态：每个文件可摊开看逐条改动与 diff，
+   行尾的「接受 / 拒绝」是**事后**审阅（拒绝 = 用快照把文件写回去）。
+   `#todo-drawer-files` 继承了 `.todo-items` 的 `max-height:132px` ——
+   摊开 diff 后太矮，这里单独放大（审阅时最需要看的就是这块）。 */
+#todo-drawer-files {
+  max-height: min(42vh, 320px);
+}
+
+.cr-loading {
+  color: var(--text-muted);
+}
+
+/* 汇总行：N 个文件 · +A −B + 两个「全部」按钮 */
+.cr-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border-glass);
+}
+.cr-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+/* 单个文件行 */
+.cr-file {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cr-file.accepted .cr-row > .file-link {
+  opacity: 0.6;
+}
+.cr-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.cr-toggle {
+  flex: none;
+  width: 16px;
+  padding: 0;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.cr-row > .file-link {
+  flex: none;
+  font-size: 11px;
+}
+
+/* 增减行数统计（精确值，与 diff 是否截断无关） */
+.cr-stat {
+  flex: none;
+  display: inline-flex;
+  gap: 4px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10px;
+}
+.cr-add { color: var(--accent); }
+.cr-del { color: var(--red); }
+.cr-unknown { color: var(--text-muted); }
+
+/* 已接受标记 */
+.cr-done {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+/* 接受 / 拒绝按钮 */
+.cr-btn {
+  flex: none;
+  padding: 1px 8px;
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: rgb(var(--btn-line-rgb));
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.cr-btn:hover {
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
+}
+.cr-btn.reject {
+  color: var(--red);
+  border-color: rgba(192, 138, 138, 0.45);
+  background: rgba(192, 138, 138, 0.08);
+}
+.cr-btn.reject:hover {
+  background: rgba(192, 138, 138, 0.16);
+}
+
+/* 摊开后的主体 */
+.cr-body {
+  margin: 0 0 4px 22px;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  border-radius: 6px;
+}
+.cr-diff-head {
+  margin-bottom: 3px;
+}
+.cr-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+}
+.cr-entry.accepted .cr-entry-label {
+  opacity: 0.6;
+}
+/* 「这一条 / 净变化」选中态（按钮自身，不在 .cr-entry 里也有） */
+.cr-entry-label.active {
+  color: var(--accent);
+}
+.cr-entry-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  font-family: inherit;
+  font-size: 10.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.cr-entry-label:hover {
+  color: var(--text);
+}
+
+/* diff 视图 */
+.diff {
+  margin-top: 3px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.45;
+  background: rgba(0, 0, 0, calc(0.28 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+}
+.diff-line {
+  padding: 0 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+}
+.diff-add {
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.10);
+}
+.diff-del {
+  color: var(--red);
+  background: rgba(192, 138, 138, 0.10);
+}
+.diff-eq {
+  color: var(--text-muted);
+}
+.diff-note {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
 /* 回合折叠（Trae 的对话流节点自动折叠）：只留用户消息 + 正文 + 汇总行。
-   **`.tool-card` 不在这个名单里**（2026-09-27 改）：卡片现在装在 `.cmd-group` 里，
-   折叠由那个 `<details>` 自己承担（组头那行「已执行 N 条命令」始终可见）；把卡片
-   列进来会让「展开回合」也看不到任何命令与输出 —— 用户反馈的「命令的执行无法显示」。
+   **2026-10-01 改：`.cmd-group` 也进这个名单** —— 用户要求「已执行 N 条命令 /
+   N 个工具调用也放进收起过程里」，即折叠态**连那行计数组头一起收起**，不再留一条。
+   ⚠️ 与 2026-09-27 那次**不同**，别混为一谈：那次是在**没有展开入口**的情况下把卡片
+   藏了（用户反馈「命令的执行无法显示」）。现在每轮都有 `turn-fold` 展开按钮，且
+   `setFolded()` 展开回合时会顺手把组一起打开 ⇒ 藏起来不会再造成「回看不到命令」。
    历史「过程」块里的工具卡仍是 flow 的直接子节点（没有 `.cmd-group` 包着），
    所以单独保留那条规则（见下）。 */
 .agent-flow.flow-folded .think-block,
 .agent-flow.flow-folded .tool-row,
 .agent-flow.flow-folded .subtask-panel,
+.agent-flow.flow-folded .cmd-group,
 .agent-flow.flow-folded .sys-note {
   display: none;
 }
@@ -2318,6 +2896,85 @@ html.no-chrome #results-list {
 .approval-card.danger {
   border-color: rgba(192, 138, 138, 0.5);
   background: rgba(192, 138, 138, 0.08);
+}
+
+/* ── MCP elicitation 卡片（A13，2026-10-04）───────────────────────
+   服务端在 `tools/call` 前向用户收集输入时的那张表单
+   （见 app/src/main.ts 的 showElicitationCard）。 */
+.elicit-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.elicit-label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.elicit-input {
+  padding: 5px 8px;
+  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  /* 表单值必须可选择/可复制 — 覆盖 body 的 user-select: none */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.elicit-check {
+  align-self: flex-start;
+}
+
+/* ── 项目 MCP 信任卡（q3 第 4 步，2026-10-06）─────────────────────
+   项目 `.mcp.json` 要在本机拉起命令时的那张确认卡
+   （见 app/src/main.ts 的 showMcpTrustCard）。卡片要如实列出每台的
+   传输与目标命令 —— 字体刻意小一号并允许换行，长命令行不能撑破卡片。 */
+.mcp-trust-project {
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+  /* 路径要能选中复制（排查「到底是哪个项目」时最常用） */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.mcp-trust-list {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.mcp-trust-list li {
+  margin-bottom: 5px;
+}
+
+.mcp-trust-tag {
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border-glass);
+  border-radius: 4px;
+}
+
+.mcp-trust-list code {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--text-muted);
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.mcp-trust-hint {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
 }
 
 .approval-danger {
@@ -2464,10 +3121,14 @@ html.no-chrome #results-list {
    刻意**不给** max-height / overflow-y：新增一层滚动条、以及限制结果区高度都是本项目
    明令禁止的（agent-ui-spec §0 规则 1 / ai-spec §11 规则 44）—— 面板跟内容长，
    滚动交给外层结果区。 */
+/* 子代理（A14）产生的块：**整体缩进一级 + 一条更重的左边线**（2026-10-01 用户要求
+   「如果是子 agent 的需要缩进以用来区分」）。它挂在主对话流里，但内容属于一个
+   独立上下文 —— 不缩进就分不清哪几行是子代理干的、哪几行是主对话干的。 */
 .subtask-panel {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  margin-left: 14px;
   padding: 6px 8px;
   border-radius: 6px;
   background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
@@ -2652,11 +3313,92 @@ html.no-chrome #results-list {
   margin-bottom: 5px;
 }
 
+/* 长计划默认折叠时的「展开全文 / 收起」（2026-10-06，q3 第 6 步）——
+   见 main.ts 的 renderPlanCard：默认只铺前 PLAN_PREVIEW_LINES 行，这枚按钮把完整
+   原文换出来。**刻意不做模型摘要**（那张卡是裁决写操作的唯一依据，摘要会藏风险）。 */
+.approval-batch-card .approval-plan-toggle {
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.approval-batch-card .approval-plan-toggle:hover {
+  color: var(--text);
+  border-color: var(--accent-border);
+}
+
 /* 计划比普通审批卡需要更长的阅读窗口（几十行是常态）—— 放宽**外层**上限，
    而不是给正文再加一层滚动条（嵌套双滚动条见上面 `.approval-cmd-box` 的教训）。
    只在这一批里真的出现计划卡时才加：普通命令审批仍然保持 380px。 */
 .approval-batch-card.has-plan .approval-batch-body {
   max-height: 62vh;
+}
+
+/* 计划卡分页（2026-10-03，用户要求）：一批里有多份计划时一次只显示一页 —— `.plan-page`
+   的显隐由 main.ts 的 showPlanPage 切换（非当前页 style.display=none）。上一页 / 下一页
+   打在分页条上；末页固定是「补充要求」，提交后以**拒因**回灌给模型。 */
+.approval-batch-card .plan-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.approval-batch-card .plan-nav {
+  flex-shrink: 0;
+  padding: 2px 9px;
+  font-size: 11px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  cursor: pointer;
+}
+.approval-batch-card .plan-nav:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+.approval-batch-card .plan-nav:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.approval-batch-card .plan-page-label {
+  flex: 1;
+  text-align: center;
+}
+/* 末页「补充要求」 */
+.approval-batch-card .plan-custom-page {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.approval-batch-card .plan-custom-title {
+  font-size: 12px;
+  color: var(--text);
+}
+.approval-batch-card .plan-custom-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 72px;
+  resize: vertical;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.approval-batch-card .plan-custom-submit {
+  align-self: flex-end;
 }
 
 /* 对话流里的计划相位横幅（单例节点，进 / 出复用同一个）。
@@ -2900,6 +3642,17 @@ html.no-chrome #results-list {
   background: rgba(var(--accent-rgb), 0.15);
 }
 
+/* 回退按钮的「待确认」态（2026-09-30）—— 本次回退会连带还原磁盘文件时的二次确认。
+   与 `.run-mode-confirm-ok` 用同一支语义红（--red 家族固定，不随主题漂移，见 ai-spec
+   规则 45/48）；「所有按钮底色」那条规则已经 `:not([data-armed="1"])` 放行，所以这里
+   的底色不会被盖掉。 */
+.msg-actions button.msg-rollback[data-armed="1"],
+.turn-rollback[data-armed="1"] {
+  opacity: 1 !important;
+  color: var(--red);
+  background: rgba(192, 138, 138, 0.18);
+}
+
 /* 复制按钮（agent-flow 结尾，实时对话助手全文）——同印象派主题 */
 .flow-copy {
   align-self: flex-end;
@@ -3025,6 +3778,74 @@ html.no-chrome #results-list {
   margin: 0 4px;
 }
 
+/* ── 抽屉里的「轮次缩略」（U2，2026-10-06）────────────────────────────
+   会话行下面挂一串「#N 提问缩略」；点某一行 = 恢复该会话并跳到那一轮。
+   行样式照右栏 `.chat-node-item`（同一类东西：都是「索引」，都要求单行省略）。
+
+   ⚠️ 开关 `.history-turns-toggle` **同时带 `.history-item-meta`**：它是嵌在会话行
+   内部、替掉原来那行「N 条」的 meta（用户定的形态）。所以这里**刻意不设字号/颜色**，
+   让 `.history-item-meta` 那套生效；只去掉按钮自带的边框底色。 */
+.history-turns-toggle {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+}
+.history-turns-toggle::before {
+  content: "▸";
+  display: inline-block;
+  width: 11px;
+  transition: transform 0.12s;
+}
+.history-turns-toggle.expanded::before { transform: rotate(90deg); }
+.history-turns-toggle:hover { color: var(--accent); opacity: 1; }
+.history-turns {
+  margin: 2px 8px 4px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border-glass);
+}
+.history-turns-item {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  width: 100%;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--text);
+  font-size: 0.73rem;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+.history-turns-item:hover { background: rgba(var(--accent-rgb), 0.12); }
+.history-turns-idx {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.68rem;
+}
+.history-turns-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-turns-earlier {
+  display: block;
+  width: 100%;
+  padding: 4px 6px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  text-align: left;
+  cursor: pointer;
+}
+.history-turns-earlier:hover { color: var(--accent); }
+
 .history-item.open .history-item-preview {
   display: block;
 }
@@ -3108,6 +3929,174 @@ html.no-chrome #results-list {
   padding: 6px 8px;
 }
 /* 历史抽屉滚动条沿用全局统一外观（见「统一细滚动条」一节） */
+
+/* ── 「提问节点」：右侧竖排小点 + 悬停展开的窗口（2026-10-02）────────────
+   与左侧的会话历史抽屉对称：同样的玻璃底、同样的滑入。区别是它列的是**本会话内**
+   每一条用户提问，点一下跳到那条气泡。
+   宽度取 220px（左抽屉的 38.2% 对一条索引来说太宽），窗口更窄时收到 34%。
+   `z-index: 18` **低于**左抽屉背景的 19 —— 左抽屉是模态的，盖住右栏才是对的。
+   ⚠️ `padding-right: 26px` 是给**轨道**留的位：那颗小点浮在面板右缘之上（DOM 靠后、
+   同 z-index 画在上面），不留位的话它会压住行文字。 */
+#chat-node-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 220px;
+  max-width: 34%;
+  height: 100%;
+  padding-right: 26px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(16px);
+  border-left: 1px solid var(--border-glass);
+  z-index: 18;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
+}
+#chat-node-panel.visible {
+  transform: translateX(0);
+  pointer-events: auto;
+}
+#chat-node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-glass);
+  flex-shrink: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+/* 「第 3 / 16 条」—— 鼠标没在轨道上时，位置信息只活在这一行小字与那颗高亮的点里。 */
+#chat-node-pos {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+/* ── 轨道：常驻的竖排小点 ────────────────────────────────────────
+   **一颗点 = 一段提问**（提问数超过 `CHAT_NODE_DOTS_MAX` 时按比例采样，见 main.ts）——
+   两万条提问逐条建点会把右栏自己变成几万个节点，正是 `CHAT_NODE_WINDOW` 要躲开的那件事。
+   高亮那颗 = 现在读到哪条提问。 */
+#chat-node-rail {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  transform: translateY(-50%);
+  z-index: 18; /* 与面板同层，靠 DOM 顺序压在上面 */
+  padding: 8px 5px;
+  border-radius: 10px;
+  background: rgba(var(--surface-rgb), 0.28);
+  backdrop-filter: blur(8px);
+  max-height: 72%;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+#chat-node-rail::-webkit-scrollbar { display: none; }
+#chat-node-dots {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+}
+.chat-node-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(var(--ink-rgb), 0.3);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.15s;
+}
+.chat-node-dot:hover { background: rgba(var(--accent-rgb), 0.75); transform: scale(1.5); }
+/* 现在所在的那条：实心高亮 + 稍大，扫一眼就能定位（用户要求「否则就展示现在在哪个节点」）。 */
+.chat-node-dot.current { background: var(--accent); transform: scale(1.6); }
+#chat-node-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+}
+/* 一行 = 一条提问。**单行省略**：这是索引不是内容，两行以上反而不好扫。 */
+.chat-node-item {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  width: 100%;
+  padding: 5px 6px;
+  margin-bottom: 2px;
+  border: none;
+  background: none;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.76rem;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+.chat-node-item:hover { background: rgba(var(--accent-rgb), 0.12); }
+.chat-node-item.active { background: rgba(var(--accent-rgb), 0.18); }
+.chat-node-idx {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.7rem;
+}
+.chat-node-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-node-empty {
+  padding: 10px 8px;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+/* 右栏里的「更早的提问」沿用聊天流那颗按钮的外观，但**撑满面板内宽** ——
+   通用那份是按 `#results-list` 的宽度写的（`100% - 24px` + 两侧 12px 外边距），
+   放进 220px 的右栏会左边顶满、右边缺一角。 */
+#chat-node-list .chat-load-earlier {
+  width: 100%;
+  margin: 0 0 6px;
+}
+
+/* 「载入更早」——窗口化渲染后聊天流顶部那颗按钮（见 main.ts 的 CHAT_RENDER_WINDOW）。 */
+.chat-load-earlier {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 4px 12px 10px;
+  padding: 6px;
+  border: 1px dashed rgba(var(--btn-line-rgb), calc(var(--btn-line-alpha) * 1.4));
+  border-radius: 8px;
+  background: none;
+  color: var(--text-dim);
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+.chat-load-earlier:hover {
+  color: var(--text);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+}
+
+/* 跳转落点闪一下（用 box-shadow 而不是背景 —— 助手气泡本来没有底色，
+   改 background 会让「闪一下」把整块涂上色、看起来像被选中）。 */
+@keyframes chat-flash {
+  0%   { box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.45); }
+  100% { box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0); }
+}
+.chat-msg-flash { animation: chat-flash 1.1s ease-out 1; }
 
 /* ── New conversation button ──────────────────────────────────── */
 #chat-new-btn {
@@ -3237,6 +4226,26 @@ html.no-chrome #results-list {
 }
 .chat-more-actions button:hover {
   background: rgba(var(--ink-rgb), 0.12);
+}
+
+/* 文件边界档位按钮（2026-10-05 搬进「更多设置」）：与上面那排小按钮同族。 */
+#chat-profile-btn {
+  padding: 4px 10px;
+  font-size: 0.68rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--ink-rgb), 0.06);
+  color: var(--text);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+#chat-profile-btn:hover {
+  background: rgba(var(--ink-rgb), 0.12);
+}
+/* 「完全」放松写入边界 → 用红色提示（与运行方式自动档同一种告警色）。 */
+#chat-profile-btn[data-profile="full"] {
+  color: var(--red);
+  border-color: rgba(192, 138, 138, 0.35);
 }
 
 /* 思考开关：两档分段（开 / 关） */
@@ -3483,11 +4492,6 @@ html.no-chrome #results-list {
   flex-direction: column;
   gap: 6px;
   padding-top: 6px;
-}
-.chat-persona-hint {
-  font-size: 10px;
-  line-height: 1.45;
-  color: var(--text-muted);
 }
 .chat-persona-text {
   width: 100%;
@@ -3949,7 +4953,6 @@ html.no-chrome #results-list {
 /* A 组 ─ 工具图标按钮 */
 #settings-btn,
 #chat-history-btn,
-#humanize-btn,
 #chat-drawer-close,
 #plugin-bar-exit,
 #plugin-bar-float,
@@ -3966,7 +4969,6 @@ html.no-chrome #results-list {
 }
 #settings-btn:hover,
 #chat-history-btn:hover,
-#humanize-btn:hover,
 #chat-drawer-close:hover,
 #plugin-bar-exit:hover,
 #plugin-bar-float:hover,
@@ -3992,6 +4994,7 @@ html.no-chrome #results-list {
 #chat-new-btn,
 #chat-more-btn,
 #chat-runmode-btn,
+#chat-profile-btn,
 .chat-more-seg button,
 .chat-more-actions button,
 #chat-tools-save,
@@ -4385,6 +5388,12 @@ html.no-chrome #results-list {
   min-height: 0;
   font-size: 0.78rem;
   color: var(--text);
+  /* 音乐插件那几块「玻璃面板」共用的**压淡描边**（2026-10-01 用户第 3 条，
+     样张先落在左栏 `.music-side`、确认后铺到主区这几块）。
+     做成局部 token 而不是直接改全局 `--border-glass`：那个变量全应用几十处
+     都在用，为音乐插件调淡会连带改掉别处的框线；也**不能三处各写一遍字面值**
+     —— 那样迟早只剩两处跟着改。 */
+  --music-panel-line: rgba(232, 216, 202, 0.055);
 }
 
 /* ── 顶部工具条（默认态）：头像 + 账号名 + 搜索框 + 两个按钮 ──────
@@ -4403,10 +5412,18 @@ html.no-chrome #results-list {
   flex: 0 0 auto;
   width: 26px;
   height: 26px;
+  /* 2026-10-01：它从 `<span>` 改成 `<button>`（点击 = 账号与连接窗口）。
+     按钮的默认内边距 / 边框必须先清掉 —— 不清理的话 26px 的圆会被撑成三十几，
+     工具条那一行的基线也跟着变。 */
+  padding: 0;
+  border: 1px solid transparent;
   border-radius: 50%;
   overflow: hidden;
   background: rgba(var(--ink-rgb), 0.08);
+  cursor: pointer;
 }
+.music-avatar:hover { border-color: var(--accent-border); }
+.music-avatar:focus-visible { outline: 1px solid var(--accent-border); outline-offset: 1px; }
 .music-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .music-acc {
   flex: 0 1 auto;
@@ -4484,6 +5501,30 @@ html.no-chrome #results-list {
   min-height: 0;
 }
 
+/* ── 设置页（2026-10-01）：**整屏**，与 `#music-v-player` 同级 ──────────────
+   它是替换掉整块默认视图的第三态（见 music.ts 的 MusicMode 注释）。
+   不自己定尺寸 —— 沿用默认态那 1280×720 的定尺，内容区自己滚。 */
+.music-setview {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.music-set-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.music-set-title { font-size: 0.8rem; color: var(--text); }
+.music-set-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 2px 10px 2px;
+}
+
 .music-setup {
   display: flex;
   flex-direction: column;
@@ -4519,6 +5560,410 @@ html.no-chrome #results-list {
 }
 .music-field input[type="text"]:focus { border-color: var(--accent-border); }
 .music-field-port input[type="text"] { width: 96px; }
+/* 串流质量：三档互斥按钮。**不能用原生 `<select>`** —— WebView2 透明窗口里它不渲染
+   弹出层（code-rules §5.2）。选中态走 `aria-pressed` + 主题色变量，不新增 accent 例外。 */
+.music-seg { display: flex; gap: 4px; }
+/* 档数多的时候（调音的五档预设）**允许折行** —— 不折行时最后两档会被挤出
+   设置页右边界（那一页是定尺宽，`.music-set-body` 不横向滚动）。 */
+.music-seg-wrap { flex-wrap: wrap; }
+.music-seg-btn {
+  padding: 4px 12px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.music-seg-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-seg-btn[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+
+/* 通道槽（P5-2，2026-10-03）：一排「全局 + 每条声道」的按钮。8 声道时有 9 个 ⇒ 必须允许
+   折行（同 `.music-seg-wrap` 那条注释的理由）。按钮右侧那个小数字是**这条槽里开着的
+   段数** —— 一眼能看出哪条声道已经调过，不必逐个点进去翻。 */
+.music-slot-list { flex-wrap: wrap; }
+.music-slot-btn { display: inline-flex; align-items: center; gap: 4px; }
+.music-slot-btn em { font-style: normal; font-size: 0.62rem; opacity: 0.7; }
+
+/* 预设**列表**（2026-10-03 用户要求「预设通过列表显示切换」）：竖排一行一档、整行可点。
+   旧的分段按钮在五档时会被挤出定尺页面右边界（见上面 `.music-seg-wrap` 的注释）。 */
+.music-preset-list { display: flex; flex-direction: column; gap: 3px; width: 100%; }
+.music-preset-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 5px 10px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.music-preset-item:hover { color: var(--text); border-color: var(--accent-border); }
+.music-preset-item[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+
+/* 我的预设（P5-1，2026-10-03）：一行 = 用它 + 重命名 + 删除。 */
+.music-sub-label {
+  margin-top: 6px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+.music-preset-user { display: flex; align-items: center; gap: 3px; }
+.music-preset-user .music-preset-item {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-preset-icon {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.music-preset-icon:hover {
+  color: var(--text);
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+/* 命名行（保存 / 重命名 / 删除确认三态共用）。WebView2 **没有 `window.prompt`**，
+   所以名字只能在这一行里输（见 music.ts 的 `TunePresetEdit`）。 */
+.music-preset-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.music-preset-edit input {
+  flex: 1 1 120px;
+  min-width: 0;
+  padding: 5px 8px;
+  font-size: 0.72rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+}
+.music-preset-edit .music-hint { flex: 1 1 100%; }
+
+/* ── 调音页的滤波器表（P0 2026-10-02）────────────────────────────────
+   一段一行：逐段开关 + 类型 + 频率 + 增益 / Q + 删除。宽窄靠 `.music-tune-num`
+   那个定宽输入框控制 —— 定宽才不会「填了增益之后频率框跟着跳」。
+   ⚠️ 类型用**自绘下拉**（`.music-tune-menu` 就地摊开），**不是原生 `<select>`**：
+   WebView2 透明窗口里原生下拉的弹出层不渲染（code-rules §5.2）。 */
+.music-field-narrow input[type="text"] { width: 96px; }
+.music-tune-plot { display: flex; flex-direction: column; gap: 4px; }
+/* 曲线缩放（2026-10-03 用户要求「放大缩小调音曲线界面」）：工具栏在右上；画布放进横向
+   滚动容器 —— 倍率 100% 时铺满、放大后由容器滚，页面本身不横向溢出。 */
+.music-tune-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.music-tune-scroll { width: 100%; overflow-x: auto; }
+.music-tune-zoom {
+  width: 22px;
+  height: 20px;
+  padding: 0;
+  font-size: 0.8rem;
+  line-height: 1;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.music-tune-zoom:hover { color: var(--text); border-color: var(--accent-border); }
+.music-tune-zoom-label { min-width: 40px; text-align: center; font-size: 0.7rem; color: var(--text-dim); }
+.music-tune-plot canvas {
+  display: block;
+  width: 100%;
+  height: 170px;
+  box-sizing: border-box;
+  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 8px;
+}
+/* 频段柱容器（2026-10-03 用户口径「滤波器与均衡器合并」）：横排、放不下就换行。 */
+.music-tune-filters { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; }
+.music-tune-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 7px;
+  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 7px;
+}
+/* 关掉的段**留在表里但显示为「不生效」**（宿主也不把它发给引擎）——
+   变淡而不是藏起来，用户一眼能看出「它在、只是没开」。 */
+.music-tune-row.off { opacity: 0.5; }
+/* ── 频段柱（2026-10-03 用户口径「滤波器与均衡器合并」）───────────────────
+   一根柱 = 频率（可编辑，在最上）/ 增益竖拉条 / 大号增益 / Q / 类型按钮（+ 开关 + 删除）。
+   ⚠️ 一格里 `gain_db` 有**两个**控件（竖拉条 + 大号数字框）—— 两者共用 `data-f`，
+   提交走同一条 `change` 委托，见 music.ts 的 tuningBandHtml。 */
+.music-tune-band {
+  flex: 0 0 auto;
+  align-items: center;
+  width: 84px;
+  padding: 5px 4px;
+}
+.music-tune-band .music-tune-num { width: 60px; text-align: center; }
+.music-band-freq { font-size: 0.68rem; }
+/* 拉条正下方：**大号**增益读数（用户口径「拉条下方大的是对应频率的增益」） */
+.music-band-gain { font-size: 0.82rem; font-weight: 600; }
+.music-band-gain.na { color: var(--text-dim); font-weight: 400; }
+/* 再正下方：Q（比增益小一号） */
+.music-band-q { font-size: 0.66rem; color: var(--text-dim); }
+/* 最下方：类型切换按钮 + 开关 + 删除（柱宽只有 84px，按钮自适应、不写死宽度） */
+.music-band-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 100%;
+}
+.music-band-foot .music-tune-kind { width: auto; max-width: 100%; padding: 3px 5px; font-size: 0.64rem; }
+.music-band-foot .music-tune-del { margin-left: 0; }
+/* 竖向拉条：现代 Chromium 用 `writing-mode` 把 range 立起来（WebView2 支持）。
+   只换主色、不重画滑块 —— 原生 range 的键位 / 无障碍语义都是现成的，
+   自己画一套（见 code-rules §5.2 的反例）只会把键盘操作一起做丢。 */
+.music-tune-vslider {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 20px;
+  height: var(--tf-slider-h, 120px);
+  accent-color: var(--accent);
+}
+/* 该类型没有增益（一阶高通 / 低通）：占位保持整排高度一致 —— 不给拉条，也就无从改增益。 */
+.music-tune-vslider-na { width: 20px; height: var(--tf-slider-h, 120px); border: 1px dashed var(--border-glass); border-radius: 4px; }
+
+/* ── 频段柱左侧的图例（2026-10-06 用户要求）────────────────────────────
+   把「频率 / 增益 / 质量」各标一次，并与柱内三行**逐行对齐** —— 三个框都只有数字，
+   少了它用户不知道哪个是哪个。行高与频段柱**共用 `--tf-*` 四个变量**（定义在这一层，
+   两边都继承得到）：改一处两边同步，不会各算一套自然高度而错位。
+   第二格（.l-slider）是空占位，对齐的是那根竖拉条 —— 增益那一行同时有拉条与大号读数，
+   图例只在读数那一行标一次。 */
+.music-tune-filterwrap {
+  --tf-freq-h: 28px;
+  --tf-slider-h: 120px;
+  --tf-gainnum-h: 32px;
+  --tf-q-h: 28px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.music-tune-legend {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 2px;
+  /* 透明边框只为与 .music-tune-band 的 1px 边框对齐（差 1px 整列就会偏） */
+  border: 1px solid transparent;
+  box-sizing: border-box;
+}
+.music-tune-legend span {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.music-tune-legend .l-freq { height: var(--tf-freq-h); }
+.music-tune-legend .l-slider { height: var(--tf-slider-h); }
+.music-tune-legend .l-gain { height: var(--tf-gainnum-h); }
+.music-tune-legend .l-q { height: var(--tf-q-h); }
+/* 柱子那三行**钉死高度**，与上面四个变量同源 —— 不钉的话两边各走自然高度（字体一改就错位）。 */
+.music-tune-band .music-band-freq { height: var(--tf-freq-h); }
+.music-tune-band .music-band-gain { height: var(--tf-gainnum-h); }
+.music-tune-band .music-band-q { height: var(--tf-q-h); }
+/* 该类型没有增益时那一格是 `<span>—</span>`（不是 input）：固定高度后要自己把破折号居中 */
+.music-band-gain.na { display: flex; align-items: center; justify-content: center; }
+
+/* ── 调音页的三栏骨架（2026-10-03，参照 Peace 主窗）────────────────────
+   左 = 工具条 + 我的预设 / 中 = 三条全局滑块 + 频段柱 / 右 = 通道槽 + 全局效果器。
+   ⚠️ 2026-10-03 用户口径**定死了两边的宽度**：左栏 180px、右栏（扬声器声道那一列）220px，
+   中间吃剩下的全部（`minmax(0, 1fr)`）。中间的频段柱是横排的，所以它必须能自适应。 */
+.music-tune-cols {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr) 220px;
+  gap: 12px;
+  align-items: start;
+}
+.music-tune-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+/* 左右两栏各自纵向滚动：中栏（推子 + 参数段）比它们高得多，不各自滚就会把整页
+   撑出纵向滚动条 —— 那会连标题栏一起滚走。 */
+.music-tune-col-presets,
+.music-tune-col-side { max-height: 100%; overflow-y: auto; }
+/* 「左标签 + 滑块 + 右数值框」一行 —— Peace 顶部那几条就是这个形态。 */
+.music-tune-sliderrow { display: flex; align-items: center; gap: 8px; }
+.music-tune-sliderrow > label {
+  flex: 0 0 auto;
+  width: 92px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+/* 数值框定宽 60px（2026-10-03 用户口径「中间区域文本框定宽 60」）—— 定宽才不会
+   「填了增益之后频率框跟着跳」。 */
+.music-tune-sliderrow > .music-tune-num { width: 60px; }
+/* 通道槽在**这一页**改成竖排列表（Peace 右栏那一列就是竖排 + 选中行高亮）。
+   ⚠️ 只在这一页成立：曲线窗里那一排仍是横排（见 music.ts 的 curveShellHtml）。 */
+.music-slot-col { flex-direction: column; align-items: stretch; }
+.music-slot-col .music-slot-btn { justify-content: space-between; }
+/* 调音页标题栏右侧那颗「频响曲线…」按钮（总开关之前） */
+.music-set-head .music-curve-open { margin-left: auto; }
+.music-set-head > .music-switch { margin-left: 10px; }
+/* ── 曲线窗（`plugin-music-curve`，2026-10-03）─────────────────────────
+   那扇窗的内容就是「一块画布 + 一行控制」：不加外层垫料，让曲线吃满窗口宽度。 */
+.music-curve-root { height: 100%; }
+.music-curve-root .music-setview { height: 100%; }
+.music-curve-root .music-set-body { overflow-y: auto; }
+
+/* ── 全局效果器（P5-4，2026-10-03）：延迟 / 声道复制 / 卷积 ───────────────
+   延迟 = 数字框 + **横向**拉条（现成的 `.music-tune-vslider` 是立起来的，用不上）；
+   声道复制 = 一行「源 → 目标 + 删除」，两侧按钮复用 `.music-tune-kind` 那一族。 */
+.music-tune-hslider { flex: 1 1 auto; min-width: 120px; accent-color: var(--accent); }
+.music-copy-list { display: flex; flex-direction: column; gap: 4px; }
+.music-copy-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 箭头只是分隔符，别让它抢走点击面积（行内的控件都是按钮，这一格不是）。 */
+.music-copy-arrow { flex: 0 0 auto; color: var(--text-dim); font-size: 0.75rem; }
+.music-copy-row .music-tune-kind { width: 76px; }
+
+.music-tune-sw {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 4px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.music-tune-sw[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-border); }
+.music-tune-kind {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  width: 108px;
+  padding: 4px 7px;
+  font-size: 0.7rem;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.music-tune-kind:hover { border-color: var(--accent-border); }
+.music-tune-kind[aria-expanded="true"] { border-color: var(--accent-border); color: var(--text); }
+.music-tune-num {
+  flex: 0 0 auto;
+  width: 60px;
+  box-sizing: border-box;
+  padding: 4px 7px;
+  font-size: 0.7rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.music-tune-num:focus { border-color: var(--accent-border); }
+.music-tune-del {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 5px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+/* 删除是危险操作：hover 走红系（同 `.tool-card.failed` 那一族的语义色） */
+.music-tune-del:hover { color: var(--red); border-color: rgba(192, 138, 138, 0.4); }
+.music-tune-menu { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 2px; }
+
+/* ── 调音页 2026-10-02 的四处改造 ──────────────────────────────────── */
+
+/* 总开关：**切换按钮**（用户要求把原来那两个「开 / 关」互斥按钮换掉）。
+   状态只有一个来源 —— `aria-checked`；轨道与滑块都从它派生，不再有
+   「两个按钮谁亮着」这套需要同步的中间态（同 `.music-seg-btn` 那条纪律）。
+   尺寸刻意写死：滑块位移量 = 宽 − 2×(边距 + 滑块) 必须能整除对上，否则开关
+   会在两个状态之间「差半像素」（在 1x 屏上看得出来）。 */
+.music-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 20px;
+  box-sizing: border-box;
+  padding: 0;
+  /* 关 = 明显暗色（2026-10-03 用户报「开/关状态分别不明显」）：轨道近全黑、
+     边框压到极低、滑块也是灰的 —— 与「开」形成一眼可辨的明暗差。 */
+  background: rgba(0, 0, 0, calc(0.62 * var(--shade-scale)));
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+.music-switch:hover { border-color: var(--accent-border); }
+.music-switch[aria-checked="true"] {
+  /* 开 = 明显亮色：整条轨道铺满 accent（不只是半透明的 accent-bg），并带一点辉光。 */
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.55);
+}
+.music-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.32);
+  transition: transform 0.15s, background 0.15s;
+}
+.music-switch[aria-checked="true"] .music-switch-knob {
+  transform: translateX(18px);
+  background: #fff;
+}
+
+/* 「测量」那一块（按钮 + 一行结果摘要）。按钮置灰表示正在跑 ——
+   连点两次会同时开两条回环流，第二条必然拿不到设备。 */
+.music-tune-probe {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.music-tune-probe .music-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 频响曲线是**可拖的编辑面**（拖手柄改频率 / 增益，空白处按下新增一段）。
+   光标要给一个「这里能拖」的提示，否则没人知道它不是一张只读的图；
+   `touch-action: none` 挡掉 WebView 的默认手势，否则拖动会被当成滚动。 */
+.music-tune-plot canvas {
+  cursor: crosshair;
+  touch-action: none;
+}
+
 .music-redirect-row { display: flex; align-items: center; gap: 6px; }
 .music-redirect-row code {
   flex: 1 1 auto;
@@ -4547,6 +5992,22 @@ html.no-chrome #results-list {
 }
 .music-btn:hover { color: var(--text); }
 .music-btn.music-primary { border-color: var(--accent-border); color: var(--text); }
+/* A-B 盲测（2026-10-06）：两个快照槽 + 随机映射 + 揭晓。
+   `active` 同时用在「当前正放的那个槽」与「盲测开关」上。 */
+.music-tune-ab {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-glass);
+}
+.music-tune-ab .music-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+.music-tune-ab .music-btn:disabled { opacity: 0.45; cursor: default; }
 .music-msg {
   min-height: 0.9rem;
   font-size: 0.66rem;
@@ -4629,10 +6090,29 @@ html.no-chrome #results-list {
   display: flex;
   align-items: center;
   transition: background 0.12s ease;
+  /* **整行高亮块圆润 + 左右留缺口**（2026-10-01 用户第二轮口径：样张那两条
+     「一和二都需要」，并且「主区歌曲行也是要更改的部分」⇒ 两条一起铺到
+     `.music-pl` 与 `.music-tr`）。
+     缺口 = 这里的 4px + 容器 `.music-side-list` 自己的 6px padding，合起来 10px：
+     不留缺口的话圆角是压在面板边缘上的，看上去跟没改一样（用户上一轮反馈的
+     正是「没有生效」）。行本身仍**不画框**（2026-09-28：「取消外框」），
+     所以圆角作用在 hover / 选中那层底色上。 */
+  position: relative;
+  border-radius: 10px;
+  margin: 0 4px;
 }
-/* 行间那条**不明显的分界线**（最后一行不画，免得贴着一块空白的底边突兀） */
-#music-side-list > .music-pl:not(:last-child) {
-  border-bottom: 1px solid rgba(var(--ink-rgb), 0.05);
+/* 行间那条**不明显的分界线**。改用伪元素而不是 row 自己的 `border-bottom`：
+   ① 它能自由地两端内缩（border 只能贴着盒子的边框走）；
+   ② 1px 已是物理下限，「更细」只能靠**更淡**表达（0.05 → 0.03）。
+   最后一行不画，免得贴着一块空白的底边突兀。 */
+#music-side-list > .music-pl:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 0;
+  height: 1px;
+  background: rgba(var(--ink-rgb), 0.03);
 }
 /* Spotify 那种行 hover：一层很淡的底，不换色相 */
 .music-pl:hover { background: rgba(var(--ink-rgb), 0.05); }
@@ -4642,6 +6122,16 @@ html.no-chrome #results-list {
    底色刻意压得比 hover 还淡 —— 它只是「主区现在是谁」的标记，不是一块卡片。 */
 .music-pl.on { background: rgba(var(--ink-rgb), 0.06); }
 .music-pl.on .music-pl-name { color: var(--text); }
+/* 编辑态里被勾中的行（2026-10-01「修改列表」）。
+   **必须与 `.on`（主区正在看的那一项）明显不同** —— 两者会同时出现，长得一样
+   用户就分不清「我勾了谁」和「主区在看谁」。所以这里用**强调色左缘 + 一层更实的底**，
+   `.on` 那套依旧只靠底色和文字提亮。左缘用 `box-shadow` 的 `inset` 而不是 `border-left`：
+   加 border 会把行内容整体右推 2px，进 / 出编辑态时整列会跳一下。 */
+.music-pl.sel {
+  background: rgba(var(--accent-rgb), 0.14);
+  box-shadow: inset 2px 0 0 0 var(--accent);
+}
+.music-pl.sel .music-pl-name { color: var(--accent); }
 /* 收藏夹读取失败（多半是缺 `user-library-read`）：原因已经在副标题那行写着，
    这里把副标题染成警示色即可 —— 整行加红框比一行小字更像「这个面板坏了」。 */
 .music-pl.err .music-pl-sub { color: var(--red); opacity: 1; }
@@ -4674,6 +6164,16 @@ html.no-chrome #results-list {
   color: #fff;
   background: linear-gradient(135deg, #4a3aff 0%, #8f6bed 62%, #c8b6ff 100%);
 }
+/* 「最常听的歌曲」那一行的封面位（2026-10-01 用户第 4 条）。与收藏夹那块
+   **渐变 + 实心心**刻意区分：它是「前端合成的一行入口」，用一层极淡的强调色底
+   + 描边图标，不抢「真资源」的视觉权重。 */
+.music-pl-trend-cover {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.14);
+}
 .music-pl-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .music-pl-name {
   font-size: 0.78rem;
@@ -4695,7 +6195,13 @@ html.no-chrome #results-list {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  /* 与左栏歌单行同一套（2026-10-01 用户第二轮口径：「主区歌曲行也是要更改的部分」）：
+     **整行高亮块圆角 + 左右留缺口**。主区这边原本**没有**行间分隔线，
+     所以这里不凭空加一条 —— 只做圆角与缺口。
+     `width: 100%` 要减掉左右各 4px 的 margin，否则会横向溢出 8px（滚动条凭空出现）。 */
+  width: calc(100% - 8px);
+  margin: 0 4px;
+  border-radius: 10px;
   padding: 3px 8px;
   text-align: left;
   font-size: 0.72rem;
@@ -4768,53 +6274,101 @@ body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
   position: relative;
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  /* 4 列 = 左端抽屉 + 正在播放 + 播放键组 + 右端；`.no-drawer` 时回到 3 列。
+     抽屉是 grid 的第一列，**「有没有抽屉」必须与模板一起切** —— 模板 4 列而只剩
+     3 个在流里的元素时，正在播放块会落进那条 0 宽的 `auto` 列里（见 music.ts 的 setDrawer）。 */
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   gap: 12px;
   height: 54px;
   margin-top: 8px;
   padding: 0 10px;
-  border: 1px solid var(--border-glass);
-  border-radius: 10px;
+  /* 描边 / 圆角与左栏面板同一套（2026-10-01 用户第 3 条铺开，见 `.music-side`）：
+     这条栏是主区里与左栏同构的那块玻璃面板，两处不一致会「一半硬一半软」。
+     ⚠️ 它的圆角变小之后，下面 `.music-bp` 那条进度线的左右让位（8px）也要够用。 */
+  border: 1px solid var(--music-panel-line);
+  border-radius: 6px;
   background: rgba(var(--ink-rgb), 0.03);
 }
-/* 细进度线：**2px、可拖**（Spotify 的那条就是 2px）。左右各让开 8px，
-   免得 2px 的直线从 10px 的圆角外面探出去。 */
+/* 细进度线：**画出来 2px、可点可拖的范围 18px**（2026-10-01 用户反馈
+   「进度条有些窄、可能不好触碰」）。做法是**盒子本身就是命中区**，那条 2px 的线
+   由 ::before 画在盒子正中 —— 于是「拖动时把视觉拓宽到触发区域」只需要把 ::before
+   拉满整盒，几何一个数都不用动。盒子向上多探 8px（正好是 `.music-nowbar` 的
+   `margin-top`，不会压住上面的曲目列表），向下 10px 落在栏自身的空隙里；
+   左右各让开 8px，免得直线从栏的 6px 圆角外面探出去。 */
 .music-bp {
   position: absolute;
   left: 8px;
   right: 8px;
-  top: 0;
-  height: 2px;
-  border-radius: 2px;
-  background: rgba(var(--ink-rgb), 0.14);
+  top: -8px;
+  height: 18px;
+  border-radius: 9px;
   --seek-pct: 0%;
   cursor: pointer;
 }
-/* 命中区：画出来只有 2px，可点可拖的范围上下各多 4px（不然几乎压不中） */
+/* 轨道（平时的样子）：2px、居中 */
 .music-bp::before {
   content: "";
   position: absolute;
   left: 0;
   right: 0;
-  top: -4px;
-  bottom: -4px;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 2px;
+  background: rgba(var(--ink-rgb), 0.14);
+  transition: top 0.12s ease, height 0.12s ease, margin-top 0.12s ease, border-radius 0.12s ease;
+}
+/* 拖动中：轨道与填充一起铺满命中区。它们本来就是「能点的那块」，
+   平时只画中间 2px 只是不想让一条细线看起来那么粗。 */
+.music-bp.music-dragging::before {
+  top: 0;
+  height: 100%;
+  margin-top: 0;
+  border-radius: 9px;
 }
 .music-bp-fill {
   position: absolute;
   left: 0;
-  top: 0;
-  bottom: 0;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
   width: var(--seek-pct);
   border-radius: 2px;
   background: var(--accent);
-  transition: width 0.3s linear;
+  transition: width 0.3s linear, top 0.12s ease, height 0.12s ease, margin-top 0.12s ease,
+    border-radius 0.12s ease;
 }
-.music-bp.music-dragging .music-bp-fill { transition: none; }
-/* 时间气泡：这条线在栏顶，气泡只能**往下**放（放在线上方会跑出窗口） */
-.music-bp .music-progress-tip { bottom: auto; top: calc(100% + 4px); }
+.music-bp.music-dragging .music-bp-fill {
+  top: 0;
+  height: 100%;
+  margin-top: 0;
+  border-radius: 9px;
+  transition: none;
+}
+/* 时间气泡：这条线在栏顶，气泡只能**往下**放（放在线上方会跑出窗口）。
+   相对**盒子中线**（就是那条线）下移 6px —— 与加宽命中区之前的落点一致。 */
+.music-bp .music-progress-tip { bottom: auto; top: calc(50% + 6px); }
 .music-bp:hover .music-progress-tip,
 .music-bp.music-dragging .music-progress-tip { opacity: 1; }
+
+/* 进度线右端那对时间数字（`00:00 / 00:00`，2026-10-01 用户要求）。
+   只加在 **Spotify 那条线**上 —— 本地播放那条的时间在 `.music-bend` 里，另有位置
+   （两条同时只有一个可见，所以两块时间不会打架）。数字本身用 `pointer-events: none`：
+   它压在命中区右端，不能把「拖到最右」这件事抢走。 */
+.music-bp-timed { right: 96px; }
+.music-btime {
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  /* 等宽数字：不然秒数从 9 变 10 时整串会左右抖一下（同 `.music-ltime`） */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
 
 /* 左：正在播放。整块是一个按钮 —— 「点它打开播放面板」比多画一枚图标更符合直觉。 */
 .music-bnow {
@@ -4831,6 +6385,39 @@ body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
   cursor: pointer;
 }
 .music-bnow:hover { background: rgba(var(--ink-rgb), 0.06); }
+/* 左端那枚「换到另一侧」的抽屉（2026-10-03）：两条控制栏同屏只能有一条，
+   另一条收进这枚小胶囊里。**竖直居中**是刻意的 —— `.music-bp` 那条 18px 的
+   进度命中带贴着栏顶（top:-8 / height:18），居中放才不会压住它。 */
+.music-nowbar.no-drawer { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
+.music-drawer-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: center;
+  padding: 3px 7px;
+  font-size: 0.62rem;
+  line-height: 1;
+  color: var(--text-muted);
+  background: rgba(var(--ink-rgb), 0.05);
+  border: 1px solid var(--music-panel-line);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.music-drawer-btn:hover { color: var(--text); background: rgba(var(--ink-rgb), 0.1); }
+.music-drawer-btn svg { width: 11px; height: 11px; }
+/* 左块右端那枚「进入小窗播放」的小图标（2026-10-03）：右端那枚独立按钮删掉之后，
+   它是「这一块可点」的唯一可见提示。`margin-left: auto` 把它顶到最右，别挤标题。 */
+.music-bnow-go {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+.music-bnow:hover .music-bnow-go { color: var(--text); opacity: 1; }
 .music-bnow-cover {
   flex: 0 0 auto;
   width: 40px;
@@ -4874,14 +6461,22 @@ body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
 }
 
 /* ── 左栏（Library 四类）── */
+/* 左栏整块面板（用户 2026-10-01 第 3 条「边框线太硬」，指认的就是这一块）。
+   两处一起收（用户选「两者一起」）：
+   · 描边：`1px var(--border-glass)` → **更淡的 `--music-panel-line`**（定义在
+     `.music-root` 上，见那里的注释：为什么不动全局 `--border-glass`）。
+   · 圆角：`10px` → `6px`（用户原话「边角的圆形度调低一些」）。
+   **这一处是样张；用户确认后已铺到主区那两块同构的玻璃面板**（`.music-nowbar`
+   与其变体 `.music-lnowbar`、以及播放态的 `.music-pv-card`）—— 三处必须一起看，
+   只改一两处会留下「一半边硬、一半边软」的观感。 */
 .music-side {
   flex: 0 0 var(--music-side-w, 300px);
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border-glass);
-  border-radius: 10px;
+  border: 1px solid var(--music-panel-line);
+  border-radius: 6px;
   overflow: hidden;
   background: rgba(var(--ink-rgb), 0.03);
 }
@@ -5033,6 +6628,199 @@ body.music-resizing * { cursor: col-resize !important; }
   white-space: nowrap;
 }
 
+/* ── 本地媒体库那一页（2026-10-01）────────────────────────────────────
+   宿主 `media_lib.rs` 提供数据；这一页与 Spotify 那两栏**共用壳**（左栏 + 主区），
+   但内容分属两套数据源。它有一条与 Spotify 那侧不同的性质：**不要求登录** ——
+   工具条上那枚文件夹按钮在未连接时也点得动（见 music.ts 的 setLocalPage）。
+   注意这种「共用壳、内容两套」的写法要克制：不要反过来把本地的东西塞进
+   `.music-tr` / `SideKind` 那套里（那是两套数据被缝在一起的样子）。 */
+
+/* 工具条上那枚入口按钮的按下态（进本地页时亮着，好知道自己在哪一页） */
+#music-local-btn.on { color: var(--accent); border-color: var(--accent-border); }
+
+/* 「本地与 Spotify 同时出声」那把开关（2026-10-01）。
+   **两枚按钮共用这一个类**（Spotify 底部栏 + 本地播放条），所以状态色写在这里一处
+   —— 它们是同一个状态的两个视图，颜色不许分叉。 */
+.music-dual-btn.on { color: var(--accent); border-color: var(--accent-border); }
+
+/* 左栏头：与那排 Spotify 页签**互斥显示**（一个标题 + 添加 / 扫描两枚按钮） */
+.music-local-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 8px 8px 6px;
+}
+.music-local-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-local-head-btns { display: flex; gap: 4px; flex: 0 0 auto; position: relative; }
+
+/* `＋` 的二选一浮层（目录 / 播放列表文件，2026-10-01）。定位参照是上面那排按钮：
+   `.music-dd` 默认 `top: calc(100% + 6px)`，这里只需把它钉在右缘、给个宽度。
+   220px 是量出来的：两条 `music-dev-row` 的副标题（「临时打开一份 .m3u / .m3u8 / .pls，
+   不入库」）在 220px 下换两行就住手了，再窄会折成三行、浮层比左栏还高。 */
+#music-local-add-dd { right: 0; width: 220px; }
+
+/* 编辑态里那枚垃圾桶是**危险操作**：hover 染成警示红（与 `.music-pl-x:hover` 同色）。
+   退出并保存那枚则是「完成」的动作，用主题强调色，与那两枚灰按钮拉开。 */
+#music-local-del:hover { color: var(--red); }
+#music-local-editdone:hover { color: var(--accent); }
+
+/* 目录行左侧那块「封面」位（本地目录不是图片，画一个图标） */
+.music-pl-dir {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+/* 行尾那枚移除按钮：**悬停才显形** —— 常驻会跟每一行抢注意力，而用户多半是在
+   浏览、不是在删目录。用 `opacity` 不用 `display`：后者会让行宽在悬停时抖一下。 */
+.music-pl-x {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  margin-right: 6px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+.music-pl:hover .music-pl-x { opacity: 1; }
+.music-pl-x:hover { color: var(--red); background: rgba(var(--ink-rgb), 0.08); }
+/* 键盘用户：聚焦到它时也必须可见（`:focus-visible` 只在键盘操作时命中） */
+.music-pl-x:focus-visible { opacity: 1; }
+
+/* 主区那一页：筛选框那一行 + 进度 + 曲目表 */
+.music-local-page { display: flex; flex-direction: column; gap: 8px; }
+.music-local-head-row { display: flex; align-items: center; gap: 6px; }
+.music-local-q {
+  flex: 1 1 auto;
+  /* 同 `.music-search`：`min-width: 0` 是必需的，否则输入框会被 placeholder
+     撑着不肯缩，窗口变窄时把旁边的按钮顶出去。 */
+  min-width: 0;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--ink-rgb), 0.05);
+  color: var(--text);
+  font-size: 0.72rem;
+}
+.music-local-q::placeholder { color: var(--text-muted); }
+
+/* 「正在看哪份播放列表」那枚标记（2026-10-01 第二批）。它**顶替筛选框的位置**：
+   筛选是在宿主的 SQL 里做的（只认媒体库），对一份临时打开的播放列表没有意义。
+   做成胶囊 + 一枚 ✕ = 「看一眼现在这份是谁的、顺手能退出去」。 */
+.music-list-chip {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 4px 0 10px;
+  border-radius: 13px;
+  border: 1px solid var(--accent-border);
+  background: rgba(var(--ink-rgb), 0.05);
+  color: var(--text);
+  font-size: 0.72rem;
+}
+.music-list-chip-n { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 扫描进度：细进度条 + 一句说明。**进行中 / 出错 / 上一次收尾三态互斥**，
+   只有「出错」与「正常收尾」靠颜色区分。 */
+.music-scan-row { display: flex; align-items: center; gap: 8px; font-size: 0.68rem; color: var(--text-muted); }
+.music-scan-bar {
+  flex: 0 0 140px;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.1);
+}
+.music-scan-fill { display: block; height: 100%; background: var(--accent); transition: width 0.25s ease; }
+.music-scan-txt { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.music-scan-done { color: var(--text-dim); }
+.music-scan-err { color: var(--red); white-space: normal; line-height: 1.5; }
+
+/* 视频的**画面层**（2026-10-01 用户第 8 条）。它夹在扫描行与曲目列表之间，
+   只在放视频时出现（`renderLocalVideo` 负责开合与拆装里面的 video）。
+   **限高是关键**：不限的话一条 1080p 竖屏视频会按原始比例把下面那份曲目列表
+   一路顶出面板；这里让画面自己收缩（`object-fit: contain`，两侧留黑边而不是拉伸）。 */
+.music-video {
+  flex: 0 0 auto;
+  max-height: 46vh;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+}
+.music-video-el { display: block; width: 100%; max-height: 46vh; object-fit: contain; }
+
+/* 本地曲目行。**点它 = 播这一首**（2026-10-01 接入播放之后它变成了按钮），
+   所以这里按 `.music-tr` 那套来：整行可点、hover 提亮、在播的那一行标色。 */
+.music-mt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+.music-mt:hover { background: rgba(var(--ink-rgb), 0.05); }
+/* 「正在放的这一首」。与 `.music-tr.playing` 同一条视觉语言（同一个 `--accent`），
+   好让两套列表在「哪一首在放」这件事上读起来是一回事。 */
+.music-mt.playing { color: var(--accent); }
+.music-mt-i { flex: 0 0 auto; width: 16px; text-align: right; font-size: 0.62rem; color: var(--text-muted); }
+.music-mt-cover {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: rgba(var(--ink-rgb), 0.06);
+}
+.music-mt-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.music-mt-ico { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; color: var(--text-muted); }
+.music-mt-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.music-mt-n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.music-mt-a {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.music-mt-d { flex: 0 0 auto; font-size: 0.62rem; color: var(--text-muted); }
+
+/* ── 本地文件播放条（2026-10-01）────────────────────────────────────
+   与上面那条 Spotify 控制栏（`.music-nowbar`）**同构但不同源**：这里是
+   宿主 `player.rs` 那条本机音频流。所以直接复用那套栅格 / 进度线 / 圆钮的
+   类，只覆盖两处真正不同的地方 —— 左边那块不是按钮（本地没有播放界面可进），
+   以及右端多一个「当前 / 总时长」。 */
+.music-lnowbar { margin-top: 8px; }
+/* 左块在本地那条栏里**同样是按钮**（2026-10-03 用户口径）：原来那两条
+   `cursor: default` / `:hover { background: none }` 是为了表达「本地没有播放界面可进」，
+   而 2026-10-01 有了本地小窗之后那句话已不成立 —— 两行一起删掉，让它与 Spotify
+   那条栏的左块表现一致（点它进 #music-v-lplayer）。 */
+.music-ltime {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  /* 等宽数字：不然 1 和 8 宽度不同，每 500ms 刷新一次时那串数字会左右抖 */
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── 浮层：搜索下拉预览 + 设备 / 队列弹层（都是绝对定位，**不占布局**）──
    不占布局是硬要求：面板是定尺 1280×720，浮层若参与布局，窗口高会跟着
    搜索结果条数抖。定位参照：搜索预览挂 `.music-search-wrap`（对齐输入框），
@@ -5136,11 +6924,16 @@ body.music-resizing * { cursor: col-resize !important; }
   display: flex;
   align-items: center;
   height: 130px;
-  border-radius: 12px;
+  /* 描边 / 圆角与左栏面板同一套（2026-10-01 用户第 3 条铺开，见 `.music-side`）：
+     `--music-panel-line` 替掉原来的 `--border-glass`，圆角 12px → 6px。
+     ⚠️ **改这个圆角必须同步改上面 `body:has(.music-root.music-player-on) …`
+     那条 `border-radius`**（它必须与这里相等，否则悬浮窗的玻璃圆角会从长条外面
+     露出来，见那条注释）。 */
+  border-radius: 6px;
   /* **边框用 `box-shadow: inset` 而不是 `border`**（2026-09-27 实测）：`border` 会吃掉
      内容盒（550→548），右侧列就被压成 448、连 `height: 130` 也会比内容盒高 2px 而溢出。
      inset 阴影不参与布局，长条的**内容盒**才正好是 550×130。 */
-  box-shadow: inset 0 0 0 1px var(--border-glass);
+  box-shadow: inset 0 0 0 1px var(--music-panel-line);
   background: rgba(0, 0, 0, calc(0.16 * var(--shade-scale)));
   overflow: hidden;
 }
@@ -5148,8 +6941,10 @@ body.music-resizing * { cursor: col-resize !important; }
   flex: 0 0 100px;
   width: 100px;
   height: 100px;
-  border-radius: 8px;
-  border: 1px solid var(--border-glass);
+  /* 圆角**不能大于外层长条**（6px）：它贴在长条最左缘，比外层大的话会被长条的
+     `overflow: hidden` 裁成一个和大圆角对不上的弧，看着像封面缺了一角。 */
+  border-radius: 6px;
+  border: 1px solid var(--music-panel-line);
   background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
   overflow: hidden;
 }
@@ -5163,6 +6958,38 @@ body.music-resizing * { cursor: col-resize !important; }
   height: 130px;
   display: flex;
   flex-direction: column;
+}
+
+/* ── 本地小窗（`#music-v-lplayer`）**中间那一格** H65 ──────────────────
+   远端那条长条这一格放的是歌词（`.music-lyr`）；本地文件没有歌词，所以换成
+   **大号进度线 + 时间**。高度必须钉在 65，否则整张卡片就不是 130 ——
+   而 130 是 `MUSIC_W_BAR` / `applyResize` / 宿主 `MUSIC_MIN_H` 三处共用的定尺
+   （见 ai-spec §4.6、预检 #39 ④）。 */
+.music-lp-mid {
+  flex: 0 0 65px;
+  height: 65px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 0 10px;
+}
+/* 进度线**直接复用 `.music-bp`**（轨道 ::before / 填充 / 时间气泡 / `.music-dragging`
+   那几套样式一行都不用重写）。它默认是绝对定位、贴在默认态那条栏的顶边上；
+   这里把它掰回文档流并占满这一格的宽度 —— 选择器权重与 `.music-bp` 相同，
+   靠**位置在后**取胜，所以这条必须排在那条之后（本文件里它确实在后面）。 */
+.music-lp-seek {
+  position: relative;
+  left: auto;
+  right: auto;
+  top: auto;
+  width: 100%;
+}
+.music-lp-time {
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── 歌名模块 H30：歌名（亮）+ 歌手·专辑（暗）+ 时间 + 返回入口 ──
@@ -5255,20 +7082,29 @@ body.music-resizing * { cursor: col-resize !important; }
    **位置由一个 CSS 变量驱动**（`--seek-pct`，music.ts 只写这一个）：
    填充 / 圆点 / 时间气泡三处都要跟着它走，写三遍 JS 迟早会漂移。
    `padding` + `background-clip: content-box` 是**命中区**：画出来只有 3px，
-   但可点可拖的范围上下各 6px（圆点探出的部分也归它）。 */
+   但可点可拖的范围上下各 **9px**（= 19px；2026-10-01 用户反馈「有点窄、
+   不好触碰」，从各 6px 加宽）。`top` 与 `padding` 同步加大是为了**让那条 3px 线
+   停在原处** —— 改的是可点范围，不是视觉位置。 */
 .music-progress {
   position: absolute;
-  top: -6px;
+  top: -9px;
   left: 0;
   right: 0;
   height: 3px;
-  padding: 6px 0;
+  padding: 9px 0;
   box-sizing: content-box;
   border-radius: 2px;
   background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
   background-clip: content-box;
   --seek-pct: 0%;
   cursor: pointer;
+}
+/* 拖动中：底色铺满整个命中区（与 `.music-bp` 同一条纪律 —— 用户要求
+   「调进度条时视觉拓宽至触发区域」）。平时只画中间那 3px，可拖的范围却有 21px。 */
+.music-progress.music-dragging {
+  background: rgba(var(--ink-rgb), 0.14);
+  background-clip: border-box;
+  border-radius: 10px;
 }
 .music-progress-fill {
   height: 3px;
@@ -5277,12 +7113,21 @@ body.music-resizing * { cursor: col-resize !important; }
   background: var(--accent);
   transition: width 0.3s linear;
 }
-/* 拖动中：填充必须**逐帧跟手**，`.3s` 的补间会让它落后于指针 */
-.music-progress.music-dragging .music-progress-fill { transition: none; }
-/* 圆点：平时不出现，悬停 / 拖动时才浮出来（带一点放大动画） */
+/* 拖动中：① 填充必须**逐帧跟手**（`.3s` 的补间会让它落后于指针）；
+   ② 连同底色一起**长到命中区的高度** —— 21px 是上面算出来的整盒高，
+   `margin-top: -9px` 把它从内容区顶格提到盒子最上沿。 */
+.music-progress.music-dragging .music-progress-fill {
+  height: 21px;
+  margin-top: -9px;
+  border-radius: 10px;
+  transition: none;
+}
+/* 圆点：平时不出现，悬停 / 拖动时才浮出来（带一点放大动画）。
+   `top` 跟着 padding 走到 9px —— 它要**落在那条 3px 线的正中**，
+   不跟着走的话加宽命中区会让圆点浮到线上面去。 */
 .music-progress-dot {
   position: absolute;
-  top: 6px;
+  top: 9px;
   left: var(--seek-pct);
   width: 9px;
   height: 9px;
@@ -5298,7 +7143,7 @@ body.music-resizing * { cursor: col-resize !important; }
 .music-progress:hover .music-progress-dot,
 .music-progress.music-dragging .music-progress-dot { opacity: 1; transform: scale(1); }
 /* 时间气泡：显示在**圆点正上方**（短时浮在歌词区上，卡片没裁掉这块）
-   `bottom: 100%` 是相对命中区（15px 高）的底边 ⇒ 正好落在那条 3px 线上方。 */
+   `bottom: 100%` 是相对命中区（21px 高）的底边 ⇒ 正好落在那条 3px 线上方。 */
 .music-progress-tip {
   position: absolute;
   bottom: 100%;
@@ -5327,7 +7172,20 @@ body.music-resizing * { cursor: col-resize !important; }
   height: 3px;
   -webkit-appearance: none;
   appearance: none;
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  /* 轨道**更暗**、已生效的那一段**更亮**（2026-10-01 用户口径：「音乐条最底层调暗、
+     生效的部分调亮」）。
+     填充**不需要多一个元素**：一条硬停在 `--vol-pct` 上的两段渐变就是「轨道 + 填充」，
+     那个变量由 JS 在每次写 `value` 时一并写（见 music.ts 的 paintVolume）——
+     所以这里不许再出现第二处「填充怎么算」的定义。
+     `--vol-pct` 的静态初值写在三个 input 的 `style` 上（与它们的 `value` 对齐），
+     免得首帧先画成 0% 再跳一下。 */
+  background: linear-gradient(
+    to right,
+    var(--accent) 0,
+    var(--accent) var(--vol-pct, 0%),
+    rgba(0, 0, 0, calc(0.55 * var(--shade-scale))) var(--vol-pct, 0%),
+    rgba(0, 0, 0, calc(0.55 * var(--shade-scale))) 100%
+  );
   border-radius: 2px;
   outline: none;
   cursor: pointer;
@@ -5411,10 +7269,13 @@ body.music-resizing * { cursor: col-resize !important; }
 .music-round-btn:hover { color: var(--text); border-color: var(--accent-border); }
 .music-play-btn { width: 30px; height: 30px; }
 .music-round-btn:disabled { opacity: 0.4; cursor: default; }
-/* 三态按钮：关 = 暗、随机 / 单曲循环 = 主题色；单曲循环多一个小「1」 */
+/* 三态按钮：关 = 暗、随机 / 单曲循环 = 主题色；单曲循环多一个小「1」。
+   本地那条栏上那枚（`#music-l-mode`）是**四态**（多一档 `repeat_all` 循环列表），
+   与这枚共用同一套类名和配色 —— 所以 `repeat_all` 要一起列进强调色分组。 */
 .music-mode-btn { position: relative; }
 .music-mode-btn[data-mode="off"] { opacity: 0.5; }
 .music-mode-btn[data-mode="shuffle"],
+.music-mode-btn[data-mode="repeat_all"],
 .music-mode-btn[data-mode="repeat_one"] {
   color: var(--accent);
   border-color: var(--accent-border);
@@ -5702,4 +7563,276 @@ body.music-resizing * { cursor: col-resize !important; }
   background: rgba(var(--ink-rgb), 0.12);
   color: var(--text);
 }
+
+/* ── 下载进度（dl-，2026-09-30）────────────────────────────────────
+   环形进度 + 中间数字 + 实时速度。形状由 `src/download-progress.ts` 生成，
+   但**样式写在这里**：插件市场（主 bundle）与 OCR 插件（单独打包的 ESM）都要用，
+   放进任一边的局部 <style> 都会漏掉另一边。 */
+.dl-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.dl-ring-wrap {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.dl-ring {
+  width: 100%;
+  height: 100%;
+  /* 从 12 点方向起画：SVG 的 0° 在 3 点方向 */
+  transform: rotate(-90deg);
+}
+.dl-ring-track {
+  fill: none;
+  stroke: rgba(var(--ink-rgb), 0.14);
+  stroke-width: 3;
+}
+.dl-ring-fill {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  /* pathLength="100" ⇒ dasharray 固定 100，dashoffset = 剩下的百分比 */
+  stroke-dasharray: 100;
+  transition: stroke-dashoffset 0.2s linear;
+}
+/* 服务端没给 Content-Length（算不出百分比）时：转起来，别让用户以为卡死了 */
+.dl-ring-wrap.is-unknown .dl-ring-fill {
+  stroke-dasharray: 25 75;
+  animation: dl-spin 1.1s linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes dl-spin {
+  to { transform: rotate(360deg); }
+}
+.dl-ring-pct {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.52rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.dl-meta {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.25;
+}
+.dl-phase {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+.dl-speed {
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 代理插件面板（proxy-，2026-10-02）───────────────────────────────
+   它是**接管型**面板（`layout.takeover`），整块由插件自己画（见 builtin/proxy.ts）。
+   所以这里的定尺/留白要自己来：外框、列表、底部那条一次性提示。
+   颜色**只用主题变量**（`--text*` / `--accent*` / `--red`），不写死色值。 */
+.proxy-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 10px 16px;
+  max-width: 760px;
+  margin: 0 auto;
+}
+/* 多页布局（2026-10-06 重构）：左侧导航 + 右侧内容。proxy 是 takeover 型、面板铺满
+   窗口，所以这里自己定两栏；导航宽度固定，内容区自适应且允许收缩（`min-width: 0`，
+   否则长 URL 会把内容区顶宽、把导航挤扁）。 */
+.proxy-body { display: flex; gap: 14px; align-items: flex-start; }
+.proxy-nav { flex: 0 0 88px; display: flex; flex-direction: column; gap: 2px; }
+.proxy-nav-btn {
+  padding: 6px 9px;
+  font-size: 0.72rem;
+  text-align: left;
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.proxy-nav-btn:hover { color: var(--text); background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale))); }
+.proxy-nav-btn.on { color: var(--text); background: var(--accent-bg); }
+.proxy-pages { flex: 1 1 auto; min-width: 0; }
+.proxy-page { display: none; flex-direction: column; gap: 8px; }
+.proxy-page.on { display: flex; }
+
+/* 分段控件（与输入栏「思考开关」同一形态）—— **项目不用原生 <select>**，见
+   agent-ui-spec §5.3。`.proxy-seg-wrap` 是分组按钮那版：候选可能多，允许换行。 */
+.proxy-seg {
+  display: inline-flex;
+  gap: 2px;
+  align-self: flex-start;
+  padding: 2px;
+  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 7px;
+}
+.proxy-seg-wrap { flex-wrap: wrap; align-self: stretch; }
+.proxy-seg-btn {
+  padding: 3px 10px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.proxy-seg-btn:hover:not(:disabled) { color: var(--text); }
+.proxy-seg-btn.on { color: var(--text); background: var(--accent-bg); }
+.proxy-seg-btn:disabled { opacity: 0.5; cursor: default; }
+.proxy-head { display: flex; flex-direction: column; gap: 3px; }
+.proxy-title { font-size: 0.86rem; color: var(--text); }
+/* 「系统里到底是什么样」：常态是小字说明，对不上时**变黄红系**（那是要人处理的状态） */
+.proxy-state { font-size: 0.7rem; color: var(--text-dim); }
+.proxy-state.warn { color: var(--red); }
+.proxy-list { display: flex; flex-direction: column; gap: 6px; }
+/* 列表行：与音乐插件那边的 `.music-tr` 同一套口径（圆角靠 margin 留缺口，
+   否则圆角压在面板边缘上等于没改 —— 见预检 #52 ⑥）。 */
+.proxy-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 7px;
+}
+.proxy-row.on { border-color: var(--accent-border); background: var(--accent-bg); }
+.proxy-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.proxy-row-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proxy-row-server {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proxy-row-note { color: var(--text-muted); }
+.proxy-tag {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  font-size: 0.62rem;
+  color: var(--text);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 4px;
+}
+.proxy-btn {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.proxy-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent-border); }
+.proxy-btn:disabled { opacity: 0.5; cursor: default; }
+.proxy-btn.primary { color: var(--text); border-color: var(--accent-border); }
+/* 删除是危险操作：hover 走红系（同 `.tool-card.failed` 那一族的语义色） */
+.proxy-btn.danger:hover:not(:disabled) { color: var(--red); border-color: rgba(192, 138, 138, 0.4); }
+.proxy-empty { padding: 10px 2px; font-size: 0.72rem; color: var(--text-dim); }
+.proxy-form { display: flex; gap: 6px; flex-wrap: wrap; }
+.proxy-form input[type="text"] {
+  box-sizing: border-box;
+  padding: 5px 9px;
+  font-size: 0.72rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.proxy-form input[type="text"]:focus { border-color: var(--accent-border); }
+#proxy-label { flex: 0 0 150px; }
+#proxy-server { flex: 1 1 240px; }
+.proxy-link {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.72rem;
+  color: var(--text);
+  cursor: pointer;
+}
+.proxy-msg { min-height: 0.9rem; font-size: 0.66rem; color: var(--text-dim); }
+
+/* ── 内核（mihomo）区块，2026-10-03 ─────────────────────────────── */
+.proxy-sec-title {
+  margin: 10px 0 4px 0;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+.proxy-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 端口是 number 输入，样式与上面那批 text 对齐（同一副观感）。
+   2026-10-06：**去掉 Chromium 的原生 spinner**（输入框右侧那对上下小箭头）—— 它是
+   WebView2 的默认形态，与本文件顶部那套全局细滚动条不搭（用户点名）。只去掉控件、
+   不去掉语义：键盘上下键照样能增减。 */
+.proxy-panel input[type="number"] {
+  box-sizing: border-box;
+  flex: 0 0 110px;
+  padding: 5px 9px;
+  font-size: 0.72rem;
+  color: var(--text);
+  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  outline: none;
+  caret-color: var(--accent);
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.proxy-panel input[type="number"]::-webkit-outer-spin-button,
+.proxy-panel input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.proxy-panel input[type="number"]:focus { border-color: var(--accent-border); }
+#mihomo-release { flex: 1 1 240px; }
+/* 延迟：好/差/未知三档用语义色，一眼能扫出来 */
+.proxy-delay { font-size: 0.68rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+.proxy-delay.ok { color: var(--green); }
+.proxy-delay.bad { color: var(--yellow); }
+.proxy-delay.dim { color: var(--text-muted); }
+.proxy-log {
+  margin: 6px 0 0 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 7px 9px;
+  font-size: 0.64rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, calc(0.35 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+}
+.proxy-log:empty { display: none; }
 

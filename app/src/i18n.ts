@@ -340,6 +340,23 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "열기",
     "en": "Open",
   },
+  // 「选项」菜单（2026-10-02）：原来这里是两颗平铺按钮（打开 / 复制路径），
+  // 现在「复制路径 + 打开文件目录 + 以管理员身份运行」收进一个菜单里。
+  // 「以管理员身份运行」直接复用上面的 `detail.elevate_title`，不另起一条文案。
+  "detail.preview_options": {
+    "zh-CN": "选项",
+    "zh-TW": "選項",
+    "ja": "オプション",
+    "ko": "옵션",
+    "en": "Options",
+  },
+  "detail.preview_open_dir": {
+    "zh-CN": "打开文件目录",
+    "zh-TW": "開啟檔案目錄",
+    "ja": "フォルダーを開く",
+    "ko": "폴더 열기",
+    "en": "Open containing folder",
+  },
   "detail.preview_copy_path": {
     "zh-CN": "复制路径",
     "zh-TW": "複製路徑",
@@ -583,6 +600,34 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "AI 생성 중...",
     "en": "AI is generating...",
   },
+  "chat.queue_title": {
+    "zh-CN": "待发送 · {count} 条",
+    "zh-TW": "待傳送 · {count} 條",
+    "ja": "送信待ち · {count} 件",
+    "ko": "전송 대기 · {count}개",
+    "en": "Pending · {count}",
+  },
+  "chat.queue_send_now": {
+    "zh-CN": "立即发送",
+    "zh-TW": "立即傳送",
+    "ja": "今すぐ送信",
+    "ko": "즉시 전송",
+    "en": "Send now",
+  },
+  "chat.queue_remove": {
+    "zh-CN": "移除",
+    "zh-TW": "移除",
+    "ja": "削除",
+    "ko": "제거",
+    "en": "Remove",
+  },
+  "chat.queue_edit": {
+    "zh-CN": "编辑",
+    "zh-TW": "編輯",
+    "ja": "編集",
+    "ko": "편집",
+    "en": "Edit",
+  },
   "chat.session_count": {
     "zh-CN": "{count} 个会话",
     "zh-TW": "{count} 個會話",
@@ -714,11 +759,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Save failed",
   },
   "chat.rollback": {
-    "zh-CN": "回退到此处（移除其后消息）。只回退对话，不还原磁盘上已改动的文件",
-    "zh-TW": "回退到此處（移除其後訊息）。只回退對話，不還原磁碟上已改動的檔案",
-    "ja": "ここにロールバック（以降のメッセージを削除）。会話のみを戻し、ディスク上の変更済みファイルは元に戻しません",
-    "ko": "여기로 롤백(이후 메시지 제거). 대화만 되돌리며 디스크의 변경된 파일은 복원하지 않습니다",
-    "en": "Roll back to here (remove later messages). Conversation only — files already changed on disk are not reverted",
+    "zh-CN": "回退到此处（移除其后消息）；本次对话改过的文件若留有原件快照，会一并还原",
+    "zh-TW": "回退到此處（移除其後訊息）；本次對話改過的檔案若留有原件快照，會一併還原",
+    "ja": "ここにロールバック（以降のメッセージを削除）。この会話で変更したファイルは、原本のスナップショットがあれば一緒に元へ戻します",
+    "ko": "여기로 롤백(이후 메시지 제거). 이 대화에서 변경한 파일은 원본 스냅샷이 있으면 함께 복원합니다",
+    "en": "Roll back to here (remove later messages); files changed in this conversation are reverted too when an original snapshot is available",
   },
   "chat.retry": {
     "zh-CN": "重试此对话并重新发送",
@@ -728,11 +773,48 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Retry this message and resend",
   },
   "chat.rolled_back": {
-    "zh-CN": "已回退对话（后续消息已移除）；磁盘上已改动的文件不会还原",
-    "zh-TW": "已回退對話（後續訊息已移除）；磁碟上已改動的檔案不會還原",
-    "ja": "会話をロールバックしました（以降のメッセージを削除）。ディスク上の変更済みファイルは戻りません",
-    "ko": "대화를 롤백했습니다(이후 메시지 제거). 디스크의 변경된 파일은 복원되지 않습니다",
-    "en": "Conversation rolled back (later messages removed); files already changed on disk are untouched",
+    "zh-CN": "已回退对话（后续消息已移除）",
+    "zh-TW": "已回退對話（後續訊息已移除）",
+    "ja": "会話をロールバックしました（以降のメッセージを削除）",
+    "ko": "대화를 롤백했습니다(이후 메시지 제거)",
+    "en": "Conversation rolled back (later messages removed)",
+  },
+  "chat.rolled_back_files": {
+    "zh-CN": "已回退对话，并还原 {n} 个已更改文件",
+    "zh-TW": "已回退對話，並還原 {n} 個已更改檔案",
+    "ja": "会話をロールバックし、変更した {n} 個のファイルを元に戻しました",
+    "ko": "대화를 롤백하고 변경된 파일 {n}개를 복원했습니다",
+    "en": "Conversation rolled back; {n} changed file(s) restored",
+  },
+  "chat.rollback_files_armed": {
+    "zh-CN": "{n} 个已更改文件将会回退 —— 再点一次确认",
+    "zh-TW": "{n} 個已更改檔案將會回退 —— 再點一次確認",
+    "ja": "変更した {n} 個のファイルも元に戻ります —— もう一度クリックで確定",
+    "ko": "변경된 파일 {n}개도 함께 되돌립니다 —— 한 번 더 클릭해 확인",
+    "en": "{n} changed file(s) will be reverted — click again to confirm",
+  },
+  // 「没有文件要还原」时的确认文案（2026-10-06 加）：回退对话本身**不可撤销**（立刻写盘），
+  // 不该因为「恰好没动过文件」就静默执行 —— 用户报「这个回退并没有提醒用户是否回退」。
+  "chat.rollback_armed": {
+    "zh-CN": "其后的对话将被移除（不可撤销）—— 再点一次确认",
+    "zh-TW": "其後的對話將被移除（無法復原）—— 再點一次確認",
+    "ja": "以降の会話を削除します（取り消し不可）—— もう一度クリックで確定",
+    "ko": "이후 대화가 제거됩니다(되돌릴 수 없음) —— 한 번 더 클릭해 확인",
+    "en": "Later messages will be removed (cannot be undone) — click again to confirm",
+  },
+  "chat.rollback_files_skipped": {
+    "zh-CN": "{n} 个文件因快照不可用（二进制或超出大小上限）未还原",
+    "zh-TW": "{n} 個檔案因快照不可用（二進位或超出大小上限）未還原",
+    "ja": "{n} 個のファイルはスナップショットが使えないため（バイナリ / サイズ超過）元に戻せませんでした",
+    "ko": "스냅샷을 쓸 수 없어(바이너리/용량 초과) 파일 {n}개를 복원하지 못했습니다",
+    "en": "{n} file(s) not restored — snapshot unavailable (binary or over the size cap)",
+  },
+  "chat.rollback_files_failed": {
+    "zh-CN": "{n} 个文件还原失败",
+    "zh-TW": "{n} 個檔案還原失敗",
+    "ja": "{n} 個のファイルの復元に失敗しました",
+    "ko": "파일 {n}개 복원에 실패했습니다",
+    "en": "{n} file(s) failed to restore",
   },
   "chat.rollback_turn": {
     "zh-CN": "回退到本轮",
@@ -747,6 +829,61 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "このメッセージをコピー",
     "ko": "이 메시지 복사",
     "en": "Copy this message",
+  },
+  // ── 窗口化渲染 + 「提问节点」（2026-10-02）────────────────────
+  // `chat.load_earlier` / `chat.node_earlier` 里的 {n} 是**这一屏会补上的条数**
+  // （不是剩余总数）—— 与按钮行为一致，别改成「还剩 N 条」。
+  "chat.load_earlier": {
+    "zh-CN": "载入更早的 {n} 条",
+    "zh-TW": "載入更早的 {n} 則",
+    "ja": "さらに前の {n} 件を読み込む",
+    "ko": "이전 {n}개 더 불러오기",
+    "en": "Load {n} earlier messages",
+  },
+  "chat.node_title": {
+    "zh-CN": "提问节点",
+    "zh-TW": "提問節點",
+    "ja": "質問ノード",
+    "ko": "질문 노드",
+    "en": "Questions",
+  },
+  // 鼠标没停在轨道上时，「现在在哪」只靠这颗小字 + 那颗高亮的小点表达。
+  // `{n}` = 当前提问的序号，`{total}` = 本会话提问总数（都是 1 基）。
+  "chat.node_pos": {
+    "zh-CN": "第 {n} / {total} 条",
+    "zh-TW": "第 {n} / {total} 則",
+    "ja": "{n} / {total} 件目",
+    "ko": "{n} / {total}번째",
+    "en": "{n} / {total}",
+  },
+  "chat.node_empty": {
+    "zh-CN": "本会话还没有提问",
+    "zh-TW": "本對話還沒有提問",
+    "ja": "この会話にはまだ質問がありません",
+    "ko": "이 대화에는 아직 질문이 없습니다",
+    "en": "No questions in this conversation yet",
+  },
+  "chat.node_untitled": {
+    "zh-CN": "（无标题）",
+    "zh-TW": "（無標題）",
+    "ja": "（無題）",
+    "ko": "(제목 없음)",
+    "en": "(untitled)",
+  },
+  "chat.node_earlier": {
+    "zh-CN": "更早的 {n} 条提问",
+    "zh-TW": "更早的 {n} 則提問",
+    "ja": "さらに前の {n} 件の質問",
+    "ko": "이전 질문 {n}개",
+    "en": "{n} earlier questions",
+  },
+  // 左抽屉里「把这段会话摊开成一轮轮提问」的开关（U2 第一刀，2026-10-06）
+  "chat.drawer_turns": {
+    "zh-CN": "{n} 轮提问",
+    "zh-TW": "{n} 輪提問",
+    "ja": "{n} 件の質問",
+    "ko": "질문 {n}개",
+    "en": "{n} turns",
   },
   "chat.view_image": {
     "zh-CN": "查看图片",
@@ -871,6 +1008,27 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "총 {lines}행 · 승인하면 쓰기 계열 도구가 복구되고 이 계획대로 실행합니다",
     "en": "{lines} lines · approving re-enables write tools and starts execution",
   },
+  "agent.plan_expand": {
+    "zh-CN": "展开全文",
+    "zh-TW": "展開全文",
+    "ja": "全文を表示",
+    "ko": "전체 보기",
+    "en": "Show full plan",
+  },
+  "agent.plan_collapse": {
+    "zh-CN": "收起",
+    "zh-TW": "收合",
+    "ja": "折りたたむ",
+    "ko": "접기",
+    "en": "Collapse",
+  },
+  "agent.mcp_config_reload": {
+    "zh-CN": "MCP 配置已改动（{files}），本回合仍用旧配置；正在重启，下次提问即生效。",
+    "zh-TW": "MCP 設定已變更（{files}），本回合仍用舊設定；正在重新啟動，下次提問即生效。",
+    "ja": "MCP 設定を変更しました（{files}）。このターンは旧設定のままです。再起動しており、次回の質問から反映されます。",
+    "ko": "MCP 설정이 변경되었습니다({files}). 이번 턴은 이전 설정을 사용했으며, 재시작 후 다음 질문부터 적용됩니다.",
+    "en": "MCP config changed ({files}); this turn used the old config. Restarting — it applies from your next message.",
+  },
   "agent.plan_approve": {
     "zh-CN": "批准计划",
     "zh-TW": "批准計畫",
@@ -900,6 +1058,186 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "ユーザーがこの計画を却下しました：プランモードのままです。いかなる変更も実行せず、指摘に沿って計画を修正し、再度 ExitPlanMode を呼んでください。",
     "ko": "사용자가 이 계획을 거부했습니다: 여전히 플랜 모드입니다. 어떤 변경도 실행하지 말고, 의견에 맞게 계획을 수정한 뒤 ExitPlanMode를 다시 호출하세요.",
     "en": "The user rejected this plan. You are still in plan mode — do not make any change. Revise the plan per their feedback and call ExitPlanMode again.",
+  },
+  // 计划卡分页（2026-10-03）：一批里有多份计划时一次只显示一页，末页固定是「补充要求」。
+  "agent.plan_cancel": {
+    "zh-CN": "取消",
+    "zh-TW": "取消",
+    "ja": "キャンセル",
+    "ko": "취소",
+    "en": "Cancel",
+  },
+  // ── MCP elicitation 卡片（A13，2026-10-04）───────────────────────
+  // 用户工具在 `tools\*.json` 里声明 `elicit` 时，服务端会在执行前向用户收集输入；
+  // agent 侧把它转成 `control_request`（subtype=elicitation），前端渲染成这张表单。
+  // 回包复用审批通道的 `updatedInput` —— 表单值就是 MCP 规范要的 `content`。
+  "agent.elicit_title": {
+    "zh-CN": "需要你补充信息",
+    "zh-TW": "需要你補充資訊",
+    "ja": "入力が必要です",
+    "ko": "입력이 필요합니다",
+    "en": "Input needed",
+  },
+  "agent.elicit_submit": {
+    "zh-CN": "提交",
+    "zh-TW": "提交",
+    "ja": "送信",
+    "ko": "제출",
+    "en": "Submit",
+  },
+  "agent.elicit_cancel": {
+    "zh-CN": "取消",
+    "zh-TW": "取消",
+    "ja": "キャンセル",
+    "ko": "취소",
+    "en": "Cancel",
+  },
+  "agent.mcp_trust_title": {
+    "zh-CN": "这个项目要求启动 MCP 服务器",
+    "zh-TW": "這個專案要求啟動 MCP 伺服器",
+    "ja": "このプロジェクトが MCP サーバーの起動を要求しています",
+    "ko": "이 프로젝트가 MCP 서버 실행을 요청합니다",
+    "en": "This project wants to start MCP servers",
+  },
+  "agent.mcp_trust_body": {
+    "zh-CN": "下面的命令会在你的电脑上运行。只信任你确认过的项目。",
+    "zh-TW": "下面的指令會在你的電腦上執行。只信任你確認過的專案。",
+    "ja": "以下のコマンドがこの PC で実行されます。確認したプロジェクトだけを信頼してください。",
+    "ko": "아래 명령이 이 PC에서 실행됩니다. 확인한 프로젝트만 신뢰하세요.",
+    "en": "These commands will run on your computer. Only trust projects you have reviewed.",
+  },
+  "agent.mcp_trust_allow": {
+    "zh-CN": "仅本次",
+    "zh-TW": "僅本次",
+    "ja": "今回のみ",
+    "ko": "이번만",
+    "en": "Just once",
+  },
+  "agent.mcp_trust_always": {
+    "zh-CN": "始终信任",
+    "zh-TW": "始終信任",
+    "ja": "常に信頼",
+    "ko": "항상 신뢰",
+    "en": "Always trust",
+  },
+  "agent.mcp_trust_deny": {
+    "zh-CN": "拒绝",
+    "zh-TW": "拒絕",
+    "ja": "拒否",
+    "ko": "거부",
+    "en": "Deny",
+  },
+  "plugin.sidecar_trust_title": {
+    "zh-CN": "这个插件要求启动一个本机程序",
+    "zh-TW": "這個外掛要求啟動一個本機程式",
+    "ja": "このプラグインがローカルプログラムの起動を要求しています",
+    "ko": "이 플러그인이 로컬 프로그램 실행을 요청합니다",
+    "en": "This plugin wants to run a local program",
+  },
+  "plugin.sidecar_trust_hint": {
+    "zh-CN": "它会在你的电脑上运行本机进程，并能按下面的范围访问本机端口。只信任你确认过的插件。",
+    "zh-TW": "它會在你的電腦上執行本機程序，並可依下列範圍存取本機連接埠。只信任你確認過的外掛。",
+    "ja": "お使いの PC 上でローカルプロセスを実行し、以下の範囲でローカルポートにアクセスできます。確認したプラグインだけを信頼してください。",
+    "ko": "이 PC에서 로컬 프로세스를 실행하며 아래 범위의 로컬 포트에 접근할 수 있습니다. 확인한 플러그인만 신뢰하세요.",
+    "en": "It runs a local process on your computer and can reach local ports within the range below. Only trust plugins you have reviewed.",
+  },
+  "plugin.sidecar_trust_once": {
+    "zh-CN": "仅本次",
+    "zh-TW": "僅本次",
+    "ja": "今回のみ",
+    "ko": "이번만",
+    "en": "Just once",
+  },
+  "plugin.sidecar_trust_always": {
+    "zh-CN": "始终信任",
+    "zh-TW": "始終信任",
+    "ja": "常に信頼",
+    "ko": "항상 신뢰",
+    "en": "Always trust",
+  },
+  "plugin.sidecar_trust_deny": {
+    "zh-CN": "拒绝",
+    "zh-TW": "拒絕",
+    "ja": "拒否",
+    "ko": "거부",
+    "en": "Deny",
+  },
+  "plugin.sidecar_ports_tag": {
+    "zh-CN": "可访问端口",
+    "zh-TW": "可存取連接埠",
+    "ja": "アクセス可能なポート",
+    "ko": "접근 가능한 포트",
+    "en": "Reachable ports",
+  },
+  "plugin.sidecar_ports_own": {
+    "zh-CN": "仅它自己的端口",
+    "zh-TW": "僅它自己的連接埠",
+    "ja": "自身のポートのみ",
+    "ko": "자체 포트만",
+    "en": "Only its own port",
+  },
+  "plugin.sidecar_ports_any": {
+    "zh-CN": "任意本机端口（请谨慎）",
+    "zh-TW": "任意本機連接埠（請謹慎）",
+    "ja": "任意のローカルポート（注意）",
+    "ko": "모든 로컬 포트 (주의)",
+    "en": "Any local port (be careful)",
+  },
+  "plugin.sidecar_denied": {
+    "zh-CN": "已拒绝该插件启动本机程序",
+    "zh-TW": "已拒絕此外掛啟動本機程式",
+    "ja": "このプラグインのローカルプログラム起動を拒否しました",
+    "ko": "이 플러그인의 로컬 프로그램 실행을 거부했습니다",
+    "en": "You denied this plugin from running a local program",
+  },
+  "agent.plan_prev": {
+    "zh-CN": "上一页",
+    "zh-TW": "上一頁",
+    "ja": "前へ",
+    "ko": "이전",
+    "en": "Previous",
+  },
+  "agent.plan_next": {
+    "zh-CN": "下一页",
+    "zh-TW": "下一頁",
+    "ja": "次へ",
+    "ko": "다음",
+    "en": "Next",
+  },
+  "agent.plan_page": {
+    "zh-CN": "第 {i} / {n} 页",
+    "zh-TW": "第 {i} / {n} 頁",
+    "ja": "{i} / {n} ページ",
+    "ko": "{i} / {n} 페이지",
+    "en": "Page {i} of {n}",
+  },
+  "agent.plan_custom_title": {
+    "zh-CN": "对计划不满意？补充你的要求",
+    "zh-TW": "對計畫不滿意？補充你的要求",
+    "ja": "計画に不満ですか？要望を追加してください",
+    "ko": "계획이 마음에 들지 않나요? 요구사항을 추가하세요",
+    "en": "Not satisfied? Add your own requirements",
+  },
+  "agent.plan_custom_ph": {
+    "zh-CN": "写下你希望怎么改（模型会据此重做计划，不会执行本计划）",
+    "zh-TW": "寫下你希望怎麼改（模型會據此重做計畫，不會執行本計畫）",
+    "ja": "どう直してほしいかを記入（モデルはこれに沿って計画をやり直します）",
+    "ko": "어떻게 수정하길 원하는지 적어 주세요(모델이 이를 반영해 계획을 다시 만듭니다)",
+    "en": "Describe what to change (the agent will redo the plan; this plan won't run)",
+  },
+  "agent.plan_custom_submit": {
+    "zh-CN": "提交补充要求",
+    "zh-TW": "提交補充要求",
+    "ja": "要望を送信",
+    "ko": "요구사항 제출",
+    "en": "Submit requirements",
+  },
+  "agent.plan_custom_msg": {
+    "zh-CN": "用户对这份计划不满意，补充要求如下：{text}\n你仍在计划模式，不要执行任何改动；按以上要求修改计划后再调用一次 ExitPlanMode。",
+    "zh-TW": "使用者對這份計畫不滿意，補充要求如下：{text}\n你仍在計畫模式，請勿執行任何變更；依上述要求修改計畫後再呼叫一次 ExitPlanMode。",
+    "ja": "ユーザーはこの計画に不満です。追加要望：{text}\nプランモードのままです。変更を実行せず、上記に沿って計画を修正し、再度 ExitPlanMode を呼んでください。",
+    "ko": "사용자가 이 계획에 만족하지 않습니다. 추가 요구사항: {text}\n여전히 플랜 모드입니다. 변경을 실행하지 말고 위 요구에 맞게 계획을 수정한 뒤 ExitPlanMode를 다시 호출하세요.",
+    "en": "The user is not satisfied with this plan. Their additional requirements: {text}\nYou are still in plan mode — do not make any change. Revise the plan accordingly and call ExitPlanMode again.",
   },
   "agent.plan_saved": {
     "zh-CN": "计划已保存：{path}",
@@ -936,6 +1274,81 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "コンテキストを圧縮しました（スリム化 {elided} · 破棄 {dropped}）",
     "ko": "컨텍스트가 압축되었습니다 (슬림화 {elided} · 폐기 {dropped})",
     "en": "Context compacted ({elided} slimmed · {dropped} dropped)",
+  },
+  // 同一次压缩的**对话流版本**（2026-10-06）：状态行那条一闪而过、且会被后续状态覆盖，
+  // 这条留在记录里，用户回头能看懂「这轮模型为什么忘了前面的事」。
+  "agent.compacted_note": {
+    "zh-CN": "上下文已压缩：省略 {elided} 个工具结果，丢弃 {dropped} 条早期消息",
+    "zh-TW": "上下文已壓縮：省略 {elided} 個工具結果，丟棄 {dropped} 條早期訊息",
+    "ja": "コンテキストを圧縮しました：ツール結果 {elided} 件を省略、古いメッセージ {dropped} 件を破棄",
+    "ko": "컨텍스트 압축됨: 도구 결과 {elided}개 생략, 오래된 메시지 {dropped}개 폐기",
+    "en": "Context compacted: {elided} tool results elided, {dropped} old messages dropped",
+  },
+  // 单次提问的成本预算（2026-10-01）：撞顶后先压缩续命，续不动才收口。
+  // 两条都不带数字/工具名 —— 那是开发者向数据（§13.5 第 ④ 条），进日志不进界面。
+  "agent.budget_extended": {
+    "zh-CN": "上下文已压缩，继续执行",
+    "zh-TW": "上下文已壓縮，繼續執行",
+    "ja": "コンテキストを圧縮して続行します",
+    "ko": "컨텍스트를 압축하고 계속 진행합니다",
+    "en": "Context compacted — continuing",
+  },
+  "agent.budget_exhausted": {
+    "zh-CN": "本轮花费已达上限，AI 正在收尾作答",
+    "zh-TW": "本輪花費已達上限，AI 正在收尾作答",
+    "ja": "今回のコスト上限に達しました — まとめに入ります",
+    "ko": "이번 요청의 비용 한도에 도달했습니다 — 마무리 중",
+    "en": "Turn cost limit reached — wrapping up",
+  },
+  // 工具轮次兜底上限（2026-10-01）：轮次已降级为兜底闸门，但它打满时界面要如实说一句
+  //（原先只有 stderr 一行，用户只看到「AI 自己停了」）。
+  "agent.rounds_exhausted": {
+    "zh-CN": "本轮工具调用已达上限，AI 正在收尾作答",
+    "zh-TW": "本輪工具呼叫已達上限，AI 正在收尾作答",
+    "ja": "ツール呼び出しの上限に達しました — まとめに入ります",
+    "ko": "도구 호출 한도에 도달했습니다 — 마무리 중",
+    "en": "Tool-call limit reached — wrapping up",
+  },
+  // 卡住检测（2026-10-01）：模型连续几轮在重复同一件事，已提示它换思路。
+  "agent.stuck_detected": {
+    "zh-CN": "检测到 AI 在原地重复，已提示它换思路",
+    "zh-TW": "偵測到 AI 在原地重複，已提示它換個思路",
+    "ja": "AI が同じ操作を繰り返しています — 方針転換を促しました",
+    "ko": "AI가 같은 작업을 반복하고 있습니다 — 방향 전환을 요청했습니다",
+    "en": "AI is repeating itself — prompted to change approach",
+  },
+  // 正在执行的命令：实时指令（2026-10-01，用户要求「命令卡上加后台运行 / 停止」）。
+  // 两个动作都会**同时告诉模型**（走 `tool_control` 那条通路，见 main.ts sendToolControl）。
+  "agent.cmd_background": {
+    "zh-CN": "后台运行",
+    "zh-TW": "背景執行",
+    "ja": "バックグラウンド実行",
+    "ko": "백그라운드 실행",
+    "en": "Run in background",
+  },
+  "agent.cmd_stop": {
+    "zh-CN": "停止",
+    "zh-TW": "停止",
+    "ja": "停止",
+    "ko": "중지",
+    "en": "Stop",
+  },
+  // 卡片状态：已转后台（命令还在跑，按钮撤掉，等结果）
+  "agent.cmd_in_background": {
+    "zh-CN": "已在后台运行",
+    "zh-TW": "已在背景執行",
+    "ja": "バックグラウンドで実行中",
+    "ko": "백그라운드에서 실행 중",
+    "en": "Running in background",
+  },
+  // 待办清单里「后台运行」那一行的「取消」（不另设分区标题：那一区始终展开，
+  // 且抽屉头已有标题，再加一行只是噪音 —— 见 agent-ui-spec §3.9）
+  "agent.bg_cancel": {
+    "zh-CN": "取消",
+    "zh-TW": "取消",
+    "ja": "キャンセル",
+    "ko": "취소",
+    "en": "Cancel",
   },
   "agent.loading": {
     "zh-CN": "Agent 加载中...",
@@ -1179,6 +1592,415 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "번역",
     "en": "Translate",
   },
+  "plugin.proxy": {
+    "zh-CN": "代理",
+    "zh-TW": "代理",
+    "ja": "プロキシ",
+    "ko": "프록시",
+    "en": "Proxy",
+  },
+  // ── 代理插件面板（proxy.*，2026-10-02）──────────────────────────────
+  // 两条纪律写在界面文案里、不只是注释：① 系统代理**不覆盖 librespot**（它只认启动参数
+  // `-x`），所以「联动」那个开关不是可选项、是关键；② librespot 只认 **HTTP 代理**
+  // （`http://…`），socks5 那一类只能给系统代理用（判据见 music.rs 的
+  // `validate_librespot_proxy`）。说错这两句，用户会以为「开了代理但没效果」。
+  "proxy.title": {
+    "zh-CN": "代理",
+    "zh-TW": "代理",
+    "ja": "プロキシ",
+    "ko": "프록시",
+    "en": "Proxy",
+  },
+  // 多页导航（2026-10-06 面板重构）：左侧那列四个页签。
+  "proxy.nav_proxies": {
+    "zh-CN": "节点",
+    "zh-TW": "節點",
+    "ja": "ノード",
+    "ko": "노드",
+    "en": "Nodes",
+  },
+  "proxy.nav_subs": {
+    "zh-CN": "订阅",
+    "zh-TW": "訂閱",
+    "ja": "購読",
+    "ko": "구독",
+    "en": "Subscriptions",
+  },
+  "proxy.nav_log": {
+    "zh-CN": "日志",
+    "zh-TW": "日誌",
+    "ja": "ログ",
+    "ko": "로그",
+    "en": "Log",
+  },
+  "proxy.nav_settings": {
+    "zh-CN": "设置",
+    "zh-TW": "設定",
+    "ja": "設定",
+    "ko": "설정",
+    "en": "Settings",
+  },
+  "proxy.state_on": {
+    "zh-CN": "系统代理：已启用 → {server}",
+    "zh-TW": "系統代理：已啟用 → {server}",
+    "ja": "システムプロキシ：有効 → {server}",
+    "ko": "시스템 프록시: 사용 중 → {server}",
+    "en": "System proxy: on → {server}",
+  },
+  "proxy.state_off": {
+    "zh-CN": "系统代理：未启用",
+    "zh-TW": "系統代理：未啟用",
+    "ja": "システムプロキシ：無効",
+    "ko": "시스템 프록시: 사용 안 함",
+    "en": "System proxy: off",
+  },
+  "proxy.state_mismatch": {
+    "zh-CN": "（配置里启用了「{label}」，但系统里没生效 —— 可能被组策略压回去了）",
+    "zh-TW": "（設定裡啟用了「{label}」，但系統裡沒生效 —— 可能被群組原則壓回去了）",
+    "ja": "（設定では「{label}」を有効にしていますが、システムに反映されていません —— グループポリシーで上書きされた可能性があります）",
+    "ko": "(설정에서는 「{label}」을 켰지만 시스템에 적용되지 않았습니다 — 그룹 정책으로 덮였을 수 있습니다)",
+    "en": "(Configured as \"{label}\" but it did not take effect — group policy may have overridden it)",
+  },
+  "proxy.empty": {
+    "zh-CN": "还没有代理 —— 在下面填一条",
+    "zh-TW": "還沒有代理 —— 在下面填一條",
+    "ja": "プロキシがまだありません —— 下に入力してください",
+    "ko": "아직 프록시가 없습니다 — 아래에 추가하세요",
+    "en": "No proxies yet — add one below",
+  },
+  "proxy.in_use": {
+    "zh-CN": "使用中",
+    "zh-TW": "使用中",
+    "ja": "使用中",
+    "ko": "사용 중",
+    "en": "in use",
+  },
+  "proxy.socks_note": {
+    "zh-CN": " · socks5 只能给系统代理用，本机播放用不了",
+    "zh-TW": " · socks5 只能給系統代理用，本機播放用不了",
+    "ja": " · socks5 はシステムプロキシ専用で、ローカル再生には使えません",
+    "ko": " · socks5는 시스템 프록시 전용이며 로컬 재생에는 쓸 수 없습니다",
+    "en": " · socks5 works for the system proxy only, not for local playback",
+  },
+  "proxy.enable": {
+    "zh-CN": "启用",
+    "zh-TW": "啟用",
+    "ja": "有効化",
+    "ko": "사용",
+    "en": "Enable",
+  },
+  "proxy.disable": {
+    "zh-CN": "停用",
+    "zh-TW": "停用",
+    "ja": "無効化",
+    "ko": "중지",
+    "en": "Turn off",
+  },
+  "proxy.del": {
+    "zh-CN": "删除",
+    "zh-TW": "刪除",
+    "ja": "削除",
+    "ko": "삭제",
+    "en": "Delete",
+  },
+  "proxy.label_ph": {
+    "zh-CN": "名称（可选）",
+    "zh-TW": "名稱（可選）",
+    "ja": "名前（任意）",
+    "ko": "이름 (선택)",
+    "en": "Name (optional)",
+  },
+  // 占位符只演示**格式**，刻意不写任何真实端口（2026-10-02 用户要求）：
+  // 原值 `http://127.0.0.1:7890` 是别的软件（Clash）的默认端口，摆在这里容易被
+  // 当成「本插件的默认值」照抄。现在用 `:端口 / :PORT` 表示「这里要填端口号」。
+  "proxy.server_ph": {
+    "zh-CN": "http://127.0.0.1:端口",
+    "zh-TW": "http://127.0.0.1:連接埠",
+    "ja": "http://127.0.0.1:ポート",
+    "ko": "http://127.0.0.1:포트",
+    "en": "http://127.0.0.1:PORT",
+  },
+  "proxy.add": {
+    "zh-CN": "添加",
+    "zh-TW": "新增",
+    "ja": "追加",
+    "ko": "추가",
+    "en": "Add",
+  },
+  "proxy.link": {
+    "zh-CN": "让本机播放（librespot）也走这条代理",
+    "zh-TW": "讓本機播放（librespot）也走這條代理",
+    "ja": "ローカル再生（librespot）もこのプロキシ経由にする",
+    "ko": "로컬 재생(librespot)도 이 프록시를 사용",
+    "en": "Also route local playback (librespot) through this proxy",
+  },
+  "proxy.link_hint": {
+    "zh-CN": "只有 http:// 开头的代理能给 librespot 用；开着这个开关时，停用代理会把 librespot 一起掰回直连（包括你手填的那个值）。",
+    "zh-TW": "只有 http:// 開頭的代理能給 librespot 用；開著這個開關時，停用代理會把 librespot 一起掰回直連（包括你手填的那個值）。",
+    "ja": "librespot に使えるのは http:// で始まるプロキシだけです。このスイッチが入っていると、プロキシを無効化したときに librespot も直接接続へ戻します（手入力した値も含みます）。",
+    "ko": "http:// 로 시작하는 프록시만 librespot에 쓸 수 있습니다. 이 스위치가 켜져 있으면 프록시를 끌 때 librespot도 직결로 되돌립니다(직접 입력한 값 포함).",
+    "en": "Only http:// proxies work with librespot. While this switch is on, turning the proxy off also returns librespot to a direct connection — including any value you typed by hand.",
+  },
+  "proxy.hint": {
+    "zh-CN": "系统代理只影响走 Windows 设置的程序（浏览器、商店应用等）—— librespot 不读它，所以要让本机播放走代理请打开上面那个开关。",
+    "zh-TW": "系統代理只影響走 Windows 設定的程式（瀏覽器、商店應用等）—— librespot 不讀它，所以要讓本機播放走代理請打開上面那個開關。",
+    "ja": "システムプロキシは Windows の設定を使うプログラム（ブラウザー、ストアアプリなど）にだけ効きます —— librespot は読みませんので、ローカル再生をプロキシ経由にするには上のスイッチを入れてください。",
+    "ko": "시스템 프록시는 Windows 설정을 사용하는 프로그램(브라우저, 스토어 앱 등)에만 적용됩니다 — librespot은 이를 읽지 않으므로, 로컬 재생을 프록시로 보내려면 위 스위치를 켜세요.",
+    "en": "The system proxy only affects programs that use Windows' settings (browsers, Store apps…). librespot does not read it — turn on the switch above to route local playback through the proxy.",
+  },
+  // ── 内核（mihomo）区块，2026-10-03 ──────────────────────────────
+  "proxy.m_title": {
+    "zh-CN": "内核（mihomo）",
+    "zh-TW": "核心（mihomo）",
+    "ja": "コア（mihomo）",
+    "ko": "코어 (mihomo)",
+    "en": "Core (mihomo)",
+  },
+  "proxy.manual_title": {
+    "zh-CN": "手动代理（不用内核）",
+    "zh-TW": "手動代理（不用核心）",
+    "ja": "手動プロキシ（コアを使わない）",
+    "ko": "수동 프록시 (코어 미사용)",
+    "en": "Manual proxy (without the core)",
+  },
+  "proxy.m_need_core": {
+    "zh-CN": "还没安装内核。点「下载内核」从官方 Release 获取（首次需要联网）。",
+    "zh-TW": "尚未安裝核心。點「下載核心」從官方 Release 取得（首次需要網路）。",
+    "ja": "コアが未インストールです。「コアをダウンロード」で公式 Release から取得します（初回はネット接続が必要）。",
+    "ko": "코어가 설치되지 않았습니다. 「코어 다운로드」로 공식 Release에서 받으세요 (최초 1회 네트워크 필요).",
+    "en": "The core is not installed yet. Click “Download core” to fetch it from the official release (needs network the first time).",
+  },
+  "proxy.m_running": {
+    "zh-CN": "内核运行中 · {ver} · 混合端口 {port}",
+    "zh-TW": "核心執行中 · {ver} · 混合埠 {port}",
+    "ja": "コア稼働中 · {ver} · 混合ポート {port}",
+    "ko": "코어 실행 중 · {ver} · 혼합 포트 {port}",
+    "en": "Core running · {ver} · mixed port {port}",
+  },
+  "proxy.m_stopped": {
+    "zh-CN": "内核已安装（{ver}）但没在运行",
+    "zh-TW": "核心已安裝（{ver}）但未執行",
+    "ja": "コアは導入済み（{ver}）ですが停止中です",
+    "ko": "코어가 설치됨({ver}) but 실행 중이 아님",
+    "en": "Core installed ({ver}) but not running",
+  },
+  "proxy.m_install": {
+    "zh-CN": "下载内核",
+    "zh-TW": "下載核心",
+    "ja": "コアをダウンロード",
+    "ko": "코어 다운로드",
+    "en": "Download core",
+  },
+  "proxy.m_start": {
+    "zh-CN": "启动内核并接管系统代理",
+    "zh-TW": "啟動核心並接管系統代理",
+    "ja": "コアを起動してシステムプロキシを接管",
+    "ko": "코어 시작 및 시스템 프록시接管",
+    "en": "Start core and take over the system proxy",
+  },
+  "proxy.m_stop": {
+    "zh-CN": "停止内核并还原系统代理",
+    "zh-TW": "停止核心並還原系統代理",
+    "ja": "コアを停止してシステムプロキシを復元",
+    "ko": "코어 중지 및 시스템 프록시 복원",
+    "en": "Stop core and restore the system proxy",
+  },
+  "proxy.m_working": {
+    "zh-CN": "处理中…",
+    "zh-TW": "處理中…",
+    "ja": "処理中…",
+    "ko": "처리 중…",
+    "en": "Working…",
+  },
+  "proxy.m_port_ph": {
+    "zh-CN": "混合端口 7890",
+    "zh-TW": "混合埠 7890",
+    "ja": "混合ポート 7890",
+    "ko": "혼합 포트 7890",
+    "en": "Mixed port 7890",
+  },
+  "proxy.m_ctrl_ph": {
+    "zh-CN": "控制端口 9090",
+    "zh-TW": "控制埠 9090",
+    "ja": "コントロールポート 9090",
+    "ko": "제어 포트 9090",
+    "en": "Controller port 9090",
+  },
+  "proxy.m_release_ph": {
+    "zh-CN": "下载源（留空 = 官方 GitHub；可填镜像前缀）",
+    "zh-TW": "下載來源（留空 = 官方 GitHub；可填鏡像前綴）",
+    "ja": "ダウンロード元（空欄 = 公式 GitHub、ミラー接頭辞も可）",
+    "ko": "다운로드 소스 (비우면 공식 GitHub, 미러 접두사 가능)",
+    "en": "Download source (empty = official GitHub; a mirror prefix works too)",
+  },
+  "proxy.m_save": {
+    "zh-CN": "保存",
+    "zh-TW": "儲存",
+    "ja": "保存",
+    "ko": "저장",
+    "en": "Save",
+  },
+  "proxy.m_sub_name_ph": {
+    "zh-CN": "订阅名（可留空）",
+    "zh-TW": "訂閱名（可留空）",
+    "ja": "購読名（空欄可）",
+    "ko": "구독 이름 (비워도 됨)",
+    "en": "Subscription name (optional)",
+  },
+  "proxy.m_sub_url_ph": {
+    "zh-CN": "订阅链接（Clash YAML）",
+    "zh-TW": "訂閱連結（Clash YAML）",
+    "ja": "購読 URL（Clash YAML）",
+    "ko": "구독 링크 (Clash YAML)",
+    "en": "Subscription URL (Clash YAML)",
+  },
+  "proxy.m_sub_add": {
+    "zh-CN": "添加订阅",
+    "zh-TW": "新增訂閱",
+    "ja": "購読を追加",
+    "ko": "구독 추가",
+    "en": "Add subscription",
+  },
+  "proxy.m_no_subs": {
+    "zh-CN": "还没有订阅 —— 没有订阅就不会有任何节点，节点列表会是空的。",
+    "zh-TW": "還沒有訂閱 —— 沒有訂閱就不會有任何節點，節點列表會是空的。",
+    "ja": "購読がありません —— 購読が無いとノードも無く、ノード一覧は空になります。",
+    "ko": "구독이 없습니다 — 구독이 없으면 노드도 없어 노드 목록이 비어 있습니다.",
+    "en": "No subscriptions yet — without one there are no nodes, so the node list stays empty.",
+  },
+  "proxy.m_unnamed": {
+    "zh-CN": "（未命名订阅）",
+    "zh-TW": "（未命名訂閱）",
+    "ja": "（名前なし購読）",
+    "ko": "(이름 없는 구독)",
+    "en": "(unnamed subscription)",
+  },
+  "proxy.m_no_nodes": {
+    "zh-CN": "内核里还没有节点。检查订阅是否可用，然后重启内核。",
+    "zh-TW": "核心裡還沒有節點。檢查訂閱是否可用，然後重啟核心。",
+    "ja": "コアにノードがありません。購読が有効か確認し、コアを再起動してください。",
+    "ko": "코어에 노드가 없습니다. 구독이 유효한지 확인한 뒤 코어를 재시작하세요.",
+    "en": "No nodes in the core yet. Check the subscription and restart the core.",
+  },
+  "proxy.m_test": {
+    "zh-CN": "测速",
+    "zh-TW": "測速",
+    "ja": "速度テスト",
+    "ko": "속도 테스트",
+    "en": "Test",
+  },
+  "proxy.m_delay_ok": {
+    "zh-CN": "{name}：{ms} ms",
+    "zh-TW": "{name}：{ms} ms",
+    "ja": "{name}：{ms} ms",
+    "ko": "{name}: {ms} ms",
+    "en": "{name}: {ms} ms",
+  },
+  "proxy.m_log": {
+    "zh-CN": "查看日志",
+    "zh-TW": "檢視日誌",
+    "ja": "ログを見る",
+    "ko": "로그 보기",
+    "en": "View log",
+  },
+  "proxy.m_log_empty": {
+    "zh-CN": "（日志为空 —— 内核还没启动过）",
+    "zh-TW": "（日誌為空 —— 核心尚未啟動過）",
+    "ja": "（ログが空です —— コアがまだ起動していません）",
+    "ko": "(로그가 비어 있음 — 코어가 아직 시작되지 않았습니다)",
+    "en": "(log is empty — the core has not been started yet)",
+  },
+  "proxy.m_hint": {
+    "zh-CN": "订阅改动要重启内核才生效；节点/组/模式在内核运行时即时生效。内核从官方 Release 按需下载，不随安装包分发。",
+    "zh-TW": "訂閱變更要重啟核心才生效；節點/組/模式在核心執行時即時生效。核心從官方 Release 按需下載，不隨安裝包分發。",
+    "ja": "購読の変更はコア再起動後に有効になります。ノード/グループ/モードはコア稼働中は即時反映されます。コアは公式 Release から都度ダウンロードし、インストーラーには同梱しません。",
+    "ko": "구독 변경은 코어 재시작 후 적용됩니다. 노드/그룹/모드는 코어 실행 중 즉시 반영됩니다. 코어는 공식 Release에서 필요할 때 받으며 설치 패키지에 포함되지 않습니다.",
+    "en": "Subscription changes apply after the core restarts; nodes/groups/mode apply live while it runs. The core is downloaded on demand from the official release and is not bundled with the installer.",
+  },
+  "proxy.m_saved": {
+    "zh-CN": "已保存（订阅改动需重启内核生效）",
+    "zh-TW": "已儲存（訂閱變更需重啟核心生效）",
+    "ja": "保存しました（購読の変更はコア再起動後に反映）",
+    "ko": "저장됨 (구독 변경은 코어 재시작 후 적용)",
+    "en": "Saved (subscription changes need a core restart)",
+  },
+  "proxy.m_err_same_port": {
+    "zh-CN": "混合端口与控制端口不能相同",
+    "zh-TW": "混合埠與控制埠不能相同",
+    "ja": "混合ポートとコントロールポートは同じにできません",
+    "ko": "혼합 포트와 제어 포트는 같을 수 없습니다",
+    "en": "The mixed port and the controller port must differ",
+  },
+  "proxy.m_err_url": {
+    "zh-CN": "订阅链接要以 http:// 或 https:// 开头",
+    "zh-TW": "訂閱連結要以 http:// 或 https:// 開頭",
+    "ja": "購読 URL は http:// または https:// で始まる必要があります",
+    "ko": "구독 링크는 http:// 또는 https://로 시작해야 합니다",
+    "en": "The subscription URL must start with http:// or https://",
+  },
+  "proxy.err_empty": {
+    "zh-CN": "代理地址不能为空",
+    "zh-TW": "代理位址不能為空",
+    "ja": "プロキシのアドレスを入力してください",
+    "ko": "프록시 주소를 입력하세요",
+    "en": "The proxy address cannot be empty",
+  },
+  "proxy.err_space": {
+    "zh-CN": "代理地址里不能有空格",
+    "zh-TW": "代理位址裡不能有空格",
+    "ja": "プロキシのアドレスに空白は使えません",
+    "ko": "프록시 주소에 공백을 넣을 수 없습니다",
+    "en": "The proxy address cannot contain spaces",
+  },
+  "proxy.err_port": {
+    "zh-CN": "代理地址要带端口，形如 http://127.0.0.1:端口",
+    "zh-TW": "代理位址要帶連接埠，形如 http://127.0.0.1:連接埠",
+    "ja": "プロキシのアドレスにはポートが必要です（例：http://127.0.0.1:ポート）",
+    "ko": "프록시 주소에는 포트가 필요합니다 (예: http://127.0.0.1:포트)",
+    "en": "The proxy address needs a port, e.g. http://127.0.0.1:PORT",
+  },
+  "proxy.err_dup": {
+    "zh-CN": "这条已经在列表里了",
+    "zh-TW": "這條已經在清單裡了",
+    "ja": "この項目はすでに一覧にあります",
+    "ko": "이미 목록에 있는 항목입니다",
+    "en": "That one is already in the list",
+  },
+  "proxy.err_not_applied": {
+    "zh-CN": "已写入，但系统里没生效（可能被组策略压回去了）",
+    "zh-TW": "已寫入，但系統裡沒生效（可能被群組原則壓回去了）",
+    "ja": "書き込みはしましたが、システムに反映されませんでした（グループポリシーで上書きされた可能性があります）",
+    "ko": "기록했지만 시스템에 적용되지 않았습니다(그룹 정책으로 덮였을 수 있습니다)",
+    "en": "Written, but it did not take effect (group policy may have overridden it)",
+  },
+  "proxy.err_librespot": {
+    "zh-CN": "本机播放的代理没设上：{err}",
+    "zh-TW": "本機播放的代理沒設上：{err}",
+    "ja": "ローカル再生のプロキシを設定できませんでした：{err}",
+    "ko": "로컬 재생 프록시를 설정하지 못했습니다: {err}",
+    "en": "Could not set the local playback proxy: {err}",
+  },
+  "proxy.added": {
+    "zh-CN": "已添加",
+    "zh-TW": "已新增",
+    "ja": "追加しました",
+    "ko": "추가됨",
+    "en": "Added",
+  },
+  "proxy.removed": {
+    "zh-CN": "已删除",
+    "zh-TW": "已刪除",
+    "ja": "削除しました",
+    "ko": "삭제됨",
+    "en": "Deleted",
+  },
+  "proxy.saved": {
+    "zh-CN": "已保存",
+    "zh-TW": "已儲存",
+    "ja": "保存しました",
+    "ko": "저장됨",
+    "en": "Saved",
+  },
   // ── 翻译插件面板（xl-，2026-09-29）──────────────────────────
   // 五条界面纪律见 plugins/builtin/translate.ts 顶部与 code-rules 预检 #40：
   // 一个动作最多一条提示、状态靠小字自明、失败只说「哪一步没成 + 能做什么」。
@@ -1378,6 +2200,34 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "클립보드 인식",
     "en": "Recognize Clipboard",
   },
+  "ocr.screen_btn": {
+    "zh-CN": "截屏识别",
+    "zh-TW": "截圖辨識",
+    "ja": "画面をキャプチャ",
+    "ko": "화면 캡처",
+    "en": "Capture Screen",
+  },
+  "ocr.shot_hint": {
+    "zh-CN": "拖拽选择要识别的区域（Esc 取消）",
+    "zh-TW": "拖曳選擇要辨識的區域（Esc 取消）",
+    "ja": "認識したい範囲をドラッグで選択（Esc でキャンセル）",
+    "ko": "인식할 영역을 드래그하세요 (Esc 취소)",
+    "en": "Drag to select the area to recognize (Esc to cancel)",
+  },
+  "ocr.shot_capturing": {
+    "zh-CN": "正在截屏…",
+    "zh-TW": "正在截圖…",
+    "ja": "画面をキャプチャ中…",
+    "ko": "화면 캡처 중…",
+    "en": "Capturing screen…",
+  },
+  "ocr.shot_failed": {
+    "zh-CN": "截屏失败：",
+    "zh-TW": "截圖失敗：",
+    "ja": "キャプチャに失敗：",
+    "ko": "화면 캡처 실패: ",
+    "en": "Screen capture failed: ",
+  },
   "ocr.file_btn": {
     "zh-CN": "选择文件",
     "zh-TW": "選擇檔案",
@@ -1491,13 +2341,6 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "다운로드 중 {mb} MB",
     "en": "Downloading {mb} MB",
   },
-  "ocr.engine_installed": {
-    "zh-CN": "已安装",
-    "zh-TW": "已安裝",
-    "ja": "インストール済み",
-    "ko": "설치됨",
-    "en": "Installed",
-  },
   "ocr.engine_ready": {
     "zh-CN": "引擎已就绪",
     "zh-TW": "引擎已就緒",
@@ -1512,12 +2355,14 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "설치 실패. 네트워크 확인 후 재시도",
     "en": "Install failed — check network and retry",
   },
-  "ocr.engine_retry": {
-    "zh-CN": "重试",
-    "zh-TW": "重試",
-    "ja": "再試行",
-    "ko": "재시도",
-    "en": "Retry",
+  // 命令成功、但引擎仍不在 ⇒ 插件包本身没声明引擎依赖（旧包）。别报成网络问题，
+  // 那会把用户引到错的方向（2026-09-30 用户报的 release 下不了引擎就是这个）。
+  "ocr.engine_not_declared": {
+    "zh-CN": "引擎未随插件下载：请在 设置 → 插件 里对「OCR 文字识别」点一次「更新」，再回来重试",
+    "zh-TW": "引擎未隨外掛下載：請在 設定 → 外掛 對「OCR 文字識別」點一次「更新」，再回來重試",
+    "ja": "エンジンがプラグインと一緒に取得されませんでした：設定 → プラグインで「OCR 文字識別」を一度「更新」してから再試行してください",
+    "ko": "엔진이 플러그인과 함께 받아지지 않았습니다: 설정 → 플러그인에서 'OCR 文字識別'을 한 번 '업데이트'한 뒤 다시 시도하세요",
+    "en": "The engine wasn't downloaded with the plugin: open Settings → Plugins and press \"Update\" once for \"OCR 文字識別\", then retry",
   },
 
   // ── Memo ───────────────────────────────────────────────────
@@ -2039,6 +2884,16 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "한 곡 반복",
     "en": "Repeat one",
   },
+  // 只有**本地**那一侧的播放模式钮有这一档（2026-10-01 用户第 8 条）：
+  // Spotify 那枚三态钮里没有「循环列表」（它的 web API 用 `repeat=context` 表达，
+  // 本仓那枚钮刻意只做三档，见 §4.6）。
+  "music.mode_repeat_all": {
+    "zh-CN": "循环列表",
+    "zh-TW": "循環清單",
+    "ja": "リストをリピート",
+    "ko": "목록 반복",
+    "en": "Repeat all",
+  },
   "music.open_player": {
     "zh-CN": "打开播放界面",
     "zh-TW": "開啟播放介面",
@@ -2131,6 +2986,35 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "팟캐스트",
     "en": "Podcasts",
   },
+  // ── 「最常听」栏（2026-10-01 用户第 4 条；2026-10-02 删掉了并列的「新发行」）──
+  // ⚠️ 只做「能拿到的」：Spotify 的**官方编辑歌单**（`/browse/featured-playlists` 与
+  // `/browse/categories/{id}/playlists`）与 recommendations 是 2024-11-27 同一批下线的，
+  // 新应用一律 403、没有等待名单 —— 所以这里没有「发现歌单」这一栏。
+  // 同批的 `/browse/new-releases`（「新发行」）release 实测也是永久 403，2026-10-02 整条删除。
+  "music.tab_top": {
+    "zh-CN": "最常听",
+    "zh-TW": "最常聽",
+    "ja": "よく聴く",
+    "ko": "자주 듣는",
+    "en": "Most played",
+  },
+  "music.top_tracks": {
+    "zh-CN": "最常听的歌曲",
+    "zh-TW": "最常聽的歌曲",
+    "ja": "よく聴く曲",
+    "ko": "자주 듣는 곡",
+    "en": "Most played tracks",
+  },
+  // 副标题写死窗口而不是含糊的「最常听」：`/me/top/*` 是**按时间窗**取的，
+  // 我们用的 `time_range=short_term` 就是**近 4 周**（Spotify 的另两档是
+  // medium_term ≈ 6 个月、long_term ≈ 一年）。不写清楚会被当成「有史以来」。
+  "music.top_tracks_sub": {
+    "zh-CN": "近 4 周",
+    "zh-TW": "近 4 週",
+    "ja": "過去 4 週間",
+    "ko": "최근 4주",
+    "en": "Last 4 weeks",
+  },
   "music.tracks": {
     "zh-CN": "歌曲",
     "zh-TW": "歌曲",
@@ -2166,12 +3050,672 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "이 기기에서 재생",
     "en": "Play on this device",
   },
+  // librespot 的代理输入框占位符。原先是 `.ts` 里硬编码的 `http://127.0.0.1:7890`
+  // —— 那是别的软件的默认端口，容易被当成「推荐值」（2026-10-02 用户要求去掉）。
+  "music.librespot_proxy_ph": {
+    "zh-CN": "http://127.0.0.1:端口（留空 = 直连）",
+    "zh-TW": "http://127.0.0.1:連接埠（留空 = 直連）",
+    "ja": "http://127.0.0.1:ポート（空欄 = 直接接続）",
+    "ko": "http://127.0.0.1:포트 (비우면 직결)",
+    "en": "http://127.0.0.1:PORT (empty = direct)",
+  },
+  // 串流质量：只有 librespot 这条路能调（官方 Web API 没有质量参数）。
+  // 三个档位值（96/160/320）是 librespot 自己 --help 里列的，所以按钮上直接写数字，不进 i18n。
+  // 设置页（2026-10-01 从连接卡片搬出来）：标题 + 一行「只影响谁」+ 一行**如实说明为何封顶**
+  "music.quality": {
+    "zh-CN": "本机串流质量",
+    "zh-TW": "本機串流品質",
+    "ja": "この端末のストリーミング品質",
+    "ko": "이 기기 스트리밍 품질",
+    "en": "On-device streaming quality",
+  },
+  "music.quality_hint": {
+    "zh-CN": "只影响 Spotify 的「本机播放」（librespot），改动重启后生效；最高 320 kbps —— Spotify 的无损流受 DRM 保护，第三方客户端取不到",
+    "zh-TW": "只影響 Spotify 的「本機播放」（librespot），改動重啟後生效；最高 320 kbps —— Spotify 的無損串流受 DRM 保護，第三方客戶端取不到",
+    "ja": "Spotify の「この端末で再生」（librespot）にのみ適用され、変更は再起動後に反映されます。最高 320 kbps —— Spotify のロスレス配信は DRM で保護されており、サードパーティ製クライアントでは取得できません",
+    "ko": "Spotify의 '이 기기에서 재생'(librespot)에만 적용되며 변경은 다시 시작한 뒤 반영됩니다. 최대 320 kbps —— Spotify의 무손실 스트림은 DRM으로 보호되어 서드파티 클라이언트가 받을 수 없습니다",
+    "en": "Applies to Spotify \"Play on this device\" (librespot) only — takes effect after it restarts. Capped at 320 kbps: Spotify's lossless streams are DRM-protected and third-party clients cannot obtain them",
+  },
+  "music.quality_local_note": {
+    "zh-CN": "本地文件播放不受这一档影响：文件按原来的格式解码播放，是几 kbps 就是几 kbps",
+    "zh-TW": "本機檔案播放不受這一檔影響：檔案照原格式解碼播放，是幾 kbps 就是幾 kbps",
+    "ja": "ローカルファイルの再生には影響しません。ファイルは元の形式のままデコードされるため、ビットレートは変わりません",
+    "ko": "로컬 파일 재생에는 영향을 주지 않습니다. 파일은 원래 형식대로 디코딩되므로 비트레이트가 바뀌지 않습니다",
+    "en": "Local file playback is unaffected — files are decoded as they are, whatever bitrate they already have",
+  },
+  // 调音（2026-10-01 用户第 5 条）。DSP 内核 = `tuning-engine`，**已内置进宿主**，
+  // 不再是独立插件（见 ai-spec §4.10 与预检 #51）。
+  // 预设键（flat / bass / vocal / treble / loudness）由**宿主**那张表出
+  // （`player.rs` 的 `TUNING_PRESETS`），这里只负责「键 → 文案」——
+  // 加一档只改宿主 + 这里各一条，别在前端再抄一份名单。
+  "music.tuning": {
+    "zh-CN": "调音",
+    "zh-TW": "調音",
+    "ja": "チューニング",
+    "ko": "튜닝",
+    "en": "Tuning",
+  },
+  "music.tuning_on": {
+    "zh-CN": "开启",
+    "zh-TW": "開啟",
+    "ja": "オン",
+    "ko": "켜기",
+    "en": "On",
+  },
+  "music.tuning_off": {
+    "zh-CN": "关闭",
+    "zh-TW": "關閉",
+    "ja": "オフ",
+    "ko": "끄기",
+    "en": "Off",
+  },
+  // 标题栏那枚「三段切换」的三段（2026-10-01 用户口径：本地音乐 + 调音两个入口
+  // 收成这一枚，放在标题栏原插件名文字的位置）。文案要**短** —— 它长在悬浮窗
+  // 那条 40px 高的标题栏里，三段并排，长一点就会挤掉右边那三个窗口按钮。
+  "music.tb_online": {
+    "zh-CN": "在线歌单",
+    "zh-TW": "線上歌單",
+    "ja": "オンライン",
+    "ko": "온라인",
+    "en": "Online",
+  },
+  "music.tb_local": {
+    "zh-CN": "本地音乐",
+    "zh-TW": "本機音樂",
+    "ja": "ローカル",
+    "ko": "로컬",
+    "en": "Local",
+  },
+  "music.tb_tuning": {
+    "zh-CN": "调音",
+    "zh-TW": "調音",
+    "ja": "音質調整",
+    "ko": "튜닝",
+    "en": "Tuning",
+  },
+  // 曲线缩放（2026-10-03）。旧 `music.tuning_note`（「每档都按最大提升量压低整体音量…」）
+  // 随页面下方那行说明一起删除，键不再保留（死键会被误当成「还挂着某处」）。
+  "music.tuning_zoom_in": {
+    "zh-CN": "放大曲线",
+    "zh-TW": "放大曲線",
+    "ja": "曲線を拡大",
+    "ko": "곡선 확대",
+    "en": "Zoom in curve",
+  },
+  "music.tuning_zoom_out": {
+    "zh-CN": "缩小曲线",
+    "zh-TW": "縮小曲線",
+    "ja": "曲線を縮小",
+    "ko": "곡선 축소",
+    "en": "Zoom out curve",
+  },
+  "music.tuning_saved": {
+    "zh-CN": "已应用",
+    "zh-TW": "已套用",
+    "ja": "適用しました",
+    "ko": "적용됨",
+    "en": "Applied",
+  },
+  // ── 调音页 P0（可编辑的链，2026-10-02）──────────────────────────────
+  // 滤波器类型名（`music.tk_<引擎 Kind::name()>`）：**键必须与引擎那张名单逐字相同**
+  // （`biquad.rs` 的 `Kind::name()`）—— 认不出的键前端回退成键本身（见 tuningKindLabel）。
+  // ── 用户预设 / 工具条（P5-1，2026-10-03）：把整条链存成命名预设、重命名 / 删除、导入 / 导出 ──
+  // 2026-10-03 用户口径：内置那 5 档整批删掉（连同 `tuning_presets` / `tuning_custom` /
+  // `tuning_user_presets(_empty)` 那几条说明文案），工具条移到顶部、文案改成「保存 / 导入 / 导出」。
+  "music.tuning_preset_save": {
+    "zh-CN": "保存",
+    "zh-TW": "儲存",
+    "ja": "保存",
+    "ko": "저장",
+    "en": "Save",
+  },
+  "music.tuning_preset_import": {
+    "zh-CN": "导入",
+    "zh-TW": "匯入",
+    "ja": "読み込み",
+    "ko": "가져오기",
+    "en": "Import",
+  },
+  "music.tuning_preset_export": {
+    "zh-CN": "导出",
+    "zh-TW": "匯出",
+    "ja": "書き出し",
+    "ko": "내보내기",
+    "en": "Export",
+  },
+  "music.tuning_preset_ok": {
+    "zh-CN": "保存",
+    "zh-TW": "儲存",
+    "ja": "保存",
+    "ko": "저장",
+    "en": "Save",
+  },
+  "music.tuning_preset_overwrite": {
+    "zh-CN": "覆盖",
+    "zh-TW": "覆蓋",
+    "ja": "上書き",
+    "ko": "덮어쓰기",
+    "en": "Overwrite",
+  },
+  "music.tuning_preset_cancel": {
+    "zh-CN": "取消",
+    "zh-TW": "取消",
+    "ja": "キャンセル",
+    "ko": "취소",
+    "en": "Cancel",
+  },
+  "music.tuning_ab_title": {
+    "zh-CN": "A/B 对比",
+    "zh-TW": "A/B 對比",
+    "ja": "A/B 比較",
+    "ko": "A/B 비교",
+    "en": "A/B compare",
+  },
+  "music.tuning_ab_save_a": {
+    "zh-CN": "存到 A",
+    "zh-TW": "存到 A",
+    "ja": "A に保存",
+    "ko": "A에 저장",
+    "en": "Save to A",
+  },
+  "music.tuning_ab_save_b": {
+    "zh-CN": "存到 B",
+    "zh-TW": "存到 B",
+    "ja": "B に保存",
+    "ko": "B에 저장",
+    "en": "Save to B",
+  },
+  "music.tuning_ab_saved_a": {
+    "zh-CN": "已把当前调音存到 A",
+    "zh-TW": "已把目前調音存到 A",
+    "ja": "現在の設定を A に保存しました",
+    "ko": "현재 설정을 A에 저장했습니다",
+    "en": "Saved the current tuning to A",
+  },
+  "music.tuning_ab_saved_b": {
+    "zh-CN": "已把当前调音存到 B",
+    "zh-TW": "已把目前調音存到 B",
+    "ja": "現在の設定を B に保存しました",
+    "ko": "현재 설정을 B에 저장했습니다",
+    "en": "Saved the current tuning to B",
+  },
+  "music.tuning_ab_blind": {
+    "zh-CN": "盲测",
+    "zh-TW": "盲測",
+    "ja": "ブラインド",
+    "ko": "블라인드",
+    "en": "Blind",
+  },
+  "music.tuning_ab_reveal": {
+    "zh-CN": "揭晓",
+    "zh-TW": "揭曉",
+    "ja": "答え合わせ",
+    "ko": "공개",
+    "en": "Reveal",
+  },
+  "music.tuning_ab_empty": {
+    "zh-CN": "先点「存到 A / 存到 B」把当前调音各存一份快照",
+    "zh-TW": "先點「存到 A / 存到 B」把目前調音各存一份快照",
+    "ja": "まず「A に保存 / B に保存」で現在の設定を保存してください",
+    "ko": "먼저 'A에 저장 / B에 저장'으로 현재 설정을 저장하세요",
+    "en": "First save the current tuning into A and/or B",
+  },
+  "music.tuning_ab_hint": {
+    "zh-CN": "A：{a}　B：{b}（点一下切换；两槽都存了才能开盲测）",
+    "zh-TW": "A：{a}　B：{b}（點一下切換；兩槽都存了才能開盲測）",
+    "ja": "A：{a}　B：{b}（クリックで切替。両方保存でブラインド可）",
+    "ko": "A: {a}　B: {b} (클릭하여 전환, 둘 다 저장해야 블라인드 가능)",
+    "en": "A: {a}　B: {b} (click to switch; save both to enable blind)",
+  },
+  "music.tuning_ab_blind_hint": {
+    "zh-CN": "盲测中：1 / 2 分别是哪个槽是随机的，听出来再点「揭晓」",
+    "zh-TW": "盲測中：1 / 2 各對應哪個槽是隨機的，聽出來再點「揭曉」",
+    "ja": "ブラインド中：1 / 2 がどちらのスロットかはランダムです。「答え合わせ」で確認",
+    "ko": "블라인드 중: 1 / 2가 어느 슬롯인지는 무작위입니다. 판단 후 '공개'를 누르세요",
+    "en": "Blind: whether 1 or 2 is A is randomized — hit Reveal when you've decided",
+  },
+  "music.tuning_ab_revealed": {
+    "zh-CN": "揭晓：1 = {one}，2 = {two}",
+    "zh-TW": "揭曉：1 = {one}，2 = {two}",
+    "ja": "答え：1 = {one}、2 = {two}",
+    "ko": "공개: 1 = {one}, 2 = {two}",
+    "en": "Revealed: 1 = {one}, 2 = {two}",
+  },
+  "music.tuning_preset_rename": {
+    "zh-CN": "重命名",
+    "zh-TW": "重新命名",
+    "ja": "名前を変更",
+    "ko": "이름 바꾸기",
+    "en": "Rename",
+  },
+  "music.tuning_preset_delete": {
+    "zh-CN": "删除",
+    "zh-TW": "刪除",
+    "ja": "削除",
+    "ko": "삭제",
+    "en": "Delete",
+  },
+  "music.tuning_preset_save_prompt": {
+    "zh-CN": "给这条链起个名字（同名会问你要不要覆盖）",
+    "zh-TW": "給這條鏈取個名字（同名會問你要不要覆蓋）",
+    "ja": "このチェーンに名前を付けてください（同名なら上書き確認が出ます）",
+    "ko": "이 체인에 이름을 붙이세요 (같은 이름이면 덮어쓸지 물어봅니다)",
+    "en": "Name this chain (if the name exists, you'll be asked to overwrite)",
+  },
+  "music.tuning_preset_rename_prompt": {
+    "zh-CN": "把「{name}」改名为",
+    "zh-TW": "把「{name}」改名為",
+    "ja": "「{name}」の新しい名前",
+    "ko": "\"{name}\"의 새 이름",
+    "en": "New name for \"{name}\"",
+  },
+  "music.tuning_preset_delete_confirm": {
+    "zh-CN": "删除预设「{name}」？（已经存下来的那条链文件会被删掉，当前正在听的链不动）",
+    "zh-TW": "刪除預設「{name}」？（已存下來的鏈檔案會被刪掉，目前正在聽的鏈不動）",
+    "ja": "プリセット「{name}」を削除しますか？（保存済みのチェーンは消えますが、今再生中のチェーンは変わりません）",
+    "ko": "프리셋 \"{name}\"을 삭제할까요? (저장된 체인 파일은 지워지지만, 지금 듣고 있는 체인은 그대로입니다)",
+    "en": "Delete preset \"{name}\"? (the saved chain file goes away; the chain you're hearing does not change)",
+  },
+  "music.tuning_preset_name_empty": {
+    "zh-CN": "预设名不能为空",
+    "zh-TW": "預設名不能為空",
+    "ja": "プリセット名を入力してください",
+    "ko": "프리셋 이름을 입력하세요",
+    "en": "Preset name can't be empty",
+  },
+  "music.tuning_preset_exists": {
+    "zh-CN": "已经有一个叫「{name}」的预设",
+    "zh-TW": "已經有一個叫「{name}」的預設",
+    "ja": "「{name}」というプリセットがすでにあります",
+    "ko": "\"{name}\" 프리셋이 이미 있습니다",
+    "en": "A preset named \"{name}\" already exists",
+  },
+  "music.tuning_preset_saved": {
+    "zh-CN": "已保存预设「{name}」",
+    "zh-TW": "已儲存預設「{name}」",
+    "ja": "プリセット「{name}」を保存しました",
+    "ko": "프리셋 \"{name}\" 저장됨",
+    "en": "Saved preset \"{name}\"",
+  },
+  "music.tuning_preset_renamed": {
+    "zh-CN": "已重命名为「{name}」",
+    "zh-TW": "已重新命名為「{name}」",
+    "ja": "「{name}」に名前を変更しました",
+    "ko": "\"{name}\"으로 이름 변경됨",
+    "en": "Renamed to \"{name}\"",
+  },
+  "music.tuning_preset_deleted": {
+    "zh-CN": "已删除预设「{name}」",
+    "zh-TW": "已刪除預設「{name}」",
+    "ja": "プリセット「{name}」を削除しました",
+    "ko": "프리셋 \"{name}\" 삭제됨",
+    "en": "Deleted preset \"{name}\"",
+  },
+  "music.tuning_preset_imported": {
+    "zh-CN": "已导入并应用「{name}」",
+    "zh-TW": "已匯入並套用「{name}」",
+    "ja": "「{name}」を読み込んで適用しました",
+    "ko": "\"{name}\" 가져와 적용됨",
+    "en": "Imported and applied \"{name}\"",
+  },
+  "music.tuning_preset_exported": {
+    "zh-CN": "已导出到 {path}",
+    "zh-TW": "已匯出到 {path}",
+    "ja": "{path} に書き出しました",
+    "ko": "{path} 에 내보냈습니다",
+    "en": "Exported to {path}",
+  },
+  // 三条全局水平滑块（2026-10-03 用户口径）：总增益 / 低音增益 / 高音增益。
+  // 后两条不是引擎字段 —— 宿主 `effective_json` 会把非零值追加成 low_shelf / high_shelf。
+  "music.tuning_preamp": {
+    "zh-CN": "总增益",
+    "zh-TW": "總增益",
+    "ja": "総ゲイン",
+    "ko": "총 게인",
+    "en": "Total gain",
+  },
+  "music.tuning_bass": {
+    "zh-CN": "低音增益",
+    "zh-TW": "低音增益",
+    "ja": "低音ゲイン",
+    "ko": "저음 게인",
+    "en": "Bass",
+  },
+  "music.tuning_treble": {
+    "zh-CN": "高音增益",
+    "zh-TW": "高音增益",
+    "ja": "高音ゲイン",
+    "ko": "고음 게인",
+    "en": "Treble",
+  },
+  // ── 通道槽（P5-2，2026-10-03）：全局 + 每条声道单独一条链。槽名本身（L / R / C …）
+  // 是 Peace 那套顺序的纯标识，不入 i18n（见 music.ts 的 CHANNEL_NAMES）。
+  //
+  // ⚠️ 2026-10-03 补：`music.tuning_slots` 这个键**一直没定义过** —— `t()` 缺键时原样
+  // 返回键名，于是右栏与曲线窗那两个标题一直显示成字面量「music.tuning_slots」
+  // （用户管那块叫「扬声器声道」，这里按他的叫法补上）。
+  "music.tuning_slots": {
+    "zh-CN": "扬声器声道",
+    "zh-TW": "揚聲器聲道",
+    "ja": "スピーカーチャンネル",
+    "ko": "스피커 채널",
+    "en": "Speaker channels",
+  },
+  "music.tuning_slot_global": {
+    "zh-CN": "全局",
+    "zh-TW": "全域",
+    "ja": "全体",
+    "ko": "전체",
+    "en": "Global",
+  },
+  // ── 图示均衡器（P5-3）那批键已随「滤波器与均衡器合并」（2026-10-03 用户口径）整批删除 ──
+  // ── 全局效果器（P5-4，2026-10-03）：延迟 / 声道复制 / 卷积。三样都是引擎的**顶层字段**
+  // ⇒ 面板只在「全局」通道槽里显示（见 music.ts 的 renderTuneFx）。──
+  "music.tuning_delay": {
+    "zh-CN": "延迟（ms）",
+    "zh-TW": "延遲（ms）",
+    "ja": "遅延（ms）",
+    "ko": "지연 (ms)",
+    "en": "Delay (ms)",
+  },
+  "music.tuning_copy_add": {
+    "zh-CN": "加一条",
+    "zh-TW": "加一條",
+    "ja": "規則を追加",
+    "ko": "규칙 추가",
+    "en": "Add rule",
+  },
+  "music.tuning_conv": {
+    "zh-CN": "卷积（房间校正）",
+    "zh-TW": "卷積（空間校正）",
+    "ja": "コンボリューション（部屋補正）",
+    "ko": "컨볼루션(룸 보정)",
+    "en": "Convolution (room correction)",
+  },
+  "music.tuning_conv_none": {
+    "zh-CN": "没启用",
+    "zh-TW": "未啟用",
+    "ja": "未使用",
+    "ko": "사용 안 함",
+    "en": "Not enabled",
+  },
+  "music.tuning_conv_pick": {
+    "zh-CN": "选择 IR 文件…",
+    "zh-TW": "選擇 IR 檔…",
+    "ja": "IR ファイルを選択…",
+    "ko": "IR 파일 선택…",
+    "en": "Choose IR file…",
+  },
+  "music.tuning_conv_clear": {
+    "zh-CN": "关闭卷积",
+    "zh-TW": "關閉卷積",
+    "ja": "コンボリューションを無効化",
+    "ko": "컨볼루션 끄기",
+    "en": "Turn off convolution",
+  },
+  // ── Peace 三栏重排 + 曲线窗（2026-10-03，用户口径「参照 Peace 主窗」）─────────
+  "music.tuning_curve": {
+    "zh-CN": "频响曲线",
+    "zh-TW": "頻響曲線",
+    "ja": "周波数特性",
+    "ko": "주파수 응답",
+    "en": "Frequency response",
+  },
+  "music.tuning_curve_open": {
+    "zh-CN": "频响曲线…",
+    "zh-TW": "頻響曲線…",
+    "ja": "周波数特性…",
+    "ko": "주파수 응답…",
+    "en": "Frequency response…",
+  },
+  "music.tuning_open": {
+    "zh-CN": "调音…",
+    "zh-TW": "調音…",
+    "ja": "チューニング…",
+    "ko": "튜닝…",
+    "en": "Tuning…",
+  },
+  "music.tuning_add": {
+    "zh-CN": "加一段",
+    "zh-TW": "加一段",
+    "ja": "セクションを追加",
+    "ko": "구간 추가",
+    "en": "Add band",
+  },
+  // ── 实时测量（2026-10-02）：播一段扫频 + WASAPI 回环录回来，量「真正送到硬件的」
+  // 那条频响。文案必须**如实说会出声** —— 点下去莫名其妙响一下是最糟的体验。
+  "music.tuning_measure": {
+    "zh-CN": "测量实际输出",
+    "zh-TW": "測量實際輸出",
+    "ja": "実際の出力を測定",
+    "ko": "실제 출력 측정",
+    "en": "Measure actual output",
+  },
+  "music.tuning_measuring": {
+    "zh-CN": "测量中…（会连播两段扫频，约 6 秒）",
+    "zh-TW": "測量中…（會連播兩段掃頻，約 6 秒）",
+    "ja": "測定中…（スイープ音を2回、約6秒再生します）",
+    "ko": "측정 중… (스윕 2회, 약 6초 재생)",
+    "en": "Measuring… (two sweeps, ~6s total)",
+  },
+  "music.tuning_probe_hint": {
+    "zh-CN": "连播两段扫频（一趟直通、一趟走链）并回环录回输出：绿虚线 = 仅自身链，蓝点线 = 最终输出（含系统音效）—— 请先把别的播放器静音",
+    "zh-TW": "連播兩段掃頻（一趟直通、一趟走鏈）並回環錄回輸出：綠虛線 = 僅自身鏈，藍點線 = 最終輸出（含系統音效）—— 請先把其他播放器靜音",
+    "ja": "スイープを2回（直通／チェーン経由）再生しループバック録音で測定：緑破線 = チェーン単体、青点線 = 最終出力（システム音効込み）—— 他のプレイヤーは先にミュートしてください",
+    "ko": "스윕을 2회(직통/체인 경유) 재생하고 루프백 녹음으로 측정: 초록 점선 = 체인 단독, 파랑 점선 = 최종 출력(시스템 효과 포함) — 다른 플레이어는 먼저 음소거하세요",
+    "en": "Two sweeps (bypass & through-chain) with loopback capture: green dashed = chain alone, blue dotted = final output (incl. system effects) — mute other players first",
+  },
+  "music.tuning_probe_result": {
+    "zh-CN": "覆盖率 {cov}% · 仅自身链 vs 合成 平均差 {dev} dB · 系统平均 {sys} dB · 用时 {ms}ms",
+    "zh-TW": "覆蓋率 {cov}% · 僅自身鏈 vs 合成 平均差 {dev} dB · 系統平均 {sys} dB · 用時 {ms}ms",
+    "ja": "カバレッジ {cov}% · チェーン単体 vs 合成 平均差 {dev} dB · システム平均 {sys} dB · {ms}ms",
+    "ko": "커버리지 {cov}% · 체인 단독 vs 합성 평균 차 {dev} dB · 시스템 평균 {sys} dB · {ms}ms",
+    "en": "Coverage {cov}% · chain-alone vs computed avg Δ {dev} dB · system avg {sys} dB · {ms}ms",
+  },
+  "music.tuning_freq": {
+    "zh-CN": "频率",
+    "zh-TW": "頻率",
+    "ja": "周波数",
+    "ko": "주파수",
+    "en": "Freq",
+  },
+  "music.tuning_gain": {
+    "zh-CN": "增益",
+    "zh-TW": "增益",
+    "ja": "ゲイン",
+    "ko": "게인",
+    "en": "Gain",
+  },
+  "music.tuning_q": {
+    "zh-CN": "质量",
+    "zh-TW": "質量",
+    "ja": "Q",
+    "ko": "Q",
+    "en": "Q",
+  },
+  "music.tuning_del": {
+    "zh-CN": "删除这一段",
+    "zh-TW": "刪除這一段",
+    "ja": "このセクションを削除",
+    "ko": "이 구간 삭제",
+    "en": "Remove this band",
+  },
+  "music.tuning_rate": {
+    "zh-CN": "按 {rate} kHz 计算",
+    "zh-TW": "按 {rate} kHz 計算",
+    "ja": "{rate} kHz で計算",
+    "ko": "{rate} kHz 기준",
+    "en": "Computed at {rate} kHz",
+  },
+  "music.tk_peaking": {
+    "zh-CN": "峰值",
+    "zh-TW": "峰值",
+    "ja": "ピーキング",
+    "ko": "피킹",
+    "en": "Peaking",
+  },
+  "music.tk_low_shelf": {
+    "zh-CN": "低架",
+    "zh-TW": "低架",
+    "ja": "ローシェルフ",
+    "ko": "로우 셸프",
+    "en": "Low shelf",
+  },
+  "music.tk_high_shelf": {
+    "zh-CN": "高架",
+    "zh-TW": "高架",
+    "ja": "ハイシェルフ",
+    "ko": "하이 셸프",
+    "en": "High shelf",
+  },
+  "music.tk_low_pass": {
+    "zh-CN": "低通",
+    "zh-TW": "低通",
+    "ja": "ローパス",
+    "ko": "로우패스",
+    "en": "Low pass",
+  },
+  "music.tk_high_pass": {
+    "zh-CN": "高通",
+    "zh-TW": "高通",
+    "ja": "ハイパス",
+    "ko": "하이패스",
+    "en": "High pass",
+  },
+  "music.tk_band_pass": {
+    "zh-CN": "带通",
+    "zh-TW": "帶通",
+    "ja": "バンドパス",
+    "ko": "밴드패스",
+    "en": "Band pass",
+  },
+  "music.tk_notch": {
+    "zh-CN": "陷波",
+    "zh-TW": "陷波",
+    "ja": "ノッチ",
+    "ko": "노치",
+    "en": "Notch",
+  },
+  "music.tk_all_pass": {
+    "zh-CN": "全通",
+    "zh-TW": "全通",
+    "ja": "オールパス",
+    "ko": "올패스",
+    "en": "All pass",
+  },
+  "music.tk_low_pass_1": {
+    "zh-CN": "低通（一阶）",
+    "zh-TW": "低通（一階）",
+    "ja": "ローパス（1次）",
+    "ko": "로우패스 (1차)",
+    "en": "Low pass (1st)",
+  },
+  "music.tk_high_pass_1": {
+    "zh-CN": "高通（一阶）",
+    "zh-TW": "高通（一階）",
+    "ja": "ハイパス（1次）",
+    "ko": "하이패스 (1차)",
+    "en": "High pass (1st)",
+  },
+  // 内置 5 档预设的显示名（`music.tuning_p_*`）已随 2026-10-03「内置预设整批删掉」一并删除。
+  "music.settings_back": {
+    "zh-CN": "返回",
+    "zh-TW": "返回",
+    "ja": "戻る",
+    "ko": "뒤로",
+    "en": "Back",
+  },
+  "music.account_btn": {
+    "zh-CN": "账号与连接",
+    "zh-TW": "帳號與連接",
+    "ja": "アカウントと接続",
+    "ko": "계정 및 연결",
+    "en": "Account & connection",
+  },
   "music.local_no_exe": {
     "zh-CN": "找不到 librespot —— 请在设置里填它的路径",
     "zh-TW": "找不到 librespot —— 請在設定裡填它的路徑",
     "ja": "librespot が見つかりません —— 設定でパスを指定してください",
     "ko": "librespot을 찾을 수 없습니다 —— 설정에서 경로를 입력하세요",
     "en": "librespot not found — set its path in Settings",
+  },
+  // 「播放在哪」自动就位（2026-09-30，见 music.rs 的 music_autoconfigure）。
+  // 「正在启用」= 那条慢路径（拉 librespot + 等它注册成设备，约 6 秒）；前三条规则是
+  // 一次接口往返，面板上用 600ms 定时器把这句话藏掉（见 music.ts 的 ensurePlayTarget）。
+  "music.auto_starting": {
+    "zh-CN": "正在启用本机播放…",
+    "zh-TW": "正在啟用本機播放…",
+    "ja": "この端末での再生を有効にしています…",
+    "ko": "이 기기에서 재생을 켜는 중…",
+    "en": "Enabling playback on this device…",
+  },
+  "music.auto_local_started": {
+    "zh-CN": "未检测到 Spotify 桌面端，已启用本机播放",
+    "zh-TW": "未偵測到 Spotify 桌面端，已啟用本機播放",
+    "ja": "Spotify デスクトップ版が見つからないため、この端末での再生を有効にしました",
+    "ko": "Spotify 데스크톱 앱이 없어 이 기기에서 재생을 켰습니다",
+    "en": "No Spotify desktop client found — enabled playback on this device",
+  },
+  // **自动拉起失败**（宿主回 `start_failed`：缺 exe / 起不来）—— 与下面那条「没有可用设备」
+  // 分开：那句会把用户引去开 Spotify 桌面端，而这里该做的动作是「去设备列表手动开一下」。
+  "music.auto_start_failed": {
+    "zh-CN": "本机播放没能自动启用 —— 请在右上角设备列表里手动打开",
+    "zh-TW": "本機播放沒能自動啟用 —— 請在右上角裝置清單裡手動開啟",
+    "ja": "この端末での再生を自動で有効にできませんでした —— 右上のデバイス一覧から手動で有効にしてください",
+    "ko": "이 기기에서 재생을 자동으로 켜지 못했습니다: 오른쪽 위 기기 목록에서 직접 켜세요",
+    "en": "Couldn't enable playback on this device automatically — turn it on manually from the device list (top right)",
+  },
+  "music.auto_none": {
+    "zh-CN": "没有可用设备：请打开 Spotify 桌面端 / 手机端，或在设备里启用本机播放",
+    "zh-TW": "沒有可用裝置：請開啟 Spotify 桌面端 / 手機端，或在裝置裡啟用本機播放",
+    "ja": "利用できるデバイスがありません：Spotify のデスクトップ版／スマホ版を開くか、デバイスで「この端末で再生」を有効にしてください",
+    "ko": "사용 가능한 기기가 없습니다: Spotify 데스크톱/모바일 앱을 열거나 기기에서 '이 기기에서 재생'을 켜세요",
+    "en": "No device available — open the Spotify desktop/mobile app, or enable \"Play on this device\"",
+  },
+  // 进程起来了、却在设备列表里一直没有它 —— 有凭据但没注册成功的兜底。别报成「已启用」。
+  "music.auto_local_unregistered": {
+    "zh-CN": "本机播放没出现在 Spotify 设备列表里：稍后再看一次，或改用设备列表里的其他设备",
+    "zh-TW": "本機播放沒出現在 Spotify 裝置清單裡：稍後再看一次，或改用裝置清單裡的其他裝置",
+    "ja": "この端末での再生が Spotify のデバイス一覧に出てきません：少し後にもう一度確認するか、別のデバイスを使ってください",
+    "ko": "이 기기에서의 재생이 Spotify 기기 목록에 나타나지 않습니다: 잠시 후 다시 확인하거나 다른 기기를 사용하세요",
+    "en": "Local playback never showed up in Spotify's device list — check again in a moment, or use another device",
+  },
+  // librespot 首次登录（一次性）。没有凭据时它不会成为一台已登录的 Connect 设备，
+  // 所以这一行是「本机播放」唯一的启用入口（见 ai-spec §4.6 已知缺口 1）。
+  "music.local_login": {
+    "zh-CN": "本机播放：首次登录",
+    "zh-TW": "本機播放：首次登入",
+    "ja": "この端末で再生：初回ログイン",
+    "ko": "이 기기에서 재생: 최초 로그인",
+    "en": "Play on this device: first-time sign-in",
+  },
+  "music.local_login_hint": {
+    "zh-CN": "浏览器会打开 Spotify 授权页（需先把 http://127.0.0.1:8898/login 加进该应用的 Redirect URIs）",
+    "zh-TW": "瀏覽器會開啟 Spotify 授權頁（需先把 http://127.0.0.1:8898/login 加進該應用的 Redirect URIs）",
+    "ja": "ブラウザで Spotify の認可ページが開きます（事前に http://127.0.0.1:8898/login をアプリの Redirect URIs に追加してください）",
+    "ko": "브라우저에서 Spotify 인증 페이지가 열립니다 (먼저 http://127.0.0.1:8898/login 을 앱의 Redirect URIs 에 추가하세요)",
+    "en": "Your browser will open Spotify's authorize page (first add http://127.0.0.1:8898/login to that app's Redirect URIs)",
+  },
+  "music.local_login_started": {
+    "zh-CN": "已发起登录：请在浏览器里完成 Spotify 授权",
+    "zh-TW": "已發起登入：請在瀏覽器裡完成 Spotify 授權",
+    "ja": "ログインを開始しました：ブラウザで Spotify の認可を完了してください",
+    "ko": "로그인을 시작했습니다: 브라우저에서 Spotify 인증을 완료하세요",
+    "en": "Sign-in started — finish the Spotify authorization in your browser",
+  },
+  "music.local_login_ok": {
+    "zh-CN": "登录完成，已切到本机播放",
+    "zh-TW": "登入完成，已切到本機播放",
+    "ja": "ログイン完了、この端末での再生に切り替えました",
+    "ko": "로그인 완료, 이 기기에서 재생으로 전환했습니다",
+    "en": "Signed in — switched to playback on this device",
+  },
+  "music.auto_need_login": {
+    "zh-CN": "本机播放还需先登录一次 —— 打开右上角设备列表，点「本机播放：首次登录」",
+    "zh-TW": "本機播放還需要先登入一次 —— 開啟右上角裝置清單，點「本機播放：首次登入」",
+    "ja": "この端末での再生には一度ログインが必要です —— 右上のデバイス一覧から「この端末で再生：初回ログイン」を選んでください",
+    "ko": "이 기기에서의 재생은 로그인이 한 번 필요합니다: 오른쪽 위 기기 목록에서 '이 기기에서 재생: 최초 로그인'을 선택하세요",
+    "en": "Local playback needs a one-time sign-in — open the device list (top right) and pick \"Play on this device: first-time sign-in\"",
   },
   "music.pick_hint": {
     "zh-CN": "从左侧选一项",
@@ -2186,6 +3730,306 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "この欄は空です",
     "ko": "이 항목은 비어 있습니다",
     "en": "Nothing here yet",
+  },
+  // ── 本地媒体库（2026-10-01）──────────────────────────────────────
+  // 这一组是**插件里「本地音乐」那一页**的文案（宿主是 `media_lib.rs` + `player.rs`）。
+  // 与上面那些 Spotify 文案分开写，是因为这一层的可用条件不同：**不要求登录**
+  // （本地库与账号无关），播放也走宿主自己那条本机音频流，不经过 Spotify。
+  "music.local_library": {
+    "zh-CN": "本地音乐",
+    "zh-TW": "本機音樂",
+    "ja": "ローカル音楽",
+    "ko": "로컬 음악",
+    "en": "Local music",
+  },
+  "music.local_all": {
+    "zh-CN": "全部曲目",
+    "zh-TW": "全部曲目",
+    "ja": "すべての曲",
+    "ko": "모든 곡",
+    "en": "All tracks",
+  },
+  "music.local_add": {
+    "zh-CN": "添加（目录或播放列表文件）",
+    "zh-TW": "新增（目錄或播放清單檔案）",
+    "ja": "追加（フォルダまたはプレイリストファイル）",
+    "ko": "추가 (폴더 또는 재생 목록 파일)",
+    "en": "Add (folder or playlist file)",
+  },
+  "music.local_rescan": {
+    "zh-CN": "扫描",
+    "zh-TW": "掃描",
+    "ja": "スキャン",
+    "ko": "스캔",
+    "en": "Scan",
+  },
+  // ── `＋` 的那个二选一浮层 + 编辑态三枚按钮（2026-10-01 用户口径）──
+  "music.local_add_head": {
+    "zh-CN": "添加到列表",
+    "zh-TW": "新增到清單",
+    "ja": "リストに追加",
+    "ko": "목록에 추가",
+    "en": "Add to the list",
+  },
+  "music.local_add_dir": {
+    "zh-CN": "添加音乐目录",
+    "zh-TW": "新增音樂目錄",
+    "ja": "音楽フォルダを追加",
+    "ko": "음악 폴더 추가",
+    "en": "Add a music folder",
+  },
+  "music.local_add_dir_hint": {
+    "zh-CN": "落库并扫描，之后可随时重扫",
+    "zh-TW": "入庫並掃描，之後可隨時重掃",
+    "ja": "登録してスキャンします（あとで再スキャン可能）",
+    "ko": "등록하고 스캔합니다 (나중에 다시 스캔 가능)",
+    "en": "Indexed and scanned — rescannable anytime",
+  },
+  "music.local_add_list_hint": {
+    "zh-CN": "临时打开一份 .m3u / .m3u8 / .pls，不入库",
+    "zh-TW": "臨時開啟一份 .m3u / .m3u8 / .pls，不入庫",
+    "ja": ".m3u / .m3u8 / .pls を一時的に開きます（登録なし）",
+    "ko": ".m3u / .m3u8 / .pls 를 임시로 엽니다 (등록 안 함)",
+    "en": "Open a .m3u / .m3u8 / .pls temporarily — nothing is indexed",
+  },
+  "music.local_edit": {
+    "zh-CN": "修改列表",
+    "zh-TW": "修改清單",
+    "ja": "リストを編集",
+    "ko": "목록 편집",
+    "en": "Edit the list",
+  },
+  "music.local_del_sel": {
+    "zh-CN": "把勾选的目录移出列表",
+    "zh-TW": "把勾選的目錄移出清單",
+    "ja": "チェックしたフォルダをリストから外す",
+    "ko": "체크한 폴더를 목록에서 제거",
+    "en": "Remove the checked folders from the list",
+  },
+  "music.local_edit_done": {
+    "zh-CN": "退出并保存",
+    "zh-TW": "退出並儲存",
+    "ja": "終了して保存",
+    "ko": "종료하고 저장",
+    "en": "Exit and save",
+  },
+  // ── 本地与 Spotify「同时出声」那把开关（2026-10-01 用户第 7 条）──
+  "music.dual_play": {
+    "zh-CN": "同时出声（本地与 Spotify 可以一起放）",
+    "zh-TW": "同時出聲（本機與 Spotify 可以一起播）",
+    "ja": "同時再生（ローカルと Spotify を一緒に鳴らす）",
+    "ko": "동시 재생 (로컬과 Spotify를 함께 재생)",
+    "en": "Play together (local and Spotify at the same time)",
+  },
+  "music.dual_on": {
+    "zh-CN": "已打开同时出声 —— 两侧可以一起放，互不停",
+    "zh-TW": "已開啟同時出聲 —— 兩側可以一起播，互不停",
+    "ja": "同時再生をオン —— 両方を一緒に鳴らせます",
+    "ko": "동시 재생 켜짐 — 양쪽을 함께 재생할 수 있습니다",
+    "en": "Play-together is on — both can play at once",
+  },
+  "music.dual_off": {
+    "zh-CN": "已关闭同时出声 —— 起一路会把另一路停下",
+    "zh-TW": "已關閉同時出聲 —— 起一路會把另一路停下",
+    "ja": "同時再生をオフ —— 片方を鳴らすともう片方が止まります",
+    "ko": "동시 재생 꺼짐 — 한쪽을 재생하면 다른 쪽이 멈춥니다",
+    "en": "Play-together is off — starting one stops the other",
+  },
+  "music.local_n_tracks": {
+    "zh-CN": "{n} 首",
+    "zh-TW": "{n} 首",
+    "ja": "{n} 曲",
+    "ko": "{n}곡",
+    "en": "{n} tracks",
+  },
+  "music.local_never_scanned": {
+    "zh-CN": "尚未扫描",
+    "zh-TW": "尚未掃描",
+    "ja": "未スキャン",
+    "ko": "아직 스캔 안 함",
+    "en": "Not scanned yet",
+  },
+  "music.local_missing": {
+    "zh-CN": "目录已不存在（被删或盘没插）",
+    "zh-TW": "目錄已不存在（被刪或磁碟未連接）",
+    "ja": "フォルダが見つかりません（削除されたか、ドライブが接続されていません）",
+    "ko": "폴더가 없습니다 (삭제되었거나 드라이브가 연결되지 않음)",
+    "en": "Folder is gone (deleted, or the drive is unplugged)",
+  },
+  "music.local_no_roots": {
+    "zh-CN": "还没有添加目录",
+    "zh-TW": "還沒有新增目錄",
+    "ja": "フォルダがまだありません",
+    "ko": "아직 추가한 폴더가 없습니다",
+    "en": "No folders yet",
+  },
+  "music.local_add_hint": {
+    "zh-CN": "点左上角那枚「+」可以选一个音乐目录（会扫描并建索引），或临时打开一份播放列表文件",
+    "zh-TW": "點左上角那枚「+」可以選一個音樂目錄（會掃描並建索引），或臨時開啟一份播放清單檔案",
+    "ja": "左上の「+」から音楽フォルダ（スキャンして索引を作成）か、プレイリストファイルを開けます",
+    "ko": "왼쪽 위 '+' 로 음악 폴더(스캔 후 색인 생성)를 고르거나, 재생 목록 파일을 열 수 있습니다",
+    "en": "Use the + button (top left) to pick a music folder (scanned and indexed) or open a playlist file",
+  },
+  "music.local_empty": {
+    "zh-CN": "这个范围里没有已入库的曲目",
+    "zh-TW": "這個範圍裡沒有已入庫的曲目",
+    "ja": "この範囲に取り込み済みの曲はありません",
+    "ko": "이 범위에 등록된 곡이 없습니다",
+    "en": "No indexed tracks in this range",
+  },
+  "music.local_filter_ph": {
+    "zh-CN": "筛选标题 / 歌手 / 专辑…",
+    "zh-TW": "篩選標題 / 歌手 / 專輯…",
+    "ja": "タイトル / アーティスト / アルバムで絞り込み…",
+    "ko": "제목 / 아티스트 / 앨범으로 필터…",
+    "en": "Filter by title, artist, album…",
+  },
+  // ── 播放列表文件（.m3u / .m3u8 / .pls，2026-10-01 第二批）──
+  "music.local_open_playlist": {
+    "zh-CN": "打开播放列表文件（.m3u / .m3u8 / .pls）",
+    "zh-TW": "開啟播放清單檔案（.m3u / .m3u8 / .pls）",
+    "ja": "プレイリストファイルを開く（.m3u / .m3u8 / .pls）",
+    "ko": "재생 목록 파일 열기 (.m3u / .m3u8 / .pls)",
+    "en": "Open a playlist file (.m3u / .m3u8 / .pls)",
+  },
+  "music.local_close_playlist": {
+    "zh-CN": "关闭这份播放列表，回到媒体库",
+    "zh-TW": "關閉這份播放清單，回到媒體庫",
+    "ja": "このプレイリストを閉じてライブラリに戻る",
+    "ko": "이 재생 목록을 닫고 라이브러리로 돌아가기",
+    "en": "Close this playlist and go back to the library",
+  },
+  "music.local_not_playlist": {
+    "zh-CN": "这个文件不是播放列表 —— 只认 .m3u / .m3u8 / .pls",
+    "zh-TW": "這個檔案不是播放清單 —— 只認 .m3u / .m3u8 / .pls",
+    "ja": "このファイルはプレイリストではありません —— .m3u / .m3u8 / .pls のみ対応",
+    "ko": "이 파일은 재생 목록이 아닙니다 — .m3u / .m3u8 / .pls 만 지원합니다",
+    "en": "That isn't a playlist file — only .m3u / .m3u8 / .pls are supported",
+  },
+  "music.local_list_empty": {
+    "zh-CN": "这份播放列表里的文件一个也没找到 —— 可能被移动或删除了",
+    "zh-TW": "這份播放清單裡的檔案一個也沒找到 —— 可能被移動或刪除了",
+    "ja": "このプレイリストのファイルが一つも見つかりません —— 移動か削除された可能性があります",
+    "ko": "이 재생 목록의 파일을 하나도 찾을 수 없습니다 — 이동되었거나 삭제되었을 수 있습니다",
+    "en": "None of the files in this playlist were found — they may have been moved or deleted",
+  },
+
+  // ── 本地**播放**（2026-10-01）──
+  // 这几条都是「宿主拒了，用户该做什么」的话。原样贴宿主的报错会带一串完整路径
+  // 与英文解码器名（见 music.ts 的 `localErrText`）。
+  "music.local_stop": {
+    "zh-CN": "停止播放",
+    "zh-TW": "停止播放",
+    "ja": "再生を停止",
+    "ko": "재생 중지",
+    "en": "Stop",
+  },
+  "music.local_queue_end": {
+    "zh-CN": "已经是这一批的最后一首了",
+    "zh-TW": "已經是這一批的最後一首了",
+    "ja": "このリストの最後の曲です",
+    "ko": "이 목록의 마지막 곡입니다",
+    "en": "That's the last track in this list",
+  },
+  // 底部播放条**常驻**（2026-10-03）之后才有的空态：没播过任何本地歌曲时条上那行字。
+  // ⚠️ 与上面那条 `music.local_empty`（「这个范围里没有已入库的曲目」）**不是一件事**：
+  // 那条说的是**曲目列表**空，这条说的是**播放条**里还没有过任何一首。
+  "music.local_bar_empty": {
+    "zh-CN": "还没有播放任何本地歌曲",
+    "zh-TW": "還沒有播放任何本機歌曲",
+    "ja": "まだローカル曲を再生していません",
+    "ko": "아직 재생한 로컬 곡이 없습니다",
+    "en": "No local track played yet",
+  },
+  // 左端那枚「换到另一侧」的抽屉上的字（它指的是**另一侧**）。
+  "music.drawer_local": {
+    "zh-CN": "本地",
+    "zh-TW": "本機",
+    "ja": "ローカル",
+    "ko": "로컬",
+    "en": "Local",
+  },
+  "music.drawer_online": {
+    "zh-CN": "在线",
+    "zh-TW": "線上",
+    "ja": "オンライン",
+    "ko": "온라인",
+    "en": "Online",
+  },
+  "music.local_no_device": {
+    "zh-CN": "找不到可用的音频输出设备 —— 检查一下系统声音输出",
+    "zh-TW": "找不到可用的音訊輸出裝置 —— 檢查一下系統音效輸出",
+    "ja": "利用できるオーディオ出力デバイスがありません —— システムの音声出力を確認してください",
+    "ko": "사용 가능한 오디오 출력 장치가 없습니다 — 시스템 사운드 출력을 확인하세요",
+    "en": "No audio output device — check your system sound output",
+  },
+  "music.local_file_missing": {
+    "zh-CN": "这个文件不在了 —— 可能被移动或删除，重新扫描一次",
+    "zh-TW": "這個檔案不在了 —— 可能被移動或刪除，重新掃描一次",
+    "ja": "このファイルが見つかりません —— 移動か削除された可能性があります。再スキャンしてください",
+    "ko": "이 파일이 없습니다 — 이동되었거나 삭제되었을 수 있습니다. 다시 스캔하세요",
+    "en": "That file is gone — it may have been moved or deleted; rescan the library",
+  },
+  "music.local_decode_failed": {
+    "zh-CN": "这个文件解不开 —— 可能是格式不受支持或文件损坏",
+    "zh-TW": "這個檔案解不開 —— 可能是格式不受支援或檔案損毀",
+    "ja": "このファイルをデコードできません —— 未対応の形式か破損の可能性があります",
+    "ko": "이 파일을 디코딩할 수 없습니다 — 지원하지 않는 형식이거나 손상되었을 수 있습니다",
+    "en": "Couldn't decode that file — unsupported format or a damaged file",
+  },
+  // 视频画面解不开（2026-10-01 用户第 8 条）。**只报画面这一半** —— 声音走的是宿主
+  // rodio（另一条链路），画面出不来时它多半还在放；所以措辞里不出现「听不到」，
+  // 免得用户以为两条都坏了。落点见 music.ts 的 renderLocalVideo。
+  "music.video_unsupported": {
+    "zh-CN": "这段视频放不出画面 —— 容器或编码不受支持，可转成 mp4 再试",
+    "zh-TW": "這段影片放不出畫面 —— 容器或編碼不受支援，可轉成 mp4 再試",
+    "ja": "この動画は映像を表示できません —— コンテナまたはコーデックが未対応です。mp4 への変換をお試しください",
+    "ko": "이 동영상은 화면을 표시할 수 없습니다 — 컨테이너 또는 코덱이 지원되지 않습니다. mp4로 변환해 보세요",
+    "en": "This video can't be displayed — its container or codec isn't supported; try converting to mp4",
+  },
+  // 扫描中：**两条文案**。`total` 为 0 表示「候选还在数」——那时分母是假的，
+  // 不能写「0 / 0」（`media_lib.rs` 是先数一遍再解析，所以中途 total 会从 0 跳上来）。
+  "music.local_scanning": {
+    "zh-CN": "正在扫描：{a} / {b}",
+    "zh-TW": "正在掃描：{a} / {b}",
+    "ja": "スキャン中：{a} / {b}",
+    "ko": "스캔 중: {a} / {b}",
+    "en": "Scanning: {a} / {b}",
+  },
+  "music.local_scanning_n": {
+    "zh-CN": "正在扫描：已解析 {a} 个文件",
+    "zh-TW": "正在掃描：已解析 {a} 個檔案",
+    "ja": "スキャン中：{a} 件を解析済み",
+    "ko": "스캔 중: {a}개 분석됨",
+    "en": "Scanning: {a} files parsed",
+  },
+  "music.local_scan_done": {
+    "zh-CN": "扫描完成 —— 新增 {added}、更新 {updated}、移除 {removed}、跳过 {failed}",
+    "zh-TW": "掃描完成 —— 新增 {added}、更新 {updated}、移除 {removed}、跳過 {failed}",
+    "ja": "スキャン完了 —— 追加 {added} / 更新 {updated} / 削除 {removed} / スキップ {failed}",
+    "ko": "스캔 완료 — 추가 {added}, 갱신 {updated}, 제거 {removed}, 건너뜀 {failed}",
+    "en": "Scan finished — added {added}, updated {updated}, removed {removed}, skipped {failed}",
+  },
+  "music.local_more": {
+    "zh-CN": "只列出前 {a} 首（共 {b} 首）—— 用上面的筛选框缩小范围",
+    "zh-TW": "只列出前 {a} 首（共 {b} 首）—— 用上面的篩選框縮小範圍",
+    "ja": "最初の {a} 曲のみ表示（全 {b} 曲）—— 上の絞り込みで範囲を狭めてください",
+    "ko": "처음 {a}곡만 표시 (전체 {b}곡) — 위 필터로 범위를 좁히세요",
+    "en": "Showing the first {a} of {b} — narrow it down with the filter above",
+  },
+  "music.local_scan_busy": {
+    "zh-CN": "已经在扫描了 —— 等这一轮结束",
+    "zh-TW": "已經在掃描了 —— 等這一輪結束",
+    "ja": "すでにスキャン中です —— 終わるまでお待ちください",
+    "ko": "이미 스캔 중입니다 — 끝날 때까지 기다리세요",
+    "en": "A scan is already running — wait for it to finish",
+  },
+  "music.local_remove_busy": {
+    "zh-CN": "正在扫描，暂时不能移除目录 —— 等这一轮结束再试",
+    "zh-TW": "正在掃描，暫時不能移除目錄 —— 等這一輪結束再試",
+    "ja": "スキャン中はフォルダを削除できません —— 終わってから再度お試しください",
+    "ko": "스캔 중에는 폴더를 제거할 수 없습니다 — 끝난 뒤 다시 시도하세요",
+    "en": "Can't remove a folder while scanning — try again once it finishes",
   },
   "music.err_no_client_id": {
     "zh-CN": "请先填写 Client ID",
@@ -2266,6 +4110,78 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "歌詞サービスの制限中です。{s} 秒後にお試しください",
     "ko": "가사 서비스가 제한 중입니다. {s}초 후 다시 시도하세요",
     "en": "Lyrics service is rate limiting — retry in {s}s",
+  },
+  // Spotify **接口**限流（2026-10-02 加；2026-10-03 改成「按 `Retry-After` 停够 + 手动恢复」）。
+  // 宿主一旦收到 429 就**停掉所有** Spotify Web API 请求，默认**停到 `Retry-After` 到期**
+  // —— 实测这一族端点（`/me/player*`）会给 12 小时量级的 `Retry-After`，而且**换 token
+  // 也不重置**（按 app 计的端点级处罚）。但**保留**用户手动恢复的出口（提前试由他自己决定），
+  // 所以按钮上带一个倒计时；唯一入口是工具条上那枚按钮（`spotify_resume`）。
+  "music.err_spotify_stopped": {
+    "zh-CN": "Spotify 请求已暂停（触发了限流），点「恢复」重试",
+    "zh-TW": "Spotify 請求已暫停（觸發了限流），點「恢復」重試",
+    "ja": "Spotify へのリクエストを停止しました（レート制限）。「復元」を押して再試行してください",
+    "ko": "Spotify 요청이 일시 중지되었습니다(속도 제한). '복원'을 눌러 다시 시도하세요",
+    "en": "Spotify requests are paused (rate limited) — click Resume to retry",
+  },
+  "music.resume": {
+    "zh-CN": "恢复",
+    "zh-TW": "恢復",
+    "ja": "復元",
+    "ko": "복원",
+    "en": "Resume",
+  },
+  // 按钮上的倒计时（`wait` 由 `fmtWait` 拼好，见 `music.wait_*`）。**它只是提示**：
+  // 早于 `Retry-After` 手动恢复是允许的，只是很可能又撞一次 429。
+  "music.resume_in": {
+    "zh-CN": "恢复（约 {wait} 后）",
+    "zh-TW": "恢復（約 {wait} 後）",
+    "ja": "復元（約 {wait} 後）",
+    "ko": "복원 (약 {wait} 후)",
+    "en": "Resume (in ~{wait})",
+  },
+  "music.resume_hint": {
+    "zh-CN": "{reason} —— Spotify 建议约 {wait} 后再试；现在试也可以，但很可能又撞 429",
+    "zh-TW": "{reason} —— Spotify 建議約 {wait} 後再試；現在試也可以，但很可能又撞 429",
+    "ja": "{reason} —— Spotify の推奨は約 {wait} 後です。今試すこともできますが、再び 429 になる可能性が高いです",
+    "ko": "{reason} —— Spotify는 약 {wait} 후를 권장합니다. 지금 시도할 수 있지만 다시 429가 될 가능성이 높습니다",
+    "en": "{reason} — Spotify suggests waiting ~{wait}; you can try now, but a 429 is likely again",
+  },
+  "music.resumed": {
+    "zh-CN": "已恢复 Spotify 连接",
+    "zh-TW": "已恢復 Spotify 連線",
+    "ja": "Spotify 接続を再開しました",
+    "ko": "Spotify 연결을 다시 시작했습니다",
+    "en": "Spotify connection resumed",
+  },
+  // `Retry-After` 倒计时的时长单位（`fmtWait` 按语言取）。**单位必须跟语言走**，
+  // 所以不写死在代码里；数值只由 `fmtWait` 取整后传进来。
+  "music.wait_h": {
+    "zh-CN": "{h} 小时",
+    "zh-TW": "{h} 小時",
+    "ja": "{h} 時間",
+    "ko": "{h}시간",
+    "en": "{h}h",
+  },
+  "music.wait_hm": {
+    "zh-CN": "{h} 小时 {m} 分",
+    "zh-TW": "{h} 小時 {m} 分",
+    "ja": "{h} 時間 {m} 分",
+    "ko": "{h}시간 {m}분",
+    "en": "{h}h {m}m",
+  },
+  "music.wait_m": {
+    "zh-CN": "{m} 分",
+    "zh-TW": "{m} 分",
+    "ja": "{m} 分",
+    "ko": "{m}분",
+    "en": "{m}m",
+  },
+  "music.wait_s": {
+    "zh-CN": "{s} 秒",
+    "zh-TW": "{s} 秒",
+    "ja": "{s} 秒",
+    "ko": "{s}초",
+    "en": "{s}s",
   },
   "music.auth_ok": {
     "zh-CN": "已连接 Spotify",
@@ -2478,19 +4394,105 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "복구",
     "en": "Fix",
   },
+  // ── 软件更新（检查 / 下载 / 静默安装，2026-09-30）────────────────
+  // {version} 由前端替换（不带 `v`，`v` 写在文案里）；{percent} / {mb} 同 ocr.engine_* 的口径。
+  "settings.update": {
+    "zh-CN": "更新",
+    "zh-TW": "更新",
+    "ja": "アップデート",
+    "ko": "업데이트",
+    "en": "Updates",
+  },
+  "settings.update_check": {
+    "zh-CN": "检查更新",
+    "zh-TW": "檢查更新",
+    "ja": "更新を確認",
+    "ko": "업데이트 확인",
+    "en": "Check for updates",
+  },
+  "settings.update_checking": {
+    "zh-CN": "检查中…",
+    "zh-TW": "檢查中…",
+    "ja": "確認中…",
+    "ko": "확인 중…",
+    "en": "Checking…",
+  },
+  "settings.update_current": {
+    "zh-CN": "当前版本 v{version}",
+    "zh-TW": "目前版本 v{version}",
+    "ja": "現在のバージョン v{version}",
+    "ko": "현재 버전 v{version}",
+    "en": "Current v{version}",
+  },
+  "settings.update_available": {
+    "zh-CN": "有新版本 v{version}",
+    "zh-TW": "有新版本 v{version}",
+    "ja": "新しいバージョン v{version} があります",
+    "ko": "새 버전 v{version} 있습니다",
+    "en": "v{version} is available",
+  },
+  "settings.update_latest": {
+    "zh-CN": "已是最新版本",
+    "zh-TW": "已是最新版本",
+    "ja": "最新版です",
+    "ko": "최신 버전입니다",
+    "en": "Up to date",
+  },
+  "settings.update_install": {
+    "zh-CN": "下载并安装",
+    "zh-TW": "下載並安裝",
+    "ja": "ダウンロードしてインストール",
+    "ko": "다운로드 및 설치",
+    "en": "Download & install",
+  },
+  "settings.update_downloading": {
+    "zh-CN": "下载中 {percent}%",
+    "zh-TW": "下載中 {percent}%",
+    "ja": "ダウンロード中 {percent}%",
+    "ko": "다운로드 중 {percent}%",
+    "en": "Downloading {percent}%",
+  },
+  "settings.update_downloading_unknown": {
+    "zh-CN": "下载中 {mb} MB",
+    "zh-TW": "下載中 {mb} MB",
+    "ja": "ダウンロード中 {mb} MB",
+    "ko": "다운로드 중 {mb} MB",
+    "en": "Downloading {mb} MB",
+  },
+  "settings.update_verifying": {
+    "zh-CN": "正在校验安装包…",
+    "zh-TW": "正在校驗安裝檔…",
+    "ja": "インストーラーを検証中…",
+    "ko": "설치 파일 검증 중…",
+    "en": "Verifying installer…",
+  },
+  "settings.update_installing": {
+    "zh-CN": "正在安装，应用即将重启…",
+    "zh-TW": "正在安裝，應用即將重新啟動…",
+    "ja": "インストール中。まもなく再起動します…",
+    "ko": "설치 중입니다. 곧 다시 시작됩니다…",
+    "en": "Installing — the app will restart…",
+  },
+  "settings.update_auto": {
+    "zh-CN": "自动更新",
+    "zh-TW": "自動更新",
+    "ja": "自動更新",
+    "ko": "자동 업데이트",
+    "en": "Automatic updates",
+  },
+  "settings.update_auto_hint": {
+    "zh-CN": "开启后启动时自动检查，发现新版本会自动下载安装并重启应用。",
+    "zh-TW": "開啟後啟動時自動檢查，發現新版本會自動下載安裝並重新啟動應用程式。",
+    "ja": "オンにすると起動時に確認し、新しいバージョンがあれば自動でダウンロード・インストールして再起動します。",
+    "ko": "켜면 시작할 때 확인하고 새 버전이 있으면 자동으로 다운로드·설치 후 앱을 다시 시작합니다.",
+    "en": "When on, checks on startup and automatically downloads, installs, and restarts when a new version is found.",
+  },
   "settings.general": {
     "zh-CN": "常规",
     "zh-TW": "一般",
     "ja": "一般",
     "ko": "일반",
     "en": "General",
-  },
-  "settings.ocr_engine": {
-    "zh-CN": "OCR 引擎",
-    "zh-TW": "OCR 引擎",
-    "ja": "OCR エンジン",
-    "ko": "OCR 엔진",
-    "en": "OCR engine",
   },
   "settings.hotkey_record": {
     "zh-CN": "点击录制新热键",
@@ -3045,11 +5047,11 @@ const DICT: Record<string, Record<LangTag, string>> = {
   },
   // 安全档位（文件边界）与 AI 面板折叠 —— 与运行方式的关系见 docs/agent-ui-spec.md §4.4
   "settings.security_profile": {
-    "zh-CN": "安全档位",
-    "zh-TW": "安全檔位",
-    "ja": "セキュリティ段階",
-    "ko": "보안 단계",
-    "en": "Security level",
+    "zh-CN": "权限",
+    "zh-TW": "權限",
+    "ja": "権限",
+    "ko": "권한",
+    "en": "Permissions",
   },
   "settings.security_profile_ro": {
     "zh-CN": "只读",
@@ -3059,26 +5061,29 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Read-only",
   },
   "settings.security_profile_project": {
-    "zh-CN": "项目",
-    "zh-TW": "專案",
-    "ja": "プロジェクト",
-    "ko": "프로젝트",
-    "en": "Project",
+    "zh-CN": "工作区",
+    "zh-TW": "工作區",
+    "ja": "ワークスペース",
+    "ko": "작업 공간",
+    "en": "Workspace",
   },
   "settings.security_profile_full": {
-    "zh-CN": "完全",
-    "zh-TW": "完全",
-    "ja": "完全",
-    "ko": "완전",
-    "en": "Full",
+    "zh-CN": "系统",
+    "zh-TW": "系統",
+    "ja": "システム",
+    "ko": "시스템",
+    "en": "System",
   },
   // 描述精简（2026-09-21，用户要求「所有描述都得精简」）：一句说完，不再逐档解释。
+  // 2026-10-06 改名「安全档位 → 权限」，并把这句改**准**：原先写「决定写操作是否被自动放行」
+  // 是错的 —— 决定「问不问」的是运行方式（命令审批方式）；这里决定的是**能不能写**、
+  // 以及**是否受工作区限制**（「完全」档会把工作区锁一起关掉）。
   "settings.security_profile_hint": {
-    "zh-CN": "档位决定写操作是否被自动放行；切换会重启 Agent。",
-    "zh-TW": "檔位決定寫入是否自動放行；切換會重啟 Agent。",
-    "ja": "段階は書き込みを自動許可するかを決めます。切り替えると Agent を再起動します。",
-    "ko": "단계는 쓰기 자동 허용 여부를 정합니다. 전환하면 Agent가 재시작됩니다.",
-    "en": "The level decides whether writes are auto-approved. Switching restarts the agent.",
+    "zh-CN": "决定能否写文件、是否受工作区限制；切换会重启 Agent。",
+    "zh-TW": "決定能否寫入檔案、是否受工作區限制；切換會重啟 Agent。",
+    "ja": "ファイル書き込みの可否とワークスペース制限の適用を決めます。切り替えると Agent を再起動します。",
+    "ko": "파일 쓰기 가능 여부와 작업 공간 제한 적용을 정합니다. 전환하면 Agent가 재시작됩니다.",
+    "en": "Decides whether writes are allowed and whether the workspace limit applies. Switching restarts the agent.",
   },
   "settings.ai_vision": {
     "zh-CN": "模型支持图片输入",
@@ -3086,6 +5091,35 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "モデルが画像入力に対応",
     "ko": "모델이 이미지 입력 지원",
     "en": "Model accepts image input",
+  },
+  // 出图（A13，2026-10-03）：留空 = 不启用，agent 不注册 ImageGen 工具。
+  "settings.ai_image_model": {
+    "zh-CN": "出图模型",
+    "zh-TW": "出圖模型",
+    "ja": "画像生成モデル",
+    "ko": "이미지 생성 모델",
+    "en": "Image model",
+  },
+  "settings.ai_image_url": {
+    "zh-CN": "出图端点",
+    "zh-TW": "出圖端點",
+    "ja": "画像生成エンドポイント",
+    "ko": "이미지 생성 엔드포인트",
+    "en": "Image endpoint",
+  },
+  "settings.ai_image_model_hint": {
+    "zh-CN": "例：qwen-image-3.0-pro。留空 = 不启用出图（agent 不会装上 ImageGen 工具）。保存后需重启 AI 生效。",
+    "zh-TW": "例：qwen-image-3.0-pro。留空 = 不啟用出圖（agent 不會裝上 ImageGen 工具）。儲存後需重啟 AI 生效。",
+    "ja": "例: qwen-image-3.0-pro。空欄 = 画像生成を無効化（agent に ImageGen ツールを載せません）。保存後は AI の再起動が必要です。",
+    "ko": "예: qwen-image-3.0-pro. 비우면 이미지 생성을 끕니다 (agent에 ImageGen 도구가 등록되지 않습니다). 저장 후 AI를 재시작해야 적용됩니다.",
+    "en": "e.g. qwen-image-3.0-pro. Empty = image generation off (the agent will not get the ImageGen tool). Takes effect after the AI restarts.",
+  },
+  "settings.ai_image_url_hint": {
+    "zh-CN": "留空 = 用 DashScope 多点编辑端点（与 Qwen-Image 匹配）。密钥复用上面的 API Key。",
+    "zh-TW": "留空 = 用 DashScope 多點編輯端點（與 Qwen-Image 相符）。金鑰沿用上面的 API Key。",
+    "ja": "空欄 = DashScope のマルチモーダル編集エンドポイントを使用（Qwen-Image 用）。鍵は上の API Key を流用します。",
+    "ko": "비우면 DashScope 멀티모달 편집 엔드포인트를 사용합니다 (Qwen-Image용). 키는 위의 API Key를 재사용합니다.",
+    "en": "Empty = DashScope multimodal-edit endpoint (what Qwen-Image uses). The key is reused from the API Key above.",
   },
   // 权限 hooks 的 UI（开关 / 描述 / 打开文件 / 报错文案）已于 2026-09-21 全部移除 ——
   // 它是**开发者选项**，常驻开启，只由 config\hooks.json 的 enabled 字段决定（缺省 true）。
@@ -3166,19 +5200,19 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "작업 실패: {err}",
     "en": "Failed: {err}",
   },
-  "settings.cost_col_date": {
-    "zh-CN": "日期",
-    "zh-TW": "日期",
-    "ja": "日付",
-    "ko": "날짜",
-    "en": "Date",
+  "settings.cost_col_time": {
+    "zh-CN": "时间",
+    "zh-TW": "時間",
+    "ja": "時刻",
+    "ko": "시간",
+    "en": "Time",
   },
-  "settings.cost_col_turns": {
-    "zh-CN": "提问",
-    "zh-TW": "提問",
-    "ja": "質問",
-    "ko": "질문",
-    "en": "Prompts",
+  "settings.cost_col_requests": {
+    "zh-CN": "请求次数",
+    "zh-TW": "請求次數",
+    "ja": "リクエスト数",
+    "ko": "요청 수",
+    "en": "Requests",
   },
   "settings.cost_col_input": {
     "zh-CN": "输入",
@@ -3194,12 +5228,37 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "캐시 적중",
     "en": "Cache hit",
   },
+  // 面板表格的两个输入列（2026-10-06）：命中 / 未命中分开列，各自乘自己的单价
+  "settings.cost_col_hit_input": {
+    "zh-CN": "输入（命中缓存）",
+    "zh-TW": "輸入（命中快取）",
+    "ja": "入力（キャッシュ命中）",
+    "ko": "입력(캐시 적중)",
+    "en": "Input (cache hit)",
+  },
+  "settings.cost_col_miss_input": {
+    "zh-CN": "输入（未命中缓存）",
+    "zh-TW": "輸入（未命中快取）",
+    "ja": "入力（キャッシュ未命中）",
+    "ko": "입력(캐시 미적중)",
+    "en": "Input (cache miss)",
+  },
   "settings.cost_col_write": {
     "zh-CN": "缓存写入",
     "zh-TW": "快取寫入",
     "ja": "キャッシュ書込",
     "ko": "캐시 쓰기",
     "en": "Cache write",
+  },
+  // 「缓存写入」恒为 0 的解释（2026-10-02）。**只挂在表头 title 上，不做成面板里的文字**——
+  // 用户 2026-09-29 明确要求那个展开面板「只有数据，没有说明文字」（见 usage-cost.ts 头注释）。
+  // 悬停能看到的这句只回答「为什么这列一直是 0」。
+  "settings.cost_col_write_hint": {
+    "zh-CN": "当前端点（DeepSeek 自动前缀缓存）不返回这个值，所以恒为 0；Anthropic 原生端点才有",
+    "zh-TW": "目前端點（DeepSeek 自動前綴快取）不傳回這個值，所以恆為 0；Anthropic 原生端點才有",
+    "ja": "現在のエンドポイント（DeepSeek の自動プレフィックスキャッシュ）はこの値を返さないため常に 0 です（Anthropic ネイティブのみ）",
+    "ko": "현재 엔드포인트(DeepSeek 자동 프리픽스 캐시)는 이 값을 반환하지 않아 항상 0입니다 (Anthropic 네이티브만)",
+    "en": "The current endpoint (DeepSeek automatic prefix cache) never reports this, so it stays 0; only native Anthropic endpoints do",
   },
   "settings.cost_col_output": {
     "zh-CN": "输出",
@@ -3229,12 +5288,63 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "합계",
     "en": "Total",
   },
+  // 面板右上角的时间范围下拉框（2026-10-06）
+  "settings.cost_range_today": {
+    "zh-CN": "今天",
+    "zh-TW": "今天",
+    "ja": "今日",
+    "ko": "오늘",
+    "en": "Today",
+  },
+  "settings.cost_range_7d": {
+    "zh-CN": "近 7 天",
+    "zh-TW": "近 7 天",
+    "ja": "直近 7 日",
+    "ko": "최근 7일",
+    "en": "Last 7 days",
+  },
+  "settings.cost_range_30d": {
+    "zh-CN": "近 30 天",
+    "zh-TW": "近 30 天",
+    "ja": "直近 30 日",
+    "ko": "최근 30일",
+    "en": "Last 30 days",
+  },
+  "settings.cost_range_dates": {
+    "zh-CN": "具体日期",
+    "zh-TW": "具體日期",
+    "ja": "特定の日付",
+    "ko": "특정 날짜",
+    "en": "Specific date",
+  },
+  "settings.cost_range_empty": {
+    "zh-CN": "所选范围内没有用量",
+    "zh-TW": "所選範圍內沒有用量",
+    "ja": "選択した範囲に使用量がありません",
+    "ko": "선택한 범위에 사용량이 없습니다",
+    "en": "No usage in the selected range",
+  },
   "settings.cost_k_price": {
-    "zh-CN": "价格",
-    "zh-TW": "價格",
-    "ja": "価格",
-    "ko": "가격",
-    "en": "Prices",
+    "zh-CN": "最后更新价格日期",
+    "zh-TW": "最後更新價格日期",
+    "ja": "価格の最終更新日",
+    "ko": "가격 최종 업데이트 날짜",
+    "en": "Price last updated",
+  },
+  // 面板左上角「当前统计的模型」（2026-10-06）：多模型混用时它是一个下拉框
+  "settings.cost_k_model": {
+    "zh-CN": "当前统计的模型",
+    "zh-TW": "目前統計的模型",
+    "ja": "集計中のモデル",
+    "ko": "현재 집계 모델",
+    "en": "Model in view",
+  },
+  "settings.cost_model_all": {
+    "zh-CN": "总计",
+    "zh-TW": "總計",
+    "ja": "合計",
+    "ko": "전체",
+    "en": "All models",
   },
   "settings.cost_k_unpriced": {
     "zh-CN": "未定价",
@@ -3288,33 +5398,21 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Please refresh my local model price table. Prices are in CNY per million tokens, billed separately for input (cache miss) / cache_read (cache hit) / cache_write (cache write) / output.\n\nFirst use WebSearch / WebFetch to check the latest official pricing for these models:\n{models}\n\nThen use Write to save the result into this file:\n{path}\n\nFormat (you may Read the existing config\\pricing.json as a template first):\n```json\n{\n  \"models\": {\n    \"<model>\": { \"input\": 0, \"cache_read\": 0, \"cache_write\": 0, \"output\": 0, \"source_url\": \"<official pricing page URL>\", \"updated_at\": \"YYYY-MM-DD\" }\n  }\n}\n```\n\nRules: (1) do **not** edit config\\pricing.json — I confirm it in the settings panel; (2) for models carried over unchanged keep their original source_url / updated_at; (3) if a price cannot be found, say so plainly and never invent numbers.\n\nIf the official page has **peak / off-peak (time-of-day) pricing**, add it the way the existing config\\pricing.json does with `time_windows`: the base four rates are the **off-peak (default)** rates, and each `time_windows` entry carries the rates for that window (with days / from / to).",
   },
   "settings.persona_title": {
-    "zh-CN": "人格 / 自定义提示词",
-    "zh-TW": "人格 / 自訂提示詞",
-    "ja": "ペルソナ / カスタム指示",
-    "ko": "페르소나 / 사용자 지시문",
-    "en": "Persona / custom instructions",
+    "zh-CN": "人格",
+    "zh-TW": "人格",
+    "ja": "ペルソナ",
+    "ko": "페르소나",
+    "en": "Persona",
   },
-  // 人格（L2）2026-09-21 搬进输入栏「更多设置」：描述压成**一句**（用户要求所有描述精简）。
-  "settings.persona_hint": {
-    "zh-CN": "接在内置人格之后，最多 {max} 字符；不进子代理。保存后需重启 AI。",
-    "zh-TW": "接在內建人格之後，最多 {max} 字元；不進子代理。儲存後需重啟 AI。",
-    "ja": "内蔵ペルソナの後に追加、最大 {max} 文字。サブエージェントには入りません。保存後は AI の再起動が必要。",
-    "ko": "내장 페르소나 뒤에 추가, 최대 {max}자. 서브 에이전트에는 미포함. 저장 후 AI 재시작 필요.",
-    "en": "Appended after the built-in persona, {max} chars max; not sent to subagents. Restart the AI after saving.",
-  },
+  // 人格（L2）2026-09-21 搬进输入栏「更多设置」。**刻意不留任何说明文案**（2026-10-06 用户
+  // 要求：标题只留「人格」，标题下方那句说明与文本框的 placeholder 全部删掉）—— 功能自解释；
+  // 保存后的反馈仍走 `persona_saved` / `persona_takes_effect`。
   "settings.persona_edit": {
     "zh-CN": "编辑",
     "zh-TW": "編輯",
     "ja": "編集",
     "ko": "편집",
     "en": "Edit",
-  },
-  "settings.persona_placeholder": {
-    "zh-CN": "例如：\n- 叫我老王，别用「您」\n- 回答先给结论，再给理由\n- 代码示例一律用 Rust",
-    "zh-TW": "例如：\n- 叫我老王，別用「您」\n- 回答先給結論，再給理由\n- 程式範例一律用 Rust",
-    "ja": "例：\n- 呼び方は「さん」付けで\n- 結論を先に、理由は後に\n- コード例は常に Rust",
-    "ko": "예:\n- 존댓말 대신 반말로\n- 결론을 먼저, 이유는 나중에\n- 코드 예시는 항상 Rust",
-    "en": "For example:\n- Call me Alex, skip the formalities\n- Lead with the conclusion, then the reasoning\n- Always write code samples in Rust",
   },
   "settings.persona_save": {
     "zh-CN": "保存",
@@ -3537,6 +5635,22 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "다운로드 후 설치 중…",
     "en": "Downloading and installing…",
   },
+  // 行内环形进度的阶段文字（2026-09-30）：插件包 / 依赖在下载、或在解压。
+  // 速度另起一行（`dl-speed`），不塞进这两条里。
+  "settings.plugins_market_downloading": {
+    "zh-CN": "下载中",
+    "zh-TW": "下載中",
+    "ja": "ダウンロード中",
+    "ko": "다운로드 중",
+    "en": "Downloading",
+  },
+  "settings.plugins_market_extracting": {
+    "zh-CN": "解压中",
+    "zh-TW": "解壓中",
+    "ja": "展開中",
+    "ko": "압축 해제 중",
+    "en": "Extracting",
+  },
   "settings.plugins_market_uninstall": {
     "zh-CN": "卸载",
     "zh-TW": "解除安裝",
@@ -3684,6 +5798,35 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "ツールエディタを開く",
     "ko": "도구 편집기 열기",
     "en": "Open Tool Editor",
+  },
+  // 远端 MCP 服务器（2026-10-01）：用户在 config\mcp.json 里手写条目，这里只给入口与状态
+  "settings.mcp_remote_title": {
+    "zh-CN": "远端 MCP 服务器",
+    "zh-TW": "遠端 MCP 伺服器",
+    "ja": "リモート MCP サーバー",
+    "ko": "원격 MCP 서버",
+    "en": "Remote MCP servers",
+  },
+  "settings.mcp_none": {
+    "zh-CN": "还没有配置。",
+    "zh-TW": "尚未設定。",
+    "ja": "まだ設定されていません。",
+    "ko": "아직 설정되지 않았습니다.",
+    "en": "None configured.",
+  },
+  "settings.mcp_count": {
+    "zh-CN": "已配置 {n} 台，改完需重启 AI 才生效。",
+    "zh-TW": "已設定 {n} 台，改完需重新啟動 AI 才生效。",
+    "ja": "設定済み {n} 台。変更後は AI の再起動が必要です。",
+    "ko": "설정됨 {n}대. 변경 후 AI를 다시 시작해야 적용됩니다.",
+    "en": "{n} configured — restart AI to apply.",
+  },
+  "settings.mcp_open": {
+    "zh-CN": "编辑配置",
+    "zh-TW": "編輯設定",
+    "ja": "設定を編集",
+    "ko": "설정 편집",
+    "en": "Edit config",
   },
   "settings.enter_url": {
     "zh-CN": "请输入 URL",
@@ -4237,6 +6380,22 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "성공",
     "en": "Done",
   },
+  // 写入内容的静态安全分析（A17，2026-10-01）：审批卡上那份是**执行前**看的，
+  // 这两条挂在**结果卡**上（用户可能压根没看审批卡）。只列规则与行号、不显示内容。
+  "agent.secret_warn_title": {
+    "zh-CN": "写入的内容里可能含凭据",
+    "zh-TW": "寫入的內容裡可能含憑證",
+    "ja": "書き込んだ内容に認証情報が含まれている可能性があります",
+    "ko": "작성한 내용에 자격 증명이 포함되어 있을 수 있습니다",
+    "en": "This content may contain credentials",
+  },
+  "agent.secret_warn_note": {
+    "zh-CN": "只列出命中的规则与行号，不显示命中的内容。",
+    "zh-TW": "只列出命中的規則與行號，不顯示命中的內容。",
+    "ja": "一致したルールと行番号のみを表示し、内容そのものは表示しません。",
+    "ko": "일치한 규칙과 줄 번호만 표시하며, 내용 자체는 표시하지 않습니다.",
+    "en": "Only the matched rules and line numbers are listed — never the content itself.",
+  },
   "agent.tool_exit_nonzero": {
     "zh-CN": "完成（退出码 {code}）",
     "zh-TW": "完成（退出碼 {code}）",
@@ -4250,6 +6409,15 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "タイムアウト",
     "ko": "시간 초과",
     "en": "Timed out",
+  },
+  // 用户点了「停止」（2026-10-01）：**不许**与「成功」共用 —— 命令是被 kill 的，
+  // 没有退出码，报「完成」就是骗人（见 main.ts `fillToolCard` 的 `stopped` 分支）。
+  "agent.tool_stopped": {
+    "zh-CN": "已停止",
+    "zh-TW": "已停止",
+    "ja": "停止しました",
+    "ko": "중지됨",
+    "en": "Stopped",
   },
   "agent.tool_skipped": {
     "zh-CN": "已跳过",
@@ -4366,13 +6534,15 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "과정 · {n}단계",
     "en": "{n} steps",
   },
-  // 运行方式（Trae「沙箱」的 Lunac 等价物：问不问，不是隔离边界）
+  // 命令审批方式（Trae「沙箱」的 Lunac 等价物：问不问，不是隔离边界）
+  // 2026-10-06 改名「运行方式 → 命令审批方式」（用户要求）：它管的是**所有工具调用**要不要
+  // 弹审批卡（命令、写入、网络读取都在内），名字强调「审批」是为了与「权限」区分开。
   "agent.run_mode": {
-    "zh-CN": "运行方式",
-    "zh-TW": "執行方式",
-    "ja": "実行モード",
-    "ko": "실행 방식",
-    "en": "Run mode",
+    "zh-CN": "命令审批方式",
+    "zh-TW": "命令審批方式",
+    "ja": "コマンド承認方式",
+    "ko": "명령 승인 방식",
+    "en": "Command approval",
   },
   "agent.run_mode_manual": {
     "zh-CN": "手动",
@@ -4396,47 +6566,49 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Auto",
   },
   "agent.run_mode_manual_hint": {
-    "zh-CN": "每个写操作都先询问（含白名单命中）",
-    "zh-TW": "每個寫入操作都先詢問（含白名單命中）",
-    "ja": "書き込み操作は毎回確認（許可リストも同様）",
-    "ko": "쓰기 작업마다 확인 (허용 목록 포함)",
-    "en": "Ask before every write (including allowlisted)",
+    "zh-CN": "每次工具调用都先询问（含白名单命中）",
+    "zh-TW": "每次工具呼叫都先詢問（含白名單命中）",
+    "ja": "ツール呼び出しは毎回確認（許可リストも同様）",
+    "ko": "모든 도구 호출을 확인 (허용 목록 포함)",
+    "en": "Ask before every tool call (including allowlisted)",
   },
   "agent.run_mode_allowlist_hint": {
-    "zh-CN": "只读命令自动放行，其余先询问",
-    "zh-TW": "唯讀命令自動放行，其餘先詢問",
-    "ja": "読み取り専用コマンドは自動実行、他は確認",
-    "ko": "읽기 전용 명령은 자동 실행, 나머지는 확인",
-    "en": "Read-only commands auto-run; ask for the rest",
+    "zh-CN": "只读操作自动放行，其余先询问",
+    "zh-TW": "唯讀操作自動放行，其餘先詢問",
+    "ja": "読み取り専用の操作は自動実行、他は確認",
+    "ko": "읽기 전용 작업은 자동 실행, 나머지는 확인",
+    "en": "Read-only actions auto-run; ask for the rest",
   },
   "agent.run_mode_auto_hint": {
-    "zh-CN": "所有命令都不再询问（危险命令仍拦截）",
-    "zh-TW": "所有命令都不再詢問（危險命令仍攔截）",
-    "ja": "すべてのコマンドを確認しません（危険なコマンドは遮断）",
-    "ko": "모든 명령을 묻지 않음 (위험 명령은 차단)",
-    "en": "Never ask (dangerous commands still blocked)",
+    "zh-CN": "所有工具调用都不再询问（危险操作仍拦截）",
+    "zh-TW": "所有工具呼叫都不再詢問（危險操作仍攔截）",
+    "ja": "すべてのツール呼び出しを確認しません（危険な操作は遮断）",
+    "ko": "모든 도구 호출을 묻지 않음 (위험 작업은 차단)",
+    "en": "Never ask (dangerous actions still blocked)",
   },
+  // ⚠️ 这条必须与「权限」的最新语义一致：「完全」档会连工作区锁一起关掉
+  // （见 `main.rs`：`locked = LUNAC_WORKSPACE_LOCKED=="1" && !skip_permissions`）。
   "agent.run_mode_auto_warning": {
-    "zh-CN": "自动运行中：命令不再询问；「完全」安全档位会忽略工作区限制",
-    "zh-TW": "自動執行中：命令不再詢問；「完全」安全檔位會忽略工作區限制",
-    "ja": "自動実行中: コマンドを確認しません。「完全」段階ではワークスペース制限も無視します",
-    "ko": "자동 실행 중: 명령을 묻지 않습니다. '완전' 단계는 작업 공간 제한도 무시합니다",
-    "en": "Auto-run on: no confirmation; the \"full\" security level also ignores the workspace limit",
+    "zh-CN": "自动审批中：不再询问；「系统」权限会忽略工作区限制",
+    "zh-TW": "自動審批中：不再詢問；「系統」權限會忽略工作區限制",
+    "ja": "自動承認中: 確認しません。「システム」権限はワークスペース制限も無視します",
+    "ko": "자동 승인 중: 묻지 않습니다. '시스템' 권한은 작업 공간 제한도 무시합니다",
+    "en": "Auto-approval on: no confirmation; the \"system\" permission level also ignores the workspace limit",
   },
   "agent.run_mode_auto_confirm": {
-    "zh-CN": "切换到自动运行？命令将不再询问。",
-    "zh-TW": "切換到自動執行？命令將不再詢問。",
-    "ja": "自動実行に切り替えますか？コマンドは確認されません。",
-    "ko": "자동 실행으로 전환할까요? 명령을 묻지 않습니다.",
-    "en": "Switch to auto-run? Commands will no longer be confirmed.",
+    "zh-CN": "切换到自动审批？工具调用将不再询问。",
+    "zh-TW": "切換到自動審批？工具呼叫將不再詢問。",
+    "ja": "自動承認に切り替えますか？ツール呼び出しは確認されません。",
+    "ko": "자동 승인으로 전환할까요? 도구 호출을 묻지 않습니다.",
+    "en": "Switch to auto-approval? Tool calls will no longer be confirmed.",
   },
   // 文件边界（工作区锁）与拦截
   "agent.run_mode_confirm_ok": {
-    "zh-CN": "开启自动运行",
-    "zh-TW": "開啟自動執行",
-    "ja": "自動実行を有効化",
-    "ko": "자동 실행 켜기",
-    "en": "Turn on auto-run",
+    "zh-CN": "开启自动审批",
+    "zh-TW": "開啟自動審批",
+    "ja": "自動承認を有効化",
+    "ko": "자동 승인 켜기",
+    "en": "Turn on auto-approval",
   },
   "agent.run_mode_confirm_cancel": {
     "zh-CN": "取消",
@@ -4538,6 +6710,112 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "ファイルを表示できません（移動または削除された可能性）",
     "ko": "파일을 찾을 수 없습니다(이동 또는 삭제됨)",
     "en": "Can't locate that file (it may have been moved or deleted)",
+  },
+  // ── U1 代码变更 diff 卡（2026-10-06）：事后审阅 + 用快照回滚 ──────
+  "agent.cr_loading": {
+    "zh-CN": "正在读取文件…",
+    "zh-TW": "正在讀取檔案…",
+    "ja": "ファイルを読み込み中…",
+    "ko": "파일 읽는 중…",
+    "en": "Reading files…",
+  },
+  "agent.cr_summary": {
+    "zh-CN": "{files} 个文件 · +{add} −{del}",
+    "zh-TW": "{files} 個檔案 · +{add} −{del}",
+    "ja": "{files} 個のファイル · +{add} −{del}",
+    "ko": "파일 {files}개 · +{add} −{del}",
+    "en": "{files} files · +{add} −{del}",
+  },
+  "agent.cr_accept": {
+    "zh-CN": "接受",
+    "zh-TW": "接受",
+    "ja": "承認",
+    "ko": "수락",
+    "en": "Accept",
+  },
+  "agent.cr_reject": {
+    "zh-CN": "拒绝",
+    "zh-TW": "拒絕",
+    "ja": "拒否",
+    "ko": "거부",
+    "en": "Reject",
+  },
+  "agent.cr_accept_all": {
+    "zh-CN": "全部接受",
+    "zh-TW": "全部接受",
+    "ja": "すべて承認",
+    "ko": "모두 수락",
+    "en": "Accept all",
+  },
+  "agent.cr_reject_all": {
+    "zh-CN": "全部拒绝",
+    "zh-TW": "全部拒絕",
+    "ja": "すべて拒否",
+    "ko": "모두 거부",
+    "en": "Reject all",
+  },
+  "agent.cr_reject_hint": {
+    "zh-CN": "撤销这一条改动（写回改动前的内容）",
+    "zh-TW": "復原這一條改動（寫回改動前的內容）",
+    "ja": "この変更を取り消す（変更前の内容を書き戻す）",
+    "ko": "이 변경을 취소합니다(변경 전 내용으로 되돌림)",
+    "en": "Undo this change (writes back the previous content)",
+  },
+  "agent.cr_reject_file_hint": {
+    "zh-CN": "撤销该文件的全部改动（写回最早那份内容）",
+    "zh-TW": "復原該檔案的全部改動（寫回最早那份內容）",
+    "ja": "このファイルの変更をすべて取り消す（最初の内容を書き戻す）",
+    "ko": "이 파일의 모든 변경을 취소합니다(가장 이른 내용으로 되돌림)",
+    "en": "Undo all changes to this file (writes back the earliest content)",
+  },
+  "agent.cr_accepted": {
+    "zh-CN": "已接受",
+    "zh-TW": "已接受",
+    "ja": "承認済み",
+    "ko": "수락됨",
+    "en": "Accepted",
+  },
+  "agent.cr_turn": {
+    "zh-CN": "第 {n} 轮",
+    "zh-TW": "第 {n} 輪",
+    "ja": "第 {n} ターン",
+    "ko": "{n}번째 턴",
+    "en": "Turn {n}",
+  },
+  "agent.cr_net": {
+    "zh-CN": "净变化",
+    "zh-TW": "淨變化",
+    "ja": "正味の変更",
+    "ko": "순 변화",
+    "en": "Net change",
+  },
+  "agent.cr_unreadable": {
+    "zh-CN": "无法预览（原内容为二进制或超出大小上限）",
+    "zh-TW": "無法預覽（原內容為二進位或超出大小上限）",
+    "ja": "プレビューできません（元の内容がバイナリかサイズ上限超過）",
+    "ko": "미리보기 불가(원본이 바이너리이거나 크기 상한 초과)",
+    "en": "Can't preview (original is binary or over the size limit)",
+  },
+  "agent.cr_truncated": {
+    "zh-CN": "差异过长，仅显示前 {n} 行",
+    "zh-TW": "差異過長，僅顯示前 {n} 行",
+    "ja": "差分が長すぎるため、先頭 {n} 行のみ表示",
+    "ko": "차이가 너무 길어 앞 {n}행만 표시",
+    "en": "Diff too long; showing first {n} lines",
+  },
+  "agent.cr_reverted": {
+    "zh-CN": "已撤销 {n} 处改动",
+    "zh-TW": "已復原 {n} 處改動",
+    "ja": "{n} 件の変更を元に戻しました",
+    "ko": "변경 {n}건을 되돌렸습니다",
+    "en": "Reverted {n} change(s)",
+  },
+  "agent.cr_reverted_part": {
+    "zh-CN": "已撤销 {n} 处改动（{failed} 处失败或跳过）",
+    "zh-TW": "已復原 {n} 處改動（{failed} 處失敗或略過）",
+    "ja": "{n} 件の変更を元に戻しました（{failed} 件失敗またはスキップ）",
+    "ko": "변경 {n}건을 되돌렸습니다({failed}건 실패 또는 건너뜀)",
+    "en": "Reverted {n} change(s) ({failed} failed or skipped)",
   },
   "agent.please_wait": {
     "zh-CN": "请稍候...",

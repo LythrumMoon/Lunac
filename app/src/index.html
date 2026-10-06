@@ -221,6 +221,23 @@
       <div id="chat-drawer-list"></div>
     </div>
     <div id="results-list"></div>
+    <!-- 「提问节点」（2026-10-02；同日按用户要求改成**右侧竖排小圆点**）：
+         常驻的只有**一排点** —— 其中一颗高亮 = 「现在读到哪条提问」；鼠标移到轨道上才展开
+         列出问题正文的窗口（移开即收）。
+         列表**必须由 `chatHistory`（内存里的权威副本）生成**，不能查 DOM ——
+         聊天流现在只渲染尾部 N 条（main.ts 的 `CHAT_RENDER_WINDOW`），
+         早先的气泡在 DOM 里根本不存在，「要从内存里再取」的正是这一段。 -->
+    <div id="chat-node-panel" class="hidden">
+      <div id="chat-node-head">
+        <span id="chat-node-title"></span>
+        <span id="chat-node-pos"></span>
+      </div>
+      <div id="chat-node-list"></div>
+    </div>
+    <!-- 轨道放在面板**之后**：同 z-index 下 DOM 靠后的画在上面，点才浮在面板右缘之上。 -->
+    <div id="chat-node-rail" class="hidden">
+      <div id="chat-node-dots"></div>
+    </div>
       <!-- 任务抽屉（2026-09-21）：待办清单**不再占用对话链路**，改成输入框上方的一条小抽屉。
            没有内容（既无待办、也无改动文件）时整块隐藏；「确认」= 收工，清空并收起抽屉。
            结构：标题 + 进度文本 + 三个按钮（详细任务 / 更改文件 / 确认）+ 两个可展开的列表。
@@ -235,9 +252,26 @@
         </div>
         <ul id="todo-drawer-tasks" class="todo-items hidden"></ul>
         <ul id="todo-drawer-files" class="todo-items hidden"></ul>
+        <!-- 后台运行的命令（2026-10-01）：与上面两个不同，它**始终展开** ——
+             用户正等着它跑完，不该再点一层才看得见；每行右侧一颗「取消」。 -->
+        <ul id="todo-drawer-bg" class="todo-items hidden"></ul>
       </div>
+      <!-- 审批停靠位（2026-10-02 用户要求「权限卡 / 计划卡停靠输入框位置」）：
+           卡片出现在这里（输入栏正上方），出现期间输入栏整条让位（body.approval-open，
+           见 styles.css）—— 审批不会再随对话流滚走、也不会被滚丢。
+           计划待批准时再叠一层 body.plan-open：连任务抽屉（待办 + 文件更改）一起藏。 -->
+      <div id="approval-dock" class="hidden"></div>
       <!-- Chat input bar (visible when AI chat is active) -->
       <div id="chat-input-bar" class="hidden">
+        <!-- 待发送队列（2026-09-30）：AI 生成中输入的消息不再只用状态栏一句「排队中」打发，
+             而是一条可见的队列。每条可「立即发送」（中断当前生成、改发这条）或「移除」；
+             不操作则等本轮生成结束后按序自动发出（原 pendingMessages 行为）。 -->
+        <div id="chat-queue" class="hidden">
+          <div id="chat-queue-head">
+            <span id="chat-queue-title"></span>
+          </div>
+          <div id="chat-queue-list"></div>
+        </div>
         <!-- Chat file chips — same as search bar chips, shown in AI mode -->
         <div id="chat-file-chips"></div>
         <div id="chat-input-row">
@@ -315,6 +349,13 @@
                 </button>
                 <span class="chat-more-hint" id="chat-runmode-hint"></span>
               </div>
+              <!-- 权限（文件边界；UI 名 2026-10-06 由「安全档位」改为「权限」）：
+                   与「命令审批方式」正交 —— 后者决定「问不问」，这里决定「允不允许」。
+                   点一下循环三档（只读 → 项目 → 完全），与上面同一种交互。 -->
+              <div class="chat-more-row">
+                <span class="chat-more-label" id="chat-profile-label"></span>
+                <button id="chat-profile-btn" type="button"></button>
+              </div>
               <!-- 工作区：原独立弹窗的内容，扁平化成一行（无嵌套弹窗） -->
               <div class="chat-more-row chat-more-block">
                 <span class="chat-more-ic">
@@ -362,7 +403,6 @@
                 </div>
               </div>
               <div id="chat-persona-box" class="chat-persona-box hidden">
-                <div class="chat-persona-hint" id="chat-persona-hint"></div>
                 <textarea id="chat-persona-text" class="chat-persona-text" spellcheck="false"></textarea>
                 <div class="chat-persona-foot">
                   <div class="chat-more-actions">
@@ -405,16 +445,6 @@
               <rect x="4" y="4" width="16" height="16" rx="2"/>
               <circle cx="8.6" cy="8.6" r="1.1" fill="#fff" opacity="0.75"/>
               <circle cx="16.4" cy="16.4" r="0.5" fill="#fff" opacity="0.4"/>
-            </svg>
-          </button>
-          <button id="humanize-btn" title="去除 AI 痕迹" aria-label="Humanize" style="display:none">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">
-                <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
-              </g>
-              <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
-              <circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/>
-              <circle cx="16" cy="16" r="0.5" fill="currentColor" stroke="none" opacity="0.45"/>
             </svg>
           </button>
         </div>

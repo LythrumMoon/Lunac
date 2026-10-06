@@ -42,6 +42,7 @@ const pluginEntries: Record<string, string> = {
   "clipboard-history": p("./src/plugins/builtin/clipboard-history.ts"),
   ocr: p("./src/plugins/builtin/ocr.ts"),
   convert: p("./src/plugins/builtin/convert.ts"),
+  proxy: p("./src/plugins/builtin/proxy.ts"),
   pet: p("./src/plugins/builtin/pet.ts"),
 };
 
@@ -53,15 +54,37 @@ if (!only || !(only in pluginEntries)) {
       `整包构建请用 scripts/build-plugins.ps1（它会逐个入口各调一次）。`,
   );
 }
-const entry = pluginEntries[only];
+// ── 附加入口（可选，2026-09-30 为桌宠的 Live2D 引擎加的）─────────────────
+// `LUNAC_PLUGIN_EXTRA_OUT` = 产物在插件目录内的相对路径（如 `engine/live2d-engine.js`）
+// `LUNAC_PLUGIN_EXTRA_SRC` = 源码路径（相对 app/，如 `src/plugins/builtin/live2d-engine.ts`）
+// 由 `scripts/build-plugins.ps1` 按插件的 `extraEntries` 逐个**再起一次**本配置。
+//
+// **为什么是「同一插件的第二次构建」而不是多入口**：插件包里的每个 js 都必须是自包含单文件
+// —— 多入口会让 Rollup 把共享模块提成公共 chunk，而宿主是用 `import(convertFileSrc(...))`
+// 装载的，asset 协议把整条绝对路径 percent-encode 进 URL 最后一段，**相对 specifier 必然
+// 落到协议根**⇒ 那个 chunk 404（见下方 `inlineDynamicImports` 那段）。而有些模块**必须晚于
+// 某个运行时全局脚本才敢求值**（`pixi-live2d-display` 在模块求值时就检查
+// `window.Live2DCubismCore`），`inlineDynamicImports` 又会把它提前到顶层 ⇒ 只能拆成独立文件、
+// 由插件运行时按**绝对 URL** 动态 import（见 `src/plugins/builtin/live2d.ts` 的文件头）。
+const extraOut = (process.env.LUNAC_PLUGIN_EXTRA_OUT ?? "").trim();
+const extraSrc = (process.env.LUNAC_PLUGIN_EXTRA_SRC ?? "").trim();
+if (extraOut && (!extraSrc || extraOut.includes("..") || extraSrc.includes(".."))) {
+  throw new Error(`附加入口参数不合法（out=${extraOut} / src=${extraSrc}）—— 两者都不许含 ".."`);
+}
+const slash = extraOut.lastIndexOf("/");
+const outSub = slash >= 0 ? extraOut.slice(0, slash) : "";
+const outName = slash >= 0 ? extraOut.slice(slash + 1) : extraOut;
+
+const entry = extraOut ? p(`./${extraSrc.replace(/^\.\//, "")}`) : pluginEntries[only];
 
 export default defineConfig({
   root: "src",
   // 库模式不需要 public/ 里的静态资源，也不该把它们复制进插件包
   publicDir: false,
   build: {
-    // 一个插件一个目录（与清单的 entry 一致），只清自己那一份
-    outDir: `../plugin-dist/${only}`,
+    // 一个插件一个目录（与清单的 entry 一致），只清自己那一份；
+    // 附加入口落在它自己的子目录里（`emptyOutDir` 也只清那一层，不会碰主产物）
+    outDir: outSub ? `../plugin-dist/${only}/${outSub}` : `../plugin-dist/${only}`,
     emptyOutDir: true,
     // 源码里没有 `.ts` 之外的资源，但显式关掉 sourcemap 能让包小一半
     sourcemap: false,
@@ -72,8 +95,15 @@ export default defineConfig({
     },
     rollupOptions: {
       output: {
-        // 单入口 ⇒ 产物就是一个文件，直接叫 index.js（清单的 entry 默认值）
-        entryFileNames: "index.js",
+        // 单入口 ⇒ 产物就是一个文件。主入口叫 index.js（清单的 entry 默认值），
+        // 附加入口用它自己在插件目录内的文件名。
+        entryFileNames: extraOut ? outName : "index.js",
+        // **产物必须是自包含单文件**：宿主用 `import(convertFileSrc(<插件目录>/index.js))`
+        // 装载，而 asset 协议把**整条绝对路径** percent-encode 进 URL 最后一段 ⇒ 打包器
+        // 生成的任何相对 specifier（`./chunk-xxx.js`）都会落到协议**根**、不是插件目录，
+        // 于是那个文件 404、插件打开即失败（文件头那次「多入口拆出公共 chunk」就是这个坑）。
+        // 这条把「万一将来真出现可分析的动态 import」也一并按死。
+        inlineDynamicImports: true,
       },
     },
   },

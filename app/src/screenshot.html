@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lunac</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <!-- 截屏框选覆盖窗（2026-10-06）。
+       它加载**独立的一页**（不是 plugin.html / index.html）：这扇窗只做一件事 ——
+       把宿主抓来的整张虚拟桌面铺满、让用户拖一个框，然后把**像素矩形**回给宿主。
+       见 src-tauri/src/screenshot.rs 的模块注释。 -->
+</head>
+<body class="shot-body">
+  <div id="shot-root">
+    <img id="shot-img" alt="" draggable="false" />
+    <div id="shot-dim"></div>
+    <div id="shot-box" hidden></div>
+    <div id="shot-size" hidden></div>
+    <div id="shot-hint"></div>
+  </div>
+  <script type="module" src="/screenshot-overlay.ts"></script>
+</body>
+</html>

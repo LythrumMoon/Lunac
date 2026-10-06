@@ -12,9 +12,23 @@ import { attachPluginListeners } from "./plugins/attach";
 import { refreshMarketPlugins, hasDiskPlugin } from "./plugins/market";
 import { isBasePlugin } from "./plugins/kinds";
 import { installHostBridge } from "./plugins/host";
+import { createSidecarBridge, activatePluginSidecar, deactivatePluginSidecar, maybeAutoStartSidecar } from "./plugins/sidecar";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
-import { loadUsageCost, renderUsageCostPanel } from "./usage-cost.js";
+import {
+  loadUsageCost,
+  renderUsageCostPanel,
+  parseUsageRangeValue,
+  DEFAULT_USAGE_RANGE,
+  type UsageRange,
+  type UsageModelFilter,
+} from "./usage-cost.js";
+import { lineDiff } from "./text-diff.js";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
+// 命令卡终端（2026-10-05，用户要求）：命令类工具（Cmd / PowerShell）的正文改用
+// xterm.js 渲染，可实时看到输出、也能键入（键入经 tool_control 转发给子进程 stdin）。
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 
 // ── 窗口角色：聊天独立窗 vs 主窗（2026-09-29，AI 聊天搬进独立界面）────
 //
@@ -143,13 +157,24 @@ const chatInput = el("chat-input") as HTMLTextAreaElement;
 const chatSendBtn = el("chat-send-btn");
 const chatStopBtn = el("chat-stop-btn");
 const chatHistoryBtn = el("chat-history-btn");
-const humanizeBtn = el("humanize-btn");
+const chatQueue = el("chat-queue");
+const chatQueueTitle = el("chat-queue-title");
+const chatQueueList = el("chat-queue-list");
 const chatFileChipsContainer = el("chat-file-chips");
 const chatAddFileBtn = el("chat-add-file-btn");
 const fileChips = el("file-chips");
 const chatDrawer = el("chat-drawer");
 const chatDrawerList = el("chat-drawer-list");
 const chatDrawerClose = el("chat-drawer-close");
+// 「提问节点」（2026-10-02）——只有聊天独立窗用得上（主窗没有整段会话），
+// 显隐由 setDetached 按 IS_CHAT_WINDOW 控制。同日按用户要求改成**右侧竖排小圆点**：
+// 常驻的只有一堆点（其中一颗高亮 = 现在读到哪条提问），鼠标移到轨道上才展开列表窗口。
+const chatNodePanel = el("chat-node-panel");
+const chatNodeRail = el("chat-node-rail");
+const chatNodeDots = el("chat-node-dots");
+const chatNodeList = el("chat-node-list");
+const chatNodeTitle = el("chat-node-title");
+const chatNodePos = el("chat-node-pos");
 /** Parent of chatDrawer — used to re-insert drawer after DOM removal */
 const drawerParent = chatDrawer.parentElement!;
 /** Sibling before which to re-insert drawer (results-list) */
@@ -163,6 +188,8 @@ const chatMoreWorkspaceLabel = el("chat-more-workspace-label");
 const chatModeSeg = el("chat-mode-seg");
 const chatRunmodeBtn = el("chat-runmode-btn");
 const chatRunmodeHint = el("chat-runmode-hint");
+const chatProfileBtn = el("chat-profile-btn") as HTMLButtonElement | null;
+const chatProfileLabel = el("chat-profile-label");
 const chatWorkspacePath = el("chat-workspace-path");
 const chatWorkspaceSelect = el("chat-workspace-select");
 const chatWorkspaceReset = el("chat-workspace-reset");
@@ -174,7 +201,6 @@ const chatToolsMsg = el("chat-tools-msg");
 const chatPersonaLabel = el("chat-persona-label");
 const chatPersonaEdit = el("chat-persona-edit") as HTMLButtonElement;
 const chatPersonaBox = el("chat-persona-box");
-const chatPersonaHint = el("chat-persona-hint");
 const chatPersonaText = el("chat-persona-text") as HTMLTextAreaElement;
 const chatPersonaSave = el("chat-persona-save") as HTMLButtonElement;
 const chatPersonaReset = el("chat-persona-reset") as HTMLButtonElement;
@@ -189,6 +215,25 @@ const todoDrawerFiles = el("todo-drawer-files");
 const todoDrawerTasksBtn = el("todo-drawer-tasks-btn") as HTMLButtonElement;
 const todoDrawerFilesBtn = el("todo-drawer-files-btn") as HTMLButtonElement;
 const todoDrawerOkBtn = el("todo-drawer-ok-btn") as HTMLButtonElement;
+/** 抽屉里的「后台运行」区（2026-10-01，用户要求：后台命令列在这里、能从这里取消）。 */
+const todoDrawerBg = el("todo-drawer-bg");
+/** 审批停靠位（2026-10-02）：权限卡 / 计划卡挂在这里，**输入栏位置**。
+ *  空着时整块 `.hidden` —— 显隐统一由 `syncApprovalChrome()` 管。 */
+const approvalDock = el("approval-dock");
+
+// 后台命令的「取消」：按 `tool_use_id` 发一条 `stop` —— 与命令卡上那颗「停止」走
+// **完全同一条**通路（agent 侧 `route_tool_control` 只认 tool_use_id），所以「已经
+// 转后台、`run_shell` 早就退出」的那些命令同样能被它杀掉：接管它们的收尾线程仍在看
+// 同一个 `stop` 标志（见 main.rs 的 `hand_off_to_background`）。
+// 监听器绑在**容器**上而不是每一行上：`renderTodoDrawer` 每次重建 innerHTML，
+// 绑在行上的监听器会被丢掉，而绑在容器上的不会 —— 也不必担心重复绑定。
+todoDrawerBg.addEventListener("click", (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-bg]");
+  if (!btn) return;
+  const cmd = backgroundCmds.get(btn.dataset.bg || "");
+  if (cmd) sendToolControl("stop", cmd.toolUseId);
+  (btn as HTMLButtonElement).disabled = true;
+});
 
 // ── 窗口尺寸 —— 实测驱动（方案A，修复「窗口尺寸与结果区渲染区域不一致」）──
 // 设计宽度 800px；窗口可拖拽缩放（tauri.conf resizable:true），宽度变化经
@@ -762,6 +807,8 @@ function clearFileChips() {
 /** Sync chip empty state to Rust for Esc handling */
 function syncChipsEmpty() {
   invoke("set_chips_empty", { empty: attachedFiles.length === 0 }).catch(() => {});
+  // 附件增删也要重算发送/停止按钮的显隐（附件本身就是合法 payload，见 updateComposerButtons）。
+  updateComposerButtons();
 }
 
 /** Auto-resize textarea to fit content (grows search bar dynamically) */
@@ -776,6 +823,8 @@ function autoResizeChatTextarea() {
   chatInput.style.height = "auto";
   const h = Math.min(60, Math.max(30, chatInput.scrollHeight));
   chatInput.style.height = h + "px";
+  // 文本变了 ⇒ 发送/停止按钮的显隐跟着变（生成中有文本才给发送按钮，见 updateComposerButtons）。
+  updateComposerButtons();
 }
 
 // ── Window ───────────────────────────────────────────────────────
@@ -885,6 +934,47 @@ type ScoredEntry =
   | { kind: "ai-fallback" };
 let currentEntries: ScoredEntry[] = [];
 
+/** 本回合的 AI 是否**写过插件目录**（`Modules\`）—— 决定回合收尾要不要自动重扫插件。
+ *
+ *  为什么需要它（2026-10-05 用户报「AI 生成的插件要先去设置点『重新扫描』才搜得到」）：
+ *  插件 registry 只在**启动**与设置的安装/卸载/重扫时刷新（`refreshMarketPlugins`），
+ *  而 AI 自建插件是**直接往 `Modules\<id>\` 写文件**的 ⇒ registry 里没有它，搜索就搜不到。
+ *  这里在工具流里嗅一下「这一轮有没有碰过 `Modules\`」，碰过才在收尾重扫一次（精准、不白扫）。 */
+let pluginDirTouched = false;
+
+/** MCP 配置在 agent 启动后被改过（`system/mcp_config_changed`）—— 决定回合收尾要不要重启 agent。
+ *
+ *  为什么需要它（2026-10-06）：`config\mcp.json` 与 `.mcp.json` 只在 agent **启动时**读一次，
+ *  而工具表是固定前缀（ai-spec §11 规则 18）⇒ 改了必须重启才生效、不能热更。agent 是宿主的
+ *  子进程、重启不了自己，所以由 agent 上报、前端在**本回合结束后**重启（见 result 分支）。
+ *  存的是被改过的文件展示名，仅用于给用户如实交代一句。 */
+let pendingMcpConfigRestart: string[] = [];
+
+/** 因 MCP 配置改动而重启 agent（2026-10-06）：先如实插一行说明，再走标准的
+ *  「存会话 → stop → start」（`__lunac_reload_agent` 自带先存会话，见文件末尾）。
+ *  **两条路径共用**：回合外（空闲）立即重启、回合结束（`result`）收尾重启。 */
+function restartForMcpConfig(files: string[]): void {
+  agentNewBlock("text");
+  agentAppend("text", t("agent.mcp_config_reload", { files: files.join(" / ") }));
+  agentCloseBlock();
+  void (window as any).__lunac_reload_agent?.();
+}
+
+/** 从一次工具调用（`Write` / `Edit` / `Cmd` / `PowerShell` 等）里判断有没有写到 `Modules\`。
+ *  判据是**入参 JSON 串里出现 `Modules\` / `Modules/`** —— 宁可多扫一次（代价极小），
+ *  也不要漏掉（漏了用户又得手点重扫）。 */
+function notePluginDirWrite(name: string | undefined, input: unknown): void {
+  if (!name || input === undefined) return;
+  if (!["Write", "Edit", "MultiEdit", "NotebookEdit", "Cmd", "PowerShell"].includes(name)) return;
+  let s = "";
+  try {
+    s = typeof input === "string" ? input : JSON.stringify(input);
+  } catch {
+    return;
+  }
+  if (/Modules[\\/]/.test(s)) pluginDirTouched = true;
+}
+
 let pluginActive = false;           // true when a plugin result panel is showing
 let activePluginId: string | null = null;  // which plugin is active (for toggle)
 let detached = false;               // detach mode
@@ -946,6 +1036,10 @@ interface ChatDoneInfo {
    *  归因：「这一问的钱有多少是子代理烧的」）。消费方**不得**把它再加一次。
    *  旧 agent 不报该字段 → undefined（2026-09-29）。 */
   subagent?: ChatDoneSubagentUsage;
+  /** 这条记录是**中断收尾**的兜底值（2026-10-06）：回合被取消 / agent 被强杀，拿不到
+   *  `result.usage`，只能用逐请求 `usage_delta` 的累计值落账。它**只覆盖已完成的请求**，
+   *  最后一个飞行中的请求不在内 —— 落盘时带上这个标记，日后对账能分辨「少是正常的」。 */
+  partial?: boolean;
 }
 interface ChatDoneSubagentUsage {
   input_tokens: number;
@@ -992,6 +1086,73 @@ let agentSessionId = "";
  *  压缩会改写请求前缀 → 端点侧缓存作废，是命中率的**断裂型**失效来源；
  *  必须与「新内容天生没被上一轮缓存覆盖」的自然未命中分开看（ai-spec §11 规则 23）。 */
 let liveCompaction = { elided: 0, dropped: 0 };
+
+/** 本次提问内**逐请求**累积的用量（来自 agent 的 `usage_delta`，2026-10-06）。
+ *
+ *  **为什么必须有它**：回合被取消 / 中断 / agent 被强杀时，`result.usage` 永远不会来，
+ *  本地就**一条账都不落**，而平台照计费 —— 实测 2026-10-02：agent 日志 389 次请求、
+ *  平台 401 次、本地 `usage-*.jsonl` 只有 308 次（有一轮 36 次请求整轮没落账，
+ *  当天本地金额只有平台的 53%）。
+ *
+ *  所以 agent 每完成一次请求就当场报一条，这里累计。**正常收尾不用它**（`result.usage`
+ *  才是权威值，还含子代理/复盘），只有异常收尾才拿它兜底（见 `flushTurnUsage`）。 */
+const turnUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheCreate: 0,
+  requests: [] as ChatDoneRequestUsage[],
+  /** **第一条** `usage_delta` 的本地时刻 —— 兜底落账时的 `ts`。
+   *  为什么不直接用 `Date.now()`：中断可能发生在很久之后（用户取消后隔天才回来），
+   *  用「落账那刻」会把这一轮的钱记到错误的日期。用首条请求的时刻，与本地账一贯的
+   *  「整轮归到开始那一小时」口径也一致（见 reconcile-usage.ps1 的精度声明）。 */
+  firstTs: 0,
+};
+
+/** 归零累计器 —— 回合开始、以及收尾落账之后各调一次（两道保险，防上一轮的值漏进来）。 */
+function resetTurnUsage() {
+  turnUsage.input = 0;
+  turnUsage.output = 0;
+  turnUsage.cacheRead = 0;
+  turnUsage.cacheCreate = 0;
+  turnUsage.requests.length = 0;
+  turnUsage.firstTs = 0;
+}
+
+/** 正常收尾：`result.usage` 是权威值 —— 记表盘 + 落盘，并把累计器作废。 */
+function recordTurnUsage(info: ChatDoneInfo) {
+  addUsageToTotals(info);
+  // 压缩计数一并计入表盘（本对话口径），面板据此解释命中率
+  usageTotals.elided += liveCompaction.elided;
+  usageTotals.dropped += liveCompaction.dropped;
+  updateTokenDashboard();
+  appendUsageLog(info);
+  resetTurnUsage();
+}
+
+/** 异常收尾兜底：拿逐请求累计值落一条账（**带 `partial` 标记**）。
+ *
+ *  一个请求都没完成（比如刚发出就被取消）就不落 —— 空记录只会污染对账。
+ *  表盘也照加：被中断的那一轮确实花了钱，不该从「本对话」里消失。 */
+function flushTurnUsage() {
+  const hasAny =
+    turnUsage.requests.length > 0 ||
+    turnUsage.input + turnUsage.output + turnUsage.cacheRead + turnUsage.cacheCreate > 0;
+  if (!hasAny) return;
+  const info: ChatDoneInfo = {
+    stop_reason: "interrupted",
+    input_tokens: turnUsage.input,
+    output_tokens: turnUsage.output,
+    cache_read_input_tokens: turnUsage.cacheRead,
+    cache_creation_input_tokens: turnUsage.cacheCreate,
+    requests: turnUsage.requests.slice(),
+    partial: true,
+  };
+  addUsageToTotals(info);
+  updateTokenDashboard();
+  appendUsageLog(info, turnUsage.firstTs || undefined);
+  resetTurnUsage();
+}
 
 // ── Chat conversation mode ────────────────────────────────────────
 // 思考开关（2026-09-15：原 fast/think/deep 三档收敛为两档）：
@@ -1044,6 +1205,8 @@ function renderMoreMenuLabels() {
   if (chatMoreThinkIc) chatMoreThinkIc.innerHTML = THINK_SVG;
   if (chatMoreThinkLabel) chatMoreThinkLabel.textContent = t("chat.more_thinking");
   if (chatMoreWorkspaceLabel) chatMoreWorkspaceLabel.textContent = t("settings.workspace");
+  if (chatProfileLabel) chatProfileLabel.textContent = t("settings.security_profile");
+  renderProfileUI();
   renderWorkspaceMenuLabels();
   renderToolsBlacklistLabels();
   renderPersonaLabels();
@@ -1124,6 +1287,9 @@ interface SessionStep {
 /** 一个回合的过程快照 —— 历史回顾时按回合渲染成可折叠的「过程」块。 */
 interface SessionProcess {
   turn: number;
+  /** 本回合是否产出了助手消息（收尾正文）；`false` = 只有思考/工具（含被中断）。
+   *  历史渲染据此决定挂到助手气泡还是自己的用户气泡之后。旧记录缺省 ⇒ 当作 `true`。 */
+  hasMsg?: boolean;
   items: SessionStep[];
 }
 
@@ -1136,6 +1302,23 @@ interface ChatSession {
   usage?: SessionUsage;
   /** 过程快照（按回合分组）；旧记录没有该字段 */
   steps?: SessionProcess[];
+  /** 待办清单时间线；旧记录没有该字段（2026-10-02） */
+  todos?: SessionTodoSnapshot[];
+}
+
+/** 待办清单在某一回合的快照 —— 回退 / 切会话后重建任务抽屉用（2026-10-02）。
+ *
+ *  **为什么要按回合存一条时间线**：待办原本是纯内存态，回退时只能整块清掉
+ *  （用户报「一点回退任务列表就没了」）。只存「最新一份」也不够 —— 回退到早先的
+ *  一点后，会把**回退点之后**才产生的待办显示出来。按 `turn` 存时间线才能取到
+ *  「回退点那一刻」的那份。
+ *
+ *  `turn` 口径与 `SessionProcess.turn` / 文件快照的 `turn` **完全一致**：
+ *  采集时已完成的助手消息条数（0 起）。所以回退到 idx 时，`turn < K` 的那些
+ *  快照才是该保留的（K = 保留下来的助手消息条数，见 `keptAssistantCountFor`）。 */
+interface SessionTodoSnapshot {
+  turn: number;
+  todos: unknown[];
 }
 
 // ── Session persistence — file-based via Rust IPC ─────────────────
@@ -1235,6 +1418,8 @@ async function persistCurrentSessionInner(
   snapshotId: string | null,
   snapshotUsage: SessionUsage,
   snapshotSteps: SessionProcess[],
+  snapshotFrames: FileSnapshot[],
+  snapshotTodos: SessionTodoSnapshot[],
 ) {
   // Keep any conversation with at least one real user message. Previously
   // this required 1 user + 1 assistant, so conversations where the CLI
@@ -1276,6 +1461,10 @@ async function persistCurrentSessionInner(
     // 旧记录没有这两个字段，读取端按可选处理（前端 `?.`，Rust 侧 `#[serde(default)]`）。
     usage: snapshotUsage,
     steps: snapshotSteps,
+    // 待办清单时间线一并落盘（2026-10-02）：回退 / 切会话后据此重建任务抽屉。
+    // 空时间线写 `undefined`（Rust 侧 `skip_serializing_if` → 该行写 NULL），
+    // 免得给每个没待办的会话都塞一个空数组。
+    todos: snapshotTodos.length ? snapshotTodos : undefined,
   };
   if (idx >= 0) {
     sessions[idx] = session; // update in place
@@ -1283,6 +1472,10 @@ async function persistCurrentSessionInner(
     sessions.unshift(session);
   }
   await saveSessions(sessions);
+  // 文件快照随会话落盘（2026-10-01）：原来它只活在内存里 ⇒ 恢复历史会话后「回退 + 还原
+  // 文件」只能放弃。落盘后这条对**所有**会话成立（`restoreSession` 负责读回来）。
+  // 提交的是**调用那一刻的副本**（`snapshotFrames`），不是全局 —— 理由见 saveCurrentSession。
+  await saveFrames(sid, snapshotFrames);
 }
 
 function saveCurrentSession() {
@@ -1296,8 +1489,22 @@ function saveCurrentSession() {
     turn: g.turn,
     items: g.items.map(i => ({ ...i })),
   }));
+  // 快照也要**当场取一份**：`newConversation()` 会在调用之后立刻清空全局
+  // （旧会话的快照已随它自己的记录落盘），排队里再读全局就只剩空表 ——
+  // 那会把旧会话盘上那份快照删掉（表现是「切回去再回退，文件还原不了了」）。
+  const snapshotFrames = sessionFileSnapshots.map(s => ({ ...s }));
+  // 待办时间线同样**当场取一份**（理由同快照）：`newConversation()` 会在调用后立刻清空全局，
+  // 排队里再读就只剩空表 —— 那会把旧会话盘上那份时间线抹掉。
+  const snapshotTodos = sessionTodoTimeline.map(t => ({ turn: t.turn, todos: t.todos }));
   return queueSessionSave(() =>
-    persistCurrentSessionInner(snapshot, snapshotId, snapshotUsage, snapshotSteps),
+    persistCurrentSessionInner(
+      snapshot,
+      snapshotId,
+      snapshotUsage,
+      snapshotSteps,
+      snapshotFrames,
+      snapshotTodos,
+    ),
   );
 }
 
@@ -1319,6 +1526,8 @@ function restoreSession(session: ChatSession) {
     turn: g.turn,
     items: g.items.map(i => ({ ...i })),
   }));
+  // 待办时间线读回来（2026-10-02）：恢复会话后任务抽屉由它重建 —— 旧记录没有该字段 → 空表。
+  sessionTodoTimeline = (session.todos ?? []).map(t => ({ turn: t.turn, todos: [...t.todos] }));
   // Cancel any active streaming before restoring
   if (isStreaming) {
     streamId++;
@@ -1346,7 +1555,6 @@ function restoreSession(session: ChatSession) {
   setPluginBar(briefTitle);
   // Ensure chat UI buttons are in the correct state
   setStreamingUI(false);
-  humanizeBtn.style.display = "none";
   invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
 
   resultsContainer.classList.remove("hidden");
@@ -1357,11 +1565,29 @@ function restoreSession(session: ChatSession) {
   // roll-back button (需求4).
   renderChatLogHtml();
   // 过程快照：每个回合的过程块插到该回合的助手气泡之后（可折叠）
-  renderHistoryProcess(session);
+  renderHistoryProcess(sessionSteps);
   // 「本次会话改动过的文件」由过程快照重建（任务抽屉的唯一数据源之一，见 renderTodoDrawer）。
-  // 待办清单重建不出来（它不落盘），所以**同时清空** —— 否则切会话会看到上一个会话的任务。
-  // backlog §8.1。
+  // 待办清单**不再清空**（2026-10-02）：它现在随会话落盘，紧跟着由时间线精确还原 —— 旧
+  // 实现「重建不出来所以清掉」的前提已不成立（见 rebuildChangedFilesFromSteps 的注释）。
   rebuildChangedFilesFromSteps(sessionSteps);
+  applyTodoTimeline(null); // 恢复会话 ⇒ 取时间线最后一条（整段会话的最终待办）
+  // 文件快照随会话读回来（2026-10-01，此前**刻意不落盘**）：读回来之后「回退到这条消息」
+  // 才真的能把 agent 改过的文件一起还原，而不只是回退对话。
+  // **异步 + 代守卫**：读盘回来时用户可能已经切走、或者已经点过回退 —— 那种情况下这份
+  // 「旧盘读」必须丢掉，否则会把已经回退掉的文件重新放回列表（再点一次 = 重复还原）。
+  const framesEpochAt = ++framesEpoch;
+  sessionFileSnapshots = [];
+  void (async () => {
+    try {
+      const frames = await invoke<FileSnapshot[]>("snapshots_load", { sessionId: session.id });
+      if (framesEpoch === framesEpochAt && currentSessionId === session.id) {
+        sessionFileSnapshots = frames ?? [];
+      }
+    } catch (e) {
+      // 读不出来 = 这次回退不还原文件（与改造前的行为一致）。**不报错、也不猜**。
+      console.warn("[lunac] snapshots_load failed:", e);
+    }
+  })();
   statusText.textContent = t("status.history_restored");
   // 把该会话的历史灌回 agent：恢复只是重建了 DOM，agent 侧还留着它自己上一段对话的
   // 上下文（甚至是另一个会话的）—— 不灌的话「恢复旧会话后追问」必然是零上文
@@ -1374,11 +1600,61 @@ function restoreSession(session: ChatSession) {
 
 // ── Chat log re-render + roll-back (需求4) ──────────────────────
 
-/** Render chatHistory as bubbles inside #chat-log, each with a roll-back
- *  button that restores the conversation up to (and including) that node. */
-function renderChatLogHtml() {
+/** 聊天流**一次渲染多少条消息**（窗口化渲染的窗口大小）。
+ *
+ *  **为什么必须有它**（2026-10-02 实测）：聊天窗加载的是主界面那份 `index.html`
+ *  （`plugin_window::page_for` 里唯一例外），开局会把整段会话重放成真实 DOM。
+ *  release 版一份 **45,216 条消息**的会话量出来是 **1,088,429 个 DOM 节点**、对应
+ *  renderer 进程**工作集 3.87 GB / 私有 3.83 GB**（同一时刻主窗口只有 322 个节点 /
+ *  88.9 MB）。节点数与消息数**线性相关** ⇒「打开 AI 窗就吃光内存」不是泄漏，是没有上限。
+ *  窗口化之后开窗成本只与「最近一屏」有关，与整段会话多长无关。
+ *
+ *  120 = 「比一屏多、又不至于过重」的折中（1200px 高的窗口一屏约 20–40 条）。 */
+const CHAT_RENDER_WINDOW = 120;
+
+/** 聊天流当前渲染的**起点**（`chatHistory` 下标）。0 = 一直渲染到会话开头。
+ *
+ *  它只影响**渲染**；`chatHistory` 始终是完整的内存权威副本 ——
+ *  「要更早的再去内存里取」指的就是把这个起点往前挪一屏再重绘（见 `loadEarlierChat`）。 */
+let chatRenderFrom = 0;
+
+/** 「提问节点」右栏一次列出多少条提问（同样窗口化 —— 见 `renderChatNodeList`）。 */
+const CHAT_NODE_WINDOW = 200;
+
+/** 右栏当前列出的**提问序号**起点（1 基，对应显示上的 `#n`）。 */
+let chatNodeFrom = 1;
+
+/** 默认窗口起点 = 会话尾部一屏。 */
+function chatTailFrom(): number {
+  return Math.max(0, chatHistory.length - CHAT_RENDER_WINDOW);
+}
+
+/** `chatHistory[0..from)` 里有几条助手消息。
+ *
+ *  窗口化之后，DOM 里第 k 条助手气泡的**全局轮次** = 这个数 + k
+ *  —— `renderHistoryProcess` 靠它把过程快照对回正确的回合。 */
+function assistantCountBefore(from: number): number {
+  let n = 0;
+  for (let i = 0; i < from && i < chatHistory.length; i++) if (chatHistory[i].role !== "user") n++;
+  return n;
+}
+
+/** Render chatHistory as bubbles inside #chat-log —— **只渲染一个窗口**
+ *  （`chatRenderFrom` 到结尾），不是整段会话（理由见 `CHAT_RENDER_WINDOW`）。
+ *
+ *  `opts.reset` = 把窗口挪到尾部（恢复会话时用）；`opts.from` = 显式指定起点。 */
+function renderChatLogHtml(opts: { reset?: boolean; from?: number } = {}) {
+  if (opts.reset) chatRenderFrom = chatTailFrom();
+  if (typeof opts.from === "number") chatRenderFrom = opts.from;
+  chatRenderFrom = Math.max(0, Math.min(chatRenderFrom, Math.max(0, chatHistory.length - 1)));
+  const hidden = chatRenderFrom;
   let html = '<div class="ai-response" id="chat-log">';
+  if (hidden > 0) {
+    // 条数写进 `data-n`，文案在 DOM 建好之后填（i18n 是运行时的事）。
+    html += `<button type="button" class="chat-load-earlier" data-n="${Math.min(hidden, CHAT_RENDER_WINDOW)}"></button>`;
+  }
   chatHistory.forEach((msg, idx) => {
+    if (idx < chatRenderFrom) return;
     const bubble = msg.role === "user" ? "chat-msg-user" : "chat-msg-assistant";
     // 用户气泡走 `userBubbleText()`：把存着的 `[Attached files]…[User query]…` 还原成
     // 与实时气泡一致的「提问 + 📎 文件名」（否则进历史后附件行消失，见该函数注释）。
@@ -1388,23 +1664,42 @@ function renderChatLogHtml() {
   html += '</div>';
   resultsList.innerHTML = html;
   const log = document.getElementById("chat-log");
+  const earlier = log?.querySelector<HTMLButtonElement>(".chat-load-earlier");
+  if (earlier) {
+    earlier.textContent = t("chat.load_earlier", { n: earlier.dataset.n || "0" });
+    earlier.addEventListener("click", () => loadEarlierChat());
+  }
   // A11 起回退点不再只限用户提问：**任意消息**都能作为回退点（「保留到这里、丢掉其后」）。
   // 用户气泡 = 复制 + 回退 + 重试；助手气泡 = 复制 + 回退（重试要重发的是用户那句话，
-  // 对助手气泡不成立）。按钮文案里写明「只回退对话、不还原磁盘上的文件」。
-  log?.querySelectorAll<HTMLElement>(".chat-msg-user").forEach(msg => {
-    const idx = Number(msg.dataset.idx);
-    attachMsgActions(msg, Number.isFinite(idx) ? idx : undefined, { retry: true });
-  });
-  log?.querySelectorAll<HTMLElement>(".chat-msg-assistant").forEach(msg => {
-    const idx = Number(msg.dataset.idx);
-    attachMsgActions(msg, Number.isFinite(idx) ? idx : undefined);
-  });
+  // 对助手气泡不成立）。
+  // ⚠️ 动作条**不在这里挂**了 —— 改成鼠标移上去才建（见 `installLazyMsgActions`），
+  //    那一条是本轮最大的一项内存收益，别把这段改回去。
   // Render LaTeX in restored content
   setTimeout(() => {
     const container = resultsList.querySelector(".ai-response");
     if (container) renderLatex(container as HTMLElement);
   }, 20);
+  // 右栏列表跟着一起重建（`reset` 透传：换会话时它也该回到「最近一屏」）。
+  renderChatNodeList({ reset: opts.reset });
   applyWindowSize();
+}
+
+/** 「载入更早」：把渲染窗口往前挪一屏，从**内存里**把更早的消息取出来补上。
+ *
+ *  不做增量前插、而是整块重绘：`chatHistory` 已经是权威副本，重绘只是再拼一遍
+ *  字符串（一屏的量级），换来「下标与 DOM 永远一致」这条不变量 —— 比省下的那点时间值钱。
+ *  重绘前记下当前第一条气泡的视口位置，补完照它还原滚动：
+ *  否则内容往上长，用户正看着的那一条会「往下跳」。 */
+function loadEarlierChat() {
+  if (chatRenderFrom <= 0) return;
+  const log = document.getElementById("chat-log");
+  const anchor = log?.querySelector<HTMLElement>(".chat-msg-user, .chat-msg-assistant");
+  const anchorIdx = anchor?.dataset.idx;
+  const beforeTop = anchor ? anchor.getBoundingClientRect().top : 0;
+  renderChatLogHtml({ from: Math.max(0, chatRenderFrom - CHAT_RENDER_WINDOW) });
+  if (anchorIdx === undefined) return;
+  const again = document.querySelector<HTMLElement>(`#chat-log [data-idx="${anchorIdx}"]`);
+  if (again) resultsList.scrollTop += again.getBoundingClientRect().top - beforeTop;
 }
 
 /** 上下文裁剪之后，把**已渲染气泡**烘死的 `data-idx` 一起前移（A11 修的既有 bug）。
@@ -1447,8 +1742,13 @@ function clipStep(s: string, n = STEP_MAX): string {
   return v.length > n ? v.slice(0, n) + "…" : v;
 }
 
-/** 把本轮的过程块按 DOM 顺序抽成步骤（回合结束时调用一次）。 */
-function recordTurnSteps(flowEl: HTMLElement) {
+/** 把本轮的过程块按 DOM 顺序抽成步骤（回合收尾时调用一次）。
+ *
+ *  `hasMsg` = 这一轮是否**产出了助手消息**（收尾正文）。它决定历史渲染时这一组过程块挂到
+ *  哪里：有消息 ⇒ 钉在那条助手气泡后；无消息（只调工具 / 被强制中断）⇒ 挂到它自己的用户
+ *  气泡之后。旧实现用「分组序号 == 助手气泡序号」的对齐假设，一旦出现无消息的回合，它后面
+ *  的每一组都会整体错位一格（用户报的「输出挂到错误消息下」）。 */
+function recordTurnSteps(flowEl: HTMLElement, hasMsg: boolean) {
   const items: SessionStep[] = [];
   flowEl
     .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card")
@@ -1473,7 +1773,13 @@ function recordTurnSteps(flowEl: HTMLElement) {
         });
       }
     });
-  if (items.length) sessionSteps.push({ turn: sessionSteps.length + 1, items });
+  if (items.length) {
+    // `turn` 与 `SessionTodo` 同口径：采集时**已完成的助手消息条数**（0 起，= 回合下标）。
+    // 有消息时 `completedTurnCount()` 已含这一条 ⇒ 减 1 才是本回合的下标（旧实现写的是
+    // 「分组序号 + 1」，与文档口径不一致，正是错位的根因之一）。
+    const turn = Math.max(0, completedTurnCount() - (hasMsg ? 1 : 0));
+    sessionSteps.push({ turn, hasMsg, items });
+  }
 }
 
 /** 历史「过程」块里的一步 → HTML（复用实时对话的类名，样式免费）。 */
@@ -1504,15 +1810,34 @@ function historyStepHtml(s: SessionStep): string {
   );
 }
 
-/** 历史回顾：把每个回合的过程快照渲染成可折叠的「过程」块，
- *  插到该回合的助手气泡之后（回合 N ↔ 第 N 条助手消息）。 */
-function renderHistoryProcess(session: ChatSession) {
-  const groups = (session.steps ?? []).filter(g => g.items && g.items.length > 0);
+/** 把每个回合的过程快照渲染成可折叠的「过程」块，插到该回合的助手气泡之后
+ *  （回合 N ↔ 第 N 条助手消息）。
+ *
+ *  **两处在用**（2026-10-06 起）：① 历史回顾（`restoreSession`）；② **回退之后的重绘**
+ *  —— 回退会把对话整块重画成纯文本气泡（`renderChatLogHtml` 只画 `chatHistory`），
+ *  过程块不重插就整片消失（用户报「回退后第一段对话的思考过程丢失」）。
+ *  所以入参是 `steps` 数组，不是整个会话对象。
+ *
+ *  ⚠️ 过程块**默认折叠**（`flow-folded`）：回退后它们会以「过程 · N 步」一行出现，
+ *  点开看全文 —— 与历史回顾同一形态，也避免一次回退把整屏塞满。 */
+function renderHistoryProcess(steps: SessionProcess[]) {
+  const groups = steps.filter(g => g.items && g.items.length > 0);
   if (!groups.length) return;
   const log = document.getElementById("chat-log");
   if (!log) return;
   const assistants = Array.from(log.querySelectorAll<HTMLElement>(".chat-msg-assistant"));
-  groups.forEach((g, i) => {
+  // **窗口化之后的偏移**：聊天流只渲染 `chatRenderFrom` 之后的消息，所以 DOM 里第 0 条
+  // 助手气泡并不是第 0 个回合 —— 被窗口挡在前面的那些助手消息条数就是偏移量。
+  // 少了它，过程块会整体挂错回合（长会话里的表现是「折叠块对不上回答」）。
+  const offset = assistantCountBefore(chatRenderFrom);
+  // **按顺序配对，不再用分组下标直接对齐助手气泡**（2026-10-03 修「输出挂错消息」）：
+  //   旧写法 `assistants[gi - offset]` 假设「每组恰好一条助手消息」，而**没有收尾正文的
+  //   回合**（只调工具 / 被强制中断）也会记一组 —— 它后面每一组都会整体错位一格，挂到
+  //   别人的回答下。改为两个游标：有消息的组才消耗一条助手气泡；无消息的组挂到它自己的
+  //   用户气泡之后（= 下一条助手气泡的前一个兄弟）。
+  let ordinal = 0;            // 下一条助手气泡的**全局**序号（含窗口外）
+  let lastPlaced: HTMLElement | null = null; // 本窗口内最近放置的过程块
+  for (const g of groups) {
     const flow = document.createElement("div");
     flow.className = "agent-flow history-process flow-folded";
     flow.innerHTML = g.items.map(historyStepHtml).join("");
@@ -1533,10 +1858,29 @@ function renderHistoryProcess(session: ChatSession) {
     footer.appendChild(btn);
     flow.appendChild(footer);
     setFolded(true);
-    const host = assistants[i];
-    if (host) host.insertAdjacentElement("afterend", flow);
-    else log.appendChild(flow);
-  });
+
+    // 旧记录没有 `hasMsg` ⇒ 当作「有消息」，与改造前的逐组对齐行为完全一致（向后兼容）。
+    const owns = g.hasMsg !== false;
+    let host: Element | null = null;
+    if (owns) {
+      if (ordinal >= offset) host = assistants[ordinal - offset] ?? null;
+      ordinal++;
+    } else {
+      // 无消息的回合：优先挂到它自己的用户气泡之后 —— 该回合没有助手气泡，所以「下一条
+      // 助手气泡的前一个兄弟」正是它自己的用户消息。末回合没有下一条助手气泡时才退到
+      // 「最近放置的过程块」之后。
+      const nextBubble = assistants[ordinal - offset] ?? null;
+      host = nextBubble ? nextBubble.previousElementSibling : lastPlaced;
+    }
+    // 落不到宿主（整组在渲染窗口之外）就什么都不做 —— **绝不**退回 `appendChild` 到末尾，
+    // 那正是「过程块挂到别人回答后面」的旧 bug。
+    if (host) {
+      host.insertAdjacentElement("afterend", flow);
+      lastPlaced = flow;
+    } else {
+      lastPlaced = null;
+    }
+  }
 }
 
 /** 复制气泡原文到剪贴板（含 [Attached files] 前缀时只复制用户提问原文）。 */
@@ -1569,23 +1913,48 @@ function attachMsgActions(msg: HTMLElement, idx: number | undefined, opts: { ret
   const valid = typeof idx === "number" && Number.isInteger(idx) && idx >= 0;
   const wrap = doc("div");
   wrap.className = "msg-actions";
-  const mk = (cls: string, title: string, svg: string, onClick: () => void) => {
+  // 回调收到按钮本身：回退的**两段式确认**要把「待确认」写在按钮上（见 onRollbackClick）。
+  const mk = (cls: string, title: string, svg: string, onClick: (b: HTMLElement) => void) => {
     const b = doc("button");
     b.className = cls;
     b.title = title;
     b.innerHTML = svg;
-    b.addEventListener("click", onClick);
+    b.addEventListener("click", () => onClick(b));
     wrap.appendChild(b);
   };
   mk("msg-copy", t("chat.copy_msg"), COPY_SVG, () => copyMsgText(msg, idx));
   if (valid) {
-    mk("msg-rollback", t("chat.rollback"), ROLLBACK_SVG, () => rollbackChat(idx as number));
+    mk("msg-rollback", t("chat.rollback"), ROLLBACK_SVG, (b) => void onRollbackClick(idx as number, b));
   }
   if (valid && opts.retry) {
     mk("msg-retry", t("chat.retry"), RETRY_SVG, () => retryChat(idx as number));
   }
   msg.appendChild(wrap);
 }
+
+/** 动作条**懒创建**：鼠标进到哪条气泡上，才给哪条建 `.msg-actions`。
+ *
+ *  **为什么必须有它**（2026-10-02 实测，本轮最大的一项收益）：以前每条消息渲染时都挂
+ *  一个动作条 + 1–3 个按钮 + 每个按钮一个内联 SVG。一份 45,216 条消息的会话里，
+ *  光这一项就是 `.msg-actions` / `.msg-copy` / `.msg-rollback` **各 45,216 个**、
+ *  `<svg>` **115,268 个** —— 占全部 108 万节点的**六成以上**。
+ *
+ *  **挂一次、委派到底**：监听器挂在 `#results-list`（它不随重绘被换掉）。
+ *  挂到 `#chat-log` 上就得每次重绘重挂一遍（`innerHTML =` 会把监听器连同旧节点一起丢掉），
+ *  那种「重绘处要记得重挂」的隐式耦合迟早漏一处。
+ *
+ *  幂等靠 `.msg-actions` 的存在性判断 —— `mouseover` 在子元素之间移动时也会连发。 */
+function installLazyMsgActions() {
+  resultsList.addEventListener("mouseover", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    const bubble = target?.closest<HTMLElement>(".chat-msg-user, .chat-msg-assistant");
+    if (!bubble || bubble.querySelector(".msg-actions")) return;
+    const raw = bubble.dataset.idx;
+    const idx = raw !== undefined && Number.isFinite(Number(raw)) ? Number(raw) : undefined;
+    attachMsgActions(bubble, idx, { retry: bubble.classList.contains("chat-msg-user") });
+  });
+}
+installLazyMsgActions();
 
 /** 解析 startAIChat 拼装的 finalQuery（含 [Attached files] 前缀），
  *  恢复原始提问文本与附加文件列表，供重试复用。 */
@@ -1656,17 +2025,29 @@ const COPY_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" st
 /** 回退对话到消息 `idx`（**闭区间**，即保留这条）：丢掉其后的全部消息、把裁剪后的会话存盘、
  *  把保留下来的历史灌回 agent 上下文，然后整块重绘。`idx = -1` 表示回退到空对话（重试首条消息用）。
  *
- *  **A11（2026-09-20）**——回退点从「用户轮」扩到**任意消息**（助手回复也能当回退点），
- *  并把纪律写死在这里：
- *  - **只回退对话与 agent 上下文**：磁盘上 agent 已经改动的文件**一律不动**（没有文件
- *    内容历史快照，也没有 `fileHistory`）。界面文案必须如实说明这一点。
+ *  **A11（2026-09-20）**——回退点从「用户轮」扩到**任意消息**（助手回复也能当回退点）。
+ *  **2026-09-30 起多了一步「文件回退」**（用户要求「按回退按钮把已更改文件也回退到那个
+ *  对话点，并提示用户文件将会回退」）：详见下面的第 4 步与 `revertFileSnapshots()` ——
+ *  只有**这一轮真的采到快照**（= 当前这次对话里 agent 用 Write/Edit 动过的文件）才还原；
+ *  采不到快照的文件（快照读不出来、二进制、超上限，或文件是恢复历史后才出现的）不还原，
+ *  状态栏会如实分开报「已还原 N / 跳过 M / 失败 K」。界面提示分两层：
+ *  ① 动手**之前**那一次两段式确认（`onRollbackClick`；2026-10-06 起**任何**回退都要确认，
+ *     不只是有文件要还原的那种）；
+ *  ② 动手**之后**状态栏的结果文案。
  *  - **不可撤销**：这里会立刻把裁剪后的会话写回 `chat.db`（全删全插），被丢掉的那段
  *    没有第二份 —— 旧实现往 localStorage 塞过一份 `lunac-rollback-snapshots`，但**全仓
  *    没有读取方**（纯死代码 + 白占配额），A11 一并删掉，注释随之改成实话。
  *  - 重绘后的气泡下标由 `renderChatLogHtml()` 重新烘焙，`shiftRenderedMsgIdx` 的存量
- *    偏移随之归零。 */
+ *    偏移随之归零。
+ *  - **过程快照也随回退走**（2026-10-06）：第 1.6 步按 `turn < kept` 裁掉被丢弃那几轮的
+ *    `sessionSteps`（**在存盘之前**，否则盘上会留着），第 5.5 步再把保留的部分重插回 DOM
+ *    —— 少任一步都会表现为「回退后思考 / 工具卡整片消失」或「改动过的文件与对话对不上」。 */
 async function rollbackChat(idx: number) {
   if (idx < -1 || (idx >= 0 && !chatHistory[idx])) return;
+  // **必须在裁剪 chatHistory 之前算**（K 的定义就是「保留下来的助手消息条数」）：
+  //   · 第 4 步的文件快照分界线用它；
+  //   · 待办时间线的裁剪也用它（`turn < K` 的快照才属于回退点之前）。
+  const kept = keptAssistantCountFor(idx);
   // 必须在下面把 isStreaming 清零**之前**记住：第 4 步要靠它决定「要不要先取消这次运行」。
   const wasStreaming = isStreaming;
   if (isStreaming) {
@@ -1675,11 +2056,22 @@ async function rollbackChat(idx: number) {
     setStreamingUI(false);
     cliTextCallback = null;
     cliDoneCallback = null;
+    // 飞行中的工具卡当场收尾：下面会杀掉 agent.exe，那些 `tool_result` 不会再来
+    //（与 `stopAIChat` 同口径，见 backlog M2-6）。必须在 `agentView = null` **之前**调。
+    markFlyingCardsStopped(agentView);
     agentView = null;
     agentTurn = null;
   }
   // 1) Trim to the roll-back node (inclusive)
   chatHistory = chatHistory.slice(0, idx + 1);
+  // 1.5) 待办时间线一并裁掉「被丢掉那几轮」的快照（2026-10-02）。必须排在**存盘之前**：
+  //      否则盘上还留着回退点之后的待办，下次恢复会话又把它摆出来。
+  sessionTodoTimeline = sessionTodoTimeline.filter(s => s.turn < kept);
+  // 1.6) 过程快照（思考 / 工具卡）按**同一把尺子**裁掉（2026-10-06 加）。也必须在存盘之前
+  //      —— 否则盘上留着被丢掉那几轮的过程，恢复会话时又冒出来。
+  //      裁完还要**重插回 DOM**（见第 5 步）：旧实现不裁也不重插，于是回退后过程块整片消失
+  //      （用户报「第一段对话的思考过程丢失」），而且「改动过的文件」会与对话对不上。
+  sessionSteps = sessionSteps.filter(g => g.turn < kept);
   // 2) Persist the trimmed session
   try { await saveCurrentSession(); } catch {}
   // 3) 让 agent 的上下文与界面保持一致（2026-09-17 改）。
@@ -1692,18 +2084,84 @@ async function rollbackChat(idx: number) {
   //    把历史补上（`cliReady` 此刻为 false，它自己会挂起）。
   if (wasStreaming) {
     try { await invoke("stop_cli"); } catch {}
+    // agent 已死 ⇒ 待审批的卡再也答不了，必须清掉（`stopAIChat` 一直这么做，回退路径
+    // 此前漏了这一步）：否则「重试」之后旧审批卡还留在停靠位上、看起来像任务没停，而且
+    // 那个 request_id 不会再有人应答。
+    clearPermissionCards();
     cliReady = false;
     try { await invoke("start_cli"); } catch {}
   }
   queueAgentHistory(chatHistory);
-  // 4) Re-render
+  // 4) 文件回退（2026-09-30）：把 agent 在被丢掉那几轮里改过的磁盘文件还原回去。
+  //    K = **保留下来的助手消息条数**；`turn >= K` 的快照就是被丢掉那几轮的改动。
+  //    还原按回合倒序执行 ⇒ 落点 = 回退点的状态（见 revertFileSnapshots）。
+  const revert = await revertFileSnapshots(kept);
+  // 回退当场把裁剪后的快照表写回盘：**盘上那份必须立刻等于内存这份** ——
+  // 不然用户这会儿关掉应用，盘上还留着「已经回退过」的那几条，下次恢复会话再点回退
+  // 就是**重复还原**（文件被退到更早的状态）。写失败只 console，不影响回退本身。
+  await persistSessionFrames();
+  // 5) Re-render
   renderChatLogHtml();
+  // 5.5) 过程块重插（2026-10-06）：上面那次重绘**只画 `chatHistory` 的纯文本气泡**，
+  //      若不补这一步，回退后思考 / 工具卡会整片消失（用户报「思考过程丢失」）。
+  //      此时 `sessionSteps` 已在第 1.6 步裁到回退点 ⇒ 挂出来的过程与对话一致。
+  renderHistoryProcess(sessionSteps);
   // 「改动过的文件」跟着过程快照重建（写进任务抽屉，见 renderTodoDrawer）。
-  // 注：`sessionSteps` 本身不随回退裁剪（既有行为），所以这里通常与回退前一致 ——
-  // 但它保证「列表 = 记录里真实存在的改动」这一条恒成立，不依赖调用顺序。
+  // 自 2026-10-06 起 `sessionSteps` **会**随回退裁剪（第 1.6 步），所以这份列表现在真的
+  // 等于「保留下来的回合里改动过的文件」—— 此前它不裁，回退后列表与对话对不上。
   rebuildChangedFilesFromSteps(sessionSteps);
-  statusText.textContent = t("chat.rolled_back");
+  // 待办跟着回退点还原（2026-10-02）：`turn < kept` 的最后一条 = 回退那一刻的清单。
+  // 这就是「一点回退任务列表就没了」的修复点 —— 与上面文件列表同一批重建。
+  applyTodoTimeline(kept);
+  // 已还原的文件从列表里摘掉 —— **必须排在 rebuild 之后**（`sessionSteps` 不随回退
+  // 裁剪，rebuild 会把它们原样装回来）。同一文件若在保留下来的回合里也改过，
+  // `revertFileSnapshots` 已经把它从 `paths` 里去掉了（那部分改动没有回退）。
+  if (revert.paths.size > 0) {
+    sessionChangedFiles = sessionChangedFiles.filter(p => !revert.paths.has(p));
+    renderTodoDrawer();
+  }
+  statusText.textContent = rolledBackStatusText(revert);
   requestAnimationFrame(() => chatInput.focus());
+}
+
+/** 回退结束的状态栏文案 —— 有还原就报数，「跳过 / 失败」分开写，不合成一个含糊的「部分成功」。 */
+function rolledBackStatusText(r: { restored: number; deleted: number; skipped: number; failed: number }): string {
+  const n = r.restored + r.deleted;
+  const extra: string[] = [];
+  if (r.skipped > 0) extra.push(t("chat.rollback_files_skipped", { n: String(r.skipped) }));
+  if (r.failed > 0) extra.push(t("chat.rollback_files_failed", { n: String(r.failed) }));
+  if (n === 0 && extra.length === 0) return t("chat.rolled_back");
+  const head = n > 0 ? t("chat.rolled_back_files", { n: String(n) }) : t("chat.rolled_back");
+  return extra.length ? `${head} · ${extra.join(" · ")}` : head;
+}
+
+/** 回退按钮的**两段式确认**（2026-09-30；2026-10-06 起「对话回退本身」也必须确认）。
+ *
+ *  第一次点 = 把按钮置为待确认态（`data-armed="1"`，红底）并在状态栏写明这次会丢什么，
+ *  4 秒内再点一次才执行。文案分两种：
+ *    · 有文件要还原 ⇒ 「N 个已更改文件将会回退」（动手**之前**就告诉用户，不只是事后报数）；
+ *    · 无文件       ⇒ 「其后的对话将被移除（不可撤销）」。
+ *
+ *  ⚠️ **2026-10-06 改掉「没文件就一步到位」**（用户报「这个回退并没有提醒用户是否回退」）：
+ *  回退会**立刻把裁剪后的会话写回 `chat.db`、且不可撤销**（见 `rollbackChat` 的文件头），
+ *  一个会丢数据的动作不该因为「恰好没动过文件」就静默执行。
+ *
+ *  为什么不用原生 `confirm`：全仓一贯不用（`.run-mode-confirm` 那条注释写明「不用原生
+ *  confirm，就地长二次确认」）。 */
+async function onRollbackClick(idx: number, btn: HTMLElement) {
+  if (btn.dataset.armed === "1") {
+    btn.dataset.armed = "";
+    await rollbackChat(idx);
+    return;
+  }
+  const files = new Set(pendingFileReverts(keptAssistantCountFor(idx)).map(s => s.path));
+  btn.dataset.armed = "1";
+  statusText.textContent = files.size
+    ? t("chat.rollback_files_armed", { n: String(files.size) })
+    : t("chat.rollback_armed");
+  window.setTimeout(() => {
+    if (btn.dataset.armed === "1") btn.dataset.armed = "";
+  }, 4000);
 }
 
 async function showChatHistory() {
@@ -1801,6 +2259,8 @@ function forceResetPluginUI() {
   // Reset plugin state flags
   pluginActive = false;
   activePluginId = null;
+  // 面板关了 ⇒ 它起的 sidecar 进程一起收掉（契约 ⑥「必须绑定面板」）
+  deactivatePluginSidecar();
   isChatHistoryView = false;
   // 本函数不走 applyWindowSize()，所以必须自己补一次界面层同步 —— 否则调用方
   // 回到简洁搜索后 Rust 还停在 plugin，Esc 会一直 emit clear、永远隐藏不掉窗口。
@@ -1818,6 +2278,7 @@ function forceResetPluginUI() {
   cliTextCallback = null;
   cliDoneCallback = null;
   pendingMessages = [];
+  renderChatQueue();
   // Ensure both inputs are unlocked
   searchInput.disabled = false;
   chatInput.disabled = false;
@@ -1829,6 +2290,45 @@ function forceResetPluginUI() {
   showTokenDashboard(false);
 }
 
+// ── 软件更新：启动时的静默检查（2026-09-30）──────────────────────
+// 宿主侧见 src-tauri/src/updater.rs。三条纪律：
+//   ① **不阻塞启动、失败一律吞掉**：延迟几秒后在后台跑。网络不通不该在启动时弹任何东西
+//      —— 用户什么都没做错。只有他手动点「检查更新」的那次才如实显示错误。
+//   ② 有新版时**唯一的可见提示**是设置齿轮上的一个点（`#settings-btn.has-update`，
+//      样式见 styles.css）：不弹窗、不抢焦点。版本号与「下载并安装」都在设置→常规里。
+//   ③ `autoInstall` 打开时才真的自己装 —— 那会拉起安装器并**重启应用**，
+//      所以它必须是用户主动打开的开关（默认关，见 updater.rs 的 UpdateConfig）。
+interface UpdateStatusPayload {
+  current: string;
+  hasUpdate: boolean;
+  latest: string;
+  notes: string;
+  size: number;
+}
+
+function startUpdateCheckOnBoot(): void {
+  void (async () => {
+    try {
+      const cfg = await invoke<{ checkOnStartup: boolean; autoInstall: boolean }>("update_config_get");
+      if (!cfg.checkOnStartup) return;
+      // 让启动的先跑完（磁盘 / 网络 / 界面），别和冷启动抢时间
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      const st = await invoke<UpdateStatusPayload>("update_check");
+      if (!st.hasUpdate) return;
+      console.log(`[lunac] 发现新版本 ${st.latest}（当前 ${st.current}）`);
+      if (cfg.autoInstall) {
+        // 成功路径上应用会退出（装完由安装器重新拉起）⇒ 这行之后的代码不会执行
+        await invoke("update_install");
+        return;
+      }
+      settingsBtn.classList.add("has-update");
+    } catch (e) {
+      // 静默：更新检查失败不该在启动时打扰用户（诊断信息在控制台与宿主日志里）
+      console.log("[lunac] 启动检查更新跳过：", e);
+    }
+  })();
+}
+
 // ── Init i18n + plugins ──────────────────────────────────────────
 (async () => {
   await initI18n();
@@ -1836,7 +2336,7 @@ function forceResetPluginUI() {
   applyI18nToStaticUI();
   // 磁盘插件的宿主桥：**必须在任何插件模块被加载之前装好** —— 插件里的 `t` 走的是它
   //（见 plugins/host.ts：插件自带的 i18n 副本没初始化过，语言会退回 key）。
-  installHostBridge({ t, apiVersion: 1 });
+  installHostBridge({ t, apiVersion: 2, sidecar: createSidecarBridge() });
   registerBuiltinPlugins();
   // 磁盘插件（L1）：扫 `<exe 根>\Modules\` 并注册进同一个 registry —— 放在状态行之前，
   // 让「插件 N」把第三方也算上（结果区能搜到的就是这一份）。失败不抛（只记控制台）。
@@ -1845,6 +2345,9 @@ function forceResetPluginUI() {
 
   // 预热备忘录标识检索索引（供搜索栏“标识直达编辑”使用）
   import("./plugins/builtin/memo").then(m => m.refreshMemoIndex()).catch(() => {});
+
+  // 软件更新：后台静默检查一次（不阻塞、失败不打扰，见 startUpdateCheckOnBoot 的三条纪律）
+  startUpdateCheckOnBoot();
 
   // AI 供应商配置不再由前端恢复：唯一真相源是 <exe 根>\config\ai.json，
   // 由 Rust 侧 main() 在启动时读回并注入环境变量（见 commands::apply_saved_ai_config）。
@@ -2091,7 +2594,8 @@ pluginBarFloat.addEventListener("click", async () => {
   if (!pluginActive || !id) return;
   const input = searchInput.value.trim();
   try {
-    await invoke("open_plugin_window", { pluginId: id, input });
+    // `key: null` = 主窗（附属窗才给 key，见插件窗那条通路）
+    await invoke("open_plugin_window", { pluginId: id, key: null, input });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     statusText.textContent = t("plugin.float_failed", { error: msg });
@@ -2147,19 +2651,28 @@ async function newConversation(skipCliRestart = false) {
   agentView = null;
   agentTurn = null;
   pendingMessages = [];
+  renderChatQueue();
   // 表盘口径 = 当前这次对话，新对话即归零（按天日志不受影响，对账照旧）
   resetUsageTotals();
   liveCompaction = { elided: 0, dropped: 0 };
   // 新对话 → 过程快照也重新开始（旧会话的已随它自己的记录落盘）
   sessionSteps = [];
   // 「改动过的文件」跟着同一条生命周期（它本来就是从过程快照推导出来的）——
-  // 不跟着清会看到上一次对话改的文件还挂在列表里。待办清单同理（它是下一条
-  // TodoWrite 才会重新建立的临时状态）。两者都装在任务抽屉里，清完即收起。
+  // 不跟着清会看到上一次对话改的文件还挂在列表里。待办清单同理，但它现在有**时间线**
+  // （随会话落盘，见 sessionTodoTimeline）—— 新对话意味着这条时间线也从头开始；
+  // 旧会话那份已经随它自己的记录落盘，切回去照样能还原。两者都装在任务抽屉里，清完即收起。
   sessionChangedFiles = [];
+  // 文件快照同寿命：新对话不再需要回退上一段对话的改动。
+  // 旧的快照**已经在盘上**（随那次会话记录落盘，见 persistCurrentSessionInner）——
+  // 这里只清内存这份，别去删盘上那份：切回那个历史会话还要用它。
+  sessionFileSnapshots = [];
+  framesEpoch++;
+  sessionTodoTimeline = [];
   todoItems = [];
   todoTasksOpen = false;
   todoFilesOpen = false;
   todoDismissed = false;
+  resetChangeReview();
   renderTodoDrawer();
 
   // Restart CLI to clear accumulated conversation context.
@@ -2173,7 +2686,6 @@ async function newConversation(skipCliRestart = false) {
     updateAgentStatus("ready");
   }
 
-  humanizeBtn.style.display = "none";
   closeDrawer();
 
   // Show fresh AI chat UI
@@ -2306,6 +2818,37 @@ function applyRunModeProfile(mode: AgentRunMode, restart: boolean) {
   setSecurityProfile(profile, restart);
 }
 
+// ── 权限（文件边界；UI 名 2026-10-06 由「安全档位」改为「权限」）────────────
+// 与「命令审批方式」正交：后者决定「问不问」（前端审批），这里决定「允不允许」
+// （后端文件边界，会重启 agent）。交互照搬那个按钮 —— 点一下循环三档。
+const PROFILE_ORDER: SecurityProfile[] = ["safe", "project", "full"];
+const PROFILE_LABEL_KEY: Record<SecurityProfile, string> = {
+  safe: "settings.security_profile_ro",
+  project: "settings.security_profile_project",
+  full: "settings.security_profile_full",
+};
+
+/** 刷新「更多设置」里那一行的档位文字与 tooltip（语言切换 / 切换后都要调）。 */
+function renderProfileUI() {
+  if (!chatProfileBtn) return;
+  const p = getSavedProfile();
+  chatProfileBtn.textContent = t(PROFILE_LABEL_KEY[p]);
+  chatProfileBtn.dataset.profile = p;
+  const tip = `${t("settings.security_profile")}：${t(PROFILE_LABEL_KEY[p])} — ${t("settings.security_profile_hint")}`;
+  chatProfileBtn.setAttribute("title", tip);
+  chatProfileBtn.setAttribute("aria-label", tip);
+}
+
+chatProfileBtn?.addEventListener("click", (e) => {
+  e.stopPropagation(); // 别让「更多」菜单的 outside-click 把它关掉
+  const next = PROFILE_ORDER[(PROFILE_ORDER.indexOf(getSavedProfile()) + 1) % PROFILE_ORDER.length];
+  setSecurityProfile(next, true);
+  // 只读档下「自动运行」的说法不成立 → 收回到最保守的「手动」（收紧方向）。
+  if (next === "safe") writeRunMode("manual");
+  renderRunModeUI();
+  renderProfileUI();
+});
+
 // 设置面板改了安全档位 → 同步胶囊显示（只读档下「自动运行」的说法不成立，
 // 收回到最保守的「手动」；这是收紧方向，不会悄悄放松询问）。
 window.addEventListener("lunac-security-profile-changed", (e) => {
@@ -2314,6 +2857,7 @@ window.addEventListener("lunac-security-profile-changed", (e) => {
   setSecurityProfile(profile, true);
   if (profile === "safe") writeRunMode("manual");
   renderRunModeUI();
+  renderProfileUI();
 });
 
 let runModeConfirmEl: HTMLElement | null = null;
@@ -2430,7 +2974,7 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "Read" },
   { name: "Write" },
   { name: "Edit" },
-  { name: "Bash" },
+  { name: "Cmd" },
   { name: "PowerShell" },
   { name: "Glob" },
   { name: "Grep" },
@@ -2459,6 +3003,11 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   // （禁掉后模型只能直接动手，或在正文里讲计划）。
   { name: "EnterPlanMode" },
   { name: "ExitPlanMode" },
+  // 多代理通信（2026-10-05，A13）：同一轮并发的那几个子代理互相看见（ListPeers）与
+  // 投一段文本（SendMessage）。两件都**不碰本机**（只读写 agent 进程内的 peer 登记处），
+  // 列出来同样只是给用户一个开关。
+  { name: "ListPeers" },
+  { name: "SendMessage" },
 ];
 
 function loadCustomBlacklist(): string[] {
@@ -2557,7 +3106,6 @@ function renderPersonaLabels() {
   chatPersonaSave.textContent = t("settings.persona_save");
   chatPersonaReset.textContent = t("settings.persona_reset");
   chatPersonaRestart.textContent = t("settings.persona_restart");
-  chatPersonaHint.textContent = t("settings.persona_hint", { max: String(personaMax) });
 }
 
 async function loadPersona() {
@@ -2569,7 +3117,6 @@ async function loadPersona() {
   } catch {
     /* 读不到就留空：用户照样能写，保存走宿主校验，不必在这里报错 */
   }
-  chatPersonaText.placeholder = t("settings.persona_placeholder");
   renderPersonaLabels();
 }
 
@@ -2683,6 +3230,257 @@ function toggleDrawer(show?: boolean) {
   if (target) openDrawer(); else closeDrawer();
 }
 
+// ── 「提问节点」（2026-10-02，用户要求；同日改成**右侧竖排小圆点**）──────
+//
+// 右侧常驻**一排小点**（一颗 = 一段提问，高亮那颗 = 现在读到哪条）；鼠标移到轨道上
+// 才展开列出问题正文的窗口，点一行就跳到那条气泡。四条设计约束：
+//   ① **列表只认 `chatHistory`**（内存里的权威副本），**不查 DOM** —— 聊天流是
+//      窗口化渲染的（见 `CHAT_RENDER_WINDOW`），早先的气泡根本不在 DOM 里，
+//      查 DOM 只能列出最后一屏，而「跳转」恰恰是给长会话用的；
+//   ② **列表自己也窗口化**（`CHAT_NODE_WINDOW`）—— 一份两万多条提问的会话若逐条建行，
+//      右栏自己就是几万个节点，等于把刚修掉的问题从左边搬到右边；
+//   ③ **轨道必须封顶**（`CHAT_NODE_DOTS_MAX`）：点虽小，但两万个点就是两万个 DOM 节点
+//      加一条几十万像素高的轨道。超上限就**按比例采样**（一颗点代表一段提问），
+//      跳转落在「这一段的第一条」；每颗点记着 `data-user`，所以「哪颗点算当前」不必重算采样公式；
+//   ④ **「现在在哪」只看 DOM 里那段**（`currentQuestionIndex`）—— 视口中线之上最后一条
+//      用户消息。聊天流是窗口化的，所以这个判据天然只看得到当前窗口，不会去扫几万条。
+
+/** 轨道上最多几颗点（见上面约束 ③）。 */
+const CHAT_NODE_DOTS_MAX = 48;
+
+/** 右栏是否开着（= 鼠标停在轨道 / 面板上）。 */
+function isChatNodesOpen(): boolean {
+  return chatNodePanel.classList.contains("visible");
+}
+
+/** 本会话的提问在 `chatHistory` 里的下标表（升序）。两处渲染共用同一份判据。 */
+function chatUserIndices(): number[] {
+  const users: number[] = [];
+  chatHistory.forEach((m, idx) => { if (m.role === "user") users.push(idx); });
+  return users;
+}
+
+/** 提问节点的显示标签 = 剥掉 `[Attached files]` 前缀、折成一行。 */
+function chatNodeLabel(msgIdx: number): string {
+  return parseAttachedQuery(chatHistory[msgIdx]?.content ?? "").text.replace(/\s+/g, " ").trim();
+}
+
+/** 现在读到哪条提问（返回 `users` 里的下标）。判据见约束 ④。 */
+function currentQuestionIndex(users: number[]): number {
+  if (!users.length) return 0;
+  const box = resultsList.getBoundingClientRect();
+  const line = box.top + box.height * 0.35; // 用 1/3 高度处当「阅读线」：比正中稳，不会随一行高度抖
+  let best = -1;
+  resultsList.querySelectorAll<HTMLElement>("#chat-log [data-idx]").forEach((node) => {
+    if (node.getBoundingClientRect().top > line) return;
+    const idx = Number(node.dataset.idx);
+    if (Number.isFinite(idx) && idx > best) best = idx;
+  });
+  if (best < 0) return 0; // 还没滚到任何提问（在开场提示上）⇒ 指第一条，不空着
+  let n = 0;
+  for (let i = 0; i < users.length; i++) {
+    if (users[i] <= best) n = i;
+    else break;
+  }
+  return n;
+}
+
+/** 把「现在读到哪条」标到轨道与标题上。**轨道不存在就直接返回**（主窗 / 空会话）。 */
+function updateChatNodeCurrent() {
+  if (!IS_CHAT_WINDOW) return;
+  const dots = chatNodeDots.querySelectorAll<HTMLElement>(".chat-node-dot");
+  if (!dots.length) return;
+  const users = chatUserIndices();
+  if (!users.length) return;
+  const cur = currentQuestionIndex(users);
+  const curMsg = users[cur];
+  // 当前那颗 = **`data-user` 不超过当前提问的最后一颗**（采样时一颗点代表一段，取段首）。
+  let pick: HTMLElement | null = null;
+  dots.forEach((d) => { if (Number(d.dataset.user) <= curMsg) pick = d; });
+  dots.forEach((d) => { d.classList.toggle("current", d === pick); });
+  chatNodePos.textContent = t("chat.node_pos", { n: String(cur + 1), total: String(users.length) });
+  // 点多到轨道自己会滚时，把当前那颗带进视野（**只动轨道自己的 scrollTop**，
+  // 不能用 scrollIntoView —— 那会连 `#results-list` 一起滚，把正在读的位置抖掉）。
+  const rail = chatNodeRail as HTMLElement;
+  const p = pick as HTMLElement | null;
+  if (p) {
+    const top = p.offsetTop;
+    const bottom = top + p.offsetHeight;
+    if (top < rail.scrollTop) rail.scrollTop = top - 8;
+    else if (bottom > rail.scrollTop + rail.clientHeight) rail.scrollTop = bottom - rail.clientHeight + 8;
+  }
+}
+
+/** 轨道（常驻）。`users` 由调用方传入，避免同一次渲染里数两遍。 */
+function renderChatNodeRail(users: number[]) {
+  chatNodeDots.innerHTML = "";
+  const total = users.length;
+  const n = Math.min(total, CHAT_NODE_DOTS_MAX);
+  // 空会话 / 主窗：整条轨道收起（留着一条空壳会让人以为「点了没反应」）
+  chatNodeRail.classList.toggle("hidden", !IS_CHAT_WINDOW || n === 0);
+  for (let i = 0; i < n; i++) {
+    // 不采样时一顆点一条；采样时每颗点覆盖 [from, to] 这一段
+    const from = n >= total ? i : Math.floor((i * total) / n);
+    const to = n >= total ? i : Math.max(from, Math.floor(((i + 1) * total) / n) - 1);
+    const label = chatNodeLabel(users[from]) || t("chat.node_untitled");
+    const dot = doc("button");
+    dot.setAttribute("type", "button");
+    dot.className = "chat-node-dot";
+    dot.dataset.user = String(users[from]);
+    dot.title = from === to ? `#${from + 1} ${label}` : `#${from + 1}–#${to + 1}`;
+    dot.addEventListener("click", () => jumpToChatMsg(users[from]));
+    chatNodeDots.appendChild(dot);
+  }
+}
+
+/** 开 / 关列表窗口。**开着才建列表**：长会话那几百行没必要在关着的时候也常驻。 */
+function showChatNodes(on: boolean) {
+  chatNodePanel.classList.remove("hidden");
+  chatNodePanel.classList.toggle("visible", on);
+  if (on) {
+    renderChatNodeList();
+    updateChatNodeCurrent();
+  }
+}
+
+/** 悬停开合。轨道与面板**共用一套**：从轨道滑进面板时不能收 —— 两边都算「在里面」，
+ *  中间那条缝用一小段延迟跨过去（180ms，比面板 250ms 的滑入短，不会看到它先开完再关）。 */
+let chatNodeHideTimer: number | undefined;
+function chatNodesHover(on: boolean) {
+  if (!IS_CHAT_WINDOW) return;
+  if (chatNodeHideTimer !== undefined) {
+    window.clearTimeout(chatNodeHideTimer);
+    chatNodeHideTimer = undefined;
+  }
+  if (on) {
+    showChatNodes(true);
+  } else {
+    chatNodeHideTimer = window.setTimeout(() => {
+      chatNodeHideTimer = undefined;
+      showChatNodes(false);
+    }, 180);
+  }
+}
+
+/** 列表（窗口化）。`reset` = 把起点挪回「最近一屏」（切会话时用）。 */
+function renderChatNodeList(opts: { reset?: boolean } = {}) {
+  if (!IS_CHAT_WINDOW) return; // 主窗没有整段会话，也没这条轨道
+  const users = chatUserIndices();
+  const tail = Math.max(0, users.length - CHAT_NODE_WINDOW);
+  if (opts.reset) chatNodeFrom = tail;
+  chatNodeFrom = Math.max(0, Math.min(chatNodeFrom, tail));
+  renderChatNodeRail(users);      // 轨道常驻：与窗口开没开无关
+  if (!isChatNodesOpen()) return; // 关着就别建那几百行
+  chatNodeList.innerHTML = "";
+  if (!users.length) {
+    const empty = doc("div");
+    empty.className = "chat-node-empty";
+    empty.textContent = t("chat.node_empty");
+    chatNodeList.appendChild(empty);
+    return;
+  }
+  if (chatNodeFrom > 0) {
+    const more = doc("button");
+    more.setAttribute("type", "button");
+    more.className = "chat-load-earlier";
+    more.textContent = t("chat.node_earlier", { n: String(Math.min(chatNodeFrom, CHAT_NODE_WINDOW)) });
+    more.addEventListener("click", () => {
+      chatNodeFrom = Math.max(0, chatNodeFrom - CHAT_NODE_WINDOW);
+      renderChatNodeList();
+    });
+    chatNodeList.appendChild(more);
+  }
+  // 「现在在哪」在列表里也要看得出来：先算一次当前提问，建行时顺手标上 `.active`。
+  const curMsg = users.length ? users[currentQuestionIndex(users)] : -1;
+  for (let i = chatNodeFrom; i < users.length; i++) {
+    const msgIdx = users[i];
+    const label = chatNodeLabel(msgIdx);
+    const row = doc("button");
+    row.setAttribute("type", "button");
+    row.className = "chat-node-item" + (msgIdx === curMsg ? " active" : "");
+    row.dataset.msgIdx = String(msgIdx);
+    row.title = label;
+    const num = doc("span");
+    num.className = "chat-node-idx";
+    // 编号是**提问的绝对序号**（不是窗口内的序号）—— 窗口滑动时编号必须稳定。
+    num.textContent = `#${i + 1}`;
+    const txt = doc("span");
+    txt.className = "chat-node-text";
+    // 提问里可能带尖括号之类：一律 `textContent`，绝不 `innerHTML`。
+    txt.textContent = label || t("chat.node_untitled");
+    row.append(num, txt);
+    row.addEventListener("click", () => jumpToChatMsg(msgIdx));
+    chatNodeList.appendChild(row);
+  }
+}
+
+/** 跳到某条消息：**目标在渲染窗口之外就先扩窗**（从内存里取回来），再滚动 + 闪一下。 */
+function jumpToChatMsg(msgIdx: number) {
+  if (msgIdx < 0 || msgIdx >= chatHistory.length) return;
+  if (msgIdx < chatRenderFrom) {
+    // 留一点上文（三分之一屏）—— 跳过去不至于只看得到孤零零一条。
+    renderChatLogHtml({ from: Math.max(0, msgIdx - Math.floor(CHAT_RENDER_WINDOW / 3)) });
+  }
+  const el = document.querySelector<HTMLElement>(`#chat-log [data-idx="${msgIdx}"]`);
+  if (!el) return;
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  // 先摘再加：连点同一条时动画才会重放（否则第二次点没有任何反馈）。
+  el.classList.remove("chat-msg-flash");
+  void el.offsetWidth;
+  el.classList.add("chat-msg-flash");
+  chatNodeList.querySelectorAll<HTMLElement>(".chat-node-item").forEach((r) => {
+    r.classList.toggle("active", r.dataset.msgIdx === String(msgIdx));
+  });
+  // 轨道上的高亮**立刻**跟上（别等滚动事件 —— 平滑滚动要几百毫秒，那期间点还停在旧位置）。
+  const users = chatUserIndices();
+  const cur = users.indexOf(msgIdx);
+  if (cur >= 0) {
+    const dots = chatNodeDots.querySelectorAll<HTMLElement>(".chat-node-dot");
+    let pick: HTMLElement | null = null;
+    dots.forEach((d) => { if (Number(d.dataset.user) <= msgIdx) pick = d; });
+    dots.forEach((d) => { d.classList.toggle("current", d === pick); });
+    chatNodePos.textContent = t("chat.node_pos", { n: String(cur + 1), total: String(users.length) });
+  }
+}
+
+chatNodeRail.addEventListener("mouseenter", () => chatNodesHover(true));
+chatNodeRail.addEventListener("mouseleave", () => chatNodesHover(false));
+// 面板只在它**开着**的时候才可能收到鼠标（关着时 `pointer-events: none`）。
+chatNodePanel.addEventListener("mouseenter", () => chatNodesHover(true));
+chatNodePanel.addEventListener("mouseleave", () => chatNodesHover(false));
+// 滚动时更新「现在在哪」。rAF 节流：一帧最多算一次，而且只扫当前 DOM 里那几十条。
+let chatNodeScrollRaf = 0;
+resultsList.addEventListener("scroll", () => {
+  if (!IS_CHAT_WINDOW || chatNodeScrollRaf) return;
+  chatNodeScrollRaf = requestAnimationFrame(() => {
+    chatNodeScrollRaf = 0;
+    updateChatNodeCurrent();
+  });
+}, { passive: true });
+
+/** 抽屉里「一个会话展开后一次建几轮」——与右栏 `CHAT_NODE_WINDOW` 同一条纪律：
+ *  不封顶的话，一份几百轮的会话会给抽屉塞进几百个节点。 */
+const DRAWER_TURNS_WINDOW = 20;
+
+/** 哪些会话在抽屉里是「摊开成轮次列表」的（按会话 id 记，重绘/重开抽屉都不丢）。 */
+const drawerExpanded = new Set<string>();
+/** 每个展开的会话各自摊开了多少轮（默认 `DRAWER_TURNS_WINDOW`，点「更早」往上加）。 */
+const drawerTurnCount = new Map<string, number>();
+
+/** 抽屉里某一轮的缩略标签：与右栏 `chatNodeLabel` **同一套剥法**（去掉 `[Attached files]`
+ *  前缀、折成一行）。差别只在数据源 —— 这里读的是**会话记录里的那条**，不是当前 `chatHistory`。 */
+function chatTurnLabel(content: string): string {
+  return parseAttachedQuery(content).text.replace(/\s+/g, " ").trim();
+}
+
+/** 左抽屉：会话列表。
+ *
+ *  **U2 第一刀（2026-10-06）**：每个会话可**摊开成一轮轮的提问缩略**，点某一轮 =
+ * 恢复该会话并**停到那一轮**上。在此之前抽屉只有「整段恢复会话」这一种粒度 ——
+ * 而「我要看的是那次对话的第三轮」这种需求，用户只能恢复后靠右栏那排圆点自己找。
+ *  两个来源是同一份数据（`loadSessions()` 已经带回全部 messages），不必新增宿主命令。
+ *  点某一轮时 `restoreSession` 只重建 DOM（默认渲染尾部窗口），**必须再 `jumpToChatMsg`**
+ *  —— 它自己会把渲染窗口往前挪（见那里的注释）。 */
 function renderDrawerHistory(sessions: ChatSession[]) {
   chatDrawerList.innerHTML = "";
   if (sessions.length === 0) {
@@ -2695,12 +3493,20 @@ function renderDrawerHistory(sessions: ChatSession[]) {
     const firstMsg = cleanUserContent(s.messages[0]?.content || t("chat.empty_session"));
     const preview = firstMsg.length > 60 ? firstMsg.slice(0, 60) + "…" : firstMsg;
     const msgCount = s.messages.length;
-    // 需求：标题严格居中、不显示时间，meta 仅保留消息条数。
+    // 该会话里的「提问」下标（升序）—— 与右栏 `chatUserIndices` 同一条口径
+    const users: number[] = [];
+    s.messages.forEach((m, idx) => { if (m.role === "user") users.push(idx); });
+    const expanded = drawerExpanded.has(s.id);
+    // 需求：标题严格居中、不显示时间。
+    // 「N 轮提问」**嵌进行内、替掉原来那行「N 条」**（用户 2026-10-06 定的形态）——
+    // 它本身就是这行唯一的 meta，点它摊开/收起轮次列表；列表接在会话行下方。
     item.innerHTML = `
       <div class="history-item-header">
         <div class="history-item-info">
           <div class="history-item-title">${esc(preview)}</div>
-          <div class="history-item-meta">${t("chat.msgs", { count: String(msgCount) })}</div>
+          ${users.length > 0
+            ? `<button type="button" class="history-item-meta history-turns-toggle${expanded ? " expanded" : ""}">${esc(t("chat.drawer_turns", { n: String(users.length) }))}</button>`
+            : `<div class="history-item-meta">${t("chat.msgs", { count: String(msgCount) })}</div>`}
         </div>
         <button class="history-item-delete" title="${esc(t("chat.delete_session"))}">×</button>
       </div>`;
@@ -2712,9 +3518,64 @@ function renderDrawerHistory(sessions: ChatSession[]) {
     item.querySelector(".history-item-delete")!.addEventListener("click", async (e) => {
       e.stopPropagation();
       await deleteChatSession(s.id);
+      drawerExpanded.delete(s.id);
+      drawerTurnCount.delete(s.id);
       const remaining = await loadSessions();
       renderDrawerHistory(remaining);
     });
+    // 摊开 / 收起（开关就在 header 里 ⇒ **必须 stopPropagation**，否则会顺手恢复整个会话）
+    item.querySelector(".history-turns-toggle")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (drawerExpanded.has(s.id)) drawerExpanded.delete(s.id);
+      else drawerExpanded.add(s.id);
+      renderDrawerHistory(sessions);
+    });
+
+    // ── 轮次缩略（摊开时才建行）─────────────────────────────────
+    if (expanded && users.length > 0) {
+      const list = doc("div");
+      list.className = "history-turns";
+      const shown = Math.min(users.length, drawerTurnCount.get(s.id) ?? DRAWER_TURNS_WINDOW);
+      const from = users.length - shown;
+      if (from > 0) {
+        const more = doc("button");
+        more.setAttribute("type", "button");
+        more.className = "history-turns-earlier";
+        more.textContent = t("chat.node_earlier", { n: String(Math.min(from, DRAWER_TURNS_WINDOW)) });
+        more.addEventListener("click", (e) => {
+          e.stopPropagation();
+          drawerTurnCount.set(s.id, shown + DRAWER_TURNS_WINDOW);
+          renderDrawerHistory(sessions);
+        });
+        list.appendChild(more);
+      }
+      for (let k = from; k < users.length; k++) {
+        const msgIdx = users[k];
+        const label = chatTurnLabel(s.messages[msgIdx]?.content ?? "");
+        const row = doc("button");
+        row.setAttribute("type", "button");
+        row.className = "history-turns-item";
+        row.title = label;
+        const num = doc("span");
+        num.className = "history-turns-idx";
+        // 编号 = 提问的**绝对序号**（不是窗口内的序号）
+        num.textContent = `#${k + 1}`;
+        const txt = doc("span");
+        txt.className = "history-turns-text";
+        // 提问里可能带尖括号之类：一律 `textContent`，绝不 `innerHTML`（同右栏那份）
+        txt.textContent = label || t("chat.node_untitled");
+        row.append(num, txt);
+        row.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          toggleDrawer(false);
+          await restoreSession(s);
+          // 恢复只重建了 DOM、且默认停在尾部 ⇒ 再跳一次到那一轮
+          jumpToChatMsg(msgIdx);
+        });
+        list.appendChild(row);
+      }
+      item.appendChild(list);
+    }
     chatDrawerList.appendChild(item);
   });
 }
@@ -2732,6 +3593,7 @@ function sendChatMessage() {
     statusText.textContent = t("status.queued", { count: String(pendingMessages.length) });
     chatInput.value = "";
     autoResizeChatTextarea();
+    renderChatQueue();
     return;
   }
   chatInput.value = "";
@@ -2739,18 +3601,103 @@ function sendChatMessage() {
   startAIChat(text);
 }
 
+// ── 待发送队列（2026-09-30）─────────────────────────────────────
+// 队列本身是既有的 pendingMessages（生成中按下发送即入队，本轮结束后按序发出）。
+// 这里只补两件用户可见的事：① 一条可见的队列条；② 每条可「立即发送」= 中断当前
+// 生成，把这条提前发出去（剩下的仍留在队列里）。渲染与状态栏同一份数据，别各写各的。
+
+const QUEUE_SEND_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
+const QUEUE_DEL_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+const QUEUE_EDIT_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+
+function renderChatQueue() {
+  if (pendingMessages.length === 0) {
+    chatQueue.classList.add("hidden");
+    chatQueueList.innerHTML = "";
+    return;
+  }
+  chatQueue.classList.remove("hidden");
+  chatQueueTitle.textContent = t("chat.queue_title", { count: String(pendingMessages.length) });
+  const sendTitle = esc(t("chat.queue_send_now"));
+  const editTitle = esc(t("chat.queue_edit"));
+  const delTitle = esc(t("chat.queue_remove"));
+  chatQueueList.innerHTML = pendingMessages.map((m, i) => `
+    <div class="chat-queue-item">
+      <span class="chat-queue-text">${esc(m)}</span>
+      <button type="button" class="chat-queue-btn chat-queue-send" data-qi="${i}" title="${sendTitle}" aria-label="${sendTitle}">${QUEUE_SEND_ICON}</button>
+      <button type="button" class="chat-queue-btn chat-queue-edit" data-qi="${i}" title="${editTitle}" aria-label="${editTitle}">${QUEUE_EDIT_ICON}</button>
+      <button type="button" class="chat-queue-btn chat-queue-del" data-qi="${i}" title="${delTitle}" aria-label="${delTitle}">${QUEUE_DEL_ICON}</button>
+    </div>`).join("");
+}
+
+/** 「立即发送」：把第 index 条从队列摘出，中断当前生成后**优先**发它。
+ *  剩下的排队项不受影响 —— 新一轮结束后由 processQueue 继续消化。 */
+async function sendQueuedNow(index: number) {
+  if (index < 0 || index >= pendingMessages.length) return;
+  const [msg] = pendingMessages.splice(index, 1);
+  renderChatQueue();
+  if (isStreaming) await stopAIChat({ drainQueue: false });
+  statusText.textContent = t("status.sending_queued", { count: String(pendingMessages.length) });
+  await startAIChat(msg);
+}
+
+chatQueueList.addEventListener("click", (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>(".chat-queue-btn");
+  if (!btn) return;
+  const idx = Number(btn.dataset.qi);
+  if (!Number.isInteger(idx)) return;
+  if (btn.classList.contains("chat-queue-send")) {
+    void sendQueuedNow(idx);
+  } else if (btn.classList.contains("chat-queue-edit")) {
+    // 编辑：把这一条从队列摘回输入栏（**不发送**），其余队列保留。仍处于生成中时，
+    // 用户改完再按发送会重新入队（见 sendChatMessage）。
+    const [msg] = pendingMessages.splice(idx, 1);
+    renderChatQueue();
+    chatInput.value = msg ?? "";
+    autoResizeChatTextarea();
+    chatInput.focus();
+    if (pendingMessages.length > 0) {
+      statusText.textContent = t("status.queued", { count: String(pendingMessages.length) });
+    } else if (isStreaming) {
+      statusText.textContent = t("agent.generating");
+    }
+  } else {
+    pendingMessages.splice(idx, 1);
+    renderChatQueue();
+    if (pendingMessages.length > 0) {
+      statusText.textContent = t("status.queued", { count: String(pendingMessages.length) });
+    } else if (isStreaming) {
+      // 摘掉最后一条必须把「排队中」这句擦掉：生成常常还要跑很久，不擦就会一直挂着
+      // 一个假数字（2026-09-30 真机回归发现，见 ai-spec §11 规则 70）。
+      statusText.textContent = t("agent.generating");
+    }
+  }
+});
+
 // ── Stop / Queue helpers ────────────────────────────────────────
 
+/** 发送 / 停止两个按钮的显隐（2026-10-03，用户报「生成中明明有文本却发不出去，
+ *  按钮还停在『中止当前任务』状态」）。
+ *
+ *  旧实现是「生成中把发送按钮整个藏掉、只留停止」—— 于是队列只能靠回车触发，
+ *  **按钮点不了**。现在生成中两者都在：
+ *    · 停止按钮：生成中恒显（那是这一格的主操作）；
+ *    · 发送按钮：生成中在「有文本 / 有附件」时显（点它 = **入队**，见 `sendChatMessage`），
+ *      输入为空时不显，免得空发一条。
+ *  非生成中只显发送按钮。
+ *
+ *  依赖 `isStreaming`（各调用点都先更新它再调 `setStreamingUI`），并且必须在
+ *  **文本 / 附件每次变化后**都调一次 —— 两个钩子：`autoResizeChatTextarea`（文本，含
+ *  发送后的程序化清空）与 `syncChipsEmpty`（附件增删）。 */
+function updateComposerButtons() {
+  const hasPayload = chatInput.value.trim().length > 0 || attachedFiles.length > 0;
+  chatStopBtn.style.display = isStreaming ? "flex" : "none";
+  chatSendBtn.style.display = isStreaming && !hasPayload ? "none" : "flex";
+}
+
 function setStreamingUI(streaming: boolean) {
-  if (streaming) {
-    chatSendBtn.style.display = "none";
-    chatStopBtn.style.display = "flex";
-    chatInput.placeholder = t("chat.generating");
-  } else {
-    chatSendBtn.style.display = "flex";
-    chatStopBtn.style.display = "none";
-    chatInput.placeholder = t("chat.placeholder");
-  }
+  chatInput.placeholder = streaming ? t("chat.generating") : t("chat.placeholder");
+  updateComposerButtons();
 }
 
 // ── Token dashboard ─────────────────────────────────────────────
@@ -2784,6 +3731,11 @@ function addUsageToTotals(info: ChatDoneInfo) {
 let usagePanelOpen = false;
 let usagePanelBusy = false;
 let usagePanelDirty = false;
+/** 面板右上角那个时间范围（2026-10-06，用户定）——**跨开关保留**（关掉再开还是刚才看的那段）。
+ *  按天读的仍是近 `COST_RANGE_DAYS` 天那一份，这里只决定「裁到哪段、按天还是按小时画」。 */
+let usageRange: UsageRange = DEFAULT_USAGE_RANGE;
+/** 面板左上角「当前统计的模型」（2026-10-06，用户定）：`null` = 总计（全部模型）。同样跨开关保留。 */
+let usageModel: UsageModelFilter = null;
 
 function updateTokenDashboard() {
   const { hit, miss, total, elided, dropped } = usageTotals;
@@ -2821,9 +3773,11 @@ function localStamp(d: Date): string {
   return `${localDateKey(d)}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-/** 把一次提问的用量追加进本地日志（只追加，失败不影响对话） */
-function appendUsageLog(info: ChatDoneInfo) {
-  const now = new Date();
+/** 把一次提问的用量追加进本地日志（只追加，失败不影响对话）。
+ *
+ *  `ts` 缺省 = 现在；中断兜底那条会显式传**首条请求的时刻**（见 `turnUsage.firstTs`）。 */
+function appendUsageLog(info: ChatDoneInfo, ts?: number) {
+  const now = new Date(ts ?? Date.now());
   void invoke("append_usage_log", {
     date: localDateKey(now),
     record: {
@@ -2842,6 +3796,8 @@ function appendUsageLog(info: ChatDoneInfo) {
       requests: info.requests ?? [],
       // 其中来自子代理 / 后台复盘的部分（只作归因，**不要**再计入金额）；旧 agent → undefined
       subagent: info.subagent,
+      // 中断收尾的兜底记录（2026-10-06）：只覆盖已完成的上报请求，最后一个飞行中的不在内
+      partial: info.partial === true,
     },
   }).catch(() => {});
 }
@@ -2889,7 +3845,20 @@ async function refreshTokenUsagePanel(): Promise<void> {
   try {
     do {
       usagePanelDirty = false;
-      tokenUsagePanel.innerHTML = renderUsageCostPanel(await loadUsageCost());
+      const data = await loadUsageCost();
+      tokenUsagePanel.innerHTML = renderUsageCostPanel(data, usageRange, usageModel);
+      // 两个下拉框都是**每次重排后重新绑**的（innerHTML 换了节点，旧监听跟着没了）。
+      // 改动就再刷一轮 —— 那份数据本来就是每次刷新都重读的（对话中每落一次用量
+      // 都会走这里），多读一次没有额外代价。
+      const bind = (id: string, apply: (v: string) => void) => {
+        tokenUsagePanel.querySelector<HTMLSelectElement>(id)?.addEventListener("change", (e) => {
+          apply((e.target as HTMLSelectElement).value);
+          void refreshTokenUsagePanel();
+        });
+      };
+      bind("#cost-range-select", (v) => { usageRange = parseUsageRangeValue(v); });
+      // 模型下拉的第一项（空串）就是「总计」
+      bind("#cost-model-select", (v) => { usageModel = v === "" ? null : v; });
     } while (usagePanelDirty && usagePanelOpen);
   } finally {
     usagePanelBusy = false;
@@ -2913,17 +3882,79 @@ tokenDashboard.addEventListener("click", () => {
   setUsagePanelOpen(!usagePanelOpen);
 });
 
-async function stopAIChat() {
+/** 把仍在飞行的工具卡标成「已停止」。
+ *
+ *  **为什么必须有它**：`agent.exe` 一旦没了，这条命令的 `tool_result` 就**永远不会回来** ——
+ *  而卡片的状态全靠它收尾，收不到就永远停在「执行中」（backlog M2-6：全局「停止」与队列
+ *  「立即发送」两条路原来都没收尾；只有点卡片自己的停止按钮那条有乐观置上，见 `createToolCard`）。
+ *
+ *  **只改视觉、不置 `card.done`**：与乐观置上同一条纪律 —— 真相永远由结果文本说了算。
+ *  万一 `tool_result` 在进程退出前已写进管道、稍后才到，`fillToolCard` 会照旧把它重新判成
+ *  成功 / 失败 / 超时（它会先摘掉 `running` 与 `stopped`）。 */
+function markFlyingCardsStopped(v: AgentView | null) {
+  if (!v) return;
+  const cards = new Set<AgentToolCard>(v.toolCards.values());
+  if (v.openCard) cards.add(v.openCard);
+  for (const card of cards) {
+    if (card.done || !card.el.classList.contains("running")) continue;
+    card.el.classList.remove("running");
+    card.el.classList.add("stopped");
+    const stateEl = card.el.querySelector<HTMLElement>(".tool-state");
+    if (stateEl) stateEl.textContent = t("agent.tool_stopped");
+  }
+}
+
+/** 被**强制中断**（停止 / 立即发送队列项）的回合做一次「部分收尾」—— 把实时 DOM 里的
+ *  思考 / 工具过程（含已流出的半截正文）固化进**过程快照**，避免它们随着一次重绘就彻底
+ *  消失，用户可以在「查看过程」里回看。
+ *
+ *  为什么需要它（2026-10-03，用户报「继续任务被强制中断后，没有输出时应该有思考过程，
+ *  但在 Lunac 里看不到」）：正常收尾**全在** `cliDoneCallback` 里（`recordTurnSteps` /
+ *  助手消息进 `chatHistory` / `saveCurrentSession`），而中断路径会**先把 `cliDoneCallback`
+ *  置空**再杀进程 —— 于是被中断的回合永远走不到那段收尾：思考只留在临时的实时 DOM 里，
+ *  一次重绘（回退 / 切会话 / 重开窗）就没了。
+ *
+ *  ⚠️ **刻意不 push 助手消息**（2026-10-03 定案）：被中断的回合必须**不进 AI 上下文** ——
+ *  一 push，半截正文就会写进 `chat.db` 的 messages（进 FTS 索引，可被 `SessionSearch`
+ *  搜到）并随后续 `set_history` 回灌给模型，模型就读到一条**被截断的助手消息**。半截正文
+ *  仍以 `text` 步骤留在过程块里（`recordTurnSteps` 会抽 `.agent-text`），用户照样看得到，
+ *  只是模型看不到。
+ *
+ *  也因此 `recordTurnSteps(flow, false)`：被中断的回合**没有**助手气泡，历史渲染要把它挂到
+ *  自己的用户气泡之后（见 `renderHistoryProcess`）。
+ *  ⚠️ **必须在 `agentView = null` 之前调用**（本函数靠它拿实时 DOM）。 */
+function finalizeInterruptedTurn() {
+  const v = agentView;
+  if (!v) return;
+  agentCloseBlock();
+  recordTurnSteps(v.flow, false); // 只进过程快照，不进 chatHistory / AI 上下文
+  saveCurrentSession().catch(() => {});
+}
+
+async function stopAIChat(opts: { drainQueue?: boolean } = {}) {
+  // drainQueue=false 是给「立即发送队列项」用的：中断当前生成但**不要**顺手把队列
+  // 排空（调用方紧接着要发自己那一条），也不要把状态栏写成「已停止」。
+  const drainQueue = opts.drainQueue !== false;
   if (!isStreaming) return;
   // Cancel streaming by advancing streamId — old callbacks will no-op
   streamId++;
   cliTextCallback = null;
   cliDoneCallback = null;
+  // 用户点了「停止」：**当场**把这一轮已完成的请求落账（2026-10-06）。回调已被上面的
+  // `cliDoneCallback = null` 掐断，所以不能指望收尾那条路；而「停止后直接关应用」就会
+  // 永远丢掉这一轮的账（见 turnUsage 的注释）。
+  flushTurnUsage();
   isStreaming = false;
   setStreamingUI(false);
+  // 中断前先固化这一轮（思考 / 过程 / 已流出的正文）—— 必须排在下面 `agentView = null`
+  // 之前，否则这一轮永远走不到 cliDoneCallback 的收尾，内容只留在实时 DOM 里会丢。
+  finalizeInterruptedTurn();
 
   // Stop the CLI (agent mode) — kills agent.exe and clears its context.
   await invoke("stop_cli").catch(() => {});
+  // 飞行中的工具卡当场收尾（不等 `closed` 事件）：agent.exe 已经死了，那些 `tool_result`
+  // 不会再来（见 `markFlyingCardsStopped` 与 backlog M2-6）。
+  markFlyingCardsStopped(agentView);
   cliReady = false;
   agentView = null;
   agentTurn = null;
@@ -2932,6 +3963,8 @@ async function stopAIChat() {
   // Remove loading cursor from last message
   const loading = resultsList.querySelector(".cursor-blink");
   if (loading) loading.remove();
+
+  if (!drainQueue) return;
 
   if (pendingMessages.length > 0) {
     statusText.textContent = t("status.stopped_queued", { count: String(pendingMessages.length) });
@@ -2946,6 +3979,7 @@ async function stopAIChat() {
 async function processQueue() {
   while (pendingMessages.length > 0 && !isStreaming) {
     const msg = pendingMessages.shift()!;
+    renderChatQueue();
     statusText.textContent = t("status.sending_queued", { count: String(pendingMessages.length) });
     await startAIChat(msg);
     // Brief pause to let the caller settle
@@ -2953,7 +3987,7 @@ async function processQueue() {
   }
 }
 
-chatStopBtn.addEventListener("click", stopAIChat);
+chatStopBtn.addEventListener("click", () => void stopAIChat());
 
 chatSendBtn.addEventListener("click", sendChatMessage);
 
@@ -2994,16 +4028,6 @@ chatAddFileBtn.addEventListener("click", async () => {
   }
 });
 
-// Humanize button — append humanize request for last assistant response
-humanizeBtn.addEventListener("click", () => {
-  const lastAssistant = chatHistory.filter(m => m.role === "assistant").pop();
-  if (!lastAssistant || isStreaming) return;
-  const humanizeQuery = "Rewrite the following to remove AI writing patterns. Follow the humanizer methodology: remove significance inflation, promotional language, AI vocabulary words, copula avoidance, em dashes, boldface headers, emoji decorations, collaborative artifacts, knowledge-cutoff disclaimers, filler phrases, and generic conclusions. Add a human voice with varied rhythm, opinions, and specific details. Output ONLY the rewritten text:\n\n" + lastAssistant.content;
-  chatInput.value = humanizeQuery;
-  autoResizeChatTextarea();
-  sendChatMessage();
-});
-
 // ── Detach mode — hide search bar, expand results panel ────────
 function setDetached(on: boolean) {
   // **聊天独立窗也走这里**（2026-09-29）：它借的正是这段外观（`#app.detached` =
@@ -3031,6 +4055,10 @@ function setDetached(on: boolean) {
     detachedVscodeBtn.classList.toggle("hidden", !isAiHeader);
     detachedPinBtn.classList.toggle("hidden", !IS_CHAT_WINDOW);
     detachedMinBtn.classList.toggle("hidden", !IS_CHAT_WINDOW);
+    // 「提问节点」的轨道（2026-10-02）——同样只给聊天独立窗：主窗没有整段会话列。
+    // 空会话时轨道本来就收着（`renderChatNodeRail` 判 0 颗点），这里再挡一次，
+    // 免得刚切过插件、列表还没重算时冒出一条空壳。
+    chatNodeRail.classList.toggle("hidden", !IS_CHAT_WINDOW || chatNodeDots.childElementCount === 0);
     if (isAiHeader) {
       detachedVscodeBtn.title = t("detached.vscode");
     }
@@ -3133,6 +4161,12 @@ const PLUGIN_ICON_PATHS: Record<string, string> = {
   // 翻译（2026-09-29）：语言符号 —— 「文」与「A」相对。**刻意不用地球**：
   // 那个图形已经是 `web-search` 的，两行图标一样会让用户认错插件。
   "translate": `<path d="M2 5h10"/><path d="m6 2v3"/><path d="m3 8 4 5 4-5"/><path d="M12 22l4-9 4 9"/><path d="M13.5 19h5"/>`,
+  // 桌宠（2026-10-01，用户要求「顺便将桌宠图标也改了」）：猫爪印 —— 与清单里那个
+  // 🐾 同一个意思，但换成与其余图标同一套「扫笔 + 高光」语言的线性图形（icon-style.md §2）。
+  // ⚠️ 加这一条之前它是**查不到的** ⇒ `pluginIconSvg` 走兜底 🔧，搜索「桌宠」看到的
+  // 是一把扳手（`PLUGIN_ICON_PATHS` 是唯一的图标汇聚点，见函数头注释）。
+  // 路径取自 Lucide 的 paw-print，与上面这些同源，不自己画。
+  "pet": `<circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>`,
 };
 
 /** 当前主题包提供的插件图标（插件 id → 已 convertFileSrc 的 URL）。
@@ -3178,11 +4212,19 @@ function renderAIEntry(): void {
   selectedIndex = 0;
 
   const frag = document.createDocumentFragment();
+  // **`currentEntries` 必须与这里的 DOM 顺序逐项对应** —— 回车走的是
+  // `currentEntries[selectedIndex]`（见 searchInput 的 Enter 分支）。此前本函数只设
+  // `selectedIndex = 0`、**却不重建 `currentEntries`**，于是「输入文本 → 删空 → 上下键 →
+  // 回车」时，回车用的仍是上一轮搜索的旧条目：高亮停在空查询的第一项、回车却跳到旧结果里
+  // 那一条（2026-10-05 用户实测：「输入 lunac 删除后按两次下键，应选空白内容的 AI 助手，
+  // 却跳进 lunac 的第二项设置」）。修法 = 边建 DOM 边建 entries。
+  const entries: ScoredEntry[] = [];
 
   // Web Search — always visible alongside AI Agent
   const wsPlugin = pluginRegistry.getAll().find(p => p.id === "web-search");
   if (wsPlugin) {
     buildWebSearchItem(wsPlugin, searchInput.value.trim(), frag);
+    entries.push({ kind: "ws-fallback" });
   }
 
   const aiItem = doc("div");
@@ -3197,6 +4239,8 @@ function renderAIEntry(): void {
     startAIChat(searchInput.value.trim());
   });
   frag.appendChild(aiItem);
+  entries.push({ kind: "ai-fallback" });
+  currentEntries = entries;
   resultsList.replaceChildren(frag);
   statusText.textContent = t("status.ai", { mode: currentModeLabel() });
   applyWindowSize();
@@ -3232,6 +4276,9 @@ function renderClipboardOCREntry(): void {
   items.forEach(item => item.classList.remove("selected"));
   ocrItem.classList.add("selected");
   selectedIndex = 0;
+  // OCR 被插到**第 0 项** ⇒ `currentEntries` 必须跟着前插一位，否则回车会错位到
+  // Web 搜索那一条（与 renderAIEntry 的重建是成对的两半，缺一则回车映射错行）。
+  currentEntries = [{ kind: "plugin", plugin: ocrPlugin }, ...currentEntries];
 
   // **插入第 3 项后必须重新断言高度**（2026-09-19 修，不得删）。
   // 两个调用方（`win.onFocusChanged` 的唤出分支、`runSearchNow` 的空查询分支）都是
@@ -3488,6 +4535,7 @@ async function closePluginView() {
     setStreamingUI(false);
   }
   pendingMessages = [];
+  renderChatQueue();
   consecutiveFailures = 0;
   pluginActive = false;
   activePluginId = null;
@@ -3514,7 +4562,6 @@ async function closePluginView() {
   resultsList.innerHTML = "";
   currentResults = [];
   selectedIndex = 0;
-  humanizeBtn.style.display = "none";
   // Restore search input from plugin state
   const st = pid ? pluginStates.get(pid) : undefined;
   searchInput.value = st?.searchQuery || "";
@@ -3559,6 +4606,13 @@ interface CliEventLine {
   /** system/context_compacted 的压缩计数（见 usageTotals / ai-spec §11 规则 23） */
   elided?: number;
   dropped?: number;
+  /** system/budget_extended：第几次「压缩续命」与上限（2026-10-01 成本预算）。
+   *  界面**不显示**这两个数（§13.5 第 ④ 条），留着只为事件流可回溯。 */
+  times?: number;
+  max?: number;
+  /** system/budget_exhausted 的已续命次数；system/rounds_exhausted 的轮次上限 */
+  extensions?: number;
+  rounds?: number;
   /** system/plan_mode（计划相位，A7）：`on` = 进入 / `off` = 已批准解除；
    *  `reason` 只有进入时才有（模型给用户的一句话说明）。 */
   state?: string;
@@ -3566,6 +4620,12 @@ interface CliEventLine {
   /** system/attachment_note（图片附件，A8）：本轮**没能发出去**的附件及原因。
    *  只有真有失败项时才发这个事件（见 renderAttachmentNote）。 */
   skipped?: { path?: string; reason?: string }[];
+  /** system/mcp_config_changed（2026-10-06）：agent 启动后被改过的 MCP 配置文件展示名。
+   *  工具表是固定前缀 ⇒ 只能重启才生效。 */
+  files?: string[];
+  /** 同上事件：`true` = 这拍是 agent **空闲**时打的（回合外改的）⇒ 前端**立即重启**；
+   *  缺省 / `false` = 回合刚开时发现的 ⇒ 等本回合 `result` 收尾再重启（见 result 分支）。 */
+  idle?: boolean;
   /** system/hook_note（权限 hooks，A9）：用户脚本的裁决 / 输出 / 失败（见 renderHookNote）。
    *  字段名是 `hook_event` 而不是 `event` —— `event` 已被 stream_event 占用（对象形状）。 */
   hook_event?: string;
@@ -3582,6 +4642,15 @@ interface CliEventLine {
     /** A14：这条审批来自哪个子任务（`task-1` / `skill-2` …）。主循环自己发起的调用
      *  **不写该键** —— 缺字段就是「不属于任何子任务」，前端按普通卡渲染。 */
     task_id?: string;
+    /** `subtype=elicitation`（A13）专用：服务端要求用户补充的说明文字与表单
+     *  （JSON Schema 子集）。见 core-agent/src/main.rs 的 `open_elicitation`。 */
+    message?: string;
+    requestedSchema?: unknown;
+    /** `subtype=mcp_trust`（q3）专用：项目路径 + 要连的服务器清单
+     *  （每台 `{name, transport, target, fingerprint}`）。见 core-agent/src/main.rs
+     *  的 `ask_mcp_trust` 与 main.ts 的 `showMcpTrustCard`。 */
+    project?: string;
+    servers?: unknown;
   };
   /** system/task_started|task_progress|task_done（子代理事件，A14）：`task_id` 归组，
    *  `description` 只在 started 上、`tool`/`round` 只在 progress 上、`ok`/`ms` 只在 done 上。
@@ -3611,8 +4680,25 @@ interface CliEventLine {
       is_error?: boolean;
     }>;
   };
-  usage?: { input_tokens: number; output_tokens: number };
+  /** A17（2026-10-01）：**写入类工具**（Write / Edit）结果附带的安全告警，
+   *  与审批卡那份 `analysis.secrets` 同源。**只有真有命中时才有这个键** ——
+   *  按 `tool_use_id` 配到对应的命令卡上，渲染成一块可见的色块（见 fillToolCard）。
+   *  **它不进 `message`**：`message` 要原样进 history 发给端点。 */
+  security_warnings?: Array<{ tool_use_id?: string; hits?: Array<{ rule?: string; line?: number }> }>;
+  /** 两个来源共用这个键、形状**不同**：① `result` 的权威用量（四类总量 + `requests` +
+   *  `subagent`）；② `usage_delta`（2026-10-06）的单请求用量 `{in, read, create, out}`。
+   *  所以只钉住 `result` 那两个必有字段，其余放开、各处自行收窄。 */
+  usage?: { input_tokens?: number; output_tokens?: number; [k: string]: unknown };
   model?: string;
+  /** `tool_output`（2026-09-30）：命令卡跑着的时候的 stdout / stderr 分片。
+   *  `tool_use_id` 指到哪张卡，`stream` 只有 `stdout` / `stderr` 两个取值。 */
+  tool_use_id?: string;
+  /** `background_started` / `background_done`（2026-10-01）：后台命令的自增 id
+   *  （形态 `bg_<pid>_<seq>`）与命令原文（已截断，给待办清单那一行显示）。 */
+  id?: string;
+  label?: string;
+  stream?: string;
+  chunk?: string;
 }
 
 // ── Agent state machine (Pi reference: turn lifecycle) ────────────
@@ -3675,15 +4761,32 @@ let agentTurn: AgentTurn | null = null;
 // The agent output is a SEQUENCE of blocks (thinking / text / tool use /
 // approval cards) rendered in arrival order — not one big text blob with
 // cards stuck at the bottom.
+/** 写入内容的静态安全分析命中项（A17）。`rule` 是技术名词，**不翻译**；
+ *  `line` 是**写入内容里**的行号（不是磁盘文件的行号，`Edit` 时尤其别搞混）。 */
+interface ToolSecretHit {
+  rule?: string;
+  line?: number;
+}
+
 /** 一张命令执行卡片的状态（按 tool_use_id 与 tool_result 配对）。 */
 interface AgentToolCard {
   el: HTMLDetailsElement;
   name: string;
-  /** 命令原文（Bash/PowerShell）或 k=v 参数摘要 */
+  /** 命令原文（Cmd/PowerShell）或 k=v 参数摘要 */
   cmd: string;
   /** 起始时间：入参开始流式时记；经过审批的卡片会在「批准」时重置（不把用户犹豫算进耗时） */
   startAt: number;
   done: boolean;
+  /** 写类工具：本卡的文件原内容快照是否已经采集过（入参流式会多次回调，只采第一次）。 */
+  snapshotTaken?: boolean;
+  /** 命令类工具（Cmd / PowerShell）：正文用 xterm 终端渲染，而不是 `<pre class="tool-out">`。 */
+  isShell?: boolean;
+  /** 该卡的终端实例（惰性创建、收起即释放；释放后仅 `termBuf` 留存）。 */
+  term?: Terminal;
+  /** 终端的 fit 插件（重建 / 窗口 resize 时重新量尺寸）。 */
+  fit?: FitAddon;
+  /** 终端累积输出（终端未创建时的落点；累计上限见 `TERM_BUF_MAX`）。 */
+  termBuf?: string;
 }
 
 interface AgentView {
@@ -3916,7 +5019,7 @@ function refreshCmdGroup(group: Element | null) {
   let other = 0;
   cards.forEach(c => {
     const n = c.querySelector(".tool-name")?.textContent?.trim() || "";
-    if (n !== "Bash" && n !== "PowerShell") other++;
+    if (n !== "Cmd" && n !== "PowerShell") other++;
   });
   const fails = group!.querySelectorAll(".tool-card.failed").length;
   const key = other === 0 ? "agent.cmd_group_cmds" : "agent.cmd_group_calls";
@@ -3930,11 +5033,136 @@ function closeCmdGroup(v: AgentView) {
   v.cmdGroupBody = null;
 }
 
+// ── 命令卡终端（2026-10-05，用户要求「命令执行显示改成 cmd/PowerShell 终端」）─────
+//
+// 命令类工具（Cmd / PowerShell）的正文不再是一段 `<pre>` 文本，而是一台 xterm.js
+// 终端：agent 侧实时回传的 stdout/stderr 分片直接写进去（ANSI 转义由 xterm 解释），
+// 用户也能在终端里键入 —— 字符经 `tool_control`（`action:"stdin"`）转发给子进程 stdin。
+//
+// **惰性创建、收起即释放**：一张卡只在展开时才占一台 xterm（xterm 的 DOM/canvas 不便宜，
+// 长对话里几十张卡各扣一台会拖垮渲染）。收起时把内容留在 `card.termBuf`，再展开时重建回放。
+// 卡片随对话被移除时由 `watchFlowForTermRemoval` 兜底释放（xterm 不 dispose 会留全局监听）。
+
+/** 终端累积输出的上限（字符）：命令能刷出几十万行，只留尾部 —— 与 `.tool-out` 同口径。 */
+const TERM_BUF_MAX = 200_000;
+
+/** 「哪个 `.tool-term` 宿主元素属于哪张卡」—— DOM 移除时据此释放终端。 */
+const termOwner = new WeakMap<HTMLElement, AgentToolCard>();
+/** 当前活着的终端卡（窗口 resize 时统一重新 fit）。 */
+const liveTermCards = new Set<AgentToolCard>();
+
+/** 把一段输出并进终端缓冲（终端未创建 / 已收起时也照攒，保证重建后不丢）。 */
+function appendTermBuf(card: AgentToolCard, chunk: string) {
+  let t = (card.termBuf || "") + chunk;
+  if (t.length > TERM_BUF_MAX) t = t.slice(-TERM_BUF_MAX);
+  card.termBuf = t;
+}
+
+/** 惰性建这台终端（第一次展开、或首次要写实时输出时调）。 */
+function ensureCardTerminal(card: AgentToolCard): Terminal | undefined {
+  if (card.term) return card.term;
+  const host = card.el.querySelector<HTMLElement>(".tool-term");
+  if (!host) return undefined;
+  const term = new Terminal({
+    convertEol: true, // 管道输出只有 \n，转成 \r\n，否则各行会呈台阶状
+    cursorBlink: !card.done,
+    disableStdin: card.done,
+    fontFamily: "ui-monospace, Consolas, monospace",
+    fontSize: 11,
+    lineHeight: 1.25,
+    scrollback: 3000,
+    theme: {
+      background: "#0b0b0c",
+      foreground: "#d6d6d6",
+      cursor: "#8ab4f8",
+      selectionBackground: "rgba(138,180,248,0.30)",
+    },
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(host);
+  card.term = term;
+  card.fit = fit;
+  termOwner.set(host, card);
+  liveTermCards.add(card);
+  if (card.termBuf) term.write(card.termBuf);
+  // 键入 → 子进程。**本地回显必须自己做**：没有 PTY，没人替我们回显。
+  term.onData((data) => {
+    if (card.done) return;
+    const id = card.el.dataset.toolId;
+    if (!id) return;
+    // Ctrl-C：往管道里写 0x03 **不会**中断 Windows 进程（那要 GenerateConsoleCtrlEvent），
+    // 所以映射到既有的「停止」动作 —— 既符合用户对终端的直觉，也真的能杀掉进程。
+    if (data === "\x03") {
+      echoTermInput(term, data);
+      sendToolControl("stop", id);
+      return;
+    }
+    // Enter 发 `\r\n` 而不是 `\r`：读管道的一方（python input() 等）按 `\n` 断行。
+    sendToolControl("stdin", id, data === "\r" ? "\r\n" : data);
+    echoTermInput(term, data);
+  });
+  requestAnimationFrame(() => {
+    try { fit.fit(); } catch { /* 元素尚未量到尺寸 */ }
+  });
+  return term;
+}
+
+/** 把用户键入的可见字符画回终端（没有 PTY，回显得自己做）。 */
+function echoTermInput(term: Terminal, data: string) {
+  if (data === "\r") { term.write("\r\n"); return; }
+  if (data === "\x7f") { term.write("\b \b"); return; }
+  if (data === "\x03") { term.write("^C\r\n"); return; }
+  const visible = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  if (visible) term.write(visible);
+}
+
+function disposeCardTerminal(card: AgentToolCard) {
+  const host = card.el.querySelector<HTMLElement>(".tool-term");
+  if (host) termOwner.delete(host);
+  liveTermCards.delete(card);
+  try { card.term?.dispose(); } catch { /* 已释放 */ }
+  card.term = undefined;
+  card.fit = undefined;
+}
+
+/** DOM 被移除时释放它里面的终端（对话清空 / 回退 / 历史重画都走这里）。 */
+function disposeTermsIn(node: Node) {
+  if (!(node instanceof HTMLElement)) return;
+  const hosts: HTMLElement[] = [];
+  if (node.classList.contains("tool-term")) hosts.push(node);
+  node.querySelectorAll<HTMLElement>(".tool-term").forEach((h) => hosts.push(h));
+  for (const h of hosts) {
+    const card = termOwner.get(h);
+    if (card) {
+      disposeCardTerminal(card);
+      termOwner.delete(h);
+    }
+  }
+}
+
+let termObserver: MutationObserver | null = null;
+/** 盯住对话流：卡片被移除时释放它的终端（xterm 不 dispose 会留全局监听）。 */
+function watchFlowForTermRemoval(flow: HTMLElement) {
+  termObserver?.disconnect();
+  termObserver = new MutationObserver((muts) => {
+    for (const m of muts) for (const n of Array.from(m.removedNodes)) disposeTermsIn(n);
+  });
+  termObserver.observe(flow, { childList: true, subtree: true });
+}
+
+window.addEventListener("resize", () => {
+  for (const c of liveTermCards) {
+    try { c.fit?.fit(); } catch { /* ignore */ }
+  }
+});
+
 /** 建一张命令执行卡片：头部（工具名 + 命令 + 状态）+ 折叠体（元信息 / 完整命令 / 输出 / 操作）。 */
 function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
   const el = document.createElement("details");
   el.className = "tool-card running";
   if (id) el.dataset.toolId = id;
+  const isShell = name === "Cmd" || name === "PowerShell";
   el.innerHTML =
     `<summary class="tool-card-head">` +
     `<span class="tool-ic">${TERM_SVG}</span>` +
@@ -3943,17 +5171,82 @@ function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
     `<span class="tool-state">${esc(t("agent.tool_running"))}</span>` +
     `</summary>` +
     `<div class="tool-body">` +
+    `<div class="tool-live hidden"></div>` +
     `<div class="tool-meta"></div>` +
     `<pre class="tool-cmd-full"></pre>` +
-    `<pre class="tool-out"></pre>` +
+    // 命令类工具用终端渲染（xterm 挂在 `.tool-term` 上）；其余工具照旧 `<pre>`。
+    (isShell ? `<div class="tool-term"></div>` : `<pre class="tool-out"></pre>`) +
     `<div class="tool-actions"></div>` +
     `</div>`;
   // 卡片一律进「命令组」（见 ensureCmdGroup）—— 回合折叠时藏的是组，不是卡片
   ensureCmdGroup(v).appendChild(el);
   refreshCmdGroup(v.cmdGroup); // 组头计数从组内 DOM 现推，追加完再刷一次
-  const card: AgentToolCard = { el, name, cmd: "", startAt: performance.now(), done: false };
+  const card: AgentToolCard = {
+    el, name, cmd: "", startAt: performance.now(), done: false, isShell,
+  };
   if (id) v.toolCards.set(id, card);
+
+  // 终端**惰性**：展开才建、收起即释放（内容留在 `card.termBuf`，再展开回放）。
+  if (isShell) {
+    el.addEventListener("toggle", () => {
+      if (el.open) {
+        ensureCardTerminal(card);
+      } else {
+        disposeCardTerminal(card);
+      }
+    });
+  }
+
+  // ── 「后台运行 / 停止」（2026-10-01，用户要求）────────────────────
+  // **只在命令还在跑的时候给**：这两个是「对一条执行中的命令下指令」，不是对结果的
+  // 后续操作 ⇒ 放在卡内靠前的位置，命令一返回就整块撤掉（见 agentToolResult）。
+  // 只给 shell 类工具 —— 别的工具没有「跑一半可以打断」这回事，agent 侧同理
+  //（`run_one_tool` 里那个 `matches!(name, "Cmd" | "PowerShell")`）。
+  const live = el.querySelector<HTMLElement>(".tool-live");
+  if (live && id && (name === "Cmd" || name === "PowerShell")) {
+    live.classList.remove("hidden");
+    live.innerHTML =
+      `<button type="button" class="tool-live-btn" data-act="bg">${esc(t("agent.cmd_background"))}</button>` +
+      `<button type="button" class="tool-live-btn danger" data-act="stop">${esc(t("agent.cmd_stop"))}</button>`;
+    live.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-act]");
+      if (!btn) return;
+      // 卡片本身是 `<details>`：不拦一下，点按钮会顺手把它开合掉 —— 看起来像「没反应」
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.act === "bg" ? "background" : "stop";
+      sendToolControl(act, id);
+      // 立刻失效：这两个动作**不可逆**（agent 下一拍就动手），不能让用户以为还能反悔。
+      // 真正的状态由 `background_started` / 工具结果回来确认。
+      live.querySelectorAll("button").forEach((b) => ((b as HTMLButtonElement).disabled = true));
+      // 乐观置上 `.stopped`（黄色「已停止」）；真相由结果文本再判一次（见 fillToolCard）
+      if (act === "stop") el.classList.add("stopped");
+    });
+  }
   return card;
+}
+
+/** 这条 tool_use 是不是已经转后台了？是则给出它的后台 id。 */
+function bgOf(toolUseId: string | undefined) {
+  if (!toolUseId) return undefined;
+  for (const [id, v] of backgroundCmds) {
+    if (v.toolUseId === toolUseId) return id;
+  }
+  return undefined;
+}
+
+/** 把一张命令卡的「实时控制」块换成**已转后台**的状态（2026-10-01）。
+ *
+ *  命令还在跑（只是不占 agent 了）⇒ **不再给按钮**：真正该出现的按钮是「取消」，
+ *  而它统一收在待办清单那一区（用户要求「用户也可以在那里取消」）—— 两个地方各放
+ *  一个取消，迟早出现「这边点了那边没反应」。 */
+function markCardBackground(toolUseId: string | undefined) {
+  if (!toolUseId) return;
+  const card = agentView?.toolCards.get(toolUseId);
+  const live = card?.el.querySelector<HTMLElement>(".tool-live");
+  if (!live) return;
+  live.classList.remove("hidden");
+  live.innerHTML = `<span class="tool-live-state">${esc(t("agent.cmd_in_background"))}</span>`;
 }
 
 function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, toolId?: string) {
@@ -4025,13 +5318,13 @@ function agentAppend(kind: "thinking" | "text", s: string) {
   agentScroll();
 }
 
-/** 把工具入参 JSON 变成一行可读摘要：Bash/PowerShell 给命令原文，其余给 k=v。
+/** 把工具入参 JSON 变成一行可读摘要：Cmd/PowerShell 给命令原文，其余给 k=v。
  *  （Trae 风格：卡片上直接看到命令，而不是一坨原始 JSON） */
 function toolArgsDisplay(name: string, raw: string): string {
   try {
     const obj = JSON.parse(raw);
     if (typeof obj === "object" && obj !== null && !Array.isArray(obj)) {
-      if (name === "Bash" || name === "PowerShell") {
+      if (name === "Cmd" || name === "PowerShell") {
         return typeof (obj as any).command === "string" ? ((obj as any).command as string) : raw;
       }
       return Object.entries(obj)
@@ -4068,7 +5361,7 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
   // 卡片正文里放**完整命令**：头部的 `.tool-cmd` 在单行 summary 里被
   // `text-overflow: ellipsis` 截断，展开卡片也看不到全文（2026-09-27 反馈的第三处）。
   // 只给命令类工具：Write/Edit 的入参里有整个文件内容，铺进 <pre> 会把对话流压垮。
-  if (fullEl && (name === "Bash" || name === "PowerShell") && isCompleteJson(rawJson)) {
+  if (fullEl && (name === "Cmd" || name === "PowerShell") && isCompleteJson(rawJson)) {
     fullEl.textContent = display;
   }
   if (!el) return;
@@ -4081,6 +5374,10 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
   if (file) {
     card.el.dataset.file = file;
     noteChangedFile(file);
+    // 路径一旦解析出来（此时工具**还没执行**），立刻存一份原件快照 —— 回退按钮要靠它
+    // 把文件还原到改动前。`card.snapshotTaken` 挡住入参流式的重复回调（只采第一次，
+    // 也就是「这一卡动手之前」的那份）。
+    void captureFileSnapshot(card, file);
     const rest = argsWithoutPath(rawJson, field);
     el.innerHTML =
       fileLinkHtml(file) +
@@ -4147,14 +5444,24 @@ function pathDir(p: string): string {
 
 /** 记一笔改动并刷新抽屉（同一路径只留一次）。 */
 function noteChangedFile(path: string) {
-  if (!path || sessionChangedFiles.includes(path)) return;
-  sessionChangedFiles.push(path);
-  todoDismissed = false; // 又有新改动 ⇒ 抽屉该回来（见 renderTodoDrawer）
+  if (!path) return;
+  // 这个文件「现在」变了 ⇒ 缓存的现状作废（否则 diff 的新侧会停在上一版）。
+  // 「已接受」不必在这里撤：新改动会带上新的回合键，那一行自然回到「未接受」
+  // （`changeAllAccepted` 要求**全部**条目都被接受过）。
+  changeNow.delete(path);
+  if (!sessionChangedFiles.includes(path)) {
+    sessionChangedFiles.push(path);
+    todoDismissed = false; // 又有新改动 ⇒ 抽屉该回来（见 renderTodoDrawer）
+  }
   renderTodoDrawer();
 }
 
 /** 由过程快照重建列表（恢复 / 回退历史后调用）：只有带 `path` 的步骤才算真改动。
- *  顺便清掉待办清单 —— 它不落盘、无法从快照重建，留着就是「上一个会话的残留」。 */
+ *
+ *  ⚠️ 它**不再动待办清单**（2026-10-02 改）：旧实现在这里 `todoItems = []`，理由写在注释里
+ *  （「待办不落盘、重建不出来」）—— 但那条前提已经不成立：待办现在按回合存进 chat.db，
+ *  回退 / 切会话时由 `applyTodoTimeline()` 精确还原。清空的行为是用户报的
+ *  「一点回退任务列表就没了」的直接来源。 */
 function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
   const out: string[] = [];
   for (const g of steps) {
@@ -4163,16 +5470,439 @@ function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
     }
   }
   sessionChangedFiles = out;
-  todoItems = [];
-  todoTasksOpen = false;
-  todoFilesOpen = false;
-  todoDismissed = false;
+  // U1 变更审阅态跟着作废：它挂在**上一份**变更列表上（缓存了现状内容、接受标记、
+  // 摊开状态）。恢复会话 / 回退到此处都会重建这份列表 ⇒ 这里清一次即可覆盖两条路径。
+  resetChangeReview();
   renderTodoDrawer();
+}
+
+// ── 回退用的「文件内容快照」（2026-09-30）────────────────────────
+// 目标（用户要求）：点对话里的**回退按钮**时，除了回退对话与 agent 上下文，还要把 agent
+// 改过的磁盘文件一起还原到那个对话点。
+//
+// 形态：**每次写类工具调用发出时**（此刻工具还没执行）存一份「那一刻的原内容」，按
+// **回合下标**归档。回合下标 = 采集时 `chatHistory` 里已完成的助手消息条数；回退到 idx 时
+// 保留的助手消息条数 K 就是分界线 —— `turn >= K` 的快照属于要被丢掉的那几轮。
+//
+// 还原时**按回合倒序**逐份写回（先撤销最后一次改动、最后写回最早那份），落点即回退点的
+// 状态。同一回合里同一文件被改两次也只采一份（该回合开始前的那份），正是回退需要的。
+// 宿主侧命令见 `src-tauri/src/snapshots.rs`。**快照随会话落盘**（2026-10-01）：
+// 盘上那份在 `<ModuleData>\history\frames\<sessionId>.json`（**不进 chat.db** —— 那里是
+// 对话流水，而快照装的是用户文件的原内容）。`restoreSession()` 读回来、`persistCurrentSessionInner()`
+// 写回去，所以恢复历史会话后「回退 + 还原文件」照样成立。
+
+interface FileSnapshot {
+  /** 采集时已完成的助手消息条数（= 回合下标，0 起） */
+  turn: number;
+  path: string;
+  /** 采集那一刻文件是否存在（false ⇒ 回退时把它删掉） */
+  existed: boolean;
+  /** 原内容；`existed && content === null` = 读不出来（二进制 / 超上限）⇒ 拒绝还原 */
+  content: string | null;
+}
+
+let sessionFileSnapshots: FileSnapshot[] = [];
+
+/** 快照表的**代**：任何一次改动（采集 / 回退裁剪 / 切会话）都会 +1。
+ *
+ *  用途只有一个 —— `restoreSession()` 是**异步读盘**的，回来时若用户已经切了会话或
+ *  已经点过回退，这份旧盘读必须丢掉；否则会把已经回退掉的文件重新塞回列表，
+ *  再点一次回退就是**重复还原**（文件退到更早的状态）。 */
+let framesEpoch = 0;
+
+/** 已完成的回合数（= 助手消息条数）—— 采集端与回退端共用这一个口径。 */
+function completedTurnCount(): number {
+  let n = 0;
+  for (const m of chatHistory) if (m.role === "assistant") n++;
+  return n;
+}
+
+/** 回退到消息 `idx` 时**保留**的助手消息条数（= 快照分界线 K）。 */
+function keptAssistantCountFor(idx: number): number {
+  let n = 0;
+  for (let i = 0; i <= idx && i < chatHistory.length; i++) {
+    if (chatHistory[i].role === "assistant") n++;
+  }
+  return n;
+}
+
+/** `turn >= kept` 的快照 = 这次回退要还原的文件。 */
+function pendingFileReverts(kept: number): FileSnapshot[] {
+  return sessionFileSnapshots.filter(s => s.turn >= kept);
+}
+
+/** 把一个快照表写到盘上（**显式传 id 与表**：有的调用点要提交「调用那一刻」的副本，
+ *  而不是全局那份）。写失败只 console —— 快照是锦上添花，它失败不该让对话落盘失败。 */
+async function saveFrames(sessionId: string, frames: FileSnapshot[]): Promise<void> {
+  try {
+    await invoke("snapshots_save", { sessionId, frames });
+  } catch (e) {
+    console.warn("[lunac] snapshots_save failed:", e);
+  }
+}
+
+/** 把**当前内存这份**快照表写回盘（用当前会话 id）。回退之后要立刻调它 —— 见回退流程第 4 步。
+ *  还没有会话 id 时什么都不做：那时没有可挂靠的记录，下一次 `saveCurrentSession()` 会带上。 */
+async function persistSessionFrames(): Promise<void> {
+  const sid = currentSessionId;
+  if (!sid) return;
+  await saveFrames(sid, sessionFileSnapshots);
+}
+
+/** 写类工具调用发出时存一份原件快照（同一张卡只采一次，即「这一卡动手之前」的那份）。 */
+async function captureFileSnapshot(card: AgentToolCard, file: string) {
+  if (card.snapshotTaken) return;
+  card.snapshotTaken = true;
+  const turn = completedTurnCount();
+  if (sessionFileSnapshots.some(s => s.turn === turn && s.path === file)) return;
+  try {
+    const r = await invoke<{ existed: boolean; content: string | null }>("snapshot_read_text", {
+      path: file,
+    });
+    sessionFileSnapshots.push({
+      turn,
+      path: file,
+      existed: !!r?.existed,
+      content: r?.content ?? null,
+    });
+    framesEpoch++;
+  } catch (e) {
+    // 读不出来就不记：宁可这个文件不还原，也不要事后给用户一个假的「已回退」
+    console.warn("[lunac] snapshot_read_text failed:", file, e);
+  }
+}
+
+/** 把给到的快照**逐条**写回，按回合**倒序**。
+ *
+ *  **这是唯一实现**（U1 起）：`revertFileSnapshots`（按回合批量回退）与变更审阅的
+ *  「拒绝」（单条 / 单文件 / 全部）都走它 —— 倒序这件事只有一份：同一文件被改过多次时，
+ *  先写晚的那份、再写早的那份，最后落在**最早**那份内容上。
+ *  返回统计与「这次真的动过的路径」—— 调用方据此把文件从「已更改文件」列表里摘掉。 */
+async function restoreSnapshots(
+  doomed: FileSnapshot[]
+): Promise<{ restored: number; deleted: number; skipped: number; failed: number; paths: Set<string> }> {
+  const stat = { restored: 0, deleted: 0, skipped: 0, failed: 0, paths: new Set<string>() };
+  for (const s of [...doomed].sort((a, b) => b.turn - a.turn)) {
+    stat.paths.add(s.path);
+    // 原文件在、内容却没留下来（二进制 / 超上限）⇒ 一个字节都不许写，也不许删
+    if (s.existed && s.content === null) {
+      stat.skipped++;
+      continue;
+    }
+    try {
+      await invoke("snapshot_restore_text", {
+        path: s.path,
+        content: s.content,
+        existed: s.existed,
+      });
+      if (s.existed) stat.restored++;
+      else stat.deleted++;
+    } catch (e) {
+      stat.failed++;
+      console.warn("[lunac] snapshot_restore_text failed:", s.path, e);
+    }
+  }
+  return stat;
+}
+
+/** 把 `turn >= kept` 的快照按回合**倒序**写回。
+ *  返回统计与「这次真的动过的路径」—— 调用方据此把文件从「已更改文件」列表里摘掉。 */
+async function revertFileSnapshots(
+  kept: number
+): Promise<{ restored: number; deleted: number; skipped: number; failed: number; paths: Set<string> }> {
+  const doomed = pendingFileReverts(kept);
+  if (!doomed.length) {
+    return { restored: 0, deleted: 0, skipped: 0, failed: 0, paths: new Set<string>() };
+  }
+  const stat = await restoreSnapshots(doomed);
+  // 丢掉的那几轮不再有快照（再点一次回退不会重复动同一批文件）；
+  // 但**同一文件若在更早的、被保留的回合里也改过**，它仍在列表里 —— 那部分改动没被回退。
+  sessionFileSnapshots = sessionFileSnapshots.filter(s => s.turn < kept);
+  framesEpoch++;
+  const stillTracked = new Set(sessionFileSnapshots.map(s => s.path));
+  for (const p of stillTracked) stat.paths.delete(p);
+  return stat;
 }
 
 /** 一次可点的文件链接。工具卡与抽屉共用同一套类名，点击走下面那个委托监听。 */
 function fileLinkHtml(path: string): string {
   return `<a class="file-link" data-path="${esc(path)}" title="${esc(t("agent.reveal_in_explorer"))}">${esc(path)}</a>`;
+}
+
+// ── U1 代码变更 diff 卡（事后审阅 + 回滚，2026-10-06）──────────────────
+//
+// **语义（用户 2026-10-06 定）**：文件**已经被 agent 写下去了**，这里不是事前预览。
+//   · 「接受」= 标记已阅（内存态、不落盘 —— 它是「本次界面里我审过了哪些」，不是数据）
+//   · 「拒绝」= **用已有快照把文件还原**（复用 `snapshot_restore_text`，与「回退到此处」同一套）
+//
+// 三级粒度的语义都能**精确**说清（因为快照装的是「改动前那一份完整内容」）：
+//   · **单条**（一个回合对某文件的一次改动，键 `turn:path`）= 还原到**这一条之前**
+//     ⇒ 撤销这条**及更晚**的同文件改动（更早的那些包含在这份快照里，不受影响）
+//   · **单文件** = 还原到该文件**最早**那条快照 ⇒ 撤销本会话对它的全部改动
+//   · **全部** = 所有文件各按上面那条走
+//
+// diff 的两侧：**旧** = 快照里的原内容，**新** = 现在盘上的内容（同一个宿主命令读）。
+
+interface ChangeNow { existed: boolean; content: string | null }
+
+/** 每个改动文件「现在长什么样」。开列表时批量读一次；有新改动就作废重读。 */
+const changeNow = new Map<string, ChangeNow>();
+let changeNowBusy = false;
+/** 已接受的条目（键 `turn:path`）。 */
+const changeAccepted = new Set<string>();
+/** 摊开了哪些文件（按路径记）。 */
+const changeOpen = new Set<string>();
+/** 摊开的文件里 diff 显示哪一条：`turn === null` = 净变化（最早快照 → 现在）。 */
+const changeShow = { path: "", turn: null as number | null };
+
+/** 换会话 / 新对话 / 重建快照表时清掉审阅态 —— 它是**当前这一次界面**的状态，不跨会话。 */
+function resetChangeReview(): void {
+  changeNow.clear();
+  changeAccepted.clear();
+  changeOpen.clear();
+  changeShow.path = "";
+  changeShow.turn = null;
+}
+
+/** 改动条目键：一个回合对某文件的一次改动。 */
+function changeKey(turn: number, path: string): string {
+  return `${turn}:${path}`;
+}
+
+/** 一个文件的全部改动（按回合升序）。**按 `sessionChangedFiles` 驱动**：读不出原内容的
+ *  文件也在列表里（`captureFileSnapshot` 读失败不记快照），只是没有可还原的东西。 */
+function changeGroups(): { path: string; entries: FileSnapshot[] }[] {
+  return sessionChangedFiles.map((path) => ({
+    path,
+    entries: sessionFileSnapshots.filter((s) => s.path === path).sort((a, b) => a.turn - b.turn),
+  }));
+}
+
+/** 该文件全部条目都接受过 ⇒ 这一行算「已接受」。 */
+function changeAllAccepted(entries: FileSnapshot[]): boolean {
+  return entries.length > 0 && entries.every((e) => changeAccepted.has(changeKey(e.turn, e.path)));
+}
+
+/** 批量读「现在的内容」（只读缺的那些）。读完自己重绘一次 —— 不重绘的话，
+ *  展开的文件会一直停在「读不到」。 */
+async function loadChangeNow(): Promise<void> {
+  if (changeNowBusy) return;
+  const todo = sessionChangedFiles.filter((p) => !changeNow.has(p));
+  if (!todo.length) return;
+  changeNowBusy = true;
+  try {
+    for (const p of todo) {
+      try {
+        const r = await invoke<ChangeNow>("snapshot_read_text", { path: p });
+        changeNow.set(p, { existed: !!r?.existed, content: r?.content ?? null });
+      } catch {
+        changeNow.set(p, { existed: false, content: null });
+      }
+    }
+  } finally {
+    changeNowBusy = false;
+  }
+  renderTodoDrawer();
+}
+
+/** 快照 / 现状 → 可比的一段文本。
+ *
+ *  ⚠️ **`existed: false` 不是「读不出来」，而是「那一刻它还不存在」** ——
+ *  宿主对不存在的路径回 `{existed:false, content:null}`（见 `snapshots.rs`）。
+ *  新建的文件整份都是「新增」、被删的文件整份都是「删除」，两者都要能 diff 出来。
+ *  只有 `existed: true && content === null`（二进制 / 超上限）才是**真的没法预览**。 */
+function sideText(v: { existed: boolean; content: string | null }): string | null {
+  if (!v.existed) return "";
+  return v.content;
+}
+
+/** 取某一行 diff 的两侧文本。`turn === null` = 净变化（最早快照 → 现在）。
+ *  返回 `null` 表示**这一行没法预览**（某一侧读不出原文）。 */
+function changeSides(
+  g: { path: string; entries: FileSnapshot[] },
+  turn: number | null,
+): { old: string; now: string } | null {
+  const idx = turn === null ? 0 : g.entries.findIndex((e) => e.turn === turn);
+  const base = g.entries[idx];
+  if (!base) return null;
+  const oldText = sideText(base);
+  if (oldText === null) return null;
+  // 单条：新侧 = **下一条改动之前**的内容（= 这条改动之后的状态）；
+  // 没有下一条（或看净变化）⇒ 现在盘上那份。
+  const next = turn === null ? undefined : g.entries[idx + 1];
+  const nowSide = next ?? changeNow.get(g.path);
+  if (!nowSide) return null;
+  const nowText = sideText(nowSide);
+  if (nowText === null) return null;
+  return { old: oldText, now: nowText };
+}
+
+/** 一行差异（带 +/- 号；这是给人看的审阅视图，不是 patch，所以不排行号）。 */
+function diffHtml(oldText: string, newText: string): string {
+  const d = lineDiff(oldText, newText);
+  const body = d.lines
+    .map((l) => {
+      const sign = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
+      return `<div class="diff-line diff-${l.kind}">${esc(sign + l.text) || "&nbsp;"}</div>`;
+    })
+    .join("");
+  const note = d.truncated
+    ? `<div class="diff-note">${esc(t("agent.cr_truncated", { n: String(d.lines.length) }))}</div>`
+    : "";
+  return `<div class="diff">${body}</div>${note}`;
+}
+
+/** 增减行数统计（**精确值**，与 diff 是否被截断无关）。没法预览就显示 `—`。 */
+function changeStatHtml(g: { path: string; entries: FileSnapshot[] }): string {
+  const s = changeSides(g, null);
+  if (!s) return `<span class="cr-stat cr-unknown">—</span>`;
+  const d = lineDiff(s.old, s.now);
+  return (
+    `<span class="cr-stat">` +
+    `<span class="cr-add">+${d.added}</span><span class="cr-del">−${d.removed}</span>` +
+    `</span>`
+  );
+}
+
+function crBtn(act: string, path: string, label: string, extra: string, title: string, turn?: number): string {
+  return (
+    `<button type="button" class="cr-btn ${extra}" data-cr="${act}" data-crpath="${esc(path)}"` +
+    (turn === undefined ? "" : ` data-crturn="${turn}"`) +
+    ` title="${esc(title)}">${esc(label)}</button>`
+  );
+}
+
+/** 抽屉里那一块「变更审阅」。**只在文件列表展开时才重算 diff**（收起时算它没意义）。 */
+function changeReviewHtml(): string {
+  const groups = changeGroups();
+  const totalFiles = groups.length;
+  let addSum = 0;
+  let delSum = 0;
+  const rows = groups
+    .map((g) => {
+      const open = changeOpen.has(g.path);
+      const allAccepted = changeAllAccepted(g.entries);
+      // 汇总统计（最早快照 → 现在）
+      const s = changeSides(g, null);
+      if (s) {
+        const d = lineDiff(s.old, s.now);
+        addSum += d.added;
+        delSum += d.removed;
+      }
+      const hint = esc(t("agent.reveal_in_explorer"));
+      const entryRows = g.entries
+        .map((e) => {
+          const accepted = changeAccepted.has(changeKey(e.turn, e.path));
+          const shown = changeShow.path === g.path && changeShow.turn === e.turn;
+          return (
+            `<div class="cr-entry${shown ? " active" : ""}${accepted ? " accepted" : ""}">` +
+            `<button type="button" class="cr-entry-label" data-cr="show" data-crpath="${esc(g.path)}" data-crturn="${e.turn}">` +
+            `${esc(t("agent.cr_turn", { n: String(e.turn + 1) }))}</button>` +
+            (accepted
+              ? `<span class="cr-done">${esc(t("agent.cr_accepted"))}</span>`
+              : crBtn("accept", g.path, t("agent.cr_accept"), "accept", t("agent.cr_accept"), e.turn) +
+                crBtn("reject", g.path, t("agent.cr_reject"), "reject", t("agent.cr_reject_hint"), e.turn)) +
+            `</div>`
+          );
+        })
+        .join("");
+      const cur = changeShow.path === g.path ? changeShow.turn : null;
+      const sides = changeSides(g, cur);
+      const body =
+        `<div class="cr-diff-head">` +
+        `<button type="button" class="cr-entry-label${cur === null ? " active" : ""}" data-cr="show" data-crpath="${esc(g.path)}">` +
+        `${esc(t("agent.cr_net"))}</button>` +
+        `</div>` +
+        entryRows +
+        (sides ? diffHtml(sides.old, sides.now) : `<div class="diff-note">${esc(t("agent.cr_unreadable"))}</div>`);
+      return (
+        `<li class="cr-file${allAccepted ? " accepted" : ""}">` +
+        `<div class="cr-row">` +
+        `<button type="button" class="cr-toggle" data-cr="toggle" data-crpath="${esc(g.path)}" aria-expanded="${open}">${open ? "▾" : "▸"}</button>` +
+        `<a class="file-link" data-path="${esc(g.path)}" title="${hint}">${esc(pathBase(g.path))}</a>` +
+        `<span class="changed-file-dir" title="${esc(g.path)}">${esc(pathDir(g.path))}</span>` +
+        changeStatHtml(g) +
+        (allAccepted
+          ? `<span class="cr-done">${esc(t("agent.cr_accepted"))}</span>`
+          : crBtn("accept", g.path, t("agent.cr_accept"), "accept", t("agent.cr_accept")) +
+            crBtn("reject", g.path, t("agent.cr_reject"), "reject", t("agent.cr_reject_file_hint"))) +
+        `</div>` +
+        (open ? `<div class="cr-body">${body}</div>` : "") +
+        `</li>`
+      );
+    })
+    .join("");
+  const head =
+    `<li class="cr-head">` +
+    `<span class="cr-summary">${esc(t("agent.cr_summary", { files: String(totalFiles), add: String(addSum), del: String(delSum) }))}</span>` +
+    crBtn("acceptAll", "", t("agent.cr_accept_all"), "accept", t("agent.cr_accept_all")) +
+    crBtn("rejectAll", "", t("agent.cr_reject_all"), "reject", t("agent.cr_reject_all")) +
+    `</li>`;
+  return head + rows;
+}
+
+/** 审阅里的四个动作。`turn === undefined` = 作用于该文件的全部条目。 */
+async function applyChangeAction(act: string, path: string, turn: number | undefined): Promise<void> {
+  if (act === "toggle") {
+    if (changeOpen.has(path)) changeOpen.delete(path);
+    else {
+      changeOpen.add(path);
+      changeShow.path = path;
+      changeShow.turn = null;
+    }
+    renderTodoDrawer();
+    return;
+  }
+  if (act === "show") {
+    changeShow.path = path;
+    changeShow.turn = turn === undefined ? null : turn;
+    renderTodoDrawer();
+    return;
+  }
+  if (act === "accept") {
+    for (const s of sessionFileSnapshots) {
+      if (s.path !== path) continue;
+      if (turn === undefined || s.turn === turn) changeAccepted.add(changeKey(s.turn, s.path));
+    }
+    renderTodoDrawer();
+    return;
+  }
+  if (act === "acceptAll") {
+    for (const s of sessionFileSnapshots) changeAccepted.add(changeKey(s.turn, s.path));
+    renderTodoDrawer();
+    return;
+  }
+  // ── 拒绝：真的写盘 ──────────────────────────────────────────────
+  let doomed: FileSnapshot[];
+  if (act === "rejectAll") {
+    doomed = [...sessionFileSnapshots];
+  } else {
+    doomed = sessionFileSnapshots.filter(
+      (s) => s.path === path && (turn === undefined || s.turn >= turn),
+    );
+  }
+  if (!doomed.length) return;
+  const stat = await restoreSnapshots(doomed);
+  // 还原过的条目不再需要审阅；文件的「已改」记录只在它**再没有快照**时才摘掉
+  const spent = new Set(doomed.map((s) => changeKey(s.turn, s.path)));
+  sessionFileSnapshots = sessionFileSnapshots.filter((s) => !spent.has(changeKey(s.turn, s.path)));
+  for (const k of spent) changeAccepted.delete(k);
+  const stillSnapshotted = new Set(sessionFileSnapshots.map((s) => s.path));
+  sessionChangedFiles = sessionChangedFiles.filter((p) => stillSnapshotted.has(p) || !stat.paths.has(p));
+  for (const p of stat.paths) changeNow.delete(p);
+  framesEpoch++;
+  await persistSessionFrames();
+  const n = stat.restored + stat.deleted;
+  if (statusText) {
+    statusText.textContent =
+      stat.failed || stat.skipped
+        ? t("agent.cr_reverted_part", {
+            n: String(n),
+            failed: String(stat.failed + stat.skipped),
+          })
+        : t("agent.cr_reverted", { n: String(n) });
+  }
+  renderTodoDrawer();
 }
 
 // ── 任务抽屉（2026-09-21）────────────────────────────────────────────
@@ -4198,10 +5928,44 @@ let todoFilesOpen = false;
  *  在视觉上什么都不会变 —— 现在确认一定让抽屉消失。） */
 let todoDismissed = false;
 
+/** 待办清单的**时间线**（2026-10-02）：模型每次 TodoWrite 记一条 `{turn, todos}`
+ *  （同一回合覆盖），随会话落进 chat.db 的 `sessions.todos` 列。
+ *  回退 / 切会话后据此还原「那个时刻的待办」—— 见 applyTodoTimeline。 */
+let sessionTodoTimeline: SessionTodoSnapshot[] = [];
+
+/** 记一条时间线快照；同一回合内后写的覆盖先写的（模型一轮里可能发多次 TodoWrite，
+ *  只有最后一次代表这一轮的**最终**状态 —— 与 renderTodoPanel 的「整体替换」同一语义）。 */
+function recordTodoSnapshot(todos: unknown[]) {
+  const turn = completedTurnCount();
+  const snap: SessionTodoSnapshot = { turn, todos };
+  const i = sessionTodoTimeline.findIndex(s => s.turn === turn);
+  if (i >= 0) sessionTodoTimeline[i] = snap;
+  else sessionTodoTimeline.push(snap);
+}
+
+/** 按时间线还原待办。
+ *
+ *  `kept === null` = **恢复会话**：取最后一条（整段会话的最终状态）。
+ *  `kept` 是数字 = **回退到某条消息**：只保留 `turn < kept` 的快照 —— 那正是
+ *  「回退点那一刻」的待办；`turn >= kept` 的属于被丢掉的那几轮，必须一起不算
+ *  （否则回退后会看到「还没发生」的任务）。 */
+function applyTodoTimeline(kept: number | null) {
+  const alive =
+    kept === null ? sessionTodoTimeline : sessionTodoTimeline.filter(s => s.turn < kept);
+  todoItems = alive.length ? alive[alive.length - 1].todos : [];
+  todoTasksOpen = false;
+  todoFilesOpen = false;
+  todoDismissed = false;
+  renderTodoDrawer();
+}
+
 function renderTodoDrawer() {
   const hasTasks = todoItems.length > 0;
   const hasFiles = sessionChangedFiles.length > 0;
-  const hasContent = hasTasks || hasFiles;
+  // 后台运行的命令也算「抽屉里有内容」（2026-10-01）：用户正等着它跑完 ——
+  // 此刻恰恰是最需要看见它的时候，不能因为「没有待办」把整条抽屉藏掉。
+  const hasBg = backgroundCmds.size > 0;
+  const hasContent = hasTasks || hasFiles || hasBg;
   // 两个硬条件（2026-09-21 修）：
   //  ① **只在 AI 对话模式下出现** —— 抽屉是 `#results-list` 的**兄弟节点**
   //     （index.html），不判模式的话退出 AI 之后它会浮在别的插件结果上面
@@ -4231,17 +5995,31 @@ function renderTodoDrawer() {
     .join("");
   todoDrawerTasks.classList.toggle("hidden", !(hasTasks && todoTasksOpen));
 
-  const hint = esc(t("agent.reveal_in_explorer"));
-  todoDrawerFiles.innerHTML = sessionChangedFiles
+  const filesOpen = hasFiles && todoFilesOpen;
+  // U1 变更审阅：**只在展开时才重算**（每个文件都要读盘 + 比对，收起时算它纯浪费）。
+  // 缓存还没读齐时先画一行「读取中」并去补读 —— 补完自己重绘。
+  // **不能拿缺缓存当「文件已被删除」**：那会先闪一句假话再改口。
+  if (filesOpen && sessionChangedFiles.some((p) => !changeNow.has(p))) {
+    todoDrawerFiles.innerHTML = `<li class="cr-loading">${esc(t("agent.cr_loading"))}</li>`;
+    void loadChangeNow();
+  } else {
+    todoDrawerFiles.innerHTML = filesOpen ? changeReviewHtml() : "";
+  }
+  todoDrawerFiles.classList.toggle("hidden", !filesOpen);
+
+  // 后台运行区（2026-10-01）：**始终展开**、不另设开合按钮 —— 这里通常只有一两条，
+  // 而「取消」是这块存在的唯一意义，藏一层就白做了。
+  // 取消按钮只带 `data-bg`（后台 id），点击由绑在容器上的那个委托处理（见文件顶部）。
+  todoDrawerBg.innerHTML = [...backgroundCmds]
     .map(
-      (p) =>
-        `<li class="changed-file">` +
-        `<a class="file-link" data-path="${esc(p)}" title="${hint}">${esc(pathBase(p))}</a>` +
-        `<span class="changed-file-dir" title="${esc(p)}">${esc(pathDir(p))}</span>` +
+      ([id, v]) =>
+        `<li class="todo-item bg-cmd">` +
+        `<span class="bg-cmd-label" title="${esc(v.label)}">${esc(v.label)}</span>` +
+        `<button type="button" class="bg-cmd-cancel" data-bg="${esc(id)}">${esc(t("agent.bg_cancel"))}</button>` +
         `</li>`
     )
     .join("");
-  todoDrawerFiles.classList.toggle("hidden", !(hasFiles && todoFilesOpen));
+  todoDrawerBg.classList.toggle("hidden", !hasBg);
 
   setTodoDrawerBtn(todoDrawerTasksBtn, hasTasks, t("agent.todo_tasks_btn"), todoTasksOpen);
   setTodoDrawerBtn(
@@ -4263,14 +6041,14 @@ function setTodoDrawerBtn(b: HTMLButtonElement, enabled: boolean, label: string,
 
 /** 抽屉三个按钮的行为：开合 / 收起。状态只写在上面两个变量里，重绘即生效。 */
 function attachTodoDrawer() {
+  // 两个列表**可以同时展开**（2026-09-30 用户要求「两者可同时展开」）——
+  // 原先是互斥的（点开一个就收起另一个），已去掉；两个开合状态各自独立。
   todoDrawerTasksBtn.addEventListener("click", () => {
     todoTasksOpen = !todoTasksOpen;
-    if (todoTasksOpen) todoFilesOpen = false; // 两个列表不并存
     renderTodoDrawer();
   });
   todoDrawerFilesBtn.addEventListener("click", () => {
     todoFilesOpen = !todoFilesOpen;
-    if (todoFilesOpen) todoTasksOpen = false;
     renderTodoDrawer();
   });
   todoDrawerOkBtn.addEventListener("click", () => {
@@ -4281,6 +6059,9 @@ function attachTodoDrawer() {
     todoTasksOpen = false;
     todoFilesOpen = false;
     todoDismissed = true;
+    // 收工也记一笔（空清单）：不然盘上那条时间线还留着「未确认」的待办，
+    // 下次切回这个会话 / 回退就会把它又摆出来，等于「点了确认没反应」。
+    recordTodoSnapshot([]);
     renderTodoDrawer();
   });
 }
@@ -4297,6 +6078,15 @@ document.addEventListener("click", (e) => {
     console.warn("[lunac] reveal_in_explorer failed:", err);
     if (statusText) statusText.textContent = t("agent.reveal_failed");
   });
+});
+
+// U1 变更审阅的按钮：同一套委托（列表每次重画）。
+document.addEventListener("click", (e) => {
+  const btn = (e.target as HTMLElement | null)?.closest<HTMLElement>("[data-cr]");
+  if (!btn) return;
+  e.preventDefault();
+  const raw = btn.dataset.crturn;
+  void applyChangeAction(btn.dataset.cr || "", btn.dataset.crpath || "", raw === undefined ? undefined : Number(raw));
 });
 
 function agentToolArgsDelta(s: string) {
@@ -4333,6 +6123,8 @@ function parseTodoArgs(raw: string): unknown[] | null {
 function renderTodoPanel(todos: unknown[]) {
   todoItems = todos;
   todoDismissed = false; // 新清单 ⇒ 抽屉该回来（用户确认过的是**上一份**清单）
+  // 同时记进时间线（落盘用）—— 回退 / 切会话后靠它还原，见 applyTodoTimeline。
+  recordTodoSnapshot(todos);
   renderTodoDrawer();
 }
 
@@ -4374,10 +6166,13 @@ function extractToolResultText(c: unknown): string {
 
 /** core-agent 的 run_shell 把退出码与超时写进了结果文本（协议未变），这里做轻量解析；
  *  解析不到就只显示耗时 —— 降级为不显示，绝不抛错、不打断裂渲染。 */
-function parseShellOutcome(txt: string): { exitCode: number | null; timedOut: boolean } {
+function parseShellOutcome(txt: string): { exitCode: number | null; timedOut: boolean; stopped: boolean } {
   const timedOut = /\(timed out after \d+ ms/i.test(txt);
+  // 用户点了「停止」（2026-10-01）：agent 侧那句原文见 tools.rs —— 被 kill 的进程**没有退出码**，
+  // 认不出这一句就会被下面的兜底判成「完成」，等于骗人。
+  const stopped = /\(stopped by the user/i.test(txt);
   const m = txt.match(/(?:^|\n)exit code:\s*(\d+)/);
-  return { exitCode: m ? Number(m[1]) : null, timedOut };
+  return { exitCode: m ? Number(m[1]) : null, timedOut, stopped };
 }
 
 async function copyToClipboard(s: string) {
@@ -4459,7 +6254,7 @@ function appendRefusalActions(card: AgentToolCard, txt: string, isError: boolean
   const outside = parseBoundaryDenial(txt);
   if (!denied && !outside) return;
 
-  const isShell = card.name === "Bash" || card.name === "PowerShell";
+  const isShell = card.name === "Cmd" || card.name === "PowerShell";
   const danger = isShell ? dangerLabelOf(card.cmd || txt) : null;
 
   const box = document.createElement("div");
@@ -4498,19 +6293,59 @@ function appendRefusalActions(card: AgentToolCard, txt: string, isError: boolean
   body.appendChild(box);
 }
 
+/** 命令卡**运行中**的实时输出追加（2026-09-30）。
+ *
+ *  与 `fillToolCard`（跑完后的整块填充）刻意分开：这里只追加 `.tool-out`，**不碰**状态 /
+ *  耗时 / 退出码 / 截断逻辑 —— 它是**临时视图**，真正的结果一到就整块覆盖。
+ *
+ *  只留尾部 `LIVE_OUT_MAX` 个字符：下载 / 长任务能刷出几十万行，全留着会把 DOM 压垮，
+ *  而看进度关心的就是「最新几行」。滚动位置不动 —— 卡片默认折叠，摊位由用户自己掌控。 */
+const LIVE_OUT_MAX = 4000;
+
+function agentToolOutput(toolUseId: string, chunk: string) {
+  const v = agentView;
+  if (!v || !chunk) return;
+  const card = toolUseId ? v.toolCards.get(toolUseId) : undefined;
+  if (!card || card.done) return;
+  // 命令类工具：写进终端（未展开时先进 `card.termBuf`，展开后回放）——ANSI 由 xterm 解释，
+  // 所以**不再**做 `LIVE_OUT_MAX` 那种「只留尾部」的截断（终端有自己的 scrollback）。
+  if (card.isShell) {
+    appendTermBuf(card, chunk);
+    card.term?.write(chunk);
+    return;
+  }
+  const outEl = card.el.querySelector<HTMLElement>(".tool-out");
+  if (!outEl) return;
+  let text = (outEl.textContent || "") + chunk;
+  if (text.length > LIVE_OUT_MAX) text = "…\n" + text.slice(-LIVE_OUT_MAX);
+  outEl.textContent = text;
+}
+
 /** 把一次 tool_result 填回它对应的卡片：状态 / 退出码 / 耗时 / 输出 / 复制操作。 */
-function fillToolCard(card: AgentToolCard, txt: string, isError: boolean) {
+function fillToolCard(
+  card: AgentToolCard,
+  txt: string,
+  isError: boolean,
+  secretHits?: ToolSecretHit[],
+) {
   const el = card.el;
-  const { exitCode, timedOut } = parseShellOutcome(txt);
-  const isShell = card.name === "Bash" || card.name === "PowerShell";
+  const { exitCode, timedOut, stopped } = parseShellOutcome(txt);
+  const isShell = card.name === "Cmd" || card.name === "PowerShell";
   const firstLine = txt.split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 80);
 
-  el.classList.remove("running");
+  // `stopped` 一并摘掉：点「停止」那一刻是**乐观**置上的（见 createToolCard），
+  // 真相（结果文本）一到就得重新判 —— 万一那条命令在点之前就跑完了，结果里不会有那一句。
+  el.classList.remove("running", "stopped");
   const stateEl = el.querySelector<HTMLElement>(".tool-state");
   if (isError) {
     el.classList.add("failed");
     el.open = true; // 失败直接摊开，别让用户再点一次
     if (stateEl) stateEl.textContent = t("agent.tool_failed", { txt: firstLine || "unknown error" });
+  } else if (stopped) {
+    // 用户自己停的（2026-10-01）：既不是成功也不是失败，用黄色（同 timeout）。
+    // **不许走下面的 `.ok` 兜底** —— 命令被 kill、没有退出码，报「完成」就是骗人。
+    el.classList.add("stopped");
+    if (stateEl) stateEl.textContent = t("agent.tool_stopped");
   } else if (timedOut) {
     el.classList.add("timeout");
     if (stateEl) stateEl.textContent = t("agent.tool_timeout");
@@ -4550,13 +6385,59 @@ function fillToolCard(card: AgentToolCard, txt: string, isError: boolean) {
     }
   }
 
+  // 命令类工具（2026-10-05）：正文是终端，没有 `.tool-out` —— 结果落到终端里的方式是在
+  // 流式输出末尾补一行收尾状态（退出码 / 超时 / 被停），并把 stdin 关掉（命令已结束）。
+  if (card.isShell) {
+    const tail = stopped
+      ? `\r\n\x1b[2m[${t("agent.tool_stopped")}]\x1b[0m\r\n`
+      : timedOut
+        ? `\r\n\x1b[2m[${t("agent.tool_timeout")}]\x1b[0m\r\n`
+        : exitCode !== null
+          ? `\r\n\x1b[2m[${t("agent.tool_exit_code", { code: String(exitCode) })}]\x1b[0m\r\n`
+          : `\r\n`;
+    appendTermBuf(card, tail);
+    if (card.term) {
+      card.term.write(tail);
+      card.term.options.disableStdin = true;
+      card.term.options.cursorBlink = false;
+    }
+  }
+
+  // ImageGen（A13，2026-10-03）：出图工具的结果里每行是 `![generated](绝对路径)`，
+  // 那是**给模型看的路径**；这里做一层纯展示的解析，把图真正渲染进卡片。
+  // 识不出就什么都不做，文本照旧显示 —— 不给「图挂了但卡片空白」这种状态。
+  if (card.name === "ImageGen" && !isError) {
+    const box = el.querySelector<HTMLElement>(".tool-body");
+    const paths = [...txt.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)].map((m) => m[1].trim());
+    if (box && paths.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "tool-images";
+      for (const p of paths) {
+        const img = document.createElement("img");
+        img.className = "tool-image";
+        img.loading = "lazy";
+        img.alt = "";
+        // 本地绝对路径必须经 convertFileSrc（WebView2 的 CSP img-src 不含 file:）
+        img.src = /^(https?:|data:)/i.test(p) ? p : convertFileSrc(p);
+        wrap.appendChild(img);
+      }
+      box.appendChild(wrap);
+      el.open = true; // 出了图就别折叠着 —— 用户要看的就是它
+    }
+  }
+
+  // 命令已返回 ⇒ 撤掉「后台运行 / 停止」（它们只对**正在跑**的命令有意义）。
+  // **例外**：已转后台的那条其实还在跑 ⇒ 保留（内容已被 markCardBackground 换掉）。
+  if (!bgOf(el.dataset.toolId)) el.querySelector(".tool-live")?.remove();
+
   const actions = el.querySelector<HTMLElement>(".tool-actions");
   if (actions) {
     if (isShell && card.cmd.trim()) {
       actions.appendChild(toolActionButton(t("agent.tool_copy_cmd"), card.cmd));
     }
     if (txt) actions.appendChild(toolActionButton(t("agent.tool_copy_output"), txt));
-    if (txt.length > 600) {
+    // 「显示全部」只对 `<pre class="tool-out">` 有意义 —— 命令类工具是终端（无此元素）。
+    if (!card.isShell && txt.length > 600) {
       const all = document.createElement("button");
       all.type = "button";
       all.className = "tool-action";
@@ -4573,13 +6454,39 @@ function fillToolCard(card: AgentToolCard, txt: string, isError: boolean) {
     if (!actions.childElementCount) actions.remove();
   }
 
+  // ── A17：写入内容的凭据告警（2026-10-01）────────────────────────
+  // 审批卡那份是**执行前**给用户看的；这里是**结果卡**上再来一次 —— 用户可能压根没看
+  // 那张卡（自动档、或顺手点了允许），而「这条命令往磁盘写了什么」必须留在案发现场。
+  // 只列规则与行号，**不显示命中的内容**（`analysis.secrets` 本来就只有这两项）。
+  if (secretHits && secretHits.length > 0) {
+    const box = el.querySelector<HTMLElement>(".tool-body");
+    if (box) {
+      const warn = document.createElement("div");
+      warn.className = "tool-secret-warn";
+      warn.innerHTML =
+        `<strong>${esc(t("agent.secret_warn_title"))}</strong>` +
+        `<ul>${secretHits
+          .map((h) => `<li>${esc(`${h.rule || "?"}${h.line ? ` (line ${h.line})` : ""}`)}</li>`)
+          .join("")}</ul>` +
+        `<span class="tool-secret-warn-note">${esc(t("agent.secret_warn_note"))}</span>`;
+      box.insertBefore(warn, box.firstChild);
+    }
+    // 与「失败直接摊开」同一条理由：这一条必须被看见，不许藏在折叠里
+    el.open = true;
+  }
+
   // 越界 / 被拒：补一行用户可选的后续动作（§4.3）
   appendRefusalActions(card, txt, isError);
 }
 
 /** Render a tool execution outcome inline — otherwise a failed tool looks
  *  like a silent hang (only the tool row appears, then nothing). */
-function agentToolResult(isError: boolean, content: unknown, toolUseId?: string) {
+function agentToolResult(
+  isError: boolean,
+  content: unknown,
+  toolUseId?: string,
+  secretHits?: ToolSecretHit[],
+) {
   const v = agentView;
   const host = v?.flow ?? resultsList;
   const txt = extractToolResultText(content).trim();
@@ -4589,7 +6496,7 @@ function agentToolResult(isError: boolean, content: unknown, toolUseId?: string)
   if (card && !card.done) {
     card.done = true;
     if (v?.openCard === card) v.openCard = null;
-    fillToolCard(card, txt, isError);
+    fillToolCard(card, txt, isError, secretHits);
     // 失败数进组头（「已执行 3 条命令 · 1 次失败」）。按**卡片所属的组**刷，
     // 不用 `v.cmdGroup`（那可能已经是下一组的引用）。
     if (isError) refreshCmdGroup(card.el.closest("details.cmd-group"));
@@ -4637,7 +6544,7 @@ function agentToolResult(isError: boolean, content: unknown, toolUseId?: string)
 // ── Agent permission dialogs (can_use_tool control protocol) ────
 // When a tool needs approval, agent.exe emits a control_request on stdout
 // and BLOCKS until a control_response arrives on stdin. Without this UI
-// the agent would hang forever on any gated tool (e.g. Bash commands).
+// the agent would hang forever on any gated tool (e.g. Cmd commands).
 const pendingPermissionCards = new Map<string, HTMLElement>();
 
 /** 不可白名单化的命令前缀（解释器 / 启动器 / 动态执行）。
@@ -4734,7 +6641,7 @@ function classifyRequest(
 ): RequestClass {
   const inp = input as Record<string, unknown> | undefined;
   const bashCmd =
-    (toolName === "Bash" || toolName === "PowerShell") && typeof inp?.command === "string"
+    (toolName === "Cmd" || toolName === "PowerShell") && typeof inp?.command === "string"
       ? (inp.command as string)
       : null;
 
@@ -4852,8 +6759,33 @@ function respondPermission(
   invoke("send_message", { message: msg }).catch(() => {});
 }
 
+/** 对**正在执行**的命令下一条实时指令（2026-10-01）。
+ *
+ *  走的是与审批回包**同一条路**（`send_message` → agent 的 stdin 一行 JSON），
+ *  只是在 `control_response` 之外多了一种消息类型 `tool_control` —— agent 侧由
+ *  `route_tool_control` 按 `tool_use_id` 找回那条命令的控制块并置位。
+ *
+ *  ⚠️ **它不进对话队列**（agent 侧 `continue` 掉了）：这条指令是「改某个正在跑的
+ *  东西的状态」，不是一轮提问 —— 排进队列只会等用户消息走完，那时命令早跑完了。
+ *
+ *  `background` 与 `stop` **都会让模型知道**：转后台时模型的 tool_result 会变成
+ *  「已转入后台、别等它」，停止时变成「已被用户停止，别原样重试」——
+ *  所以这里不需要再额外交代模型什么。
+ *
+ *  `stdin`（2026-10-05）：把用户在命令卡终端里键入的字符（`data`）灌进子进程 stdin。
+ *  它是**高频**的（每个按键一条），所以 agent 侧刻意不逐条记日志。 */
+function sendToolControl(action: "background" | "stop" | "stdin", toolUseId: string, data?: string) {
+  const payload: Record<string, unknown> = { type: "tool_control", action, tool_use_id: toolUseId };
+  if (action === "stdin") payload.data = data ?? "";
+  const msg = JSON.stringify(payload);
+  invoke("send_message", { message: msg }).catch(() => {});
+}
+
+/** 后台运行中的命令：后台 id → `{ toolUseId, label }`。待办清单那一区就是它。 */
+const backgroundCmds = new Map<string, { toolUseId: string; label: string }>();
+
 // ── Continuous-command merging (Trae-style approval) ──────────────
-// Consecutive simple Bash/PowerShell commands in the same turn fold into
+// Consecutive simple Cmd/PowerShell commands in the same turn fold into
 // ONE approval row → one permission window, one allow/deny decision for
 // all of them. The merge is approval/presentation only: the CLI still
 // runs each command individually, so execution semantics are never
@@ -4876,7 +6808,7 @@ interface CmdGroupItem extends HTMLElement {
   _groupIds: string[];
   _groupCmds: string[];
   _groupToolUseIds: string[];
-  /** 组内出现过的命令类工具名（Bash / PowerShell，去重） */
+  /** 组内出现过的命令类工具名（Cmd / PowerShell，去重） */
   _groupToolNames: string[];
   _groupDanger: boolean;
   /** 组内命中的危险标签（去重）—— 标题 tooltip 用 */
@@ -4901,7 +6833,7 @@ interface CmdGroupItem extends HTMLElement {
 
 /** Find the last open command-group row (merge target).
  *
- *  命令类工具（`Bash` / `PowerShell`）视作**同一族** —— 用户要求「短时间内不同类型的
+ *  命令类工具（`Cmd` / `PowerShell`）视作**同一族** —— 用户要求「短时间内不同类型的
  *  命令也合并进同一次权限运行」，所以这里不再按工具名区分：只要上一行还是**未被应答**
  *  的命令组，新命令就并进去（跨轮是并不了的：下一轮的命令要等上一轮的执行结果才产生）。
  *
@@ -4921,7 +6853,7 @@ function findLastCmdGroup(taskId?: string): CmdGroupItem | null {
   return last;
 }
 
-/** 行标题：合并后工具名可能不止一个（`Bash + PowerShell`），危险 / 不透明标记也可能
+/** 行标题：合并后工具名可能不止一个（`Cmd + PowerShell`），危险 / 不透明标记也可能
  *  来自后来合并进来的那条命令，所以每次合并都重画一次。 */
 function renderGroupTitle(item: CmdGroupItem) {
   const el = item.querySelector(".approval-title");
@@ -5026,28 +6958,63 @@ function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupIte
   item._resolveNote = (allow) => (allow ? "已提交答案" : "已拒绝提问");
 }
 
-/** 计划卡（A7）：`ExitPlanMode` 的入参 `plan` 就是整份计划，原样铺在卡里给用户读。
+/** 计划卡折叠态铺多少行（2026-10-06，q3 第 6 步）。12 行约一屏，够看清「这份计划要干什么」。 */
+const PLAN_PREVIEW_LINES = 12;
+
+/** 计划卡（A7）：`ExitPlanMode` 的入参 `plan` 就是整份计划，铺在卡里给用户读。
  *
  *  不引 markdown 渲染器 —— 全应用的对话正文都是「转义 + `pre-wrap`」（见 `esc` 与
  *  `.agent-text` 的样式）。计划里那几个 `#` / `-` 用原文反倒更可信：用户看到的就是
  *  模型交出来的那一份，没有任何中间层可能改动它。
  *
  *  用 `textContent` 而不是 `innerHTML`：计划是**模型生成的任意文本**，既不该被当成
- *  HTML 解析，也不该给它任何注入的机会。 */
+ *  HTML 解析，也不该给它任何注入的机会。
+ *
+ *  **长计划默认只铺前 `PLAN_PREVIEW_LINES` 行**（2026-10-06，q3 第 6 步，用户实测
+ *  「会出现一大段文档」）：折叠态给一枚「展开全文」，点一下就是完整原文。
+ *
+ *  ⚠️ **刻意不用模型摘要代替原文** —— 这张卡是用户裁决「放行写类工具、让模型开始动手」
+ *  的**唯一依据**，摘要可能恰好丢掉「会删除某个文件」这类关键项（那就不再是「保留主要
+ *  内容」，而是把风险藏在摘要之后）。折叠**不丢任何内容**，只是默认不铺满一屏 ——
+ *  用户想读全文只需一次点击，裁决依据始终完整。 */
 function renderPlanCard(host: HTMLElement, input: unknown) {
   const inp = (input ?? {}) as Record<string, unknown>;
   const plan = typeof inp.plan === "string" ? inp.plan : "";
-  const lines = plan.trim() ? plan.trim().split("\n").length : 0;
+  // 去掉**末尾空行**再数（模型常在结尾留几行空行，算进去会让「共 N 行」虚高）
+  const lines = plan.split("\n");
+  while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+  const total = plan.trim() ? lines.length : 0;
 
   const meta = document.createElement("div");
   meta.className = "approval-plan-meta";
-  meta.textContent = t("agent.plan_meta", { lines: String(lines) });
+  meta.textContent = t("agent.plan_meta", { lines: String(total) });
   host.appendChild(meta);
 
   const box = document.createElement("div");
   box.className = "approval-plan";
-  box.textContent = plan;
   host.appendChild(box);
+
+  // 短计划直接铺完（没有可折叠的东西，就不该多一枚按钮）
+  if (total <= PLAN_PREVIEW_LINES) {
+    box.textContent = lines.join("\n");
+    return;
+  }
+
+  let expanded = false;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "approval-plan-toggle";
+  const apply = () => {
+    box.textContent = (expanded ? lines : lines.slice(0, PLAN_PREVIEW_LINES)).join("\n");
+    toggle.textContent = expanded ? t("agent.plan_collapse") : t("agent.plan_expand");
+  };
+  toggle.addEventListener("click", () => {
+    expanded = !expanded;
+    apply();
+    agentScroll();
+  });
+  apply();
+  host.appendChild(toggle);
 }
 
 /** 批准后把计划留档到 `ModuleData\plans\<本地时间戳>.md`（A7）。
@@ -5234,6 +7201,117 @@ function renderCmdGroupBody(item: CmdGroupItem) {
 // card is open (status keeps showing 等待权限确认).
 let permissionBatchCard: HTMLElement | null = null;
 
+/** 这一批里**待批准的计划卡**的 requestId（2026-10-02）。
+ *  只服务两件事：① 给 `body.plan-open` 一个判据（计划待批 ⇒ 藏任务抽屉 / 输入栏）；
+ *  ② 计划卡不给「全部允许 / 全部拒绝」。 */
+const pendingPlanIds = new Set<string>();
+
+/** 计划卡分页的展示态（2026-10-03，用户要求「多份计划各占一页 + 末页补充要求」）。
+ *  **纯展示** —— 审批语义不变：每份计划仍各自 allow/deny，`_finish` 那条路一字未改。
+ *  只有一批里出现计划卡时才建；批次卡收走时由 `resetPlanPager()` 归零。 */
+let planPagerBar: HTMLElement | null = null;
+let planCustomPage: HTMLElement | null = null;
+let planActivePage = 0;
+
+/** 批次正文里的计划页（DOM 顺序）。 */
+function planPageItems(body: HTMLElement): HTMLElement[] {
+  return Array.from(body.querySelectorAll<HTMLElement>(".approval-item.plan-page"));
+}
+
+/** 切到第 `page` 页；末页永远是「补充要求」。 */
+function showPlanPage(page: number) {
+  const body = permissionBatchCard?.querySelector<HTMLElement>(".approval-batch-body");
+  if (!body) return;
+  const items = planPageItems(body);
+  const total = items.length + 1; // +1 = 末页「补充要求」
+  planActivePage = Math.max(0, Math.min(page, total - 1));
+  items.forEach((it, i) => { it.style.display = i === planActivePage ? "" : "none"; });
+  if (planCustomPage) planCustomPage.style.display = planActivePage === total - 1 ? "" : "none";
+  const label = planPagerBar?.querySelector<HTMLElement>(".plan-page-label");
+  if (label) label.textContent = t("agent.plan_page", { i: String(planActivePage + 1), n: String(total) });
+  const prev = planPagerBar?.querySelector<HTMLButtonElement>(".plan-prev");
+  const next = planPagerBar?.querySelector<HTMLButtonElement>(".plan-next");
+  if (prev) prev.disabled = planActivePage === 0;
+  if (next) next.disabled = planActivePage >= total - 1;
+}
+
+/** 惰性创建分页条（挂批次正文最前）+ 末页「补充要求」（挂最后）。 */
+function ensurePlanPager(body: HTMLElement) {
+  if (planPagerBar?.isConnected && planCustomPage?.isConnected) return;
+  const bar = document.createElement("div");
+  bar.className = "plan-pager";
+  bar.innerHTML =
+    `<button type="button" class="plan-nav plan-prev">${esc(t("agent.plan_prev"))}</button>` +
+    `<span class="plan-page-label"></span>` +
+    `<button type="button" class="plan-nav plan-next">${esc(t("agent.plan_next"))}</button>`;
+  bar.querySelector(".plan-prev")!.addEventListener("click", () => showPlanPage(planActivePage - 1));
+  bar.querySelector(".plan-next")!.addEventListener("click", () => showPlanPage(planActivePage + 1));
+  body.insertBefore(bar, body.firstChild);
+  planPagerBar = bar;
+
+  const page = document.createElement("div");
+  page.className = "plan-custom-page";
+  const title = document.createElement("div");
+  title.className = "plan-custom-title";
+  title.textContent = t("agent.plan_custom_title");
+  const ta = document.createElement("textarea");
+  ta.className = "plan-custom-input";
+  ta.placeholder = t("agent.plan_custom_ph");
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "approval-btn plan-custom-submit";
+  submit.textContent = t("agent.plan_custom_submit");
+  submit.addEventListener("click", () => submitPlanCustomRequirements(ta.value));
+  page.append(title, ta, submit);
+  body.appendChild(page);
+  planCustomPage = page;
+}
+
+/** 末页「提交补充要求」：把用户的话作为**拒因**回灌给所有待审批的计划（等同拒绝 +
+ *  自定义反馈）—— 模型保持计划模式、据此重做计划，本计划不会执行（用户选定的语义）。 */
+function submitPlanCustomRequirements(text: string) {
+  const msg = text.trim();
+  if (!msg) return;
+  const body = permissionBatchCard?.querySelector<HTMLElement>(".approval-batch-body");
+  if (!body) return;
+  for (const it of planPageItems(body)) {
+    (it as unknown as { _finish?: (a: boolean, w?: boolean, d?: string) => void })
+      ._finish?.(false, false, t("agent.plan_custom_msg", { text: msg }));
+  }
+}
+
+/** 计划被答复（批准 / 取消 / 补充）后重排分页：页数会变，当前页要落回合法范围。 */
+function refreshPlanPager() {
+  const body = permissionBatchCard?.querySelector<HTMLElement>(".approval-batch-body");
+  if (!body) return;
+  showPlanPage(Math.min(planActivePage, planPageItems(body).length)); // 末页下标 = 计划页数
+}
+
+/** 批次卡被收走 ⇒ 分页展示态归零（否则下一批会复用上一批的页码 / 节点引用）。 */
+function resetPlanPager() {
+  planPagerBar = null;
+  planCustomPage = null;
+  planActivePage = 0;
+}
+
+/** 审批停靠位的显隐 + 让位（2026-10-02 用户要求「权限卡停靠输入框位置」）。
+ *
+ *  三件事必须**一起**做，所以只留这一个入口（散在各处迟早漏一处）：
+ *   ① 有待审批的卡 ⇒ 停靠位显示、输入栏整条藏起来（`body.approval-open`，见 styles.css）
+ *      —— 卡片**替代**输入框的位置，审批不会再随对话流滚走、也不会被滚丢；
+ *   ② 批次里有待批准的计划 ⇒ 再叠 `body.plan-open`：任务抽屉（待办 + 文件更改）整块藏，
+ *      那些都是上一轮的残留，计划待批时只会干扰阅读（用户要求）；
+ *   ③ 批量按钮随计划一起收 —— 只收计划卡上的，普通多命令审批卡仍然保留（用户确认过）。 */
+function syncApprovalChrome() {
+  const open = pendingPermissionCards.size > 0;
+  approvalDock.classList.toggle("hidden", !open);
+  document.body.classList.toggle("approval-open", open);
+  document.body.classList.toggle("plan-open", pendingPlanIds.size > 0);
+  permissionBatchCard
+    ?.querySelector(".approval-batch-actions")
+    ?.classList.toggle("hidden", pendingPlanIds.size > 0);
+}
+
 function isPermissionPending(): boolean {
   return pendingPermissionCards.size > 0;
 }
@@ -5245,6 +7323,175 @@ function updatePermissionHeader() {
     countEl.textContent = t("agent.permission_count", { count: String(pendingPermissionCards.size) });
   }
   statusText.textContent = t("agent.permission_wait");
+  syncApprovalChrome();
+}
+
+/** MCP elicitation 卡片（A13）：服务端反向发 `elicitation/create` 时的那张表单。
+ *
+ *  来源与通道：用户工具在 `tools\*.json` 里声明了 `elicit`，服务端在 `tools/call`
+ *  执行前向用户收集输入。agent 侧把它转成一条 **`control_request`**（`subtype=elicitation`）
+ *  —— 走的是与 `can_use_tool` **同一条审批通道**，回包仍复用 `respondPermission` 的
+ *  `updatedInput`（表单值原样就是 MCP 规范要的 `content`）。
+ *
+ *  `requestedSchema` 是 JSON Schema 的子集：按 `properties` 逐字段铺开 ——
+ *  有 `enum` 用下拉、`boolean` 用勾选框、`number`/`integer` 用数字框，其余当文本。 */
+const pendingElicitCards = new Map<string, HTMLElement>();
+
+function showElicitationCard(requestId: string, message: string, schema: unknown) {
+  pendingElicitCards.get(requestId)?.remove();
+  const host = agentView?.flow ?? resultsList;
+  const card = document.createElement("div");
+  card.className = "approval-card elicit-card";
+
+  const title = document.createElement("div");
+  title.className = "approval-title";
+  title.innerHTML = `<b>${esc(message || t("agent.elicit_title"))}</b>`;
+  card.appendChild(title);
+
+  const body = document.createElement("div");
+  body.className = "approval-body";
+  card.appendChild(body);
+
+  const props = ((schema as { properties?: Record<string, unknown> } | null)?.properties ??
+    {}) as Record<string, Record<string, unknown>>;
+  const required: string[] = Array.isArray((schema as { required?: unknown } | null)?.required)
+    ? ((schema as { required: string[] }).required)
+    : [];
+  const fields = new Map<string, () => unknown>();
+
+  for (const [key, defRaw] of Object.entries(props)) {
+    const def = defRaw ?? {};
+    const type = String(def.type ?? "string");
+    const wrap = document.createElement("div");
+    wrap.className = "elicit-field";
+
+    const label = document.createElement("label");
+    label.className = "elicit-label";
+    label.textContent = String(def.title ?? key) + (required.includes(key) ? " *" : "");
+    wrap.appendChild(label);
+
+    if (Array.isArray(def.enum)) {
+      const sel = document.createElement("select");
+      sel.className = "elicit-input";
+      for (const opt of def.enum as unknown[]) {
+        const o = document.createElement("option");
+        o.value = String(opt);
+        o.textContent = String(opt);
+        sel.appendChild(o);
+      }
+      wrap.appendChild(sel);
+      fields.set(key, () => sel.value);
+    } else if (type === "boolean") {
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.className = "elicit-check";
+      wrap.appendChild(cb);
+      fields.set(key, () => cb.checked);
+    } else {
+      const inp = document.createElement("input");
+      inp.className = "elicit-input";
+      inp.type = type === "number" || type === "integer" ? "number" : "text";
+      if (typeof def.description === "string") inp.placeholder = def.description;
+      if (def.default !== undefined && def.default !== null) inp.value = String(def.default);
+      wrap.appendChild(inp);
+      fields.set(key, () =>
+        type === "number" || type === "integer" ? Number(inp.value) : inp.value,
+      );
+    }
+    body.appendChild(wrap);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  actions.innerHTML = `
+    <button class="approval-btn approval-allow">${esc(t("agent.elicit_submit"))}</button>
+    <button class="approval-btn approval-deny">${esc(t("agent.elicit_cancel"))}</button>`;
+  card.appendChild(actions);
+
+  const done = (allow: boolean) => {
+    card.remove();
+    pendingElicitCards.delete(requestId);
+    if (allow) {
+      const content: Record<string, unknown> = {};
+      for (const [k, get] of fields) content[k] = get();
+      respondPermission(requestId, true, undefined, content);
+    } else {
+      respondPermission(requestId, false);
+    }
+  };
+  actions.querySelector(".approval-allow")!.addEventListener("click", () => done(true));
+  actions.querySelector(".approval-deny")!.addEventListener("click", () => done(false));
+
+  host.appendChild(card);
+  pendingElicitCards.set(requestId, card);
+  agentScroll();
+}
+
+/** 项目 MCP 信任卡（q3 第 4 步，2026-10-06）：项目目录下的 `.mcp.json` 要在本机拉起这些
+ *  命令，用户得先点头。与 `can_use_tool` **同一条审批通道**（`subtype = mcp_trust`），
+ *  回包复用 `respondPermission`。
+ *
+ *  三个按钮的语义：
+ *    · 仅本次  —— 放行，但**不写**信任记录（下次进这个项目还会问）；
+ *    · 始终信任 —— 放行 + 写进 `mcp-trusted.json`（`updatedInput.remember`）；
+ *    · 拒绝    —— 本次会话不接这批服务器（工具表里就没有它们）。
+ *
+ *  卡片要如实列出**每台服务器的传输与目标命令** —— 「装谁 = 信任谁」这条调查路径不能断
+ *  （与插件市场那条同一条纪律）。 */
+const pendingMcpTrustCards = new Map<string, HTMLElement>();
+
+function showMcpTrustCard(requestId: string, project: string, servers: unknown) {
+  pendingMcpTrustCards.get(requestId)?.remove();
+  const host = agentView?.flow ?? resultsList;
+  const card = document.createElement("div");
+  card.className = "approval-card mcp-trust-card";
+
+  const title = document.createElement("div");
+  title.className = "approval-title";
+  title.innerHTML = `<b>${esc(t("agent.mcp_trust_title"))}</b>`;
+  card.appendChild(title);
+
+  const body = document.createElement("div");
+  body.className = "approval-body";
+  const rows = Array.isArray(servers) ? (servers as Array<Record<string, unknown>>) : [];
+  const items = rows
+    .map((s) => {
+      const name = esc(String(s.name ?? ""));
+      const transport = esc(String(s.transport ?? ""));
+      const target = esc(String(s.target ?? ""));
+      return `<li><b>${name}</b><span class="mcp-trust-tag">${transport}</span><code>${target}</code></li>`;
+    })
+    .join("");
+  body.innerHTML =
+    `<div class="mcp-trust-project">${esc(project)}</div>` +
+    `<ul class="mcp-trust-list">${items}</ul>` +
+    `<div class="mcp-trust-hint">${esc(t("agent.mcp_trust_body"))}</div>`;
+  card.appendChild(body);
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  actions.innerHTML = `
+    <button class="approval-btn approval-allow">${esc(t("agent.mcp_trust_allow"))}</button>
+    <button class="approval-btn approval-always">${esc(t("agent.mcp_trust_always"))}</button>
+    <button class="approval-btn approval-deny">${esc(t("agent.mcp_trust_deny"))}</button>`;
+  card.appendChild(actions);
+
+  const done = (allow: boolean, remember = false) => {
+    card.remove();
+    pendingMcpTrustCards.delete(requestId);
+    if (allow) {
+      respondPermission(requestId, true, undefined, remember ? { remember: true } : undefined);
+    } else {
+      respondPermission(requestId, false);
+    }
+  };
+  actions.querySelector(".approval-allow")!.addEventListener("click", () => done(true));
+  actions.querySelector(".approval-always")!.addEventListener("click", () => done(true, true));
+  actions.querySelector(".approval-deny")!.addEventListener("click", () => done(false));
+
+  host.appendChild(card);
+  pendingMcpTrustCards.set(requestId, card);
+  agentScroll();
 }
 
 function showPermissionCard(
@@ -5263,15 +7510,11 @@ function showPermissionCard(
   // 声明在这里（而不是画正文那一段）：批量卡要不要放宽高度上限，取决于这一批里有没有它。
   const isPlan = toolName === "ExitPlanMode";
 
-  // Whitelisted / built-in safe → auto-approve, show a one-line notice
+  // 白名单 / 内置安全工具 → **静默放行**（2026-10-01 用户要求删掉那行提示）。
+  // 原先每放行一次都往流里落一行「✓ 自动允许: X」，一轮里能刷十几行，纯噪音；
+  // 而「这条到底走没走审批」从流里本来就能看出来 —— **没有审批卡就是自动放行**。
   if (cls.auto) {
     respondPermission(requestId, true, toolUseId);
-    const row = document.createElement("div");
-    row.className = "tool-row auto-approved";
-    // A14：自动放行也要能看出这条属于哪个子任务（多个子代理并发时尤其）
-    row.textContent = `${taskId ? `[${taskId}] ` : ""}✓ 自动允许: ${toolName}${cls.bashCmd ? " · " + cls.bashCmd.slice(0, 80) : ""}`;
-    host.appendChild(row);
-    agentScroll();
     return;
   }
 
@@ -5286,7 +7529,11 @@ function showPermissionCard(
         <button class="approval-btn approval-batch-deny-all">${t("agent.deny_all")}</button>
       </div>
       <div class="approval-batch-body"></div>`;
-    host.appendChild(card);
+    // **挂到停靠位**（2026-10-02 用户要求），不挂 `host`（对话流）：
+    //   ① 卡片在流里会随滚动跑掉 —— 用户得往下翻才能找到那颗「允许」，长回合里极难找；
+    //   ② 挂在输入栏位置 = 审批出现在视线落点上，且输入栏同时让位（syncApprovalChrome）。
+    // `host` 仍然保留：计划批准后的留档提示要落回**对话流**（见下面的 persistApprovedPlan 注释）。
+    approvalDock.appendChild(card);
     permissionBatchCard = card;
     card.querySelector(".approval-batch-allow-all")!.addEventListener("click", () => {
       const seen = new Set<HTMLElement>();
@@ -5305,13 +7552,13 @@ function showPermissionCard(
       }
     });
   }
-  const body = permissionBatchCard.querySelector(".approval-batch-body")!;
+  const body = permissionBatchCard.querySelector<HTMLElement>(".approval-batch-body")!;
   // 计划卡要读几十行正文：把**外层**那个滚动容器的高度上限放宽（见 styles.css 的
   // `has-plan`）—— 不给计划框自己加第二层滚动条（嵌套双滚动是本项目明确禁掉的）。
   if (isPlan) permissionBatchCard.classList.add("has-plan");
 
   // ── Continuous-command merge: fold a follow-up command into the last open
-  // Bash/PowerShell approval row instead of a new one ───────────────────
+  // Cmd/PowerShell approval row instead of a new one ───────────────────
   if (cls.bashCmd && !cls.auto && isMergeableCommand(cls.bashCmd)) {
     const last = findLastCmdGroup(taskId);
     if (last && last._groupIds.length < MAX_CMD_GROUP) {
@@ -5376,7 +7623,7 @@ function showPermissionCard(
     <div class="approval-actions">
       <button class="approval-btn approval-allow">${isAsk ? "提交" : isPlan ? t("agent.plan_approve") : "允许"}</button>
       ${isAsk || isPlan ? "" : alwaysBtn}
-      <button class="approval-btn approval-deny">拒绝</button>
+      <button class="approval-btn approval-deny">${isPlan ? t("agent.plan_cancel") : "拒绝"}</button>
     </div>`;
   renderGroupTitle(item);
   // 计划卡的标题不走 `renderGroupTitle`（那个拼的是工具名 + 参数摘要）——
@@ -5390,12 +7637,23 @@ function showPermissionCard(
     renderAskQuestions(item.querySelector(".approval-body")!, input, item);
   } else if (isPlan) {
     renderPlanCard(item.querySelector(".approval-body")!, input);
+    // 计划卡答复后的文案用 plan 专用键（`agent.plan_approved_note` / `plan_rejected_note`
+    // 此前一直是死键 —— 计划走的是通用「已批准 / 已拒绝」，说不清「仍在计划模式」。
+    item._resolveNote = (allow) =>
+      allow ? t("agent.plan_approved_note") : t("agent.plan_rejected_note");
+    // 计划分页（2026-10-03）：每份计划 = 一页；末页是「补充要求」。新计划到达时若当前停在
+    // 末页，就切到刚到达的这一页（否则用户会看不到新计划）；停在某张计划页则保持不动。
+    item.classList.add("plan-page");
+    ensurePlanPager(body);
+    const planCount = planPageItems(body).length;
+    if (planActivePage >= planCount - 1) planActivePage = planCount - 1;
+    showPlanPage(planActivePage);
   } else {
     renderCmdGroupBody(item);
   }
   agentScroll();
 
-  const finish = (allow: boolean, always = false) => {
+  const finish = (allow: boolean, always = false, denyOverride?: string) => {
     const ids = item._groupIds;
     // Always-allow whitelists the first command's prefix or the tool name
     if (always && !item._groupDanger && !item._groupOpaque) {
@@ -5419,9 +7677,13 @@ function showPermissionCard(
       // 计划卡被拒 → 给模型的**专用**拒因（见 i18n 的 agent.plan_deny_msg）：
       // 通用那句「User denied」不会告诉它「仍在计划模式」，它会以为可以接着动手，
       // 然后每个写类调用都撞一次 `write_blocked`。
-      const denyMsg = isPlan && !allow ? t("agent.plan_deny_msg") : undefined;
+      // `denyOverride` = 末页「补充要求」带回来的自定义反馈（见 submitPlanCustomRequirements）。
+      const denyMsg = !allow
+        ? denyOverride ?? (isPlan ? t("agent.plan_deny_msg") : undefined)
+        : undefined;
       respondPermission(rid, allow, item._groupToolUseIds[i] || undefined, updated, denyMsg);
       pendingPermissionCards.delete(rid);
+      pendingPlanIds.delete(rid);
     });
     // 批准的计划留档（A7）：异步、失败不影响执行，见 persistApprovedPlan。
     // 落点用 `host`（对话流）而**不是** `item.parentElement`（审批卡正文）——
@@ -5451,6 +7713,8 @@ function showPermissionCard(
     // Slide the resolved row out, then finalize the batch card
     setTimeout(() => {
       item.remove();
+      // 计划页数变了 ⇒ 重排分页（当前页落回合法范围；仍留在批次卡上的其它计划不受影响）。
+      if (isPlan) refreshPlanPager();
       if (pendingPermissionCards.size === 0) {
         clearPermissionCards();
       } else {
@@ -5463,6 +7727,7 @@ function showPermissionCard(
   item.querySelector(".approval-always")?.addEventListener("click", () => finish(true, true));
   item.querySelector(".approval-deny")!.addEventListener("click", () => finish(false));
 
+  if (isPlan) pendingPlanIds.add(requestId); // 计划卡 ⇒ 收批量按钮 + 藏任务抽屉（syncApprovalChrome）
   pendingPermissionCards.set(requestId, item);
   updatePermissionHeader();
 }
@@ -5472,6 +7737,9 @@ function removePermissionCard(requestId: string) {
   if (row) {
     row.remove();
     pendingPermissionCards.delete(requestId);
+    pendingPlanIds.delete(requestId);
+    // 被 agent 取消的计划也占一页 ⇒ 页数变了，重排分页（当前页落回合法范围）。
+    if (row.classList.contains("plan-page")) refreshPlanPager();
   }
   if (pendingPermissionCards.size === 0) {
     clearPermissionCards();
@@ -5486,6 +7754,11 @@ function clearPermissionCards() {
     permissionBatchCard = null;
   }
   pendingPermissionCards.clear();
+  pendingPlanIds.clear();
+  // 批次卡连同分页条 / 补充页一起被移除 ⇒ 展示态归零（否则下一批会复用旧节点引用）。
+  resetPlanPager();
+  // 卡片没了 ⇒ 停靠位收起、输入栏与任务抽屉一起回来（见 syncApprovalChrome）。
+  syncApprovalChrome();
 }
 
 listen<{ line: string }>("cli-output", (event) => {
@@ -5533,6 +7806,23 @@ listen<{ line: string }>("cli-output", (event) => {
         statusText.textContent = t("agent.working");
       }
     }
+    // 逐请求用量（2026-10-06）：agent 每完成一次 API 请求就报一条（主循环与子代理都报）。
+    // 只**累计**、不落账 —— 落账要么等 `result`（权威值），要么等异常收尾的 flushTurnUsage()。
+    // 理由见 turnUsage 的注释（回合被中断时 result 永远不会来，而平台照计费）。
+    else if (data.type === "usage_delta") {
+      const u = data.usage as Record<string, unknown> | undefined;
+      if (u) {
+        const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+        const req: ChatDoneRequestUsage = { in: n("in"), read: n("read"), create: n("create"), out: n("out") };
+        // 记下**首条**请求的时刻：中断兜底落账时拿它当 `ts`（见 turnUsage.firstTs）
+        if (!turnUsage.firstTs) turnUsage.firstTs = Date.now();
+        turnUsage.input += req.in;
+        turnUsage.cacheRead += req.read;
+        turnUsage.cacheCreate += req.create;
+        turnUsage.output += req.out;
+        turnUsage.requests.push(req);
+      }
+    }
     // System init — CLI finished loading plugins and scanning dir.
     // This arrives per-query-turn in stream-json mode. Status display
     // only; cliReady is set by cli-status("stdout") which arrives first
@@ -5563,6 +7853,60 @@ listen<{ line: string }>("cli-output", (event) => {
       liveCompaction.elided += elided;
       liveCompaction.dropped += dropped;
       statusText.textContent = t("agent.compacted", { elided: String(elided), dropped: String(dropped) });
+      // 压缩是**改写上下文**的大事（2026-10-06 用户要求可见）：在对话流里留一条记录，
+      // 别让人只在状态行一闪而过时才发现「模型怎么忘了前面的事」。
+      //
+      // ⚠️ **必须插独立节点，不能用 `agentAppend("text", …)`**（2026-10-06 实测踩到）：
+      // 那条路会把文本并进 `agentView.textAll`，而收尾时 `finalText = textAll` 会被
+      // `chatHistory.push` 存进会话库、下次还回灌给模型 —— 结果是助手回复的开头变成
+      // 「上下文已压缩：省略 12 个工具结果…」，与任务完全无关、且污染历史。
+      // 形态照 `renderHookNote`（同样绕开 textAll）。
+      const host = agentView?.flow ?? resultsList;
+      const note = document.createElement("div");
+      note.className = "sys-note sys-note-line";
+      note.textContent = t("agent.compacted_note", { elided: String(elided), dropped: String(dropped) });
+      host.appendChild(note);
+      agentScroll();
+    }
+    // MCP 配置改动（2026-10-06）：agent 只在**启动时**读一次 MCP 配置，而工具表是固定前缀
+    // ⇒ 改完必须重启才生效、不能热更。agent 重启不了自己，所以上报、由前端重启。分两条路：
+    //   · `idle: true`（agent 空闲时发现，即**回合外**改的）⇒ 现在没有回合在跑，**立即重启**；
+    //   · 否则（回合刚开时发现）⇒ 不能打断，等本回合 `result` 收尾再重启（见下面 result 分支）。
+    else if (data.type === "system" && data.subtype === "mcp_config_changed") {
+      const files = Array.isArray(data.files) ? data.files.map(String) : [];
+      if (files.length) {
+        if (data.idle === true) restartForMcpConfig(files);
+        else pendingMcpConfigRestart = files;
+      }
+    }
+    // 成本预算（2026-10-01）：撞顶后先「压缩续命」，续不动才要求模型收口。
+    // 两条都要写状态行 —— 用户得知道「AI 为什么突然收尾了」，以及可以继续追问。
+    else if (data.type === "system" && data.subtype === "budget_extended") {
+    statusText.textContent = t("agent.budget_extended");
+    }
+    else if (data.type === "system" && data.subtype === "budget_exhausted") {
+    statusText.textContent = t("agent.budget_exhausted");
+    }
+    // 工具轮次兜底上限（2026-10-01）：轮次已降级为兜底闸门，但打满时同样要如实说一句。
+    else if (data.type === "system" && data.subtype === "rounds_exhausted") {
+    statusText.textContent = t("agent.rounds_exhausted");
+    }
+    // 卡住检测（2026-10-01）：模型连续几轮在重复同一件事，已提示它换思路。
+    else if (data.type === "system" && data.subtype === "stuck_detected") {
+    statusText.textContent = t("agent.stuck_detected");
+    }
+    // 命令转后台 / 后台完成（2026-10-01）：两块状态**只由这两条事件驱动** ——
+    // 前端不自己推断「它跑完没有」（command 何时退出只有 agent 知道）。
+    else if (data.type === "system" && data.subtype === "background_started") {
+    const bid = String(data.id ?? "");
+    const tid = String(data.tool_use_id ?? "");
+    backgroundCmds.set(bid, { toolUseId: tid, label: String(data.label ?? "") });
+    markCardBackground(tid);
+    renderTodoDrawer();
+    }
+    else if (data.type === "system" && data.subtype === "background_done") {
+    backgroundCmds.delete(String(data.id ?? ""));
+    renderTodoDrawer();
     }
     // 计划相位（A7）：模型调 `EnterPlanMode` / 用户批准 `ExitPlanMode` 时由 agent 广播。
     // 前端**只镜像**这个状态，不自己推断（理由见 renderPlanModeNotice）。
@@ -5582,11 +7926,29 @@ listen<{ line: string }>("cli-output", (event) => {
         items: Array.isArray(data.items) ? data.items : [],
       });
     }
+    // MCP elicitation（A13）：用户工具声明了 `elicit`，服务端在 `tools/call` 执行前
+    // 向用户收集输入 —— 与审批卡同一条通道，但渲染成一张表单（见 showElicitationCard）。
+    else if (data.type === "control_request" && data.request?.subtype === "elicitation" && data.request_id) {
+      showElicitationCard(
+        data.request_id,
+        typeof data.request.message === "string" ? data.request.message : "",
+        data.request.requestedSchema,
+      );
+    }
+    // 项目 MCP 信任卡（q3 第 4 步）：项目的 `.mcp.json` 声明了服务器，未信任时先问用户。
+    // 走的是同一条审批通道，但独立渲染（见 showMcpTrustCard）。
+    else if (data.type === "control_request" && data.request?.subtype === "mcp_trust" && data.request_id) {
+      showMcpTrustCard(
+        data.request_id,
+        typeof data.request.project === "string" ? data.request.project : "",
+        data.request.servers,
+      );
+    }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {
       // 空闲时收到的审批来自**后台复盘 fork**（A4）：它按轮次门槛在**提问之间**跑，
       // 不是任何一次提问的一部分 —— 因此不推状态机（`idle → approval` 本就是非法迁移），
-      // 卡片照常显示/自动放行（自动档下它会以「✓ 自动允许」一行出现在流里）。
+      // 卡片照常显示/自动放行（**自动放行不落任何提示行**，见 showPermissionCard 的 `cls.auto` 分支）。
       if (agentState !== "idle") agentTransition("approval");
       showPermissionCard(
         data.request_id,
@@ -5601,6 +7963,12 @@ listen<{ line: string }>("cli-output", (event) => {
     // CLI cancelled a pending request (hook decided first / query aborted)
     else if (data.type === "control_cancel_request" && data.request_id) {
       removePermissionCard(data.request_id);
+      // elicitation 卡（A13）走同一通道，但独立登记 —— 一并收掉
+      pendingElicitCards.get(data.request_id)?.remove();
+      pendingElicitCards.delete(data.request_id);
+      // 项目 MCP 信任卡（q3）同理
+      pendingMcpTrustCards.get(data.request_id)?.remove();
+      pendingMcpTrustCards.delete(data.request_id);
       if (agentState === "approval") agentTransition("running");
     }
     // Subagent / task progress — surface instead of silent waiting.
@@ -5628,6 +7996,8 @@ listen<{ line: string }>("cli-output", (event) => {
           agentCloseBlock();
         } else if (block.type === "tool_use") {
           statusText.textContent = `Agent tool: ${block.name || "..."}`;
+          // 本回合是否碰过插件目录（AI 自建 / 自改插件）→ 收尾自动重扫，见 `notePluginDirWrite`
+          notePluginDirWrite(block.name, block.input);
           // TodoWrite 优先用整包入参画面板：端点可能直接在 content_block_start
           // 里给全量 input（此时不会有 input_json_delta），流式分片路径拿不到
           if (block.name === "TodoWrite") {
@@ -5661,8 +8031,21 @@ listen<{ line: string }>("cli-output", (event) => {
         }
       }
     }
+    // 命令卡**运行中**的实时输出（2026-09-30）：core-agent 在 Cmd / PowerShell 还在跑的
+    // 时候就把 stdout / stderr 分片推上来（`tool_output`，见 core-agent/src/main.rs 的
+    // `tool_output_sink`）—— 这里追加到对应卡片上，下载 / 长任务因此能边跑边看。
+    // 跑完时的 `tool_result` 仍会整块覆盖（`fillToolCard`），所以中途为不断流而吐出的
+    // 半截多字节字符，最终会被正确文本换掉。
+    else if (data.type === "tool_output") {
+      agentToolOutput(data.tool_use_id || "", data.chunk || "");
+    }
     // Tool execution results — surface success/failure inline
     else if (data.type === "user" && data.message?.content) {
+      // A17：写入内容的凭据告警按 tool_use_id 摊平，配对时再取（它不是 `message` 的一部分）
+      const secWarn = new Map<string, ToolSecretHit[]>();
+      for (const w of data.security_warnings || []) {
+        if (w?.tool_use_id && w.hits && w.hits.length > 0) secWarn.set(w.tool_use_id, w.hits);
+      }
       for (const block of data.message.content) {
         if (block.type === "tool_result") {
           // Update turn tool call status (Pi: structured tool lifecycle)
@@ -5671,7 +8054,12 @@ listen<{ line: string }>("cli-output", (event) => {
           // TodoWrite 的成功回执就是那块面板本身 —— 再贴一条「✓ 完成」只会把
           // 整份清单原样重复一遍；失败仍照常显示。
           if (!(lastTool?.name === "TodoWrite" && !block.is_error)) {
-            agentToolResult(!!block.is_error, block.content, block.tool_use_id);
+            agentToolResult(
+              !!block.is_error,
+              block.content,
+              block.tool_use_id,
+              block.tool_use_id ? secWarn.get(block.tool_use_id) : undefined,
+            );
           }
           if (lastTool && lastTool.status === "running") {
             lastTool.status = block.is_error ? "error" : "success";
@@ -5714,6 +8102,22 @@ listen<{ line: string }>("cli-output", (event) => {
       cliDoneCallback?.(info);
       cliTextCallback = null;
       cliDoneCallback = null;
+      // 本回合若写过 `Modules\`（AI 自建 / 自改插件）⇒ 自动重扫一次，新插件**立刻**可被搜到，
+      // 不必再让用户去设置里点「重新扫描」（2026-10-05 用户要求）。只在碰过时做，不白扫。
+      if (pluginDirTouched) {
+        pluginDirTouched = false;
+        // **广播给所有窗口**：搜索在主窗口、AI 对话在独立窗口，两个 WebView 各有各的
+        // `pluginRegistry` 实例 —— 只在对话窗里重扫，主窗口照样搜不到新插件。
+        // 各窗口的监听见文件末尾的 `lunac-plugins-changed`。
+        void emit("lunac-plugins-changed");
+      }
+      // MCP 配置在 agent 启动后被改过（且是**回合进行中**发现的）⇒ 现在才重启：本回合已经
+      // 答完，工具表是固定前缀、不能热更。回合外的改动走上面那条 `idle` 分支、当场就重启了。
+      if (pendingMcpConfigRestart.length) {
+        const files = pendingMcpConfigRestart;
+        pendingMcpConfigRestart = [];
+        restartForMcpConfig(files);
+      }
     }
     // While any permission is pending the CLI blocks on our response —
     // keep the pause indicator visible regardless of other events.
@@ -5761,6 +8165,8 @@ listen<{ state: string; message: string; instance?: number }>("cli-status", (eve
     cliReady = false;
     updateAgentStatus("idle");
     clearPermissionCards(); // CLI is gone — pending approvals can't be answered
+    // 进程没了 ⇒ 飞行中的卡片再也不会收到 `tool_result`（崩溃退出这条同属 M2-6）
+    markFlyingCardsStopped(agentView);
     if (agentState !== "idle") agentTransition("idle");
     if (cliDoneCallback) {
       cliDoneCallback();
@@ -6170,6 +8576,12 @@ function renderMixedResults(apps: AppEntry[], plugins: Plugin[]) {
   const q = searchInput.value.trim();
   const recencyStore = loadRecency();
 
+  // 结果重排 ⇒ 选中回到第一条（与下面 `idx === 0 ? " selected"` 那条高亮**必须同步**）。
+  // 少了这一句就是「输入文本后删除内容、再按上下键+回车」那个 bug 的根因：高亮画在第一行，
+  // 而键盘逻辑用的 `selectedIndex` 还停在上一次结果的下标上 ⇒ 回车打开的是**高亮行之后**
+  // 的条目（用户看到的正是「直接选到结果后的内容」）。
+  selectedIndex = 0;
+
   // ── Unified recency-scored list: apps + plugins + fallback entries ──
   type LocalEntry =
     | { kind: "app"; app: AppEntry; recency: number }
@@ -6395,7 +8807,7 @@ function launchApp(path: string) {
 async function openPluginWindow(pluginId: string) {
   if (pluginActive) await closePluginView();
   try {
-    await invoke("open_plugin_window", { pluginId, input: searchInput.value.trim() });
+    await invoke("open_plugin_window", { pluginId, key: null, input: searchInput.value.trim() });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     statusText.textContent = t("plugin.float_failed", { error: msg });
@@ -6438,6 +8850,10 @@ async function executePlugin(plugin: Plugin) {
   // Mark plugin as active (ESC will close it, not hide the window)
   pluginActive = true;
   activePluginId = plugin.id;
+  // 把 sidecar 的归属绑到当前面板（换插件会先收掉上一个的进程，见 plugins/sidecar.ts）
+  activatePluginSidecar(plugin.id);
+  // 清单声明了 sidecar.autostart ⇒ 面板一出来就起进程（首次仍会先弹信任卡）
+  maybeAutoStartSidecar(!!plugin.sidecar?.autostart);
   // 兜底要带 `plugin.name`（2026-09-29）：宿主词典里只有**官方**插件的 `plugin.<id>`，
   // 第三方 / 新插件没有条目 ⇒ 原来的 `pluginName(id)` 会把**原始 id** 当标题显示
   // （「桌宠」这条就是被它显示成 `pet` 的）。搜索列表一直用的是两参数写法，这里对齐。
@@ -6674,6 +9090,18 @@ function processLatexDelimiters(text: string): string {
   return result;
 }
 
+// ── 回合结束的提示音（2026-10-02，用户要求「结束时弹出提示音提示用户」）──────
+//
+// 出声在**宿主**（`notify_sound` → Windows `MessageBeep`），不是前端 `new Audio()`：
+// 后者受 WebView 自动播放策略约束，而「用户去忙别的、等它跑完」恰恰是最需要响一声的
+// 场景 —— 那一刻通常没有新鲜的用户手势，Audio 会被静默拦掉。
+//
+// **不 await、失败不上报**：提示音是锦上添花，不该参与「对话已完成」的收尾流程，
+// 更不该因为一台没声卡的机器让收尾变成红色报错（取消静音也算成功）。
+function playDoneSound() {
+  invoke("notify_sound").catch(() => {});
+}
+
 // ── Agent Chat (CLI subprocess) ─────────────────────────────────
 // ── 关键词条件式提示注入（System Prompt Injection）───────────────
 // 按当前提问的关键词，往**用户消息**里追加一段方法论提示（调试 / TDD / 代码审查）。
@@ -6735,7 +9163,17 @@ function pruneContext(messages: Array<{ role: string; content: string }>, maxTur
   let current: Array<{ role: string; content: string }> = [];
   for (const m of messages) {
     if (m.role === "system") continue;
-    if (m.role === "user" && current.length > 0) turns.push(current);
+    if (m.role === "user" && current.length > 0) {
+      turns.push(current);
+      // ⚠️ **这一行不能少**（2026-10-02 修的 M2-12，一份 4.5 万条的 chat.db / 298 MB）：
+      // 少它的话 `turns` 里 N 个元素**全是同一个数组的引用**（后续 `current.push` 会
+      // 继续往那个「已经收尾的回合」里加），于是 `turns.slice(-12)` 变成「整段对话的
+      // 12 个引用」⇒ `pruneContext` 返回的是**整段对话重复 12 遍**。
+      // 而它在两个地方都被调用（每回合的 `chatHistory` 与落盘快照），于是历史**每保存
+      // 一次就 ×12**：26 条 → 312 → 3744 → 44928（实测那份库里正好是 1728 = 12³ 次重复）。
+      // 它是最坏的一类 bug：不报错、不崩、只是数字慢慢变大，谁都以为「上下文压缩在生效」。
+      current = [];
+    }
     current.push(m);
   }
   if (current.length > 0) turns.push(current);
@@ -6793,6 +9231,10 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     return;
   }
 
+  // 开新一回合之前，先把上一轮**没落账**的逐请求累计值兜底落掉（2026-10-06）。
+  // 这里覆盖了绝大部分异常收尾：取消 / 回退 / 切会话 / 重试之后，用户总要再问一句 ——
+  // 那一刻上一轮的钱才终于记上。正常收尾的轮次累计器已被 recordTurnUsage 清空，这里是空转。
+  flushTurnUsage();
   isStreaming = true;
   setStreamingUI(true);
   userScrolledUp = false;
@@ -6827,6 +9269,10 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
   flowEl.dataset.turnId = turn.id;
   flowEl.innerHTML = `<div class="plugin-result-content plugin-result-loading">${t("agent.initializing")}</div>`;
   log.appendChild(flowEl);
+  // 命令卡终端（2026-10-05）：盯住对话区 —— 卡片被移除（清空 / 回退 / 历史重画）时
+  // 释放它里面的 xterm（不 dispose 会留下全局监听）。观察的是 flow 的**宿主容器**，
+  // 这样 flow 本身被移除时，其内部的终端也能被这次回调逮到。
+  watchFlowForTermRemoval(flowEl.parentElement ?? flowEl);
   resultsList.scrollTop = resultsList.scrollHeight;
   applyWindowSize();
 
@@ -6873,7 +9319,6 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     let assistantIdx = -1;
     if (finalText) {
       chatHistory.push({ role: "assistant", content: finalText });
-      humanizeBtn.style.display = "flex";
       // 复制按钮（同主题）——实时对话的助手全文，挂在 agent-flow 结尾
       const copyBtn = doc("button");
       copyBtn.className = "flow-copy";
@@ -6924,13 +9369,15 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
         rb.textContent = t("chat.rollback_turn");
         rb.addEventListener("click", () => {
           const i = Number(rb.dataset.idx);
-          if (Number.isFinite(i) && i >= 0) rollbackChat(i);
+          // 走同一套两段式确认（`data-armed="1"` 写在这颗按钮上，样式见 styles.css）
+          if (Number.isFinite(i) && i >= 0) void onRollbackClick(i, rb);
         });
         footer.appendChild(rb);
       }
 
       // 过程快照：把本轮的过程块抽成可持久化的步骤（历史回顾时展示「查看过程」）
-      recordTurnSteps(flowEl);
+      // `!!finalText` = 本轮是否产出了助手气泡（决定历史渲染时挂哪里，见 recordTurnSteps）
+      recordTurnSteps(flowEl, !!finalText);
 
       // 只有这一轮真的产生了「过程」才给折叠按钮
       const processEls = flowEl.querySelectorAll(
@@ -6962,18 +9409,21 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     isStreaming = false;
     setStreamingUI(false);
     agentTransition("done");
+    // 这一问跑完了 ⇒ 响一声（用户可能已经切去干别的了）。放在状态栏改写之前：
+    // 它是收尾的**副作用**，与下面的用量对账 / 存盘没有依赖关系。
+    playDoneSound();
     statusText.textContent = t("agent.done", { count: String(turn.toolCalls.length) });
     // result.usage 是**本次提问的绝对值**（agent.exe 每次提问重置计数），不是
     // 会话累计 —— 旧 cli.exe 才是累计值。先前这里按累计做差，会把「前缀没变」
     // 的那几轮命中缓存算成 0（两轮 cache_read 相同 → 差值 0），导致本地命中率
     // 系统性低于供应商平台、无法对账。
     if (info) {
-      addUsageToTotals(info);
-      // 压缩计数一并计入表盘（本对话口径），面板据此解释命中率
-      usageTotals.elided += liveCompaction.elided;
-      usageTotals.dropped += liveCompaction.dropped;
-      updateTokenDashboard();
-      appendUsageLog(info);
+      // 权威值（`result.usage`，含子代理/复盘）：记表盘 + 落盘，并作废逐请求累计器
+      recordTurnUsage(info);
+    } else {
+      // 收尾却**没带 usage**：agent 在流式中途没了（`cli-status` closed 会以无参回调进来），
+      // 或 `result` 里没有 usage 字段 ⇒ 用逐请求累计值兜底，否则这一轮的钱就白烧了。
+      flushTurnUsage();
     }
     cliTextCallback = null;
     cliDoneCallback = null;
@@ -7077,8 +9527,11 @@ function appendUserMsg(text: string, idx?: number) {
   if (idx !== undefined) div.dataset.idx = String(idx);
   div.textContent = text;
   log.appendChild(div);
-  attachMsgActions(div, idx, { retry: true });
+  // 动作条**不在这里挂**：`installLazyMsgActions` 的委派会在鼠标移上来时建
+  // （一次渲染几十条消息时，逐条挂按钮+SVG 是纯粹的白给，见那个函数的注释）。
   resultsList.scrollTop = resultsList.scrollHeight;
+  // 新提问 = 右栏多一个节点（只在右栏开着时才有意义，函数自己会判）。
+  renderChatNodeList();
 }
 
 /** 打开（或前置）AI 聊天的**独立窗口**。
@@ -7094,7 +9547,7 @@ function appendUserMsg(text: string, idx?: number) {
  *  `plugin-window-input` ⇒ 聊天窗把它当成「又送来一句话」（见聊天窗那条监听）。 */
 async function openChatWindow(query = "") {
   try {
-    await invoke("open_plugin_window", { pluginId: "chat", input: query });
+    await invoke("open_plugin_window", { pluginId: "chat", key: null, input: query });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     statusText.textContent = t("plugin.float_failed", { error: msg });
@@ -7104,7 +9557,7 @@ async function openChatWindow(query = "") {
 async function startAIChat(query: string, files?: string[]) {
   // **主窗不再跑聊天**（2026-09-29 用户定：AI 插件只在独立界面里，主窗的内嵌小窗与
   // detached 600 大窗都要去掉）。任何「进入 AI」的入口 —— 搜索命中 AI 条目 / 插件
-  // `execute` / 右键「问 AI」/ 历史抽屉 / 去痕迹按钮 —— 一律改成**开聊天独立窗**。
+  // `execute` / 右键「问 AI」/ 历史抽屉 —— 一律改成**开聊天独立窗**。
   //
   // 收口在这一处而不是逐个调用点：调用点有十几处，漏掉一处就是「主窗又长出一个内嵌聊天」。
   if (!IS_CHAT_WINDOW) {
@@ -7253,6 +9706,9 @@ function applyI18nToStaticUI() {
   setTitle("chat-send-btn", "tooltip.send");
   setTitle("chat-stop-btn", "tooltip.stop");
   setTitle("chat-drawer-close", "tooltip.close_history");
+  // 「提问节点」（2026-10-02）：窗口标题的文案。轨道上每颗点的 `title` 是**提问正文**
+  // （不是翻译串），在 `renderChatNodeRail` 里逐颗设，这里不管。
+  chatNodeTitle.textContent = t("chat.node_title");
   setTitle("detached-back-btn", "tooltip.restore");
   setTitle("detached-vscode-btn", "tooltip.vscode");
   setTitle("detached-pin-btn", "tooltip.always_on_top");
@@ -7287,6 +9743,13 @@ document.addEventListener("lunac-reload-settings", () => {
     const p = pluginRegistry.getAll().find(pl => pl.id === "settings");
     if (p) executePlugin(p);
   }
+});
+
+// AI 自建 / 自改插件后（对话窗在回合收尾广播 `lunac-plugins-changed`）→ **每个窗口各自**
+// 重扫插件 registry。跨窗口的必要性：搜索在主窗、对话在独立窗，两份 registry 不共享；
+// 只在一处重扫，另一处（尤其主窗的搜索）就搜不到刚生成的插件。见 `notePluginDirWrite`。
+listen("lunac-plugins-changed", () => {
+  void refreshMarketPlugins();
 });
 
 // Refresh all static UI strings in the new language.
@@ -8571,6 +11034,10 @@ win.listen("lunac-window-shown", () => {
   // `app-index-cache.json`，永不扫描目录），静态帧最迟 60ms 后被新结果换掉。
   // 复用 `refreshSearchResults()`（内部就是 dispatch input）而不是直接调
   // `runSearchNow`：走同一套去抖 + seq 校验，不会与正在输入的字抢渲染。
+  // 唤出时顺手重扫一次插件目录：AI 可能在主窗隐藏期间自建 / 自改了插件（对话窗收尾会
+  // 广播 `lunac-plugins-changed`，但主窗当时若没在跑监听就收不到）。重扫很便宜（只读
+  // 目录 + 清单），换来「刚生成的插件一唤出就搜得到」——不必再手点设置里的「重新扫描」。
+  void refreshMarketPlugins();
   if (!pluginActive && !drawerVisible) refreshSearchResults();
   triggerJSClipboardRead();
 });
@@ -8754,6 +11221,22 @@ function clearDetailHint() {
     detailHintTimer = null;
   }
   detailHint.classList.remove("detail-hint-error");
+}
+
+/** 把详情面板里这一条结果的路径写进剪贴板（2026-10-02 从「复制路径」按钮搬进「选项」菜单）。
+ *
+ *  走 Tauri 剪贴板插件而不是 `navigator.clipboard`（与仓库其它复制路径一致：后者在
+ *  WebView2 里对非安全上下文会静默失败）。反馈落在**触发它的那颗按钮**上：
+ *  菜单点完就关了，写进菜单项里等于写完就看不见。 */
+async function copyDetailPath(path: string, anchor: HTMLButtonElement) {
+  try {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(path);
+    anchor.textContent = t("detail.preview_copied");
+    setTimeout(() => { anchor.textContent = t("detail.preview_options"); }, 1200);
+  } catch (e) {
+    console.warn("[lunac] copy path failed:", e);
+  }
 }
 
 /** 目录条目的显示名：系统语言是中文就用中文名，其余语言用英文名。
@@ -9043,7 +11526,6 @@ function parentDir(path: string): string {
 function buildDetailItem(row: DetailRow, idx: number, token: number): HTMLElement {
   const item = doc("div");
   const armed = !!row.item?.danger && detailArmed === row.item.id;
-  const canElevate = detailElevatable(row);
   item.className = `result-item${idx === detailSel ? " selected" : ""}${armed ? " danger-armed" : ""}`;
   item.dataset.idx = String(idx);
 
@@ -9112,24 +11594,12 @@ function buildDetailItem(row: DetailRow, idx: number, token: number): HTMLElemen
       <div class="result-item-title${armed ? " detail-danger" : ""}">${esc(title)}</div>
       ${desc ? `<div class="result-item-desc">${esc(desc)}</div>` : ""}
     </div>
-    ${canElevate ? `<button type="button" class="result-item-elevate" title="${esc(t("detail.elevate_title"))}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 4.5 5.6V11c0 4.7 3.2 8.8 7.5 10.5 4.3-1.7 7.5-5.8 7.5-10.5V5.6Z"/></svg></button>` : ""}
     <span class="result-item-badge">${esc(badge)}</span>
   `;
   item.addEventListener("click", () => {
     detailSel = idx;
     void activateDetailRow(row);
   });
-  // 盾牌 = 「以管理员身份运行」（会弹 UAC）。**必须 stopPropagation**，
-  // 否则这一次点击会先命中行上的普通「打开」监听器（用户看到的是「点了盾牌却普通启动了」）。
-  if (canElevate) {
-    item.querySelector<HTMLElement>(".result-item-elevate")?.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      ev.preventDefault();
-      detailSel = idx;
-      markDetailSelection();
-      void activateDetailRow(row, true);
-    });
-  }
   item.addEventListener("mousemove", () => {
     if (detailSel !== idx) {
       detailSel = idx;
@@ -9306,20 +11776,48 @@ function renderDetailPreview() {
   openBtn.addEventListener("click", () => void activateDetailRow(row));
   actions.appendChild(openBtn);
   if (path) {
-    const copyBtn = doc("button") as HTMLButtonElement;
-    copyBtn.type = "button";
-    copyBtn.textContent = t("detail.preview_copy_path");
-    copyBtn.addEventListener("click", async () => {
-      try {
-        const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
-        await writeText(path);
-        copyBtn.textContent = t("detail.preview_copied");
-        setTimeout(() => { copyBtn.textContent = t("detail.preview_copy_path"); }, 1200);
-      } catch (e) {
-        console.warn("[lunac] copy path failed:", e);
-      }
+    // ── 「选项」菜单（2026-10-02 用户要求：「复制路径」改成选项，里面放
+    //    「打开文件目录」与「以管理员身份运行」）────────────────────────
+    // 复用**已有的** `showContextMenu`（`#context-menu`，与结果区右键菜单同一套），
+    // 不新建第二份菜单清单 —— 那是本仓反复踩过的「两份必然漂移」。
+    // 「复制路径」保留在菜单第一项：用户要的是**换形态**，不是把这个能力删掉
+    // （删了就是一次静默的功能回退）。
+    const optsBtn = doc("button") as HTMLButtonElement;
+    optsBtn.type = "button";
+    optsBtn.textContent = t("detail.preview_options");
+    optsBtn.addEventListener("click", (ev) => {
+      // **必须 stopPropagation**：`showContextMenu` 之后这次 click 会冒泡到
+      // `document` 上那个「点任意处就关菜单」的监听器（`hideContextMenu`），
+      // 菜单同一帧里被自己关掉 ⇒ 用户看到的就是「点了选项没反应」。
+      ev.stopPropagation();
+      const m = ev as MouseEvent;
+      const r = optsBtn.getBoundingClientRect();
+      // 键盘触发（Enter）时 clientX/Y 是 0 ⇒ 退回按钮矩形，菜单不会飞到屏幕左上角
+      showContextMenu(m.clientX || r.left, m.clientY || r.bottom, [
+        {
+          label: t("detail.preview_copy_path"),
+          action: () => { void copyDetailPath(path, optsBtn); },
+        },
+        {
+          label: t("detail.preview_open_dir"),
+          action: () => {
+            invoke("reveal_in_explorer", { path }).catch((err) => {
+              // 路径可能已被移动 / 删除（Rust 侧有存在性校验）—— 如实说，别静默
+              console.warn("[lunac] reveal_in_explorer failed:", err);
+              flashDetailHint(t("agent.reveal_failed"));
+            });
+          },
+        },
+        {
+          // 提权项：判据与 Shift+Enter 完全同源（`detailElevatable`）——
+          // 画了盾牌而 Rust 拒绝执行，或反过来，都会让用户觉得「这个菜单是坏的」。
+          label: t("detail.elevate_title"),
+          disabled: !detailElevatable(row),
+          action: () => { void activateDetailRow(row, true); },
+        },
+      ]);
     });
-    actions.appendChild(copyBtn);
+    actions.appendChild(optsBtn);
   }
 
   detailPreview.replaceChildren(thumb, titleEl, rowsEl, actions);
