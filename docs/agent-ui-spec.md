@@ -60,7 +60,7 @@
 | 沙箱 / 运行方式三档 | **适配**（重点，见 §4） | Lunac 无 OS 级沙箱，用「运行方式 + 工作区锁 + 危险命令拦截」表达同等意图，**且不得自称沙箱** |
 | 白名单（命令前缀） | **采用** | 已有机制；2026-09-20（A10）升级为 agent 侧的**可证只读**分类（`analysis.readonly`，见 §4.2），不再用前端本地前缀表 |
 | 高危命令拦截 | **采用**（已有 `CMD_BLACKLIST`） | 补「拦截原因」在卡片上的可读展示 |
-| 代码变更接受/拒绝 + DiffView | **暂不做**（评估项） | 需要后端回传 diff 或前端重算，改动面大于阶段 1/2 ⇒ 登记为 [backlog](./agent-feature-backlog.md) **U1** |
+| 代码变更接受/拒绝 + DiffView | **已落地（U1，2026-10-06）** | 形态见 §3.8.1：**事后审阅**（文件已被 agent 写下去），「拒绝」= 用已有快照把文件写回去。diff 由前端 `text-diff.ts` 重算（有界），无需后端回传 |
 | 会话 Fork / 分享 | **不做** | Lunac 是本地单机工具，分享链路与产品定位不符；Fork 收益低 |
 | 回退到任意消息 | **已扩（A11，2026-09-20）** | 原决策是「已有，保持现状，不扩」（只到**用户轮**）。用户 2026-09-20 明确改为**扩到任意消息**：助手气泡也能当回退点、实时回合在页脚（`.turn-rollback`）给入口、被上下文裁剪丢掉的老气泡只留复制。**仍不做**文件内容快照 —— 回退只动对话与 agent 上下文，界面文案如实写明「磁盘上已改动的文件不会还原」（ai-spec §11 规则 64） |
 | 一轮里多个子任务并行 | **采用（分组面板，A14，2026-09-20）** | 用户三连裁决：**分组面板**（不是左右分栏）+ **并发上限 3** + **审批加 `task_id` 标注**。落地 = `agent-flow` 里一块 `.subtask-panel`，每个子任务一行（`.subtask-row`：id / 描述 / 状态），随 `task_*` 事件就地更新；状态行在并行时报并行数。**不做分栏**的理由是两条硬约束：分栏要改总体视窗宽度（§0 规则 1）、且列内会引入第二层滚动条（§0 与 ai-spec §11 规则 44 都禁止）。见 ai-spec §11 规则 65 |
@@ -81,7 +81,7 @@
   - `.think-block`（思考）
   - `.agent-text`（正文，流式增量）
   - `.tool-row`（工具调用与结果，见 §3.3）
-  - `.subtask-panel`（**子任务分组面板**，A14：一轮里并发的每个子代理一行，就地更新；没有子任务时**连容器都不创建**）
+  - `.subtask-panel`（**子任务分组面板**，A14：一轮里并发的每个子代理一行，就地更新；没有子任务时**连容器都不创建**。**2026-10-01 加 `margin-left: 14px`** —— 用户要求「子 agent 的要缩进一个以用来区分」，让「这条是子代理干的」一眼可见）
   - `.turn-footer`（回合汇总，回合结束时出现）
 - **新增**：回合计时与状态徽标（`.turn-badge`，可选显示）—— 回合进行中在 `.turn-footer` 位置显示「执行中 · 已用 N 秒」，结束后替换为「完成 · N 步工具调用」。
 
@@ -112,6 +112,7 @@
 | 区域 | 内容 | 数据来源 |
 |---|---|---|
 | 头部 `summary` | 状态图标 + 工具名 + **命令/参数摘要**（单行，超长省略号） | 现有 `tool_use` 入参 |
+| 实时控制区 `.tool-live` | 「后台运行 / 停止」两个按钮（**只在命令还在跑时**给）；转后台后换成一行状态文字 | 纯前端 + `tool_control` 指令（见下与 §9） |
 | 元信息行 | 状态标签（执行中 / 成功 / 失败 / 已跳过）+ **退出码** + **耗时** | 退出码见下；耗时前端自算 |
 | 输出区 | 折叠的 stdout / stderr 文本（默认收起，最多渲染 600 字符 + 「查看全部」提示） | 现有 `tool_result.content` |
 | 操作区 | 复制命令、复制输出 | 纯前端 |
@@ -124,11 +125,11 @@
 - **成功/失败判定**：优先看 `tool_result.is_error`；`is_error=false` 但退出码 ≠ 0 时显示为「完成（退出码非零）」，仍**不**标红 —— 与后端语义一致（工具本身没失败，是命令返回非零）。
 - 若上述解析在真实数据上覆盖率不足，再走「后端新增结构化字段」路线（见 §9 的登记流程），**不得**先私自加字段。
 
-**命令类工具**：`Bash` / `PowerShell` 用等宽字体显示命令原文（保留换行，最多 3 行 + 省略）；`Read` / `Write` / `Edit` / `Grep` / `Glob` 显示 `k=v` 摘要（现状逻辑保留）。`TodoWrite` **不在对话流里画任何块**（2026-09-21 起连 `.todo-panel` 也撤掉），一律交给 §3.9 的任务抽屉。
+**命令类工具**：`Cmd` / `PowerShell` 用等宽字体显示命令原文（保留换行，最多 3 行 + 省略）；`Read` / `Write` / `Edit` / `Grep` / `Glob` 显示 `k=v` 摘要（现状逻辑保留）。`TodoWrite` **不在对话流里画任何块**（2026-09-21 起连 `.todo-panel` 也撤掉），一律交给 §3.9 的任务抽屉。
 
 **命令组**（2026-09-27 加，`ensureCmdGroup` / `refreshCmdGroup` / `closeCmdGroup`）：一轮里
 **一段连续的工具调用**收进一个 `<details class="cmd-group">`，组头一行写
-「已执行 N 条命令 · M 次失败」—— 整段全是 `Bash` / `PowerShell` 时写「命令」，混进别的工具
+「已执行 N 条命令 · M 次失败」—— 整段全是 `Cmd` / `PowerShell` 时写「命令」，混进别的工具
 时写「工具调用」（`agent.cmd_group_cmds` / `agent.cmd_group_calls` / `agent.cmd_group_fails`）。三条纪律：
 
 1. **分组边界 = 一段连续的工具调用**：中间出现 `text` / `thinking` 就另起一组
@@ -139,12 +140,32 @@
    `.agent-flow.history-process.flow-folded .tool-card` 兜住 —— 那条规则与前者是一对，都不许删。
 3. **组头计数从组内 DOM 现推**（`group.querySelectorAll(".tool-card")`），不另记一份计数状态 ——
    卡片会在任意时刻被追加 / 标成失败，两份状态必然漂移。
+4. **层级靠「缩进 + 垂线 + 逐层加深的底色」表达，不靠更多字号/颜色**（2026-10-01，用户要求
+   「展开要有更清楚的框格或边框线条」）：`.cmd-group-body` 缩进 8px + 一条 2px 垂线；三层深度
+   分别是**组头浮层 0.14 → 命令卡 0.18 → 卡内正文（`.tool-body`）0.26**（都乘 `--shade-scale`）。
+   思考正文（`.think-content`）另给 0.22 底色块。改任一层都要回头看另外两层，别让它们趋同。
 
 **卡片正文必须有完整命令**（2026-09-27 加）：头部的 `.tool-cmd` 活在单行 `summary` 里，被
 `text-overflow: ellipsis` 截断 ⇒ **展开卡片也看不到命令全文**（用户反馈的第三处）。所以卡片正文
-（`.tool-body`）里加一个 `<pre class="tool-cmd-full">`，只给命令类工具（`Bash` / `PowerShell`）写值 ——
+（`.tool-body`）里加一个 `<pre class="tool-cmd-full">`，只给命令类工具（`Cmd` / `PowerShell`）写值 ——
 `Write` / `Edit` 的入参里带整个文件内容，铺进 `<pre>` 会把对话流压垮。写入前必须
 `JSON.parse` 成功（流式分片是合法前缀，会把半截 JSON 当命令显示）。
+
+**实时控制：后台运行 / 停止**（2026-10-01 加，`createToolCard` 里的 `.tool-live`）：只长在**正在跑**的 `Cmd` / `PowerShell` 卡片上，命令一返回就整块撤掉（`agentToolResult`），**已转后台的那条例外** —— 它其实还在跑，只是把按钮换成了 `.tool-live-state`（`agent.cmd_in_background`）一行字。五条纪律：
+
+1. **只在 shell 类工具上给**：判据与 agent 侧 `matches!(name, "Cmd" | "PowerShell")` 必须一致（见 ai-spec §11 规则 73）—— 两侧不一致就是「按钮点了没反应」或「一条永远点不动的按钮」。
+2. **点按钮要 `preventDefault` + `stopPropagation`**：卡片本身是 `<details>`，不拦一下会顺手把它开合掉，看起来像「没反应」。
+3. **点了就立刻把按钮置灰**：这两个动作**不可逆**（agent 下一拍就动手），不能让用户以为还能反悔。真正状态等 `background_started` / `background_done` 事件回来确认。
+4. **「已停止」必须如实报、不许落进「成功」兜底**：点「停止」那一刻给卡片**乐观**加 `.stopped`（黄色，同 `timeout` —— 不是失败，是「这轮没跑完」）；结果回来时 `fillToolCard` **先摘掉 `.stopped` 再按结果文本重判** —— `parseShellOutcome` 认 agent 那句 `(stopped by the user…` ⇒ 写 `agent.tool_stopped`（「已停止」，5 语言）。⚠️ **被 kill 的进程没有退出码**，不单独认这一句就会落进末尾的 `.ok` 兜底、显示成「成功」，那是骗人。
+5. **取消只在一个地方**：转后台之后的「取消」统一收在 §3.9 的任务抽屉里，**卡片上不再给第二个取消按钮** —— 两个地方各放一个取消，迟早出现「这边点了那边没反应」。
+
+**命令卡终端（2026-10-05 加）**：命令类工具（`Cmd` / `PowerShell`）的卡片正文不再是 `<pre class="tool-out">` 纯文本，改成一块 **xterm.js 交互式终端** `<div class="tool-term">`（`app/src/main.ts` 顶部 `import { Terminal }` / `FitAddon` 并引入 `@xterm/xterm/css/xterm.css`；其余工具仍用 `.tool-out`）。`.tool-term` 高 220px、深色底（`styles.css`）。五条纪律：
+
+1. **惰性创建、收起即释放**：xterm 实例**只在卡片首次展开时**建（`<details>` 的 `toggle` 事件），**收起就 `dispose()`**；内容留在 `card.termBuf`（上限 `TERM_BUF_MAX = 200_000` 字符），再展开时重建并回放。卡片随对话被移除时由 `MutationObserver`（`watchFlowForTermRemoval(flow)`）兜底释放 —— **不 dispose 会残留全局监听 / 渲染循环**，越积越多。
+2. **实时输出直接进终端**：agent 侧 `tool_output` 的 stdout/stderr 分片直接 `term.write(chunk)`（ANSI 转义交给 xterm 解释），**不再**做原来 `.tool-out` 那种「只留尾部 4000 字符」的截断 —— 终端自己的 scrollback = **3000 行**（滚动条沿用全局细滚动条规范）。卡片收尾时 `fillToolCard` 照旧写状态。
+3. **键入转发（真交互式）**：用户在终端里键入的字符经 `sendToolControl("stdin", …)` 走 `tool_control` 发给 agent，agent 写进子进程 stdin；**Enter 发 `\r\n`（不是 `\r`）** —— 读管道的一方按 `\n` 断行。
+4. **本地回显**：因为没有 PTY，xterm 不会自动回显，由前端自己画（`echoTermInput`）：Enter → `\r\n`；退格（`\x7f`）→ `\b \b`；Ctrl-C（`\x03`）→ 回显 `^C\r\n` 并**映射到既有的「停止」动作**（往管道里写 `0x03` 不会真的中断 Windows 进程，那要 `GenerateConsoleCtrlEvent`）；其余可见字符原样回显。收尾时在终端末尾补一行暗色状态（退出码 / 超时 / 已停止，用现有 i18n key），并置 `disableStdin`、关掉光标闪烁。
+5. **没有 PTY，哪些编辑动作不生效要如实说**：只做**行级 stdin 转发**。方向键、Tab 补全、全屏 TUI（vim、htop）、由控制台完成的退格等行编辑**不生效**（本轮明确选定「stdin 转发」而非「真 ConPTY」，别照「真终端」预期去补）。
 
 > **注意区分两个「复制」**：上面的操作区属于**执行卡片**（`.tool-row`，命令已经跑完）。**审批卡**（`.approval-batch-card`）的命令区**不放复制按钮**（2026-09 用户要求删除）—— 按钮固定在右上角，短命令与它之间会空出一大片（还得给 `.approval-cmd-list` 预留 56px 右边距），而命令文本本身已可选中复制（`.approval-cmd-box` 有 `user-select: text`），够了。**不得**为「方便复制」把按钮加回去。
 
@@ -159,11 +180,15 @@
 ### 3.5 回合自动折叠
 
 - 回合完成后（收到 `result`），若回合内块数 ≥ 3 或工具调用 ≥ 2，**默认折叠**该回合的所有中间块（思考/工具/结果/子任务面板），仅保留：用户消息、助手最终正文、`.turn-footer`（含「展开过程」按钮）。
-- **折叠折的是「命令组」，不是命令卡**（2026-09-27 修）：`.flow-folded` 只隐藏
-  `.think-block` / `.tool-row` / `.subtask-panel` / `.sys-note`，**不再隐藏 `.tool-card`** ——
-  卡片装在 `.cmd-group` 里，由那个 `<details>` 自己承担开合，折叠态保底留一行
-  「已执行 N 条命令」。旧规则把卡片一起 `display: none`，于是回合结束后命令、退出码、输出
-  全都看不到（用户反馈「命令的执行无法显示」的根因）。`setFolded()` 同步所有
+- **折叠折的是「命令组」，不是命令卡**（2026-09-27 修；2026-10-01 加 `.cmd-group`）：
+  `.flow-folded` 隐藏 `.think-block` / `.tool-row` / `.subtask-panel` / `.sys-note` /
+  **`.cmd-group`**，**不隐藏 `.tool-card`** ——
+  卡片装在 `.cmd-group` 里，由那个 `<details>` 自己承担开合。
+  **2026-10-01 的改动**（用户要求「已执行 N 条命令也放进收起过程里」）：折叠态**连 `.cmd-group`
+  的组头一起藏**，不再保底留一行「已执行 N 条命令」。⚠️ 这**与 2026-09-27 那次不是一回事**，
+  别混：那次是在**没有展开入口**的情况下把卡片藏了（用户反馈「命令的执行无法显示」的根因）；
+  现在每轮都有 `.turn-fold` 展开按钮，且 `setFolded()` 展开回合时会顺手把组一起打开 ⇒
+  藏起来不会再造成「回看不到命令」。`setFolded()` 同步所有
   `details.cmd-group` 的 `open`：折叠 ⇒ 全收，展开 ⇒ 全摊开（不让「展开回合」变成还要再点一次）。
   **唯一例外**是历史「过程 · N 步」块（`renderHistoryProcess`）—— 那里的 `.tool-card` 是 flow 的
   直接子节点、没有命令组，所以另留一条 `.agent-flow.history-process.flow-folded .tool-card` 规则。
@@ -181,12 +206,13 @@
 - **命令区出现大片空白 / 内容不贴顶 = `pre-wrap` 继承把模板缩进渲染成了空行（2026-09-17 定位，真因）**：用户三次反馈「命令缩进 + 空白」，前两次改的固定高度（`height:144px`）与嵌套双滚动**都是真问题、也都该修**，但**症状仍在**。真因是：`#chat-log`（`.ai-response`）自己声明了 `white-space: pre-wrap`，而 `.approval-body` / `.approval-cmd-box` / `.approval-cmd-list` 这些**中间容器没声明** ⇒ 继承 `pre-wrap` ⇒ `main.ts` 里三处 `innerHTML = \`…\`` 模板（`card.innerHTML` / `item.innerHTML` / `renderCmdGroupBody()`）的**缩进换行被当成真实空行渲染**。实测：一处空白节点 ≈ **45px**，命令区 471px 里 **315px（67%）是空行**，命令文本只占 129px。修法是 `.approval-card { white-space: normal; }`（声明在卡片根，一次覆盖三层模板），修后 471 → **156px（−315px）**、文本仍 129px 不变、外层滚动条消失。**通用纪律**：往 `#chat-log` / `.agent-flow` 里拼 `innerHTML` 的模板**不得带缩进换行**（写成一行，或给结构容器声明 `white-space: normal`）。见 ai-spec §11 规则 33。
 - **排查心法**：用户说「命令有缩进 / 有空行」时，**先按这个顺序查，别凭截图猜** —— ① **把实际命令字符串取出来看**（`ModuleData\history\chat.db` 里该会话的 `steps` 快照；注意 `detail` 是**截断到 200 字符**的显示文本，不是全文，落盘日志也只记「等待审批 PowerShell」不记命令原文）；② 查 `white-space` 的**计算值**（`getComputedStyle(el).whiteSpace`）与容器高度能否**逐项对账**（文本高度 + padding + 附属行，有无余数）；③ 用 `Range.getClientRects()` 数容器内**空白文本节点**是否产生了行盒（`rectCount > 0` 即幽灵空行）。实测多次命令原文都是**干净单行、`normalizeCmdForDisplay()` 也没改坏**，别去改 agent 侧输出或那个归一化函数。
 - **命令区不放复制按钮**（2026-09）：按钮固定右上角会给短命令留一大段空白（`.approval-cmd-list` 还得预留 56px 右边距）；命令文本本身可选中复制。注意这与执行卡片 `.tool-row` 的「复制命令」是**两个不同组件**，不要混。
-- **同一次权限运行内合并成一行**（2026-09 放宽）：同一条未应答的命令组行是**唯一合并目标**，`Bash` 与 `PowerShell` **视作同一族**（用户要求「短时间内不同类型的命令也合并进同一个权限运行」）。合并**只影响审批展示** —— 每条命令仍由 agent 各自执行，`&&` 短路、退出码、输出都不受影响，所以含 `&&` / `|` / 重定向 / 换行的**复杂命令同样入组**（旧实现按算子排除，正是「复杂任务里同类请求一行一条堆满卡片」的原因）。上限 `MAX_CMD_GROUP = 20` 条 / 单条 2000 字符。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。
-- **合并后标题要重画**：工具名可能不止一个（显示 `Bash + PowerShell`），⛔ / ⚠ / 🔑 标记也可能来自后来合并进来的那条命令 —— `renderGroupTitle()` 在每次合并时重画标题；`renderCmdGroupBody()` 顺带兜掉「始终允许」（组内只要有一条危险 / 不透明 / 命中凭据，整组都不给）。行的 `danger` 类同步补上。
+- **同一次权限运行内合并成一行**（2026-09 放宽）：同一条未应答的命令组行是**唯一合并目标**，`Cmd` 与 `PowerShell` **视作同一族**（用户要求「短时间内不同类型的命令也合并进同一个权限运行」）。合并**只影响审批展示** —— 每条命令仍由 agent 各自执行，`&&` 短路、退出码、输出都不受影响，所以含 `&&` / `|` / 重定向 / 换行的**复杂命令同样入组**（旧实现按算子排除，正是「复杂任务里同类请求一行一条堆满卡片」的原因）。上限 `MAX_CMD_GROUP = 20` 条 / 单条 2000 字符。**跨轮永远合并不了**：下一轮的命令要等上一轮的执行结果才由模型产生。
+- **合并后标题要重画**：工具名可能不止一个（显示 `Cmd + PowerShell`），⛔ / ⚠ / 🔑 标记也可能来自后来合并进来的那条命令 —— `renderGroupTitle()` 在每次合并时重画标题；`renderCmdGroupBody()` 顺带兜掉「始终允许」（组内只要有一条危险 / 不透明 / 命中凭据，整组都不给）。行的 `danger` 类同步补上。
 - **「始终允许」写白名单要写**组内**每一条**命令的命令词（旧实现只记第一条 → 组里第二条以后的同类命令下次还要再问一遍，即用户反馈的「允许过还要再问」）。解释器 / 启动器前缀与危险 / 不透明命令照旧排除（§4.3）。
 - **自动档不该弹卡**：`opaque` 判据 2026-09 已收窄到「不知道要跑哪个程序」（参数里的 `$HOME` / `$env:TEMP` 不算，见 ai-spec §3.5）—— 旧口径会让自动档下每条带 `$` 的命令都弹卡。
+- **自动放行一律静默、不落任何提示行（2026-10-01，用户要求「自动允许的提示可以删除」）**：白名单 / 内置安全工具 / 可证只读（`analysis.readonly`）放行时**不再往对话流里写「✓ 自动允许: X」**。理由：一轮里能刷十几行，纯噪音；而「这条到底走没走审批」从流里本来就能看出来 —— **没有审批卡就是自动放行**。`.tool-row.auto-approved` 规则与那一条文案**已删**，**不得加回**。
 - **计划卡 = 同一条通道的第三种行（2026-09-20，A7）**：`ExitPlanMode` 走 `can_use_tool`，整份计划在 `input.plan` 里。三条**不能省**：① **任何档位都不自动放行、白名单也免疫**（与 `AskUserQuestion` 同级 —— 自动放行等于「计划没人读过就开工」）；② **不给「始终允许」**（白名单化 = 以后每份计划都自动批准，等于关掉整个计划模式）；③ 正文用 `textContent` 原样铺开（**不是** `innerHTML`、**不引** markdown 渲染器 —— 计划是模型生成的任意文本）。按钮文案是「批准计划 / 拒绝」，结论提示要**说清后果**（`agent.plan_approved_note` / `agent.plan_rejected_note`），并随拒绝回一句说明「你仍在计划模式」的**专用拒因**（`agent.plan_deny_msg`，见 ai-spec §11 规则 59）。计划长（几十行是常态）⇒ 只在这一批出现计划卡时把**外层** `.approval-batch-body` 的上限放宽到 `62vh`（`.approval-batch-card.has-plan`），**不给正文加第二层滚动**（同上文嵌套双滚动条的教训）。
-- **子代理的审批要标明归属，且命令并不许跨任务（2026-09-20，A14）**：`control_request.request.task_id` 存在时，行标题前置一个 `.approval-task-tag`（纯文字 `task-1`，**不加 emoji** —— 与「控件文案不带 emoji」同一条纪律）；自动放行那条一行提示同样带 `[task-1] ` 前缀。**合并的边界必须比对 task id**（`findLastCmdGroup(taskId)`）：两个子任务的命令并进同一行，会让「允许」一次放行两个任务，而标注只能显示其中一个 —— 用户就分不清自己批了谁。缺 `task_id` = 主循环自己的调用，与主循环的合并（`undefined` 只与 `undefined` 相等）。
+- **子代理的审批要标明归属，且命令并不许跨任务（2026-09-20，A14）**：`control_request.request.task_id` 存在时，行标题前置一个 `.approval-task-tag`（纯文字 `task-1`，**不加 emoji** —— 与「控件文案不带 emoji」同一条纪律）。（2026-10-01 起自动放行**不再落任何提示行**，故无「带 `[task-1] ` 前缀的一行提示」这回事 —— 子代理的归属只在**弹卡**时标注。）**合并的边界必须比对 task id**（`findLastCmdGroup(taskId)`）：两个子任务的命令并进同一行，会让「允许」一次放行两个任务，而标注只能显示其中一个 —— 用户就分不清自己批了谁。缺 `task_id` = 主循环自己的调用，与主循环的合并（`undefined` 只与 `undefined` 相等）。
 
 ### 3.7 历史回顾（过程与表盘）
 
@@ -211,13 +237,26 @@
 - **列表内容与界面留下的历史一致**：`steps` 快照每条带可选 `path`（`SessionStep.path`），`restoreSession()` / `rollbackChat()` 用 `rebuildChangedFilesFromSteps()` 重建、新对话清空列表。工具卡上的路径**不写回 agent 上下文**（纯前端展示）。
 - **滚动容器移到抽屉里（2026-09-21）**：列表本身不过度增长（每文件一行），限高与滚动都由抽屉的 `.todo-items`（`max-height: 132px` + `overscroll-behavior: contain`）承担；条带仍走 §5.4 那条唯一的全局 `::-webkit-scrollbar`，**禁止**在此声明 `scrollbar-width` / `scrollbar-color`。
 
+#### 3.8.1 变更审阅：diff / 接受 / 拒绝（U1，2026-10-06）
+
+`#todo-drawer-files` 展开后不再是「一行一个文件」，而是**可审阅的变更卡**（契约见 ai-spec §11 规则 86）。**关键在于这是事后审阅**：文件早被 agent 写下去了，所以「接受」只能标记已阅、「拒绝」靠快照还原。
+
+- **汇总行 `.cr-head`**：`.cr-summary`（`agent.cr_summary` = 「N 个文件 · +A −B」，A/B 是精确增减行数）+ 两颗「全部接受 / 全部拒绝」`.cr-btn`。
+- **单个文件行 `.cr-file` → `.cr-row`**：`.cr-toggle`（`▸`/`▾` 开合）· `.file-link`（**文件名**，点击定位）· `.changed-file-dir`（目录）· `.cr-stat`（`+A −B`；**没法预览时显示 `—`**）· 行尾「接受 / 拒绝」（全接受过则换成 `.cr-done`「已接受」）。
+- **摊开体 `.cr-body`**：第一行「净变化」（`.cr-diff-head` 里的 `.cr-entry-label`）+ 逐条改动（`.cr-entry`：`agent.cr_turn` 「第 N 轮」+ 该条自己的接受 / 拒绝）+ diff 视图 `.diff`（`.diff-line`，按 `diff-add` / `diff-del` / `diff-eq` 上色；截断时末尾 `.diff-note`；没法预览时整块 `.diff-note` 写 `cr_unreadable`）。
+- **两级 diff 语义**：「净变化」= 最早快照 → 现在；点某条「第 N 轮」= 该条改动前后（下一条改动之前 / 现在盘上）。
+- **按钮走 `[data-cr]` 事件委托**（`toggle` / `show` / `accept` / `acceptAll` / `reject` / `rejectAll`，`data-crpath` + 可选 `data-crturn`）—— 列表每次重画，逐个绑监听必失效（同 §3.8 的 `.file-link`）。
+- **只在展开时才算**：diff 要读盘 + 逐文件比对，收起时算它纯浪费；缓存没读齐先画一行 `.cr-loading`「正在读取文件…」并去补读，读齐自己重绘。**缺缓存不许当成「文件已被删除」**。
+- **限高**：`#todo-drawer-files` 单独把 `max-height` 放大到 `min(42vh, 320px)`（继承 `.todo-items` 的 132px 摊开 diff 后太矮）；diff 块自身再限 `max-height: 220px` + 内滚。
+
 ### 3.9 任务抽屉 `#todo-drawer`（2026-09-21）
 
 待办清单（`TodoWrite`）与「本次会话改动过的文件」两样东西**都不再进对话流**，统一收在输入框上方的抽屉里，理由（用户原话）：待办「现在是直接在对话中的链路中体现，我们需要将其提取出来用小型抽屉放置在对话框的上方」。
 
-- **位置与显隐**：DOM 在 `#results-list` 之后、`#chat-input-bar` 之前。**有内容的唯一判据** = `todoItems.length > 0 || sessionChangedFiles.length > 0`；两者都空时整块 `.hidden`（不占位、不画空壳）。`renderTodoDrawer()` 是唯一的渲染入口。
+- **位置与显隐**：DOM 在 `#results-list` 之后、`#chat-input-bar` 之前。**有内容的唯一判据** = `todoItems.length > 0 || sessionChangedFiles.length > 0 || backgroundCmds.size > 0`（2026-10-01 加第三项 —— 有命令在后台跑时，恰恰是最需要看见它的时候，不能因为「没有待办」把整条抽屉藏掉）；三者都空时整块 `.hidden`（不占位、不画空壳）。`renderTodoDrawer()` 是唯一的渲染入口。
+- **后台运行区 `#todo-drawer-bg`**（2026-10-01 加，用户要求「后台运行的命令要在待办清单里能取消」）：一行一条正在后台跑的 `Cmd` / `PowerShell`（`.todo-item.bg-cmd`：命令原文截断 120 字 + 右侧一颗「取消」，`agent.bg_cancel`）。三条纪律：① **始终展开、不另设开合按钮** —— 这里通常只有一两条，而「取消」是这块存在的唯一意义，藏一层就白做了；② **一点「取消」就置灰**（`data-bg` 按钮 + 容器级事件委托，同 §3.8 的 `.file-link`），真状态等 `background_done` 事件；③ **列表只由 `background_started` / `background_done` 两条事件维护**（`backgroundCmds: Map<后台 id, {toolUseId, label}>`），前端**不自己推断**它跑完没有。多行并存 = 天然支持「多个命令一起跑」。
 - **头行 `#todo-drawer-head`**：`#todo-drawer-title`（`agent.todo_title`）· `#todo-drawer-progress`（`agent.todo_progress` = 「已完成 D / 共 N」；**只有待办存在时才有文字**，否则留空）· 三个 `<button>`：`-tasks-btn`（展开详细任务）/ `-files-btn`（展开详细更改文件，文案复用 `agent.changed_files` 带数量）/ `-ok-btn`（确认）。
-- **按钮即开关**：`setTodoDrawerBtn()` 统一处理 `disabled`（没有对应数据就禁用）与 `.open`（展开态高亮）。两个列表**互斥**：点一个展开就收起另一个（`todoTasksOpen` / `todoFilesOpen`）。
+- **按钮即开关**：`setTodoDrawerBtn()` 统一处理 `disabled`（没有对应数据就禁用）与 `.open`（展开态高亮）。两个列表**可同时展开**（2026-09-30 用户要求「两者可同时展开」，原「点开一个就收起另一个」的互斥逻辑已删除）：`todoTasksOpen` / `todoFilesOpen` 两个开合状态各自独立，互不影响。
 - **无图标**：整个抽屉不出现 `📋 ✔ ◐ ○` 之类字符，标题栏也不放图标。待办状态**只用文字颜色**表达（`.todo-item.in_progress` = 强调色 / `.completed` = 弱化 / `.pending` = 次要）。
 - **确认 = 清掉待办**：点 `-ok-btn` 把 `todoItems` 置空并收起两个列表（`sessionChangedFiles` **保留** —— 用户可能还要照着列表去定位文件）。因为没有算力再做别的判断，这里不做二次确认弹窗。
 - **数据来源两个、生命周期不同**：待办来自 `renderTodoPanel()`（agent 的 `TodoWrite` 入参，**内存态、不落盘**）；文件列表来自 `noteChangedFile()` / `rebuildChangedFilesFromSteps()`（随 `steps` 快照可重建）。因此**恢复历史 / 回退对话时待办一律清空**（重建不出来），文件列表照旧重建；`newConversation()` 两者都清。
@@ -257,7 +296,7 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 
 | 档位 | 行为 | 落到的既有机制 |
 |---|---|---|
-| **手动**（手动运行） | 每个写类工具（Write / Edit / Bash / PowerShell）都弹审批卡 | `security_profile=project` + 审批；**手动档连白名单命中也要问**（这是它与「白名单」档的唯一差别，见 §4.2 末） |
+| **手动**（手动运行） | 每个写类工具（Write / Edit / Cmd / PowerShell）都弹审批卡 | `security_profile=project` + 审批；**手动档连白名单命中也要问**（这是它与「白名单」档的唯一差别，见 §4.2 末） |
 | **白名单**（默认档） | **只读命令**（agent 判定 `analysis.readonly`）或命中用户白名单 → 自动放行；其余仍弹卡 | `analysis.readonly`（A10，见 ai-spec §3.5「只读分类」/ §11 规则 62）+ 用户白名单。**2026-09-20 起不再用前端本地前缀表** |
 | **自动**（全部自动运行，高风险） | 不再弹卡 | `security_profile=full`（`--dangerously-skip-permissions`）。**必须**二次确认弹窗 + 顶部常驻警示标识 |
 
@@ -283,12 +322,16 @@ Trae 的沙箱是 **OS 级受限执行环境**（macOS `sandbox-exec` / Windows 
 
 危险命令被拦截时，卡片显示一行可读原因（复用中文标签，如「递归强制删除」；标签可能来自 agent 的 `analysis.dangerous`，也可能是前端 `CMD_BLACKLIST`），与 Trae 的「拦截原因可见」对齐。含无法静态判定成分时，标题处显示一个 `--yellow` 的 **⚠**（`.approval-warn-inline`，tooltip 说明原因）—— 它不是危险命令，但**不会被自动放行**（**唯一例外**：运行方式 = **自动** 档时放行，理由见 §4.2）。
 
-### 4.4 安全档位（补前端入口）
+### 4.4 安全档位（前端入口）
 
-设置面板「AI」分区有**安全档位**下拉（只读 / 项目 / 完全）。下发点是唯一的 —— 面板只广播 `lunac-security-profile-changed`，由 `main.ts` 的 `setSecurityProfile()` 调 `set_security_profile`（见 ai-spec §11 规则 21），与运行方式共用同一条 IPC，避免一次切换重启两遍 agent。与运行方式的关系写成一句说明，避免两个控件语义打架：
+**2026-10-05 搬家**：原本挂在设置面板「AI」分区的**安全档位**下拉，用户要求（对 AI 零基础做减法）后**移进输入栏「更多设置」⋯ 菜单** —— 位置就在「命令运行方式」那一行下面，控件是 `#chat-profile-btn`（一个按钮，点一下循环 只读 → 项目 → 完全），语义与文案不变。设置面板里不再有它。
+
+下发点仍然唯一 —— `main.ts` 的 `setSecurityProfile()` 调 `set_security_profile`（见 ai-spec §11 规则 21），与运行方式共用同一条 IPC，避免一次切换重启两遍 agent；旧事件 `lunac-security-profile-changed` 仍保留作兼容通道。与运行方式的关系：
 
 - 运行方式 = **问不问**（频率）；
 - 安全档位 = **允不允许**（边界）：只读档直接拒绝写类工具，完全档忽略工作区锁。
+
+**为什么保留它、而不是照「删设置项」一并删掉**：它与运行方式**部分重叠但不等价** —— 运行方式只映射（manual/allowlist→project、auto→full），**没有任何路径能到 `safe`（只读）**；删掉入口 = 只读能力不可达。用户裁定「保留，移到更多设置菜单」。
 
 **第三个概念：计划相位（2026-09-20，A7）** —— 前两个都归**用户**，这个归**模型自己**：模型调 `EnterPlanMode` 声明「先出计划、不动手」，再由用户在**计划卡**上批准（`ExitPlanMode`）才恢复写权限。三者的分工：
 
@@ -423,7 +466,7 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 
 ## 9. 数据与 IPC 契约
 
-- **本轮不改 `stream-json` 协议**。前端展示所需信息按 §3.3 从前端自有时间戳与现有 `tool_result` 文本推导。
+- **修改 `stream-json` 协议要走登记**：前端展示所需信息优先按 §3.3 从前端自有时间戳与现有 `tool_result` 文本推导。2026-09-30 / 2026-10-01 起的两次例外（`tool_output` 实时输出、`tool_control` 实时控制 + `background_started` / `background_done`）都按下面这条流程登记过（前者记在 ai-spec §2.2，后者在本节下表）。
 - 若后续确需结构化字段（例如后端直接给 `exit_code` / `duration_ms` / `timed_out`），必须：
   1. 在 ai-spec §3.5 的 stdout 契约表登记字段名与语义；
   2. 保持 `tool_result.content` 文本不变（旧消费者仍可读）；
@@ -443,12 +486,18 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
   | `task_id` / `description` / `tool` / `round` / `ok` / `ms` | `system/task_started` / `task_progress` / `task_done` | 子代理的**过程事件**（A1 起，A14 起前端按 `task_id` 归组）：`description` 只在 started 上、`tool` / `round` 只在 progress 上、`ok` / `ms` 只在 done 上。**子代理非流式** ⇒ 这是它在 UI 上的唯一落点。ai-spec §3.5「事件流」行 | 一块 `.subtask-panel`（每个 `task_id` 一行、就地更新）；状态行并行时报 `agent.subtask_parallel`，`task_done` 后**还有别的在跑就继续报并行数**，全跑完才回 `agent.working`。没有 `task_started` 的 `task_done` 不凭空造行 |
 
 - **计划卡不新增字段**（A7）：`ExitPlanMode` 复用既有的 `can_use_tool` 通道，整份计划就在 `request.input.plan` 里 —— 卡片按 §3.6 的骨架渲染，正文用 `textContent` 原样铺开（**不做 markdown 渲染、不用 `innerHTML`**：那是模型生成的任意文本）。批准时前端另调 `save_plan_md(stamp, plan)` 落档 `ModuleData\plans\`（失败只提示，不挡执行）。
+- **长计划默认折叠**（2026-10-06，q3 第 6 步，用户实测「会出现一大段文档」）：计划超过 `PLAN_PREVIEW_LINES`（12）行时，卡片默认只铺**前 12 行** + 一枚「展开全文 / 收起」，点一下换出完整原文。meta 行的「共 N 行」按**去尾空行后**的正文行数算（模型常在结尾留空行，算进去会虚高）。
+    - ⚠️ **刻意不用模型摘要代替原文**：这张卡是用户裁决「放行写类工具、让模型开始动手」的**唯一依据**，摘要可能恰好丢掉「会删除某个文件」这类关键项 —— 那不是「保留主要内容」，是把风险藏在摘要之后。折叠**不丢任何内容**，裁决依据始终完整（与 §3.6「审批卡要让用户看得见」同一条纪律）。
+    - **普通审批卡不需要折叠**：`Write` / `Edit` 的入参预览本来就截到 180 字符（`renderCmdGroupBody`）；命令卡显示完整命令（**必须**完整，那是安全要求，不许折叠）。
 - **图片附件走 stdin 的 `image` 块，不动 stdout 契约**（A8）：前端只多传一个 `{"type":"image","source":{"type":"file","path":"…"}}` 内容块（契约见 ai-spec §3.5「图片附件」/ §11 规则 60）；agent 回报的是下面这条 **`system/attachment_note`**，前端渲染成一条黄色 `.sys-note-warn`（i18n `agent.attachment_skipped`，正文逐条「路径 — 原因」）。**没有事件 = 全部发出去了**，不需要画任何东西；`skipped` 为空数组时按无事件处理。
 
 | 字段 | 位置 | 语义 | 前端行为 |
 |---|---|---|---|
 | `skipped` = `[{path, reason}]` | `system/attachment_note` | 本轮**没能随提问发出**的附件与原因（A8）：读不出来 / 不是端点支持的图片 / 超过 3.5 MB 单图上限 / 超过 10 张 —— agent 侧判定，见 ai-spec §3.5「图片附件」 | 追加一条 `details.sys-note.sys-note-warn`，标题 `t("agent.attachment_skipped", {n})`、正文逐条 `path — reason`。**缺字段或空数组 ⇒ 什么都不画**（不是错误，也没有需要用户处理的失败） |
-| `hook_event` / `tool_name` / `items` = `[{kind, text, command}]` | `system/hook_note` | **权限 hooks**（A9）的裁决 / 输出 / 失败：`kind` ∈ `block`（拦下）/ `allow`（放行）/ `info`（补充信息）/ `error`（hook 崩了 / 超时 / 输出看不懂 —— **它没有拦任何东西**）。字段名是 `hook_event` 而不是 `event`（后者已被 `stream_event` 占用，形状是对象）。见 ai-spec §3.5「权限 hooks」/ §11 规则 61 | `renderHookNote()`：追加 `details.sys-note`，`block` / `error` 加 `.sys-note-warn` 并**自动展开**（必须看见 —— 静默会让用户「以为装了保护、其实没跑」），`info` / `allow` 中性色、默认折叠；标题 `t("agent.hook_note", {event, n})`、正文逐条 `[kind] text — command`（一个事件挂多个 hook 时靠 `command` 才分得清是谁）。**`items` 为空 ⇒ 什么都不画** |
+| `hook_event` / `tool_name` / `items` = `[{kind, text, command}]` | `system/hook_note` | **权限 hooks**（A9）的裁决 / 输出 / 失败：`kind` ∈ `block`（拦下）/ `allow`（放行）/ `info`（补充信息）/ `error`（hook 崩了 / 超时 / 输出看不懂 —— **它没有拦任何东西**）。字段名是 `hook_event` 而不是 `event`（后者已被 `stream_event` 占用，形状是对象）。见 ai-spec §3.5「权限 hooks」/ §11 规则 61 | `renderHookNote()`：追加 `details.sys-note`，`block` / `error` 加 `.sys-note-warn` 并**自动展开**（必须看见 —— 静默会让用户以为装了保护、其实没跑），`info` / `allow` 中性色、默认折叠；标题 `t("agent.hook_note", {event, n})`、正文逐条 `[kind] text — command`（一个事件挂多个 hook 时靠 `command` 才分得清是谁）。**`items` 为空 ⇒ 什么都不画** |
+| `id` / `tool_use_id` / `label` | `system/background_started` | 一条命令**已转后台**（2026-10-01）：`id` = 后台 id（形态 `bg_<pid>_<seq>`）、`tool_use_id` = 它原来那张命令卡、`label` = 命令原文（截断 120 字）。见 ai-spec §3.5「命令的实时控制与后台运行」/ §11 规则 73 | `backgroundCmds.set(id, {toolUseId, label})` → `markCardBackground(toolUseId)`（把卡上的两个按钮换成一行的 `.tool-live-state`）+ `renderTodoDrawer()`（§3.9 那一区多一行）。**缺字段时按空串**，不报错 |
+| `id` / `tool_use_id` / `label` | `system/background_done` | 后台命令**已结束**（跑完或被取消）：同 id | `backgroundCmds.delete(id)` + `renderTodoDrawer()`。**这是唯一能让那一行消失的输入**；前端**不许**自己推断（命令何时退出只有 agent 知道） |
+| ~~前端 → agent：`tool_control`~~ | **stdin**（不是 stdout） | `{"type":"tool_control","action":"background"\|"stop","tool_use_id":"…"}`（2026-10-01）：命令卡「后台运行 / 停止」的**上行指令**。走 `invoke("send_message")`（宿主原样转发 stdin）。见 ai-spec §3.5「命令的实时控制与后台运行」/ §11 规则 73 | 由 `sendToolControl(action, toolUseId)` 发出。**agent 认领但不报错**未知动作（该通路以后还会加动作）⇒ 前端**不得**假设「发了就一定生效」，状态一律等 `background_*` 事件 |
 | ~~设置面板「权限 hooks」行~~ → **UI 已移除（2026-09-21）** | 无（开发者选项，**常驻可用**） | 开关 = `config\hooks.json` 的 `enabled` 字段（`get_hooks_config` / `set_hooks_enabled`；**缺省即视为 true**，用户不改配置文件就是开着的）。宿主三命令（含 `hooks_file_path`）**保留**，但前端**不得**再接线 | 设置面板里**没有** hooks 分块、没有「打开 hooks.json」按钮（用户原话：「hooks 是作为开发者的一个选项并不需要展示给用户…是否可以常驻开启」）。要看 / 改直接开 `config\hooks.json`；agent 按 mtime 热重载，改完即时生效。上述 `system/hook_note` 的裁决提示**照旧**渲染 —— 不显示开关 ≠ 不告诉用户被拦了 |
 | 「人格 / 自定义提示词」（L2，**2026-09-21 搬到输入栏 ⋯ 菜单**） | 输入栏「更多设置」（`⋯`）下拉的**最后一块**（在工具黑名单之后） | 数据来自 `get_persona`（返回 `{path, text, maxChars}`，`path` = `config\persona.md` 的绝对路径、`text` 缺文件时为空串、`maxChars` = 8000）；保存走 `set_persona(text)`（宿主侧先校验后写，失败返回 `{err}`） | 默认收起 —— 只有 `#chat-persona-label` + 一个「编辑」（`#chat-persona-edit`，`settings.persona_edit`）；点开才显示 `#chat-persona-box`（host 是懒装载：**第一次展开才 `get_persona`**，避免每次开菜单都读盘）。框内：`#chat-persona-hint`（**一句话**）· `#chat-persona-text`（`maxlength` = `maxChars`）· 三个按钮「保存 / 恢复内置 / 重启 AI」（`-save` / `-reset` / `-restart`，后者复用 `window.__lunac_reload_agent`）· 提示行 `#chat-persona-msg`。**不再显示字数计数**（`settings.persona_count` / `persona_path` 两条 i18n 已删）。**提示行每次现查节点**。文案见 ai-spec §3.5「人格 / 自定义提示词」/ §11 规则 66 |
 | 设置面板「用量与成本」分块（A12；**2026-09-29 改：设置里只剩两个按钮，数据搬进表盘展开面板**） | 设置 · AI 分块里只有「打开 pricing.json」`#settings-cost-open` + 「更新价格」`#settings-cost-update`；**汇总与逐日表格整体落在主界面「表盘展开面板」**（点状态栏的 token 表盘 → `#token-usage-panel` 在表盘上方展开，见 §3.9 与 ai-spec §3.5「定价表与成本面板」预检 ⑥） | 数据来自 `get_pricing_state`（正式 + 候选两份定价表的**原文**）与 `read_usage_range(dates)`（近 30 天，日期列表由前端按本地日期算；**算法只有一份** = `usage-cost.ts`）。金额在**前端**按 `config\pricing.json` 算，分模型计价 | 设置侧：① 「打开 pricing.json」= `pricing_file_path`（缺文件落空骨架）+ **宿主命令 `open_path()`**（**不是** shell 的 `open()` —— 本地路径会被它的 scope 正则拒掉，见 §3.10）；② 「更新价格」把提示词经 `__lunac_agent_task` 发给 agent（设置面板不自己发消息），安全档位为「只读」时**不发**并说明原因；③ 有候选文件时显示 `.cost-pending` 预览卡（旧值 → 新值 / 新增 / 「确认后失去价格」）+ 确认 / 放弃两个按钮，确认走 `commit_pricing_pending(today)`、放弃走 `discard_pricing_pending`。**面板侧只放数据、不放说明**（用户原话「只是移入数据，并不是移入说明」）：总计行由 `sumUsageCost()` 算，未定价的模型单列一行、金额前缀 `≥`。纪律见 ai-spec §11 规则 63 |
@@ -465,8 +514,8 @@ idle ──发送──▶ thinking ──工具调用──▶ tool_running ─
 
 | 原编号 | 项 | 现位置 |
 |---|---|---|
-| 9 | 代码变更 diff 卡（Write/Edit 变更预览与接受/拒绝）+ DiffView 汇总 | backlog **U1** |
-| 10 | 多轮缩略导航 / 会话 Fork | backlog **U2** |
+| 9 | 代码变更 diff 卡（Write/Edit 变更预览与接受/拒绝）+ DiffView 汇总 | **✅ 已落地（U1，2026-10-06）**，形态见 §3.8.1 |
+| 10 | 多轮缩略导航 / 会话 Fork | **✅ 多轮缩略已落地（U2）**；会话 Fork 经用户裁定取消 |
 | 11 | 真沙箱调研（Job Object 资源限制 / 低完整性级别令牌 / AppContainer） | backlog **U3** |
 
 ### 全局验收

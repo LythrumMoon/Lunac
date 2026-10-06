@@ -28,9 +28,9 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | 形态 | `agent.exe`（Rust，约 2.5MB），**独立进程**，由 `lunac.exe` 的 `start_cli` 以子进程方式拉起 |
 | 通信 | stdin/stdout 上的 **stream-json**（NDJSON），契约见 [ai-spec.md](./ai-spec.md) §3.5；agent 的 stdout **只走协议**，日志一律落盘 |
 | 数据根 | **便携模式**：一律 `<exe 根>`（`current_exe()` 所在目录），实现 dev/release 物理隔离与卸载彻底化 |
-| 关键路径 | `skills\`（技能）、`tools\`（用户工具定义）、`config\`（`ai.json` 凭据 / `hooks.json` 权限 hooks / `pricing.json` 定价表）、`ModuleData\`（`history\chat.db`、`usage\*.jsonl`）、`temp\logs\`（落盘日志） |
-| 环境注入 | 端点 / token / 模型 / 思考开关 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_HOOKS_FILE` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent（**例外**：hooks 配置本身按 mtime 热重载，改 `hooks.json` 内容不必重启）。完整变量表（17 个 `LUNAC_*`）见 [agent-feature-backlog.md](./agent-feature-backlog.md) §6 |
-| 源码 | [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)（主循环 + 上下文压缩/摘要）、[tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)、[skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)、[mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)、[bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)（命令静态安全分析 → 审批卡判据）、[log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs) |
+| 关键路径 | `skills\`（技能，**含出厂内置的三个**）、`tools\`（用户工具定义）、`config\`（`ai.json` 凭据 / `hooks.json` 权限 hooks / `pricing.json` 定价表 / `persona.md` 人格 / `mcp.json` 远端 MCP 服务器 / `mcp-tokens.json` 其 OAuth 令牌）、`ModuleData\`（`history\chat.db`、`history\frames\*.json` 文件快照、`usage\*.jsonl`）、`temp\logs\`（落盘日志） |
+| 环境注入 | 端点 / token / 模型 / 思考开关 / 安全档位 / 工作区 / `LUNAC_SKILLS_DIR` / `LUNAC_HOOKS_FILE` / `LUNAC_PERSONA_FILE` / `LUNAC_MCP_FILE` / `LUNAC_LOG_DIR` **只在 spawn 时注入**；切换这些项 = `kill_and_cleanup()` 重启 agent（**例外**：hooks 配置本身按 mtime 热重载，改 `hooks.json` 内容不必重启）。完整变量表（19 个 `LUNAC_*`）见 [agent-feature-backlog.md](./agent-feature-backlog.md) §6 |
+| 源码 | [core-agent/src/main.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/main.rs)（主循环 + 上下文压缩/摘要）、[tools.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/tools.rs)、[skills.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/skills.rs)、[mcp.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp.rs)、[mcp_oauth.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/mcp_oauth.rs)（远端 MCP 服务器的 OAuth 2.1）、[bash_safety.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/bash_safety.rs)（命令静态安全分析 → 审批卡判据）、[log.rs](file:///d:/cc/claude-code-cli-master/core-agent/src/log.rs) |
 
 ---
 
@@ -40,12 +40,12 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 |---|---|---|
 | **P0** | 多轮上下文、SSE 增量打字、用量上报（input / output / cacheRead / cacheCreate）、错误回传（失败轮整体回滚历史） | `run_query` 主循环；用量口径见 ai-spec §3.5「用量与对账」 |
 | **P0** | 思考开关跨模型自适应 | `LUNAC_THINKING`（`off` / 其余=开）→ `Thinking` 形态；400 沿降级链 `enabled+budget → adaptive → 不带字段` 重试一次并缓存结果。**只有开 / 关两档** —— 端点无思考力度旋钮（预算不被 enforce、`effort` 被静默忽略），见 ai-spec §3.5 |
-| **P1** | 内置工具 + `tool_use` / `tool_result` 往返循环 | 15 件内置工具，见 §4.1 |
+| **P1** | 内置工具 + `tool_use` / `tool_result` 往返循环 | 17 件内置工具，见 §4.1 |
 | **P1** | 子代理框架（`Agent` 工具）：派生独立上下文的子代理跑自包含任务，主对话只收最终报告 | `run_subagent()` / `run_agent_tool()` / `subagent_tool_defs()`；**串行** + 轮次上限 8 + token 预算 30 万；工具集剔掉 `Agent` / `SessionSearch` / `mcp__*`（无桥的必然失败项）、生成参数与主循环同源（thinking + max_tokens）、系统提示词含环境块与技能清单、非流式；事件 `task_started` / `task_progress` / `task_done`。契约见 ai-spec §3.5「子代理」与 §11 规则 54 |
 | **P2** | 计划模式闭环（`EnterPlanMode` / `ExitPlanMode`）：模型先出计划、用户批准后才动手 | **计划相位**（`tools::Ctx.plan_phase: Arc<AtomicBool>`）与用户的**只读档位**是两回事；相位内写类工具一律硬拒（判据统一在 `tools::write_blocked()`，含四个绕开 `tools::run` 的早退分支），`ExitPlanMode` 经审批卡批准后**即时**解除、**不重启**；批准的计划落档 `ModuleData\plans\<本地时间戳>.md`；前端横幅只镜像 `system/plan_mode`。契约见 ai-spec §3.5「计划模式闭环」与 §11 规则 59 |
 | **P2** | 权限 hooks：用户脚本在 8 个事件上介入（拦工具 / 补上下文 / 拦提问） | `config\hooks.json`（`enabled` 缺省真、`matcher` 正则、`timeout` 秒）；agent 侧按 **mtime 热重载**（改完即时生效）、解析失败保留上一份有效配置；**只认显式拒绝**（退出码 2 / `{"decision":"deny"}`），超时与崩溃**放行但可见**；hook 的 `allow` **只等于跳过审批卡** —— 危险命令与凭据命中仍强制弹卡；`PostToolUse` 的文本只拼进 `tool_result` 内部。契约见 ai-spec §3.5「权限 hooks」与 §11 规则 61；UI 在 [agent-ui-spec.md](./agent-ui-spec.md) §9 |
 | **可用性** | 瞬时失败重试：网络抖动 / 429 / 5xx（含 529）退避重试，**请求级**（不产生重复内容），并补发 `system/api_retry` | `retryable_status` / `retry_delay_ms` / `emit_api_retry`；见 ai-spec §3.5「瞬时失败重试」与 §11 规则 25 |
-| **安全** | 命令静态安全分析（Bash / PowerShell）：子命令拆分 + 引号/转义归一 + 包装器递归 + Windows 危险规则集 + **fail-closed** 不透明判定，结果随 `can_use_tool` 的 `analysis` 上报 | `bash_safety::analyze`（自研，单测 8 例）；见 ai-spec §3.5「命令静态安全分析」与 §11 规则 26 |
+| **安全** | 命令静态安全分析（Cmd / PowerShell）：子命令拆分 + 引号/转义归一 + 包装器递归 + Windows 危险规则集 + **fail-closed** 不透明判定，结果随 `can_use_tool` 的 `analysis` 上报 | `bash_safety::analyze`（自研，单测 8 例）；见 ai-spec §3.5「命令静态安全分析」与 §11 规则 26 |
 | **安全** | 写入内容的凭据扫描（`Write` / `Edit`）：**只做凭据 / 密钥泄漏**，写入前扫 `content` / `new_string`，命中随同一个 `analysis` 字段的 `secrets` 上报（`[{rule, line}]`），前端按「必须人看」处理 | `content_safety::analyze`（自研，单测 10 例）；展示通道见 ai-spec §3.5「写入内容的凭据扫描」、§13.1 与 §11 规则 58 |
 | **P2** | **只读分类**（审批频率）：判定一条命令是否「可证只读」，供**「白名单」运行档**自动放行，取代前端原先那张看不见重定向/管道的前缀表 | `bash_safety::is_provably_readonly`（与危险规则同一套 `split_subcommands` / `command_word`），结论随同一个 `analysis` 字段的 `readonly` 上报；四条结构判据（单条 / 无重定向 / 无包装器与命令替换 / 命中正向白名单）+ 与 `dangerous`·`opaque` 自洽。契约见 ai-spec §3.5「只读分类」与 §11 规则 62，前端行为见 [agent-ui-spec.md](./agent-ui-spec.md) §4.2 / §9 |
 | **P2** | 权限审批：写类工具发 `can_use_tool` → 阻塞等前端回包（超时按拒绝） | 与工作区锁是**与**关系（ai-spec §11 规则 14） |
@@ -54,7 +54,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | **上下文** | 单条工具输出预算：超 12000 字符落盘全文、只内联「头 8000 + 尾 2000 + 路径」，模型用 Read / Grep 取回全文 | `tools::apply_budget`（唯一出口，`run_tool` 调用）；落盘 `temp\tool-outputs`（7 天清理）并并入 `Ctx.add_dirs`；见 ai-spec §3.5「单条工具输出预算」与 §11 规则 27 |
 | **上下文** | 任务快照：压缩丢弃中段时，把最近一条 `TodoWrite` 清单钉回上下文，避免「压缩后忘了在做什么」 | `latest_todo_snapshot()`；纯文本 user 消息（与 `tool_use`/`tool_result` 配对结构解耦），插在第 1 条之后；见 ai-spec §11 规则 37 |
 | **执行** | 两族并行批，其余串行：一轮里**连续的**只读调用合成一批并发（上限 4）、**连续的**子代理调用（`Agent` / fork 技能）合成一批并发（上限 3，A14）；写类 / 命令 / MCP 串行 | `tools::parallel_safe` + `plan_tool_batches`（返回 `Serial` / `ReadOnly` / `Subagent` 三类批）；结果一律按下标回填 ⇒ 回灌顺序恒等于 `tool_use` 原顺序；见 ai-spec §3.5「只读工具并行」/「子代理并行批」与 §11 规则 28 / 65 |
-| **P3** | MCP 工具桥 | 把 `<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 接进请求体；**读侧**（A3）另有两件条件注册的 `resources` 工具，让模型能看到用户工具的 `handler` |
+| **P3** | MCP 工具桥 | 把 `<exe 根>\tools\*.json` 的用户工具以 `mcp__<名>` 接进请求体；**读侧**（A3 / A13）另有四件条件注册的读侧工具（`resources` 两件 + `prompts` 两件），让模型能看到用户工具的 `handler` 与用户的参数化提示词模板；并支持 `roots` / `elicitation` **双向请求**（2026-10-04，协议升 `2025-06-18`） |
 | **P4** | 技能（渐进披露；**inline + fork 两种执行模式**；可自带脚本 / 资源） | `LUNAC_SKILLS_DIR` 下 `<key>/SKILL.md`；提示词只列 `key: 描述`，模型调 `Skill` 取正文（inline）或由子代理执行后回报告（`context: fork`）。目录里**除 `SKILL.md` 之外的文件**在扫描时登记、**调用时**附在返回里（相对路径 + 深度 ≤ 3 / ≤ 40 条，**不进提示词**，见 ai-spec §3.5「P4」与 §11 规则 57） |
 | **会话** | 历史持久化 / 恢复 / **回退到任意消息**（A11）；`session_id` 是真值（`sess_<pid>_<毫秒>`，一次 agent 运行一个 id） | `ModuleData\history\chat.db`（SQLite + FTS5，含专供 CJK 的 `trigram` 索引表）；`set_history` 协议把历史灌回 agent 上下文（见 ai-spec §11 规则 30）；回退**只动对话、不还原磁盘文件**，且 `data-idx` 要跟着上下文裁剪前移（见 §11 规则 64） |
 | **UI** | AI 对话面板（思考省略 / 命令卡片 / 回合折叠 / 运行方式三档 / 用量面板 / 被改动文件路径追踪） | 规范见 [agent-ui-spec.md](./agent-ui-spec.md) |
@@ -67,11 +67,11 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 ### 4.1 当前实际注册（唯一真相源）
 
-`core-agent/src/tools.rs` 的 `defs()` 恒返回 **15 件内置工具**，再由 `main.rs` 条件追加 `Skill` 与 MCP 动态工具：
+`core-agent/src/tools.rs` 的 `defs()` 恒返回 **17 件内置工具**，再由 `main.rs` 条件追加 `Skill` 与 MCP 动态工具：
 
 | 工具 | 说明 |
 |---|---|
-| `Bash` / `PowerShell` | 命令执行（PowerShell 走 `-NoProfile -NonInteractive -Command` + 双 UTF-8 兜底） |
+| `Cmd` / `PowerShell` | 命令执行（PowerShell 走 `-NoProfile -NonInteractive -Command` + 双 UTF-8 兜底） |
 | `Read` / `Write` / `Edit` | 文件读写与精确替换编辑 |
 | `Glob` / `Grep` | 文件与内容检索 |
 | `WebSearch` | 联网检索（主源 bocha / tavily / exa / firecrawl，兜底 Bing RSS → Bing HTML → 百度抓取） |
@@ -82,15 +82,18 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | `Skill` | **条件注册**：技能目录非空且未被黑名单裁掉时追加。**两种模式**（2026-09-20，A5）：inline 取回本地技能正文（渐进披露的取回端，免审批、plan 档可用），`context: fork` 的技能则**派子代理执行后回报告**（要审批、plan 档拒绝；与 `Agent` 同一族 ⇒ 同一轮里相邻时一起进并行批，A14；工具面受 `allowed-tools:` 收窄）。契约见 ai-spec §3.5 与 §11 规则 57 / 65 |
 | `mcp__*` | **动态**：`<exe 根>\tools\*.json` 的用户工具，按名排序后接入（前缀缓存不变量，ai-spec §11 规则 18） |
 | `ListMcpResourcesTool` / `ReadMcpResourceTool` | **条件注册**（2026-09-20，A3）：只在桥真的接上了用户工具（`!bridge.defs().is_empty()`）时才追加 —— 出厂时 `tools\` 只有模板，无条件注册就是在每次请求的固定前缀里放两件空转工具。用来列 / 读 `tools\*.json` 这些 resource（模型借此看到用户工具的 `handler`；`tools\` 在工作区外，内置 `Read` 会被工作区锁拒掉）。**免审批、plan 档放行、必须串行**（走单线程 stdio 桥）。契约见 ai-spec §3.5「MCP resources 读侧」与 §11 规则 55 |
+| `ListMcpPromptsTool` / `GetMcpPromptTool` | **条件注册**（2026-10-04，A13）：与 resources 读侧**同一判据**（`!bridge.defs().is_empty()`）。列 / 取 `<exe 根>\prompts\*.md` 的用户提示词模板（`{{key}}` 按 `arguments` 展开）—— 与 resources 的分工：resources 是「给模型看的**资料**」（用户工具的定义文件），prompts 是「给模型用的**模板**」（用户预写好的参数化指令）。**免审批、plan 档放行、必须串行**。契约见 ai-spec §3.5「MCP prompts 读侧」与 §11 规则 55 |
 | `Agent` | **子代理**（2026-09-20）：派生一个独立上下文的子代理跑自包含任务，中间工具输出不进主上下文，只回最终报告（`[task-N] subagent report: …`）。**要审批、plan 档拒绝；并发上限 3**（A14：一轮里连续的 `Agent` / fork 技能合成一批并发跑，每线程一份 `cfg.detached()`，结果按下标回填）。子代理工具集剔掉 `Agent` 与计划相位两件（防递归 / 相位归主循环管）。契约见 ai-spec §3.5「子代理」与 §11 规则 65 |
 | `EnterPlanMode` / `ExitPlanMode` | **计划模式闭环**（2026-09-20，A7）：`EnterPlanMode` 只把 `Ctx.plan_phase` 置真（**免审批**、不碰本机），此后写类工具（内置四件 + `Agent` + fork 技能 + `Remember` + MCP 与走桥工具）一律硬拒；`ExitPlanMode` 把整份计划（入参 `plan`）交给 `can_use_tool` 审批卡，**批准才解除相位**、拒绝则保持为真。**只读档下 `ExitPlanMode` 也被拒**（批准了也执行不了）。两件都无条件注册、必须串行。契约见 ai-spec §3.5「计划模式闭环」与 §11 规则 59 |
+| `ListPeers` / `SendMessage` | **多代理通信**（2026-10-05，A13）：同一轮并发的那几个子代理互相看见（`ListPeers` 列出存活兄弟的 task id + 描述、自己标 `(you)`）与投一段文本（`SendMessage` 投给指定兄弟，收件方在**下一轮开始**当一条 `user` 消息读到）。**都免审批、plan 档放行**；`ListPeers` 进只读并行白名单、`SendMessage` 串行（改共享收件箱）。边界：主循环在子代理批期间**被阻塞** ⇒ 通道只存在于**同批兄弟之间**，主代理调 `SendMessage` 如实报错。实现在 `core-agent/src/peers.rs`。契约见 ai-spec §3.5「多代理通信」与 §11 规则 85 |
 | `Remember` | **条件注册**（2026-09-20，A4）：桥接通时追加。写**跨会话长期记忆**（`ModuleData\memory\MEMORY.md`，走桥的 `lunac/memory_write`），单条 ≤2000 字符、整文件 ≤6000 字符、按条去重。**要审批、串行、plan 档拒绝**（走 `needs_bridge` 早退分支 ⇒ 只读拒绝是分支内自判的）。填充它的**主要**是每 N 轮一次的后台复盘 fork（`LUNAC_NUDGE_INTERVAL`，默认 10）。契约见 ai-spec §3.5「长期记忆与后台复盘 fork」与 §11 规则 56 |
+| `ImageGen` | **条件注册**（2026-10-03，A13）：宿主注入 `LUNAC_IMAGE_MODEL` 时追加（该值 2026-10-05 起由**所选供应商预设**推导，见 `settings.ts` 的 `PROVIDER_PRESETS.image_model`，空 = 不启用）。**生成 / 编辑图片**（DashScope 多点编辑端点，**与文本侧端点不同**）并落盘到 `temp\images\`，返回 `![generated](路径)` 供前端渲染。**要审批**（外部数据出口 + 写文件 + 按张计费）、**串行**、plan 档由 `write_blocked` 拒绝。契约见 ai-spec §3.5「出图（A13）」 |
 
-**总数口径**：15（`defs()` 恒返回）+ `Skill`（0 或 1，条件）+ MCP resources 两件（0 或 2，条件）+ `Remember`（0 或 1，条件）+ N（`mcp__*` 用户工具）；`--disallowedTools` 可在注册后裁剪。条件注册的三类都**不进 `defs()`**，因此「15 件」这个数字在任何配置下都成立（守门单测 `agent_tool_is_registered_and_filterable` 钉住总数）。完整未实现工具清单见 [agent-feature-backlog.md](./agent-feature-backlog.md) §1。
+**总数口径**：17（`defs()` 恒返回）+ `Skill`（0 或 1，条件）+ MCP 读侧四件（resources 两件 + prompts 两件，各 0 或 2，条件）+ `Remember`（0 或 1，条件）+ `ImageGen`（0 或 1，条件）+ N（`mcp__*` 用户工具）；`--disallowedTools` 可在注册后裁剪。条件注册的五类都**不进 `defs()`**，因此「17 件」这个数字在任何配置下都成立（守门单测 `agent_tool_is_registered_and_filterable` 钉住总数）。完整未实现工具清单见 [agent-feature-backlog.md](./agent-feature-backlog.md) §1。
 
 ### 4.2 工具名口径提醒
 
-- 前端特判的是 `Bash` / `PowerShell`，与 agent 侧**同名同义**；其余内置工具名与旧 CLI 一致。
+- 前端特判的是 `Cmd` / `PowerShell`，与 agent 侧**同名同义**；其余内置工具名与旧 CLI 一致。
 - 工具黑名单候选列表已是**真实工具名**；勾选即真正从请求体 `tools` 裁掉（缩短前缀、提升缓存命中）。
 - 旧 CLI 的 `getAllBaseTools()` 里那些已被显式置空的工具（`Config` / `REPL` / `Workflow` / `Monitor` …）属旧 CLI 的历史包袱，登记在 backlog §4 设想区，**不要照搬**。
 
@@ -98,19 +101,29 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 ## 5. 本地扩展（用户可直接引用）
 
-发布包会在 `<exe 根>` 下预置两个目录（纯模板，**不会自动加载**）：
+发布包会在 `<exe 根>` 下预置两个目录：**内置技能**（真 `SKILL.md`，**会被加载**）+ 一批**纯模板**（`.example`，不会自动加载）。
 
 ```
 <exe 根>\
   skills\
     README.md                     ← 技能格式与生效方式说明
     _example\SKILL.md.example     ← 照抄模板（刻意不叫 SKILL.md，不会被加载）
+    code-review\SKILL.md          ← 内置技能（fork 模式）：读 diff + 上下文，出审查问题清单
+    debug\SKILL.md                ← 内置技能（inline）：系统化调试（复现 → 假设 → 验证 → 根因）
+    commit\SKILL.md               ← 内置技能（inline）：按仓库风格起草并执行一次 git commit
   tools\
     README.md                     ← 工具 JSON 格式与安全说明
     example-tool.json.example     ← 照抄模板（刻意不叫 .json，不会被加载）
 ```
 
-> 模板的源文件在仓库 [agent-templates/](file:///d:/cc/claude-code-cli-master/agent-templates)，由 [build-release.ps1](file:///d:/cc/claude-code-cli-master/build-release.ps1) 拷进暂存目录、由 [lunac-installer.nsi](file:///d:/cc/claude-code-cli-master/scripts/lunac-installer.nsi) 打进安装包。
+> **判据是文件名**：`*.example` 不会被加载、也不进模型的技能清单；真名 `SKILL.md` / `*.json` 会。内置技能随安装包分发、开箱即用，用户也可以直接改 / 删（升级安装会把它们补回来）。
+> 模板与内置技能的源文件都在仓库 [agent-templates/](file:///d:/cc/claude-code-cli-master/agent-templates)，由 [build-release.ps1](file:///d:/cc/claude-code-cli-master/build-release.ps1) 拷进暂存目录、由 [lunac-installer.nsi](file:///d:/cc/claude-code-cli-master/scripts/lunac-installer.nsi) 打进安装包。
+
+### 5.0 项目记忆（工作目录下的 `AGENTS.md`，2026-10-01）
+
+- agent 启动时读**工作目录**下的 `AGENTS.md`（不是 `<exe 根>`），拼进 `env_section` —— 于是主提示词 / 子代理 / 复盘**三处都拿得到**（子代理同样在改文件）。
+- **不做向上递归**；没有文件 / 全空白 ⇒ **一个字节都不加**（与「没这个功能」逐字节等价）；上限 8000 字符。
+- 它进**固定前缀** ⇒ 只在启动时读一次，改完要**重启 agent** 才生效（与 `config\persona.md` 同一条纪律）。
 
 ### 5.1 技能（`skills\`）
 
@@ -152,8 +165,10 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 *最后整理：2026-09-19 —— 撤下「未复刻工具表」「未复刻子系统表」「实施顺序」三节（并入 backlog），补上本轮实测的工具注册口径与已落地的任务快照 / 摘要压缩 / 会话持久化。*
 
-*2026-09-20 追加：**工具覆盖实测** —— 直接驱动 debug 版 `agent.exe`（带 `--mcp-server stdio:<lunac.exe>` 与 `LUNAC_SKILLS_DIR`，不经 UI）跑一次 13 步任务：`Read` / `Write` / `Edit` / `Glob` / `Grep` / `Bash` / `PowerShell` / `WebSearch` / `WebFetch` / `TodoWrite` / `SessionSearch` / `Skill` **全部真实调用成功（各 1 次 `ok`）**；`AskUserQuestion` 被调用后返回 `No answer was collected — the interactive channel is unavailable. Ask the user in plain text instead.` —— 探针没有前端，**这是刻意的优雅降级而非缺陷**（有前端时答案经 `can_use_tool` 的 `updatedInput` 回传）。该次提问 14 个请求、汇总命中率 90.3%。*
+*2026-09-20 追加：**工具覆盖实测** —— 直接驱动 debug 版 `agent.exe`（带 `--mcp-server stdio:<lunac.exe>` 与 `LUNAC_SKILLS_DIR`，不经 UI）跑一次 13 步任务：`Read` / `Write` / `Edit` / `Glob` / `Grep` / `Cmd` / `PowerShell` / `WebSearch` / `WebFetch` / `TodoWrite` / `SessionSearch` / `Skill` **全部真实调用成功（各 1 次 `ok`）**；`AskUserQuestion` 被调用后返回 `No answer was collected — the interactive channel is unavailable. Ask the user in plain text instead.` —— 探针没有前端，**这是刻意的优雅降级而非缺陷**（有前端时答案经 `can_use_tool` 的 `updatedInput` 回传）。该次提问 14 个请求、汇总命中率 90.3%。*
 
 *同一次运行还确认了三条链路在真实进程里同时可用：`--mcp-server` 接通（`[agent] MCP 桥已接通，用户工具 0 个`）、技能加载 1 个（`my-skill`）、往期会话索引注入 372 字。*
 
 *2026-09-20 追加（同日第五批，**A4 长期记忆与后台复盘 fork**）：工具面新增**条件注册**的 `Remember`（桥接通时才进请求体，`defs()` 仍是 13 件）；`ModuleData\memory\MEMORY.md` 成为**跨会话记忆**的落点（服务端两个自定义方法 `lunac/memory_read` / `lunac/memory_write`，不进 `tools/list`）；每 `LUNAC_NUDGE_INTERVAL`（默认 10）次提问在**提问之间**跑一次后台复盘 fork（白名单工具，自己连桥、独立 `Cfg` 副本、不发 `task_*` 事件、审批随前端运行方式）。实测：启动时注入可用（模型逐字抄回预置的记忆文件）、`system/init` 出现 14 件工具、复盘写出两条 `Remember`（9 秒）、无桥时两件事都不发生。契约见 ai-spec §3.5「长期记忆与后台复盘 fork」、纪律见 §11 规则 56。*
+
+*2026-10-05：内置工具 `Bash` 改名为 `Cmd`（用户要求；Windows 上实际执行 `cmd /C`）—— 旧名 `Bash` 不再注册，本文档与其他文档里的工具名、契约表已同步。*
