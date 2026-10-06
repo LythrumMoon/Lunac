@@ -25,6 +25,8 @@ app/src-tauri/target-e2e/
 app/src-tauri/gen/
 # 自研 agent 核心（core-agent）的编译产物
 core-agent/target/
+# 调音插件的 DSP 引擎内核（tuning-engine）的编译产物
+tuning-engine/target/
 # Tauri 侧随附的二进制（历史遗留目录）
 app/src-tauri/binaries/
 # VS Code 扩展的编译输出（源在 vscode-extension/src/）
@@ -33,7 +35,9 @@ vscode-extension/out/
 # ── 上游 / 第三方（不随本仓库分发）────────────────────────────
 # core/ = Claude Code CLI 源码与 cli.exe（Anthropic 版权，禁止再分发）
 core/
-# 离线 OCR 引擎与模型（体积大）→ 用 scripts/download-paddle-ocr.ps1 获取
+# 离线 OCR 引擎与模型（体积大）→ 已不随安装包分发：装 `ocr` 插件时由宿主下到
+# <exe 根>\Modules\ocr\paddle-ocr\（见 ai-spec §3.5）。仓库根这一份只给 dev 用
+# （scripts/download-paddle-ocr.ps1 会拉到这儿）。
 paddle-ocr/
 # 本地 gcc 工具链
 mingw64/

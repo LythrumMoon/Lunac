@@ -349,7 +349,7 @@ function blockDelta(delta){
 function renderToolInput(c){
   var display=c.raw;
   try{var obj=JSON.parse(c.raw);
-    if(obj&&typeof obj==="object"&&c.name==="Bash"&&typeof obj.command==="string")display=obj.command;
+    if(obj&&typeof obj==="object"&&c.name==="Cmd"&&typeof obj.command==="string")display=obj.command;
     else if(obj&&typeof obj==="object")display=JSON.stringify(obj).slice(0,300);
   }catch(e){}
   c.input.textContent=display.length>300?display.slice(0,300)+"…":display;
@@ -384,7 +384,7 @@ function showApproval(req){
   pendingApproval=req;
   var display="";
   try{var obj=req.input;if(obj&&typeof obj==="object"){
-      if(req.toolName==="Bash"&&typeof obj.command==="string")display=obj.command;
+      if(req.toolName==="Cmd"&&typeof obj.command==="string")display=obj.command;
       else display=JSON.stringify(obj,null,1);}
     else display=String(req.input);}catch(e){display=String(req.input||"")}
   approvalCmd.textContent="工具: "+req.toolName+"\n"+display;

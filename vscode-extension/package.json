@@ -2,7 +2,7 @@
   "name": "lunac",
   "displayName": "Lunac — AI Chat & Launcher",
   "description": "Multi-model AI chat powered by DeepSeek · OpenAI · Anthropic · Gemini · GLM · SiliconFlow · Qwen. Built-in OCR, app launcher, and tooling.",
-  "version": "0.9.6",
+  "version": "0.9.32",
   "publisher": "lunac",
   "license": "MIT",
   "engines": {
