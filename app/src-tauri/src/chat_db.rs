@@ -50,7 +50,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             title      TEXT    NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0,
             usage      TEXT,
-            steps      TEXT
+            steps      TEXT,
+            -- 待办清单时间线（2026-10-02，JSON 文本）——见 storage.rs 的 SessionTodo。
+            -- 与 usage / steps 同一纪律：可选结构走一列 JSON，不各开一堆列。
+            todos      TEXT
         );
 
         -- 有隐式 rowid（FTS 表用它对应行），(session_id, idx) 保证会话内消息有序且不重。
@@ -78,7 +81,15 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         END;
         "#,
     )
-    .map_err(|e| format!("初始化会话库失败: {e}"))
+    .map_err(|e| format!("初始化会话库失败: {e}"))?;
+
+    // 加列迁移（2026-10-02）：`CREATE TABLE IF NOT EXISTS` 对**已存在**的表**不会补列** ——
+    // 老库（0.9.20 及以前建的）必须显式 ALTER，否则上面的 todos 列只在新库里存在。
+    // 列已存在时 SQLite 报 `duplicate column name`，忽略即可 ——
+    // 这比引一套 `PRAGMA user_version` 版本簿记轻得多（现在仍只有 v1，簿记是纯负担）。
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN todos TEXT", []);
+
+    Ok(())
 }
 
 /// 全量写入：**在一个事务里**删掉所有旧数据，再按入参顺序插入。
@@ -99,8 +110,8 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
 
         let mut ins_s = conn
             .prepare(
-                "INSERT INTO sessions(id, pos, title, created_at, usage, steps)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO sessions(id, pos, title, created_at, usage, steps, todos)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .map_err(|e| e.to_string())?;
         let mut ins_m = conn
@@ -108,8 +119,8 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
             .map_err(|e| e.to_string())?;
 
         for (pos, s) in sessions.iter().enumerate() {
-            // usage / steps 是可选结构 → 统一存 JSON 文本（None 写 NULL），读回来再按
-            // Option 反序列化；不为这两个字段各开一堆列。
+            // usage / steps / todos 是可选结构 → 统一存 JSON 文本（None 写 NULL），读回来再按
+            // Option 反序列化；不为这几个字段各开一堆列。
             let usage = s
                 .usage
                 .as_ref()
@@ -122,6 +133,12 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|e| e.to_string())?;
+            let todos = s
+                .todos
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| e.to_string())?;
             ins_s
                 .execute(rusqlite::params![
                     s.id,
@@ -129,7 +146,8 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
                     s.title,
                     s.created_at as i64,
                     usage,
-                    steps
+                    steps,
+                    todos
                 ])
                 .map_err(|e| e.to_string())?;
 
@@ -156,12 +174,13 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
     let mut out: Vec<ChatSession> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("SELECT id, title, created_at, usage, steps FROM sessions ORDER BY pos ASC")
+            .prepare("SELECT id, title, created_at, usage, steps, todos FROM sessions ORDER BY pos ASC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 let usage: Option<String> = row.get(3)?;
                 let steps: Option<String> = row.get(4)?;
+                let todos: Option<String> = row.get(5)?;
                 Ok(ChatSession {
                     id: row.get::<_, String>(0)?,
                     title: row.get::<_, String>(1)?,
@@ -169,6 +188,7 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
                     // 单条记录坏掉不该让整个历史列表读不出来 ⇒ 解析失败按 None 处理。
                     usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
                     steps: steps.and_then(|s| serde_json::from_str(&s).ok()),
+                    todos: todos.and_then(|s| serde_json::from_str(&s).ok()),
                     messages: Vec::new(),
                 })
             })
@@ -475,7 +495,7 @@ fn clip(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SessionUsage;
+    use crate::storage::{SessionTodo, SessionUsage};
 
     fn mem() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -493,6 +513,7 @@ mod tests {
                 ..Default::default()
             }),
             steps: None,
+            todos: None,
             messages: vec![
                 ChatMessage {
                     role: "user".into(),
@@ -569,6 +590,58 @@ mod tests {
         assert_eq!(back[0].usage.as_ref().map(|u| u.hit), Some(7));
         assert!(back[1].messages.is_empty());
         assert!(back[1].usage.is_none());
+    }
+
+    /// 待办清单时间线要能原样往返（2026-10-02）——「回退后任务列表不丢」全靠这一列。
+    /// 同时钉住「不解构」这条纪律：条目里多余字段也必须原样带回来。
+    #[test]
+    fn todos_roundtrip_preserves_timeline() {
+        let c = mem();
+        let mut s = session("a", "带待办", "问题", "回答");
+        s.todos = Some(vec![
+            SessionTodo {
+                turn: 0,
+                todos: vec![serde_json::json!({"content": "第一步", "status": "completed"})],
+            },
+            SessionTodo {
+                turn: 2,
+                // `note` 是渲染不看的字段 —— Rust 侧不该把它吃掉。
+                todos: vec![serde_json::json!({
+                    "content": "第二步", "status": "in_progress", "note": "keep me"
+                })],
+            },
+        ]);
+        write_all(&c, &[s]).unwrap();
+
+        let back = read_all(&c).unwrap();
+        let t = back[0].todos.as_ref().expect("todos 必须读得回来");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].turn, 0);
+        assert_eq!(t[1].turn, 2);
+        assert_eq!(t[1].todos[0]["note"], "keep me");
+        assert_eq!(t[1].todos[0]["status"], "in_progress");
+    }
+
+    /// 加列迁移：老库（没有 todos 列）打开后必须被补上，且已有数据原样还在。
+    /// 这是 0.9.20 → 新版升级路径上唯一会碰老库的地方。
+    #[test]
+    fn legacy_db_gets_todos_column_added() {
+        let c = Connection::open_in_memory().unwrap();
+        // 模拟 0.9.20 及以前建的库：有 sessions 表，但**没有** todos 列。
+        c.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, pos INTEGER NOT NULL DEFAULT 0, title TEXT NOT NULL DEFAULT '',
+                 created_at INTEGER NOT NULL DEFAULT 0, usage TEXT, steps TEXT);
+             INSERT INTO sessions(id, pos, title, created_at) VALUES ('old', 0, '老会话', 1);",
+        )
+        .unwrap();
+
+        init_schema(&c).unwrap();
+
+        let back = read_all(&c).unwrap();
+        assert_eq!(back.len(), 1, "迁移不能弄丢老会话");
+        assert_eq!(back[0].id, "old");
+        assert!(back[0].todos.is_none(), "老记录没有待办 → None");
     }
 
     /// 覆盖写 = 上一次的内容必须彻底消失（含 FTS 索引里的行）——

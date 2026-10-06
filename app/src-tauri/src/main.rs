@@ -6,9 +6,14 @@
 
 mod hotkey;
 mod commands;
+mod child_job;
 mod app_indexer;
 mod file_indexer;
 mod system_catalog;
+mod system_proxy;
+// mihomo 内核托管（2026-10-03）：代理插件的第二条腿。`system_proxy` 管「Windows 的
+// 代理设置」，这里管「代理能力本身」（内核进程 + 订阅 + 节点 + 规则），见模块头。
+mod mihomo;
 mod icon_extractor;
 mod proxy_server;
 mod storage;
@@ -20,13 +25,26 @@ mod mcp_server;
 mod windows_ocr;
 mod paddle_ocr;
 mod music;
+mod media_lib;
+// 本地文件播放（音乐插件「本地音乐」页的出声口，2026-10-01）。与 `media_lib` 分开：
+// 那边是**索引**（能看），这边是**出声**（能听）—— 两件事的失败面完全不同。
+mod player;
+mod live_audio;
+// 调音的**实时硬件测量**（WASAPI 回环，2026-10-02）。与 `player` 分开：那边管
+// 「出声」，这边管「把出到硬件的声量回来」，而且它整段是 COM/WASAPI 的裸调用 ——
+// 混进 player.rs 只会让那个文件同时承担两种完全不同的失败面。
+mod tuning_probe;
 mod convert;
 mod translate;
 mod plugin_window;
+mod plugin_sidecar;
+mod screenshot;
 mod cli_bridge;
 mod agent_server;
 mod log;
 mod single_instance;
+mod updater;
+mod snapshots;
 
 use commands::{
     start_cli, stop_cli, send_message, get_status,
@@ -36,6 +54,7 @@ use commands::{
     get_hooks_config, set_hooks_enabled, hooks_file_path,
     get_pricing_state, pricing_file_path, commit_pricing_pending, discard_pricing_pending,
     get_persona, set_persona,
+    get_mcp_config, open_mcp_config,
     set_workspace, get_workspace, set_tool_blacklist,
     search_apps, launch_app, add_custom_app, remove_custom_app, list_custom_apps,
     get_app_icon,
@@ -43,6 +62,7 @@ use commands::{
     search_files, file_index_status, refresh_file_index,
     system_catalog, open_setting, run_system_action, run_system_action_elevated,
     launch_app_elevated, reveal_in_explorer,
+    notify_sound,
     set_hotkey_combo, get_hotkey_combo,
     set_auto_start, get_auto_start_info,
     check_file_exists,
@@ -52,6 +72,7 @@ use commands::{
     import_skill_content, install_skill_from_url,
     open_path,
     list_installed_plugins, install_plugin_from_url, uninstall_plugin, plugins_dir_path,
+    install_plugin_dependencies,
     fetch_plugin_index,
     run_ocr,
     save_temp_image,
@@ -64,7 +85,6 @@ use commands::{
     get_system_language,
     run_paddle_ocr,
     ocr_engine_status,
-    ocr_engine_install,
     hide_lunac,
 };
 use std::process::Command as StdCommand;
@@ -376,11 +396,9 @@ fn main() {
             // 永不扫盘（见 docs/ai-spec.md §2.1.2 与 file_indexer.rs 头注释）。
             crate::file_indexer::init();
 
-            // Spotify 桌面端探测：一旦它「从没在跑变成在跑」，自动弹一个音乐插件窗
-            // （用户选定的触发条件是「只要 Spotify 在运行就弹」，见 music.rs 的同名函数）。
-            // `is_background` 抑制开机自启那一次首轮弹出 —— 静默启动不该弹窗。
-            // 放在这里（而不是更早）：它是每 3 秒一次的纯后台轮询，不参与启动关键路径。
-            crate::music::spawn_spotify_watcher(app.handle().clone(), is_background);
+            // 2026-10-05：删掉了「每 3s 轮询进程 + Spotify 一启动就自动弹音乐插件窗」
+            // 那套检测机制（用户口径：只保留抓取正在播放 + 控制即可，不要后台常驻探测）。
+            // `music_autoconfigure` 仍会在用户主动打开面板时做一次性「桌面端是否在跑」判定。
 
             // Start Agent HTTP bridge for VSCode extension (127.0.0.1:8789)
             if let Err(e) = agent_server::start() {
@@ -404,21 +422,48 @@ fn main() {
             // （`cli_bridge::kill_and_cleanup` / `kill_port(5173)` / `agent_server::stop`）
             // 更是整个应用的后端。插件悬浮窗若走进去，关掉一个音乐小窗就会把 agent 一起清掉。
             let is_plugin_window = window.label().starts_with(plugin_window::LABEL_PREFIX);
+            // 截屏覆盖窗（`shot-overlay`）也不是主窗口，但它**必须能真的关掉**：
+            // 下面那条「关掉 = 收进托盘」的 `prevent_close` 描述的是主窗口，
+            // 套到覆盖窗上会让它变成一个藏起来、再也点不到、会话状态还留着的孤儿窗。
+            let is_overlay = window.label() == screenshot::OVERLAY_LABEL;
             match event {
                 // Prevent window close → hide to tray instead（仅主窗口）
                 WindowEvent::CloseRequested { api, .. } => {
-                    if !is_plugin_window {
+                    if !is_plugin_window && !is_overlay {
                         api.prevent_close();
                         window.hide().ok();
                     }
                 }
                 // Real cleanup on tray "Quit" → app.exit(0)（仅主窗口）
                 WindowEvent::Destroyed => {
+                    if is_overlay {
+                        // 覆盖窗关了 ⇒ 这次框选结束（没走 finish/cancel 就是取消）
+                        screenshot::on_overlay_destroyed(&window.app_handle());
+                        return;
+                    }
                     if is_plugin_window {
                         plugin_window::note_destroyed(window.label());
+                        // **音乐插件窗关了 ⇒ 本机播放（librespot）一起收掉**（2026-09-30，
+                        // 用户定）。界面没了却还有一个进程在出声 / 占着「Lunac」那台设备，
+                        // 是用户最难解释、也最容易变成孤儿进程的状态。见 music.rs 的
+                        // `on_plugin_window_destroyed`（非音乐窗是空操作）。
+                        music::on_plugin_window_destroyed(&window.app_handle(), window.label());
+                        // **插件面板关了 ⇒ 它起的 sidecar 进程一起收掉**（2026-10-06，L12）：
+                        // 契约 ⑥「必须绑定面板」—— 界面没了却还留着一个本机进程，
+                        // 与 librespot 那条是同一种「看不见的常驻进程」。
+                        plugin_sidecar::on_plugin_window_destroyed(window.label());
                         return;
                     }
                     log::info("window destroyed → app exit");
+                    // **系统代理必须在退出前还原**（2026-10-01，代理插件）：我们改的是
+                    // 整台机器的代理设置，程序走了却把它留在「指向一个已经关掉的本地端口」
+                    // 的状态，等于用户关掉 Lunac 之后整个浏览器都上不了网 —— 那比没有这个
+                    // 功能更糟。`restore_on_exit` 只在**真的改动过**时才动手（判据是备份）。
+                    // **内核先走、代理设置后还原**（2026-10-03）：顺序反了会出现
+                    // 「系统代理指着一个还活着的端口」这段短暂窗口 —— 而那个窗口里
+                    // 用户的请求会打到我们的内核上。
+                    mihomo::shutdown_on_exit();
+                    system_proxy::restore_on_exit();
                     let state = window.state::<AppState>();
 
                     // Process/stdin live in cli_bridge since the agent HTTP
@@ -435,6 +480,10 @@ fn main() {
                     // **本机播放（librespot）必须跟着走**：它是我们起的独立进程，
                     // 留着的话下次开机它还占着那台设备（见 music.rs 的 kill_librespot）。
                     music::kill_librespot();
+
+                    // **所有插件 sidecar 一起收掉**（2026-10-06，L12）：正常退出路径。
+                    // 崩溃路径由 `child_job` 的 Job Object 兜底（预检 #57）。
+                    plugin_sidecar::kill_all();
                 }
                 // 插件窗的最小化 / 还原 —— **Windows 上唯一能观察到它的地方**（2026-09-29）。
                 // tao 把 `WM_SIZE`（含 `SIZE_MINIMIZED`）统一发成 `Resized`，而
@@ -477,6 +526,8 @@ fn main() {
             discard_pricing_pending,
             get_persona,
             set_persona,
+            get_mcp_config,
+            open_mcp_config,
             set_workspace,
             get_workspace,
             set_tool_blacklist,
@@ -491,11 +542,36 @@ fn main() {
             file_index_status,
             refresh_file_index,
             system_catalog,
+            // 完成提示音（2026-10-02）：回合收尾时由前端调一次，见 commands.rs 的 notify_sound。
+            notify_sound,
             open_setting,
+            // 代理插件（2026-10-01）：系统代理的读 / 启用 / 关闭 + 代理列表的读写。
+            // 还原**不在**这里 —— 它在退出路径上（见下面 Destroyed 分支的 restore_on_exit）。
+            system_proxy::proxy_system_get,
+            system_proxy::proxy_config_get,
+            system_proxy::proxy_config_set,
+            system_proxy::proxy_enable,
+            system_proxy::proxy_disable,
+            // mihomo 内核托管（2026-10-03）：安装 / 起停 / 节点 / 测速 / 模式 / 日志。
+            mihomo::mihomo_status,
+            mihomo::mihomo_install_core,
+            mihomo::mihomo_config_set,
+            mihomo::mihomo_start,
+            mihomo::mihomo_stop,
+            mihomo::mihomo_proxies,
+            mihomo::mihomo_delay,
+            mihomo::mihomo_select,
+            mihomo::mihomo_set_mode,
+            mihomo::mihomo_log,
             run_system_action,
             run_system_action_elevated,
             launch_app_elevated,
             reveal_in_explorer,
+            // 会话回退用的文件内容快照（读 / 写回）—— 见 src/snapshots.rs
+            snapshots::snapshot_read_text,
+            snapshots::snapshot_restore_text,
+            snapshots::snapshots_save,
+            snapshots::snapshots_load,
             storage::save_chat_sessions,
             storage::load_chat_sessions,
             storage::save_clipboard_history,
@@ -527,6 +603,7 @@ fn main() {
             open_path,
             list_installed_plugins,
             install_plugin_from_url,
+            install_plugin_dependencies,
             uninstall_plugin,
             plugins_dir_path,
             fetch_plugin_index,
@@ -541,7 +618,6 @@ fn main() {
             get_system_language,
             run_paddle_ocr,
             ocr_engine_status,
-            ocr_engine_install,
             // 音乐插件（歌词 + Spotify 播放控制）—— 见 src/music.rs
             music::music_config_get,
             music::music_config_set,
@@ -565,17 +641,81 @@ fn main() {
         music::spotify_artists,
         music::spotify_albums,
         music::spotify_shows,
+        // 「最常听」两栏（2026-10-01 用户第 4 条）**需要 `user-top-read`** ——
+        // 老令牌没它时那一栏会如实报 `Insufficient client scope`，不是「空的」
+        //（见 music.rs 的 SCOPES 说明）。
+        // 「新发行」已于 2026-10-02 整条删除（`/browse/new-releases` 对个人应用
+        // 永久 403，见 music.rs 的 SCOPES 注释）。
+        music::spotify_top_artists,
+        music::spotify_top_tracks,
         music::spotify_item_tracks,
         music::spotify_devices,
         music::spotify_transfer,
+        // 「Spotify 请求闸」（2026-10-02）：一旦 429 就硬停所有 Web API 请求，
+        // 由用户在面板上手动恢复（取代原来的「定时冷却」，见 music.rs 那段注释）。
+        music::spotify_api_state,
+        music::spotify_resume,
         // 本机播放（librespot 子进程）—— 登入一次后不依赖 Spotify 桌面端出声
         music::librespot_status,
         music::librespot_start,
         music::librespot_stop,
-            // 文件转换插件（图片 / 音频 / 视频，走 ffmpeg）—— 见 src/convert.rs
-            convert::convert_engine_status,
-            convert::convert_probe,
-            convert::convert_run,
+        // 首次登录（`-j`）：没有凭据的 librespot 不会成为一台已登录设备（见 music.rs）
+        music::librespot_login,
+        // 改本机播放的代理并**按需重起**（2026-10-02）：代理是启动参数，热改不了；
+        // 代理插件的「一键联动」走这条，宿主独占「什么时候该重起」这条判断。
+        music::librespot_set_proxy,
+        // 「播放在哪」自动就位（2026-09-30）：面板打开时调一次 —— 有官方端就用官方端，
+        // 没有就自动拉起 librespot。见 music.rs 的 music_autoconfigure。
+        music::music_autoconfigure,
+        // 本地音乐**媒体库**（2026-10-01，backlog L9 第一刀）—— 目录扫描 + 标签/封面/时长。
+        // **不含播放**（解码出声是 L5 S1 的活，见 media_lib.rs 头注释）。
+        media_lib::media_roots,
+        media_lib::media_add_root,
+        media_lib::media_remove_root,
+        media_lib::media_scan_start,
+        media_lib::media_scan_status,
+        media_lib::media_tracks,
+        // 打开一份播放列表文件（.m3u / .m3u8 / .pls）→ 它的曲目（2026-10-01 第二批）。
+        // **只读那个文件**：不入库、也不要求它的目录已被添加 —— 播放列表常常指向别处。
+        media_lib::media_playlist,
+        // 本地文件**播放**（2026-10-01）。`player_play` 是唯一 async 的一条
+        // （开解码器要读盘）；其余是内存里的状态机操作，同步即可。
+        // **不含队列**：队列（下一首是谁）留在前端 —— 那里才有列表的上下文。
+        player::player_play,
+        player::player_pause,
+        player::player_resume,
+        player::player_stop,
+        player::player_seek,
+        player::player_volume,
+        player::player_status,
+        // 调音（`tuning-engine` 的挂点，2026-10-01 用户第 5 条）：总开关 + 一档预设。
+        // **不再是独立插件** —— 引擎（`tuning-engine/`）以库依赖进宿主，
+        // 面板长在音乐插件的设置页里（见 player.rs 的 TUNING_PRESETS）。
+        player::player_tuning_get,
+        player::player_tuning_set,
+        // P0（2026-10-02）：链从「一个预设键」扩成「可编辑的段 + 频响曲线」，
+        // 所以拆成三条各管一件事（见 player.rs）：只改开关 / 展开一档预设 / 覆盖整条链。
+        player::player_tuning_set_enabled,
+        player::player_tuning_apply_preset,
+        player::player_tuning_set_chain,
+        // 用户预设（P5-1，2026-10-03）：把当前链存成命名预设、重命名 / 删除、导入 / 导出。
+        // **文件对话框在前端**，这四条只收路径、只做文件 IO（见 player.rs 那一段注释）。
+        player::player_tuning_preset_save,
+        player::player_tuning_preset_delete,
+        player::player_tuning_preset_rename,
+        player::player_tuning_preset_import,
+        player::player_tuning_preset_export,
+        // A-B 盲测（两个快照槽，2026-10-06）
+        player::player_tuning_ab_state,
+        player::player_tuning_ab_save,
+        player::player_tuning_ab_apply,
+        // 实时测量（2026-10-02）：播两段扫频（一趟直通 / 一趟走链）、用 WASAPI 回环录回来，
+        // 量出「最终输出」与「仅自身链」。**会出声约 6 秒** —— 见 src/tuning_probe.rs。
+        tuning_probe::player_tuning_measure,
+        // 文件转换插件（图片 / 音频 / 视频，走 ffmpeg）—— 见 src/convert.rs
+        convert::convert_engine_status,
+        convert::convert_probe,
+        convert::convert_run,
             // 翻译插件（2026-09-29）：词典底座 + 模型补漏，译文落 SQLite（见 translate.rs）
             translate::translate_lookup,
             translate::translate_ai,
@@ -590,10 +730,30 @@ fn main() {
             plugin_window::plugin_window_set_resizable,
             plugin_window::plugin_window_pin_state,
             plugin_window::plugin_window_resize,
+            // 插件 sidecar（L12 档 1，2026-10-06）—— 见 src/plugin_sidecar.rs
+            plugin_sidecar::plugin_sidecar_start,
+            plugin_sidecar::plugin_sidecar_request,
+            plugin_sidecar::plugin_sidecar_http,
+            plugin_sidecar::plugin_sidecar_stop,
+            plugin_sidecar::plugin_sidecar_running,
+            plugin_sidecar::plugin_sidecar_trust,
+            plugin_sidecar::plugin_sidecar_deny,
+            // 屏幕截图（通用宿主能力，2026-10-06）—— 见 src/screenshot.rs
+            // 框选由**宿主的全屏置顶覆盖窗**（`shot-overlay`）完成：发起 → 取背景图 → 裁剪/取消。
+            screenshot::screenshot_overlay_begin,
+            screenshot::screenshot_overlay_image,
+            screenshot::screenshot_overlay_finish,
+            screenshot::screenshot_overlay_cancel,
             hide_lunac,
             appearance::get_system_theme,
             appearance::list_themes,
             appearance::themes_dir,
+            // 应用自更新（检查 / 下载 / 静默安装）—— 见 src/updater.rs
+            updater::update_current_version,
+            updater::update_check,
+            updater::update_install,
+            updater::update_config_get,
+            updater::update_config_set,
             commands::log_frontend,
         ])
         .run(tauri::generate_context!())

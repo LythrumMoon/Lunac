@@ -76,6 +76,17 @@ pub struct AiConfig {
     /// 图片附件作为 `image` 块发出去（见 ai-spec §3.5「图片附件」/ §11 规则 60）。
     #[serde(default)]
     pub vision: bool,
+    /// **出图模型名**（A13，2026-10-03）。空串 = 未配置 ⇒ agent 不注册 `ImageGen` 工具。
+    ///
+    /// 为什么与文本模型分开一个字段：Qwen-Image 系**不活在 OpenAI 兼容 chat 端点**上
+    /// （`compatible-mode` 只服务文本），它单独走 DashScope 的多点编辑端点；把两个模型
+    /// 塞进同一个 `model` 字段会让「对话用 qwen3-max、出图用 qwen-image-3.0」没法同时表达。
+    #[serde(default)]
+    pub image_model: String,
+    /// **出图端点**。空串 = 用 DashScope 默认（见 agent 侧 `image.rs` 的 `DEFAULT_ENDPOINT`）。
+    /// 单列字段是为了「换一家出图服务」不必改代码 —— 与文本侧的 `url` 同口径。
+    #[serde(default)]
+    pub image_url: String,
 }
 
 fn ai_config_path() -> PathBuf {
@@ -142,8 +153,49 @@ pub fn ensure_hooks_file() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-// ── 人格 / 自定义提示词（`config\persona.md`，L2）────────────────────
+// ── 远端 MCP 服务器（`config\mcp.json`，2026-10-01）──────────────────
 //
+// 用户在 `<exe 根>\config\mcp.json` 里声明远端 MCP 服务器；**由 agent 侧读取**
+// （core-agent 经 `LUNAC_MCP_FILE` 拿到路径，见 core-agent/src/mcp.rs）。
+// 宿主这里只做三件事：定位路径、缺文件时落一份骨架、给设置面板读状态。
+//
+// **格式**（`headers` 可选，用来放 `Authorization: Bearer …` 这类静态凭据）：
+//   { "servers": [ { "name": "notion", "url": "https://…", "headers": { "Authorization": "Bearer …" } } ] }
+//
+// **两道判据在 agent 侧**（这里不重复实现，免得两处漂移）：url 只接受 https
+// （明文 http 仅限本机）、坏条目只丢自己。宿主这边**不解析内容**，只看「能不能读成对象」。
+
+pub fn mcp_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("mcp.json")
+}
+
+/// 读 mcp.json 的原文；文件不存在返回 `Ok(None)`。
+pub fn load_mcp_text() -> Result<Option<String>, String> {
+    let path = mcp_config_path();
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读不出 {}：{e}", path.display())),
+    }
+}
+
+/// 缺文件时落一份**最小骨架**（空的 servers 数组）—— 用户点「打开配置」时才有东西可编辑。
+///
+/// 刻意**不预置示例服务器**：一条真 URL 会被真的去连（握手失败要等 15 秒），
+/// 而用户只是打开文件看了一眼。
+pub fn ensure_mcp_file() -> Result<PathBuf, String> {
+    let path = mcp_config_path();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(&path, "{\n  \"servers\": []\n}\n")
+            .map_err(|e| format!("写不进 {}：{e}", path.display()))?;
+    }
+    Ok(path)
+}
+
+// ── 人格 / 自定义提示词（`config\persona.md`，L2）────────────────────
 // 一段**纯文本**（Markdown 写法即可），用户自己在设置面板里编辑。宿主只做三件事：
 // 定位路径、存取原文、长度校验 —— **不解析、不加工**。
 //
@@ -245,11 +297,18 @@ pub fn save_pricing_text(text: &str) -> Result<(), String> {
 /// （命中 : 未命中 : 输出 = 0.02 : 1 : 4，峰档整体 ×2），折算汇率也自洽
 /// （0.15 USD → 1 CNY、0.6 USD → 4 CNY，同为 6.67）。
 ///
-/// **时段规则同样有出处**（官方价目表脚注）：高峰 = **周一至周五**的北京时间
-/// **09:00–12:00** 与 **14:00–18:00**，其余全部（含整个周末）为谷时，谷价 = 峰价一半。
-/// 账单 CSV 的逐小时金额与之逐项吻合（12/13 点谷、14 点峰、17 点峰、18 点后谷）。
+/// **时段规则同样有出处**（官方价目表脚注）：高峰 = **周一至周五（不含中国法定节假日）**
+/// 的北京时间 **09:00–12:00** 与 **14:00–18:00**，其余全部（含整个周末）为谷时，
+/// 谷价 = 峰价一半。
 ///
-/// **只写一次**：`ensure_pricing_file` 仅在文件不存在时落这份；用户改过的一律不动。
+/// **`holidays` 这条不能省（2026-10-06 补，实测）**：官方脚注原文是「周一至周五**（不含中国
+/// 法定节假日）**……其余时段，包括周末及**中国法定节假日全天**均为空闲时段」。
+/// 缺了它，节假日会被按峰价高估 —— 2026-10-02（国庆假期、周五）实测多算 **0.979 元**
+/// （当天平台 7 个小时的金额全部等于谷价公式，逐分吻合）。表里落的是 2026 年国务院
+/// 放假安排（国办发明电〔2025〕7 号）。
+///
+/// **只写一次**：`ensure_pricing_file` 仅在文件不存在时落这份；用户改过的一律不动
+/// （**唯一例外**是「老文件缺 `holidays` 时补一次」，见该函数的注释）。
 /// 预置的模型名是 **`deepseek-v4-flash`** —— 用户 `.env` 与实际用量日志里都是它（官方页
 /// 写明旧名 `deepseek-v4-flash` 与 `deepseek-flash` 同模型同价）。**没有实测依据的模型不预置**
 /// （如 pro：官方页只有美元价，折算汇率是本机假设 —— 宁可让面板显示「未定价」）。
@@ -258,6 +317,17 @@ pub fn save_pricing_text(text: &str) -> Result<(), String> {
 /// 「—」，而预置价表明明有据可查。任何一次「确认候选价」都会把它盖回落盘日期，语义复原。
 const DEFAULT_PRICING_JSON: &str = r#"{
   "updated_at": "2026-09-29",
+  "holidays": [
+    "2026-01-01", "2026-01-02", "2026-01-03",
+    "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
+    "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+    "2026-04-04", "2026-04-05", "2026-04-06",
+    "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+    "2026-06-19", "2026-06-20", "2026-06-21",
+    "2026-09-25", "2026-09-26", "2026-09-27",
+    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+    "2026-10-05", "2026-10-06", "2026-10-07"
+  ],
   "models": {
     "deepseek-v4-flash": {
       "input": 1,
@@ -296,12 +366,50 @@ const DEFAULT_PRICING_JSON: &str = r#"{
 /// 只在**文件不存在**时写：用户改过的价格一个字都不覆盖。预置内容本身也要过
 /// `validate_pricing_text`（守门单测 `default_pricing_json_is_valid`）—— 预置一份不合法的
 /// 价表比不预置更糟：面板要么整块算不出金额，要么提示「候选价不合法」而用户没动过任何东西。
+///
+/// **唯一例外（2026-10-06）：老文件缺顶层 `holidays` 时补一次**。`holidays` 是后加的字段，
+/// 早期装好的 `pricing.json` 里没有它 ⇒ 面板会在法定节假日按峰价高估（2026-10-02 国庆实测
+/// 多算 0.979 元）。补法是**只加这一个键**（取 `DEFAULT_PRICING_JSON` 里那份，保持单一
+/// 数据源），其余字段一个都不动；补完先过 `validate_pricing_text`，不合法就**不写**。
 pub fn ensure_pricing_file() -> Result<PathBuf, String> {
     let path = pricing_config_path();
     if !path.exists() {
         save_pricing_text(DEFAULT_PRICING_JSON)?;
+    } else {
+        backfill_pricing_holidays(&path);
     }
     Ok(path)
+}
+
+/// 老定价表缺顶层 `holidays` 时补一次。**失败一律静默** —— 补不上不该让宿主起不来，
+/// 面板会照旧按「没有节假日」算（旧行为）。
+///
+/// 判据是**键在不在**，不是「值空不空」：用户若故意写成 `"holidays": []`（明确声明无节假日），
+/// 键已存在 ⇒ 不会再补。
+fn backfill_pricing_holidays(path: &Path) {
+    let Ok(text) = fs::read_to_string(path) else { return };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return; // 坏 JSON 交给面板如实报错，别在这里猜
+    };
+    let Some(obj) = v.as_object_mut() else { return };
+    if obj.contains_key("holidays") {
+        return;
+    }
+    // 节假日清单**从预置表里取**，不在这里再抄一份（那是同一个值的第二份实现）
+    let Some(holidays) = serde_json::from_str::<serde_json::Value>(DEFAULT_PRICING_JSON)
+        .ok()
+        .and_then(|d| d.get("holidays").cloned())
+    else {
+        return;
+    };
+    obj.insert("holidays".into(), holidays);
+    let Ok(out) = serde_json::to_string_pretty(&v) else { return };
+    // 写回前先校验：宁可不补，也不要留一份面板读不动的半坏表
+    if validate_pricing_text(&out).is_err() {
+        return;
+    }
+    let _ = save_pricing_text(&format!("{out}\n"));
 }
 
 /// 候选价格文件：agent 抓完官方定价页只能写这里，**不能直接改 `pricing.json`** ——
@@ -374,15 +482,37 @@ fn validate_price_fields(
     Ok(())
 }
 
+/// 校验一个 `holidays` 字段：必须是**字符串数组**，且每项都是严格的 `YYYY-MM-DD`。
+///
+/// 为什么要挡：节假日命中的效果是「整天按谷价」，写错一个日期**不报错、只是静默算错**；
+/// 而这张表本来就是对账用的，宁可他当场看到报错。
+fn validate_holidays_field(what: &str, v: &serde_json::Value) -> Result<(), String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("{what} 的 `holidays` 必须是一个数组"))?;
+    for (i, d) in arr.iter().enumerate() {
+        let s = d
+            .as_str()
+            .ok_or_else(|| format!("{what} 的 `holidays[{i}]` 必须是 `YYYY-MM-DD` 字符串"))?;
+        validate_iso_date(s)
+            .map_err(|_| format!("{what} 的 `holidays[{i}]` 不是合法的 `YYYY-MM-DD`：{s}"))?;
+    }
+    Ok(())
+}
+
 /// 校验一份定价表文本 —— **用户手写的文件与 agent 抓来的候选走同一处**。
 ///
 /// 底线：顶层是对象 / `models` 是对象 / 每个模型的四类价格齐全且非负 /
-/// `time_windows`（可选）的每一条同样四类齐全，且时段写法与星期写法合法。
+/// `time_windows`（可选）的每一条同样四类齐全，且时段写法与星期写法合法 /
+/// `holidays`（可选，顶层或模型级）是合法的 `YYYY-MM-DD` 数组。
 /// 未知字段一律忽略（用户想加注释字段随他）。
 pub fn validate_pricing_text(text: &str) -> Result<(), String> {
     let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("语法错误：{e}"))?;
     let obj = v.as_object().ok_or("顶层必须是一个对象")?;
+    if let Some(h) = obj.get("holidays") {
+        validate_holidays_field("顶层", h)?;
+    }
     let models = match obj.get("models") {
         // 允许「只有 updated_at、还没有任何价格」的过渡态（骨架就是这样）
         None => return Ok(()),
@@ -393,6 +523,11 @@ pub fn validate_pricing_text(text: &str) -> Result<(), String> {
             .as_object()
             .ok_or_else(|| format!("模型 `{name}` 的值必须是一个对象"))?;
         validate_price_fields(&format!("模型 `{name}`"), entry)?;
+        // 模型级 `holidays`（可选，覆盖顶层）—— 放在 `time_windows` 那段之前，
+        // 否则下面那句 `continue`（无时段窗就跳过）会把它一起跳掉。
+        if let Some(h) = entry.get("holidays") {
+            validate_holidays_field(&format!("模型 `{name}`"), h)?;
+        }
 
         // 时段价（2026-09-29）：`time_windows` 里的条目**覆盖**基础四类价。
         // 命中的判定（本地时刻落在哪一条）在前端，这里只管「写得对不对」。
@@ -629,8 +764,35 @@ pub struct SessionStep {
 pub struct SessionProcess {
     #[serde(default)]
     pub turn: u64,
+    /// 本回合是否**产出了助手消息**（收尾正文）。
+    ///
+    /// 历史渲染据此把「有消息」的过程块钉到对应助手气泡后、把「无消息」（只调工具 / 被
+    /// 强制中断，没有收尾正文）的过程块挂到它自己的用户气泡之后。旧实现用「分组序号 ==
+    /// 助手气泡序号」的对齐假设，一旦出现无消息的回合，后面每一组都会整体错位（用户报的
+    /// 「输出挂到错误消息下」）。**旧记录没有该字段 ⇒ `None` 按「有消息」处理**（旧行为）。
+    #[serde(rename = "hasMsg", default, skip_serializing_if = "Option::is_none")]
+    pub has_msg: Option<bool>,
     #[serde(default)]
     pub items: Vec<SessionStep>,
+}
+
+/// 待办清单在某一回合的快照（2026-10-02）。
+///
+/// 为什么要有它：待办清单原本是**纯前端内存态**（`main.ts` 的 `todoItems`），回退历史时
+/// 只能整块清掉（`rebuildChangedFilesFromSteps` 的旧实现），表现就是「一点回退，任务列表
+/// 就没了」。现在按**回合**存一条时间线，回退到某条消息时取「回退点那一刻」的那份 ——
+/// 既不会丢，也不会把回退点之后的待办显示出来。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SessionTodo {
+    /// 采集时**已完成的助手消息条数**（= 回合下标，0 起；与 `SessionProcess.turn` 同口径）
+    #[serde(default)]
+    pub turn: u64,
+    /// 这一刻的完整待办清单（`[{content, status}]`）。
+    /// **刻意不解构**：Rust 侧只负责存取，字段语义全在前端（见 `main.ts` 的
+    /// `sessionTodoTimeline` / `renderTodoDrawer`）—— 这里解构一次就多一份「待办长什么样」
+    /// 的真相，而渲染用的只有 `content` / `status` 两个字段，将来加字段还得改两处。
+    #[serde(default)]
+    pub todos: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -646,6 +808,9 @@ pub struct ChatSession {
     /// 过程快照（按回合分组）——历史回顾时渲染「查看过程」
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steps: Option<Vec<SessionProcess>>,
+    /// 待办清单时间线 —— 回退 / 切会话后重建任务抽屉（见 `SessionTodo`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos: Option<Vec<SessionTodo>>,
 }
 
 /// 旧会话历史文件（JSON）。**只用于一次性迁移**：库建好之后它不再是真相源。
@@ -665,7 +830,15 @@ pub(crate) fn chat_db_path() -> PathBuf {
 #[tauri::command]
 pub fn save_chat_sessions(sessions: Vec<ChatSession>) -> Result<(), String> {
     ensure_history_dir().map_err(|e| e.to_string())?;
-    crate::chat_db::save(&chat_db_path(), &sessions)
+    crate::chat_db::save(&chat_db_path(), &sessions)?;
+    // 会话表落盘成功后顺手清理**已被删掉的会话**留下的快照文件（2026-10-01）。
+    // 放在这里而不是前端的删除路径：这是**唯一**知道「现在还剩哪些会话」的地方；
+    // 散在前端迟早漏一处 —— 表现是「历史删了，可用户文件副本还躺在盘上」。
+    // 不返回错误：清理失败不该让会话保存失败。
+    crate::snapshots::prune_frames(
+        &sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -852,6 +1025,14 @@ pub struct UsageRecord {
     /// 旧记录没有该字段，读时按 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<UsageSubagent>,
+    /// 这条记录是**中断收尾的兜底值**（2026-10-06）：回合被取消 / agent 被强杀，拿不到
+    /// 收尾的 `result.usage`，只能用 agent 逐请求上报的 `usage_delta` 累计值落账。
+    ///
+    /// 它**只覆盖已完成的上报请求** —— 最后一个飞行中的请求不在内，所以金额天然偏低一点。
+    /// 标记出来是为了对账时能分辨「少是正常的」，不要当成漏记去查。正常收尾的记录该字段为
+    /// `false` 且**不写盘**（旧记录没有它，读时按 `false`）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 /// `UsageRecord::subagent` 的形状（字段名与 agent 上报的原样一致，不做 camelCase 转换）。
@@ -938,6 +1119,11 @@ pub struct UsageHourTotals {
     /// 本地小时 0–23（用调用方传进来的时区偏移把 `ts` 换算成墙钟时刻）
     pub hour: u32,
     pub turns: u64,
+    /// **真实 API 请求数**（= 这些记录里 `requests` 数组的条数之和，2026-10-06）。
+    /// 与 `turns` 的区别：一次提问里模型可能往返多次，平台上每一趟都占一行。
+    /// 旧记录没有 `requests` 数组 ⇒ 按 1 计（见 `read_usage_range` 里的注释）。
+    #[serde(default)]
+    pub requests: u64,
     pub input: u64,
     pub output: u64,
     #[serde(rename = "cacheRead")]
@@ -952,6 +1138,9 @@ pub struct UsageModelTotals {
     pub model: String,
     /// 提问次数（一行日志 = 一次提问，含提问内所有工具往返）
     pub turns: u64,
+    /// 真实 API 请求数（见 `UsageHourTotals::requests`）
+    #[serde(default)]
+    pub requests: u64,
     pub input: u64,
     pub output: u64,
     #[serde(rename = "cacheRead")]
@@ -970,6 +1159,9 @@ pub struct UsageModelTotals {
 pub struct UsageDay {
     pub date: String,
     pub turns: u64,
+    /// 真实 API 请求数（见 `UsageHourTotals::requests`）
+    #[serde(default)]
+    pub requests: u64,
     pub input: u64,
     pub output: u64,
     #[serde(rename = "cacheRead")]
@@ -1013,7 +1205,13 @@ pub fn read_usage_range(
             std::collections::BTreeMap<u32, UsageHourTotals>,
         > = std::collections::BTreeMap::new();
         for r in records {
+            // **真实 API 请求数**（2026-10-06 加，用户口径）：一次提问里模型可能往返多次，
+            // 平台上每一趟各占一行 —— `requests` 数组就是逐请求落的那份明细。
+            // 旧记录没有该字段（`serde(default)` ⇒ 空表）⇒ **按 1 计**：一条用量记录至少
+            // 对应一次 API 请求，记 0 会让人以为「这天没发过请求」。
+            let reqs = r.requests.len().max(1) as u64;
             day.turns += 1;
+            day.requests += reqs;
             day.input += r.input;
             day.output += r.output;
             day.cache_read += r.cache_read;
@@ -1023,6 +1221,7 @@ pub fn read_usage_range(
                 ..Default::default()
             });
             m.turns += 1;
+            m.requests += reqs;
             m.input += r.input;
             m.output += r.output;
             m.cache_read += r.cache_read;
@@ -1039,6 +1238,7 @@ pub fn read_usage_range(
                     ..Default::default()
                 });
             h.turns += 1;
+            h.requests += reqs;
             h.input += r.input;
             h.output += r.output;
             h.cache_read += r.cache_read;
@@ -1191,6 +1391,7 @@ mod tests {
             dropped: 0,
             requests: vec![],
             subagent: None,
+            partial: false,
         }
     }
 
@@ -1322,6 +1523,9 @@ mod tests {
         other.model = "gpt-4o".into();
         other.input = 100;
         other.output = 7;
+        // 真 API 请求数（2026-10-06）：这一条里有 3 次请求 ——
+        // 其余记录没有 `requests` 数组（旧格式）⇒ 各按 1 计
+        other.requests = vec![UsageRequest::default(); 3];
         append_usage_log(d1.into(), other).unwrap();
         append_usage_log(d2.into(), rec(7000)).unwrap();
 
@@ -1339,18 +1543,27 @@ mod tests {
         assert_eq!(day1.input, 212 + 100);
         assert_eq!(day1.output, 3 + 7);
         assert_eq!(day1.cache_read, 1536);
+        // 1（旧格式按 1 计）+ 3（真的 3 次请求）
+        assert_eq!(day1.requests, 4, "真 API 请求数要按 `requests` 数组累加");
         let models: Vec<&str> = day1.models.iter().map(|m| m.model.as_str()).collect();
         assert_eq!(models, vec!["deepseek-flash", "gpt-4o"], "按模型分组");
         assert_eq!(day1.models[1].input, 100);
         assert_eq!(day1.models[0].cache_read, 1536);
+        assert_eq!(day1.models[0].requests, 1);
+        assert_eq!(day1.models[1].requests, 3);
+        // 小时桶也要带请求数（两条记录的 ts 同属一个桶）
+        assert_eq!(day1.models[0].hours[0].requests, 1);
+        assert_eq!(day1.models[1].hours[0].requests, 3);
 
         assert_eq!(days[1].turns, 1);
         assert_eq!(days[1].cache_read, 7000);
+        assert_eq!(days[1].requests, 1);
 
         // 字段名是前端消费契约（驼峰）
         let json = serde_json::to_string(day1).unwrap();
         assert!(json.contains(r#""cacheRead":1536"#), "{json}");
         assert!(json.contains(r#""cacheCreate":0"#), "{json}");
+        assert!(json.contains(r#""requests":4"#), "{json}");
 
         for d in [d1, d2] {
             let _ = fs::remove_file(usage_log_path(d).unwrap());
@@ -1431,6 +1644,26 @@ mod tests {
                 "峰时只落在周一至周五"
             );
         }
+        // 法定节假日（2026-10-06）：官方脚注是「周一至周五**不含中国法定节假日**」——
+        // 缺这条会把节假日按峰价高估（2026-10-02 国庆实测多算 0.979 元）。
+        let holidays = v["holidays"].as_array().expect("预置表必须带法定节假日");
+        for d in [
+            "2026-01-01",
+            "2026-02-15",
+            "2026-02-23",
+            "2026-04-04",
+            "2026-05-01",
+            "2026-06-19",
+            "2026-09-25",
+            "2026-10-01",
+            "2026-10-02",
+            "2026-10-07",
+        ] {
+            assert!(
+                holidays.iter().any(|x| x.as_str() == Some(d)),
+                "预置节假日表缺 {d}（国务院 2026 放假安排）"
+            );
+        }
     }
 
     /// 定价表与「候选 → 确认」的落盘纪律（A12）：
@@ -1461,6 +1694,11 @@ mod tests {
             r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [0], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
             r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [8], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
             r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "time_windows": [{"from": "09:00", "to": "12:00", "days": [1, 1], "input": 2, "cache_read": 0.04, "cache_write": 0, "output": 8}]}}}"#,
+            // 法定节假日（2026-10-06）：容器必须数组 / 每项必须是严格的 YYYY-MM-DD
+            r#"{"holidays": {}, "models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8}}}"#,
+            r#"{"holidays": ["2026/10/02"], "models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8}}}"#,
+            r#"{"holidays": [20261002], "models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8}}}"#,
+            r#"{"models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8, "holidays": ["2026-10-2"]}}}"#,
         ] {
             assert!(validate_pricing_text(bad).is_err(), "should reject `{bad}`");
         }
@@ -1476,6 +1714,16 @@ mod tests {
                  "input": 0.5, "cache_read": 0.01, "cache_write": 0, "output": 2}
             ]}}}"#;
         assert!(validate_pricing_text(good_windows).is_ok());
+        // 合法节假日：顶层与模型级（模型级覆盖顶层）都要放行
+        let good_holidays = r#"{"holidays": ["2026-10-01", "2026-10-02"],
+            "models": {"m": {"input": 1, "cache_read": 0.02, "cache_write": 0, "output": 4,
+              "holidays": ["2026-01-01"]}}}"#;
+        assert!(validate_pricing_text(good_holidays).is_ok());
+        // 空数组 = 明确声明「没有法定节假日」，也算合法（不当作缺字段）
+        assert!(validate_pricing_text(
+            r#"{"holidays": [], "models": {"m": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 8}}}"#
+        )
+        .is_ok());
         // 空骨架（还没有任何价格）算合法
         assert!(validate_pricing_text("{\"updated_at\": \"\", \"models\": {}}").is_ok());
 

@@ -1,6 +1,6 @@
 [package]
 name = "lunac"
-version = "0.9.6"
+version = "0.9.32"
 edition = "2021"
 description = "Lunac - Native AI coding assistant with local + cloud hybrid inference"
 
@@ -30,15 +30,50 @@ sha2 = "0.10"
 percent-encoding = "2"
 pinyin = { version = "0.11", features = ["plain"] }
 winreg = "0.52"
+# `Win32_Media_Audio` + `Win32_System_Com` 是**调音实时测量**（2026-10-02，
+# `tuning_probe.rs`）要的：WASAPI 回环采集（IMMDeviceEnumerator / IAudioClient /
+# IAudioCaptureClient）本身就在 `Media_Audio` 里，而创建它们要走 COM
+# （CoCreateInstance / CoTaskMemFree）。**刻意不引 `wasapi` 那个第三方 crate** ——
+# 它能做的事这里用已在依赖树里的 `windows` 就够了，少一条下载、少一份维护。
 windows = { version = "0.58", features = [
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage",
     "Storage_Streams",
     "Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    # 屏幕截图（2026-10-06，`screenshot.rs`）：GDI 的 BitBlt/CreateCompatibleBitmap/GetDIBits
+    # 在 `Win32_Graphics_Gdi`，虚拟桌面尺寸的 GetSystemMetrics 在 `Win32_UI_WindowsAndMessaging`。
+    # 两者都是**同一个 `windows` crate 的 feature**，不新增任何下载（同 sha2 那条口径）。
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# 本地音乐媒体库的**标签/时长/封面**读取（2026-10-01，`media_lib.rs`）。选它的理由：
+# **纯 Rust、且不解码音频**就能给出 duration 与内嵌封面 —— 这正是「本地解析不塞 FFmpeg
+# 全家桶」能成立的那一块（backlog L9）。**刻意只进宿主**：读任意路径的文件是 WebView
+# 做不到的事（与 convert / OCR 同一条纪律）。
+lofty = "0.25.4"
+# 本地文件的**解码 + 出声**（2026-10-01，`player.rs`）。选它的理由：播放要的是一台
+# **状态机** —— 位置口径 / 暂停语义 / seek 饱和 / 「这一首放完了」的判据，这几件事
+# 恰恰最容易写错，`rodio::Player` 已经把它们做对了（内含 cpal 输出 + symphonia 解码）；
+# 自己拼 cpal + symphonia 等于把这些重写一遍。代价是两条不轻的依赖（cpal / symphonia），
+# 换来的是不碰 FFmpeg 全家桶。**刻意只进宿主**：WebView 放不出声音，
+# 与「联网必须走宿主」是同一条纪律（ai-spec §4.6）。
+rodio = "0.22.2"
+# 调音的 **DSP 内核**（2026-10-01，用户第 5 条：取消独立调音插件、内置进音乐插件）。
+# 它是**路径依赖的库**（`tuning-engine/` 自己还有 `[[bin]]` CLI，做依赖时只建 lib），
+# 不再作为独立插件发货 —— 用法是「播放链上套一层 Chain::process_sample」，
+# **刻意不另写一份滤波器**（见 ai-spec §4.10 与预检 #51）。
+tuning-engine = { path = "../../tuning-engine" }
+# 播放列表文件（.m3u / .m3u8 / .pls）的**编码识别**。选它的理由：`.m3u8` 是 UTF-8，
+# 但老播放器（千千静听 / 老版 Foobar）导出的 `.m3u` 是 **ANSI / GBK** ——
+# 不认它的话中文路径会解成乱码，表现是「播放列表里一首都不显示」，用户完全看不出
+# 是编码问题。它在依赖树里**本来就有**（reqwest 拉的），这里只是提为直接依赖，
+# 不新增任何下载（与上面 sha2 / percent-encoding 同一口径）。
+encoding_rs = "0.8"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

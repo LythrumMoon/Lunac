@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capability set",
-  "windows": ["main", "plugin-*"],
+  "windows": ["main", "plugin-*", "shot-overlay"],
   "permissions": [
     "core:default",
     "core:window:allow-hide",

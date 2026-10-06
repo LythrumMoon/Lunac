@@ -145,101 +145,13 @@ fn core_dir() -> std::path::PathBuf {
 }
 
 // ── Subprocess management ─────────────────────────────────────────
+//
+// ⚠️ **2026-10-02：原来这里那份私有的 `mod job`（Job Object）已搬到 `crate::child_job`**。
+// 理由：「插件起的子进程必须随插件退出而终结」现在是全局规则（预检 #57），
+// librespot / PaddleOCR-json / ffmpeg 都要用同一份 job —— 各模块私藏一份必然出现
+// 「有的绑了、有的没绑」，而没绑的那种是**静默**的（只在宿主崩溃时才现形，
+// 正是本仓最怕的一类）。详见 `child_job.rs` 的模块头。
 
-// ── Windows Job Object：子进程严格绑定 lunac.exe 生命周期 ────────
-// spawn 的子进程（agent.exe / llama-server.exe）由 OS 记录父子关系，
-// 任务管理器"进程"页展开 Lunac 分组即可看到（CREATE_NO_WINDOW 只是
-// 不弹控制台，进程本身可见）。但父进程崩溃时子进程会变孤儿；
-// Job Object + KILL_ON_JOB_CLOSE 保证 lunac.exe 以任何方式退出
-// （含崩溃/taskkill）时，Windows 内核自动终止 job 内全部子进程。
-#[cfg(target_os = "windows")]
-mod job {
-    use std::os::windows::io::AsRawHandle;
-    use std::sync::OnceLock;
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
-    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicLimits {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct IoCounters {
-        read_operation_count: u64,
-        write_operation_count: u64,
-        other_operation_count: u64,
-        read_transfer_count: u64,
-        write_transfer_count: u64,
-        other_transfer_count: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct ExtendedLimits {
-        basic: BasicLimits,
-        io_info: IoCounters,
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateJobObjectW(attrs: *mut std::ffi::c_void, name: *const u16) -> isize;
-        fn SetInformationJobObject(
-            job: isize,
-            class: u32,
-            info: *const std::ffi::c_void,
-            len: u32,
-        ) -> i32;
-        fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
-    }
-
-    static JOB: OnceLock<isize> = OnceLock::new();
-
-    fn handle() -> isize {
-        *JOB.get_or_init(|| unsafe {
-            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-            if job != 0 {
-                let mut info = ExtendedLimits::default();
-                info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(
-                    job,
-                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                    &info as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<ExtendedLimits>() as u32,
-                );
-            }
-            job // handle 永不关闭 — 进程退出时由内核关闭并触发 KILL
-        })
-    }
-
-    /// 将子进程加入 job。失败不致命（极老系统不支持嵌套 job），仅记录日志。
-    pub fn assign(child: &std::process::Child) {
-        let job = handle();
-        if job == 0 {
-            return;
-        }
-        unsafe {
-            if AssignProcessToJobObject(job, child.as_raw_handle() as isize) == 0 {
-                eprintln!("[job] AssignProcessToJobObject failed (pid {})", child.id());
-            }
-        }
-    }
-}
 
 // ── Agent HTTP bridge (VSCode extension) ─────────────────────────
 // Same logic as start_cli but without Tauri AppHandle/State dependencies.
@@ -355,7 +267,8 @@ fn spawn_child(
             cmd.env(k, v);
         }
         let child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", program, e))?;
-        job::assign(&child); // 绑定生命周期：lunac 退出 → 子进程必死
+        // 绑定生命周期：lunac 退出（含崩溃/强杀）→ 子进程必死（见 child_job.rs）
+        crate::child_job::assign(&child);
         Ok(child)
     }
     #[cfg(not(target_os = "windows"))]
@@ -581,6 +494,15 @@ fn start_cli_process(
         crate::storage::persona_config_path().to_string_lossy().to_string(),
     ));
 
+    // 远端 MCP 服务器（2026-10-01）→ agent.exe：同样**无条件给路径**（文件还不存在也给）。
+    // 「文件不在 = 没配远端服务器」这个判据只有 agent 一处（core-agent/src/mcp.rs 的
+    // `load_config`）。**新增服务器要重启 agent 才生效** —— 工具表是每次请求都要发的固定
+    // 前缀，中途增删工具会把它整段打掉（与 skills 同一条纪律）。
+    envs.push((
+        "LUNAC_MCP_FILE",
+        crate::storage::mcp_config_path().to_string_lossy().to_string(),
+    ));
+
     crate::log::info(format!(
         "agent spawn: workdir={} args=[{}]",
         workdir.display(),
@@ -703,6 +625,26 @@ fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
         Ok(k) if !k.trim().is_empty() => env::set_var("LUNAC_SEARCH_KEY", k.trim()),
         _ => env::remove_var("LUNAC_SEARCH_KEY"),
     }
+    // 出图（A13，2026-10-03）：**只在配了 image_model 时才注入** —— agent 把
+    // 「`LUNAC_IMAGE_MODEL` 在不在」当作「要不要把 `ImageGen` 注册进工具池」的判据
+    // （同 `Remember` 的条件注册：没配上就注册一件必然失败的工具，白占固定前缀）。
+    // key 与文本侧复用同一把（DashScope 的 key 同时管文本与出图），单开一个变量是为了
+    // agent 侧读起来不必知道「token 也能当出图 key」这层含义。
+    match env::var("AI_IMAGE_MODEL") {
+        Ok(m) if !m.trim().is_empty() => {
+            env::set_var("LUNAC_IMAGE_MODEL", m.trim());
+            env::set_var("LUNAC_IMAGE_KEY", api_key);
+            match env::var("AI_IMAGE_URL") {
+                Ok(u) if !u.trim().is_empty() => env::set_var("LUNAC_IMAGE_URL", u.trim()),
+                _ => env::remove_var("LUNAC_IMAGE_URL"),
+            }
+        }
+        _ => {
+            env::remove_var("LUNAC_IMAGE_MODEL");
+            env::remove_var("LUNAC_IMAGE_URL");
+            env::remove_var("LUNAC_IMAGE_KEY");
+        }
+    }
 }
 
 /// 把一份 AI 配置**原样**注入进程环境变量（`ai.json` 存在时它说了算）。
@@ -743,6 +685,19 @@ fn apply_ai_config(cfg: &crate::storage::AiConfig) {
     }
     if cfg.key.trim().is_empty() {
         crate::log::warn("AI key 为空 ⇒ 对话必然 401，请在设置面板填入 key");
+    }
+    // 出图模型 / 端点（A13，2026-10-03）：空串同样**删变量**（与 provider / search 两项同口径）
+    // —— 「没配」与「配了空」必须是同一个语义，否则 `configure_agent_env` 判不出该不该
+    // 给 agent 装 `ImageGen` 工具（判据是「变量在不在」，见 agent 侧 main.rs）。
+    if cfg.image_model.trim().is_empty() {
+        env::remove_var("AI_IMAGE_MODEL");
+    } else {
+        env::set_var("AI_IMAGE_MODEL", cfg.image_model.trim());
+    }
+    if cfg.image_url.trim().is_empty() {
+        env::remove_var("AI_IMAGE_URL");
+    } else {
+        env::set_var("AI_IMAGE_URL", cfg.image_url.trim());
     }
 }
 
@@ -988,6 +943,38 @@ pub fn system_catalog() -> Vec<crate::system_catalog::CatalogItem> {
     crate::system_catalog::all()
 }
 
+// ── 完成提示音（2026-10-02，用户要求「结束时弹出提示音提示用户」）────────────
+//
+// 为什么是系统的 `MessageBeep` 而不是自带一份 wav、也不是前端 `new Audio()`：
+//   · **零资源**：不必往安装包里塞音频，也就没有「资源丢了就静默失效」这种故障模式；
+//   · **跟随系统**：音色 / 音量 / 「无声」都由 Windows 声音方案控制 —— 用户在系统里
+//     把提示音关了，这里自然也不响，**不绕过用户的意愿**；
+//   · **不受 WebView 自动播放策略约束**：而「用户去忙别的、等它跑完」恰恰是最需要响
+//     一声的场景 —— 那一刻通常没有新鲜的用户手势，前端 Audio 会被静默拦掉。
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+extern "system" {
+    /// `BOOL MessageBeep(UINT uType);`（`MB_ICONASTERISK = 0x0000_0040`）
+    fn MessageBeep(u_type: u32) -> i32;
+}
+
+/// 播一次系统提示音（「星号」音，与系统通知同一族）。
+///
+/// 返回值**刻意不检查**：静音 / 远程会话 / 无音频设备时返回 0 都属正常，提示音是锦上
+/// 添花，不该让它把「对话已完成」的收尾流程变成一条错误。
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn notify_sound() {
+    unsafe {
+        MessageBeep(0x0000_0040);
+    }
+}
+
+/// 非 Windows：静默成功（与 `child_job::assign` 同一姿态 —— 调用点不必分平台）。
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn notify_sound() {}
+
 /// 打开一个 Windows 设置页（只接受 `ms-settings:` 前缀）。
 #[tauri::command]
 pub fn open_setting(target: String) -> Result<(), String> {
@@ -1158,6 +1145,8 @@ pub async fn set_ai_config(
     search_provider: Option<String>,
     search_key: Option<String>,
     vision: Option<bool>,
+    image_model: Option<String>,
+    image_url: Option<String>,
 ) -> Result<String, String> {
     if url.trim().is_empty() || model.trim().is_empty() {
         return Err("url / model must not be empty".into());
@@ -1175,17 +1164,22 @@ pub async fn set_ai_config(
         // 图片输入开关：缺省（老前端不带这个参数）按**关**处理 —— 与「默认不发图片块」
         // 的取向一致，不会因为漏传参数就把图片发给一个可能不支持的端点。
         vision: vision.unwrap_or(false),
+        // 出图模型 / 端点（A13）：缺省按空串（= 未配置 ⇒ agent 不注册 `ImageGen`）——
+        // 与 vision 同一条取向：漏传参数绝不能凭空开启一件会往外发请求的功能。
+        image_model: image_model.unwrap_or_default().trim().to_string(),
+        image_url: image_url.unwrap_or_default().trim().to_string(),
     };
     // 先落盘再注入 env。落盘失败必须如实报错 —— 否则会重演「面板像是保存成功、
     // 重启后又变回旧值」这种最难查的问题。
     crate::storage::save_ai_config(&cfg)?;
     apply_ai_config(&cfg);
     crate::log::info(crate::log::mask_secrets(&format!(
-        "AI 配置已保存（设置面板 → config\\ai.json）provider={} url={} model={} vision={} key_tail={}",
+        "AI 配置已保存（设置面板 → config\\ai.json）provider={} url={} model={} vision={} image_model={} key_tail={}",
         cfg.provider,
         cfg.url,
         cfg.model,
         cfg.vision,
+        cfg.image_model,
         crate::log::key_tail(&cfg.key),
     )));
     Ok("AI config updated".into())
@@ -1204,6 +1198,9 @@ pub fn get_ai_config() -> serde_json::Value {
         "search_key": env::var("AI_SEARCH_KEY").unwrap_or_default(),
         // 图片输入开关（A8）：缺变量 = 关。前端据此决定要不要把图片附件发成 `image` 块。
         "vision": env::var("AI_VISION").map(|v| v.trim() == "1").unwrap_or(false),
+        // 出图（A13）：前端回读用 —— 缺变量 = 未配置，面板显示为空、agent 也没有该工具。
+        "image_model": env::var("AI_IMAGE_MODEL").unwrap_or_default(),
+        "image_url": env::var("AI_IMAGE_URL").unwrap_or_default(),
     })
 }
 
@@ -1379,6 +1376,46 @@ pub fn set_persona(text: String) -> Result<(), String> {
         text.chars().count()
     ));
     Ok(())
+}
+
+// ── 远端 MCP 服务器（`config\mcp.json`，2026-10-01）──────────────────
+//
+// 设置面板这一侧只做两件事：看状态（文件在哪、配了几条）、把文件打开让用户自己编辑。
+// **刻意不做图形编辑器**：条目形状很简单（name / url / headers），而这是一个「会连出去、
+// 还带凭据」的东西 —— 让用户看到自己写的全文，比一张表单更可信（与 hooks.json 同口径）。
+// **编辑完要重启 agent 才生效**（工具表进固定前缀，见 spawn 处的注释）。
+
+/// 读远端 MCP 服务器配置状态（设置面板用）。
+#[tauri::command]
+pub fn get_mcp_config() -> serde_json::Value {
+    let path = crate::storage::mcp_config_path();
+    let text = crate::storage::load_mcp_text().ok().flatten();
+    let (count, error) = match text.as_deref() {
+        None => (0usize, None),
+        Some(t) => {
+            // 与 hooks 同一条口径：容忍编辑器写出来的 UTF-8 BOM
+            match serde_json::from_str::<serde_json::Value>(t.trim_start_matches('\u{feff}')) {
+                Ok(v) => match v.get("servers").and_then(|s| s.as_array()) {
+                    Some(list) => (list.len(), None),
+                    None => (0, Some("mcp.json 缺少 servers 数组".to_string())),
+                },
+                Err(e) => (0, Some(format!("mcp.json 语法错误：{e}"))),
+            }
+        }
+    };
+    serde_json::json!({
+        "path": path.display().to_string(),
+        "exists": text.is_some(),
+        "count": count,
+        "error": error,
+    })
+}
+
+/// 确保 `config\mcp.json` 存在，返回它的路径（前端再用 `openLocalPath()` 打开编辑器）。
+#[tauri::command]
+pub fn open_mcp_config() -> Result<String, String> {
+    let path = crate::storage::ensure_mcp_file()?;
+    Ok(path.display().to_string())
 }
 
 
@@ -1835,6 +1872,8 @@ pub async fn install_skill_from_url(url: String) -> Result<String, String> {
 
 /// 见 `install_skill_from_url`：真正干活的同步体，只在阻塞线程池里跑。
 fn install_skill_from_url_blocking(url: String) -> Result<String, String> {
+    // 统一收口（2026-10-06）：只许公网 https，拒 loopback / 内网字面量
+    validate_public_https_url(&url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -1960,11 +1999,12 @@ pub fn plugins_dir_path() -> String {
 ///
 /// 三条闸沿用插件包的口径：**只 https**（地址是常量）、**体积上限**（Content-Length 先拦 +
 /// 按真实读到的字节再拦）、**失败如实上报**（面板上显示原因，不静默退回空市场）。
-/// 超时也**与插件包同档（120s）**（2026-09-29 从 30s 提上来）：实测本机到
-/// `raw.githubusercontent.com` 这段链路抖动极大 —— 同一台机器同一个 URL，同一轮会话里
-/// 三次全失败（19.2s / 19.4s / 30.0s）、换个时间点却 961ms 就成功；索引正文只有几百字节，
-/// 慢的从来不是传输而是**建连**，30s 对首字节来说太紧，而这条一旦失败用户看到的是
-/// 「市场列表只剩一行错误」—— 首字节慢一点也用不着让整个列表陪葬。
+/// 超时口径也**与插件包一致**（2026-09-30 改）：**没有总超时，只有建连上限**。原先这里挂的是
+/// 120s 总上限，来历是实测本机到 `raw.githubusercontent.com` 抖动极大 —— 同一台机器同一个 URL，
+/// 同一轮会话里三次全失败（19.2s / 19.4s / 30.0s）、换个时间点却 961ms 就成功；索引正文只有
+/// 几百字节，慢的从来不是传输而是**建连**，所以真正该管的只有建连（30s），拿总时长去卡它
+/// 反而会把「建连慢但会成功」的那几次误杀。而这位置一旦失败，用户看到的是「市场列表只剩
+/// 一行错误」—— 更不该由一条与总量无关的时钟来定生死。
 #[tauri::command]
 pub async fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
     run_blocking(fetch_plugin_index_blocking).await
@@ -1973,15 +2013,8 @@ pub async fn fetch_plugin_index() -> Result<Vec<crate::plugin_market::PluginInde
 /// 见 `fetch_plugin_index` 头注释：真正干活的同步体，只在阻塞线程池里跑。
 fn fetch_plugin_index_blocking() -> Result<Vec<crate::plugin_market::PluginIndexEntry>, String> {
     let limit = crate::plugin_market::MAX_INDEX_BYTES;
-    let client = reqwest::blocking::Client::builder()
-        // 与 `install_plugin_from_url_blocking` 同档；理由见上面 `fetch_plugin_index` 的注释。
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("Client error: {e}"))?;
-    let mut resp = client
-        .get(crate::plugin_market::INDEX_URL)
-        .send()
-        .map_err(|e| format!("Download failed: {e}"))?;
+    // 客户端口径与依赖下载同源（只建连超时，不设总超时）—— 见 `plugin_market::open_https_stream`。
+    let mut resp = crate::plugin_market::open_https_stream(crate::plugin_market::INDEX_URL)?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
     }
@@ -2006,44 +2039,92 @@ fn fetch_plugin_index_blocking() -> Result<Vec<crate::plugin_market::PluginIndex
     crate::plugin_market::parse_index(&text)
 }
 
+/// 远程资源 URL 的统一校验（2026-10-06，L12 收口）：**只允许 https，且拒绝 loopback / 内网**。
+///
+/// 为什么必须拒内网：`install_skill_from_url` / `download_tool_from_url` /
+/// `install_plugin_from_url` 都由**宿主**发请求，而入参来自前端（插件 JS 与主界面同源）
+/// —— 这等于一条**绕过 CSP** 触达 `http://127.0.0.1:*` 的旁路（CSP 的 `default-src`
+/// 不含 loopback，插件自己 `fetch()` 会被拦，但让宿主去拉就绕过了）。既然 sidecar 已经
+/// 提供了「**经用户授权**才能连本机」的正规通道（见 `plugin_sidecar` 的 `allowLocalPorts`
+/// / `allowLocalAny` + 信任卡），这条旁路必须收口：**只许公网 https**。
+///
+/// 判据（**不做 DNS 解析**）：scheme = `https`；host 不是 **IP 字面量**（v4 / v6 一律拒，
+/// 内网地址段全在其中）；host 不是 `localhost` / `*.localhost` / `*.internal` / `*.local`
+/// / `*.lan` / `*.home`。「域名解析到内网」那类要靠出口层，这里只挡**字面量**，
+/// 足够堵住本仓这条旁路。
+pub(crate) fn validate_public_https_url(raw: &str) -> Result<(), String> {
+    let url = raw.trim();
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err("只允许 https 地址".into());
+    };
+    // authority = 到第一个 / ? # 为止；再剥掉 userinfo 与端口
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        // IPv6 字面量写法 [::1]:8080
+        inner.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("地址缺少主机名".into());
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(format!("不允许 IP 字面量地址（含 loopback / 内网）：{host}"));
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".local")
+        || lower.ends_with(".lan")
+        || lower.ends_with(".home")
+    {
+        return Err(format!("不允许本机 / 内网主机名：{host}"));
+    }
+    Ok(())
+}
+
 /// 从 https 的 zip URL 安装插件，返回插件 id。
 ///
 /// **同 id 视为「重装 / 升级」**（2026-09-28 改）：旧版本先备份、新包或依赖失败即回滚 ——
-/// 详见 `plugin_market::install_from_bytes`。
+/// 详见 `plugin_market::install_from_bytes_with_progress`。
 ///
-/// 走 `run_blocking`：内部是 120s 超时、逐块读的 `reqwest::blocking`，是本仓**最长的**
-/// 阻塞体 —— 留在主线程上，网络一慢整个窗口就「未响应」（2026-09-22）。
+/// 走 `run_blocking`：内部是「逐块读 + 可能 88MB 的依赖下载」，是本仓**最长的**阻塞体 ——
+/// 留在主线程上，网络一慢整个窗口就「未响应」（2026-09-22）。
+///
+/// **没有总超时**（2026-09-30 用户要求，见 `plugin_market::open_https_stream`）：只留建连与读超时。
+/// 进度经 `plugin-install-progress` 事件回传（前端画进度环 + 实时速度）。
 #[tauri::command]
-pub async fn install_plugin_from_url(url: String) -> Result<String, String> {
-    run_blocking(move || install_plugin_from_url_blocking(url)).await
+pub async fn install_plugin_from_url(app: AppHandle, url: String) -> Result<String, String> {
+    run_blocking(move || install_plugin_from_url_blocking(&app, url)).await
 }
 
 /// 见 `install_plugin_from_url`：真正干活的同步体，只在阻塞线程池里跑。
-fn install_plugin_from_url_blocking(url: String) -> Result<String, String> {
+fn install_plugin_from_url_blocking(app: &AppHandle, url: String) -> Result<String, String> {
     let url = url.trim().to_string();
-    // 明文 http 的 zip 会被解压执行 ⇒ 只收 https（这是本命令与 tools / skills 那两个先例的差别）
-    if !url.starts_with("https://") {
-        return Err("只允许 https 的插件包地址".into());
-    }
+    // 插件包会被解压执行 ⇒ 只收 https，且拒 loopback / 内网（见 `validate_public_https_url`）
+    validate_public_https_url(&url)?;
     let limit = crate::plugin_market::MAX_ARCHIVE_BYTES;
     let over = || format!("插件包超过上限（{} MB）", limit / 1024 / 1024);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| format!("Client error: {}", e))?;
-    let mut resp = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("Download failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
-    }
+    // 插件 id 要等解压出清单才知道，所以「插件包本体」这一段先不带 id/条数（前端只看 bytes）
+    let emit = |p: crate::plugin_market::DependencyProgress| {
+        let _ = app.emit("plugin-install-progress", p);
+    };
+    let mut resp = crate::plugin_market::open_https_stream(&url)?;
     // 两道拦截：先看 Content-Length（省得白下几十 MB），再按**真实读到的字节**累计
     if let Some(len) = resp.content_length() {
         if len > limit {
             return Err(over());
         }
     }
+    let total = resp.content_length().unwrap_or(0);
     let mut bytes: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -2057,8 +2138,20 @@ fn install_plugin_from_url_blocking(url: String) -> Result<String, String> {
             return Err(over());
         }
         bytes.extend_from_slice(&buf[..n]);
+        emit(crate::plugin_market::DependencyProgress {
+            id: String::new(),
+            phase: "download".into(),
+            downloaded: bytes.len() as u64,
+            total,
+            index: 0,
+            count: 0,
+        });
     }
-    let id = crate::plugin_market::install_from_bytes(&bytes, &crate::plugin_market::plugins_dir())?;
+    let id = crate::plugin_market::install_from_bytes_with_progress(
+        &bytes,
+        &crate::plugin_market::plugins_dir(),
+        &mut |p| emit(p),
+    )?;
     crate::log::info(format!(
         "插件已安装：{}（{} 字节，来源 {url}）",
         id,
@@ -2067,9 +2160,40 @@ fn install_plugin_from_url_blocking(url: String) -> Result<String, String> {
     Ok(id)
 }
 
+/// 安装 / 修复**已装插件**声明的依赖（2026-09-30）。
+///
+/// 为什么需要这条：`ocr` 插件从**安装包**那条路进来时（NSIS 只拷插件代码、不带引擎 ——
+/// 引擎不能进安装包，见 ai-spec §3.5），引擎是缺的。插件内的「下载引擎」就调这条，
+/// 按插件**自己的清单**把依赖补齐。于是「引擎怎么来的」只有一条路：清单里的 `dependencies[]`。
+///
+/// **不重新下载插件包**：清单里写的就是真相，重下一次插件包纯属浪费。
+/// 事件：`plugin-install-progress`（`plugin_market::DependencyProgress`）。
+#[tauri::command]
+pub async fn install_plugin_dependencies(app: AppHandle, id: String) -> Result<(), String> {
+    run_blocking(move || {
+        let dir = crate::plugin_market::plugins_dir().join(id.trim());
+        let text = std::fs::read_to_string(dir.join(crate::plugin_market::MANIFEST_FILE))
+            .map_err(|e| format!("读不到插件清单（{e}）"))?;
+        let manifest = crate::plugin_market::parse_manifest(&text)?;
+        crate::plugin_market::install_dependencies_with_progress(
+            &dir,
+            &manifest.id,
+            &manifest.dependencies,
+            &mut |p| {
+                let _ = app.emit("plugin-install-progress", p);
+            },
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 /// 卸载插件（递归删 <exe 根>\plugins\<id>）。id 必须安全、目录必须在插件根内 —— 见 `plugin_market::uninstall`。
 #[tauri::command]
 pub fn uninstall_plugin(id: String) -> Result<String, String> {
+    // **先收 sidecar 再删目录**（2026-10-06，L12）：目录一删，进程就再也认不出归属了 ——
+    // 留一个「插件已经不存在、进程还在跑」的状态是最难解释的（同预检 #57 的口径）。
+    crate::plugin_sidecar::stop(&id);
     crate::plugin_market::uninstall(&id, &crate::plugin_market::plugins_dir())?;
     crate::log::info(format!("插件已卸载：{id}"));
     Ok(id)
@@ -2086,6 +2210,8 @@ pub async fn download_tool_from_url(url: String) -> Result<String, String> {
 
 /// 见 `download_tool_from_url`：真正干活的同步体，只在阻塞线程池里跑。
 fn download_tool_from_url_blocking(url: String) -> Result<String, String> {
+    // 统一收口（2026-10-06）：只许公网 https，拒 loopback / 内网字面量
+    validate_public_https_url(&url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -2165,52 +2291,17 @@ pub async fn run_paddle_ocr(path: String, lang: Option<String>) -> Result<String
     .await
 }
 
-// ── OCR 引擎（PaddleOCR-json）按需安装 ───────────────────────────
+// ── OCR 引擎（PaddleOCR-json）状态 ───────────────────────────────
 //
-// 引擎体积大（.7z 约 88MB / 解压后约 300MB），不随仓库分发。缺失时前端
-// 弹出「下载并安装」入口 → 本命令后台下载解压到 <exe 根>\paddle-ocr。
-// 进度与结果通过事件回传，避免长耗时的 IPC 阻塞。
-
-/// 安装是否进行中（防重入：下载是长任务，重复触发会浪费带宽并产生竞态）
-static OCR_ENGINE_INSTALLING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// 引擎体积大（.7z 约 88MB / 解压后约 300MB），**不再随安装包分发、宿主也不再自下载**
+// （2026-09-30）：它现在是 `ocr` 插件清单里的一条 `archive` 依赖，获取路径只有
+// `install_plugin_dependencies`（见上面那条命令）。这里只剩一个「装好了没」的查询，
+// 插件用它决定状态行显示「就绪」还是「缺引擎 + 修复按钮」。
 
 /// 引擎是否已就绪。
 #[tauri::command]
 pub fn ocr_engine_status() -> bool {
     paddle_ocr::engine_installed()
-}
-
-/// 下载并安装 OCR 引擎（后台线程执行，立即返回）。
-/// 事件：
-///   `ocr-engine-progress` { downloaded, total }  下载进度（total=0 表示未知）
-///   `ocr-engine-ready`    ()                     安装成功
-///   `ocr-engine-error`    String                 失败原因
-#[tauri::command]
-pub fn ocr_engine_install(app: AppHandle) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    if OCR_ENGINE_INSTALLING.swap(true, Ordering::SeqCst) {
-        return Err("OCR 引擎正在安装中，请稍候".into());
-    }
-    let handle = app.clone();
-    thread::spawn(move || {
-        let result = paddle_ocr::install_engine(|downloaded, total| {
-            let _ = handle.emit(
-                "ocr-engine-progress",
-                serde_json::json!({ "downloaded": downloaded, "total": total }),
-            );
-        });
-        OCR_ENGINE_INSTALLING.store(false, Ordering::SeqCst);
-        match result {
-            Ok(()) => {
-                let _ = handle.emit("ocr-engine-ready", ());
-            }
-            Err(e) => {
-                let _ = handle.emit("ocr-engine-error", e);
-            }
-        }
-    });
-    Ok(())
 }
 
 // ── Window control ──────────────────────────────────────────────

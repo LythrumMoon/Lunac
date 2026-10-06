@@ -184,6 +184,32 @@ const CHAT_MIN_H: f64 = 420.0;
 /// 下限只需要挡住「误缩到 0」，不必等于某个具体态的最小值。
 const MUSIC_MIN_H: f64 = 120.0;
 
+/// 音乐插件的**附属窗**（2026-10-03）：频响曲线窗。
+///
+/// 与音乐主窗的关系：**同一份插件代码、同一个 `plugin.html` 入口**，但 label 不同
+/// （`plugin-music-curve`）⇒ `open()` 那条「按 label 复用」认出这是**第二扇窗**，
+/// 不会把主窗拎到前面了事。`plugin-*` 通配仍然命中 ⇒ capabilities 授权、
+/// `on_window_event` 分流、`OPEN_WINDOWS` 计数**全部自动复用**，不必为这条通路新开权限。
+///
+/// ⚠️ **它是「合成 id」（`<插件 id>-<key>`）**：`default_size` / `min_size` 按它取尺寸，
+/// 而 `page_for` / `declared_shape` 仍用**真实插件 id** —— 附属窗**不该继承清单里给主窗
+/// 定的那套形态**（音乐清单的 1280×720 只对主窗成立）。
+pub const CURVE_WINDOW_KEY: &str = "music-curve";
+const CURVE_W: f64 = 880.0;
+const CURVE_H: f64 = 430.0;
+/// 曲线窗下限：比通用那档大 —— 里面是一张自适应重画的曲线图，太窄会把刻度挤没。
+const CURVE_MIN_W: f64 = 480.0;
+const CURVE_MIN_H: f64 = 240.0;
+
+/// 附属窗的 key 白名单（它会进窗口 label）。只允许小写字母 / 数字 / `-`。
+fn is_safe_window_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 24
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// 按插件 id 选初始窗口尺寸。**音乐插件是唯一有定尺要求的**，其余走通用尺寸；
 /// 插件清单里的 `window.width/height` 优先于这两档（`0` = 没写 ⇒ 用这里的缺省）。
 fn default_size(plugin_id: &str, shape: Option<&PluginWindowShape>) -> (f64, f64) {
@@ -191,6 +217,8 @@ fn default_size(plugin_id: &str, shape: Option<&PluginWindowShape>) -> (f64, f64
         (CHAT_W, CHAT_H)
     } else if plugin_id == "music" {
         (MUSIC_W, MUSIC_H)
+    } else if plugin_id == CURVE_WINDOW_KEY {
+        (CURVE_W, CURVE_H)
     } else {
         (WIN_W, WIN_H)
     };
@@ -213,6 +241,8 @@ fn min_size(plugin_id: &str, shape: Option<&PluginWindowShape>) -> (f64, f64) {
         (CHAT_MIN_W, CHAT_MIN_H)
     } else if plugin_id == "music" {
         (MIN_W, MUSIC_MIN_H)
+    } else if plugin_id == CURVE_WINDOW_KEY {
+        (CURVE_MIN_W, CURVE_MIN_H)
     } else {
         (MIN_W, MIN_H)
     };
@@ -295,6 +325,18 @@ pub fn label_for(plugin_id: &str) -> String {
     format!("{LABEL_PREFIX}{plugin_id}")
 }
 
+/// **带 key 的 label**（`plugin-<id>-<key>`）—— 同一个插件开**第二扇窗**时用
+/// （见 `CURVE_WINDOW_KEY`）。`key` 为空 ⇒ 与 `label_for` 逐字同义，
+/// 主窗那条路一个字节都没变。
+///
+/// ⚠️ **key 必须进 label**：`open()` 的复用判据就是 label，两者同 label 就还是同一扇窗。
+pub fn label_for_key(plugin_id: &str, key: Option<&str>) -> String {
+    match key.filter(|k| !k.is_empty()) {
+        Some(k) => format!("{LABEL_PREFIX}{plugin_id}-{k}"),
+        None => label_for(plugin_id),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct PluginWindowInit {
     pub plugin_id: String,
@@ -319,24 +361,36 @@ pub fn plugin_window_init(window: WebviewWindow) -> Result<PluginWindowInit, Str
     }
 }
 
-/// 某个插件窗现在是否开着。**自动弹出类功能**（音乐插件，见 `music.rs` 的
-/// `spawn_spotify_watcher`）用它判断该不该建窗 —— 已经开着就不要再去 `open()`，
-/// 那条复用路径会 `set_focus()` 抢焦点。
-pub fn is_open(app: &AppHandle, plugin_id: &str) -> bool {
-    app.get_webview_window(&label_for(plugin_id)).is_some()
-}
-
 /// 建窗或复用（同一个插件不建第二个）。宿主内部与前端命令**共用这一条实现** ——
 /// 「复用要推一条 `plugin-window-input`」「建窗前必须写好 PENDING」这些约束只有一份。
-pub fn open(app: &AppHandle, plugin_id: &str, input: &str) -> Result<(), String> {
+pub fn open(
+    app: &AppHandle,
+    plugin_id: &str,
+    key: Option<&str>,
+    input: &str,
+) -> Result<(), String> {
     if !is_safe_plugin_id(plugin_id) {
         return Err("ERR_BAD_PLUGIN_ID".into());
     }
-    let label = label_for(plugin_id);
+    let key = key.filter(|k| !k.is_empty());
+    if let Some(k) = key {
+        if !is_safe_window_key(k) {
+            return Err("ERR_BAD_WINDOW_KEY".into());
+        }
+    }
+    let label = label_for_key(plugin_id, key);
+    // 尺寸与形态按**合成 id**（`music` + `curve` ⇒ `music-curve`）取，见 `CURVE_WINDOW_KEY`。
+    let win_id = match key {
+        Some(k) => format!("{plugin_id}-{k}"),
+        None => plugin_id.to_string(),
+    };
 
     // 清单里声明的窗口形态（桌宠那种「无标题栏 + 不进任务栏 + 定尺」）。读不到 = 用缺省。
     // **必须在写 PENDING 之前取**：`chrome` 要跟着载荷一起交给前端。
-    let shape = declared_shape(plugin_id);
+    //
+    // ⚠️ **附属窗（带 key）不继承清单形态**：那份清单描述的是**主窗**
+    //（音乐清单的 1280×720 与 float 只对主窗成立），套到曲线窗上会把尺寸改错。
+    let shape = if key.is_none() { declared_shape(plugin_id) } else { None };
 
     // 必须在建窗**之前**写好：页面可能比这条命令返回得更快，前端一启动就会来取。
     //
@@ -368,8 +422,8 @@ pub fn open(app: &AppHandle, plugin_id: &str, input: &str) -> Result<(), String>
         return Ok(());
     }
 
-    let (w, h) = default_size(plugin_id, shape.as_ref());
-    let (min_w, min_h) = min_size(plugin_id, shape.as_ref());
+    let (w, h) = default_size(&win_id, shape.as_ref());
+    let (min_w, min_h) = min_size(&win_id, shape.as_ref());
     let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(page_for(plugin_id).into()))
         .title(plugin_id)
         .inner_size(w, h)
@@ -395,6 +449,9 @@ pub fn open(app: &AppHandle, plugin_id: &str, input: &str) -> Result<(), String>
 
 /// 打开（或复用）插件悬浮窗 —— 前端命令，实现见 `open()`。
 ///
+/// `key`（可选，2026-10-03）：**附属窗**（音乐插件传 `"curve"` ⇒ label
+/// `plugin-music-curve`）。不传 = 主窗，行为与以前逐字相同。
+///
 /// **刻意不用 `run_blocking`**：建窗不是阻塞 IO，而是「交给事件循环去建」——
 /// 它必须在**非主线程**上发起（主线程发起会与消息泵互等）。所以这里用
 /// `async fn` 薄壳本身，理由与 `music::spotify_connect` 相同。
@@ -402,9 +459,10 @@ pub fn open(app: &AppHandle, plugin_id: &str, input: &str) -> Result<(), String>
 pub async fn open_plugin_window(
     app: AppHandle,
     plugin_id: String,
+    key: Option<String>,
     input: Option<String>,
 ) -> Result<(), String> {
-    open(&app, &plugin_id, input.as_deref().unwrap_or_default())
+    open(&app, &plugin_id, key.as_deref(), input.as_deref().unwrap_or_default())
 }
 
 /// 关掉自己（标题栏的 ×）。`window` 由 Tauri 注入。
@@ -431,14 +489,39 @@ pub fn close_plugin_window(app: AppHandle, plugin_id: String) -> Result<(), Stri
     if !is_safe_plugin_id(&plugin_id) {
         return Err("ERR_BAD_PLUGIN_ID".into());
     }
-    match app.get_webview_window(&label_for(&plugin_id)) {
-        Some(w) => {
-            w.destroy().map_err(|e| format!("关闭插件窗口失败：{e}"))?;
-            crate::log::info(&format!("plugin_window: closed by uninstall {plugin_id}"));
-            Ok(())
-        }
-        None => Ok(()),
+    // **主窗 + 附属窗一起关**（2026-10-03）：卸载一个插件却留一扇还跑着它代码的
+    // 附属窗，与「卸了等于没卸」是同一种错（那正是这个命令存在的理由）。
+    if let Some(w) = app.get_webview_window(&label_for(&plugin_id)) {
+        w.destroy().map_err(|e| format!("关闭插件窗口失败：{e}"))?;
+        crate::log::info(&format!("plugin_window: closed by uninstall {plugin_id}"));
     }
+    let extra = close_keyed(&app, &plugin_id);
+    if !extra.is_empty() {
+        crate::log::info(&format!(
+            "plugin_window: closed by uninstall（附属窗 {extra:?}）"
+        ));
+    }
+    Ok(())
+}
+
+/// 关掉某个插件的**附属窗**（label 形如 `plugin-<id>-<key>`），返回关掉的 label。
+///
+/// 用途有两处：卸载插件（见 `close_plugin_window`）、以及**音乐主窗关闭时把曲线窗一起带走**
+/// （见 `music::on_plugin_window_destroyed` —— 曲线窗单独留着看一条已经不存在的链是错的）。
+///
+/// `plugin_id` 本身不校验：调用方都已经有真 id（这里是 `&str`，不是跨进程入参）。
+pub fn close_keyed(app: &AppHandle, plugin_id: &str) -> Vec<String> {
+    let prefix = format!("{LABEL_PREFIX}{plugin_id}-");
+    let mut closed = Vec::new();
+    for (label, w) in app.webview_windows() {
+        if !label.starts_with(&prefix) {
+            continue;
+        }
+        if w.destroy().is_ok() {
+            closed.push(label);
+        }
+    }
+    closed
 }
 
 #[tauri::command]
@@ -581,6 +664,31 @@ mod tests {
         // capabilities/default.json 里按 "plugin-*" 授权，改前缀必须同时改那里
         assert_eq!(label_for("music"), "plugin-music");
         assert!(label_for("music").starts_with(LABEL_PREFIX));
+    }
+
+    /// 附属窗（带 key）的 label 与尺寸（2026-10-03，频响曲线窗）。
+    #[test]
+    fn keyed_labels_stay_under_the_plugin_glob_and_get_their_own_size() {
+        // 主窗那条路**一个字节都没变**（key 为空 = 与 label_for 同义）
+        assert_eq!(label_for_key("music", None), "plugin-music");
+        assert_eq!(label_for_key("music", Some("")), "plugin-music");
+        // 附属窗：仍是 `plugin-*`（capabilities 的通配与 Destroyed 分流都靠它）
+        let curve = label_for_key("music", Some("curve"));
+        assert_eq!(curve, "plugin-music-curve");
+        assert!(curve.starts_with(LABEL_PREFIX));
+        // **不能**被认成音乐主窗 —— 认错的话关曲线窗会把 librespot 与本地播放一起杀掉
+        assert_ne!(curve, label_for("music"));
+        // 合成 id 拿到自己那套尺寸，且「最小 ≤ 默认」
+        let (def_w, def_h) = default_size(CURVE_WINDOW_KEY, None);
+        let (min_w, min_h) = min_size(CURVE_WINDOW_KEY, None);
+        assert_eq!((def_w, def_h), (CURVE_W, CURVE_H));
+        assert!(min_w <= def_w && min_h <= def_h, "曲线窗最小尺寸大于默认尺寸");
+        assert!((def_w, def_h) != (WIN_W, WIN_H), "曲线窗不该落回通用尺寸");
+        // key 的白名单（它会直接拼进 label）
+        assert!(is_safe_window_key("curve"));
+        for bad in ["", "Curve", "a/b", "a b", "a.b"] {
+            assert!(!is_safe_window_key(bad), "{bad:?} 不该被当成合法 key");
+        }
     }
 
     #[test]

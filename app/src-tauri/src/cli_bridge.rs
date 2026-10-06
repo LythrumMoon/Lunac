@@ -78,13 +78,56 @@ pub fn write_to_cli(json_line: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Kill agent.exe and clean up all state. Called on stop or app shutdown.
-/// Never blocks indefinitely: TerminateProcess is asynchronous, so we poll
-/// try_wait for up to 2s instead of an unbounded wait() (a hung agent.exe
-/// must not freeze stop_cli).
+/// 强制结束 `pid` 及其**整棵子进程树**（Windows `taskkill /F /T`）。
+///
+/// 为什么需要它：`Child::kill()` 走的是 `TerminateProcess`，它**不会**连带子进程 ——
+/// agent 正在跑的 Cmd / PowerShell 会变孤儿继续跑（用户报的「重试 / 停止后任务没停、
+/// 命令还在直接运行」）。`taskkill /T` 顺着父进程树把 agent.exe 与它当前的命令子进程
+/// 一起收掉。
+///
+/// ⚠️ **必须在该进程还活着时调用**：父进程一死，`/T` 就查不到子进程了 —— 所以调用点
+/// 排在 `child.kill()` **之前**。失败不致命：调用方随后仍会 `child.kill()`，最坏退化成
+/// 旧行为（只杀 agent.exe）。
+///
+/// 非 Windows 上是空操作（本应用只发 Windows）。
+fn kill_process_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW — 不闪控制台
+        if let Ok(mut c) = cmd.spawn() {
+            // 最多等 1s：taskkill 正常是毫秒级，卡住也不能拖死 stop_cli。
+            let deadline = Instant::now() + Duration::from_millis(1000);
+            while Instant::now() < deadline {
+                match c.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = pid;
+}
+
+/// Kill agent.exe **and the command(s) it is currently running**, then clean up state.
+/// Called on stop or app shutdown.
+///
+/// 只 `TerminateProcess(agent.exe)` 是不够的：它 spawn 的命令子进程不会跟着死。所以先
+/// `taskkill /F /T` 收整棵进程树（见 `kill_process_tree`），再 `child.kill()` 兜底。
+/// Never blocks indefinitely: taskkill 与 TerminateProcess 都带超时轮询，绝不无限等
+/// （一个卡死的 agent.exe 不许冻住 stop_cli）。
 pub fn kill_and_cleanup() {
-    // Kill process
+    // Kill the whole tree first (parent must still be alive for /T to find children),
+    // then the process itself as a fallback.
     if let Some(mut child) = take_process() {
+        kill_process_tree(child.id());
         let _ = child.kill();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

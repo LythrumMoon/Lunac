@@ -4,13 +4,21 @@
 // 目录约定：**<exe 根>\Modules\<id>\**（2026-09-28 从 `plugins\` 改名而来；与 `skills\` / `tools\` 同级，
 // 都在安装根下，卸载随目录清掉。旧 `plugins\` 由 `migrate_legacy_plugins_dir()` 一次性搬过来）。
 // 包里必须带一份清单 `lunac-plugin.json`（见 `PluginManifest`），入口是**已编译好的 ESM**（`import()`），
-// 因为前端 CSP 是 `script-src 'self' 'unsafe-inline' https://asset.localhost` —— 插件代码只能经
+// 因为前端 CSP 的 `script-src` 只放行 `'self'` 与 asset 协议（**http / https 两种写法都要写上**：
+// Windows 上 asset 协议的 origin 是 `http://asset.localhost`，见 ai-spec §3.5「加载通道」）—— 插件代码只能经
 // **asset 协议**从磁盘加载，**不能走 CDN**（同 ai-spec §3.7 的 KaTeX 缺陷是同一条约束）。
 //
 // **依赖随插件一起装**（2026-09-28 加）：清单里的 `dependencies[]` 由宿主在插件落盘后逐条拉取
 // （见 `install_dependencies`）—— 这是「release 里没有 librespot」这类问题的根治办法：
 // 依赖不再由构建脚本塞进安装包，而是**跟着用到它的那个插件**走。依赖只收 https、
 // 可选 sha256 校验、落点必须留在插件目录内。
+//
+// **`archive` 依赖**（2026-09-30 加，为 PaddleOCR-json）：有些依赖不是一个文件而是一整棵目录
+// （引擎 exe + 上百 MB 模型），上游只发 `.7z`。这条类型把压缩包下下来**解到插件目录内**的
+// `dest` 目录里（`Modules\ocr\paddle-ocr\`），于是「装 OCR 插件 = 引擎一起就位」，
+// 而不是让**所有**用户替少数人的功能在安装包里多背 70MB。解压走的是与插件包同一套判据
+// （路径穿越 / 解压后总量 / 条目数），7z 那条**必须**用 `decompress_with_extract_fn` 自己
+// 校验路径 —— sevenz-rust 的默认解压是 `dest.join(entry.name())`，对 `..\..\x` 不做任何拦截。
 //
 // **这份代码解压的是「可执行代码」，所以校验比 tools / skills 那两个先例更严**：
 //   ① 只收 https（明文 http 的 zip 会被解压执行）；
@@ -47,12 +55,25 @@ pub const MAX_ENTRIES: usize = 4000;
 pub const MAX_DEP_BYTES: u64 = 512 * 1024 * 1024;
 /// 依赖条目数上限（防清单里写一万条把安装拖死）。
 pub const MAX_DEP_ENTRIES: usize = 32;
+/// `archive` 依赖**解压后**的总量上限（2026-09-30）。比插件包那档（192MB）宽：
+/// 这条走的是「引擎 + 模型」——PaddleOCR-json 的 `.7z` 约 88MB、解开约 300MB，
+/// 按体积卡在 192MB 会让它永远装不上。1 GiB 仍能拦住「解出一个几十 GB 的树」。
+pub const MAX_DEP_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024;
+/// `archive` 依赖的条目数上限。模型目录动辄上千个小文件，比插件包那档（4000）放宽。
+pub const MAX_DEP_EXTRACT_ENTRIES: usize = 20000;
 /// 声明的宿主能力条数上限（权限名很短，16 条已经远超任何真实插件）。
 pub const MAX_PERMISSIONS: usize = 16;
+/// `reuse`（复用哪个**基础插件**的挂载监听）条数上限（2026-10-05）。几个就够，4 是宽松上限。
+pub const MAX_REUSE: usize = 4;
 /// 宿主当前**认识**的能力（2026-09-28）。**只加不减**（旧插件会带着老名字装在盘上），
 /// 清单里出现不认识的名字**只 warn、不拒绝安装** —— 那可能是给更新版宿主声明的能力，
 /// 在旧宿主上装不上反而是坏事（它只是拿不到那个能力，与「装不上」是两回事）。
-pub const KNOWN_PERMISSIONS: &[&str] = &["layout.takeover", "window.resize", "window.float"];
+pub const KNOWN_PERMISSIONS: &[&str] = &[
+    "layout.takeover",
+    "process.spawn",
+    "window.resize",
+    "window.float",
+];
 /// id 长度上限（同时是目录名长度上限）。
 const MAX_ID_CHARS: usize = 48;
 
@@ -192,12 +213,29 @@ pub struct PluginManifest {
     /// 它真正挡住的是「不小心用了没声明的东西」与「用户不知道装的东西要什么权限」。
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// **复用哪个内置（基础）插件的挂载监听**（2026-10-05 用户定：自定义插件按钮失效，
+    /// 允许「复用内置插件监听」）。
+    ///
+    /// 磁盘插件自己的 `attach(root)` 之外，再按这里的 id 追加挂上基础插件那套监听 —— 这样
+    /// AI 生成的插件若照搬了某个基础插件的面板 HTML，按钮就能真的工作，而不是一整个哑掉。
+    /// **只认宿主里编译进去的基础插件**（settings / quick-launch / memo / translate /
+    /// tool-editor），认不出的 id 一律忽略并 warn（与 `permissions` 同一条「只 warn」纪律）。
+    /// 注意：这**不违反**「拓展插件不在 bundle 里」—— 复用是**声明在插件自己的清单里**的，
+    /// 宿主代码里没有一行按某个磁盘插件的 id 分支；卸载它照样什么也不留。
+    #[serde(default)]
+    pub reuse: Vec<String>,
     /// 悬浮窗形态（2026-09-29，见 `PluginWindowShape`）。不写这一段 = 宿主缺省形态。
     ///
     /// 由**宿主**在建窗时读（`plugin_window::declared_shape()`），不进前端契约 ——
     /// 前端不需要知道窗口多大，它只管往 `#results-list` 里画东西。
     #[serde(default)]
     pub window: Option<PluginWindowShape>,
+    /// 插件自带的本机进程（2026-10-06，L12 档 1，见 `SidecarSpec`）。不写 = 无 sidecar。
+    ///
+    /// **必须与 `permissions: ["process.spawn"]` 同时出现**；起进程前还要过**独立信任门**
+    /// （`config\plugin-trusted.json`）。这一段由宿主在 `plugin_sidecar` 模块里读并执行。
+    #[serde(default)]
+    pub sidecar: Option<SidecarSpec>,
 }
 
 fn default_entry() -> String {
@@ -206,10 +244,13 @@ fn default_entry() -> String {
 
 /// 一条依赖（清单里的 `dependencies[]` 元素，2026-09-28）。
 ///
-/// 两种形态（`kind` 决定，缺省 `file`）：
+/// 三种形态（`type` 决定，缺省 `file`）：
 ///   · **`file`**（默认）：从 `url`（**必须 https**）下载单个文件到插件目录内的 `dest`。
-///     适合「引擎二进制 / 模型」这类固定文件（librespot.exe / PaddleOCR 模型）。
+///     适合「单文件引擎/二进制」这类（librespot.exe）。
 ///     可选 `sha256`：写了就**必须**对上，否则整条拒绝（供应链完整性）。
+///   · **`archive`**（2026-09-30）：从 `url`（**必须 https**）下载压缩包（`.7z` / `.zip`，
+///     按魔数自动识别），解压到插件目录内的 `dest` **目录**。适合「引擎 + 模型」这种
+///     一整棵树的依赖（PaddleOCR-json）。`sha256` 校验的是**压缩包本身**。
 ///   · **`npm`**：`npm install --prefix <插件目录> <package>@<version>`，装进插件目录的
 ///     `node_modules\`。要求用户机器上有 node/npm —— 找不到就**如实报错**，不静默跳过。
 ///
@@ -218,10 +259,10 @@ fn default_entry() -> String {
 /// 就只能等下一个版本。改成跟着插件走，装/卸/升级都在一起。
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct PluginDependency {
-    /// `file`（缺省）/ `npm`
+    /// `file`（缺省）/ `archive` / `npm`
     #[serde(default, rename = "type")]
     pub kind: String,
-    /// `file`：https 下载地址
+    /// `file` / `archive`：https 下载地址
     #[serde(default)]
     pub url: String,
     /// `npm`：包名（可带 scope，如 `@scope/pkg`）。缺省退回 `url` 字段
@@ -230,10 +271,12 @@ pub struct PluginDependency {
     /// `npm`：版本范围（可选，空 = latest）
     #[serde(default)]
     pub version: String,
-    /// `file`：相对插件目录的落点（如 `bin\librespot.exe`）。不许越界（走 `safe_join`）
+    /// `file`：相对插件目录的落点（如 `bin\librespot.exe`）。
+    /// `archive`：相对插件目录的**解压目标目录**（如 `paddle-ocr`）。不许越界（走 `safe_join`）
     #[serde(default)]
     pub dest: String,
     /// `file`：期望的 sha256（十六进制，大小写不敏感）。空 = 不校验（安装时会 warn 留痕）
+    /// `archive`：期望的**压缩包** sha256（同上）
     #[serde(default)]
     pub sha256: String,
 }
@@ -242,6 +285,153 @@ impl PluginDependency {
     fn is_npm(&self) -> bool {
         self.kind.eq_ignore_ascii_case("npm")
     }
+
+    fn is_archive(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("archive")
+    }
+}
+
+/// **sidecar**：插件自带的本机进程声明（2026-10-06 定稿，L12 档 1）。
+///
+/// 形态 = 「插件目录里带一个二进制，宿主负责起进程 + 通信 + 收尾」。UI 仍在 WebView 里
+/// （不替代 WebView），插件背后多一台「引擎进程」—— 本仓内置插件（librespot / ffmpeg /
+/// PaddleOCR / mihomo）早就在这么做，这一段把那套能力开放给磁盘插件，不必为此改主程序。
+///
+/// **必须与 `permissions: ["process.spawn"]` 同时出现**（见 `validate_sidecar`）：
+/// 能 spawn 任意二进制的插件能力无上界，不能靠「声明即生效」，要过**独立信任门**
+/// （`config\plugin-trusted.json`，指纹 = 插件 id + command + sha256）。
+///
+/// 通信：`stdio`（宿主 ↔ 进程走 stdin/stdout 的 NDJSON）/ `http`（进程监听 `127.0.0.1:port`，
+/// **由宿主代请求** —— 前端 CSP 的 `default-src` 不含 `127.0.0.1`，插件 JS 不能直接 fetch）/
+/// `both`。宿主与进程的握手行是 `{"method":"ready","params":{"port":<N>}}`（http 时带端口）。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarSpec {
+    /// 可执行文件路径（**相对插件目录**，不许绝对路径 / 不许含 `..`）。可与
+    /// `dependencies[{type:"file"}]` 配合（先下载、校验后再起）。
+    pub command: String,
+    /// 直接传给 `CreateProcess` 的参数数组（**不经 shell** —— 避免注入）。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 通道：`""` / `stdio`（缺省）/ `http` / `both`
+    #[serde(default)]
+    pub transport: String,
+    /// 仅 `http` / `both`：`0`（缺省）= 由进程自选并经 ready 行上报；非 0 = 写死该端口。
+    #[serde(default)]
+    pub port: u16,
+    /// 消息协议：`""` / `ndjson`（缺省，唯一支持）
+    #[serde(default)]
+    pub protocol: String,
+    /// 工作目录（相对插件目录，**不得越界**）。缺省 = 插件目录。
+    #[serde(default)]
+    pub cwd: String,
+    /// 附加环境变量（在宿主环境之上**只增不删**）。
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// 宿主加载插件时是否自动起（缺省 false = 插件调 API 时才起）。
+    #[serde(default)]
+    pub autostart: bool,
+    /// 崩溃重启策略：`""` / `never`（缺省）/ `on-failure`（最多 3 次、指数退避）。
+    #[serde(default)]
+    pub restart: String,
+    /// 可执行文件校验和（64 位十六进制，可选；写了就必须对上）。
+    #[serde(default)]
+    pub sha256: String,
+    /// **授权串其他本机应用**的额外端口白名单（缺省空 = 只放行自己上报的那个端口）。
+    #[serde(default)]
+    pub allow_local_ports: Vec<u16>,
+    /// 授权访问**任意** loopback 端口（信任卡上会显著标注）。缺省 false。
+    #[serde(default)]
+    pub allow_local_any: bool,
+}
+
+/// sidecar.env 条数上限。
+const MAX_SIDECAR_ENV: usize = 32;
+/// sidecar.allowLocalPorts 条数上限。
+const MAX_SIDECAR_ALLOW_PORTS: usize = 16;
+
+/// 校验 `sidecar` 段。**能静态判定的一律拒绝整包**（同清单其它字段的口径）。
+///
+/// 「禁止越界」复用 `safe_join`（与 `dependencies.dest`、`entry` 同判据）——
+/// `command` / `cwd` 都只允许插件目录内的相对路径。
+fn validate_sidecar(spec: &SidecarSpec, permissions: &[String]) -> Result<(), String> {
+    // 1) 必须与 process.spawn 同时出现（fail-closed：不声明能力的 sidecar 一律拒）
+    if !permissions.iter().any(|p| p.trim() == "process.spawn") {
+        return Err("声明了 sidecar 却缺少能力 process.spawn（两者必须同时出现）".into());
+    }
+    // 2) command：非空 + 插件目录内的相对路径
+    let cmd = spec.command.trim();
+    if cmd.is_empty() {
+        return Err("sidecar 缺少 command（可执行文件路径）".into());
+    }
+    if safe_join(Path::new("."), cmd).is_none() {
+        return Err(format!("sidecar.command 必须是插件目录内的相对路径：{cmd}"));
+    }
+    // 3) transport / protocol / restart 枚举
+    let t = spec.transport.trim();
+    if !matches!(t, "" | "stdio" | "http" | "both") {
+        return Err(format!("sidecar.transport 只支持 stdio / http / both，收到：{t}"));
+    }
+    let p = spec.protocol.trim();
+    if !matches!(p, "" | "ndjson") {
+        return Err(format!("sidecar.protocol 只支持 ndjson，收到：{p}"));
+    }
+    let r = spec.restart.trim();
+    if !matches!(r, "" | "never" | "on-failure") {
+        return Err(format!("sidecar.restart 只支持 never / on-failure，收到：{r}"));
+    }
+    // 4) cwd：不写 = 插件目录；写了就必须在插件目录内
+    let cwd = spec.cwd.trim();
+    if !cwd.is_empty() && safe_join(Path::new("."), cwd).is_none() {
+        return Err(format!("sidecar.cwd 必须在插件目录内（不得越界）：{cwd}"));
+    }
+    // 5) env：只增不删，键值不许带 NUL
+    if spec.env.len() > MAX_SIDECAR_ENV {
+        return Err(format!(
+            "sidecar.env 过多（{} 条，上限 {MAX_SIDECAR_ENV}）",
+            spec.env.len()
+        ));
+    }
+    for (k, v) in &spec.env {
+        if k.trim().is_empty() || k.contains('\0') || v.contains('\0') {
+            return Err(format!("sidecar.env 含非法键值：{k}"));
+        }
+    }
+    // 6) sha256：写了就必须是 64 位十六进制
+    let s = spec.sha256.trim();
+    if !s.is_empty() && (s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(format!("sidecar.sha256 必须是 64 位十六进制：{s}"));
+    }
+    // 7) 授权端口白名单
+    if spec.allow_local_ports.len() > MAX_SIDECAR_ALLOW_PORTS {
+        return Err(format!(
+            "sidecar.allowLocalPorts 过多（{} 条，上限 {MAX_SIDECAR_ALLOW_PORTS}）",
+            spec.allow_local_ports.len()
+        ));
+    }
+    if spec.allow_local_ports.iter().any(|x| *x == 0) {
+        return Err("sidecar.allowLocalPorts 不得含 0".into());
+    }
+    Ok(())
+}
+
+/// 依赖安装的进度（2026-09-30 加，为「大依赖要能看到进度」）。
+///
+/// 宿主**只报事实**（阶段 + 已下/总字节），**不算速度** —— 速度是「两次上报之间的差值」，
+/// 只有拿着时钟的那一端（前端）算才有意义；宿主在这里引入时间概念只会多一份要同步的状态。
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyProgress {
+    /// 插件 id（前端的进度条按它过滤：同时只该有一个在装，但事件是全局的）
+    pub id: String,
+    /// 当前阶段：`download`（下载压缩包）/ `extract`（解压）—— 前端据此换文案
+    pub phase: String,
+    /// 已下载 / 待下载字节（`total = 0` 表示服务端没给 Content-Length）
+    pub downloaded: u64,
+    pub total: u64,
+    /// 第几条 / 共几条依赖（前端显示「依赖 1/2」；`total = 0` 表示当前不是依赖阶段）
+    pub index: usize,
+    pub count: usize,
 }
 
 /// 校验依赖条目（`parse_manifest` 调用；**校验不过整包拒绝**，同清单其它字段的口径）。
@@ -267,8 +457,11 @@ fn validate_dependency(d: &PluginDependency) -> Result<(), String> {
         }
         return Ok(());
     }
-    if !matches!(d.kind.as_str(), "" | "file") {
-        return Err(format!("依赖 type 只支持 file / npm，收到：{}", d.kind));
+    if !matches!(d.kind.as_str(), "" | "file" | "archive") {
+        return Err(format!(
+            "依赖 type 只支持 file / archive / npm，收到：{}",
+            d.kind
+        ));
     }
     if !d.url.starts_with("https://") {
         return Err(format!("依赖只允许 https 地址：{}", d.url));
@@ -328,6 +521,14 @@ pub struct InstalledPlugin {
     /// 这个插件声明的宿主能力（2026-09-28）。界面上如实列出（见 `PluginManifest::permissions`）。
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// 这个插件要**复用哪些内置（基础）插件的挂载监听**（2026-10-05）。
+    /// 前端 `attach.ts` 会逐个调基础插件那套 `attachXxxListeners(root)`。
+    #[serde(default)]
+    pub reuse: Vec<String>,
+    /// 这个插件声明的 sidecar（2026-10-06）。界面上如实列出「它要起哪个进程」
+    /// （信任卡里还会再列一遍 command / args / sha256）。
+    #[serde(default)]
+    pub sidecar: Option<SidecarSpec>,
 }
 
 /// 插件根目录：`<exe 根>\Modules`（2026-09-28 由 `plugins` 改名而来；与 skills / tools 同级）。
@@ -454,6 +655,23 @@ pub fn parse_manifest(text: &str) -> Result<PluginManifest, String> {
     }
     if let Some(shape) = &m.window {
         validate_window_shape(shape)?;
+    }
+    // `reuse`：只校验 id 形状与条数；「这个 id 是不是一个真的基础插件」由前端判定
+    // （基础插件名单是前端概念，见 kinds.ts 的 BASE_PLUGIN_IDS）—— 宿主不重复一份名单。
+    if m.reuse.len() > MAX_REUSE {
+        return Err(format!(
+            "reuse 条目过多（{} 条，上限 {MAX_REUSE}）",
+            m.reuse.len()
+        ));
+    }
+    for r in &m.reuse {
+        if !is_safe_id(r.trim()) {
+            return Err(format!("reuse 里的 id 非法（只允许 [a-z0-9._-]）：{r}"));
+        }
+    }
+    // sidecar（2026-10-06）：声明了就必须同时有 process.spawn，且 command/cwd 不得越界
+    if let Some(spec) = &m.sidecar {
+        validate_sidecar(spec, &m.permissions)?;
     }
     Ok(m)
 }
@@ -636,7 +854,15 @@ fn find_manifest(root: &Path) -> Result<PathBuf, String> {
 /// 返回值是插件 id。**同 id 视为「重装 / 升级」**（2026-09-28 改）：旧目录先改名成 `.old-*`
 /// 备份，新包或依赖任一步失败就把旧的搬回来、成功才删备份。于是「装重一次」既不会无声换掉
 /// 代码（失败可回滚），也不必让用户先卸载再装。
-pub fn install_from_bytes(bytes: &[u8], plugins_root: &Path) -> Result<String, String> {
+///
+/// 依赖阶段的进度经 `on_dep_progress` 回传（2026-09-30）—— 插件包本体（几十 KB~几十 MB）
+/// 由调用方自己下载、自己报进度；这里只管**落盘之后**那些依赖的下载/解压，
+/// 大块头（PaddleOCR 的 88MB `.7z`）都在这一步。
+pub fn install_from_bytes_with_progress(
+    bytes: &[u8],
+    plugins_root: &Path,
+    on_dep_progress: &mut dyn FnMut(DependencyProgress),
+) -> Result<String, String> {
     if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
         return Err(format!(
             "压缩包超过上限（{} MB）",
@@ -715,7 +941,9 @@ pub fn install_from_bytes(bytes: &[u8], plugins_root: &Path) -> Result<String, S
     }
 
     // ── 第四步：装依赖。失败 = 整次安装失败（把新版本删掉、旧版本搬回来）──
-    if let Err(e) = install_dependencies(&target, &manifest.dependencies) {
+    if let Err(e) =
+        install_dependencies_with_progress(&target, &manifest.id, &manifest.dependencies, on_dep_progress)
+    {
         let _ = fs::remove_dir_all(&target);
         if had_old {
             let _ = fs::rename(&backup, &target);
@@ -732,7 +960,14 @@ pub fn install_from_bytes(bytes: &[u8], plugins_root: &Path) -> Result<String, S
 /// 逐条安装清单里的依赖（`dependencies[]`）。**任意一条失败即中止**，由调用方决定是否回滚。
 ///
 /// 顺序执行、不并发：依赖条数是个位数，并发带来的收益抵不过「并发失败时哪一半落了盘」的复杂度。
-pub fn install_dependencies(plugin_dir: &Path, deps: &[PluginDependency]) -> Result<(), String> {
+/// 进度经 `on_progress` 回传（2026-09-30）；`plugin_id` 只用于填进 `DependencyProgress`
+/// （前端的进度条按它过滤事件），校验 / 落盘逻辑与这条无关。
+pub fn install_dependencies_with_progress(
+    plugin_dir: &Path,
+    plugin_id: &str,
+    deps: &[PluginDependency],
+    on_progress: &mut dyn FnMut(DependencyProgress),
+) -> Result<(), String> {
     if deps.is_empty() {
         return Ok(());
     }
@@ -749,10 +984,24 @@ pub fn install_dependencies(plugin_dir: &Path, deps: &[PluginDependency]) -> Res
         // 清单在 `parse_manifest` 已校验过一次；这里再校验一次是**双保险** ——
         // `install_dependencies` 是 pub，将来可能被「只补依赖」的入口直接调用。
         validate_dependency(d).map_err(|e| format!("第 {} 条依赖（{what}）非法：{e}", i + 1))?;
+        let index = i + 1;
+        let count = deps.len();
+        let mut report = |phase: &str, downloaded: u64, total: u64| {
+            on_progress(DependencyProgress {
+                id: plugin_id.to_string(),
+                phase: phase.to_string(),
+                downloaded,
+                total,
+                index,
+                count,
+            });
+        };
         let r = if d.is_npm() {
             install_npm_dependency(plugin_dir, d)
+        } else if d.is_archive() {
+            install_archive_dependency(plugin_dir, d, &mut report)
         } else {
-            install_file_dependency(plugin_dir, d)
+            install_file_dependency(plugin_dir, d, &mut report)
         };
         r.map_err(|e| format!("第 {} 条依赖（{what}）安装失败：{e}", i + 1))?;
     }
@@ -763,10 +1012,14 @@ pub fn install_dependencies(plugin_dir: &Path, deps: &[PluginDependency]) -> Res
 ///
 /// 三道闸与插件包同源：**只 https**、**体积上限**、**落点必须留在插件目录内**（`safe_join`）；
 /// 另外多一道 **sha256**（清单写了就必须对上）。先写 `.part` 再改名 —— 半截文件不能被当成装好的。
-fn install_file_dependency(plugin_dir: &Path, d: &PluginDependency) -> Result<(), String> {
+fn install_file_dependency(
+    plugin_dir: &Path,
+    d: &PluginDependency,
+    report: &mut dyn FnMut(&str, u64, u64),
+) -> Result<(), String> {
     let dest = safe_join(plugin_dir, &d.dest)
         .ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
-    let bytes = download_bytes(&d.url, MAX_DEP_BYTES)?;
+    let bytes = download_bytes_with_progress(&d.url, MAX_DEP_BYTES, report)?;
     let want = d.sha256.trim();
     if want.is_empty() {
         crate::log::warn(format!(
@@ -791,6 +1044,191 @@ fn install_file_dependency(plugin_dir: &Path, d: &PluginDependency) -> Result<()
         format!("落盘依赖失败：{e}")
     })?;
     Ok(())
+}
+
+/// 压缩包的两种形态（按**魔数**识别，不看扩展名 —— 扩展名是作者随手写的，魔数是文件自己说的）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFormat {
+    Zip,
+    SevenZ,
+}
+
+/// 按头部魔数判断压缩格式：`PK\x03\x04`（zip）/ `7z¼¯'`（7z）。
+fn detect_archive_format(bytes: &[u8]) -> Result<ArchiveFormat, String> {
+    const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+    const SEVENZ_MAGIC: [u8; 6] = [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c];
+    if bytes.starts_with(&SEVENZ_MAGIC) {
+        return Ok(ArchiveFormat::SevenZ);
+    }
+    if bytes.starts_with(&ZIP_MAGIC) {
+        return Ok(ArchiveFormat::Zip);
+    }
+    Err("依赖压缩包既不是 zip 也不是 7z（按魔数判断）".into())
+}
+
+/// `archive` 形态的依赖：下载压缩包 → 校验 sha256 → 解到插件目录内的 staging → 原子替换 `dest` 目录。
+///
+/// 安全判据与插件包同源（见文件头）：路径穿越逐条拒、解压后总量与条目数有上限、先 staging 再改名。
+/// **7z 那条必须自己给 extract_fn** —— sevenz-rust 的默认解压直接 `dest.join(entry.name())`，
+/// 对 `..\..\x` 不做任何拦截（见其 `default_entry_extract_fn`），拿它解第三方包等于把
+/// 「路径穿越」这道闸整个去掉。zip 那条复用 `extract_zip`（已经是安全的）。
+fn install_archive_dependency(
+    plugin_dir: &Path,
+    d: &PluginDependency,
+    report: &mut dyn FnMut(&str, u64, u64),
+) -> Result<(), String> {
+    let dest = safe_join(plugin_dir, &d.dest)
+        .ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
+    let bytes = download_bytes_with_progress(&d.url, MAX_DEP_BYTES, report)?;
+    let want = d.sha256.trim();
+    if want.is_empty() {
+        crate::log::warn(format!(
+            "压缩包依赖 {} 没有 sha256，已按「只校验 https」安装 —— 作者最好补上校验和",
+            d.url
+        ));
+    } else {
+        let got = hex_sha256(&bytes);
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
+        }
+    }
+    let format = detect_archive_format(&bytes)?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_millis())
+        .unwrap_or(0);
+    let staging = plugin_dir.join(format!(".dep-staging-{stamp}"));
+    let _ = fs::remove_dir_all(&staging);
+    report("extract", 0, 0);
+
+    let extracted = extract_archive(&bytes, format, &staging);
+    if let Err(e) = extracted {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    // 上游常把整棵树包在一个顶层目录里（PaddleOCR 的 `.7z` 就是 `PaddleOCR-json_v1.4.1/`）。
+    // 只有「唯一一个子目录、包里没有别的文件」时才把它摊平 —— 与 `install_from_bytes`
+    // 对插件包的处置同源（那里也是认这一种形状），摊平后 dest 下直接是引擎 exe + models/。
+    let root = flatten_single_top_dir(&staging);
+
+    // 原子替换 dest：旧的先改名成备份，新的搬进去，成功才删备份、失败搬回来。
+    let backup = plugin_dir.join(format!(".dep-old-{stamp}"));
+    let had_old = dest.exists();
+    if had_old {
+        let _ = fs::remove_dir_all(&backup);
+        if let Err(e) = fs::rename(&dest, &backup) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!("备份旧依赖失败（未改动已装内容）：{e}"));
+        }
+    }
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            let _ = fs::remove_dir_all(&staging);
+            if had_old {
+                let _ = fs::rename(&backup, &dest);
+            }
+            return Err(format!("建依赖目录失败：{e}"));
+        }
+    }
+    if let Err(e) = fs::rename(&root, &dest) {
+        let _ = fs::remove_dir_all(&staging);
+        if had_old {
+            let _ = fs::rename(&backup, &dest);
+        }
+        return Err(format!("落盘依赖失败：{e}"));
+    }
+    let _ = fs::remove_dir_all(&staging);
+    if had_old {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
+/// 把压缩包解到 `staging`（建目录 + 按格式分派）。抽出来只为让单测能直接打这条路径
+/// （zip 穿越、7z 穿越两套判据都在它下游）。
+fn extract_archive(bytes: &[u8], format: ArchiveFormat, staging: &Path) -> Result<(), String> {
+    fs::create_dir_all(staging).map_err(|e| format!("建解压目录失败：{e}"))?;
+    match format {
+        ArchiveFormat::Zip => {
+            extract_zip(std::io::Cursor::new(bytes), staging, MAX_DEP_EXTRACT_BYTES)
+        }
+        ArchiveFormat::SevenZ => extract_sevenz(bytes, staging),
+    }
+}
+
+/// 若 `root` 下**只有唯一一个子目录、且没有任何文件**，返回那个子目录；否则返回 `root`。
+/// 这是上游打包最常见的形状（`pkg-v1.2/…`），摊平后调用方的路径少一层。
+fn flatten_single_top_dir(root: &Path) -> PathBuf {
+    let Ok(entries) = fs::read_dir(root) else {
+        return root.to_path_buf();
+    };
+    let mut only_dir: Option<PathBuf> = None;
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            return root.to_path_buf();
+        }
+        if only_dir.is_some() {
+            return root.to_path_buf();
+        }
+        only_dir = Some(p);
+    }
+    only_dir.unwrap_or_else(|| root.to_path_buf())
+}
+
+/// 解 7z 到 `staging`，**逐条校验落点 + 累计解压量 + 条目数**（理由见调用方注释）。
+///
+/// 用 `decompress_with_extract_fn` 而不是 `decompress_file`：后者把 `dest.join(entry.name())`
+/// 直接交给默认 extract_fn，`..\..\evil` 会被写到 dest 外面去。这里每条都过 `safe_join`。
+fn extract_sevenz(bytes: &[u8], staging: &Path) -> Result<(), String> {
+    let mut written: u64 = 0;
+    let mut count: usize = 0;
+    let result = sevenz_rust::decompress_with_extract_fn(
+        std::io::Cursor::new(bytes),
+        staging,
+        |entry, reader, _dest| {
+            count += 1;
+            if count > MAX_DEP_EXTRACT_ENTRIES {
+                return Err(sevenz_rust::Error::other(format!(
+                    "压缩包内条目过多（超过 {MAX_DEP_EXTRACT_ENTRIES} 个）"
+                )));
+            }
+            // **用 entry.name() 自己拼**，不用 sevenz-rust 预拼好的 _dest（那个没校验过）
+            let Some(path) = safe_join(staging, entry.name()) else {
+                return Err(sevenz_rust::Error::other(format!(
+                    "压缩包内含越界路径，已拒绝安装：{}",
+                    entry.name()
+                )));
+            };
+            if entry.is_directory() {
+                fs::create_dir_all(&path).map_err(sevenz_rust::Error::io)?;
+                return Ok(true);
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
+            }
+            let mut out = fs::File::create(&path).map_err(sevenz_rust::Error::io)?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf).map_err(sevenz_rust::Error::io)?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                if written > MAX_DEP_EXTRACT_BYTES {
+                    return Err(sevenz_rust::Error::other(format!(
+                        "解压后体积超过上限（{} MB），已拒绝安装",
+                        MAX_DEP_EXTRACT_BYTES / 1024 / 1024
+                    )));
+                }
+                out.write_all(&buf[..n]).map_err(sevenz_rust::Error::io)?;
+            }
+            Ok(true)
+        },
+    );
+    result.map_err(|e| format!("7z 解压失败：{e}"))
 }
 
 /// `npm install --prefix <插件目录> <包名>@<版本>`（`npm` 形态）。
@@ -861,27 +1299,30 @@ fn install_npm_dependency(plugin_dir: &Path, d: &PluginDependency) -> Result<(),
 
 /// 从 https 拉一段字节（有体积上限）。仅给依赖下载用 —— 插件包本体那条路在 commands.rs 里，
 /// 因为它还要兼顾 Content-Length 与错误上报的口径。
-fn download_bytes(url: &str, limit: u64) -> Result<Vec<u8>, String> {
-    if !url.starts_with("https://") {
-        return Err("只允许 https 的依赖地址".into());
-    }
+///
+/// **没有总超时**（2026-09-30 用户要求）：`archive` 依赖是 88MB 量级的引擎包，套一个「整条请求
+/// 多少秒内必须结束」的上限，在慢链路上等于把安装判死刑（而且越大的包越吃亏）。
+///
+/// 唯一剩下的时间闸是**建连超时**（30s）—— 它管的是「连不上」，与「传了多少」无关。
+/// **诚实说清代价**：传输中途若对端彻底不出声，这里不会主动掐断（`reqwest::blocking` 的
+/// `ClientBuilder` 没有 `read_timeout`，0.12 只给异步那份；要自己实现得改成分块 + 手动计时，
+/// 那是另一个量级的复杂度）。真碰上时靠 Windows 的 TCP keepalive 兜底 —— 用户选的就是
+/// 「宁可等，也不要下到一半被判超时」。
+///
+/// 每读一块回传 `(阶段, 已下, 总)`（`总 = 0` 表示服务端没给长度）。
+fn download_bytes_with_progress(
+    url: &str,
+    limit: u64,
+    report: &mut dyn FnMut(&str, u64, u64),
+) -> Result<Vec<u8>, String> {
+    let mut resp = open_https_stream(url)?;
     let over = || format!("依赖文件超过上限（{} MB）", limit / 1024 / 1024);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("Client error: {e}"))?;
-    let mut resp = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("下载失败：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}：下载失败", resp.status().as_u16()));
-    }
     if let Some(len) = resp.content_length() {
         if len > limit {
             return Err(over());
         }
     }
+    let total = resp.content_length().unwrap_or(0);
     let mut bytes: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -893,8 +1334,28 @@ fn download_bytes(url: &str, limit: u64) -> Result<Vec<u8>, String> {
             return Err(over());
         }
         bytes.extend_from_slice(&buf[..n]);
+        report("download", bytes.len() as u64, total);
     }
     Ok(bytes)
+}
+
+/// 发一个 https GET 并返回响应流（非 2xx 直接报错）。超时口径见 `download_bytes` 的注释。
+///
+/// 抽出来是为了让「依赖下载」与 commands.rs 里的「插件包下载」共用同一套超时口径 ——
+/// 两处各写一遍 `.connect_timeout(...)`，改一处漏一处的教训本仓已经有过。
+pub fn open_https_stream(url: &str) -> Result<reqwest::blocking::Response, String> {
+    if !url.starts_with("https://") {
+        return Err("只允许 https 的地址".into());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Client error: {e}"))?;
+    let resp = client.get(url).send().map_err(|e| format!("下载失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}：下载失败", resp.status().as_u16()));
+    }
+    Ok(resp)
 }
 
 /// sha256 的十六进制小写表示（用于依赖校验和比对）。
@@ -934,6 +1395,8 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
             error: String::new(),
             dependencies: Vec::new(),
             permissions: Vec::new(),
+            reuse: Vec::new(),
+            sidecar: None,
         };
         match fs::read_to_string(dir.join(MANIFEST_FILE)) {
             Ok(text) => match parse_manifest(&text) {
@@ -952,6 +1415,8 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
                     item.homepage = m.homepage.clone();
                     item.dependencies = m.dependencies.clone();
                     item.permissions = m.permissions.clone();
+                    item.reuse = m.reuse.clone();
+                    item.sidecar = m.sidecar.clone();
                     match safe_join(&dir, &m.entry) {
                         Some(p) if p.is_file() => {
                             item.entry_path = p.to_string_lossy().to_string();
@@ -1022,6 +1487,40 @@ mod tests {
         format!(
             r#"{{"id":"{id}","name":"Demo","description":"d","keywords":["demo"],"icon":"x","version":"1.0.0","entry":"index.js"}}"#
         )
+    }
+
+    /// 装一份包（不关心依赖进度）—— 生产路径由 commands.rs 传真回调，测试里一律吞掉。
+    fn install(bytes: &[u8], root: &Path) -> Result<String, String> {
+        install_from_bytes_with_progress(bytes, root, &mut |_| {})
+    }
+
+    /// sidecar（2026-10-06，L12 档 1）：**必须与 `process.spawn` 同时出现**，
+    /// 且 `command` / `cwd` 不得越出插件目录（fail-closed）。
+    #[test]
+    fn sidecar_requires_process_spawn_and_stays_in_plugin_dir() {
+        let base = r#"{"id":"s","entry":"index.js","permissions":["process.spawn"],
+            "sidecar":{"command":"bin/tool.exe","transport":"both","port":0,
+            "restart":"on-failure","sha256":"SHA"}}"#;
+        // sha256 必须是 64 位十六进制
+        assert!(parse_manifest(&base.replace("SHA", "ab")).is_err(), "sha256 位数不对必须拒");
+        let ok = base.replace("SHA", &"a".repeat(64));
+        assert!(parse_manifest(&ok).is_ok(), "合法 sidecar 应通过：{:?}", parse_manifest(&ok).err());
+
+        // 缺 process.spawn ⇒ 拒装（不能靠「声明即生效」）
+        let no_perm = ok.replace(r#""permissions":["process.spawn"],"#, "");
+        assert!(parse_manifest(&no_perm).is_err(), "sidecar 缺 process.spawn 必须拒装");
+
+        // command 越界 / 绝对路径 ⇒ 拒
+        for bad in ["../evil.exe", "C:/Windows/System32/cmd.exe", "/bin/sh"] {
+            let t = ok.replace("bin/tool.exe", bad);
+            assert!(parse_manifest(&t).is_err(), "command 越界应拒：{bad}");
+        }
+        // cwd 越界 ⇒ 拒
+        let bad_cwd = ok.replace(r#""transport":"both""#, r#""cwd":"../..","transport":"both""#);
+        assert!(parse_manifest(&bad_cwd).is_err(), "cwd 越界应拒");
+        // transport / restart 枚举
+        assert!(parse_manifest(&ok.replace(r#""transport":"both""#, r#""transport":"tcp""#)).is_err());
+        assert!(parse_manifest(&ok.replace(r#""restart":"on-failure""#, r#""restart":"always""#)).is_err());
     }
 
     #[test]
@@ -1095,7 +1594,7 @@ mod tests {
             ("lunac-plugin.json", &good_manifest("demo-pet")),
             ("index.js", "export default { id: 'demo-pet' };"),
         ]);
-        let id = install_from_bytes(&bytes, &root).unwrap();
+        let id = install(&bytes, &root).unwrap();
         assert_eq!(id, "demo-pet");
         let list = list_installed(&root);
         assert_eq!(list.len(), 1);
@@ -1107,13 +1606,13 @@ mod tests {
             ("lunac-plugin.json", &good_manifest("demo-pet")),
             ("index.js", "export default { id: 'demo-pet', v: 2 };"),
         ]);
-        assert_eq!(install_from_bytes(&bytes2, &root).unwrap(), "demo-pet");
+        assert_eq!(install(&bytes2, &root).unwrap(), "demo-pet");
         assert!(fs::read_to_string(root.join("demo-pet").join("index.js"))
             .unwrap()
             .contains("v: 2"));
         // 清单写的入口不存在 ⇒ 拒绝，且**旧版本原样保留**、不留任何残渣
         let bad = zip_bytes(&[("lunac-plugin.json", &good_manifest("demo-pet"))]);
-        let err = install_from_bytes(&bad, &root).unwrap_err();
+        let err = install(&bad, &root).unwrap_err();
         assert!(err.contains("入口不存在"), "{err}");
         assert!(root.join("demo-pet").join("index.js").is_file());
         let leftovers: Vec<String> = fs::read_dir(&root)
@@ -1138,7 +1637,7 @@ mod tests {
             ("LunacPet/lunac-plugin.json", &good_manifest("lunac-pet")),
             ("LunacPet/index.js", "export default {};"),
         ]);
-        assert_eq!(install_from_bytes(&bytes, &root).unwrap(), "lunac-pet");
+        assert_eq!(install(&bytes, &root).unwrap(), "lunac-pet");
         let list = list_installed(&root);
         assert!(list[0].valid, "{:?}", list[0].error);
         assert!(root.join("lunac-pet").join("index.js").is_file());
@@ -1193,14 +1692,18 @@ mod tests {
         let ok = r#"{"id":"music","entry":"index.js","dependencies":[
             {"type":"file","url":"https://e.com/librespot.exe","dest":"bin/librespot.exe","sha256":"AB12"},
             {"type":"npm","package":"@scope/pkg","version":"^2.0.0"},
-            {"url":"https://e.com/model.bin","dest":"model.bin"}
+            {"url":"https://e.com/model.bin","dest":"model.bin"},
+            {"type":"archive","url":"https://e.com/engine.7z","dest":"paddle-ocr","sha256":"CD34"}
         ]}"#;
         let m = parse_manifest(ok).unwrap();
-        assert_eq!(m.dependencies.len(), 3);
+        assert_eq!(m.dependencies.len(), 4);
         assert!(!m.dependencies[0].is_npm());
         assert!(m.dependencies[1].is_npm());
+        assert!(m.dependencies[3].is_archive());
+        // archive 的 dest 一律按**目录**看：`paddle-ocr` 这种单段路径合法，越界的照样拒
+        assert!(validate_dependency(&m.dependencies[3]).is_ok());
 
-        // 逐条坏：明文 http / dest 越界 / 缺 dest / npm 缺包名 / 未知 type
+        // 逐条坏：明文 http / dest 越界 / 缺 dest / npm 缺包名 / 未知 type / archive 越界
         let bad = [
             r#"[{"url":"http://e.com/a.exe","dest":"a.exe"}]"#,
             r#"[{"url":"https://e.com/a.exe","dest":"../a.exe"}]"#,
@@ -1208,11 +1711,57 @@ mod tests {
             r#"[{"type":"npm"}]"#,
             r#"[{"type":"npm","package":"--registry=http://evil"}]"#,
             r#"[{"type":"zip","url":"https://e.com/a.zip"}]"#,
+            r#"[{"type":"archive","url":"https://e.com/a.7z","dest":"../escape"}]"#,
+            r#"[{"type":"archive","url":"http://e.com/a.7z","dest":"engine"}]"#,
         ];
         for b in bad {
             let text = format!(r#"{{"id":"demo","entry":"index.js","dependencies":{b}}}"#);
             assert!(parse_manifest(&text).is_err(), "应被拒：{b}");
         }
+    }
+
+    /// `archive` 形态的识别与摊平（2026-09-30）：魔数说了算 + 唯一顶层目录才摊平。
+    #[test]
+    fn archive_dependency_detects_format_and_flattens_single_root() {
+        // 魔数：7z 与 zip 各认一份，别的（含空）一律拒
+        assert_eq!(
+            detect_archive_format(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0x00]).unwrap(),
+            ArchiveFormat::SevenZ
+        );
+        assert_eq!(
+            detect_archive_format(&[0x50, 0x4b, 0x03, 0x04, 0x00]).unwrap(),
+            ArchiveFormat::Zip
+        );
+        assert!(detect_archive_format(b"not an archive").is_err());
+        assert!(detect_archive_format(&[]).is_err());
+
+        // 唯一顶层目录 ⇒ 摊平；只要掺一个文件或多一个目录就不摊
+        let root = tmp_root("flatten");
+        let single = root.join("single");
+        fs::create_dir_all(single.join("PaddleOCR-json_v1.4.1")).unwrap();
+        assert_eq!(
+            flatten_single_top_dir(&single),
+            single.join("PaddleOCR-json_v1.4.1")
+        );
+        fs::write(single.join("stray.txt"), "x").unwrap();
+        assert_eq!(flatten_single_top_dir(&single), single);
+        let two = root.join("two");
+        fs::create_dir_all(two.join("a")).unwrap();
+        fs::create_dir_all(two.join("b")).unwrap();
+        assert_eq!(flatten_single_top_dir(&two), two);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `archive` 依赖走的是**与插件包同一套**穿越判据：zip 里的 `../evil` 必须在写盘前被拦下。
+    #[test]
+    fn archive_extraction_refuses_entries_outside_the_staging_dir() {
+        let root = tmp_root("dep-archive");
+        let staging = root.join("staging");
+        let bytes = zip_bytes(&[("../evil.exe", "MZ"), ("engine.exe", "MZ")]);
+        let err = extract_archive(&bytes, ArchiveFormat::Zip, &staging).unwrap_err();
+        assert!(err.contains("越界路径"), "{err}");
+        assert!(!root.join("evil.exe").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 声明的宿主能力（2026-09-28）：合法的过、格式非法的整包拒、**不认识的只 warn 不拒**。
@@ -1231,6 +1780,24 @@ mod tests {
         }
         let many = (0..(MAX_PERMISSIONS + 1)).map(|i| format!("\"cap{i}\"")).collect::<Vec<_>>().join(",");
         let text = format!(r#"{{"id":"demo","entry":"index.js","permissions":[{many}]}}"#);
+        assert!(parse_manifest(&text).is_err());
+    }
+
+    /// `reuse`（2026-10-05，复用基础插件监听）：合法 id 过、形状非法 / 条数超限整包拒。
+    #[test]
+    fn manifest_validates_reuse() {
+        let ok = r#"{"id":"demo","entry":"index.js","reuse":["settings","quick-launch"]}"#;
+        let m = parse_manifest(ok).unwrap();
+        assert_eq!(m.reuse, vec!["settings".to_string(), "quick-launch".to_string()]);
+        // 不写这一段 = 不复用（合法）
+        assert!(parse_manifest(r#"{"id":"demo","entry":"index.js"}"#).unwrap().reuse.is_empty());
+        // 形状非法：整包拒
+        for bad in [r#"["UPPER"]"#, r#"["has space"]"#, r#"["bad/slash"]"#] {
+            let text = format!(r#"{{"id":"demo","entry":"index.js","reuse":{bad}}}"#);
+            assert!(parse_manifest(&text).is_err(), "应被拒：{bad}");
+        }
+        let many = (0..(MAX_REUSE + 1)).map(|i| format!("\"p{i}\"")).collect::<Vec<_>>().join(",");
+        let text = format!(r#"{{"id":"demo","entry":"index.js","reuse":[{many}]}}"#);
         assert!(parse_manifest(&text).is_err());
     }
 
@@ -1304,7 +1871,8 @@ mod tests {
             dest: "../escape.exe".into(),
             ..Default::default()
         };
-        let err = install_dependencies(&plugin, &[dep]).unwrap_err();
+        let err = install_dependencies_with_progress(&plugin, "demo", &[dep], &mut |_| {})
+            .unwrap_err();
         assert!(err.contains("越界"), "{err}");
         assert!(!root.join("escape.exe").exists());
         let _ = fs::remove_dir_all(&root);

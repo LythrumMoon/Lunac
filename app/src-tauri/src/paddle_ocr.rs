@@ -8,30 +8,31 @@
 //   PaddleOCR-json.exe -image_path=<path> -config_path=<config> -ensure_ascii=false
 //   stdout → JSON: {"code":100,"data":[{"text":"...","box":[...],"score":0.99}]}
 //
-// 部署：paddle-ocr/ 目录与 core/ 平级，发行版通过 NSIS 打包到 lunac.exe 同目录。
+// 部署（2026-09-30 改）：引擎是 **`ocr` 插件的依赖**，由插件市场安装插件时按清单的
+// `dependencies[]`（`type = "archive"`）下载解压到 `Modules\ocr\paddle-ocr\`
+// （见 plugin_market.rs 的 install_archive_dependency）。
+//
+// **不再随安装包分发、宿主也不再自下载**：引擎压缩后约 88MB / 解压约 300MB，塞进安装包等于
+// 让所有用户替少数人的功能买单（见 ai-spec §3.5）。宿主侧因此**没有**任何下载代码 ——
+// 引擎的获取只有一条路：装/修插件时走插件依赖（`install_plugin_dependencies`）。
+// 老版本装在 `<exe 根>\paddle-ocr\` 的那份仍然认（见 `paddle_ocr_dir` 的优先级），
+// 免得老用户升级后 OCR 突然失效；卸载时由 nsis-hooks.nsh 清掉。
 
 use serde::Deserialize;
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-// ── 引擎部署 / 按需下载 ───────────────────────────────────────────
-//
-// PaddleOCR-json 体积大（.7z 约 88MB，解压后约 300MB），不随仓库分发
-// （见 .gitignore）。运行时若缺失，由前端按需触发下载到 `<exe 根>\paddle-ocr`。
+// ── 引擎落点 ──────────────────────────────────────────────────────
 
-/// PaddleOCR-json v1.4.1 Windows x64 发行包。
-/// 注意：该 Release 的 Windows 资产只有 `.7z`（没有 `.zip`），
-/// 用 `Expand-Archive` 解不了，故使用纯 Rust 的 sevenz-rust 解压。
-pub const PADDLE_OCR_URL: &str = "https://github.com/hiroi-sora/PaddleOCR-json/releases/download/v1.4.1/PaddleOCR-json_v1.4.1_windows_x64.7z";
-
-/// 引擎安装根目录：`<exe 根>\paddle-ocr`（与 storage.rs 数据根一致）。
+/// 引擎安装根目录：`<exe 根>\Modules\ocr\paddle-ocr`（与插件目录同源，见 plugin_market）。
 pub fn engine_root() -> PathBuf {
-    crate::storage::lunac_root_dir().join("paddle-ocr")
+    crate::plugin_market::plugins_dir()
+        .join("ocr")
+        .join("paddle-ocr")
 }
 
 /// 引擎是否已就绪（能定位到 PaddleOCR-json.exe 且默认中文模型配置存在）。
@@ -40,92 +41,6 @@ pub fn engine_installed() -> bool {
         Ok(dir) => dir.join(paddle_ocr_config_for_lang("chs")).exists(),
         Err(_) => false,
     }
-}
-
-/// 下载并安装 PaddleOCR-json 引擎。
-///
-/// 流程：下载 .7z → 解压到 staging → 校验 → 原子替换到 `<exe 根>\paddle-ocr`。
-/// 任何一步失败都会清理半成品，不会留下损坏目录（否则 `paddle_ocr_dir()`
-/// 会定位到残缺目录、OCR 永久失败却看不出原因）。
-///
-/// `on_progress(已下载字节, 总字节)`：总字节未知时为 0。
-pub fn install_engine<F: FnMut(u64, u64)>(mut on_progress: F) -> Result<(), String> {
-    let root_dir = crate::storage::lunac_root_dir();
-    let temp_dir = root_dir.join("temp");
-    fs::create_dir_all(&temp_dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
-    let archive = temp_dir.join("paddle-ocr.7z");
-    let staging = temp_dir.join("paddle-ocr-staging");
-
-    // ── 1. 下载 ──────────────────────────────────────────────────
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(900))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-    let mut resp = client
-        .get(PADDLE_OCR_URL)
-        .send()
-        .map_err(|e| format!("下载失败（网络不可达？）: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载失败: HTTP {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
-    {
-        let mut out = fs::File::create(&archive).map_err(|e| format!("创建文件失败: {e}"))?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut done: u64 = 0;
-        loop {
-            let n = resp
-                .read(&mut buf)
-                .map_err(|e| format!("读取响应失败: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])
-                .map_err(|e| format!("写入文件失败: {e}"))?;
-            done += n as u64;
-            on_progress(done, total);
-        }
-    }
-
-    // ── 2. 解压到 staging（先不碰正式目录）───────────────────────
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging).map_err(|e| format!("创建解压目录失败: {e}"))?;
-    if let Err(e) = sevenz_rust::decompress_file(&archive, &staging) {
-        let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_file(&archive);
-        return Err(format!("7z 解压失败: {e}"));
-    }
-    let _ = fs::remove_file(&archive);
-
-    // ── 3. 校验 staging（必须含 exe + 默认中文模型配置）──────────
-    let verify = |dir: &PathBuf| -> bool {
-        dir.join("PaddleOCR-json.exe").exists()
-            && dir.join(paddle_ocr_config_for_lang("chs")).exists()
-    };
-    let staged_dir = match find_engine_dir(&staging) {
-        Some(d) if verify(&d) => d,
-        _ => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(
-                "解压后未找到可用的 PaddleOCR-json.exe / models 配置，安装包可能不完整".into(),
-            );
-        }
-    };
-
-    // ── 4. 原子替换到 <exe 根>\paddle-ocr ───────────────────────
-    let target = engine_root();
-    if target.exists() {
-        fs::remove_dir_all(&target).map_err(|e| format!("清理旧引擎目录失败: {e}"))?;
-    }
-    // staged_dir 可能已是 staging 本身；统一 rename（同盘，原子）
-    fs::rename(&staged_dir, &target).map_err(|e| format!("移动到目标目录失败: {e}"))?;
-    let _ = fs::remove_dir_all(&staging);
-
-    // ── 5. 最终验证（以运行时实际查找结果为准）──────────────────
-    if !engine_installed() {
-        return Err("安装完成但引擎仍无法定位，请检查目录权限".into());
-    }
-    Ok(())
 }
 
 /// PaddleOCR-json 输出结构 ────────────────────────────────────────
@@ -182,9 +97,12 @@ pub fn find_engine_dir(root: &Path) -> Option<PathBuf> {
 /// 返回 PaddleOCR-json 可执行文件所在目录。
 ///
 /// 搜索优先级：
-///   1. `<exe 根>\paddle-ocr\`  — 安装根/数据根（见 storage.rs），也是自动下载的落点
-///   2. 项目根目录下的 `paddle-ocr/`（dev 模式：从 target/ 向上导航）
-///   3. 当前工作目录（兜底）
+///   1. `<exe 根>\Modules\ocr\paddle-ocr\`  — **正规落点**（2026-09-30）：`ocr` 插件的
+///      `archive` 依赖解压到这里（见 plugin_market.rs），删插件 = 引擎一起删
+///   2. `<exe 根>\paddle-ocr\`  — **老版本的落点**（引擎曾随安装包分发）。留着它是因为
+///      老用户升级后引擎还躺在原处，去掉这条他们的 OCR 会突然失效；卸载由 nsis-hooks.nsh 兜底
+///   3. 项目根目录下的 `paddle-ocr/`（dev 模式：从 target/ 向上导航）
+///   4. 当前工作目录（兜底）
 fn paddle_ocr_dir() -> Result<PathBuf, String> {
     let exe_dir = std::env::current_exe()
         .map_err(|e| format!("无法获取 exe 路径: {e}"))?
@@ -192,12 +110,17 @@ fn paddle_ocr_dir() -> Result<PathBuf, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // Priority 1: <exe 根>\paddle-ocr\
+    // Priority 1: 插件依赖的落点（<exe 根>\Modules\ocr\paddle-ocr\）
+    if let Some(found) = find_engine_dir(&engine_root()) {
+        return Ok(found);
+    }
+
+    // Priority 2: 老版本的落点（<exe 根>\paddle-ocr\）
     if let Some(found) = find_engine_dir(&exe_dir.join("paddle-ocr")) {
         return Ok(found);
     }
 
-    // Priority 2: 从 target/ 向上导航到项目根（dev mode）
+    // Priority 3: 从 target/ 向上导航到项目根（dev mode）
     if let Some(found) = find_engine_dir(
         &exe_dir
             .join("..")
@@ -209,7 +132,7 @@ fn paddle_ocr_dir() -> Result<PathBuf, String> {
         return Ok(found);
     }
 
-    // Priority 3: 相对当前工作目录（兜底）
+    // Priority 4: 相对当前工作目录（兜底）
     if let Some(found) =
         find_engine_dir(&std::env::current_dir().unwrap_or_default().join("paddle-ocr"))
     {
@@ -217,7 +140,7 @@ fn paddle_ocr_dir() -> Result<PathBuf, String> {
     }
 
     Err(format!(
-        "OCR 引擎未安装。请点击「下载并安装」自动获取，或手动放置到 {}",
+        "OCR 引擎未安装。请在 设置 → 插件 里装上/修复「OCR 文字识别」（引擎会作为它的依赖一并下载），或手动放置到 {}",
         engine_root().display()
     ))
 }
@@ -279,9 +202,21 @@ pub fn recognize_image(image_path: &str, lang: &str) -> Result<String, String> {
     {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let output = cmd
-        .output()
+    // **拆成 spawn + wait_with_output，只为拿到句柄绑生命周期**（预检 #57，2026-10-02）：
+    // `.output()` 内部 spawn 完就把句柄吞了，我们没法把它加进 job —— 宿主崩溃时
+    // 这个 OCR 子进程就成了孤儿（它会驻留几秒做推理，不是瞬间进程）。
+    // ⚠️ 两个管道必须**显式**声明 piped：`.output()` 会替我们设，`.spawn()` **不会**
+    // （默认继承）—— 漏了这一句，`wait_with_output` 拿回的 stdout 就是空的，
+    // 表现为「识别成功但一个字都没有」，而那是极难查的一类静默失效。
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to spawn PaddleOCR-json: {}", e))?;
+    crate::child_job::assign(&child);
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read PaddleOCR-json output: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

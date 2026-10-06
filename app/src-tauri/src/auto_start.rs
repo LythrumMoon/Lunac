@@ -54,7 +54,10 @@ pub struct AutoStartInfo {
 /// 实测日志：计划任务曾被一次 dev 调试注册成 `…\target\debug\lunac.exe --background`，
 /// 之后每次登录都由它拉起 —— 用户看到的正是「开机弹 cmd + 呼出来的界面不能用」。
 /// 所以开发构建**一律不碰用户的开机项**：既不许注册，也不去「修复」。
-fn is_dev_build() -> bool {
+///
+/// `pub(crate)`：`updater.rs` 也要同一份判断（开发构建不许自更新，理由同类）——
+/// 判据必须只有一份，别各抄一遍。
+pub(crate) fn is_dev_build() -> bool {
     if cfg!(debug_assertions) {
         return true;
     }

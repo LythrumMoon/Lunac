@@ -197,6 +197,7 @@ extern "system" {
 extern "system" {
     fn GetLastError() -> u32;
     fn GetCurrentThreadId() -> u32;
+    fn GetCurrentProcessId() -> u32;
     fn GetTickCount() -> u32;
     fn GlobalLock(h_mem: isize) -> isize;
     fn GlobalUnlock(h_mem: isize) -> i32;
@@ -1047,16 +1048,26 @@ pub fn start_hotkey(app: AppHandle) {
             // 详细搜索是被动视图、没有在跑的东西，故照旧允许自动隐藏
             // —— 这里刻意只排除 PLUGIN，不是「非 Main 全排除」，以免顺手改了既有行为。
             //
-            // **插件悬浮窗也算「不许隐藏」**（2026-09-27 多窗口）：用户点插件窗口时
-            // 主窗口必然不在前台，若不放行，「插件窗与搜索窗同时存在」这条需求
-            // 会在 2 秒后被这条守卫自己推翻（主窗口被藏掉）。
-            let plugin_windows_open = crate::plugin_window::OPEN_WINDOWS.load(Ordering::SeqCst) > 0;
+            // **判据是「前景窗口是不是我们自己的」**（2026-10-02 修，用户报「release 版里
+            // 点其他应用时搜索栏不再自动隐藏」）。原实现用的是「有没有插件悬浮窗开着」
+            // （`OPEN_WINDOWS > 0`）就整个跳过 —— 那太粗了：只要**任何一个**插件悬浮窗
+            // 还开着（音乐窗最典型，用户一直挂在那儿），主窗就**永远**不再自动隐藏，
+            // 表现就是「失焦隐藏的逻辑丢了」。
+            // 现在按 PID 判：主窗 / 任一插件悬浮窗 / 桌宠窗都是**同一进程**的 Tauri 窗口，
+            // 前景落在它们任何一个上就算「用户还在我们界面里」⇒ 不隐藏；
+            // 前景换成别的程序（浏览器 / 资源管理器…）⇒ 照常隐藏。
+            // 这同时覆盖了原注释担心的事（「插件窗与搜索窗同时存在」被守卫自己推翻）：
+            // 用户点插件窗时前景就是那个插件窗 ⇒ 本进程 ⇒ 不隐藏。
             if !DETACHED.load(Ordering::SeqCst)
                 && UI_MODE.load(Ordering::SeqCst) != UI_MODE_PLUGIN
-                && !plugin_windows_open
             {
                 let fg = GetForegroundWindow();
-                if fg != 0 && fg != hwnd {
+                let mut fg_pid = 0u32;
+                if fg != 0 {
+                    GetWindowThreadProcessId(fg, &mut fg_pid);
+                }
+                let fg_is_ours = fg_pid != 0 && fg_pid == GetCurrentProcessId();
+                if fg != 0 && fg != hwnd && !fg_is_ours {
                     let now = GetTickCount();
                     let last_toggle = LAST_TOGGLE_TICK.load(Ordering::SeqCst);
                     // Allow more time for force_foreground + clipboard read to finish.

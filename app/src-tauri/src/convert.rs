@@ -342,6 +342,10 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
+        // **绑到 lunac.exe 的生命周期上**（预检 #57，2026-10-02）：ffmpeg 是转换插件起的
+        // 子进程。它是「一次转换一个」的短命进程，跑完自己就退，但在它跑完之前
+        // 宿主崩了 / 被强杀，它就成了孤儿 —— 而它此刻正在用户的磁盘上写半个文件。
+        crate::child_job::assign(&child);
 
         // stderr 必须在**独立线程**里排空：两个管道都塞满时（ffmpeg 报错刷屏）
         // 主线程读 stdout、stderr 无人读 ⇒ 子进程写阻塞 ⇒ 双向死锁。

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::process::Stdio;
 
@@ -22,6 +22,21 @@ pub struct ToolDef {
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Value, // JSON Schema for tool parameters
     pub handler: ToolHandler,
+    /// elicitation 声明（MCP 2025-06-18，A13）：这个工具被调用时，服务端先向**用户**
+    /// 弹卡收集补充输入，拿到答案并入 `arguments` 后再执行 handler。缺省 = 不弹卡。
+    /// 语义与边界见下方 `maybe_elicit()`。**不是** `inputSchema` 的替代品：`inputSchema`
+    /// 是给**模型**看的入参契约，`requestedSchema` 是给**用户**填的表单 —— 两者可以不同。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicit: Option<ElicitSpec>,
+}
+
+/// 工具 JSON 里的 `elicit` 字段（A13）。`message` 显示在卡片顶部，`requestedSchema`
+/// 是给用户看的表单结构（MCP 规定只支持 object，且字段为 string/number/boolean/enum）。
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ElicitSpec {
+    pub message: String,
+    #[serde(default, rename = "requestedSchema")]
+    pub requested_schema: Value,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -72,6 +87,154 @@ struct McpResponse {
 struct McpError {
     code: i32,
     message: String,
+}
+
+// ── Session：stdio 上的**双向**请求（A13）──────────────────────────
+//
+// 原来 run_stdio 是单向的（读一条请求、写一条回包）。elicitation / roots 要求服务端
+// 也能**主动向客户端发请求并等回包**，所以把「一进一出」封成一个会话对象。
+//
+// 为什么不用线程：stdio 是单进程内的同步循环，主循环此刻正阻塞在 `handle_request`
+// 里，不会同时读 stdin / 写 stdout —— 直接在同一线程里读回包即可，没有并发竞争。
+struct Session<'a> {
+    input: &'a mut dyn BufRead,
+    output: &'a mut dyn Write,
+    /// 服务端自己发出的请求 id（与客户端的 id 空间独立：双方靠「有没有 method」区分
+    /// 请求与响应，不靠 id 前缀）。
+    next_id: u64,
+    /// 客户端在 initialize 里声明了 roots 能力？（没声明就不该发 roots/list）
+    client_roots: bool,
+    /// 是否已经问过 roots（问过就不重复问，即便结果为空）。
+    roots_asked: bool,
+    /// 首个 root（工作区）。`None` = 没拿到 / 客户端不支持。
+    root: Option<PathBuf>,
+}
+
+impl Session<'_> {
+    /// 向客户端发一个请求并等回包。跳过期间到达的通知 / 别的消息，只认 id 对上的响应。
+    fn send_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let msg = json!({
+            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+        });
+        let line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
+        writeln!(self.output, "{line}").map_err(|e| format!("写 stdout 失败: {e}"))?;
+        self.output
+            .flush()
+            .map_err(|e| format!("flush stdout 失败: {e}"))?;
+
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = self
+                .input
+                .read_line(&mut buf)
+                .map_err(|e| format!("读 stdin 失败: {e}"))?;
+            if n == 0 {
+                return Err("客户端关闭了连接".into());
+            }
+            let trimmed = buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            // 客户端此刻不该反向发请求；真收到就跳过（本实现不支持）。
+            if v.get("method").is_some() {
+                continue;
+            }
+            if v.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(err) = v.get("error") {
+                return Err(format!("客户端返回错误: {err}"));
+            }
+            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    /// 取工作区根（懒加载一次）。客户端没声明 roots ⇒ `None`，shell 沿用继承的 cwd。
+    fn workspace_root(&mut self) -> Option<PathBuf> {
+        if !self.client_roots {
+            return None;
+        }
+        if !self.roots_asked {
+            self.roots_asked = true;
+            self.root = match self.send_request("roots/list", json!({})) {
+                Ok(res) => res
+                    .get("roots")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(|r| r.get("uri"))
+                    .and_then(Value::as_str)
+                    .and_then(file_uri_to_path),
+                Err(e) => {
+                    eprintln!("[mcp] roots/list 失败（沿用继承的 cwd）：{e}");
+                    None
+                }
+            };
+        }
+        self.root.clone()
+    }
+}
+
+/// `file:///C:/x/y` → `C:\x\y`（只处理本机绝对路径；解析不出来就 `None`）。
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri
+        .strip_prefix("file:///")
+        .or_else(|| uri.strip_prefix("file://"))?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(rest))
+}
+
+/// 执行一次用户工具调用（A13）：先按 `elicit` 声明向**用户**弹卡收集输入，再执行 handler。
+/// `arguments` 是模型给的原始入参；用户填的答案**并入**它（同名键以用户填的为准）。
+fn run_tool_def(
+    session: &mut Session,
+    tool: &ToolDef,
+    arguments: &Value,
+) -> Result<String, String> {
+    let args = maybe_elicit(session, tool, arguments)?;
+    // roots（A13）：客户端声明了 roots 就把工作区根作为 shell handler 的 cwd。
+    let cwd = session.workspace_root();
+    execute_tool_handler(&tool.handler, &args, cwd.as_deref())
+}
+
+/// `elicit` 声明的触发点（A13）：向客户端发 `elicitation/create`，等用户填完回包，
+/// 把 `content` 并进 `arguments`。没声明 elicit 的工具原样返回入参。
+///
+/// **不弹卡的边界**：只有用户**显式**在 `tools\*.json` 里写了 `elicit` 才会走到这里；
+/// 出厂 `tools\` 为空 ⇒ 这一步在真实默认安装下永远不会触发。
+fn maybe_elicit(session: &mut Session, tool: &ToolDef, arguments: &Value) -> Result<Value, String> {
+    let Some(spec) = &tool.elicit else {
+        return Ok(arguments.clone());
+    };
+    let res = session.send_request(
+        "elicitation/create",
+        json!({ "message": spec.message, "requestedSchema": spec.requested_schema }),
+    )?;
+    let action = res.get("action").and_then(Value::as_str).unwrap_or("cancel");
+    if action != "accept" {
+        // 用户拒绝 / 取消：作为工具错误回给模型（不是桥坏了）。
+        return Err("用户拒绝了本次输入请求（工具未执行）".into());
+    }
+    let mut merged = if arguments.is_object() {
+        arguments.clone()
+    } else {
+        json!({})
+    };
+    if let Some(content) = res.get("content").and_then(Value::as_object) {
+        if let Some(obj) = merged.as_object_mut() {
+            for (k, v) in content {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Ok(merged)
 }
 
 // ── Tool loader ───────────────────────────────────────────────────
@@ -187,6 +350,141 @@ fn read_resource_result(uri: &str) -> Result<Value, String> {
         }]
     }))
 }
+
+// ── Prompts（A13，MCP 服务端侧）────────────────────────────────────
+//
+// `prompts/list` / `prompts/get` 把 `<exe 根>\prompts\*.md` 报给客户端，由 agent 侧转发成
+// 两件条件注册的只读工具（`ListMcpPromptsTool` / `GetMcpPromptTool`）。用途：用户写一段
+// 可复用的提示词模板（`{{arg}}` 占位），模型在需要时取来按参数展开 —— 与「技能」不同，
+// prompt **不加载任何代码**，只是一段参数化的文本。
+//
+// 与 resources 的差别：resources 暴露的是「用户工具的定义文件」（给模型**看** handler），
+// prompts 暴露的是「用户写好的提示词模板」（给模型**用**）。两者都只读、都限定在各自目录内。
+
+/// prompt 正文的读取上限（模板通常很小，给足余量）。
+const MAX_PROMPT_BYTES: u64 = 256 * 1024;
+
+fn prompts_dir() -> PathBuf {
+    crate::storage::lunac_root_dir().join("prompts")
+}
+
+/// 一个可用的 prompt 模板（`prompts\<name>.md`）。
+struct PromptDef {
+    name: String,
+    description: String,
+    body: String,
+}
+
+/// 拆出可选的 YAML frontmatter（`---\n…\n---`），返回 `(frontmatter, 正文)`。
+/// 没有 frontmatter 时返回 `(None, 原文)`（去掉 BOM）。
+fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
+    let t = text.trim_start_matches('\u{feff}');
+    if let Some(rest) = t.strip_prefix("---") {
+        if let Some(idx) = rest.find("\n---") {
+            let fm = &rest[..idx];
+            let body = rest[idx + 4..].trim_start_matches(['\r', '\n']);
+            return (Some(fm), body);
+        }
+    }
+    (None, t)
+}
+
+/// 从 frontmatter 里取一个 `key: value`（值去掉两侧引号）。
+fn fm_field<'a>(fm: &'a str, key: &str) -> Option<&'a str> {
+    fm.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix(key)
+            .and_then(|r| r.strip_prefix(':'))
+            .map(|v| v.trim().trim_matches('"'))
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// prompt 的描述：优先 frontmatter 的 `description:`，否则正文里第一行非空、
+/// 去掉前导 `#` 的文字。
+fn prompt_description(fm: Option<&str>, body: &str) -> String {
+    if let Some(d) = fm.and_then(|f| fm_field(f, "description")) {
+        return d.to_string();
+    }
+    body.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.trim_start_matches('#').trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 扫 `prompts\` 目录，按文件名排序返回（顺序稳定 ⇒ prompts/list 的排列稳定）。
+fn load_prompts() -> Vec<PromptDef> {
+    load_prompts_from(&prompts_dir())
+}
+
+/// 扫**指定目录**（拆出来是为了单测能指向临时目录，不碰真实 exe 根）。
+fn load_prompts_from(dir: &Path) -> Vec<PromptDef> {
+    let mut prompts = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return prompts;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().map_or(false, |e| e == "md") {
+            continue;
+        }
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size > MAX_PROMPT_BYTES {
+            eprintln!("[mcp] 跳过过大的 prompt（{size} 字节）：{}", path.display());
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if name.trim().is_empty() {
+            continue;
+        }
+        let (fm, body) = split_frontmatter(&raw);
+        prompts.push(PromptDef {
+            description: prompt_description(fm, body),
+            name,
+            body: body.to_string(),
+        });
+    }
+    prompts.sort_by(|a, b| a.name.cmp(&b.name));
+    prompts
+}
+
+/// `prompts/list` 的 `result` 部分。
+fn build_prompts_list(prompts: &[PromptDef]) -> Value {
+    let items: Vec<Value> = prompts
+        .iter()
+        .map(|p| json!({ "name": p.name, "description": p.description }))
+        .collect();
+    json!({ "prompts": items, "nextCursor": null })
+}
+
+/// `prompts/get` 的 `result` 部分：`{description, messages:[{role,content}]}`。
+/// `arguments` 里的键按 `{{key}}` / `{{key }}` 两种写法替换（复用 `resolve_template`）。
+fn prompt_get_result(prompts: &[PromptDef], name: &str, arguments: &Value) -> Result<Value, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("缺少 name 参数：要传 prompts/list 给出的 prompt 名".into());
+    }
+    let Some(p) = prompts.iter().find(|p| p.name == name) else {
+        return Err(format!("prompt 不存在：{name}"));
+    };
+    let text = resolve_template(&p.body, arguments);
+    Ok(json!({
+        "description": p.description,
+        "messages": [{
+            "role": "user",
+            "content": { "type": "text", "text": text }
+        }]
+    }))
+}
+
 
 // ── 长期记忆（A4，2026-09-20）──────────────────────────────────────
 //
@@ -346,7 +644,11 @@ fn resolve_template(template: &str, params: &Value) -> String {
 /// the agent turn forever. stdout/stderr are drained on background threads
 /// (piped buffers would otherwise deadlock), and on timeout the child is
 /// killed and an error is returned.
-fn run_shell_with_timeout(command: &str, timeout_secs: u64) -> Result<String, String> {
+fn run_shell_with_timeout(
+    command: &str,
+    timeout_secs: u64,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, String> {
     // 必须 `raw_arg` 原样拼命令行：`command` 来自用户的工具定义（`tools\*.json`），
     // 里面带引号 + 空格是常态（如 `python "C:\my tools\x.py" --arg "a b"`），
     // 而 `Command::arg` 会按 MSVC 规则把 `"` 转义成 `\"` —— cmd 不认这个转义，
@@ -366,6 +668,11 @@ fn run_shell_with_timeout(command: &str, timeout_secs: u64) -> Result<String, St
         c.args(["-c", command]);
         c
     };
+    // roots（A13）：客户端声明了 roots 时，用工作区根作为命令的工作目录；
+    // 客户端不支持 roots ⇒ 保持进程继承的 cwd（与原行为一致）。
+    if let Some(dir) = cwd {
+        c.current_dir(dir);
+    }
     c.stdout(Stdio::piped());
     c.stderr(Stdio::piped());
 
@@ -429,12 +736,16 @@ fn run_shell_with_timeout(command: &str, timeout_secs: u64) -> Result<String, St
     }
 }
 
-fn execute_tool_handler(handler: &ToolHandler, params: &Value) -> Result<String, String> {
+fn execute_tool_handler(
+    handler: &ToolHandler,
+    params: &Value,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, String> {
     match handler {
         ToolHandler::Builtin { name } => run_builtin_tool(name, params),
         ToolHandler::Shell { command } => {
             let resolved = resolve_template(command, params);
-            run_shell_with_timeout(&resolved, 60)
+            run_shell_with_timeout(&resolved, 60, cwd)
         }
         ToolHandler::Http {
             method,
@@ -946,21 +1257,38 @@ fn text_err(id: Option<Value>, msg: String) -> McpResponse {
     }
 }
 
-fn handle_request(req: &McpRequest, tools: &[ToolDef]) -> McpResponse {
+fn handle_request(req: &McpRequest, tools: &[ToolDef], session: &mut Session) -> McpResponse {
     match req.method.as_deref() {
-        Some("initialize") => McpResponse {
-            jsonrpc: "2.0".into(),
-            id: req.id.clone(),
-            result: Some(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": "lunac-mcp",
-                    "version": "0.1.0"
-                }
-            })),
-            error: None,
-        },
+        Some("initialize") => {
+            // 记下客户端是否支持 roots —— 没声明就不该反向发 roots/list（MCP 规范）。
+            session.client_roots = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("capabilities"))
+                .and_then(|c| c.get("roots"))
+                .is_some();
+            McpResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id.clone(),
+                result: Some(json!({
+                    // A13：升到 2025-06-18 —— elicitation 是该版本引入的能力。roots/prompts
+                    // 两版都支持，但统一到一个版本号最省事（客户端按此值协商）。
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {
+                        "tools": {},
+                        "prompts": {},
+                        "resources": {},
+                        // elicitation 由服务端在 `tools/call` 时按工具 JSON 的 `elicit` 字段发起。
+                        "elicitation": {}
+                    },
+                    "serverInfo": {
+                        "name": "lunac-mcp",
+                        "version": "0.1.0"
+                    }
+                })),
+                error: None,
+            }
+        }
         Some("tools/list") => McpResponse {
             jsonrpc: "2.0".into(),
             id: req.id.clone(),
@@ -974,7 +1302,7 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef]) -> McpResponse {
             match params {
                 Some(name) => {
                     match tools.iter().find(|t| t.name == name) {
-                        Some(tool) => match execute_tool_handler(&tool.handler, &args) {
+                        Some(tool) => match run_tool_def(session, tool, &args) {
                             Ok(text) => McpResponse {
                                 jsonrpc: "2.0".into(),
                                 id: req.id.clone(),
@@ -1066,6 +1394,45 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef]) -> McpResponse {
                 },
             }
         }
+        // Prompts（A13）：标准方法，与 resources 一样 —— 失败走 JSON-RPC error（工具调用
+        // 才用 `result + isError`）。`prompts/list` 恒成功（目录不存在 = 空列表）。
+        Some("prompts/list") => McpResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id.clone(),
+            result: Some(build_prompts_list(&load_prompts())),
+            error: None,
+        },
+        Some("prompts/get") => {
+            let name = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            match prompt_get_result(&load_prompts(), name, &args) {
+                Ok(result) => McpResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    result: Some(result),
+                    error: None,
+                },
+                Err(message) => McpResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    result: None,
+                    error: Some(McpError {
+                        code: -32002,
+                        message,
+                    }),
+                },
+            }
+        }
         // 往期会话检索：**自定义方法，不列进 tools/list**（见 handle_history_method 的注释）。
         Some(m) if m.starts_with("lunac/history_") => {
             let method = m.to_string();
@@ -1115,22 +1482,37 @@ pub fn run_stdio() {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
+    // 会话化 IO（A13）：`handle_request` 里的 elicitation / roots 要能**反向**读写，
+    // 所以把两个锁交给 `Session` 持有（借用期覆盖整个循环）。
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let mut session = Session {
+        input: &mut input,
+        output: &mut output,
+        next_id: 0,
+        client_roots: false,
+        roots_asked: false,
+        root: None,
+    };
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match session.input.read_line(&mut line) {
+            Ok(0) => break, // EOF：客户端关闭 stdin → 退出
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("[mcp] Stdin error: {}", e);
                 continue;
             }
-        };
+        }
 
-        let trimmed = line.trim().to_string();
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        let req: McpRequest = match serde_json::from_str(&trimmed) {
+        let req: McpRequest = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[mcp] Parse error: {} for input: {:.200}", e, trimmed);
@@ -1138,17 +1520,16 @@ pub fn run_stdio() {
             }
         };
 
-        let resp = handle_request(&req, &tools);
+        let resp = handle_request(&req, &tools, &mut session);
 
         // Only respond to requests that have an id (notifications are one-way)
         if resp.id.is_some() || resp.error.is_some() {
             let resp_json = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
-            let mut stdout_lock = stdout.lock();
-            if let Err(e) = writeln!(stdout_lock, "{}", resp_json) {
+            if let Err(e) = writeln!(session.output, "{}", resp_json) {
                 eprintln!("[mcp] Write error: {}", e);
                 return; // client closed stdin → exit
             }
-            if let Err(e) = stdout_lock.flush() {
+            if let Err(e) = session.output.flush() {
                 eprintln!("[mcp] Flush error: {}", e);
                 return;
             }
@@ -1268,6 +1649,182 @@ mod tests {
         assert_eq!(read_memory_at(&file).unwrap(), "- 只剩这一条\n");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// prompts 读侧（A13）的硬行为：按文件名排序、YAML frontmatter 描述、`{{arg}}` 模板替换、
+    /// 非 `.md` 不入列、空 name / 找不到的名字都报错。
+    ///
+    /// 用 `load_prompts_from(临时目录)` 而不是 `load_prompts()`：后者指向真实 exe 根，
+    /// 测试不许碰用户数据。
+    #[test]
+    fn prompts_are_sorted_described_and_templated() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-mcp-prompts-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // b 有 frontmatter（描述取 `description:`）；a 没有（描述取正文首个非空行）
+        fs::write(
+            dir.join("b.md"),
+            "---\ndescription: 部署检查清单\n---\n请检查 {{target}} 的部署。\n",
+        )
+        .unwrap();
+        fs::write(dir.join("a.md"), "# 代码评审\n评审 {{lang}} 代码。\n").unwrap();
+        fs::write(dir.join("note.txt"), "忽略我").unwrap(); // 非 .md 不入列
+
+        let list = load_prompts_from(&dir);
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "必须按文件名排序（prompts/list 的排列要稳定）");
+        assert_eq!(list[0].description, "代码评审", "无 frontmatter ⇒ 取正文首个非空行（去 #）");
+        assert_eq!(list[1].description, "部署检查清单", "有 frontmatter ⇒ 取 description:");
+
+        let listed = build_prompts_list(&list);
+        assert_eq!(
+            listed.pointer("/prompts/0/name").and_then(Value::as_str),
+            Some("a")
+        );
+        assert_eq!(listed.pointer("/prompts/1/description").and_then(Value::as_str), Some("部署检查清单"));
+
+        let got = prompt_get_result(&list, "b", &json!({ "target": "prod" })).unwrap();
+        assert_eq!(
+            got.pointer("/messages/0/content/text").and_then(Value::as_str),
+            Some("请检查 prod 的部署。\n"),
+            "{{target}} 要按 arguments 替换"
+        );
+        assert_eq!(got.get("description").and_then(Value::as_str), Some("部署检查清单"));
+
+        assert!(prompt_get_result(&list, "  ", &json!({})).is_err(), "空 name 要报错");
+        assert!(prompt_get_result(&list, "missing", &json!({})).is_err(), "找不到的名字要报错");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// elicitation（A13）：服务端主动发 `elicitation/create`，把用户回包的 `content`
+    /// **并入**原入参（同名键以用户填的为准）；用户 decline 则整个工具调用报错。
+    #[test]
+    fn elicitation_merges_content_and_aborts_on_decline() {
+        let tool = ToolDef {
+            name: "deploy".into(),
+            description: String::new(),
+            input_schema: json!({}),
+            handler: ToolHandler::Builtin { name: "noop".into() },
+            elicit: Some(ElicitSpec {
+                message: "需要部署目标".into(),
+                requested_schema: json!({
+                    "type": "object",
+                    "properties": { "target": { "type": "string" } }
+                }),
+            }),
+        };
+
+        // ① accept + content ⇒ 并入原入参（同名键覆盖、其余保留）
+        let reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"action\":\"accept\",\
+                     \"content\":{\"target\":\"prod\",\"extra\":1}}}\n";
+        let mut input = std::io::Cursor::new(reply.as_bytes().to_vec());
+        let mut output: Vec<u8> = Vec::new();
+        let mut session = Session {
+            input: &mut input,
+            output: &mut output,
+            next_id: 0,
+            client_roots: false,
+            roots_asked: false,
+            root: None,
+        };
+        let merged = maybe_elicit(&mut session, &tool, &json!({ "target": "old", "keep": true }))
+            .expect("accept 应当成功");
+        assert_eq!(merged.get("target").and_then(Value::as_str), Some("prod"), "用户填的覆盖原参数");
+        assert_eq!(merged.get("keep").and_then(Value::as_bool), Some(true), "没冲突的原参数保留");
+        assert_eq!(merged.get("extra").and_then(Value::as_u64), Some(1), "用户新填的键并进来");
+        let sent = String::from_utf8(output).unwrap();
+        assert!(sent.contains("\"method\":\"elicitation/create\""), "实际发出：{sent}");
+        assert!(sent.contains("需要部署目标"), "message 要原样带给客户端");
+
+        // ② decline ⇒ Err（工具不执行）
+        let reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"action\":\"decline\"}}\n";
+        let mut input = std::io::Cursor::new(reply.as_bytes().to_vec());
+        let mut output: Vec<u8> = Vec::new();
+        let mut session = Session {
+            input: &mut input,
+            output: &mut output,
+            next_id: 0,
+            client_roots: false,
+            roots_asked: false,
+            root: None,
+        };
+        assert!(maybe_elicit(&mut session, &tool, &json!({})).is_err(), "用户拒绝 ⇒ 工具不执行");
+
+        // ③ 没声明 elicit 的工具：原样返回，且**不发任何请求**
+        let plain = ToolDef { elicit: None, ..tool };
+        let mut input = std::io::Cursor::new(Vec::new());
+        let mut output: Vec<u8> = Vec::new();
+        let mut session = Session {
+            input: &mut input,
+            output: &mut output,
+            next_id: 0,
+            client_roots: false,
+            roots_asked: false,
+            root: None,
+        };
+        let args = json!({ "a": 1 });
+        assert_eq!(maybe_elicit(&mut session, &plain, &args).unwrap(), args);
+        assert!(output.is_empty(), "没声明 elicit 就一个字节都不该发");
+    }
+
+    /// roots（A13）：客户端**声明了** roots 才发 `roots/list`，取首个 root 的 `uri`
+    /// 还原成本机路径；只问一次（拿到后缓存）；没声明就一个字节都不发。
+    #[test]
+    fn roots_are_asked_only_when_declared_and_first_uri_wins() {
+        // ① 没声明 roots：不问、不发请求
+        let mut input = std::io::Cursor::new(Vec::new());
+        let mut output: Vec<u8> = Vec::new();
+        let mut session = Session {
+            input: &mut input,
+            output: &mut output,
+            next_id: 0,
+            client_roots: false,
+            roots_asked: false,
+            root: None,
+        };
+        assert_eq!(session.workspace_root(), None);
+        assert!(output.is_empty(), "客户端没声明 roots 就不该发 roots/list");
+
+        // ② 声明了 + 回包给两个 root ⇒ 取第一个；再问一次不再发请求（缓存）
+        let reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"roots\":[\
+                     {\"uri\":\"file:///D:/work/first\"},{\"uri\":\"file:///D:/second\"}]}}\n";
+        let mut input = std::io::Cursor::new(reply.as_bytes().to_vec());
+        let mut output: Vec<u8> = Vec::new();
+        let mut session = Session {
+            input: &mut input,
+            output: &mut output,
+            next_id: 0,
+            client_roots: true,
+            roots_asked: false,
+            root: None,
+        };
+        assert_eq!(
+            session.workspace_root(),
+            Some(PathBuf::from("D:/work/first")),
+            "取首个 root"
+        );
+        // 再问一次：不再发请求（缓存），返回值不变
+        assert_eq!(session.workspace_root(), Some(PathBuf::from("D:/work/first")));
+        // 到这里 `session` 不再使用 ⇒ 对 `output` 的借用结束，可以读回它
+        let sent = String::from_utf8(output).unwrap();
+        assert!(sent.contains("\"method\":\"roots/list\""), "实际发出：{sent}");
+        assert_eq!(
+            sent.matches("\"method\":\"roots/list\"").count(),
+            1,
+            "roots 只问一次，拿到后缓存：{sent}"
+        );
+
+        // ③ `file:///` 解析边界
+        assert_eq!(file_uri_to_path("file:///C:/x"), Some(PathBuf::from("C:/x")));
+        assert_eq!(file_uri_to_path("file:///"), None, "空路径不是有效 root");
+        assert_eq!(file_uri_to_path("https://example.com"), None, "非 file: 一律拒");
     }
 }
 
