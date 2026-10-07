@@ -19,7 +19,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "0.9.32"
+!define PRODUCT_VERSION "0.9.33"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
 ; 升级 / 重装时自动定位**上一版的安装目录**（2026-09-30）：从卸载注册表的
