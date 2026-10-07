@@ -575,6 +575,7 @@ Lunac AI 采用 **Agent 单模式** 设计（简单模式已于 2026-08-04 移�
 | 口径映射 | 平台「输入（命中缓存）」= `cache_read_input_tokens`；「输入（未命中缓存）」= `input_tokens`（DeepSeek 走自动缓存，实测 `cache_creation_input_tokens` 恒为 0，Anthropic 原生端点才有值）；「输出」= `output_tokens`；平台的「合计」= 三者之和 |
 | 粒度差 | 平台**按每次 API 请求**记一行，本地**按每次提问**记一行 —— 一次带工具的提问在平台上就是多行（system prompt + tools 前缀每次重发）。**2026-09 起这个差已被抹平**：`result.usage.requests[]` 把每次请求的明细带上，本地日志里也逐条落盘，可直接与平台逐行对账 |
 | 每次请求明细 | `result.usage.requests` = `[{in, read, create, out}]`（顺序 = 请求顺序；`in` = 该次未命中输入、`read` = 该次命中、`create` = 缓存写入、`out` = 该次输出）。agent 在每条 `message_stop` 推一条（`message_delta.output_tokens` 是**该条消息的累计值**，故用赋值而非累加）。**旧 agent 不报该字段 → 前端写空数组**；`UsageRecord.requests` 为空时**不写该键**（旧记录读时按空表） |
+| **输入用量的来源有两个事件（2026-10-07 实测）** | 三类输入（`input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens`）在 **Anthropic 原生**端点上是 `message_start.message.usage`；但**中转端点可能在 `message_start` 里把三类全填 0，真值只出现在 `message_delta.usage` 上**（实测 `api.moonobscura.com` + `deepseek/deepseek-v4.1-flash`：`message_start` 全 0、`message_delta` 才给 `input_tokens`）。只认 `message_start` 的表现是**输入 / 命中 / 写入三列恒为 0**、命中率恒 0%、金额只剩输出那一项 —— 面板上就是「没有数值」。判据是 `merge_input_usage(start, delta)`：**start 有任何非零就用 start（原生路径逐字节不变），三类全 0 才回落到 delta**；它幂等（同一条 delta 归并两次结果不变，不会重复计），且**不按端点名硬编码**（换端点无需改代码）。单测 `merge_input_usage_prefers_start_and_falls_back_to_delta` 钉住 |
 | **子代理 / 复盘的用量必须并入（2026-09-29）** | `run_subagent`（`Agent` 工具 / fork 技能 / 后台复盘）的每轮用量**并入** `result.usage` 的四类总量，其请求明细追加进 `requests[]` 末尾。此前它只累进自己的 `spent`（预算熔断用）而**从未上报** ⇒ **平台照收钱、本地账看不见**（实测：平台同一 key 24 次请求 vs 本地 `usage-*.jsonl` 17 次）。实现是 `Cfg.sub: Arc<SubagentUsage>`：`detached()` **共享同一本账**（并行子代理批跑的是副本，各建一份就等于只在串行路径生效 —— 有守门单测 `detached_shares_the_subagent_usage_ledger`），`run_query` 成功收尾时 `take()` 取走并归零。推入 `requests[]` 的先后由线程调度决定（并发完成），平台对账按「条数 + 合计」对齐，**不依赖顺序**。**错误路径（`finish_error`）不归并** ⇒ 被放弃那一问的子代理用量会落进下一问（量级受一问的子代理预算封顶） |
 | **四类总量里来自子代理的部分** | `result.usage.subagent = {input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, requests}` —— 它是**上面四类的子集**（已含在里面），只为**归因**（「这一问的钱有多少是子代理烧的」）。消费者**不得**把它再加一次；`usage-cost.ts` 的金额算式**只看四类总量**，一个字都没为此改。落盘 `UsageRecord.subagent`（`Option`：旧记录读成 `None`，`None` 不写回日志） |
 | 落盘 | 每次提问追加一行到 `<exe 根>\ModuleData\usage\usage-YYYY-MM-DD.jsonl`（只追加不重写、按天分片），字段 `{ts, model, sessionId?, input, output, cacheRead, cacheCreate, elided, dropped, requests?, subagent?}`；`ts` 为本地时钟 epoch 毫秒，`model` 取自 `system/init`。`sessionId` = 产生这一行的 **agent 运行**（A11，见 §3.5「会话 id 与 rewind」）；**空值不写该键**，旧记录读成空串（`serde(default)`）—— 对账口径仍是 `ts` + `model`，它只做归因 |
@@ -909,7 +910,7 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
 ### 4.2 Agent Tools 体系 (MCP Bridge)
 
 硬件 AI Tools 不走前端插件体系，而是集成到 Agent 模式：
-- **定义位置**：`app/src-tauri/tools/*.json` (MCP tool JSON 定义)
+- **定义位置**：`agent-templates/tools/*.json`（MCP tool JSON 定义；**真名 `.json` 才会被加载**，模板用 `.json.example`）。**不是 `app/src-tauri/tools/`** —— 2026-10-06 从那里搬出：`tauri.conf.json` 的 `bundle.resources` 只有 `agent.exe` + `themes`，没有任何步骤把该目录拷到 exe 根，那 3 个工具**从未被部署过**；搬到 `agent-templates/tools/` 后才走 `build-release.ps1` 既有的拷贝链路真正随包发布（见 §11 规则 24）。
 - **运行时路径**：`<exe 根>\tools\`（`mcp_server::tools_dir()` = `storage::lunac_root_dir()/tools`）。**不是 `%LOCALAPPDATA%\Lunac\tools\`** —— 整个应用是**便携式**的，所有业务数据都在 exe 所在目录下（`ModuleData/` / `tools/` / `skills/` / `temp/`），卸载时随目录一起清掉。用户可自定义增删。
 - **调用链路**：用户输入 → agent.exe (Agent) → MCP Bridge → `lunac.exe --mcp-server` → 执行 shell/http/builtin handler
 - **管理方式**：tool-editor 前端插件提供 UI 管理
@@ -924,7 +925,7 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
                       └─ 返回结果 → agent.exe → 前端渲染
 ```
 
-**内置 Agent Tools（`app/src-tauri/tools/`，当前 3 个）：**
+**内置 Agent Tools（`agent-templates/tools/`，当前 3 个；随安装包发布到 `<exe 根>\tools\`）：**
 
 | Tool ID | 类型 | 说明 |
 |---------|------|------|
@@ -932,7 +933,7 @@ Agent 回复支持 KaTeX 实时渲染 LaTeX 数学公式：
 | `weather` | shell | wttr.in 天气查询 |
 | `image_pattern_analysis` | builtin | 纯像素统计的图片风格特征提取（亮度/色调/笔触方向/纹理密度/对称性），全离线，用于参考图 → UI 设计 |
 
-> 新增内置 tool 只需往 `app/src-tauri/tools/` 放一个 JSON；`handler.type = "builtin"` 的要在 `mcp_server.rs` 里有对应实现，`shell` / `http` 由 JSON 自带命令。
+> 新增内置 tool 只需往 `agent-templates/tools/` 放一个**真名** JSON（`*.json.example` 不会被加载）；`handler.type = "builtin"` 的要在 `mcp_server.rs` 里有对应实现，`shell` / `http` 由 JSON 自带命令。改完要重跑 `build-release.ps1` 才会进安装包；dev 侧 `target\{debug,release}\tools\` 需手工 `Copy-Item agent-templates\tools\* …`（与 skills 模板同一套路，见预检 #77）。
 
 ### 4.3 插件状态保存与恢复 (前端)
 
@@ -3110,9 +3111,7 @@ app/
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
 │   ├── capabilities/default.json    # Tauri 2 权限声明
-│   └── tools/                       # Agent MCP Tools (内置)
-│       ├── system_info.json         # 系统硬件信息 tool
-│       └── weather.json             # 天气查询 tool
+│   └── themes/                      # 随包主题（bundle.resources）
 ├── vite.config.ts
 ├── tsconfig.json
 └── package.json
@@ -3157,9 +3156,12 @@ scripts/
 ├── make-icon.ts                     # 应用图标生成
 └── _extract_colors.ps1              # 主题取色辅助脚本
 
-agent-templates/                     # 发布包预置（README + *.example 模板；**skills/ 另含 4 个内置技能**，见 §11 规则 24 与 §20.1）
-├── skills/
-└── tools/
+agent-templates/                     # 发布包预置（README + *.example 模板；**skills/ 另含 4 个内置技能**，**tools/ 另含 3 个内置工具**，见 §11 规则 24 与 §20.1）
+├── skills/                          # 内置技能（真名 SKILL.md）+ _example 模板
+└── tools/                           # 内置工具（真名 .json）+ example-tool.json.example 模板
+    ├── system_info.json             # 系统硬件信息 tool（shell）
+    ├── weather.json                 # wttr.in 天气查询 tool（shell）
+    └── image_pattern_analysis.json  # 图片风格特征提取 tool（builtin，实现见 mcp_server.rs）
 ```
 
 > 所有 ps1 脚本必须**从自己的位置推导仓库根**，**禁止硬编码本机绝对路径**；统一包管理器为 `npm`。⚠️ 脚本住在 `scripts\` ⇒ 仓库根是**再往上一层**：`$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)`（`build-plugins` / `publish-plugins` / `publish-release` / `build-release` 四处同一写法）。**上跳一次会把 `$Root` 落成 `scripts\`**，于是所有 `$Root\app\…` 全部指错、脚本在第一步就抛「找不到文件」——2026-10-01 实测：`build-release.ps1` 从仓库根搬进 `scripts\` 时漏改这一行，报的是 `package.json not found at …\scripts\app\package.json`。**搬脚本＝改这一行**（若哪天某个脚本要留在仓库根，那它就该上跳一次，两套写法不许混）。
@@ -4242,7 +4244,8 @@ $u4=&$Ask ($pb+[char]10+'Reply with the single word: ok'+[char]10+'Now reply: do
     - **颜色用红系（同 `.tool-card.failed`），不用黄系**：黄系在命令卡上已被「超时 / 退出码非零 / 用户停止」占满，表达的是「没跑完」；这一条是「看见了正面证据」，与审批卡的「必须人看」同一档。
 
 75. **`agent.exe` 没了 ⇒ 飞行中的卡片必须当场收尾（M2-6，2026-10-01）**：全局「停止」与队列「立即发送」都会 `stop_cli`，进程崩溃也一样 —— 两者都让这条命令的 `tool_result` **永远回不来**，卡片就停在「执行中」（用户会以为它还在跑）。收尾落在 `markFlyingCardsStopped()` **一处**，两个调用点：`stopAIChat()` 里 `stop_cli` 之后（**不能等 `closed` 事件**，那一拍之间卡片就已经是假的「执行中」了）、以及 `cli-state === "closed"` 分支里（崩溃退出走这条）。**只改视觉、绝不置 `card.done`** —— 与点卡片上「停止」按钮的乐观置上同一条纪律：真相永远由结果文本说了算（`tool_result` 若仍在进程退出前写进管道、稍后才到，`fillToolCard` 会把它重新判成成功 / 失败 / 超时）。**禁止**在别处再养一份「谁还在跑」的状态表（判据一律从 `classList.contains("running")` 现推，与 `refreshCmdGroup` 同源）。
-    - **强制中断的回合要做一次「部分收尾」，且只进过程快照、不进 AI 上下文（A，2026-10-03 用户报障 + 定案）**：正常收尾**全在** `cliDoneCallback`（`recordTurnSteps` / 助手消息进 `chatHistory` / `saveCurrentSession`），而中断路径会**先置空 `cliDoneCallback`** 再杀进程 —— 于是「只有思考、没有收尾正文」的回合在 Lunac 里**任何地方都看不到**（用户报的「被强制中断后本该能看到思考过程，却看不到」）。现在 `stopAIChat` 在 `agentView = null` **之前**调 `finalizeInterruptedTurn()`：`agentCloseBlock()` → `recordTurnSteps(flow, false)` → `saveCurrentSession()`。**刻意不 push 助手消息** —— 被中断的回合必须**不进 AI 上下文**：一旦 push，半截正文就会写进 `chat.db` 的 messages（进 FTS 索引、可被 `SessionSearch` 搜到）并随后续 `set_history` 回灌给模型 ⇒ 模型读到一条**被截断的助手消息**（用户要求「AI 不读取错上下文」）。半截正文仍以 `text` 步骤留在过程块里可看。**回退 / 重试刻意不做这一步** —— 那一条本来就要丢弃回退点之后的内容，固化了也会被裁掉。
+    - **强制中断的回合要做一次「部分收尾」，并（2026-10-06 起）也进 AI 上下文（A，2026-10-03 用户报障；2026-10-06 用户改定）**：正常收尾**全在** `cliDoneCallback`（`recordTurnSteps` / 助手消息进 `chatHistory` / `saveCurrentSession`），而中断路径会**先置空 `cliDoneCallback`** 再杀进程 —— 于是「只有思考、没有收尾正文」的回合在 Lunac 里**任何地方都看不到**（用户报的「被强制中断后本该能看到思考过程，却看不到」）。现在 `stopAIChat` 在 `agentView = null` **之前**调 `finalizeInterruptedTurn()`：`agentCloseBlock()` → 加「已手动终止」旁注（见下一条）→ **push 半截正文为助手消息** → `pruneContext()` 裁剪 → `recordTurnSteps(flow, !!finalText)` → `saveCurrentSession()`。**⚠️ 2026-10-06 用户改定：被中断的回合也进 AI 上下文**（此前「刻意不 push、绝不进 AI 上下文」的定案**已作废**）—— 半截正文与非中断回合同口径进 `chatHistory`，因而会写进 `chat.db` 的 messages（进 FTS 索引、可被 `SessionSearch` 搜到）并随后续 `set_history` 回灌给模型；**这是用户明确要的**（「被中断的那段输出也要属于对话历史」），已知并接受「模型会读到一条被截断的助手消息」这一代价。**没有正文时（只思考 / 调工具）不 push**（同正常收尾的 `if (finalText)`），此时 `recordTurnSteps(flow, false)`、过程块挂到用户气泡之后。**回退 / 重试刻意不做这一步** —— 那一条本来就要丢弃回退点之后的内容，固化了也会被裁掉。
+    - **「已手动终止输出」必须主动显示、且随快照持久化（2026-10-06 用户要求）**：内容留住了不等于用户知道「这一轮是你掐掉的」——原先唯一线索只是状态栏一闪的「已停止」，回合流里**没有任何标记**。现在用户点「停止」（`drainQueue` 为真）时，`finalizeInterruptedTurn({ manualStop: true })` 会在 `recordTurnSteps` **之前**往 `flow` 末尾插一行 `.sys-note.sys-note-line.note-interrupted`（`appendInterruptedNote`，文案 `agent.turn_interrupted` 五语言）。三条不得回退：① **必须插独立节点、不进 `textAll`** —— 走 `agentAppend("text", …)` 会被当成助手正文存进 `chatHistory` 并回灌给模型（同「上下文压缩提示」踩过的坑），而这一行是**旁注不是内容**；② **`.note-interrupted` 同时是 `recordTurnSteps` 的采集判据**（`SessionStep.kind = "note"`，`historyStepHtml` 复原同一形态）—— 不采集的话重开会话后又只剩半截输出，与这一条的目的相悖；③ **`drainQueue: false`（「立即发送」）不加** —— 用户随即在追问下一句，插一行只是噪音（与那条路不改写状态栏同一纪律）。
 
 76. **聊天流的窗口化渲染 + 动作条懒创建（2026-10-02）**：聊天窗加载的是**主界面那份 `index.html`**（`plugin_window::page_for` 的唯一例外），开局会把整段会话重放成真实 DOM。release 版实测一份 **45,216 条消息**的会话量出 **1,088,429 个 DOM 节点**、对应 renderer 进程**工作集 3.87 GB / 私有 3.83 GB**（同一时刻主窗口只有 322 个节点 / 88.9 MB，而 JS 堆也只有 196 MB ⇒ 大头在 Blink 的节点 / 布局 / 绘制对象上，**不在 JS 堆里**）。**节点数与消息数线性相关** —— 所以「打开 AI 窗就吃光内存」**不是泄漏，是没有上限**。**七条不得回退**：
     - **聊天流只渲染一个窗口**（`CHAT_RENDER_WINDOW = 120`，即 `chatRenderFrom` 到结尾），顶上给一颗「载入更早的 N 条」；`chatHistory` **始终是完整的内存权威副本** ——「要更早的再去内存里取」= 把起点往前挪一屏再重绘（`loadEarlierChat`）。**重绘前必须记下当前第一条气泡的视口位置、补完照它还原滚动**，否则内容往上长、用户正看着的那条会往下跳。
@@ -4794,6 +4797,6 @@ Lunac 的插件加载**不是** Hermes 那种「双目录 + `register(ctx)` + `s
 
 前端插件市场（`Modules\` 扫盘 + `lunac-plugin.json` + asset 协议 `import()` + 市场索引与 zip 安装）：**正文见 §3.5「插件市场」、纪律见 §11 规则 67**，本节不再复述。三条硬约束（CSP `script-src 'self'` / Cubism 资产授权 / 常驻画布开销）在讨论**桌宠**时仍然适用 —— 那一条还挂在 [backlog](./agent-feature-backlog.md) **L1**。
 
-**另一条社区扩展形态**（一直可用、与插件市场并存）：20.1 的 MCP 桥 + `agent-templates/`（`skills/` 与 `tools/` 各一份 `.example` 模板），用户手工放进 `<exe 根>\skills\` / `tools\`。
+**另一条社区扩展形态**（一直可用、与插件市场并存）：20.1 的 MCP 桥 + `agent-templates/`（`skills/` 与 `tools/` 的 `.example` 模板 + 各自的内置项），随安装包铺到 `<exe 根>\skills\` / `tools\`，用户可继续往里手工放。
 
 

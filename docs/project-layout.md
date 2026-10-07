@@ -13,7 +13,7 @@
 | ④ | **dev 前端** | `app/src/`、`vscode-extension/src/` | ✅ | 小 | 主界面 + 内置插件源码；VSCode 扩展 |
 | ⑤ | **dev 编译产物** | `app/src-tauri/target/`、`core-agent/target/`、`tuning-engine/target/`、`app/dist/`、`app/plugin-dist/`、`vscode-extension/out/` | ✗ | **~15.8 GB** | 占整个仓库 90% 以上体积。可随时删（下次构建重来） |
 | ⑥ | **release 发布包** | `release/` | ✗ | 177 MB | `Lunac-<ver>-Setup.exe`、`latest.json`、`ext-plugins/`、`plugin-packages/`、`deps/` |
-| ⑦ | **ai 规范文档** | `docs/`、`agent-templates/` | ✅ | 1.3 MB | `ai-spec`（规范正文/红线）· `code-rules`（预检清单）· `agent-ui-spec`（界面）· `agent-feature-backlog`（待办）· `agent-implementation`（已实现）· 本文件；`agent-templates/` 是随包分发的技能/工具/Modules 模板 |
+| ⑦ | **ai 规范文档** | `docs/`、`agent-templates/` | ✅ | 1.3 MB | `ai-spec`（规范正文/红线）· `code-rules`（预检清单）· `agent-ui-spec`（界面）· `agent-feature-backlog`（待办）· `agent-implementation`（已实现）· 本文件；`agent-templates/` 是**随包预置**：`skills/`（4 个内置技能 + `.example` 模板）、`tools/`（3 个内置工具 + `.example` 模板）、`modules/`（插件开发规范） |
 | ⑧ | **参考学习目录** | `_reference/`（含 `_reference/core/`） | ✗ | 413 MB | 第三方参考源码。**整目录 gitignore**，不进发行链路 |
 
 入库的顶层只有：`.gitignore` `LICENSE` `README.md` `package.json` `agent-templates/` `app/` `core-agent/` `docs/` `licenses/` `scripts/` `tuning-engine/` `vscode-extension/`。
@@ -39,7 +39,7 @@
 | `tuning-engine/` | `app/src-tauri/Cargo.toml` 的**路径依赖**；搬它要同步改 `Cargo.toml` + `Cargo.lock` |
 | `*/node_modules/` | 必须与 `package.json` 同级（npm 解析规则） |
 | `*/target/` `app/dist/` `app/plugin-dist/` | cargo / vite 按相对路径产出的固定位置 |
-| `agent-templates/` | `build-release.ps1` 与 NSI 按名引用 |
+| `agent-templates/` | `build-release.ps1` 与 NSI 按名引用；**内置技能/工具的唯一部署来源**（`app/src-tauri/tools/` 不进任何拷贝链路，2026-10-06 已废弃） |
 
 **因此本仓库不做「按分类大搬家」**：收益只是看着整齐，代价是几十处路径引用 + 逐项回归。分类用本文件表达即可。
 
@@ -51,6 +51,7 @@
 - 上游参考源码归档：仓库根 `core/` → `_reference/core/`（`.gitignore` 改为忽略 `_reference/`，并保留 `core/` 双保险）
 - 装好的 release 侧：删掉插件更新留下的备份目录 `Modules\.old-1790942629946`（35.9 MB，10-01 的 music 0.9.12）与过期的 `config\ai.json.bak-*`
 - dev 侧：测试插件 `Modules\lunac-plugin-test`、测试技能 `skills\telegram-bot-collect`、测试配置 `config\mcp.json` / `mcp-trusted.json` 一并清除
+- **内置 Agent 工具接线**：`app/src-tauri/tools/` 那 3 个内置工具（`system_info` / `weather` / `image_pattern_analysis`）**从未被部署到 `<exe 根>\tools\`** —— 该目录不在 `tauri.conf.json` 的 `bundle.resources` 里、也没有任何拷贝步骤，`image_pattern_analysis` 的 builtin 分支成了死路径。已 `git mv` 到 `agent-templates/tools/`（真名），接上 `build-release.ps1` 既有链路；dev 侧 `target\debug\tools\` 已同步（预检 #77）
 - **备份点**：`git tag pre-cleanup-2026-10-06`（仓库回滚用）；`D:\Lunac-backup-2026-10-06\`（私钥 + release 侧被删项）
 
 **未做（需要时再单独评估）**
