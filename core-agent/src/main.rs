@@ -4852,6 +4852,25 @@ fn common_prefix_len(prev: &[u64], cur: &[u64]) -> usize {
     prev.iter().zip(cur.iter()).take_while(|(a, b)| a == b).count()
 }
 
+/// 归并一次请求的**输入侧**用量 `(input, cache_read, cache_creation)`。
+///
+/// 为什么需要它（2026-10-07 实测）：Anthropic 原生把三类输入放在 `message_start` 的
+/// `message.usage` 里；但**中转端点可能在那里全填 0**，真值只在 `message_delta` 的
+/// `usage` 上（实测 `api.moonobscura.com`：`message_start` 三类全 0，`message_delta`
+/// 才给出 `input_tokens`）。只认 `message_start` 的话，输入 / 命中 / 写入三列**永远是 0**，
+/// 命中率与金额一起失真（面板上就是用户看到的「没有数值」）。
+///
+/// 判据是「**有没有量**」而不是端点身份：`start` 有任何非零 ⇒ 用它（原生路径逐字节不变）；
+/// 三类全 0 ⇒ 回落到 `delta`。因此对同一条 delta 重复归并是**幂等**的（第二次 `merged`
+/// 等于现值，调用方据此跳过），不会把一次请求的输入计两遍。
+fn merge_input_usage(start: (u64, u64, u64), delta: (u64, u64, u64)) -> (u64, u64, u64) {
+    if start.0 + start.1 + start.2 > 0 {
+        start
+    } else {
+        delta
+    }
+}
+
 fn run_query(
     cfg: &Cfg,
     history: &mut Vec<Value>,
@@ -5463,13 +5482,36 @@ fn run_query(
                     emit_stream_event(json!({ "type": "content_block_stop", "index": idx() }));
                 }
                 "message_delta" => {
-                    if let Some(n) = ev["usage"].get("output_tokens").and_then(Value::as_u64) {
-                        out_tokens += n;
-                        // 成本预算计点（2026-10-01）：输出也计入本次提问的花费
-                        turn_tokens += n;
-                        // Anthropic 的 message_delta.output_tokens 是**本条消息的累计值**，
-                        // 所以这里是赋值不是累加（同一条消息可能来多次 delta）。
-                        cur_out = n;
+                    if let Some(u) = ev.get("usage") {
+                        if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
+                            out_tokens += n;
+                            // 成本预算计点（2026-10-01）：输出也计入本次提问的花费
+                            turn_tokens += n;
+                            // Anthropic 的 message_delta.output_tokens 是**本条消息的累计值**，
+                            // 所以这里是赋值不是累加（同一条消息可能来多次 delta）。
+                            cur_out = n;
+                        }
+                        // 输入侧兜底（2026-10-07，见 `merge_input_usage`）：原生端点在
+                        // `message_start` 给了量 ⇒ 这里幂等跳过；**中转端点**（实测
+                        // api.moonobscura.com）在那里全填 0、真值只在这条上 ⇒ 在此采用，
+                        // 否则输入 / 命中 / 写入三列永远是 0。
+                        let d = (
+                            u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            u.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                            u.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        );
+                        let m = merge_input_usage((cur_in, cur_read, cur_create), d);
+                        if m != (cur_in, cur_read, cur_create) {
+                            in_tokens += m.0.saturating_sub(cur_in);
+                            cache_read += m.1.saturating_sub(cur_read);
+                            cache_create += m.2.saturating_sub(cur_create);
+                            turn_tokens += (m.0 + m.1 + m.2)
+                                .saturating_sub(cur_in + cur_read + cur_create);
+                            cfg.last_input.set(m.0 + m.1 + m.2);
+                            cur_in = m.0;
+                            cur_read = m.1;
+                            cur_create = m.2;
+                        }
                     }
                 }
                 "message_stop" => {
@@ -6070,6 +6112,20 @@ mod tests {
             tool_output: None,
             shell_control: None,
         }
+    }
+
+    /// 输入用量归并（2026-10-07）：原生端点用 `message_start` 的量；中转端点在
+    /// `message_start` 里把三类输入全填 0、真值只在 `message_delta` 上 ⇒ 必须回落，
+    /// 否则面板的输入 / 命中 / 写入三列恒为 0（用户报的「没有数值」）。
+    #[test]
+    fn merge_input_usage_prefers_start_and_falls_back_to_delta() {
+        // 原生：start 有量 ⇒ 原样采用，delta 再给什么都不覆盖
+        assert_eq!(merge_input_usage((100, 20, 0), (0, 0, 0)), (100, 20, 0));
+        assert_eq!(merge_input_usage((100, 20, 0), (999, 999, 999)), (100, 20, 0));
+        // 中转：start 全 0 ⇒ 采用 delta 的真值
+        assert_eq!(merge_input_usage((0, 0, 0), (31, 5, 2)), (31, 5, 2));
+        // 两边都空 ⇒ 保持全 0（旧 agent / 不报用量的端点）
+        assert_eq!(merge_input_usage((0, 0, 0), (0, 0, 0)), (0, 0, 0));
     }
 
     /// A17：结果卡上的安全告警载荷 —— 判据与审批卡**同源**（`written_payload` + `analyze`）。
