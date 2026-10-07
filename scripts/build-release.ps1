@@ -295,7 +295,15 @@ $Killed = $false
 foreach ($name in @("lunac", "agent")) {
   $proc = Get-Process -Name $name -ErrorAction SilentlyContinue
   if ($proc) {
-    taskkill /F /IM "$name.exe" 2>$null | Out-Null
+    # ⚠️ taskkill 对「进程已经不在了」会往 **stderr** 写 `ERROR: The process … not found`，
+    # 而 PS 5.1 在 `$ErrorActionPreference='Stop'` 下把原生命令的 stderr 当成**终止错误**
+    # ⇒ 整条构建链在 [2/8] 当场中断（2026-10-07 实测：`agent.exe` 没在跑时必挂；上次能过
+    # 只是因为那一刻 agent 恰好在跑）。「杀不到」不是错误，所以只在这里把 EAP 降为 Continue，
+    # 并把 stderr 一并吞掉 —— 别把它扩到别处，那会吞掉真正的构建失败。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    taskkill /F /IM "$name.exe" 2>&1 | Out-Null
+    $ErrorActionPreference = $prevEap
     Write-Host "  Killed $name.exe" -ForegroundColor DarkGray
     $Killed = $true
   }
@@ -398,11 +406,14 @@ if (Test-Path "$AppDir\cli.exe") {
 
 # ── 技能 / 工具 / 插件模板（agent-templates\ → skills\ + tools\ + Modules\）──
 # 装完就有的目录。这里有两类内容，判据是「有没有用真实文件名」：
-#   · **内置技能**（agent-templates\skills\<key>\SKILL.md，2026-10-01 起）：真名 ⇒ 会被
-#     加载、进模型的技能清单。它们本身就是随包送出去的能力（code-review / debug / commit）。
+#   · **内置项**（真名）：`skills\<key>\SKILL.md`（2026-10-01 起，code-review / debug /
+#     commit / stuck-guard）与 `tools\*.json`（2026-10-06 起，system_info / weather /
+#     image_pattern_analysis）—— 真名 ⇒ 会被加载、进模型的能力清单。它们本身就是随包
+#     送出去的能力。⚠️ tools\ 这 3 个**当天才从 `app\src-tauri\tools\` 搬来**：那里既不在
+#     `tauri.conf.json` 的 resources 里、也没有任何拷贝步骤，等于**从未部署过**；搬到
+#     agent-templates\ 才接上这条既有链路（教训见 ai-spec §4.2 / 预检 #77）。
 #   · **模板**（*.example）：故意不叫真名（`_example\SKILL.md.example` /
 #     `example-tool.json.example`），用户照着抄，不会被加载、也不污染工具清单与提示词。
-# tools\ 那一侧**至今只有模板**：任何 .json 都会被当成真实工具加载。
 #
 # **Modules\**（2026-09-28）只有一份 README（插件开发规范）—— 它既给用户看，也是
 # 「让 Lunac 自己写插件」的依据（宿主把该目录与 README 的绝对路径都交给了 agent）。
