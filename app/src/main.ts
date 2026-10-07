@@ -1270,7 +1270,7 @@ interface SessionUsage {
 
 /** 过程快照里的一步：一条思考 / 一次工具调用（含结果）。 */
 interface SessionStep {
-  kind: "thinking" | "tool" | "text";
+  kind: "thinking" | "tool" | "text" | "note";
   /** 工具名（kind=tool 时） */
   name?: string;
   /** 命令原文 / 参数摘要 / 文本片段（已截断） */
@@ -1751,10 +1751,14 @@ function clipStep(s: string, n = STEP_MAX): string {
 function recordTurnSteps(flowEl: HTMLElement, hasMsg: boolean) {
   const items: SessionStep[] = [];
   flowEl
-    .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card")
+    .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card, .note-interrupted")
     .forEach(el => {
       if (items.length >= STEPS_PER_TURN_MAX) return;
-      if (el.classList.contains("think-block")) {
+      // 「本回合被手动终止」的旁注（见 appendInterruptedNote）：只是一行说明，不是内容。
+      // 只认这一种 `.note-interrupted`，**不**顺带收其它 `.sys-note`（那会改变既有快照）。
+      if (el.classList.contains("note-interrupted")) {
+        items.push({ kind: "note", detail: clipStep(el.textContent || "") });
+      } else if (el.classList.contains("think-block")) {
         const text = clipStep(el.dataset.thinkText || el.textContent || "");
         if (text) items.push({ kind: "thinking", detail: text });
       } else if (el.classList.contains("agent-text")) {
@@ -1784,6 +1788,11 @@ function recordTurnSteps(flowEl: HTMLElement, hasMsg: boolean) {
 
 /** 历史「过程」块里的一步 → HTML（复用实时对话的类名，样式免费）。 */
 function historyStepHtml(s: SessionStep): string {
+  if (s.kind === "note") {
+    // 被手动终止的旁注（同实时流的形态，见 appendInterruptedNote）—— 历史回看照样能看到
+    // 「这一轮是你掐掉的」，而不是以为模型只答了一半。
+    return `<div class="sys-note sys-note-line note-interrupted">${esc(s.detail || "")}</div>`;
+  }
   if (s.kind === "thinking") {
     const text = s.detail || "";
     return (
@@ -3914,21 +3923,49 @@ function markFlyingCardsStopped(v: AgentView | null) {
  *  置空**再杀进程 —— 于是被中断的回合永远走不到那段收尾：思考只留在临时的实时 DOM 里，
  *  一次重绘（回退 / 切会话 / 重开窗）就没了。
  *
- *  ⚠️ **刻意不 push 助手消息**（2026-10-03 定案）：被中断的回合必须**不进 AI 上下文** ——
- *  一 push，半截正文就会写进 `chat.db` 的 messages（进 FTS 索引，可被 `SessionSearch`
- *  搜到）并随后续 `set_history` 回灌给模型，模型就读到一条**被截断的助手消息**。半截正文
- *  仍以 `text` 步骤留在过程块里（`recordTurnSteps` 会抽 `.agent-text`），用户照样看得到，
- *  只是模型看不到。
+ *  ⚠️ **会 push 助手消息**（2026-10-06 用户改定；此前「刻意不 push、不进 AI 上下文」
+ *  的定案已作废）：半截正文与非中断回合同口径进 `chatHistory` —— 用户要的就是「被中断的
+ *  那段输出也属于对话历史」。代价（已知并接受）：它会写进 `chat.db` 的 messages（进 FTS
+ *  索引，可被 `SessionSearch` 搜到）并随后续 `set_history` 回灌给模型，模型会读到一条
+ *  被截断的助手消息。**没有正文时（只思考/调工具）不 push**（同正常收尾的 `if (finalText)`）。
  *
- *  也因此 `recordTurnSteps(flow, false)`：被中断的回合**没有**助手气泡，历史渲染要把它挂到
- *  自己的用户气泡之后（见 `renderHistoryProcess`）。
+ *  因此 `recordTurnSteps(flow, !!finalText)`：有正文 ⇒ 被中断的回合**有**助手气泡，历史
+ *  渲染照常挂它之后；没有 ⇒ 挂到自己的用户气泡之后（见 `renderHistoryProcess`）。
  *  ⚠️ **必须在 `agentView = null` 之前调用**（本函数靠它拿实时 DOM）。 */
-function finalizeInterruptedTurn() {
+function finalizeInterruptedTurn(opts: { manualStop?: boolean } = {}) {
   const v = agentView;
   if (!v) return;
   agentCloseBlock();
-  recordTurnSteps(v.flow, false); // 只进过程快照，不进 chatHistory / AI 上下文
+  // 只给「用户点停止」这一条加旁注。「立即发送」那条（`drainQueue: false`）**不加** ——
+  // 用户随即就在追问下一句，插一行「已手动终止」只是噪音（与那条路不改写状态栏同一纪律）。
+  if (opts.manualStop) appendInterruptedNote(v.flow);
+  // 被中断的回合**也进 AI 上下文**（2026-10-06 用户改定，此前「刻意不 push」作废）：
+  // 已流出的半截正文作为一条助手消息 push 进 `chatHistory` —— 与非中断回合同一口径
+  //（`finalText` 为空则不 push，同正常收尾的 `if (finalText)`）。⚠️ 这意味着它会写进
+  // `chat.db` 的 messages（进 FTS 索引）并随后续 `set_history` 回灌给模型，**这是用户
+  // 明确要的**：「被中断的那段输出也要成为对话历史的一部分」。
+  const finalText = v.textAll.trim();
+  if (finalText) chatHistory.push({ role: "assistant", content: finalText });
+  // 与正常收尾同口径：先按同一上限裁剪上下文（否则每中断一次就多留一条、无界增长），
+  // 再固化过程快照 —— `hasMsg` 决定历史渲染时过程块挂助手气泡还是自己的用户气泡之后。
+  const beforePrune = chatHistory.length;
+  chatHistory = pruneContext(chatHistory);
+  shiftRenderedMsgIdx(beforePrune - chatHistory.length);
+  recordTurnSteps(v.flow, !!finalText);
   saveCurrentSession().catch(() => {});
+}
+
+/** 用户按「停止」掐掉这一轮后，在过程末尾留一行明示（由 `finalizeInterruptedTurn` 调）。
+ *
+ *  形态照「上下文压缩提示」（`.sys-note sys-note-line`）：**必须插独立节点**、不进
+ *  `textAll` —— 走了 `agentAppend("text", …)` 就会被当成助手正文存进 `chatHistory`、
+ *  下次回灌给模型（同压缩提示踩过的坑，见那段注释）。`.note-interrupted` 这个类同时是
+ *  `recordTurnSteps` 的采集判据，历史回看时才不会只剩半截输出。 */
+function appendInterruptedNote(flow: HTMLElement) {
+  const note = document.createElement("div");
+  note.className = "sys-note sys-note-line note-interrupted";
+  note.textContent = t("agent.turn_interrupted");
+  flow.appendChild(note);
 }
 
 async function stopAIChat(opts: { drainQueue?: boolean } = {}) {
@@ -3948,7 +3985,8 @@ async function stopAIChat(opts: { drainQueue?: boolean } = {}) {
   setStreamingUI(false);
   // 中断前先固化这一轮（思考 / 过程 / 已流出的正文）—— 必须排在下面 `agentView = null`
   // 之前，否则这一轮永远走不到 cliDoneCallback 的收尾，内容只留在实时 DOM 里会丢。
-  finalizeInterruptedTurn();
+  // `manualStop: drainQueue`：只有用户点「停止」（drainQueue 为真）才追加「已手动终止输出」旁注。
+  finalizeInterruptedTurn({ manualStop: drainQueue });
 
   // Stop the CLI (agent mode) — kills agent.exe and clears its context.
   await invoke("stop_cli").catch(() => {});

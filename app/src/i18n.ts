@@ -6419,6 +6419,17 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "중지됨",
     "en": "Stopped",
   },
+  // 用户点「停止」掐掉**整轮**输出后，在对话流末尾留的一行明示（2026-10-06 用户要求
+  // 「主动显示手动终止输出」）：内容（思考 / 半截正文）虽已保留，但界面必须**说**这一轮
+  // 是被手动终止的 —— 否则用户分不清「跑完了」还是「被我停了」。见 main.ts
+  // `appendInterruptedNote` / `recordTurnSteps`（该行随过程快照一起持久化）。
+  "agent.turn_interrupted": {
+    "zh-CN": "已手动终止输出",
+    "zh-TW": "已手動終止輸出",
+    "ja": "手動で出力を中断しました",
+    "ko": "수동으로 출력을 중단했습니다",
+    "en": "Output manually stopped",
+  },
   "agent.tool_skipped": {
     "zh-CN": "已跳过",
     "zh-TW": "已略過",
