@@ -173,7 +173,8 @@ async function readJsonAbs(absPath: string): Promise<unknown> {
 
 /** 从 `.physics3.json` 取**物理的输入 / 输出参数 id**（去重、保持出现次序）。
  *  Cubism 公开 schema：`PhysicsSettings[].Input[].Source` / `[].Output[].Destination`，
- *  参数 id 取 `Target`（缺时认 `Id`）。文件读不到 / 结构不认识 ⇒ 两个空数组。 */
+ *  其中 `Target` 是**目标类型名**（恒为 `"Parameter"` 这类字面量）、**真正的参数 id 在 `Id`**
+ *  ⇒ 取 `Id`，仅在缺 `Id` 时退回 `Target`。文件读不到 / 结构不认识 ⇒ 两个空数组。 */
 async function physicsParams(absPath: string): Promise<{ inputs: string[]; outputs: string[] }> {
   const json = (await readJsonAbs(absPath)) as { PhysicsSettings?: unknown } | null;
   const inputs: string[] = [];
@@ -183,8 +184,8 @@ async function physicsParams(absPath: string): Promise<{ inputs: string[]; outpu
   };
   const pickId = (obj: unknown): string => {
     const o = obj as { Target?: unknown; Id?: unknown } | null | undefined;
-    if (typeof o?.Target === "string" && o.Target) return o.Target;
     if (typeof o?.Id === "string" && o.Id) return o.Id;
+    if (typeof o?.Target === "string" && o.Target) return o.Target;
     return "";
   };
   const settings = json?.PhysicsSettings;
