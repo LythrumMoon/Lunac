@@ -868,21 +868,97 @@ pub async fn send_message(_state: State<'_, AppState>, message: String) -> Resul
     Ok("Message sent".into())
 }
 
-// ── 长期记忆的前端入口（斜杠命令 /memory 与 /memory clear，2026-10-11）──
-// 记忆的真相源是 `ModuleData\memory\MEMORY.md`，读写逻辑一直在 mcp_server.rs（agent 桥那两条
-// 自定义方法的内存侧）。这两个命令只是把它 pub 出来给前端：读是只读、清空是破坏性（前端已
-// 就地二次确认）。**不新增第三个落点**，也不改 MEMORY.md 的格式与上限。
+// ── 长期记忆 / 桌宠事实记忆的前端入口（2026-10-11 / 2026-10-13）──
+// 记忆的真相源：全局 `ModuleData\memory\MEMORY.md`、桌宠 `ModuleData\memory\pet\MEMORY.md`，
+// 读写逻辑一直在 mcp_server.rs（agent 桥那两条自定义方法的内存侧）。下面的命令只是把它 pub
+// 出来给前端，并按作用域落到对应文件：**不新增第三个落点**，也不改 MEMORY.md 的格式与上限。
+// ⚠️ 这里的「桌宠记忆」= **桌宠作用域的事实记忆**（`pet\MEMORY.md`，AI 经 `Remember` 写），
+// 与「成长笔记」(`pet\GROWTH.md`，AI 经 `PetGrowth` 写) 是两个不同文件，命令名别互相串。
 
-/// 查看当前长期记忆全文（文件不存在 ⇒ 空串）。
+/// 查看当前全局长期记忆全文（文件不存在 ⇒ 空串）。
 #[tauri::command]
 pub fn get_memory() -> Result<String, String> {
-    crate::mcp_server::memory_read_text()
+    crate::mcp_server::memory_read_text(crate::mcp_server::MemoryScope::Global)
 }
 
-/// 清空长期记忆（把记忆文件截断为空）。破坏性操作，调用方（前端）负责二次确认。
+/// 清空全局长期记忆（把记忆文件截断为空）。破坏性操作，调用方（前端）负责二次确认。
 #[tauri::command]
 pub fn clear_memory() -> Result<(), String> {
-    crate::mcp_server::clear_memory_text()
+    crate::mcp_server::clear_memory_text(crate::mcp_server::MemoryScope::Global)
+}
+
+/// 桌宠作用域「事实记忆」列表（作用域 = Pet，数据源 = `pet\MEMORY.md`）：条目数组 + 两条上限。
+/// 给桌宠设置窗的「事实记忆」列表用；上限来自宿主常量（前端只回显，不另立一份）。
+#[tauri::command]
+pub fn get_pet_memory() -> Result<serde_json::Value, String> {
+    crate::mcp_server::memory_scope_payload(crate::mcp_server::MemoryScope::Pet)
+}
+
+/// 逐条删除一条桌宠事实记忆（`pet\MEMORY.md`，按内容匹配，删 A 不动 B）。破坏性操作，调用方负责二次确认。
+#[tauri::command]
+pub fn delete_pet_memory_note(text: String) -> Result<(), String> {
+    crate::mcp_server::memory_delete_entry(crate::mcp_server::MemoryScope::Pet, &text).map(|_| ())
+}
+
+/// 清空全部桌宠事实记忆（把 `pet\MEMORY.md` 截断为空）。破坏性操作，调用方负责二次确认。
+#[tauri::command]
+pub fn clear_pet_memory() -> Result<(), String> {
+    crate::mcp_server::clear_memory_text(crate::mcp_server::MemoryScope::Pet)
+}
+
+// ── 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）──────────────
+// 两款**固定路径**的小文件（宿主拼路径、AI 不参与），都**不进 `config\`**：
+//   · 成长笔记 = `ModuleData\memory\pet\GROWTH.md`（与桌宠记忆同目录、另立文件）
+//   · 人格建议 = `ModuleData\memory\pet\PERSONA_SUGGESTIONS.md`
+// **AI 只追加**（桥 `lunac/pet_growth_write` / `lunac/persona_suggestion_write`）；
+// 逐条删 / 清空 / 合并（= 用户「接受」）都只由下面的宿主命令做。UI 下轮接。
+// ⚠️ **AI 无任何改核心人格的路径**：合并只能经 `merge_persona_suggestion`（前台命令）。
+
+/// 桌宠「成长笔记」列表 + 两条上限（数据源 = `GROWTH.md`，非 MEMORY.md）。
+#[tauri::command]
+pub fn get_pet_growth() -> Result<serde_json::Value, String> {
+    crate::mcp_server::pet_growth_payload()
+}
+
+/// 逐条删除一条桌宠成长笔记（按内容匹配，删 A 不动 B）。破坏性操作，调用方负责二次确认。
+#[tauri::command]
+pub fn delete_pet_growth_note(text: String) -> Result<(), String> {
+    crate::mcp_server::pet_growth_delete_entry(&text).map(|_| ())
+}
+
+/// 清空全部桌宠成长笔记。破坏性操作，调用方负责二次确认。
+#[tauri::command]
+pub fn clear_pet_growth() -> Result<(), String> {
+    crate::mcp_server::pet_growth_clear()
+}
+
+/// 桌宠人格修订建议列表 + 上限（数据源 = `PERSONA_SUGGESTIONS.md`；AI 只能追加，用户逐条裁决）。
+#[tauri::command]
+pub fn get_persona_suggestions() -> Result<serde_json::Value, String> {
+    crate::mcp_server::persona_suggestions_payload()
+}
+
+/// 删除一条人格修订建议（用户「忽略」）。破坏性操作，调用方负责二次确认。
+#[tauri::command]
+pub fn delete_persona_suggestion(text: String) -> Result<(), String> {
+    crate::mcp_server::persona_suggestion_delete(&text).map(|_| ())
+}
+
+/// **把一条人格修订建议合并进 `config\pet-persona.md`**（用户「接受」后的动作；UI 下轮接）。
+///
+/// 合并 = 在现有桌宠人格后追加该建议（一段）。**复用 `set_pet_persona` 的同一套校验**
+/// （`storage::save_persona_text_at`：长度 `MAX_PERSONA_CHARS` / NUL / 先校验后写）—— 校验不过
+/// 一个字节都不落盘，且**不动建议区**；真写成了才把该条建议从建议区摘掉。
+#[tauri::command]
+pub fn merge_persona_suggestion(text: String) -> Result<(), String> {
+    // 首次使用：把默认人格落盘（否则合并的基线是空串，用户看不到既有内容）。
+    crate::storage::ensure_pet_persona_default()?;
+    crate::mcp_server::merge_persona_suggestion(&text)?;
+    crate::log::info(format!(
+        "桌宠人格已合并一条修订建议：{} 字（只作用于桌宠发起的对话）",
+        text.chars().count()
+    ));
+    Ok(())
 }
 
 #[tauri::command]

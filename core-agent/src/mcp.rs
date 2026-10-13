@@ -1375,22 +1375,52 @@ impl Bridge {
         self.result_text(&res)
     }
 
-    /// 读长期记忆（A4）—— 启动时注入系统提示词、复盘 fork 开跑前读一次。
+    /// 读长期记忆（A4）—— 启动 / 按轮注入记忆、复盘 fork 开跑前读一次。
     ///
-    /// 空记忆（全新安装）时服务端返回 `(long-term memory is empty)`，注入侧据此跳过。
-    pub fn memory_read(&mut self) -> Result<String, String> {
-        let res = self.request("lunac/memory_read", json!({}), HANDSHAKE_TIMEOUT)?;
+    /// `scope` 决定读哪一份（`global` / `pet`，见 `tools::MemoryScope`）。空记忆（全新安装）
+    /// 时服务端返回 `(long-term memory is empty)`，注入侧据此跳过。
+    pub fn memory_read(&mut self, scope: &str) -> Result<String, String> {
+        let res = self.request("lunac/memory_read", json!({ "scope": scope }), HANDSHAKE_TIMEOUT)?;
         self.result_text(&res)
     }
 
     /// 写长期记忆（A4）—— `Remember` 工具的后端。
     ///
-    /// `replace` = 整体替换（整理合并时用），默认按条目追加；服务端的去重与上限
-    /// 报错都会以 `isError` 回来 ⇒ 这里变成 `Err`，模型看得见原因，可自行改小重写。
-    pub fn memory_write(&mut self, content: &str, replace: bool) -> Result<String, String> {
+    /// `scope` 决定写哪一份（`global` / `pet`）；`replace` = 整体替换（整理合并时用），
+    /// 默认按条目追加；服务端的去重与上限报错都会以 `isError` 回来 ⇒ 这里变成 `Err`，
+    /// 模型看得见原因，可自行改小重写。
+    pub fn memory_write(&mut self, content: &str, replace: bool, scope: &str) -> Result<String, String> {
         let res = self.request(
             "lunac/memory_write",
-            json!({ "content": content, "replace": replace }),
+            json!({ "content": content, "replace": replace, "scope": scope }),
+            CALL_TIMEOUT,
+        )?;
+        self.result_text(&res)
+    }
+
+    /// 读桌宠成长笔记（人格地基）—— 桌宠轮注入用。空时服务端返回 `(pet growth notes are empty)`。
+    pub fn pet_growth_read(&mut self) -> Result<String, String> {
+        let res = self.request("lunac/pet_growth_read", json!({}), HANDSHAKE_TIMEOUT)?;
+        self.result_text(&res)
+    }
+
+    /// 追加一条桌宠成长笔记（人格地基）—— `PetGrowth` 工具的后端，**只追加**（无 replace）。
+    /// 服务端的去重与上限报错都会以 `isError` 回来 ⇒ 这里变 `Err`，模型看得见原因可自行改小。
+    pub fn pet_growth_write(&mut self, content: &str) -> Result<String, String> {
+        let res = self.request(
+            "lunac/pet_growth_write",
+            json!({ "content": content }),
+            CALL_TIMEOUT,
+        )?;
+        self.result_text(&res)
+    }
+
+    /// 追加一条桌宠人格修订建议（人格地基）—— `PetPersonaSuggest` 工具的后端，**只追加**。
+    /// ⚠️ 它**改不了核心人格**：合并只能由用户在界面里「接受」（宿主命令），AI 侧到不了。
+    pub fn persona_suggestion_write(&mut self, content: &str) -> Result<String, String> {
+        let res = self.request(
+            "lunac/persona_suggestion_write",
+            json!({ "content": content }),
             CALL_TIMEOUT,
         )?;
         self.result_text(&res)
@@ -2145,12 +2175,24 @@ impl McpSet {
         self.lunac()?.history_search(query, limit)
     }
 
-    pub fn memory_read(&mut self) -> Result<String, String> {
-        self.lunac()?.memory_read()
+    pub fn memory_read(&mut self, scope: &str) -> Result<String, String> {
+        self.lunac()?.memory_read(scope)
     }
 
-    pub fn memory_write(&mut self, content: &str, replace: bool) -> Result<String, String> {
-        self.lunac()?.memory_write(content, replace)
+    pub fn memory_write(&mut self, content: &str, replace: bool, scope: &str) -> Result<String, String> {
+        self.lunac()?.memory_write(content, replace, scope)
+    }
+
+    pub fn pet_growth_read(&mut self) -> Result<String, String> {
+        self.lunac()?.pet_growth_read()
+    }
+
+    pub fn pet_growth_write(&mut self, content: &str) -> Result<String, String> {
+        self.lunac()?.pet_growth_write(content)
+    }
+
+    pub fn persona_suggestion_write(&mut self, content: &str) -> Result<String, String> {
+        self.lunac()?.persona_suggestion_write(content)
     }
 
     /// resources 读侧走**宿主那条桥**：用户工具定义（`tools\*.json`）在那边，

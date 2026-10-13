@@ -10804,6 +10804,10 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
       // 按轮思考覆盖（2026-10-09）：**桌宠那一轮一律关 thinking**（省推理 token / 更快）。
       // 普通轮不带这个字段 ⇒ agent 用全局思考开关（见 ai-spec §3.5 / §4.5）。
       ...(currentTurnFromPet ? { thinking: "off" } : {}),
+      // 按轮记忆作用域（2026-10-13）：桌宠轮标注 `source:"pet"` ⇒ agent 把「主动记忆」
+      // 写进**桌宠私有**那一份、且本轮只注入桌宠私有记忆；普通轮不带 ⇒ 用全局长期记忆。
+      // 只传一个标记位，不传任何内容（内容与落点都在 AI 侧，见 core-agent 的 turn_memory_scope）。
+      ...(currentTurnFromPet ? { source: "pet" } : {}),
     });
     await invoke("send_message", { message: msg });
   } catch (err: any) {

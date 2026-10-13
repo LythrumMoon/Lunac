@@ -113,6 +113,30 @@ pub(crate) const SKIP_DIRS: [&str; 13] = [
     "__pycache__", ".idea", ".vscode", "build",
 ];
 
+/// 记忆作用域（2026-10-13）：主 AI 的**全局**长期记忆 vs **桌宠私有**的成长笔记。
+///
+/// 由**本轮的来源**决定（前端在 user 消息里带 `source`，见 main.rs 的 `turn_memory_scope`）：
+/// 桌宠发起的那一轮读写桌宠私有那一份，其余一轮用全局那一份 —— 宿主侧两份各一个文件
+/// （见 `mcp_server::memory_path_for`），互不注入（作用域隔离）。
+///
+/// 放在 `Ctx` 上而不是单开一个参数：`Ctx` 已被子代理 / 后台复盘 fork **克隆继承**（见其注释），
+/// 于是在桌宠轮里派生的复盘 / 子代理**自动写回同一作用域**，不必逐层传参。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoryScope {
+    Global,
+    Pet,
+}
+
+impl MemoryScope {
+    /// 传给宿主桥方法 `lunac/memory_*` 的 `scope` 值（宿主侧 [`MemoryScope::parse`] 认这一对）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryScope::Global => "global",
+            MemoryScope::Pet => "pet",
+        }
+    }
+}
+
 /// 工具执行上下文（由 main.rs 依据启动参数构建）。
 ///
 /// `Clone` 是为了后台复盘 fork：它在**另一条线程**上跑（见 main.rs 的 `run_review_fork`），
@@ -183,6 +207,13 @@ pub struct Ctx {
     /// —— 与 `tool_output` 同一条纪律：**不给它就不新增任何能力**（也顺带防住「子代理
     /// 里的命令被主对话的按钮误杀」这种串台）。
     pub shell_control: Option<Arc<ShellControl>>,
+    /// **本轮的记忆作用域**（2026-10-13，见 [`MemoryScope`]）：main.rs 在每个 user 轮开始前
+    /// 按「本轮来源」写进这份 `Ctx`；`Remember` 用它决定写全局还是桌宠私有那一份。
+    ///
+    /// 为什么在 `Ctx` 上：子代理 / 后台复盘 fork 拿的是**克隆**（见本结构体注释）
+    /// ⇒ 它们自动继承本轮作用域，桌宠轮里派生的复盘也写桌宠那一份，不必逐层传参。
+    /// `Copy` 值语义足够 —— 它是**每轮**的事实，不需要 `Arc` 共享。
+    pub memory_scope: MemoryScope,
 }
 
 /// 实时输出回调：`(stream, chunk)`，`stream ∈ {"stdout", "stderr"}`。
@@ -765,13 +796,18 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 ///   ② `subagent_tool_defs()` 要把它们剔掉（子代理不接桥 ⇒ 留着就是保证失败）；
 ///   ③ 启动时的条件注册。
 /// **新增这类工具只改这个数组**，别在三处分别硬编码字符串。
-pub const BRIDGE_TOOLS: [&str; 6] = [
+pub const BRIDGE_TOOLS: [&str; 8] = [
     "SessionSearch",
     "ListMcpResourcesTool",
     "ReadMcpResourceTool",
     "ListMcpPromptsTool",
     "GetMcpPromptTool",
     "Remember",
+    // 桌宠自我区（2026-10-13，人格地基）：两条都走宿主桥的 `lunac/pet_growth_write` /
+    // `lunac/persona_suggestion_write`（**只追加**）。进这张表即自动：① 子代理里被剔掉
+    // （见 `subagent_tool_defs`）；② 没桥时早退报同一句错（不静默失败）。
+    "PetGrowth",
+    "PetPersonaSuggest",
 ];
 
 /// 该工具是否必须走 MCP 桥（见 [`BRIDGE_TOOLS`]）。
@@ -805,6 +841,60 @@ pub fn remember_tool() -> Value {
                 "replace": {
                     "type": "boolean",
                     "description": "Replace the ENTIRE memory with `content` instead of appending. Only for consolidating/rewriting when the memory is full or messy."
+                }
+            },
+            "required": ["content"]
+        }
+    })
+}
+
+/// `PetGrowth` 的 schema（2026-10-13，人格地基）。**不进 `defs()`** —— 由 `main.rs`
+/// 在桥接通时条件追加；且**只在桌宠发起的那一轮**可调用（其余轮会被 `dispatch_tool` 拒）。
+///
+/// 它写的是**桌宠自己的成长笔记**（关于「自己该怎么表现」的观察 / 习惯），与 `Remember`
+/// （用户的长期记忆）是两回事：成长笔记只注入桌宠轮、**只追加**、不可改删历史（改删只由用户
+/// 在界面里逐条做）。
+pub fn pet_growth_tool() -> Value {
+    json!({
+        "name": "PetGrowth",
+        "description": "Append ONE short note to your own growth log as the desktop pet — a \
+            durable observation or habit about how you should behave (tone, pace, what you \
+            noticed works). This is your private self-notes, not the user's memory. Use it only \
+            during a desktop-pet turn, for something worth carrying into future pet \
+            conversations. Append-only — you cannot edit or delete past notes. Write one concise \
+            self-contained line per call, in the language you speak to the user.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "One self-contained observation about how to behave (a sentence)."
+                }
+            },
+            "required": ["content"]
+        }
+    })
+}
+
+/// `PetPersonaSuggest` 的 schema（2026-10-13，人格地基）。**不进 `defs()`**，条件注册，
+/// **只在桌宠轮可调用**。
+///
+/// ⚠️ 它**改不了核心人格**：只会把一条「修订建议」写进固定路径的建议区，由用户之后在界面里
+/// **接受 → 合并**（事前确认，非「已阅」）。AI 侧没有任何直接写 `pet-persona.md` 的路径。
+pub fn persona_suggestion_tool() -> Value {
+    json!({
+        "name": "PetPersonaSuggest",
+        "description": "Propose ONE change to your own core persona (the desktop pet's persona). \
+            You CANNOT edit the persona yourself — this only records a suggestion for the user to \
+            review and merge later (they decide). Use it during a desktop-pet turn when you notice \
+            the persona should say something differently. Write one concise, actionable proposal \
+            per call, in the user's language.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "One concrete proposed change to the persona (a sentence)."
                 }
             },
             "required": ["content"]
@@ -937,6 +1027,15 @@ pub fn needs_approval(name: &str) -> bool {
             // 问不代表每次都弹卡：前端按运行方式决定（自动档静默放行），复盘 fork 的
             // 写入也走同一条路（见 main.rs 的 `run_review_fork`）。
             | "Remember"
+            // `PetGrowth`（2026-10-13 人格地基）**要问** —— 与 `Remember` **同一条判据**：
+            // 它写的是**跨会话、会在用户没看见时被注入以后每一轮**的持久文本（成长笔记注入
+            // 桌宠轮）；「只追加 / 封顶 / 落盘前脱敏」都不改变「持久副作用」这个事实，
+            // 故与 `Remember` 一视同仁（前端仍按运行方式决定）。
+            // ⚠️ `PetPersonaSuggest` **刻意不在这里**（2026-10-13）：它**只写一条「建议」**、
+            // **不改任何会被注入的内容** —— 建议要用户之后亲手「接受 → 合并」才生效，与
+            // `Remember`「直接写进以后每轮上下文」判然不同。判据：**只写建议 ≠ 直接改人格**；
+            // 若这里也弹卡，就对「改人格」这道门问两次（建议时一次、合并时一次），第一道可省。
+            | "PetGrowth"
             // `Agent` **要问**：它自己不直接碰本机，但它派生的是一个**能写文件、能跑命令**
             // 的子代理 —— 「派一个代理出去干活」这个决定本身值得确认。
             // 子代理内部的每次写操作**仍会各自再走一次审批**（见 `run_subagent`），
@@ -3714,6 +3813,8 @@ mod tests {
             // 两个标志一次都不会被读到，行为与改造前逐字节一致。
             tool_output: None,
             shell_control: None,
+            // 单测默认全局作用域；需要桌宠作用域时由用例自己摆（见 main.rs 的作用域注入）。
+            memory_scope: MemoryScope::Global,
         }
     }
 
@@ -4471,6 +4572,62 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(required.contains(&json!("content")), "content 必填");
+    }
+
+    /// 桌宠自我区（2026-10-13 人格地基）两件口径：**不在 `defs()` 里**（条件注册）、
+    /// **必须走桥**、必须串行；且**没有任何一件能写核心人格**
+    /// —— 桥只给「只追加」两条，合并只能走宿主命令（AI 侧到不了）。
+    ///
+    /// 「要不要弹卡」两件**刻意不同**：
+    ///   · `PetGrowth` **要**（与 `Remember` 同判据：写的是跨会话、会被注入以后每一轮的持久文本）。
+    ///   · `PetPersonaSuggest` **不要** —— 它**只写一条「建议」**、**不改任何会被注入的内容**，
+    ///     真要生效还需用户之后亲手「接受 → 合并」。判据：**只写建议 ≠ 直接改人格**，
+    ///     故第一道门可省（若这里也弹卡，就对「改人格」问两次）。
+    #[test]
+    fn pet_self_tools_are_bridge_only_serial_and_append_only() {
+        let all = defs(&[]);
+        for n in ["PetGrowth", "PetPersonaSuggest"] {
+            assert!(!names(&all).contains(&n.to_string()), "{n} 不该出现在 defs() 里（条件注册）");
+            assert!(needs_bridge(n), "{n} 必须走 MCP 桥");
+            assert!(!gated_in_read_only(n), "{n} 不在「只读档仍要问」那张表里");
+            assert!(!parallel_safe(n), "{n} 走单线程 stdio 桥，必须串行");
+        }
+        // 审批口径两件不同：成长笔记要（与 Remember 同判据），人格建议不要（只写建议、不改注入内容）
+        assert!(
+            needs_approval("PetGrowth") && needs_approval("Remember"),
+            "PetGrowth 写跨会话持久文本，与 Remember 同判据：要审批"
+        );
+        assert!(
+            !needs_approval("PetPersonaSuggest"),
+            "PetPersonaSuggest 只写「建议」、不改任何注入内容，等用户合并才生效 ⇒ 不弹卡"
+        );
+        // schema 是一等公民形状，且**只有 content**（没有「改核心人格」那种入参形态）
+        for t in [pet_growth_tool(), persona_suggestion_tool()] {
+            assert!(t.get("name").and_then(Value::as_str).is_some(), "缺 name");
+            assert!(t.get("description").and_then(Value::as_str).is_some(), "缺 description");
+            let required = t
+                .pointer("/input_schema/required")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(required, vec![json!("content")], "只应有 content 一个必填项");
+        }
+        // 「AI 无改核心人格路径」的 agent 侧证据：能到达宿主的工具**恰好**是这些（新增一件
+        // 都意味着 AI 多了一条到宿主的路径，必须在这里显式登记）；**没有**任何写人格的一件。
+        assert_eq!(
+            BRIDGE_TOOLS,
+            [
+                "SessionSearch",
+                "ListMcpResourcesTool",
+                "ReadMcpResourceTool",
+                "ListMcpPromptsTool",
+                "GetMcpPromptTool",
+                "Remember",
+                "PetGrowth",
+                "PetPersonaSuggest",
+            ],
+            "走桥工具清单变更必须显式登记（AI 到宿主的每条路径都在这里）"
+        );
     }
 
     /// 没超预算的结果必须**逐字节原样**回给模型（不许多出任何说明文字、不许碰磁盘）

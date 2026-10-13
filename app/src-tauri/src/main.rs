@@ -59,6 +59,11 @@ use commands::{
     start_cli, stop_cli, send_message, get_status,
     // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
     get_memory, clear_memory,
+    // 桌宠事实记忆（桌宠私有 `pet\MEMORY.md`，AI 经 Remember 写）的前端入口
+    get_pet_memory, delete_pet_memory_note, clear_pet_memory,
+    // 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）
+    get_pet_growth, delete_pet_growth_note, clear_pet_growth,
+    get_persona_suggestions, delete_persona_suggestion, merge_persona_suggestion,
     set_security_profile, list_start_menu_apps,
     set_query_state, set_recording_state, set_ui_mode, set_chips_empty,
     set_ai_mode, set_thinking_mode, set_detached, get_ai_config, set_ai_config, test_ai_connection,
@@ -543,6 +548,19 @@ fn main() {
             // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
             get_memory,
             clear_memory,
+            // 桌宠事实记忆（桌宠私有 `pet\MEMORY.md`）的前端入口：
+            // 只读列表 + 逐条删 + 清空，给桌宠设置窗用；写入由 AI 侧 Remember 完成。
+            get_pet_memory,
+            delete_pet_memory_note,
+            clear_pet_memory,
+            // 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）：AI 只追加（桥），
+            // 这三读两删一合并给桌宠设置窗用（UI 下轮接）。
+            get_pet_growth,
+            delete_pet_growth_note,
+            clear_pet_growth,
+            get_persona_suggestions,
+            delete_persona_suggestion,
+            merge_persona_suggestion,
             get_status,
             set_security_profile,
             list_start_menu_apps,

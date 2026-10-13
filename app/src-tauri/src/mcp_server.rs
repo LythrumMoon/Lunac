@@ -486,33 +486,71 @@ fn prompt_get_result(prompts: &[PromptDef], name: &str, arguments: &Value) -> Re
 }
 
 
-// ── 长期记忆（A4，2026-09-20）──────────────────────────────────────
+// ── 长期记忆（A4，2026-09-20；作用域化 2026-10-13）──────────────────
 //
-// 落点 `<exe 根>\ModuleData\memory\MEMORY.md`（与 `history\chat.db` 同在 ModuleData 下），
-// 两个自定义方法（与 history 那两个同构：**不进 `tools/list`、不吃审批卡**）：
-//   · `lunac/memory_read`  —— agent 启动时注入系统提示词；复盘 fork 开跑前读一次
+// 落点（与 `history\chat.db` 同在 ModuleData 下）：
+//   · 全局 = `<exe 根>\ModuleData\memory\MEMORY.md`（主 AI 的长期记忆）
+//   · 桌宠 = `<exe 根>\ModuleData\memory\pet\MEMORY.md`（桌宠私有成长笔记）
+// 两个自定义方法（与 history 那两个同构：**不进 `tools/list`、不吃审批卡**），
+// 入参带 `scope`（`global` / `pet`，缺省 global）决定读 / 写哪一份：
+//   · `lunac/memory_read`  —— agent 启动 / 按轮注入记忆；复盘 fork 开跑前读一次
 //   · `lunac/memory_write` —— 内置工具 `Remember` 的后端，**按条目追加**
+// 两份各一个文件 ⇒ 桌宠轮里写的东西**不会**反向注入主 AI 对话（作用域隔离）。
 //
 // 为什么是独立的小文本、而不是往 chat.db 里再开一张表（backlog §4 要求「照 SessionSearch
 // 那套设计」，指通道与冻结快照纪律，不是指存储介质）：两者**不是一类东西** ——
 //   · `chat.db` 是**原始流水**（全量、按会话、FTS5 检索，靠 `SessionSearch` 现查）；
 //   · `MEMORY.md` 是从流水里**提炼出来的少量结论**（用户偏好 / 项目约定 / 踩过的坑）。
 //     流水里没有「哪句值得留」这个判断，提炼那一步正是 A4 复盘 fork 的职责。
-// 选文本而非 DB 的现实理由：① 它要进**系统提示词的固定前缀**（启动时读一次、进程内冻结），
-// 必须是一段稳定纯文本；② 用户要能直接读、直接改（Hermes 的分层同款）；③ 写入是
-// 「追加 + 上限」的小文件，为它开表属过度设计。
+// 选文本而非 DB 的现实理由：① 它要作为一段**稳定纯文本**注入（agent 侧注在 history 开头，
+// 见 `core-agent` 的 `context_block_message`）；② 用户要能直接读、直接改（Hermes 的分层同款）；
+// ③ 写入是「追加 + 上限」的小文件，为它开表属过度设计。
 //
-// **上限是硬闸，不是提示**：这段内容每轮都随系统提示词重发，无限增长会同时吃掉上下文与
+// **上限是硬闸，不是提示**：这段内容每轮都随上下文重发，无限增长会同时吃掉上下文与
 // 命中率。超限**报错**而不是静默截断 —— 静默截断会让模型以为已经记住了。
 
 const MEMORY_FILE: &str = "MEMORY.md";
 /// 单条记忆上限（一条通常只有一两句；超过这个量级说明该拆成多条或先提炼）
 const MAX_MEMORY_ENTRY_CHARS: usize = 2_000;
-/// 记忆文件上限 ≈ 1500 token（占 128k 预算的 1.2%）。注入侧同口径 —— 文件整段进固定前缀。
+/// 记忆文件上限 ≈ 1500 token（占 128k 预算的 1.2%）。注入侧同口径 —— 文件整段注入
+/// （agent 侧按作用域注入到 history 开头，见 `core-agent` 的 `context_block_message`）。
 const MAX_MEMORY_CHARS: usize = 6_000;
 
-fn memory_path() -> PathBuf {
-    crate::storage::module_data_dir().join("memory").join(MEMORY_FILE)
+/// 记忆作用域（2026-10-13）：主 AI 的**全局**长期记忆 vs **桌宠私有**的成长笔记。
+///
+/// 两份**各一个文件**（见 [`memory_path_for`]）、各走一套读写 ⇒ 「桌宠轮里写的东西不会
+/// 反向影响主 AI 对话」（作用域隔离）；也各有各的注入路径（见 `core-agent` 的按轮注入）。
+/// `scope` 是 agent 桥方法 `lunac/memory_*` 的入参；缺省 = `Global`（向后兼容无 scope 的旧调用）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoryScope {
+    Global,
+    Pet,
+}
+
+impl MemoryScope {
+    /// 解析桥方法传来的 `scope` 字符串：缺省 / 空 = 全局；`pet` = 桌宠私有；
+    /// 其余值**报错**（不静默当全局 —— 那会把桌宠的东西写进主 AI 记忆）。
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("global") => Ok(MemoryScope::Global),
+            Some("pet") => Ok(MemoryScope::Pet),
+            Some(other) => Err(format!("未知记忆作用域: {other}")),
+        }
+    }
+}
+
+/// 桌宠私有目录 = `ModuleData\memory\pet\`（桌宠记忆与成长笔记 / 人格建议的**共同父目录**）。
+fn pet_scope_dir() -> PathBuf {
+    crate::storage::module_data_dir().join("memory").join("pet")
+}
+
+/// 某一作用域的记忆文件路径。
+/// 全局 = `ModuleData\memory\MEMORY.md`（沿用旧落点）；桌宠 = `ModuleData\memory\pet\MEMORY.md`。
+fn memory_path_for(scope: MemoryScope) -> PathBuf {
+    match scope {
+        MemoryScope::Global => crate::storage::module_data_dir().join("memory").join(MEMORY_FILE),
+        MemoryScope::Pet => pet_scope_dir().join(MEMORY_FILE),
+    }
 }
 
 /// 读记忆全文（不存在 ⇒ 空串，属全新安装的正常情况）。
@@ -526,14 +564,98 @@ fn read_memory_at(path: &std::path::Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("读取记忆失败：{e}"))
 }
 
-fn read_memory() -> Result<String, String> {
-    read_memory_at(&memory_path())
+fn read_memory(scope: MemoryScope) -> Result<String, String> {
+    read_memory_at(&memory_path_for(scope))
+}
+
+/// 条目归一（**去重与逐条删共用同一个判据**）：折叠所有空白、去首尾、统一小写。
+/// 只用于「判断两条是不是同一条」—— 落盘 / 注入的正文仍是用户看到的原文。
+fn normalize_entry(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// 把记忆正文按行切成 `(行首字节偏移, 行内容)`（不丢字节：偏移用于按内容删除时精确定位）。
+/// 行尾 `\r` 一并剥掉，兼容 CRLF。
+fn line_offsets(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    for i in 0..=bytes.len() {
+        if i == bytes.len() || bytes[i] == b'\n' {
+            let raw = &text[start..i];
+            out.push((start, raw.strip_suffix('\r').unwrap_or(raw)));
+            start = i + 1;
+        }
+    }
+    out
+}
+
+/// 把记忆正文拆成条目：`(起始字节, 结束字节(不含), 条目正文)`。
+/// 条目 = 一个 `- ` 起头的 bullet 及其后续**续行**（写入侧用两空格缩进续行）。
+/// 列出（给前端）与按内容逐条删**必须共用这一套切分**，否则会出现「列出来却删不掉」。
+fn split_entries(text: &str) -> Vec<(usize, usize, String)> {
+    let mut out: Vec<(usize, usize, String)> = Vec::new();
+    let mut cur: Option<(usize, String)> = None;
+    for (offset, line) in line_offsets(text) {
+        if line.starts_with("- ") || line == "-" {
+            if let Some((s, body)) = cur.take() {
+                out.push((s, offset, body));
+            }
+            cur = Some((offset, line.strip_prefix("- ").unwrap_or("").to_string()));
+        } else if let Some((_, body)) = cur.as_mut() {
+            let cont = line.trim();
+            if !cont.is_empty() {
+                body.push('\n');
+                body.push_str(cont);
+            }
+        }
+        // 既不是 bullet、又没有当前条目 ⇒ 前导空行 / 噪声，跳过（写入侧不会产生别的形状）。
+    }
+    if let Some((s, body)) = cur {
+        out.push((s, text.len(), body));
+    }
+    out
+}
+
+/// 列出某作用域的全部记忆条目（正文，不含 `- ` 前缀）；文件不存在 ⇒ 空列表。
+fn list_memory_entries_at(path: &std::path::Path) -> Result<Vec<String>, String> {
+    Ok(split_entries(&read_memory_at(path)?)
+        .into_iter()
+        .map(|(_, _, body)| body)
+        .collect())
+}
+
+/// 按内容删掉**一条**记忆（归一后比对，与去重同判据）：删 A 不动 B。
+/// 命中后连同它的续行整块摘掉，其余条目原样保留（不改动格式）。找不到 ⇒ `Err`（不谎报成功）。
+fn delete_memory_entry_at(path: &std::path::Path, needle: &str) -> Result<String, String> {
+    let target = normalize_entry(needle);
+    if target.is_empty() {
+        return Err("缺少要删除的条目内容".into());
+    }
+    let text = read_memory_at(path)?;
+    let Some((start, end)) = split_entries(&text)
+        .into_iter()
+        .find(|(_, _, body)| normalize_entry(body) == target)
+        .map(|(s, e, _)| (s, e))
+    else {
+        return Err("没找到这条记忆（可能已被删除或已改写）".into());
+    };
+    let mut next = String::with_capacity(text.len());
+    next.push_str(&text[..start]);
+    next.push_str(&text[end..]);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("建记忆目录失败 {e}"))?;
+    }
+    fs::write(path, next.as_bytes()).map_err(|e| format!("写入记忆失败：{e}"))?;
+    Ok(format!("已删除一条记忆（剩 {} 条）", split_entries(&next).len()))
 }
 
 /// 追加（或整体替换）一条记忆。
 ///
-/// 去重按**整条条目**比对：复盘 fork 每 10 轮跑一次，很容易把同一条事实反复写进来，
-/// 而重复条目既占上限又稀释提示词。
+/// 去重按**归一后的整条条目**比对（折叠空白 + 大小写不敏感）：复盘 fork 每 10 轮跑一次，
+/// 很容易把同一条事实反复写进来（常只差一个空格或大小写），精确匹配挡不住它 —— 而重复
+/// 条目既占上限又稀释提示词。归一判据与 [`delete_memory_entry_at`] 共用，保证「列出来的
+/// 那条一定删得掉」。
 fn write_memory_at(
     path: &std::path::Path,
     content: &str,
@@ -568,7 +690,12 @@ fn write_memory_at(
         }
         // 多行条目缩进成一条 bullet，保证「一行 = 一条」这个形状不被破坏
         let bullet = format!("- {}", text.replace('\n', "\n  "));
-        if existing.contains(&bullet) {
+        // 归一后比对（折叠空白 + 大小写不敏感）：与 delete_memory_entry_at 同判据。
+        let n = normalize_entry(text);
+        if split_entries(&existing)
+            .iter()
+            .any(|(_, _, body)| normalize_entry(body) == n)
+        {
             return Ok("(already remembered — nothing changed)".into());
         }
         let mut head = existing.clone();
@@ -596,8 +723,8 @@ fn write_memory_at(
     ))
 }
 
-fn write_memory_entry(content: &str, replace: bool) -> Result<String, String> {
-    write_memory_at(&memory_path(), content, replace)
+fn write_memory_entry(scope: MemoryScope, content: &str, replace: bool) -> Result<String, String> {
+    write_memory_at(&memory_path_for(scope), content, replace)
 }
 
 /// 把记忆文件截断为空（**文件不存在 ⇒ 幂等空操作**）。
@@ -610,24 +737,50 @@ fn clear_memory_at(path: &std::path::Path) -> Result<(), String> {
     fs::write(path, b"").map_err(|e| format!("清空记忆失败：{e}"))
 }
 
-/// 前端「查看长期记忆」（斜杠命令 `/memory`）的只读入口：只是 `read_memory` 的 pub 包装
+/// 前端「查看长期记忆」（斜杠命令 `/memory`）的只读入口：`read_memory` 的 pub 包装
 /// （文件不存在 ⇒ 空串）。给宿主 `#[tauri::command]` 调用。
-pub fn memory_read_text() -> Result<String, String> {
-    read_memory()
+pub fn memory_read_text(scope: MemoryScope) -> Result<String, String> {
+    read_memory(scope)
 }
 
-/// 前端「清空长期记忆」（斜杠命令 `/memory clear`）的入口：把记忆文件截断为空。
-/// 破坏性操作，前端已就地二次确认；这里只做确定性落盘，不新增提示路径。
-pub fn clear_memory_text() -> Result<(), String> {
-    clear_memory_at(&memory_path())
+/// 前端「清空长期记忆 / 桌宠成长笔记」的入口：把该作用域的记忆文件截断为空。
+/// 破坏性操作，调用方（前端）负责二次确认；这里只做确定性落盘，不新增提示路径。
+pub fn clear_memory_text(scope: MemoryScope) -> Result<(), String> {
+    clear_memory_at(&memory_path_for(scope))
+}
+
+/// 列出某作用域的全部记忆条目（**桌宠设置窗「成长笔记」列表的数据源**）。
+pub fn memory_entries(scope: MemoryScope) -> Result<Vec<String>, String> {
+    list_memory_entries_at(&memory_path_for(scope))
+}
+
+/// 按内容删掉**一条**记忆（**桌宠设置窗「逐条删」的数据源**）：删 A 不动 B。
+pub fn memory_delete_entry(scope: MemoryScope, needle: &str) -> Result<String, String> {
+    delete_memory_entry_at(&memory_path_for(scope), needle)
+}
+
+/// 某作用域记忆的设置窗载荷：条目列表 + 两条上限。上限**以宿主常量为唯一真相源**
+/// （前端只回显，不另立一份，见 `docs/ui-style.md` §界面 3 的 `maxChars` 纪律）。
+pub fn memory_scope_payload(scope: MemoryScope) -> Result<Value, String> {
+    Ok(serde_json::json!({
+        "entries": memory_entries(scope)?,
+        "maxEntryChars": MAX_MEMORY_ENTRY_CHARS,
+        "maxTotalChars": MAX_MEMORY_CHARS,
+    }))
+}
+
+/// 从桥方法参数解析作用域（缺省 = 全局；无法识别 ⇒ 报错，绝不静默落到全局）。
+fn memory_scope_from(params: Option<&Value>) -> Result<MemoryScope, String> {
+    MemoryScope::parse(params.and_then(|p| p.get("scope")).and_then(Value::as_str))
 }
 
 /// 分派长期记忆的自定义方法（形状与 `handle_history_method` 一致：错误走
 /// `result + isError`，因为这是「这次没写成」，不是「方法不存在」）。
+/// `scope` 决定读 / 写哪一份（全局 / 桌宠私有，见 [`MemoryScope`]）。
 fn handle_memory_method(method: &str, params: Option<&Value>) -> Result<String, String> {
     match method {
         "lunac/memory_read" => {
-            let text = read_memory()?;
+            let text = read_memory(memory_scope_from(params)?)?;
             if text.trim().is_empty() {
                 Ok("(long-term memory is empty)".into())
             } else {
@@ -635,6 +788,7 @@ fn handle_memory_method(method: &str, params: Option<&Value>) -> Result<String, 
             }
         }
         "lunac/memory_write" => {
+            let scope = memory_scope_from(params)?;
             let content = params
                 .and_then(|p| p.get("content"))
                 .and_then(Value::as_str)
@@ -643,9 +797,174 @@ fn handle_memory_method(method: &str, params: Option<&Value>) -> Result<String, 
                 .and_then(|p| p.get("replace"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            write_memory_entry(content, replace)
+            write_memory_entry(scope, content, replace)
         }
         other => Err(format!("未知记忆方法: {other}")),
+    }
+}
+
+// ── 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）────────────────
+//
+// 两款**宿主固定路径**的追加式小文件（AI 不参与拼路径，**不进 `config\`** —— 避 §7 工作锁、
+// 也让 `config\pet-persona.md` 保持「用户资产」的纯粹）：
+//   · 成长笔记 = `ModuleData\memory\pet\GROWTH.md`（与桌宠私有记忆 `MEMORY.md` **同目录、另立文件**）
+//   · 人格修订建议 = `ModuleData\memory\pet\PERSONA_SUGGESTIONS.md`
+//
+// 与长期记忆同款纪律（**复用同一批助手，不另造第二套**）：
+//   · **只追加**（AI 侧唯一写入形态）；逐条删 / 清空只经宿主命令（用户 UI 下轮接）；
+//   · 上限**复用既有记忆口径**（`MAX_MEMORY_ENTRY_CHARS` / `MAX_MEMORY_CHARS` —— §62 不得新增
+//     第三份常量），超限**报错不静默截断**；
+//   · 落盘前过 `mask_secrets`（体现在复用的 `write_memory_at` 里）；
+//   · 去重 / 逐条删共用 `normalize_entry` 归一判据（列出来的按内容删得掉）；
+//   · 格式 = 与记忆一致的扁平 bullet（`- ` 起头），故 `split_entries` / `delete_memory_entry_at`
+//     直接可用。
+//
+// ⚠️ **AI 无任何改核心人格的路径**：桥只给两条**只追加**方法（`lunac/pet_growth_write` /
+//    `lunac/persona_suggestion_write`）；把建议**合并进 `pet-persona.md`** 只能走宿主命令
+//    `merge_persona_suggestion`（复用 `storage` 那套人格校验：长度 / NUL / 先校验后写），AI 侧到不了。
+
+const PET_GROWTH_FILE: &str = "GROWTH.md";
+const PERSONA_SUGGESTIONS_FILE: &str = "PERSONA_SUGGESTIONS.md";
+
+/// 成长笔记文件路径（与桌宠私有记忆同目录、**另立文件**，不混进 `MEMORY.md`）。
+fn pet_growth_path() -> PathBuf {
+    pet_scope_dir().join(PET_GROWTH_FILE)
+}
+
+/// 人格修订建议文件路径（宿主固定路径，**不进 `config\`**）。
+fn persona_suggestions_path() -> PathBuf {
+    pet_scope_dir().join(PERSONA_SUGGESTIONS_FILE)
+}
+
+// — 成长笔记（桌宠私有，只追加）—
+
+/// 读成长笔记全文（不存在 ⇒ 空串）；`lunac/pet_growth_read` 与注入侧共用。
+pub fn pet_growth_read_text() -> Result<String, String> {
+    read_memory_at(&pet_growth_path())
+}
+
+/// 列出成长笔记全部条目（桌宠设置窗「成长笔记」列表的数据源）。
+pub fn pet_growth_entries() -> Result<Vec<String>, String> {
+    list_memory_entries_at(&pet_growth_path())
+}
+
+/// 按内容删掉**一条**成长笔记（删 A 不动 B）。
+pub fn pet_growth_delete_entry(needle: &str) -> Result<String, String> {
+    delete_memory_entry_at(&pet_growth_path(), needle)
+}
+
+/// 清空全部成长笔记（截断为空；文件不存在 ⇒ 幂等空操作）。
+pub fn pet_growth_clear() -> Result<(), String> {
+    clear_memory_at(&pet_growth_path())
+}
+
+/// **追加**一条成长笔记（无 replace：AI 侧只能追加，改删历史只由用户逐条做）。
+pub fn pet_growth_append(content: &str) -> Result<String, String> {
+    write_memory_at(&pet_growth_path(), content, false)
+}
+
+/// 成长笔记的设置窗载荷：条目列表 + 两条上限（上限以宿主常量为唯一真相源）。
+pub fn pet_growth_payload() -> Result<Value, String> {
+    Ok(serde_json::json!({
+        "entries": pet_growth_entries()?,
+        "maxEntryChars": MAX_MEMORY_ENTRY_CHARS,
+        "maxTotalChars": MAX_MEMORY_CHARS,
+    }))
+}
+
+// — 人格修订建议（只追加；合并走宿主命令、复用 `set_pet_persona` 的校验）—
+
+/// 列出全部人格修订建议。
+pub fn persona_suggestions_list() -> Result<Vec<String>, String> {
+    list_memory_entries_at(&persona_suggestions_path())
+}
+
+/// 删除一条人格修订建议。
+pub fn persona_suggestion_delete(needle: &str) -> Result<String, String> {
+    delete_memory_entry_at(&persona_suggestions_path(), needle)
+}
+
+/// **追加**一条人格修订建议（AI 侧唯一写入形态；不接受任何「直接改人格」的语义）。
+pub fn persona_suggestion_append(content: &str) -> Result<String, String> {
+    write_memory_at(&persona_suggestions_path(), content, false)
+}
+
+/// 建议区的设置窗载荷：条目列表 + 上限。
+pub fn persona_suggestions_payload() -> Result<Value, String> {
+    Ok(serde_json::json!({
+        "entries": persona_suggestions_list()?,
+        "maxEntryChars": MAX_MEMORY_ENTRY_CHARS,
+        "maxTotalChars": MAX_MEMORY_CHARS,
+    }))
+}
+
+/// 把一条**已存在于建议区**的人格修订建议合并进人格文件（用户「接受」后的动作，UI 下轮做）。
+///
+/// 合并 = 在现有人格后追加该建议（一段）。**校验复用 `storage::save_persona_text_at`**
+/// —— 那正是 `set_persona` / `set_pet_persona` 的同一实现（长度 `MAX_PERSONA_CHARS` / NUL /
+/// 先校验后写）。顺序：先确认建议在册 → 先校验后写人格 → **写成了才**把该条建议从建议区摘掉
+/// （校验不过时人格与建议区**都不动**）。
+///
+/// 参数显式给两个路径：单测必须能指向临时目录，绝不碰真实 `ModuleData` / `config\`。
+fn merge_persona_suggestion_at(
+    suggestion: &str,
+    persona_path: &std::path::Path,
+    suggestions_path: &std::path::Path,
+) -> Result<(), String> {
+    let trimmed = suggestion.trim();
+    if trimmed.is_empty() {
+        return Err("要合并的建议内容为空".into());
+    }
+    // 只能合并**建议区里真有**的那一条：不允许凭空塞一段进人格。
+    let target = normalize_entry(trimmed);
+    if !list_memory_entries_at(suggestions_path)?
+        .iter()
+        .any(|e| normalize_entry(e) == target)
+    {
+        return Err("没找到这条人格建议（可能已被删除或改写）".into());
+    }
+    let current = read_memory_at(persona_path)?;
+    let merged = if current.trim().is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{}\n\n{}", current.trim_end(), trimmed)
+    };
+    // 先校验后写（同一套判据）：合并后超上限 / 含 NUL 一律拒绝。
+    crate::storage::save_persona_text_at(persona_path, &merged)?;
+    // 写成了才摘掉建议（建议区是待办清单，不是账本；摘不掉不回滚人格）。
+    let _ = delete_memory_entry_at(suggestions_path, trimmed);
+    Ok(())
+}
+
+/// 真实路径版本（宿主命令 `merge_persona_suggestion` 用）。
+pub fn merge_persona_suggestion(suggestion: &str) -> Result<(), String> {
+    merge_persona_suggestion_at(
+        suggestion,
+        &crate::storage::pet_persona_config_path(),
+        &persona_suggestions_path(),
+    )
+}
+
+/// 分派桌宠自我区（成长笔记 / 人格建议）的**自定义方法**（形状与 `handle_memory_method` 一致：
+/// 错误走 `result + isError`）。**三条只有「读成长笔记」与两条「只追加写」** ——
+/// 没有任何改核心人格、或改删历史条目的入口（合并只能走宿主命令）。
+fn handle_pet_self_method(method: &str, params: Option<&Value>) -> Result<String, String> {
+    let content = params
+        .and_then(|p| p.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match method {
+        "lunac/pet_growth_read" => {
+            let text = pet_growth_read_text()?;
+            if text.trim().is_empty() {
+                Ok("(pet growth notes are empty)".into())
+            } else {
+                Ok(text)
+            }
+        }
+        "lunac/pet_growth_write" => pet_growth_append(content),
+        "lunac/persona_suggestion_write" => persona_suggestion_append(content),
+        other => Err(format!("未知桌宠自我区方法: {other}")),
     }
 }
 
@@ -1463,6 +1782,15 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef], session: &mut Session) ->
                 Err(msg) => text_err(req.id.clone(), msg),
             }
         }
+        // 桌宠自我区（成长笔记 / 人格建议，2026-10-13）：同上，自定义方法、不列进 tools/list。
+        // 只有「读成长笔记」与两条「只追加写」；**没有**任何改核心人格的方法（合并走宿主命令）。
+        Some(m) if m.starts_with("lunac/pet_") || m.starts_with("lunac/persona_") => {
+            let method = m.to_string();
+            match handle_pet_self_method(&method, req.params.as_ref()) {
+                Ok(text) => text_ok(req.id.clone(), text),
+                Err(msg) => text_err(req.id.clone(), msg),
+            }
+        }
         _ => {
             // Notifications (no id) should be silently ignored per MCP spec
             if req.id.is_some() {
@@ -1609,7 +1937,7 @@ mod tests {
     }
 
     /// 长期记忆的**追加 / 去重 / 上限**三条硬行为（A4，2026-09-20）。
-    /// 用临时目录而不是 `memory_path()`：后者指向真实 ModuleData，测试不许碰用户数据。
+    /// 用临时目录而不是 `memory_path_for(..)`：后者指向真实 ModuleData，测试不许碰用户数据。
     #[test]
     fn memory_appends_dedupes_and_enforces_the_cap() {
         let dir = std::env::temp_dir().join(format!(
@@ -1666,9 +1994,9 @@ mod tests {
     }
 
     /// 凭据兜底（2026-10-11，与 A17 / M2-8 同类）：写进记忆的内容落盘前必须过 mask_secrets
-    /// —— 对话里出现的 API key 不能跟着 MEMORY.md 进入以后每一次系统提示词。同时钉住
+    /// —— 对话里出现的 API key 不能跟着 MEMORY.md 进入以后的每一次对话上下文。同时钉住
     /// 「脱敏不弄坏 bullet 形状」与「脱敏不引入写失败路径」两点（复用 log.rs 的 mask_secrets）。
-    /// 用临时目录而不是 memory_path()：测试不许碰真实 ModuleData。
+    /// 用临时目录而不是 memory_path_for(..)：测试不许碰真实 ModuleData。
     #[test]
     fn memory_masks_secrets_before_persisting() {
         let dir = std::env::temp_dir().join(format!(
@@ -1698,7 +2026,7 @@ mod tests {
     }
 
     /// 清空记忆（斜杠命令 `/memory clear` 的后端 `clear_memory_at`）：把文件截断为空，
-    /// 且对「本来就不存在」幂等。用临时目录而不是 `memory_path()`：测试不许碰真实 ModuleData。
+    /// 且对「本来就不存在」幂等。用临时目录而不是 `memory_path_for(..)`：测试不许碰真实 ModuleData。
     #[test]
     fn memory_clear_truncates_and_is_idempotent() {
         let dir = std::env::temp_dir().join(format!(
@@ -1721,6 +2049,246 @@ mod tests {
         // 文件本就不存在 ⇒ 空操作也返回 Ok（幂等）
         let missing = dir.join("nope.md");
         assert!(clear_memory_at(&missing).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 每个用例一个独立临时目录（不碰真实 `<exe 根>\ModuleData`）。
+    fn tmp_memory_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "lunac-mcp-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    /// 作用域隔离（2026-10-13，桌宠私有记忆的地基）：全局与桌宠**各一个文件**，
+    /// 写一份不动另一份 —— `scope` 参数化落到不同的路径就是这条隔离的全部实现。
+    #[test]
+    fn memory_scopes_are_isolated() {
+        // 路径映射本身：两份落点不同、都在 memory 目录下。
+        let g = memory_path_for(MemoryScope::Global);
+        let p = memory_path_for(MemoryScope::Pet);
+        assert_ne!(g, p, "全局与桌宠不能是同一个文件");
+        assert!(g.ends_with("memory/MEMORY.md"), "{g:?}");
+        assert!(p.ends_with("memory/pet/MEMORY.md"), "{p:?}");
+
+        // 两个临时文件代表两个作用域：写桌宠**不得**改动全局。
+        let dir = tmp_memory_dir("memscope");
+        let gfile = dir.join("MEMORY.md");
+        let pfile = dir.join("pet").join("MEMORY.md");
+        assert!(write_memory_at(&gfile, "全局约定", false).is_ok());
+        assert!(write_memory_at(&pfile, "桌宠笔记", false).is_ok());
+        assert_eq!(read_memory_at(&gfile).unwrap(), "- 全局约定\n");
+        assert_eq!(read_memory_at(&pfile).unwrap(), "- 桌宠笔记\n");
+
+        let g_before = read_memory_at(&gfile).unwrap();
+        assert!(write_memory_at(&pfile, "桌宠第二条", false).is_ok());
+        assert_eq!(read_memory_at(&gfile).unwrap(), g_before, "写桌宠私有不得影响全局注入");
+        assert_eq!(list_memory_entries_at(&pfile).unwrap().len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 作用域解析：缺省 / `global` = 全局，`pet` = 桌宠；无法识别**报错**（绝不静默落全局）。
+    #[test]
+    fn memory_scope_parse_is_strict() {
+        assert_eq!(MemoryScope::parse(None).unwrap(), MemoryScope::Global);
+        assert_eq!(MemoryScope::parse(Some("")).unwrap(), MemoryScope::Global);
+        assert_eq!(MemoryScope::parse(Some("global")).unwrap(), MemoryScope::Global);
+        assert_eq!(MemoryScope::parse(Some("pet")).unwrap(), MemoryScope::Pet);
+        assert_eq!(MemoryScope::parse(Some(" pet ")).unwrap(), MemoryScope::Pet);
+        assert!(MemoryScope::parse(Some("other")).is_err());
+    }
+
+    /// 去重按**归一**判据（折叠空白 + 大小写不敏感）：只差空格 / 大小写的同一条不得重复落盘。
+    /// 归一判据与逐条删共用 ⇒ 「列出来的那条一定删得掉」。
+    #[test]
+    fn memory_dedupes_on_normalized_entry() {
+        let dir = tmp_memory_dir("memnorm");
+        let file = dir.join("MEMORY.md");
+        assert!(write_memory_at(&file, "User prefers   TABS", false).is_ok());
+        // 只差内部多余空格 ⇒ 视为同一条
+        assert!(write_memory_at(&file, "User prefers TABS", false)
+            .unwrap()
+            .contains("already"));
+        // 只差大小写 ⇒ 视为同一条
+        assert!(write_memory_at(&file, "user prefers tabs", false)
+            .unwrap()
+            .contains("already"));
+        // 内容确实不同 ⇒ 不是重复，要落盘
+        assert!(!write_memory_at(&file, "User prefers spaces", false)
+            .unwrap()
+            .contains("already"));
+        assert_eq!(list_memory_entries_at(&file).unwrap().len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 逐条删（2026-10-13，桌宠设置窗「逐条删」的地基）：删 A 不动 B；多行条目整块摘；
+    /// 找不到 / 空内容 ⇒ 报错（不谎报成功）；删空后读为空串（注入侧即无正文）。
+    #[test]
+    fn memory_delete_removes_one_entry_only() {
+        let dir = tmp_memory_dir("memdel");
+        let file = dir.join("MEMORY.md");
+        assert!(write_memory_at(&file, "条目A", false).is_ok());
+        assert!(write_memory_at(&file, "条目B", false).is_ok());
+        assert!(write_memory_at(&file, "多行第一条\n续行内容", false).is_ok());
+        assert_eq!(list_memory_entries_at(&file).unwrap().len(), 3);
+
+        // 删 A（归一匹配：大小写差异也认）—— B 与多行条目必须原样在
+        assert!(delete_memory_entry_at(&file, "条目a").is_ok());
+        assert_eq!(
+            list_memory_entries_at(&file).unwrap(),
+            vec!["条目B".to_string(), "多行第一条\n续行内容".to_string()],
+            "只该删掉 A"
+        );
+        let text = read_memory_at(&file).unwrap();
+        assert!(text.contains("- 条目B"));
+        assert!(!text.contains("条目A"));
+
+        // 找不到 / 空 needle ⇒ 报错，不谎报成功
+        assert!(delete_memory_entry_at(&file, "没有这条").is_err());
+        assert!(delete_memory_entry_at(&file, "   ").is_err());
+
+        // 多行条目（含续行）整块删
+        assert!(delete_memory_entry_at(&file, "多行第一条\n续行内容").is_ok());
+        assert_eq!(list_memory_entries_at(&file).unwrap(), vec!["条目B".to_string()]);
+
+        // 删空 ⇒ 读到空串、无条目（注入侧即空）
+        assert!(delete_memory_entry_at(&file, "条目B").is_ok());
+        assert_eq!(read_memory_at(&file).unwrap(), "");
+        assert!(list_memory_entries_at(&file).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── 桌宠成长笔记 / 人格建议（2026-10-13，人格地基）─────────────
+
+    /// 落点：与桌宠私有记忆**同目录、另立文件**，且两款都**不在 `config\` 下**。
+    #[test]
+    fn pet_self_paths_are_fixed_siblings_outside_config() {
+        let growth = pet_growth_path();
+        let suggest = persona_suggestions_path();
+        let pet_mem = memory_path_for(MemoryScope::Pet);
+        assert_eq!(growth.parent(), pet_mem.parent(), "与桌宠记忆同目录（同族）");
+        assert_ne!(growth, pet_mem, "成长笔记另立文件，不混进 MEMORY.md");
+        assert_ne!(suggest, pet_mem, "建议区另立文件，不混进 MEMORY.md");
+        assert!(growth.ends_with("memory/pet/GROWTH.md"), "{growth:?}");
+        assert!(suggest.ends_with("memory/pet/PERSONA_SUGGESTIONS.md"), "{suggest:?}");
+        for p in [&growth, &suggest] {
+            assert!(
+                !p.to_string_lossy().contains("config"),
+                "人格两区不得落进 config\\（§7 工作锁 / 用户资产纯粹）：{p:?}"
+            );
+        }
+    }
+
+    /// 成长笔记的**只追加 / 归一去重 / 上限 / 逐条删**四条硬行为。
+    ///
+    /// 成长笔记与桌宠记忆走**同一批助手**（`write_memory_at` / `list_memory_entries_at` /
+    /// `delete_memory_entry_at`，只是落点换成 `GROWTH.md`）—— 故这里用临时 `GROWTH.md` 直接钉住
+    /// 这四条本事；固定落点的形状由 `pet_self_paths_are_fixed_siblings_outside_config` 单独钉。
+    #[test]
+    fn pet_growth_file_is_append_only_deduped_capped_and_deletable() {
+        let dir = tmp_memory_dir("petgrowth");
+        let file = dir.join("GROWTH.md");
+
+        // ① 只追加：先写一条，再写另一条 —— 前一条必须原样在（不覆盖）
+        assert!(write_memory_at(&file, "说话可以更简短一点", false).is_ok());
+        assert!(write_memory_at(&file, "被夸时轻轻晃一下就好", false).is_ok());
+        assert_eq!(
+            list_memory_entries_at(&file).unwrap(),
+            vec!["说话可以更简短一点".to_string(), "被夸时轻轻晃一下就好".to_string()]
+        );
+
+        // ② 归一去重：只差空白 / 大小写视为同一条，不重复落盘
+        assert!(write_memory_at(&file, "  说话可以更简短一点  ", false)
+            .unwrap()
+            .contains("already"));
+        assert_eq!(list_memory_entries_at(&file).unwrap().len(), 2);
+
+        // ③ 单条超限 ⇒ 报错、不落盘（不静默截断）
+        let before = read_memory_at(&file).unwrap();
+        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false).is_err());
+        assert_eq!(read_memory_at(&file).unwrap(), before, "超限不得落盘");
+
+        // ④ 逐条删：删 A 不动 B
+        assert!(delete_memory_entry_at(&file, "说话可以更简短一点").is_ok());
+        assert_eq!(
+            list_memory_entries_at(&file).unwrap(),
+            vec!["被夸时轻轻晃一下就好".to_string()]
+        );
+
+        // ⑤ 总量超限 ⇒ 报错、不落盘（把文件顶到接近上限再追加）
+        let big = "y".repeat(1_900);
+        let mut i = 0;
+        while write_memory_at(&file, &format!("{big}{i}"), false).is_ok() {
+            i += 1;
+            assert!(i < 20, "总量上限没生效：一直写得进去");
+        }
+        let full = read_memory_at(&file).unwrap();
+        assert!(full.chars().count() <= MAX_MEMORY_CHARS);
+        assert!(write_memory_at(&file, &format!("{big}{i}"), false).is_err(), "总量超限必须报错");
+        assert_eq!(read_memory_at(&file).unwrap(), full, "总量超限不得落盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 桌宠自我区的**桥方法**只认「读成长笔记」+ 两条「只追加写」；
+    /// **任何「写核心人格」的方法名一律落到「未知方法」** —— 这是「AI 无改核心人格路径」的
+    /// 宿主侧证据（AI 只能经 `lunac/*` 到达宿主）。
+    #[test]
+    fn pet_self_bridge_rejects_any_persona_write() {
+        // 两条合法写 = 只追加。空 content ⇒ 报「content 为空」，**不是**「未知方法」⇒ 证明被识别。
+        for ok in ["lunac/pet_growth_write", "lunac/persona_suggestion_write"] {
+            let e = handle_pet_self_method(ok, Some(&json!({ "content": "   " }))).unwrap_err();
+            assert!(!e.contains("未知"), "{ok} 应被识别为合法方法：{e}");
+        }
+        // 任何「写人格」形态一律不被识别（桥不提供这条路径）
+        for bad in [
+            "lunac/persona_write",
+            "lunac/persona_merge",
+            "lunac/pet_persona_write",
+            "lunac/set_pet_persona",
+            "lunac/merge_persona_suggestion",
+        ] {
+            let e = handle_pet_self_method(bad, Some(&json!({ "content": "x" }))).unwrap_err();
+            assert!(e.contains("未知"), "{bad} 不该被桥识别（AI 不得改核心人格）：{e}");
+        }
+    }
+
+    /// ⑦ 建议 → 合并：**复用 `set_persona` / `set_pet_persona` 同一套校验**
+    /// （长度上限 / NUL / 先校验后写）；且只能合并建议区里真有的那一条。
+    #[test]
+    fn persona_suggestion_merge_reuses_persona_validation() {
+        let dir = tmp_memory_dir("petmerge");
+        let persona = dir.join("pet-persona.md");
+        let sug = dir.join("PERSONA_SUGGESTIONS.md");
+
+        // 不在册的建议 ⇒ 拒绝（不允许凭空塞一段进人格）
+        assert!(merge_persona_suggestion_at("凭空一段", &persona, &sug).is_err());
+
+        // 在册建议 ⇒ 合并成功：人格追加该段、建议从建议区摘掉
+        assert!(write_memory_at(&persona, "你是桌面宠物。", true).is_ok());
+        assert!(write_memory_at(&sug, "说话时可以偶尔用一点点俏皮话", false).is_ok());
+        assert!(merge_persona_suggestion_at("说话时可以偶尔用一点点俏皮话", &persona, &sug).is_ok());
+        let p = read_memory_at(&persona).unwrap();
+        assert!(p.contains("你是桌面宠物。") && p.contains("说话时可以偶尔用一点点俏皮话"));
+        assert!(list_memory_entries_at(&sug).unwrap().is_empty(), "合并成功后建议应被摘掉");
+
+        // 长度上限：合并后超 `MAX_PERSONA_CHARS` ⇒ 报错，**人格与建议区都不动**（先校验后写）
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&persona, "x".repeat(crate::storage::MAX_PERSONA_CHARS)).unwrap();
+        assert!(write_memory_at(&sug, "再补一句俏皮话", false).is_ok());
+        let before = read_memory_at(&persona).unwrap();
+        let err = merge_persona_suggestion_at("再补一句俏皮话", &persona, &sug).unwrap_err();
+        assert!(err.contains("上限") || err.contains("过长"), "应报长度上限：{err}");
+        assert_eq!(read_memory_at(&persona).unwrap(), before, "校验不过不得写人格");
+        assert_eq!(list_memory_entries_at(&sug).unwrap().len(), 1, "校验不过不得摘建议");
 
         let _ = fs::remove_dir_all(&dir);
     }

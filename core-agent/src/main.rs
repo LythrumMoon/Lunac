@@ -2082,13 +2082,23 @@ fn memory_enabled() -> bool {
 /// 兜底截断仍然由这一层负责。
 const MEMORY_INJECT_CHARS: usize = 6_000;
 
+/// 按注入上限截断（**唯一的注入封顶实现**，记忆与成长笔记共用）：超 `MEMORY_INJECT_CHARS`
+/// 就截到头。抽成纯函数是为了可单测（§65：往 history 里塞东西的每条路径都要有硬上限）。
+fn cap_inject(text: &str) -> String {
+    if text.chars().count() > MEMORY_INJECT_CHARS {
+        crate::log::truncate_chars(text, MEMORY_INJECT_CHARS)
+    } else {
+        text.to_string()
+    }
+}
+
 /// 取当前长期记忆文本；没有 / 空 / 出错都返回 `None`（**不报错** —— 记忆是锦上添花）。
 ///
-/// 两个调用方：启动时的注入（`memory_block`）与每次复盘前的「当前记忆」（放进复盘的
-/// 提示词，好让它不重复写已有条目）。
-fn fetch_memory(bridge: Option<&mut mcp::McpSet>) -> Option<String> {
+/// `scope` = 读哪一份（全局 / 桌宠私有）。两个调用方：启动 / 按轮注入（`memory_block`）
+/// 与每次复盘前的「当前记忆」（放进复盘的提示词，好让它不重复写已有条目）。
+fn fetch_memory(bridge: Option<&mut mcp::McpSet>, scope: tools::MemoryScope) -> Option<String> {
     let b = bridge?;
-    match b.memory_read() {
+    match b.memory_read(scope.as_str()) {
         Ok(t) => {
             let t = t.trim();
             // 空记忆时服务端回的那句是**回执文案**，不是记忆内容
@@ -2105,56 +2115,63 @@ fn fetch_memory(bridge: Option<&mut mcp::McpSet>) -> Option<String> {
     }
 }
 
-/// 取「长期记忆」固定段（带前导空行，直接拼进系统提示词）。
+/// 取某一作用域的「记忆注入段」（带前导空行，拼进注入块正文）。
 ///
 /// `remember_tool_on` = `Remember` 真的在工具池里。**必须传**：段里写着「用 `Remember`
 /// 工具追加」，工具不在还这么写，等于指挥模型去调一个不存在的工具（与往期会话索引遇
 /// `SessionSearch` 被禁就不注入是同一条纪律）。
 ///
+/// `scope` 决定读哪一份（全局 / 桌宠私有）：两份各一个文件、各一段，**互不掺入**。
+///
 /// 拿不到就返回**空串**，任何情况都不报错、不阻断启动。
-fn memory_block(bridge: Option<&mut mcp::McpSet>, remember_tool_on: bool) -> String {
+fn memory_block(
+    bridge: Option<&mut mcp::McpSet>,
+    remember_tool_on: bool,
+    scope: tools::MemoryScope,
+) -> String {
     if !memory_enabled() {
         eprintln!("[agent] 长期记忆已关闭（{MEMORY_ENV}=0）");
         return String::new();
     }
-    // 记忆正文（可能为空）。**空记忆不再直接返回空串**：改造前那样写，全新安装时系统提示词
+    // 记忆正文（可能为空）。**空记忆不再直接返回空串**：改造前那样写，全新安装时提示词
     // 里完全没有 Remember 引导，模型不知道可以主动写、而唯一能播种的复盘又没触发 ⇒ 冷启动
     // 死锁（2026-10-11 修，方案 D）。改为「正文可空、引导照发」。
     //
     // 超限时保留**较早**的部分（truncate_chars 留头部）：较早的条目是更 established 的约定，
     // 尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入已按同值封顶），
     // 只有用户手工把文件改大才会触发。
-    let body = fetch_memory(bridge)
-        .map(|text| {
-            if text.chars().count() > MEMORY_INJECT_CHARS {
-                crate::log::truncate_chars(&text, MEMORY_INJECT_CHARS)
-            } else {
-                text
-            }
-        })
+    let body = fetch_memory(bridge, scope)
+        .map(|text| cap_inject(&text))
         .unwrap_or_default();
-    let block = memory_block_text(remember_tool_on, &body);
+    let block = memory_block_text(remember_tool_on, &body, scope);
     if block.is_empty() {
         return block;
     }
+    // 全局那两条日志文案**逐字节不变**（e2e / 日志检索都按它认冷启动）；桌宠用同构文案。
+    let label = match scope {
+        tools::MemoryScope::Global => "长期记忆",
+        tools::MemoryScope::Pet => "桌宠私有记忆",
+    };
     if body.is_empty() {
-        eprintln!("[agent] 长期记忆为空，已注入 Remember 引导（冷启动）");
+        eprintln!("[agent] {label}为空，已注入 Remember 引导（冷启动）");
     } else {
-        eprintln!("[agent] 长期记忆已注入（{} 字）", body.chars().count());
+        eprintln!("[agent] {label}已注入（{} 字）", body.chars().count());
     }
     block
 }
 
-/// 组装长期记忆注入段（纯函数：只依赖「写侧引导是否可用」与「记忆正文」，便于单测）。
+/// 组装记忆注入段（纯函数：只依赖「写侧引导是否可用」「记忆正文」「作用域」，便于单测）。
 ///
 /// 缓存纪律（2026-10-11 方案 D 明确）：表头与引导句是**固定前缀**，记忆正文永远拼在它们
 /// 之后（顺序固定为 表头 + 引导 + 空行 + 正文）。于是「空记忆 → 有记忆」时，块首到引导末尾
 /// 逐字节不变 —— 端点按最长公共前缀命中，只有正文那一段 miss，而不是从块首整段作废。
 /// 反面做法（正文插到引导之前 / 引导里回显正文）会让**每写一次记忆就打掉一次缓存**。
 ///
+/// 表头按 `scope` 区分（全局 / 桌宠各一段）：全局措辞**逐字节不变**（缓存不变量）。
+///
 /// 空记忆 + 写侧不可用 ⇒ 空串：没有正文可注、也没有可写的工具，拿一句「记忆是空的」去占
 /// 前缀只是纯噪音（也是改造前的行为）。
-fn memory_block_text(remember_tool_on: bool, body: &str) -> String {
+fn memory_block_text(remember_tool_on: bool, body: &str, scope: tools::MemoryScope) -> String {
     if body.is_empty() && !remember_tool_on {
         return String::new();
     }
@@ -2165,12 +2182,91 @@ fn memory_block_text(remember_tool_on: bool, body: &str) -> String {
         "- (The `Remember` tool is disabled in this session, so this memory can only be \
          extended outside this app.)"
     };
+    let header = match scope {
+        tools::MemoryScope::Global => "# Long-term memory",
+        tools::MemoryScope::Pet => "# Long-term memory (desktop pet — private notes)",
+    };
     format!(
-        "\n\n# Long-term memory\n\
+        "\n\n{header}\n\
          Durable facts saved in earlier sessions. Treat them as background you already know; \
          they are not part of the current request.\n\
          {tail}\n\n{body}",
     )
+}
+
+/// 取桌宠成长笔记文本（人格地基）；没有 / 空 / 出错都返回 `None`（**不报错**）。
+///
+/// 与 `fetch_memory` 同理：成长为桌宠自我笔记，读不到就当没有，绝不阻断桌宠轮。
+fn fetch_growth(bridge: Option<&mut mcp::McpSet>) -> Option<String> {
+    let b = bridge?;
+    match b.pet_growth_read() {
+        Ok(t) => {
+            let t = t.trim();
+            if t.is_empty() || t == "(pet growth notes are empty)" {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Err(e) => {
+            eprintln!("[agent] 桌宠成长笔记读取失败（当作没有）: {e}");
+            None
+        }
+    }
+}
+
+/// 取桌宠成长笔记的注入段（带前导空行；拿不到 ⇒ 空串，不报错、不阻断）。
+///
+/// `pet_growth_on` = `PetGrowth` 真的在工具池里（段里写着「用 `PetGrowth` 追加」，工具不在还
+/// 这么写，等于指挥模型去调一个不存在的工具）。注入侧上限**复用 `cap_inject`**
+/// （= `MEMORY_INJECT_CHARS`，同一份真相源，§62 不新增第三份常量）。
+fn growth_block(bridge: Option<&mut mcp::McpSet>, pet_growth_on: bool) -> String {
+    let body = fetch_growth(bridge).map(|text| cap_inject(&text)).unwrap_or_default();
+    let block = growth_block_text(pet_growth_on, &body);
+    if !block.is_empty() {
+        if body.is_empty() {
+            eprintln!("[agent] 桌宠成长笔记为空，已注入 PetGrowth 引导（冷启动）");
+        } else {
+            eprintln!("[agent] 桌宠成长笔记已注入（{} 字）", body.chars().count());
+        }
+    }
+    block
+}
+
+/// 组装成长笔记注入段（纯函数：只依赖「写侧是否可用」与正文，便于单测）。
+///
+/// 缓存纪律与 `memory_block_text` 同款：表头 + 引导是**固定前缀**，正文永远拼在其后 ——
+/// 「空 → 有」时只有正文那一段 miss，不从块首整段作废。成长笔记只在**桌宠轮**注入
+/// （见提问循环里 `turn_block` 的 Pet 分支），与全局记忆块拼在同一个上下文块里。
+fn growth_block_text(pet_growth_on: bool, body: &str) -> String {
+    if body.is_empty() && !pet_growth_on {
+        return String::new();
+    }
+    let tail = if pet_growth_on {
+        "- Add one with the `PetGrowth` tool (one concise note per call)."
+    } else {
+        "- (The `PetGrowth` tool is disabled in this session, so these notes can only be \
+           extended outside this app.)"
+    };
+    format!(
+        "\n\n# Growth notes (desktop pet — how you've chosen to behave)\n\
+         Notes you wrote in earlier desktop-pet sessions about your own manner and habits. \
+         Treat them as your own established style; they are not part of the current request.\n\
+         {tail}\n\n{body}",
+    )
+}
+
+/// 「桌宠发起的那一轮」在 user 消息里的来源标记（前端 `currentTurnFromPet` ⇒ `source:"pet"`，
+/// 见 `app/src/main.ts` 的发送点）。与 `thinking:"off"` 同款：**只认这一个值**，其余（含缺省）
+/// 一律全局 —— 识别不出就退回全局，绝不因为一个坏字段把一轮变成桌宠轮。
+const TURN_SOURCE_PET: &str = "pet";
+
+/// 由本轮 user 消息的 `source` 推出记忆作用域（缺省 / 其它值 = 全局）。
+fn turn_memory_scope(msg: &Value) -> tools::MemoryScope {
+    match msg.get("source").and_then(Value::as_str) {
+        Some(v) if v.eq_ignore_ascii_case(TURN_SOURCE_PET) => tools::MemoryScope::Pet,
+        _ => tools::MemoryScope::Global,
+    }
 }
 
 // ── 思考开关：跨模型自适应 ───────────────────────────────────────
@@ -2670,6 +2766,12 @@ static BACKGROUND_DONE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// 后台命令的自增号（`bg_<pid>_<seq>`，形态同 `next_request_id`）
 static BG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 「本轮是否已追加过一条成长笔记」（2026-10-13 人格地基）：`PetGrowth` **每轮 ≤ 1 条**。
+/// 每个 user 轮开始时复位（见提问循环里 `PET_GROWTH_USED_THIS_TURN.store(false, ..)`）；
+/// 用进程级静态（与 `LAST_PUSH_NOTIFICATION` / `SHELL_CONTROLS` 同款）——「每轮」是主循环事实，
+/// 不必塞进 `Ctx`。子代理拿不到桥（`PetGrowth` 在 `BRIDGE_TOOLS` 里被剔掉），故不受影响。
+static PET_GROWTH_USED_THIS_TURN: AtomicBool = AtomicBool::new(false);
 
 /// 一条后台命令给前端看的描述。
 struct BgCmd {
@@ -3972,7 +4074,7 @@ fn main() {
             add_dirs.push(dir);
         }
     }
-    let tools_ctx = tools::Ctx {
+    let mut tools_ctx = tools::Ctx {
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         add_dirs,
         read_only: cli.permission_mode == "plan",
@@ -3988,6 +4090,9 @@ fn main() {
         // 因为回调要绑死那一次的 tool_use_id。实时控制（后台运行 / 停止）同理。
         tool_output: None,
         shell_control: None,
+        // 记忆作用域（2026-10-13）：起手全局；每个 user 轮开始前按本轮来源重设
+        //（见提问循环里的 `tctx.memory_scope = turn_memory_scope(...)`）。
+        memory_scope: tools::MemoryScope::Global,
     };
 
     // P3 MCP 工具桥：把 <exe 根>\tools\*.json 的用户工具接进工具池。
@@ -4105,13 +4210,18 @@ fn main() {
     // 往期会话索引（A2）**自 2026-10-07 起不再注入**：新建对话必须与上个对话在模型侧隔离
     // （每次重启都会把刚结束的那个会话列进索引，模型思考里就带上个对话的痕迹 —— 用户报的
     // 就是这个）。取回侧保留：模型需要时自己调 `SessionSearch`（`lunac/history_search`）。
-    // 长期记忆（A4，2026-09-20）：**启动时取一次**的冻结快照。
-    // 「写侧工具是否真的在池里」先算出来 —— 注入文案与条件注册必须同源，否则会出现
-    // 「提示词让模型调 Remember，但它不在工具表里」这种自相矛盾的组合。
+    // 长期记忆（A4，2026-09-20）：**启动时取一次**的全局冻结快照（桌宠私有那一份按轮现读，
+    // 见提问循环里的 `turn_block`）。「写侧工具是否真的在池里」先算出来 —— 注入文案与条件
+    // 注册必须同源，否则会出现「提示词让模型调 Remember，但它不在工具表里」这种自相矛盾的组合。
     let remember_on = memory_enabled()
         && has_lunac_bridge
         && !cli.disallowed.iter().any(|d| d == "Remember");
-    let memory_section = memory_block(mcp_bridge.as_mut(), remember_on);
+    // 桌宠自我区（2026-10-13 人格地基）：两件写入侧工具**条件注册** —— 与 `Remember` 同判据
+    // （没桥就写不进去，注册了也只是必然失败的占位）。运行时**只认桌宠轮**（见 dispatch_tool）。
+    let pet_growth_on = has_lunac_bridge && !cli.disallowed.iter().any(|d| d == "PetGrowth");
+    let persona_suggest_on =
+        has_lunac_bridge && !cli.disallowed.iter().any(|d| d == "PetPersonaSuggest");
+    let memory_section = memory_block(mcp_bridge.as_mut(), remember_on, tools::MemoryScope::Global);
     // 用户人格 / 自定义提示词（L2，2026-09-21）：与 skills / 索引 / 记忆同款的**启动时读一次**。
     // 宿主经 `LUNAC_PERSONA_FILE` 给出 `config\persona.md` 的路径；面板上保存后要**重启 agent**
     // 才生效 —— 热读会让系统提示词每轮都变、把整个固定前缀的缓存打掉（规则 18/23），
@@ -4165,6 +4275,16 @@ fn main() {
     if remember_on {
         tool_defs.push(tools::remember_tool());
         tool_names.push("Remember".into());
+    }
+    // 桌宠自我区（2026-10-13 人格地基）：与 `Remember` 同款**条件注册**（判据见上面 `pet_*_on`）。
+    // 运行时只认桌宠轮 —— 注册在池里是为了让桌宠轮看得见，非桌宠轮调用会被 `dispatch_tool` 拒。
+    if pet_growth_on {
+        tool_defs.push(tools::pet_growth_tool());
+        tool_names.push("PetGrowth".into());
+    }
+    if persona_suggest_on {
+        tool_defs.push(tools::persona_suggestion_tool());
+        tool_names.push("PetPersonaSuggest".into());
     }
     // 出图（A13，2026-10-03）：**条件注册** —— 宿主配了 `config\ai.json` 的 image_model
     // 才会注入 `LUNAC_IMAGE_MODEL`。没配就注册，等于在固定前缀里放一件必然失败的工具
@@ -4490,6 +4610,25 @@ fn main() {
                 // 不需要「按轮开」（全局开关已经能开）。
                 let thinking_override =
                     thinking_override_from(msg.get("thinking").and_then(Value::as_str));
+                // 记忆作用域（2026-10-13）：桌宠发起的那一轮读写**桌宠私有**那一份，其余用
+                // 全局。写进 `tools_ctx`（`Remember` / 子代理 / 后台复盘 fork 都从它取），
+                // 并据此决定本轮注入哪一份记忆 —— 两份**互不注入**。
+                let turn_scope = turn_memory_scope(&msg);
+                tools_ctx.memory_scope = turn_scope;
+                // 成长笔记的「每轮 ≤ 1 条」闸随本轮复位（见 `PET_GROWTH_USED_THIS_TURN`）。
+                PET_GROWTH_USED_THIS_TURN.store(false, Ordering::Relaxed);
+                // 全局轮用启动时的**冻结快照**（缓存纪律，`ctx_block` 进程内恒定）；桌宠轮
+                // **按轮现读**：桌宠笔记 / 成长笔记是它会话里现长出来的，冻结会让「刚记的当轮看不见」。
+                // 桌宠轮的上下文块 = 桌宠私有记忆段 + 成长笔记段（两段拼在**同一个** history 开头
+                // 的 context block 里 —— 注入/去重仍是「先摘旧块、再把新块放开头」，与上一轮一致）。
+                let turn_block: Option<Value> = match turn_scope {
+                    tools::MemoryScope::Global => ctx_block.clone(),
+                    tools::MemoryScope::Pet => {
+                        let section = memory_block(mcp_bridge.as_mut(), remember_on, turn_scope);
+                        let growth = growth_block(mcp_bridge.as_mut(), pet_growth_on);
+                        context_block_message(&format!("{section}{growth}"))
+                    }
+                };
                 run_query(
                     &cfg,
                     &mut history,
@@ -4505,7 +4644,7 @@ fn main() {
                     &skills,
                     &system_prompt,
                     &subagent_system,
-                    ctx_block.as_ref(),
+                    turn_block.as_ref(),
                     thinking_override,
                 );
                 // 复盘的四个前置（方案 B，2026-10-11）：① 本轮确实完成了一次用户提问
@@ -4528,7 +4667,10 @@ fn main() {
                         now_epoch_secs(),
                     )
                 {
-                    let memory = fetch_memory(mcp_bridge.as_mut()).unwrap_or_default();
+                    // 「当前记忆」按**本轮作用域**读（桌宠轮读桌宠私有那份）：复盘据此避免
+                    // 重复写、且写回的也是同一份（`tools_ctx.memory_scope` 已随本轮设好，
+                    // 复盘线程拿的是它的克隆 ⇒ 自动同作用域）。
+                    let memory = fetch_memory(mcp_bridge.as_mut(), turn_scope).unwrap_or_default();
                     review_seq += 1;
                     // spawn 前先吃掉本会话配额（无论派没派成，本会话都不再重试）——「每会话
                     // ≤ 1 次」是硬上限。只有**真派出去**了才记「上次复盘时间」（写侧发生了
@@ -5769,6 +5911,36 @@ tools work again. Execute the plan task by task in the order you wrote it, and k
 posted with TodoWrite. If reality contradicts the plan (a file is not where you expected), say \
 so instead of improvising silently.";
 
+/// `PetGrowth` / `PetPersonaSuggest` 的**前置判据**（不碰桥，故可单测）：通过则返回要写的内容。
+///
+/// 三关（任一不过即拒，**不写任何东西**）：
+///   ① **仅桌宠轮**（`tctx.memory_scope == Pet`）—— 非桌宠轮调用一律拒；
+///   ② 写类档位（只读 / 计划相位）直接拒（与 `Remember` 同源 `write_blocked`）；
+///   ③ `PetGrowth` **每轮 ≤ 1 条**（`PET_GROWTH_USED_THIS_TURN`）；内容非空。
+fn pet_self_write_gate<'a>(
+    tctx: &tools::Ctx,
+    name: &str,
+    input: &'a Value,
+) -> Result<&'a str, String> {
+    if tctx.memory_scope != tools::MemoryScope::Pet {
+        return Err(format!(
+            "{name} is only available during a desktop-pet turn (the user message must carry \
+             source=\"pet\"); it does not apply to normal chat."
+        ));
+    }
+    if let Some(why) = tools::write_blocked(tctx, name) {
+        return Err(why);
+    }
+    let content = input.get("content").and_then(Value::as_str).unwrap_or("").trim();
+    if content.is_empty() {
+        return Err("缺少 content 参数：要记的内容不能为空".into());
+    }
+    if name == "PetGrowth" && PET_GROWTH_USED_THIS_TURN.swap(true, Ordering::Relaxed) {
+        return Err("每轮最多追加一条成长笔记（本轮已追加过一条）。".into());
+    }
+    Ok(content)
+}
+
 fn dispatch_tool(
     tctx: &tools::Ctx,
     mcp_bridge: Option<&mut mcp::McpSet>,
@@ -5861,6 +6033,7 @@ fn dispatch_tool(
             // 但上面那条 `needs_bridge` 早退把 `tools::run` 里的拦截绕过去了，
             // 不在这一层补，只读档 / 计划相位就能改长期记忆（2026-09-20 A7 起共用
             // `tools::write_blocked`，两档的措辞自动分开）。
+            // **写哪一份由本轮作用域决定**（`tctx.memory_scope`，桌宠轮 = 桌宠私有）。
             "Remember" => {
                 if let Some(why) = tools::write_blocked(tctx, "Remember") {
                     Err(why)
@@ -5877,10 +6050,18 @@ fn dispatch_tool(
                             .get("replace")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
-                        bridge.memory_write(content, replace)
+                        bridge.memory_write(content, replace, tctx.memory_scope.as_str())
                     }
                 }
             }
+            // 桌宠自我区（2026-10-13 人格地基）：两条都**只追加**、**只在桌宠轮可用**、
+            // `PetGrowth` 每轮 ≤ 1 条。三关判据抽在 `pet_self_write_gate`（可单测，不碰桥）。
+            // ⚠️ 这里**没有**任何写核心人格的分支 —— 建议只能进建议区，合并由用户在界面上做。
+            "PetGrowth" | "PetPersonaSuggest" => match pet_self_write_gate(tctx, name, input) {
+                Err(why) => Err(why),
+                Ok(content) if name == "PetGrowth" => bridge.pet_growth_write(content),
+                Ok(content) => bridge.persona_suggestion_write(content),
+            },
             // 显式兜底（**不要**写成 `_ => read_resource`）：`BRIDGE_TOOLS` 里新加一件却忘了
             // 在这里接线时，宁可回一句「实现缺失」，也不要静默地按 read_resource 去执行。
             other => Err(format!(
@@ -6315,15 +6496,16 @@ fn run_query(
     };
 
     // ── 上下文块幂等注入（2026-10-06，M2-16 方案 D）────────────────────
-    // 注在 history **开头**、且**只注一次**（位置选择的理由见 `context_block_message`）。
-    // 幂等判据是表头：`set_history`（回退 / 恢复会话）会整份换掉 history，注过的那条随之
-    // 消失 ⇒ 下一问要能认出来并补回去，否则表现为「回退之后模型突然不记得长期记忆」。
-    // 压缩若把它当旧消息丢掉，也会在这里补回（代价：那一次提问的前缀在此处失配一次）。
+    // 注在 history **开头**（位置选择的理由见 `context_block_message`）。
+    // 做法：先摘掉任何在册的旧注入块、再把本轮这块放到开头 —— 于是
+    //   · 全局轮（块内容进程内恒定）：与「只注一次」逐字节等价，缓存不变量不受影响；
+    //   · 桌宠轮（按轮现读）：笔记一变，块就地刷新 ⇒ 桌宠当轮就能看见刚记的东西；
+    //   · `set_history`（回退 / 恢复会话）整份换掉 history 后，这里能把它补回去
+    //     （否则表现为「回退之后模型突然不记得长期记忆」）；压缩把它当旧消息丢掉时同理。
     // **必须排在 `base` 之前**：`base` 是「本轮压入的消息」的起点，注入的这条不属于本轮。
     if let Some(cb) = ctx_block {
-        if !history.iter().any(is_context_block_msg) {
-            history.insert(0, cb.clone());
-        }
+        history.retain(|m| !is_context_block_msg(m));
+        history.insert(0, cb.clone());
     }
 
     // 回滚锚点：本轮压入的所有消息（user / assistant / tool_result）都在其后。
@@ -7632,7 +7814,88 @@ mod tests {
             plan_phase: Arc::new(AtomicBool::new(false)),
             tool_output: None,
             shell_control: None,
+            memory_scope: tools::MemoryScope::Global,
         }
+    }
+
+    /// 桌宠自我区（2026-10-13 人格地基）的前置判据：**仅桌宠轮**、写类档位拒、
+    /// `PetGrowth` **每轮 ≤ 1 条**、内容非空。判据纯函数（不碰桥），故直接单测。
+    #[test]
+    fn pet_self_write_gate_is_pet_only_and_caps_growth_per_turn() {
+        // 进程级静态：本用例自己摆，别依赖别处的复位。
+        PET_GROWTH_USED_THIS_TURN.store(false, Ordering::Relaxed);
+
+        // 非桌宠轮（作用域 = 全局）⇒ 两件都拒（① ）
+        let global = test_ctx();
+        for n in ["PetGrowth", "PetPersonaSuggest"] {
+            let e = pet_self_write_gate(&global, n, &json!({ "content": "x" })).unwrap_err();
+            assert!(e.contains("desktop-pet"), "{n} 非桌宠轮应被拒：{e}");
+        }
+
+        // 桌宠轮（作用域 = Pet）⇒ 放行，返回 trim 后的内容
+        let mut pet = test_ctx();
+        pet.memory_scope = tools::MemoryScope::Pet;
+        assert_eq!(
+            pet_self_write_gate(&pet, "PetPersonaSuggest", &json!({ "content": "  建议  " })).unwrap(),
+            "建议"
+        );
+
+        // 空内容 ⇒ 拒
+        assert!(pet_self_write_gate(&pet, "PetGrowth", &json!({ "content": "   " })).is_err());
+
+        // ③ 每轮 ≤ 1 条：连着两次 `PetGrowth` ⇒ 第二次必拒；复位后（= 下一轮）又能写
+        assert!(pet_self_write_gate(&pet, "PetGrowth", &json!({ "content": "第一次" })).is_ok());
+        let e = pet_self_write_gate(&pet, "PetGrowth", &json!({ "content": "第二次" })).unwrap_err();
+        assert!(e.contains("最多追加一条"), "{e}");
+        PET_GROWTH_USED_THIS_TURN.store(false, Ordering::Relaxed);
+        assert!(pet_self_write_gate(&pet, "PetGrowth", &json!({ "content": "下一轮" })).is_ok());
+
+        // 写类档位（只读 / 计划相位）⇒ 拒（与 `Remember` 同源 `write_blocked`）（② ）
+        let mut ro = test_ctx();
+        ro.memory_scope = tools::MemoryScope::Pet;
+        ro.read_only = true;
+        assert!(pet_self_write_gate(&ro, "PetPersonaSuggest", &json!({ "content": "x" })).is_err());
+
+        PET_GROWTH_USED_THIS_TURN.store(false, Ordering::Relaxed);
+    }
+
+    /// ⑧ 成长笔记注入**封顶**（复用 `MEMORY_INJECT_CHARS`）且**不进 system**（§45）：
+    /// 超长截到上限、两次截断逐字节相同（前缀稳定），并作为 history 开头的上下文块注入。
+    #[test]
+    fn growth_notes_are_capped_and_live_in_the_context_block() {
+        let huge = "字".repeat(MEMORY_INJECT_CHARS + 5_000);
+        let capped = cap_inject(&huge);
+        // 封顶 = 截到上限 + 一小段截断标记（`…(truncated)`）；关键是**有硬上限**、不再随文件增长。
+        assert!(
+            capped.chars().count() <= MEMORY_INJECT_CHARS + 16,
+            "必须封顶（上限 + 截断标记）：{}",
+            capped.chars().count()
+        );
+        assert!(capped.ends_with("…(truncated)"), "截断必须留可辨识标记");
+        assert_eq!(cap_inject(&huge), capped, "两次截断必须逐字节相同（前缀稳定）");
+        assert_eq!(cap_inject("短笔记"), "短笔记", "不超上限时原样");
+
+        // 空正文 + 写侧不可用 ⇒ 不加空壳
+        assert_eq!(growth_block_text(false, ""), "");
+        // 有正文 ⇒ 表头 + 引导在前、正文永远拼在其后（空→有只 miss 正文那一段）
+        let blk = growth_block_text(true, "被夸时轻轻晃一下");
+        assert!(blk.contains("Growth notes") && blk.contains("PetGrowth"));
+        assert!(
+            blk.rfind("被夸时轻轻晃一下").unwrap() > blk.find("PetGrowth").unwrap(),
+            "正文必须拼在引导之后"
+        );
+
+        // 合成 history 开头的一条 user 消息，表头可被幂等判据认出；空 ⇒ None
+        assert!(context_block_message("   ").is_none());
+        let cb = context_block_message(&blk).expect("非空时应生成块");
+        let text = cb.pointer("/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(text.starts_with(CONTEXT_BLOCK_HEADER));
+        assert!(is_context_block_msg(&cb), "成长笔记块必须能被幂等判据认出");
+
+        // §45：成长笔记**不得进 system 固定前缀**（否则每长一条就整段 miss）
+        let env = env_block(std::path::Path::new("C:/work"));
+        let system = build_system_prompt("", &env, "");
+        assert!(!system.contains("Growth notes"), "成长笔记不得进 system 固定前缀");
     }
 
     /// 输入用量归并（2026-10-07）：原生端点用 `message_start` 的量；中转端点在
@@ -8190,23 +8453,63 @@ mod tests {
     /// Remember 引导**（否则全新安装永远学不会主动写）。引导是固定前缀、正文拼在其后。
     #[test]
     fn memory_block_injects_guidance_when_memory_is_empty() {
+        use tools::MemoryScope;
         // 空记忆 + 写侧可用 ⇒ 注入表头 + 引导（没有正文）。
-        let empty = memory_block_text(true, "");
+        let empty = memory_block_text(true, "", MemoryScope::Global);
         assert!(empty.contains("# Long-term memory"), "空记忆也要注入表头");
         assert!(
             empty.contains("Add a fact with the `Remember` tool"),
             "空记忆也要注入 Remember 引导（冷启动死锁的回归防线）"
         );
         // 空记忆 + 写侧不可用 ⇒ 无可注入（不拿一句空话污染前缀）。
-        assert!(memory_block_text(false, "").is_empty(), "空记忆 + 写侧不可用 ⇒ 空串");
+        assert!(
+            memory_block_text(false, "", MemoryScope::Global).is_empty(),
+            "空记忆 + 写侧不可用 ⇒ 空串"
+        );
         // 有正文时行为不变，且正文必须落在引导**之后**（缓存前缀纪律：前缀逐字节稳定）。
-        let full = memory_block_text(true, "- prefers tabs");
+        let full = memory_block_text(true, "- prefers tabs", MemoryScope::Global);
         assert!(full.contains("Add a fact with the `Remember` tool"));
         assert!(full.ends_with("- prefers tabs"), "正文必须拼在引导之后");
         // 逐字节稳定性：空记忆的块必须是「有正文的块」的前缀（引导段一字不差）。
         assert!(
             full.starts_with(&empty),
             "空记忆的块必须是有记忆块的前缀（引导段不随正文变）"
+        );
+    }
+
+    /// 作用域（2026-10-13）：全局与桌宠各一段、表头可区分（互不掺入）；本轮作用域由
+    /// user 消息的 `source` 推出，**只认 `pet`**，其余（含缺省 / 坏值）一律全局。
+    #[test]
+    fn memory_scope_is_selected_by_turn_source() {
+        use tools::MemoryScope;
+        // 表头区分：全局段不含桌宠后缀；桌宠段带上私有说明。
+        let g = memory_block_text(true, "- a", MemoryScope::Global);
+        let p = memory_block_text(true, "- a", MemoryScope::Pet);
+        assert!(g.contains("# Long-term memory\n"), "{g}");
+        assert!(
+            p.contains("desktop pet — private notes"),
+            "桌宠段要有可区分的表头：{p}"
+        );
+        assert!(!g.contains("private notes"), "全局段不得混入桌宠措辞");
+
+        // source 解析：只认 `pet`（大小写不敏感），其余一律全局。
+        assert_eq!(
+            turn_memory_scope(&json!({ "type": "user", "source": "pet" })),
+            MemoryScope::Pet
+        );
+        assert_eq!(
+            turn_memory_scope(&json!({ "type": "user", "source": "PET" })),
+            MemoryScope::Pet
+        );
+        assert_eq!(
+            turn_memory_scope(&json!({ "type": "user", "thinking": "off" })),
+            MemoryScope::Global,
+            "缺省 source ⇒ 全局"
+        );
+        assert_eq!(
+            turn_memory_scope(&json!({ "type": "user", "source": "chat" })),
+            MemoryScope::Global,
+            "无法识别 ⇒ 退回全局（绝不误判成桌宠轮）"
         );
     }
 

@@ -278,13 +278,19 @@ pub fn load_persona_text() -> Result<Option<String>, String> {
 }
 
 /// **先校验后写**：不合格时一个字节都不落盘（与 A12 定价表同一条纪律）。
-pub fn save_persona_text(text: &str) -> Result<(), String> {
+///
+/// 拆出「只依赖 path」的形态：桌宠人格建议的**合并**（`mcp_server::merge_persona_suggestion_at`）
+/// 也要走**同一套校验**（长度 / NUL / 先校验后写）—— 三个调用点共用这一个实现，不各写一遍。
+pub fn save_persona_text_at(path: &std::path::Path, text: &str) -> Result<(), String> {
     validate_persona_text(text)?;
-    let path = persona_config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+    fs::write(path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+}
+
+pub fn save_persona_text(text: &str) -> Result<(), String> {
+    save_persona_text_at(&persona_config_path(), text)
 }
 
 /// 校验只挡两件会真出事的事：① 超长（固定前缀每轮都发）；② NUL（会破坏文本工具链）。
@@ -327,12 +333,7 @@ pub fn load_pet_persona_text() -> Result<Option<String>, String> {
 
 /// **先校验后写**（复用用户人格那套判据：长度上限 + 不含 NUL；不合格一个字节都不落盘）。
 pub fn save_pet_persona_text(text: &str) -> Result<(), String> {
-    validate_persona_text(text)?;
-    let path = pet_persona_config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+    save_persona_text_at(&pet_persona_config_path(), text)
 }
 
 /// 桌宠的**默认人格**（2026-10-09 用户口径：女性 / 输出简洁 / 语气温柔 / 不带书面语 / 口语化；
