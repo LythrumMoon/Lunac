@@ -44,6 +44,7 @@ const pluginEntries: Record<string, string> = {
   convert: p("./src/plugins/builtin/convert.ts"),
   proxy: p("./src/plugins/builtin/proxy.ts"),
   pet: p("./src/plugins/builtin/pet.ts"),
+  "local-model": p("./src/plugins/builtin/local-model.ts"),
 };
 
 /** 本次打哪一个（由 build-plugins.ps1 逐个设置）。 */

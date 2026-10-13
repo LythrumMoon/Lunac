@@ -138,13 +138,16 @@ struct Kbdllhookstruct {
 #[derive(Copy, Clone, Default)]
 struct Point { x: i32, y: i32 }
 
+// `pub(crate)` + 放开 `message` / `l_param`：`mouse_hook.rs` 的 WH_MOUSE_LL 消息泵
+// 复用它（两者都要声明 `GetMessageW` / `PeekMessageW`，而「同一 Win32 符号在一个 crate
+// 里只能有一种声明」，各自定义一份 Msg 会触发 `clashing_extern_declarations`）。
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
-struct Msg {
+pub(crate) struct Msg {
     hwnd: isize,
-    message: u32,
+    pub(crate) message: u32,
     w_param: usize,
-    l_param: isize,
+    pub(crate) l_param: isize,
     time: u32,
     pt: Point,
 }
@@ -570,36 +573,7 @@ pub fn hide_window() {
 /// 游戏场景下 SetForegroundWindow 可能因前台锁定竞争而失败（游戏持续抢占前台），
 /// 加入最多 3 次重试（间隔 16ms ≈ 1 帧）。
 unsafe fn force_foreground(hwnd: isize) {
-    let fg = GetForegroundWindow();
-    if fg == hwnd {
-        return; // already foreground
-    }
-
-    let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
-    let our_thread = GetCurrentThreadId();
-
-    // Attach to foreground thread → borrow its foreground activation rights
-    let attached = if fg_thread != 0 && fg_thread != our_thread {
-        AttachThreadInput(our_thread, fg_thread, 1) != 0
-    } else {
-        false
-    };
-
-    for attempt in 0..3 {
-        if GetForegroundWindow() == hwnd {
-            break;
-        }
-        if attempt > 0 {
-            thread::sleep(std::time::Duration::from_millis(16));
-        }
-        // Don't use send_alt_unlock when AttachThreadInput is active —
-        // the input injection could interfere with the foreground transition.
-        SetForegroundWindow(hwnd);
-    }
-
-    if attached {
-        AttachThreadInput(our_thread, fg_thread, 0);
-    }
+    force_foreground_hwnd(hwnd);
 
     if let Some(app) = APP.get() {
         let _ = app.run_on_main_thread(|| {
@@ -607,6 +581,49 @@ unsafe fn force_foreground(hwnd: isize) {
                 let _ = w.set_focus();
             }
         });
+    }
+}
+
+/// **只**把 `hwnd` 搬到前台（借前台线程的输入优先级 = `AttachThreadInput` +
+/// `SetForegroundWindow`），**不碰主窗** —— 供插件窗复用。
+///
+/// 2026-10-09：桌宠发消息时要让 AI 聊天窗自动弹到前面，但 Tauri 的 `set_focus()` 对
+/// **后台进程**会被 Windows 的 `ForegroundLockTimeout` 拦下（同 `force_foreground` 的注释），
+/// 表现是「窗开了却躲在别的窗口后面」。这里与 `force_foreground` 用同一套手法，只是**只针对
+/// 目标窗**（不去 set_focus 主窗，否则会把刚提到前面的插件窗又顶下去）。
+pub(crate) fn force_foreground_hwnd(hwnd: isize) {
+    unsafe {
+        if hwnd == 0 {
+            return;
+        }
+        let fg = GetForegroundWindow();
+        if fg == hwnd {
+            return; // already foreground
+        }
+
+        let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        let our_thread = GetCurrentThreadId();
+
+        // Attach to foreground thread → borrow its foreground activation rights
+        let attached = if fg_thread != 0 && fg_thread != our_thread {
+            AttachThreadInput(our_thread, fg_thread, 1) != 0
+        } else {
+            false
+        };
+
+        for attempt in 0..3 {
+            if GetForegroundWindow() == hwnd {
+                break;
+            }
+            if attempt > 0 {
+                thread::sleep(std::time::Duration::from_millis(16));
+            }
+            SetForegroundWindow(hwnd);
+        }
+
+        if attached {
+            AttachThreadInput(our_thread, fg_thread, 0);
+        }
     }
 }
 
@@ -876,6 +893,12 @@ fn install_hook_thread() {
                 "[lunac::hotkey] Hotkey ready via RegisterHotKey (no keyboard hook) ({})",
                 combo
             );
+            // ⚠️ 上面那句 `eprintln!` 在 release 下**是丢的**（GUI 子系统没有控制台）。
+            // 而「热键走哪条路」直接决定**会不会装全局键盘钩子** —— 钩子意味着全系统
+            // 每一次按键都要经过我们，既是输入/L 帧卡顿的常见嫌疑，也是杀软眼里的
+            // 键盘记录器特征（见 docs/code-rules.md 的热键双模式一节）。排查「游戏卡顿 /
+            // 热键失效」时这是**第一个要看的事实**，所以必须进落盘日志。
+            crate::log::info(format!("hotkey: backend=register (no hook) combo={combo}"));
         } else {
             // 先置 HOOK_MODE=true 再装钩子：若安装失败并提前 return，看门狗仍会
             // 因心跳停更而触发重装（恢复原有自愈能力）；装好后再打印成功日志。
@@ -883,6 +906,10 @@ fn install_hook_thread() {
             hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard_hook, 0, 0);
             if hook == 0 {
                 eprintln!("[lunac::hotkey] SetWindowsHookEx FAILED err={}", GetLastError());
+                crate::log::warn(format!(
+                    "hotkey: backend=LL-hook 安装失败 err={} combo={combo}",
+                    GetLastError()
+                ));
                 let _ = io::stderr().flush();
                 RESTARTING_HOOK.store(false, Ordering::SeqCst);
                 return;
@@ -892,6 +919,10 @@ fn install_hook_thread() {
             } else {
                 eprintln!("[lunac::hotkey] Hotkey ready via LL hook fallback ({})", combo);
             }
+            crate::log::warn(format!(
+                "hotkey: backend=LL-hook (fallback) combo={combo} restart={restart} \
+                 —— RegisterHotKey 没注册上（组合被别的程序占用 / Alt+Space 系统保留）"
+            ));
         }
         let _ = io::stderr().flush();
 
@@ -964,6 +995,10 @@ pub fn start_hotkey(app: AppHandle) {
             "[lunac::hotkey] Failed to apply hotkey '{}': {} — falling back to default",
             initial, e
         );
+        // 配置坏了就回默认键这件事必须留痕 —— 否则用户看到的现象是「我设的热键自己变了」
+        crate::log::warn(format!(
+            "hotkey: 配置的热键 '{initial}' 无法应用（{e}）→ 回退默认 {DEFAULT_HOTKEY}"
+        ));
         let _ = parse_and_set_hotkey(DEFAULT_HOTKEY);
     }
 
@@ -1024,6 +1059,12 @@ pub fn start_hotkey(app: AppHandle) {
                             now.wrapping_sub(ping),
                             HOOK_RESTART_COUNT.load(Ordering::Relaxed)
                         );
+                        // 看门狗重装是「热键莫名失效」的现场证据，同样不能只走 eprintln
+                        crate::log::warn(format!(
+                            "hotkey: 看门狗判定钩子已死（最后心跳 {}ms 前）→ 重装 #{}",
+                            now.wrapping_sub(ping),
+                            HOOK_RESTART_COUNT.load(Ordering::Relaxed)
+                        ));
                         let _ = io::stderr().flush();
                         // install_hook_thread 内部会向旧泵线程发 WM_QUIT 并卸载钩子，
                         // 防止钩子句柄泄漏（此处无需重复发送）。

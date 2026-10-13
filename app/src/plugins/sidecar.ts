@@ -16,7 +16,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { t } from "../i18n.js";
-import type { LunacSidecarApi, LunacSidecarHttpOptions } from "./host";
+import type { LunacSidecarApi, LunacSidecarHttpOptions, LunacSidecarStartResult } from "./host";
 
 /** 当前窗口里挂着的那个插件（sidecar 的归属）。同一窗口一次只有一个面板。 */
 let activePluginId: string | null = null;
@@ -113,6 +113,57 @@ export function maybeAutoStartSidecar(autostart: boolean): void {
   void bridgeRef.start().catch(err => console.warn("[lunac sidecar] autostart failed:", err));
 }
 
+/** 起进程 + 处理信任门。**不依赖 `activePluginId`** —— 供「非面板托管点」复用。
+ *
+ *  面板那条路（`createSidecarBridge().start()`）只多一层 `requirePlugin()`；这个函数是
+ *  它的内核。设置里的「本地模型决策」开关与启动时的 ensure 直接用 pluginId 调它，
+ *  于是同一套信任门（`needs_trust` → 弹卡 → `trust/deny` → 再起）只有一份实现。 */
+async function startFor(pluginId: string): Promise<LunacSidecarStartResult> {
+  const first = await invoke<{ status: string; port?: number }>("plugin_sidecar_start", { pluginId });
+  if (first?.status !== "needs_trust") {
+    return { status: "started", port: first?.port ?? undefined };
+  }
+  const decision = await showSidecarTrustCard(first as never);
+  if (decision === "deny") {
+    await invoke("plugin_sidecar_deny", { pluginId }).catch(() => {});
+    throw new Error(t("plugin.sidecar_denied"));
+  }
+  await invoke("plugin_sidecar_trust", { pluginId, remember: decision === "always" });
+  const again = await invoke<{ status: string; port?: number }>("plugin_sidecar_start", { pluginId });
+  return { status: "started", port: again?.port ?? undefined };
+}
+
+/** 「非面板托管点」用的启停（2026-10-09，本地模型决策开关）。
+ *  与面板那条路的区别只是**不需要先有活动面板** —— 进程 owner 仍是**发起调用的窗口**，
+ *  设置面板在主窗里渲染 ⇒ owner = `main`，随应用退出由 `kill_all` 兜底回收。 */
+export function startPluginSidecar(pluginId: string): Promise<LunacSidecarStartResult> {
+  return startFor(pluginId);
+}
+
+/** 收掉某个插件的 sidecar（不依赖活动面板）。 */
+export function stopPluginSidecar(pluginId: string): Promise<boolean> {
+  return invoke<boolean>("plugin_sidecar_stop", { pluginId });
+}
+
+/** 设置托管路径专用：**直接落盘信任**后起进程（**不经信任卡**，2026-10-09 用户要求）。
+ *
+ *  为什么去掉信任卡：信任卡渲染在 `#results-list` 里，而设置面板正是把整个布局放进那个容器 ——
+ *  卡片会被 settings 的布局裁掉（实测「被页面吞了」）。改为设置面板内的**内联警告 + 确认**，
+ *  确认后直接 `trust(remember=true)` → `start`。
+ *
+ *  **安全口径没有放松**：清单仍要过 `validate_sidecar`（`process.spawn` + `command` 限插件目录 +
+ *  sha256 格式），`trust` 仍按「id + command + sha256」指纹落盘，且 `start/stop` 照旧落审计日志 ——
+ *  变的只是「三档信任卡」→「一次明确的警告确认」。指纹随命令/校验和变化而失效，改命令需重新确认。 */
+export async function startPluginSidecarTrusted(pluginId: string): Promise<void> {
+  await invoke("plugin_sidecar_trust", { pluginId, remember: true });
+  await invoke("plugin_sidecar_start", { pluginId });
+}
+
+/** 某插件的 sidecar 是否在跑（启动 ensure 用）。 */
+export function pluginSidecarRunning(pluginId: string): Promise<boolean> {
+  return invoke<boolean>("plugin_sidecar_running", { pluginId });
+}
+
 /** 造一份桥，交给 `installHostBridge({ t, apiVersion: 2, sidecar })`。 */
 export function createSidecarBridge(): LunacSidecarApi {
   // 事件分发表：`event`（推送行的 method）→ 回调集
@@ -149,19 +200,7 @@ export function createSidecarBridge(): LunacSidecarApi {
   const api: LunacSidecarApi = {
     async start() {
       ensureListen();
-      const pluginId = requirePlugin();
-      const first = await invoke<{ status: string; port?: number }>("plugin_sidecar_start", { pluginId });
-      if (first?.status !== "needs_trust") {
-        return { status: "started", port: first?.port ?? undefined };
-      }
-      const decision = await showSidecarTrustCard(first as never);
-      if (decision === "deny") {
-        await invoke("plugin_sidecar_deny", { pluginId }).catch(() => {});
-        throw new Error(t("plugin.sidecar_denied"));
-      }
-      await invoke("plugin_sidecar_trust", { pluginId, remember: decision === "always" });
-      const again = await invoke<{ status: string; port?: number }>("plugin_sidecar_start", { pluginId });
-      return { status: "started", port: again?.port ?? undefined };
+      return startFor(requirePlugin());
     },
 
     async request(method: string, params?: unknown) {

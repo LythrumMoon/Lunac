@@ -363,11 +363,17 @@ pub fn plugin_window_init(window: WebviewWindow) -> Result<PluginWindowInit, Str
 
 /// 建窗或复用（同一个插件不建第二个）。宿主内部与前端命令**共用这一条实现** ——
 /// 「复用要推一条 `plugin-window-input`」「建窗前必须写好 PENDING」这些约束只有一份。
+///
+/// `hidden`（2026-10-10）：**后台轮**。桌宠发起的那一轮只要求默默跑完、不抢前台 ——
+/// 为 true 时「复用」不 unminimize / show / set_focus / 提前台 / 广播可见性，
+/// 「新建」用 `.visible(false)` 且不聚焦（WebView 照常加载并执行脚本）。
+/// 默认 false ⇒ 所有既有调用方的行为逐字不变。
 pub fn open(
     app: &AppHandle,
     plugin_id: &str,
     key: Option<&str>,
     input: &str,
+    hidden: bool,
 ) -> Result<(), String> {
     if !is_safe_plugin_id(plugin_id) {
         return Err("ERR_BAD_PLUGIN_ID".into());
@@ -411,10 +417,33 @@ pub fn open(
 
     // 已经开着 ⇒ 只把它拎到前面，并把新入参推给它（同一个插件不该开出两个窗）
     if let Some(existing) = app.get_webview_window(&label) {
+        // **后台轮（hidden）**：不 unminimize / show / set_focus / 提前台，也不广播
+        // 可见性 —— 只把入参推进去，它照样能跑（见 `open` 的 `hidden` 参数）。
+        if hidden {
+            // **定向**（`emit_to`）而不是 `emit`：tauri 的 `Emitter::emit` 默认走
+            // `manager().emit()` = **广播给所有窗口**（`WebviewWindow::emit` 不带 label 过滤）。
+            // 音乐 / 桌宠 / 聊天同时开着是常态，广播会让**别的插件窗**也收到这条 —— 而
+            // plugin-window.ts 的 `plugin-window-input` 监听会据此 `render()` **整页重挂**
+            // （桌宠据此重载模型、把主动反应的 `proactiveBusy` 一起清掉 ⇒ 回复丢失）。
+            // 这一条只该送给这扇窗自己（label 就是它），见 `open()` 的复用路径。
+            let _ = app.emit_to(label.as_str(), "plugin-window-input", input);
+            return Ok(());
+        }
         let _ = existing.unminimize();
         let _ = existing.show();
         let _ = existing.set_focus();
-        let _ = existing.emit("plugin-window-input", input);
+        // 聊天窗**强行提到前台**（2026-10-09）：Tauri 的 `set_focus()` 对后台进程会被 Windows
+        // 前台锁拦下 ⇒ 桌宠发消息时表现为「聊天窗开了却躲在别的窗口后面」。借前台线程的输入
+        // 优先级再搬一次（见 hotkey::force_foreground_hwnd），只对 chat 做。
+        if plugin_id == "chat" {
+            if let Ok(h) = existing.hwnd() {
+                crate::hotkey::force_foreground_hwnd(h.0 as isize);
+            }
+        }
+        // **定向**（`emit_to`）：见上面 hidden 分支那条注释 —— 用广播会让别的插件窗
+        // 收到这条 `plugin-window-input` 而整页重挂（桌宠会因此重载模型、丢掉主动反应的
+        // `proactiveBusy`）。这里 label 就是这扇窗自己。
+        let _ = app.emit_to(label.as_str(), "plugin-window-input", input);
         // 「我又可见了」这一声必须由**主动方**喊：`show()` 不产生 `WM_SIZE`，
         // 所以插件自己 `hide()` 之后，`Resized` 那条路永远不会替我们补上这一次
         // （没有它，桌宠被重新打开后动画不会恢复 —— 见 announce_visibility_now）。
@@ -437,11 +466,21 @@ pub fn open(
         .resizable(shape.as_ref().map_or(true, |s| s.resizable))
         .always_on_top(shape.as_ref().map_or(true, |s| s.always_on_top))
         .skip_taskbar(shape.as_ref().is_some_and(|s| s.skip_taskbar))
-        .visible(true)
+        .visible(!hidden)
         .build()
         .map_err(|e| format!("建插件窗口失败：{e}"))?;
 
-    let _ = built.set_focus();
+    // **后台轮（hidden）**：新建的窗就保持隐藏 —— 不聚焦、不强提前台。页面照常加载：
+    // 待初始化载荷已在建窗**之前**写好，前端一启动就会来取（桌宠那轮据此开跑）。
+    if !hidden {
+        let _ = built.set_focus();
+        // 新开的聊天窗同样强行提到前台（理由见上面 existing 分支那条注释）。
+        if plugin_id == "chat" {
+            if let Ok(h) = built.hwnd() {
+                crate::hotkey::force_foreground_hwnd(h.0 as isize);
+            }
+        }
+    }
     OPEN_WINDOWS.fetch_add(1, Ordering::SeqCst);
     crate::log::info(&format!("plugin_window: opened {label}"));
     Ok(())
@@ -455,14 +494,48 @@ pub fn open(
 /// **刻意不用 `run_blocking`**：建窗不是阻塞 IO，而是「交给事件循环去建」——
 /// 它必须在**非主线程**上发起（主线程发起会与消息泵互等）。所以这里用
 /// `async fn` 薄壳本身，理由与 `music::spotify_connect` 相同。
+///
+/// `hidden`（可选，2026-10-10）：**后台轮** —— 桌宠发起的那一轮只想默默跑，别弹窗 /
+/// 别抢前台。缺省（不传）= false，行为与加这个参数之前逐字相同（见 `open`）。
 #[tauri::command]
 pub async fn open_plugin_window(
     app: AppHandle,
     plugin_id: String,
     key: Option<String>,
     input: Option<String>,
+    hidden: Option<bool>,
 ) -> Result<(), String> {
-    open(&app, &plugin_id, key.as_deref(), input.as_deref().unwrap_or_default())
+    open(
+        &app,
+        &plugin_id,
+        key.as_deref(),
+        input.as_deref().unwrap_or_default(),
+        hidden.unwrap_or(false),
+    )
+}
+
+/// 当前**开着的插件窗**的 id 列表（不含 AI 聊天窗本身），按字母序去重。
+///
+/// 用途（docs/todo.md §待办 3-3「当前打开的插件」）：AI 聊天窗是个**独立 WebView**
+/// （label `plugin-chat`），拿不到主窗的 `activePluginId`，前端也没有别的窗口枚举手段
+/// —— 只有宿主知道此刻有哪些插件窗开着。聊天窗在发请求前问一次，把结果作为**可变上下文**
+/// 拼进那条 user 消息（**不进**系统提示词固定前缀 —— 插件开/关是高频事件，放进固定前缀
+/// 会让端点前缀缓存整段作废）。
+///
+/// 只读、无副作用。判据 = **窗口存在**（不区分最小化 / 隐藏）：本命令回答「它开着吗」，
+/// 不是「它此刻在前台吗」。`plugin-<id>` 与附属窗 `plugin-<id>-<key>`（如
+/// `plugin-music-curve`）都算，取 label 去掉前缀后的整串。
+#[tauri::command]
+pub fn open_plugin_ids(app: AppHandle) -> Vec<String> {
+    let mut ids: Vec<String> = app
+        .webview_windows()
+        .into_keys()
+        .filter_map(|label| label.strip_prefix(LABEL_PREFIX).map(str::to_string))
+        .filter(|id| id.as_str() != CHAT_WINDOW_ID)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// 关掉自己（标题栏的 ×）。`window` 由 Tauri 注入。

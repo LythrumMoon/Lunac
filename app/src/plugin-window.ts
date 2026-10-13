@@ -16,6 +16,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { initI18n, loadSavedLanguage, pluginName, t } from "./i18n.js";
 import { pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
@@ -151,6 +152,24 @@ function wireTitlebar() {
 
 // ── 启动 ──────────────────────────────────────────────────────────
 
+/** 插件窗的 JS 报错**必须落到宿主日志**（2026-10-09）。
+ *
+ *  此前 `log_frontend` / `window.onerror` 只在主窗（`main.ts`）注册过，插件窗走的是
+ *  本文件这个入口 ⇒ 插件窗里任何异常都是黑箱：用户在 release 版遇到「桌宠窗一片空白 /
+ *  没有反应」，`lunac-*.log` 里却一行都没有。这里补上同一份上报。 */
+function reportFrontend(level: string, message: string): void {
+  void invoke("log_frontend", { level, message }).catch(() => {});
+}
+window.addEventListener("error", (e) =>
+  reportFrontend("error", `[plugin-window ${currentPluginId || "?"}] ${e.message} @ ${e.filename}:${e.lineno}`),
+);
+window.addEventListener("unhandledrejection", (e) =>
+  reportFrontend(
+    "error",
+    `[plugin-window ${currentPluginId || "?"}] unhandledrejection: ${e.reason instanceof Error ? e.reason.message : String(e.reason)}`,
+  ),
+);
+
 (async () => {
   await initI18n();
   loadSavedLanguage();
@@ -177,8 +196,14 @@ function wireTitlebar() {
   });
   void emit(THEME_REQ_EVENT);
 
-  // 已开着同一个插件时再次「打开」⇒ 宿主不新建窗口，改推一条新入参过来
-  void listen<string>("plugin-window-input", ev => {
+  // 已开着同一个插件时再次「打开」⇒ 宿主**定向**推一条 `plugin-window-input` 给**本窗**
+  // （宿主走 `emit_to(label)`）。这里**必须用带 label 的 `listen`**（`getCurrentWindow().listen`
+  // ⇒ target = 本窗 label）。**不要**用 `@tauri-apps/api/event` 的裸 `listen` —— 它注册的
+  // target 是 `Any`，而 tauri 的 `match_any_or_filter` 对 `Any` listener **恒匹配**，
+  // 于是宿主 `emit_to` 的 label 过滤对本窗**完全失效**：聊天窗被复用前置时推的那条入参
+  // 会被**桌宠窗**一起收到 ⇒ `render()` 整页重挂（重载模型 + 清掉主动反应的 `proactiveBusy`
+  // ⇒ 主动对话回复丢失）。见 ai-spec §4.5「plugin-window-input 必须定向」。
+  void getCurrentWindow().listen<string>("plugin-window-input", ev => {
     if (typeof ev.payload === "string" && currentPluginId) void render(currentPluginId, ev.payload);
   });
 

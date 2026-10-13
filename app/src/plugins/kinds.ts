@@ -59,6 +59,27 @@ export function showsInMarket(id: string): boolean {
   return !(id in MERGED_INTO);
 }
 
+/** 「基础设施插件」（2026-10-09 用户定）：**只提供能力、没有面向用户的入口**。
+ *
+ *  `local-model`（本地决策模型）是第一个：它的定位是给「桌宠消息 / agent 对话输入」做
+ *  要不要发云模型的本地判断，用户从不直接打开它 —— 开关统一放「**设置 → AI → 本地模型决策**」。
+ *  但**它仍要留在插件市场**（用户从那下载/卸载这份能力）。
+ *
+ *  所以它与 `MERGED_INTO` 是两回事，判据必须分开：
+ *   · **不进搜索结果**（`registry.search()` 用它过滤）；
+ *   · **市场行不给「打开」按钮**（settings 的 `marketRowHtml` 用它）；
+ *   · 但仍占市场一行（下载 / 卸载照旧）—— **不要**把它塞进 `MERGED_INTO`，那会把它整个从市场拿掉。 */
+export const HEADLESS_PLUGIN_IDS: readonly string[] = [
+  "local-model",     // 本地决策模型（开关在 设置→AI）
+];
+
+const HEADLESS = new Set<string>(HEADLESS_PLUGIN_IDS);
+
+/** 是不是「只提供能力、无用户入口」的基础设施插件。 */
+export function isHeadlessPlugin(id: string): boolean {
+  return HEADLESS.has(id);
+}
+
 /** 基础插件的展示排序权重（不在清单里的给一个很大的值 —— 让拓展插件排后面）。 */
 export function basePluginOrder(id: string): number {
   const i = BASE_PLUGIN_IDS.indexOf(id);

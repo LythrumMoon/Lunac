@@ -1,6 +1,6 @@
 [package]
 name = "lunac"
-version = "0.9.33"
+version = "0.9.36"
 edition = "2021"
 description = "Lunac - Native AI coding assistant with local + cloud hybrid inference"
 
@@ -63,6 +63,11 @@ lofty = "0.25.4"
 # 换来的是不碰 FFmpeg 全家桶。**刻意只进宿主**：WebView 放不出声音，
 # 与「联网必须走宿主」是同一条纪律（ai-spec §4.6）。
 rodio = "0.22.2"
+# 桌宠语音的 **ZipVoice 零样本克隆** 通路（2026-10-10，`tts_zipvoice.rs`）：
+# 本工具链是 `x86_64-pc-windows-gnu`，而 sherpa-onnx 的 Rust crate 下的是 MSVC 静态库
+# ⇒ 链接期必挂。改成**运行期**加载宿主自带的 `sherpa-onnx-c-api.dll` 取函数指针 ——
+# 只依赖 PE 导出表，与工具链 ABI 无关（详见 tts_zipvoice.rs 文件头）。
+libloading = "0.8"
 # 调音的 **DSP 内核**（2026-10-01，用户第 5 条：取消独立调音插件、内置进音乐插件）。
 # 它是**路径依赖的库**（`tuning-engine/` 自己还有 `[[bin]]` CLI，做依赖时只建 lib），
 # 不再作为独立插件发货 —— 用法是「播放链上套一层 Chain::process_sample」，

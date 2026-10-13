@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
+// 内置工具：Read / Write / Edit / NotebookEdit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Cmd" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 /// 单条工具输出的**内联预算**（字符）：超过就把全文落盘、只内联「头 + 尾 + 路径」。
@@ -104,8 +105,10 @@ const SCRAPE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
 /// 少一个 `Accept` 就回 1488 字节的验证页（见 `scrape_get` 的注释）。
 const SCRAPE_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
 
-/// 目录遍历时跳过的常见重目录（避免 Glob/Grep 卡在依赖上）
-const SKIP_DIRS: [&str; 13] = [
+/// 目录遍历时跳过的常见重目录（避免 Glob/Grep 卡在依赖上）。
+/// **2026-10-12 起 `pub(crate)`**：子目录记忆懒加载（`main.rs` 的 `eligible_subdir`）复用这份
+/// 忽略名单，不另发明第二张表（同一套约定）。
+pub(crate) const SKIP_DIRS: [&str; 13] = [
     ".git", "node_modules", "target", "dist", "out", ".next", ".nuxt", ".venv", "venv",
     "__pycache__", ".idea", ".vscode", "build",
 ];
@@ -125,6 +128,24 @@ pub struct Ctx {
     pub read_only: bool,
     /// 越界拦截开关（工作区已配置时为真）
     pub locked: bool,
+    /// **有效工作目录的覆盖层**（2026-10-11，`EnterWorktree` / `ExitWorktree`）。
+    ///
+    /// `cwd` 是**进程级常量**（工作区根，也是系统提示词里那条），
+    /// 本字段是**独立的一层覆盖**：`EnterWorktree` 成功后设成 worktree 的绝对路径，
+    /// `ExitWorktree` 清回 `None`。**只有三类「寻址」用途读它**（见 [`effective_cwd`]）：
+    /// 相对路径从哪解析（[`resolve`]）、shell 在哪个目录跑（[`run_shell`]）、
+    /// Glob / Grep 的默认根。**不重建系统提示词**（规则 18 前缀不变量；工具返回文本负责把
+    /// 新目录告诉模型）。
+    ///
+    /// ⚠️ **落点在数据根、不在工作区里**（2026-10-11 改）：worktree 建在
+    /// `<exe 根>\temp\worktrees\`（见 [`worktree_root`]），**已不在 `cwd` 之内** —— 故该根
+    /// 目录由 main.rs 并进 `Ctx.add_dirs`（与 `output_dir` / `image_dir` 同一机制），否则
+    /// `guard` 会把 worktree 内的写直接拒掉。**只放行这一个应用自己的目录**，不放宽
+    /// 用户工作区的边界。
+    ///
+    /// 为什么是 `Arc<Mutex<..>>`：与 `plan_phase` 同 —— `Ctx` 是 `Clone` 且要跨线程
+    ///（只读并行批用 `&Ctx`、后台复盘 / 子代理拿克隆），值语义会各持一份。
+    pub worktree: Arc<Mutex<Option<PathBuf>>>,
     /// **计划相位**（2026-09-20，原 backlog A7）：模型自己调 `EnterPlanMode` 声明
     /// 「只出计划、不动手」，`ExitPlanMode` 被用户批准后解除。
     ///
@@ -267,7 +288,7 @@ pub fn write_blocked(ctx: &Ctx, what: &str) -> Option<String> {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 十七个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 二十一个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -310,6 +331,29 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                     "replace_all": { "type": "boolean", "description": "Replace every occurrence" }
                 },
                 "required": ["file_path", "old_string", "new_string"]
+            }
+        }),
+        json!({
+            "name": "NotebookEdit",
+            "description": "Edit one cell of a Jupyter notebook (.ipynb) in place. Target a \
+                cell by cell_id (preferred) or by its 0-based cell_number, then pick edit_mode: \
+                replace (default) rewrites that cell's source, insert adds a new cell at that \
+                position (cell_type is required; with cell_id the new cell goes right after \
+                it), delete removes the cell. Use this instead of Write/Edit for .ipynb — it \
+                understands the notebook JSON structure, so the other cells, metadata and \
+                nbformat are left untouched. new_source is the COMPLETE new body of the cell \
+                (the whole code or markdown), not a fragment.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "notebook_path": { "type": "string", "description": "Absolute or workspace-relative path to the .ipynb file" },
+                    "cell_id": { "type": "string", "description": "The target cell's id (preferred). For insert, the new cell is placed right after this cell." },
+                    "cell_number": { "type": "integer", "description": "0-based index of the target cell. For insert, the new cell is inserted at this index (a value equal to the cell count appends)." },
+                    "new_source": { "type": "string", "description": "The cell's complete new source. Required for replace and insert; ignored for delete." },
+                    "cell_type": { "type": "string", "enum": ["code", "markdown"], "description": "Cell type. Required for insert; for replace it switches the cell's type when given." },
+                    "edit_mode": { "type": "string", "enum": ["replace", "insert", "delete"], "description": "What to do with the cell (default replace)" }
+                },
+                "required": ["notebook_path", "new_source"]
             }
         }),
         json!({
@@ -467,14 +511,52 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "PetControl",
+            "description": "Control the on-screen desktop pet avatar (its Live2D model) so it \
+                reacts physically while you talk. Use it to trigger one of the user's \
+                configured pet hotkeys, play a saved preset motion, or directly set a model \
+                parameter / expression. The available names (hotkey key strings, preset names, \
+                parameter ids, expression names) are listed in your context when the user is \
+                talking to the pet — only use names from that list. The pet's reaction is \
+                purely visual: after calling, do NOT mention the tool name, the parameter \
+                names or values, or any technical detail in your reply — just keep talking \
+                naturally, as if the pet simply moved on its own.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["hotkey", "motion", "param", "expression", "artmeshColor"],
+                        "description": "hotkey = run a configured hotkey by its key string; \
+                            motion = play a saved preset motion by name; param = set a model \
+                            parameter; expression = switch an expression on or off; \
+                            artmeshColor = tint one ArtMesh (a part of the artwork) with a color."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "hotkey: the key string (e.g. \"Ctrl+Numpad1\"). motion: \
+                            the preset name. param: the parameter id. expression: the \
+                            expression name. artmeshColor: the ArtMesh (drawable) id."
+                    },
+                    "value": {
+                        "type": "number",
+                        "description": "param: the value to set. expression: 1 to switch on, \
+                            0 to switch off (default 1). artmeshColor: the RGB color packed as \
+                            0xRRGGBB (0xFFFFFF = original, no tint). Ignored for hotkey / motion."
+                    }
+                },
+                "required": ["action", "name"]
+            }
+        }),
+        json!({
             "name": "SessionSearch",
             "description": "Search the user's OWN past chat sessions in this app (a local \
                 full-text index over earlier conversations) and return matching messages \
                 grouped by session. Use it whenever the user refers to an earlier \
                 conversation — \"last time\", \"we discussed that before\", \"上次\", \
-                \"之前聊过的\" — because you cannot recall past sessions from memory. The \
-                history index in your system prompt lists only titles and opening lines; \
-                this tool reads what was actually said. Read-only and local: it never \
+                \"之前聊过的\" — because you cannot recall past sessions from memory. \
+                Nothing about earlier sessions is shown to you automatically, so this tool \
+                is the only way to read what was actually said. Read-only and local: it never \
                 touches the network.",
             "input_schema": {
                 "type": "object",
@@ -587,6 +669,71 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                     "content": { "type": "string", "description": "The note to deliver. Keep it short and self-contained." }
                 },
                 "required": ["to", "content"]
+            }
+        }),
+        json!({
+            "name": "EnterWorktree",
+            "description": "Create a git worktree for the current repository and switch your \
+                effective working directory into it, so you can work on an isolated branch \
+                without touching the main checkout. The worktree is created under the app's own \
+                data root (\"<exe root>\\temp\\worktrees\\<repo>-<name>\", outside your workspace, \
+                so it never shows up as an untracked dir in the repo) and gets a NEW branch named \
+                <name>. After this call, relative paths and shell commands resolve inside the \
+                worktree (absolute paths are unchanged, and the original workspace stays \
+                readable). Fails clearly if the workspace is not a git repository, or if you are \
+                already inside a worktree (call ExitWorktree first). This tool never forces or \
+                deletes anything.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Worktree and branch name (ASCII letters, digits, '-', '_', '/' or '.'; must not contain '..'). The worktree dir becomes \"<exe root>\\temp\\worktrees\\<repo>-<name>\" (repo = the main checkout's directory name)." }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "ExitWorktree",
+            "description": "Leave the git worktree you entered with EnterWorktree and switch your \
+                effective working directory back to the original workspace root. This is \
+                conservative: it does NOT delete the worktree or its branch — they are left on \
+                disk for you (or the user) to remove later with \"git worktree remove <path>\". \
+                Fails if you are not currently inside a worktree.",
+            "input_schema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "SendUserFile",
+            "description": "Present a local file to the user as a card in the conversation: its \
+                name, path, size and type, with buttons to open it or reveal it in the file \
+                manager. Use it when the user asks for a file (a report, an export, a generated \
+                artifact) and you want to hand it over explicitly instead of merely mentioning \
+                the path in your reply. The path is resolved and checked exactly like Read (the \
+                workspace boundary applies), and a missing file is reported as a readable error — \
+                nothing is presented until the file exists. Only metadata is delivered; with \
+                preview=true a short text excerpt is attached for text files (large files and \
+                binaries are never sent in full).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Absolute or workspace-relative path to the file to hand over" },
+                    "preview": { "type": "boolean", "description": "Attach a short text excerpt for text files (default false)" }
+                },
+                "required": ["file_path"]
+            }
+        }),
+        json!({
+            "name": "PushNotification",
+            "description": "Send a desktop notification to the user (a title and a body) — a short \
+                heads-up about something that happened while they were not looking at the app (a \
+                long task finished, an error needs attention). Use it sparingly: it interrupts. \
+                Do not use it to reply, to ask a question, or for anything that belongs in the \
+                conversation. It is rate-limited — a second call within a few seconds is refused.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short notification title (one line)" },
+                    "body": { "type": "string", "description": "Notification body text" }
+                },
+                "required": ["title", "body"]
             }
         }),
     ];
@@ -765,6 +912,8 @@ pub fn get_prompt_tool() -> Value {
 /// `AskUserQuestion` 也必须问：**交互本身就是它的功能**（答案经审批卡的
 /// `updatedInput` 回传，不问就拿不到答案）。
 /// `TodoWrite` **不问**：它只改前端那块待办面板，不碰本机任何东西。
+/// `PetControl` **不问**（2026-10-10）：它只让桌宠形象动一下（前端收到 `tool_use` 后广播给
+/// 桌宠窗），agent 侧无任何本机副作用 —— 与 `TodoWrite` 同一条判据。
 /// 走桥的只读工具（`SessionSearch` / resources 读侧 / prompts 读侧）**也不问** —— 它们只读
 /// 本机自己的数据（会话库 / 用户写的工具定义与提示词模板），与 `Read`/`Grep` 同级；
 /// **不构成先例**：判据仍是「执行会不会改变本机或把数据带出」。
@@ -775,6 +924,9 @@ pub fn needs_approval(name: &str) -> bool {
         name,
         "Write"
             | "Edit"
+            // `NotebookEdit`（2026-10-11）**要问**：它是写类 —— 改的是磁盘上的 `.ipynb`。
+            // 与 `Edit` 同一条判据（编辑器侧凭据扫描见 main.rs 的 `written_payload`）。
+            | "NotebookEdit"
             | "Cmd"
             | "PowerShell"
             | "WebSearch"
@@ -799,9 +951,26 @@ pub fn needs_approval(name: &str) -> bool {
             // （与 `WebFetch` 同类的外部数据出口），② 它写本机文件，③ **按张计费** ——
             // 花的是用户的钱，更该在花之前让用户看见。
             | "ImageGen"
+            // `EnterWorktree` / `ExitWorktree`（A13，2026-10-11）**要问**：它们的语义是
+            // 「改仓库状态」—— 前者建一个 git worktree + 一条新分支、并把有效工作目录切过去；
+            // 后者把有效工作目录切回来。都视作**写类**（与 `Write` / `Edit` 同级判据），
+            // 只读档 / 计划相位下由 [`write_blocked`] 直接拒（见 `run()`），不进
+            // [`gated_in_read_only`]（只读档该拒、而不是「问了再做」）。
+            | "EnterWorktree"
+            | "ExitWorktree"
     )
 }
 
+/// `SendUserFile` / `PushNotification`（A13，2026-10-11）**刻意不在这里** —— **都不需要审批**：
+///   · `SendUserFile` 只是**读**一个本地文件的元信息（resolve + stat，与 `Read` 同源路径处理），
+///     既不改本机、也不把内容带出本机（可选预览也只在**本地**界面上显示）。既有约定里
+///     **`Read` 不需要审批** ⇒ 与它同级，本工具同样不需要；若给它加审批，反而会变成「绕过
+///     `Read` 审批的旁路」的反面误读（真正的旁路是**读得到但审不到**，这里既不读全文也不外发）。
+///   · `PushNotification` 只是向前端发一条 `system` 事件，前端弹一条**本地**通知 —— 无本机副作用、
+///     无外部出口，与 `TodoWrite` / `PetControl` 同级（都免审批）。
+/// 两件在**只读档 / 计划相位**下也都**放行**（读元信息 / 弹本机通知都不是「动手」）⇒ 也**不进**
+/// [`gated_in_read_only`]（那一列是「只读档仍要问」的交互类工具，见下）。
+///
 /// `EnterPlanMode` **刻意不在这里**（2026-09-20 A7）：它只把 agent 进程内的一个标志
 /// 置真、再给前端发一条状态事件 —— 既不碰本机也不改前端数据，比 `TodoWrite` 还轻
 /// （连面板都不重绘）。问它等于让用户批准「我要开始思考了」。
@@ -852,12 +1021,21 @@ pub fn parallel_safe(name: &str) -> bool {
     matches!(
         name,
         "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "TodoWrite"
+        // `PetControl`（桌宠动作，2026-10-10）：agent 侧无副作用（效果全在前端广播），
+        // 与 `TodoWrite` 同级 ⇒ 收进白名单（前端按到达顺序执行，动作不会乱序）。
+        | "PetControl"
         // `ListPeers`（A13，2026-10-05）：纯读进程内的 peer 登记处，不写盘、不发请求 ⇒
         // 收进白名单。`SendMessage` **刻意不收** —— 它会改共享的收件箱（有副作用），
         // 与白名单「只收纯读工具」的口径不符。
         | "ListPeers"
     )
 }
+
+/// `SendUserFile` / `PushNotification`（A13，2026-10-11）**刻意不进**上面这张只读并行白名单：
+///   · 两件都要在 `main.rs` 的 `dispatch_tool` 里发 `system` 事件（卡片 / 通知），**串行执行**
+///     才能保证事件与周围工具卡的出现顺序确定（并行批在 worker 线程里跑）；
+///   · `PushNotification` 还要读写进程级节流时间戳（`LAST_PUSH_NOTIFICATION`），并发会绕过节流。
+/// 代价只是少一次并行 —— 它们的实际开销是 stat / 一次锁，可忽略。
 
 // ── 分发 ─────────────────────────────────────────────────────────
 
@@ -868,6 +1046,8 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "Read" => read(ctx, input),
         "Write" => write(ctx, input),
         "Edit" => edit(ctx, input),
+        // NotebookEdit（2026-10-11）：写类 —— 按 cell 编辑 `.ipynb`，拦法与 `Edit` 同源。
+        "NotebookEdit" => notebook_edit(ctx, input),
         "Cmd" => cmd(ctx, input),
         "PowerShell" => powershell(ctx, input),
         "Glob" => glob(ctx, input),
@@ -876,16 +1056,35 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "WebFetch" => webfetch(input),
         "AskUserQuestion" => ask_user_question(input),
         "TodoWrite" => todo_write(input),
+        // PetControl（桌宠动作，2026-10-10）：**不碰本机、不落盘、免审批** —— agent 侧只回一句
+        // 回执，真正的效果由前端执行（见 `pet_control` 的函数注释）。
+        "PetControl" => pet_control(input),
         // 多代理通信（A13，2026-10-05）：**无本机副作用** —— 只读写进程内的 peer 登记处，
         // 因此免审批、只读档放行（`needs_approval` / `gated_in_read_only` 里都没有它们）。
         "ListPeers" => list_peers(input),
         "SendMessage" => send_message(input),
+        // SendUserFile / PushNotification（A13，2026-10-11）：效果全在前端（一张文件卡 / 一条
+        // 桌面通知），这里只回回执；结构化载荷由 `main.rs` 的 `dispatch_tool` 发成 `system`
+        // 事件（`tools.rs` 拿不到 `emit`）。两件都免审批（见 `needs_approval`）。
+        "SendUserFile" => send_user_file(ctx, input).map(|(text, _)| text),
+        "PushNotification" => push_notification(input).map(|(text, _)| text),
         // ImageGen（A13，2026-10-03）：**写类** —— 它往 `temp\images\` 落图。
         // 只读档 / 计划相位的拦法与 Write 同源（`write_blocked`），但**不**进
         // `gated_in_read_only`：只读档下它该被**拒绝**，而不是「问了再做」。
         "ImageGen" => match write_blocked(ctx, "ImageGen") {
             Some(why) => Err(why),
             None => crate::image::run(input),
+        },
+        // EnterWorktree / ExitWorktree（A13，2026-10-11）：**写类** —— 会改仓库状态
+        // （建 worktree + 分支、切换有效工作目录）。只读档 / 计划相位的拦法与 Write 同源
+        // （`write_blocked`），不进 `gated_in_read_only`（只读档该直接拒，而不是「问了再做」）。
+        "EnterWorktree" => match write_blocked(ctx, "EnterWorktree") {
+            Some(why) => Err(why),
+            None => enter_worktree(ctx, input),
+        },
+        "ExitWorktree" => match write_blocked(ctx, "ExitWorktree") {
+            Some(why) => Err(why),
+            None => exit_worktree(ctx),
         },
         other => Err(format!("Unknown tool: {other}")),
     }
@@ -931,8 +1130,113 @@ fn resolve(ctx: &Ctx, raw: &str) -> PathBuf {
     if p.is_absolute() {
         normalize(p)
     } else {
-        normalize(&ctx.cwd.join(p))
+        normalize(&effective_cwd(ctx).join(p))
     }
+}
+
+/// 当前**有效工作目录**：进了 worktree 就是它，否则就是进程工作区根 `cwd`（见 `Ctx::worktree`）。
+///
+/// 只用于「相对路径解析 / shell 工作目录 / 默认遍历根」这三类**寻址**用途；
+/// **不用于** [`guard`] —— 边界恒为 `cwd` + `add_dirs`。worktree 落在数据根
+/// （`<exe 根>\temp\worktrees`，见 [`worktree_root`]），那**不在 `cwd` 之内**，
+/// 由启动时并进的 `add_dirs` 放行（与 `output_dir` / `image_dir` 同法）；
+/// 原始工作区里的文件也照旧可达。
+fn effective_cwd(ctx: &Ctx) -> PathBuf {
+    ctx.worktree
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| ctx.cwd.clone())
+}
+
+// ── 子目录记忆懒加载的「触达判据」（2026-10-12，§待办 3-1a 子目录级）──────
+//
+// 背景：agent **没有**「此刻在动哪个目录」的状态（工具只收到显式路径），而子目录记忆
+// 只能**懒加载**（碰到才注、且只进可变层，绝不动固定前缀 —— 见 main.rs）。所以判据收在
+// 「一次工具调用**显式带**的路径 → 它所属的目录」这一处，纯函数、可判定、可单测。
+
+/// 一次「文件类」工具调用的路径参数语义：`File` = 值指向文件（取父目录）；`Dir` = 值本身是目录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    File,
+    Dir,
+}
+
+/// 子目录记忆的**深度上限**（触碰目录相对 cwd 的层数）。防御异常深的路径；正常项目远到不了。
+pub const MAX_SUBDIR_MEMORY_DEPTH: usize = 8;
+
+/// 工具名 → 其路径参数的语义（`None` = 这次调用**不指向任何目录**，即不算「触碰」）。
+///
+/// **触发判据（可判定、可解释，写进文档）**：只认**显式路径参数**的这几件 ——
+///   · `Read` / `Write` / `Edit` / `SendUserFile`：`file_path`（文件 ⇒ 取父目录）；
+///   · `NotebookEdit`：`notebook_path`（文件 ⇒ 取父目录）；
+///   · `Glob` / `Grep`：`path`（根目录，缺省 = 工作目录 ⇒ 等于 cwd、自然不合格）。
+/// **刻意不解析 `Cmd` / `PowerShell` 的命令行**（`cd` 藏在字符串里、无法可靠判定），
+/// 故 shell 一律不改「当前触达目录」——它是可判定性与安全性的取舍，写进 docs/todo.md §3-1a。
+pub fn path_arg_kind(name: &str) -> Option<PathKind> {
+    match name {
+        "Read" | "Write" | "Edit" | "NotebookEdit" | "SendUserFile" => Some(PathKind::File),
+        "Glob" | "Grep" => Some(PathKind::Dir),
+        _ => None,
+    }
+}
+
+/// 该工具调用里路径参数的键名（与 `path_arg_kind` 同源，一一对应）。
+pub fn path_arg_key(name: &str) -> Option<&'static str> {
+    match name {
+        "Read" | "Write" | "Edit" | "SendUserFile" => Some("file_path"),
+        "NotebookEdit" => Some("notebook_path"),
+        "Glob" | "Grep" => Some("path"),
+        _ => None,
+    }
+}
+
+/// 一次工具调用「被触碰的目录」的**绝对路径**（`None` = 不指向目录 / 无路径参数 / 空路径）。
+/// 文件类取父目录、目录类取自身；相对路径按 `cwd` 解析（与工作区根同源，不含 worktree 覆盖 ——
+/// 见 `eligible_subdir` 里「边界恒为 cwd」的说明）。
+pub fn touched_dir(cwd: &Path, name: &str, input: &Value) -> Option<PathBuf> {
+    let key = path_arg_key(name)?;
+    let raw = input.get(key)?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = Path::new(raw);
+    let p = if p.is_absolute() {
+        normalize(p)
+    } else {
+        normalize(&cwd.join(p))
+    };
+    match path_arg_kind(name)? {
+        PathKind::File => p.parent().map(Path::to_path_buf),
+        PathKind::Dir => Some(p),
+    }
+}
+
+/// 触碰到的目录是不是一个**够格的「子目录」**（可注入真值的纯判据，便于单测）。
+///
+/// 三条同时成立才算：
+///   ① 在 `cwd` **之内**且**不等于** `cwd`（严格更深）—— 向上那一层（cwd 及父级）由固定前缀负责；
+///   ② 相对 `cwd` 的**任一层目录名**都不在忽略名单 `SKIP_DIRS` 里（`.git` / `node_modules` /
+///      `target` … ⇒ 连它们的子目录也一并跳过，不只看最后一段）；
+///   ③ 层数 ≤ `MAX_SUBDIR_MEMORY_DEPTH`。
+pub fn eligible_subdir(cwd: &Path, dir: &Path) -> bool {
+    let Ok(rel) = dir.strip_prefix(cwd) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false; // 就是 cwd 本身
+    }
+    let comps: Vec<Component> = rel.components().collect();
+    if comps.len() > MAX_SUBDIR_MEMORY_DEPTH {
+        return false;
+    }
+    !comps.iter().any(|c| match c {
+        Component::Normal(n) => n
+            .to_str()
+            .map(|s| SKIP_DIRS.iter().any(|d| s.eq_ignore_ascii_case(d)))
+            .unwrap_or(false),
+        _ => false,
+    })
 }
 
 /// 工作区锁生效时，路径必须落在 cwd 或 `--add-dir` 之内。
@@ -1131,6 +1435,254 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     ))
 }
 
+// ── NotebookEdit ─────────────────────────────────────────────────
+
+/// `NotebookEdit` 的三种编辑模式（Claude Code 口径）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotebookMode {
+    Replace,
+    Insert,
+    Delete,
+}
+
+/// 按 cell 编辑 Jupyter notebook（`.ipynb`）—— **写类**，拦法与 `Edit` 同源。
+///
+/// **为什么单开一件、不拿 `Edit` 改 `.ipynb`**：notebook 是结构化 JSON
+/// （`cells[]` + `metadata` + `nbformat`），字符串替换在转义后的 `source` 数组上极易改错
+/// 结构；本工具按 cell 定位、**只动目标 cell**，其余原样保留。
+///
+/// **结构与风格**：解析成 `serde_json::Value` 改完再序列化。key 顺序天然是字典序 ——
+/// 这正是 Jupyter `nbformat` 的落盘口径（`json.dumps(..., indent=1, sort_keys=True)`）；
+/// 缩进由 [`detect_indent`] 沿用原文件，末尾换行也照原样保留 ⇒ 未改动的部分逐字节不变。
+fn notebook_edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    if let Some(why) = write_blocked(ctx, "NotebookEdit") {
+        return Err(why);
+    }
+    let path = resolve(ctx, &str_arg(input, "notebook_path")?);
+    guard(ctx, &path)?;
+
+    let mode = match input.get("edit_mode").and_then(Value::as_str).unwrap_or("replace") {
+        "replace" => NotebookMode::Replace,
+        "insert" => NotebookMode::Insert,
+        "delete" => NotebookMode::Delete,
+        other => {
+            return Err(format!(
+                "edit_mode must be \"replace\", \"insert\" or \"delete\", got \"{other}\""
+            ))
+        }
+    };
+    let new_source = input.get("new_source").and_then(Value::as_str).unwrap_or("");
+    let cell_type = input.get("cell_type").and_then(Value::as_str);
+    if let Some(ct) = cell_type {
+        if ct != "code" && ct != "markdown" {
+            return Err(format!("cell_type must be \"code\" or \"markdown\", got \"{ct}\""));
+        }
+    }
+    if mode == NotebookMode::Insert && cell_type.is_none() {
+        return Err("cell_type is required when edit_mode is \"insert\"".into());
+    }
+    // replace / insert 必须有正文（空串 = 清空是合法的）；字段整个缺失多半是模型漏带。
+    if mode != NotebookMode::Delete && input.get("new_source").is_none() {
+        return Err("new_source is required for replace / insert".into());
+    }
+    let cell_id = input.get("cell_id").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let cell_number = match input.get("cell_number").and_then(Value::as_i64) {
+        Some(n) if n >= 0 => Some(n as usize),
+        Some(n) => return Err(format!("cell_number must be >= 0, got {n}")),
+        None => None,
+    };
+
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let trailing_nl = text.ends_with('\n');
+    let indent = detect_indent(&text);
+    let mut doc: Value = serde_json::from_str(&text).map_err(|e| {
+        format!("{} is not a valid notebook (JSON parse failed): {e}", path.display())
+    })?;
+    if !doc.is_object() {
+        return Err(format!(
+            "{} is not a Jupyter notebook (top level is not a JSON object)",
+            path.display()
+        ));
+    }
+    // cell 是否带 id（nbformat 4.5+ 要求；老 notebook 没有）—— 插入新 cell 时据此决定要不要
+    // 生成 id，免得给老格式塞一个它不认的字段。
+    let uses_ids = doc.get("nbformat_minor").and_then(Value::as_u64).map_or(false, |m| m >= 5)
+        || doc
+            .get("cells")
+            .and_then(Value::as_array)
+            .map_or(false, |a| a.iter().any(|c| c.get("id").is_some()));
+
+    let (summary, written) = {
+        let cells = doc.get_mut("cells").and_then(Value::as_array_mut).ok_or_else(|| {
+            format!("{} is not a Jupyter notebook (no \"cells\" array)", path.display())
+        })?;
+        match mode {
+            NotebookMode::Delete => {
+                let i = locate_cell(cells, cell_id, cell_number, false, &path)?;
+                cells.remove(i);
+                (
+                    format!(
+                        "Deleted cell {i} from {} — {} cell(s) remain",
+                        path.display(),
+                        cells.len()
+                    ),
+                    String::new(),
+                )
+            }
+            NotebookMode::Replace => {
+                let i = locate_cell(cells, cell_id, cell_number, false, &path)?;
+                {
+                    let obj = cells[i].as_object_mut().ok_or_else(|| {
+                        format!("cell {i} in {} is not a JSON object", path.display())
+                    })?;
+                    // 沿用原 cell 的 source 写法（列表 / 字符串）；缺省按 Jupyter 的列表写。
+                    let as_list = !matches!(obj.get("source"), Some(Value::String(_)));
+                    obj.insert("source".into(), source_value(new_source, as_list));
+                    if let Some(ct) = cell_type {
+                        obj.insert("cell_type".into(), Value::String(ct.into()));
+                    }
+                }
+                (
+                    format!(
+                        "Replaced the source of cell {i} in {} — {} cell(s) total",
+                        path.display(),
+                        cells.len()
+                    ),
+                    new_source.to_string(),
+                )
+            }
+            NotebookMode::Insert => {
+                let i = locate_cell(cells, cell_id, cell_number, true, &path)?;
+                let ct = cell_type.unwrap_or("code");
+                cells.insert(i, build_notebook_cell(ct, new_source, uses_ids));
+                (
+                    format!(
+                        "Inserted a {ct} cell at position {i} in {} — {} cell(s) total",
+                        path.display(),
+                        cells.len()
+                    ),
+                    new_source.to_string(),
+                )
+            }
+        }
+    };
+
+    // 序列化：沿用原缩进，末尾换行照原样保留 ⇒ 未改动的行逐字节不变。
+    let mut buf = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(indent.as_slice());
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    doc.serialize(&mut ser)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    let mut out = String::from_utf8(buf)
+        .map_err(|e| format!("serialized notebook for {} is not valid UTF-8: {e}", path.display()))?;
+    if trailing_nl {
+        out.push('\n');
+    }
+    fs::write(&path, out.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("{summary}{}", secret_note(&written)))
+}
+
+/// 解析目标 cell 的下标。`for_insert` 时允许等于 `cells.len()`（追加），且 `cell_id` 的
+/// 语义是「插到该 cell **之后**」；replace / delete 则必须是已存在的 cell。
+fn locate_cell(
+    cells: &[Value],
+    cell_id: Option<&str>,
+    cell_number: Option<usize>,
+    for_insert: bool,
+    path: &Path,
+) -> Result<usize, String> {
+    if let Some(id) = cell_id {
+        let pos = cells
+            .iter()
+            .position(|c| c.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or_else(|| format!("cell id \"{id}\" not found in {}", path.display()))?;
+        return Ok(if for_insert { pos + 1 } else { pos });
+    }
+    let n = cells.len();
+    match cell_number {
+        Some(k) if for_insert && k <= n => Ok(k),
+        Some(k) if !for_insert && k < n => Ok(k),
+        Some(k) => Err(format!(
+            "cell_number {k} is out of range for {} ({n} cell(s))",
+            path.display()
+        )),
+        None if for_insert => Ok(n),
+        None => Err(format!(
+            "{}: specify cell_id or cell_number to select a cell",
+            path.display()
+        )),
+    }
+}
+
+/// 把一段源文本转成 notebook 的 `source` 取值。`as_list` = Jupyter 的规范写法（按行拆成
+/// 字符串数组，除最后一段外每段以 `\n` 结尾）；否则写成单个字符串（沿用原 cell 的写法）。
+fn source_value(text: &str, as_list: bool) -> Value {
+    if as_list {
+        Value::Array(
+            text.split_inclusive('\n')
+                .map(|line| Value::String(line.to_string()))
+                .collect(),
+        )
+    } else {
+        Value::String(text.to_string())
+    }
+}
+
+/// 造一个新的 notebook cell。字段顺序与 Jupyter 一致 —— `serde_json` 的 Map 是字典序，
+/// 正好与 `nbformat` 的 `sort_keys=True` 落盘口径相同。
+fn build_notebook_cell(cell_type: &str, source: &str, uses_ids: bool) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("cell_type".into(), Value::String(cell_type.to_string()));
+    if cell_type == "code" {
+        m.insert("execution_count".into(), Value::Null);
+    }
+    if uses_ids {
+        m.insert("id".into(), Value::String(random_cell_id()));
+    }
+    m.insert("metadata".into(), json!({}));
+    if cell_type == "code" {
+        m.insert("outputs".into(), json!([]));
+    }
+    m.insert("source".into(), source_value(source, true));
+    Value::Object(m)
+}
+
+/// 新 cell 的 `id`（8 字节随机 → 16 位十六进制）。只在 notebook 用 id 时才调用。
+/// getrandom 失败退回时间 / pid 熵（与 mcp_oauth 的兜底同款；id 只需唯一、不需密码学强度）。
+fn random_cell_id() -> String {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        let mut seed = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ (std::process::id() as u64).rotate_left(17);
+        for b in buf.iter_mut() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (seed >> 33) as u8;
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 取原文件的缩进风格（第一个缩进行的前导空白）。Jupyter 落盘恒为 1 个空格；这里照抄原文件，
+/// 凡是标准的 notebook 都能沿用，避免整文件重排。解析不出（单行 / 非 pretty）时退回 1 空格。
+fn detect_indent(text: &str) -> Vec<u8> {
+    for line in text.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let ws: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        if !ws.is_empty() {
+            return ws.into_bytes();
+        }
+        break; // 顶级键没有缩进 ⇒ 不是 pretty 输出，用默认
+    }
+    b" ".to_vec()
+}
+
 // ── Cmd / PowerShell ────────────────────────────────────────────
 //
 // 两个工具除了「怎么起进程」之外完全一样：并发读干管道防死锁、超时 kill、
@@ -1209,7 +1761,10 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64, label: &str) -> Result<
     // 接成管道，让用户能把键入送进子进程；否则保持 `Stdio::null()`，与改造前逐字节一致
     //（单测 / 子代理 / 后台复盘都走后者）。
     let interactive = ctx.shell_control.is_some();
-    cmd.current_dir(&ctx.cwd)
+    // 有效工作目录（进了 worktree 就是 worktree 里，见 `effective_cwd`）——
+    // 先绑定再借用，别让临时值只在链式调用里活。
+    let shell_cwd = effective_cwd(ctx);
+    cmd.current_dir(&shell_cwd)
         .stdin(if interactive { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1231,6 +1786,13 @@ fn run_shell(ctx: &Ctx, cmd: &mut Command, timeout: u64, label: &str) -> Result<
             return Err(msg);
         }
     };
+    // 记下 PID（2026-10-08，用户要求「AI 跑的命令要能在任务管理器里找到」）：起的是
+    // `cmd /C ...` / `powershell -Command ...`，**真正干活的程序常常是它的孙进程**，而
+    // 任务管理器默认只显示映像名、不显示命令行 —— 只报「跑完了」等于没有可核对的锚点。
+    // 这一行让「某条命令当时是什么 pid、还在不在」有据可查（转后台那条路还会带上 pid）。
+    if let Some(c) = child.as_ref() {
+        crate::log::info(format!("shell[{prog}] spawn pid={}", c.id()));
+    }
     let out_pipe: Option<ChildStdout> = child.as_mut().and_then(|c| c.stdout.take());
     let err_pipe = child.as_mut().and_then(|c| c.stderr.take());
     // 交互式终端（2026-10-05）：把子进程 stdin 的写端交给控制块 —— 前端键入经
@@ -1529,7 +2091,7 @@ fn glob(ctx: &Ctx, input: &Value) -> Result<String, String> {
     let pattern = str_arg(input, "pattern")?;
     let base = match input.get("path").and_then(Value::as_str) {
         Some(p) if !p.trim().is_empty() => resolve(ctx, p),
-        _ => ctx.cwd.clone(),
+        _ => effective_cwd(ctx),
     };
     guard(ctx, &base)?;
 
@@ -1572,7 +2134,7 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
     let pattern = str_arg(input, "pattern")?;
     let base = match input.get("path").and_then(Value::as_str) {
         Some(p) if !p.trim().is_empty() => resolve(ctx, p),
-        _ => ctx.cwd.clone(),
+        _ => effective_cwd(ctx),
     };
     guard(ctx, &base)?;
 
@@ -2507,6 +3069,42 @@ fn todo_write(input: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+// ── PetControl（桌宠动作，2026-10-10）─────────────────────────────
+
+/// `PetControl` 不改本机、不落盘、也不需要审批 —— 与 `TodoWrite` 同型：**效果全在前端**。
+///
+/// 真正的动作由 `main.ts` 完成：它读到这条 `tool_use` 的入参就向桌宠窗**广播** `pet-control`
+/// （`{type:"ai-action", action, name, value}`），由**持有 Live2D 实例**的桌宠窗落到模型上
+/// （设置窗没有实例，这与热键「测试」同一条分工）。agent 侧因此只校验入参、回一句回执；
+/// **不做**任何模型/文件操作，也不去猜桌宠窗在不在（前端是 fire-and-forget）。
+///
+/// **为什么不做成 MCP builtin**：tools/call 在 `lunac.exe --mcp-server` **另一个进程**里跑，
+/// 拿不到主进程里那扇桌宠窗（无法 `emit`）；而内置工具走 stdout 流回前端，天然带 `tool_use`。
+fn pet_control(input: &Value) -> Result<String, String> {
+    let action = input
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let name = input.get("name").and_then(Value::as_str).unwrap_or("").trim();
+    if action.is_empty() || name.is_empty() {
+        return Err("PetControl needs both \"action\" and \"name\".".into());
+    }
+    match action {
+        "hotkey" | "motion" | "param" | "expression" | "artmeshColor" => {}
+        other => {
+            return Err(format!(
+                "Unsupported PetControl action \"{other}\" — use hotkey / motion / param / \
+                 expression / artmeshColor."
+            ))
+        }
+    }
+    Ok(format!(
+        "Pet action delivered to the avatar ({action} \"{name}\"). Stay in character — do not \
+         describe this call or any parameter in your reply."
+    ))
+}
+
 /// `ListPeers`（A13 多代理通信，2026-10-05）：列出**同批并发**的兄弟子代理。
 ///
 /// 主代理调用时通常为空 —— 子代理批期间主循环被阻塞（见 `peers.rs` 的模块注释），
@@ -2543,6 +3141,331 @@ fn send_message(input: &Value) -> Result<String, String> {
     let n = crate::peers::bus().send(&from, to, content)?;
     Ok(format!(
         "Message delivered to {to} ({n} chars). That agent will read it at the start of its next round."
+    ))
+}
+
+// ── SendUserFile / PushNotification（A13，2026-10-11）─────────────────
+//
+// 两件都是「**agent → 用户的呈递**」：对用户可见的效果**全在前端**（一张文件卡 / 一条
+// 桌面通知），agent 侧只做参数校验与元信息计算。真正的渲染由 `main.rs` 在
+// `dispatch_tool` 里发 `system/user_file` / `system/push_notification` 事件、前端
+// `main.ts` 落卡 / 弹通知 —— 与 `PetControl` 同型（`tools.rs` 是纯实现层、拿不到 `emit`）。
+//
+// **审批判定（与既有约定一致）**：两件都**不需要审批**，理由逐条见 `needs_approval`。
+
+/// `SendUserFile` 预览读取的**字节上限**：超过就不读、不给预览（大文件绝不整份塞进事件）。
+const FILE_PREVIEW_MAX_BYTES: u64 = 128 * 1024;
+/// 预览截断到的**字符上限**。
+const FILE_PREVIEW_CHARS: usize = 1200;
+/// `PushNotification` 标题 / 正文的字符上限（防止一条通知把界面撑爆）。
+const PUSH_TITLE_MAX_CHARS: usize = 120;
+const PUSH_BODY_MAX_CHARS: usize = 500;
+/// `PushNotification` 的最短间隔（毫秒）—— **防刷屏**：间隔内的第二次调用直接拒。
+pub const PUSH_NOTIFICATION_MIN_INTERVAL_MS: u128 = 3000;
+/// 上一次成功发出通知的时刻（进程级；`PushNotification` 串行执行，见 `parallel_safe`）。
+static LAST_PUSH_NOTIFICATION: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// 按扩展名把文件归一类（只影响前端显示的一行**类型标签**，不参与任何安全判定）。
+/// 刻意**不读内容** —— 元信息要便宜；图片/二进制只给类型与大小，不给正文。
+fn classify_media_kind(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff"
+        | "avif" | "heic" => "image",
+        "pdf" => "pdf",
+        "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "zst" => "archive",
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" => "audio",
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "wmv" | "flv" | "m4v" => "video",
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "c"
+        | "cc" | "cpp" | "h" | "hpp" | "cs" | "rb" | "php" | "swift" | "kt" | "sh" | "ps1"
+        | "bat" | "cmd" | "sql" | "html" | "htm" | "css" | "scss" | "less" | "json" | "yaml"
+        | "yml" | "toml" | "xml" | "md" | "markdown" | "ipynb" => "code",
+        "txt" | "log" | "csv" | "tsv" | "ini" | "cfg" | "conf" | "text" => "text",
+        _ => "other",
+    }
+}
+
+/// 该类型是否允许附文本预览（只对纯文本 / 代码放行；图片、二进制一律不给正文）。
+fn previewable_kind(kind: &str) -> bool {
+    kind == "text" || kind == "code"
+}
+
+/// `SendUserFile`：把本地文件呈递给用户。
+///
+/// **路径与安全**：`resolve` + `guard` 与 `Read` **逐行同源**（相对路径按有效工作目录解析、
+/// 越界在工作区锁下拒绝）。不存在的文件返回**可读错误**（`<path>: <os error>`，与 `Read`
+/// 同一措辞），**绝不静默成功**。
+///
+/// **返回**：`(给模型的回执文本, 进 `system/user_file` 事件的载荷)` —— 载荷字段：
+/// `path` / `name` / `size`（字节）/ `kind`（见 `classify_media_kind`），`preview` 仅在
+/// 显式要求且为文本类时才有。
+pub fn send_user_file(ctx: &Ctx, input: &Value) -> Result<(String, Value), String> {
+    let path = resolve(ctx, &str_arg(input, "file_path")?);
+    guard(ctx, &path)?;
+
+    let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if meta.is_dir() {
+        return Err(format!(
+            "{} is a directory — SendUserFile hands over a single file (use Glob/Grep for \
+             directory trees)",
+            path.display()
+        ));
+    }
+    let size = meta.len();
+    let kind = classify_media_kind(&path);
+
+    // 预览是**可选**的、且严格有界：只对文本类、且不超过字节上限的文件读一次、截断到字符上限。
+    // 大文件 / 二进制一律不读 —— 元信息已经足够（前端有「打开 / 在资源管理器中显示」）。
+    let mut preview = String::new();
+    let want_preview = input.get("preview").and_then(Value::as_bool).unwrap_or(false);
+    if want_preview && previewable_kind(kind) && size <= FILE_PREVIEW_MAX_BYTES {
+        if let Ok(bytes) = fs::read(&path) {
+            let text = String::from_utf8_lossy(&bytes);
+            preview = text.chars().take(FILE_PREVIEW_CHARS).collect();
+        }
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut payload = json!({
+        "path": path.display().to_string(),
+        "name": name,
+        "size": size,
+        "kind": kind,
+    });
+    if !preview.is_empty() {
+        payload["preview"] = json!(preview);
+    }
+
+    let receipt = format!(
+        "Presented \"{}\" ({} bytes, {}) to the user as a card in the conversation.{}",
+        path.display(),
+        size,
+        kind,
+        if preview.is_empty() {
+            String::new()
+        } else {
+            " A short text preview is attached.".to_string()
+        }
+    );
+    Ok((receipt, payload))
+}
+
+/// 节流判据（**纯函数**，便于单测）：`None` = 允许发；`Some(remaining_ms)` = 还要等多久。
+fn push_notification_wait_ms(now: Instant, last: Option<Instant>) -> Option<u128> {
+    let last = last?;
+    let elapsed = now.saturating_duration_since(last).as_millis();
+    if elapsed >= PUSH_NOTIFICATION_MIN_INTERVAL_MS {
+        None
+    } else {
+        Some(PUSH_NOTIFICATION_MIN_INTERVAL_MS - elapsed)
+    }
+}
+
+/// `PushNotification`：给用户弹一条桌面通知（标题 + 正文）。
+///
+/// **防滥用**：进程级**节流** —— 距上一次成功发出 < `PUSH_NOTIFICATION_MIN_INTERVAL_MS`
+/// （3 秒）时直接拒，并如实告知还要等多久；标题 / 正文各自截断到上限。
+///
+/// **返回**：`(回执, 进 `system/push_notification` 事件的载荷)`，载荷字段 = `title` / `body`。
+pub fn push_notification(input: &Value) -> Result<(String, Value), String> {
+    let title_raw = input.get("title").and_then(Value::as_str).unwrap_or("").trim();
+    let body_raw = input.get("body").and_then(Value::as_str).unwrap_or("").trim();
+    if title_raw.is_empty() {
+        return Err("PushNotification needs a non-empty \"title\".".into());
+    }
+    if body_raw.is_empty() {
+        return Err("PushNotification needs a non-empty \"body\".".into());
+    }
+
+    // 节流：**先判后置位**（占位即算发出，失败不占位）。锁中毒视为不可用（不静默放行刷屏）。
+    {
+        let mut last = LAST_PUSH_NOTIFICATION
+            .lock()
+            .map_err(|_| "PushNotification throttle is unavailable (lock poisoned).".to_string())?;
+        if let Some(remain) = push_notification_wait_ms(Instant::now(), *last) {
+            return Err(format!(
+                "PushNotification is rate-limited: a notification was sent less than {PUSH_NOTIFICATION_MIN_INTERVAL_MS} ms \
+                 ago — wait {remain} ms before sending another."
+            ));
+        }
+        *last = Some(Instant::now());
+    }
+
+    let title: String = title_raw.chars().take(PUSH_TITLE_MAX_CHARS).collect();
+    let body: String = body_raw.chars().take(PUSH_BODY_MAX_CHARS).collect();
+    let payload = json!({ "title": title, "body": body });
+    Ok((format!("Notification sent: \"{title}\"."), payload))
+}
+
+// ── EnterWorktree / ExitWorktree（A13，2026-10-11）──────────────────
+//
+// 「有效工作目录」的覆盖层见 `Ctx::worktree` / `effective_cwd`。这两个工具只做两件事：
+// 建 worktree 并置覆盖、清覆盖。**保守边界**：绝不 `--force`、绝不删用户的 worktree /
+// 分支（`ExitWorktree` 只切回、不动磁盘）。
+
+/// 在 `dir` 下跑一次 git：成功返回 stdout（trim），失败返回 stderr（trim）。
+fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW —— 同 Cmd / PowerShell，GUI 下不闪黑框
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("failed to run git (is it installed?): {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            format!("git {} failed", args.first().copied().unwrap_or(""))
+        } else {
+            err
+        })
+    }
+}
+
+/// worktree / 分支名的合法字符（同时挡住路径穿越与非法 git ref 名）。
+fn valid_worktree_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
+}
+
+/// worktree 目录名 = `<仓库目录名>-<name>`（2026-10-11）。
+///
+/// **为什么要仓库前缀**：worktree 统一落在数据根的共享目录 `<exe 根>\temp\worktrees\` 下，
+/// 若目录名只用 `<name>`，**两个不同仓库用同一个名字就会撞名**（第二次 `git worktree add`
+/// 会因目标目录已存在而被拒）。用**仓库根的目录名**前缀即可区分「哪个仓库 + 哪个名字」。
+/// 分支名仍是 `<name>`（分支是每仓库独立的 ref，不会跨仓库撞名；同一仓库内同名再进仍按
+/// 「目录已存在 ⇒ 转达 git 原文、不 `--force`」处理）。
+///
+/// `repo` 取仓库根路径（`git rev-parse --show-toplevel`）的末段；取不到时回退 `repo`。
+fn worktree_dir_name(repo: &str, name: &str) -> String {
+    let r = Path::new(repo)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("repo");
+    format!("{r}-{name}")
+}
+
+/// `EnterWorktree`（A13，2026-10-11；落点 2026-10-11 改到数据根）：为当前仓库建一个 git
+/// worktree，并把**有效工作目录**切过去（见 `Ctx::worktree` / `effective_cwd`）。
+///
+/// 落点 = `<exe 根>\temp\worktrees\<仓库目录名>-<name>`（见 [`worktree_root`] /
+/// [`worktree_dir_name`]）—— **在用户仓库之外**，避免在仓库里显出未跟踪目录；该根目录由
+/// main.rs 并进 `add_dirs` 放行（否则工作区锁会拒 worktree 内的写）。
+/// 分支 = `git worktree add -b <name> <dir>` 新建。失败一律**状态不变**：
+///   · 已在 worktree 里 ⇒ 报错要求先 `ExitWorktree`（可重入 / 幂等）；
+///   · 非 git 仓库 / 找不到仓库根 ⇒ 报错；
+///   · 目标目录已存在 / 分支已存在 ⇒ 转达 git 原文，**不 `--force`**。
+///
+/// 可观测：成功后写 INFO 日志，并把新 cwd 放进返回文本让模型知道相对路径从此落在哪
+///（系统提示词**不重建** —— 规则 18 前缀不变量）。
+fn enter_worktree(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    let name = input.get("name").and_then(Value::as_str).unwrap_or("").trim();
+    if !valid_worktree_name(name) {
+        return Err(
+            "EnterWorktree needs a \"name\" of ASCII letters, digits, '-', '_', '/' or '.' \
+             (and no '..')."
+                .into(),
+        );
+    }
+    // 已在某个 worktree 里 ⇒ 明确报错（可重入：不重复建、不乱改状态）。
+    if let Ok(g) = ctx.worktree.lock() {
+        if let Some(cur) = g.as_ref() {
+            return Err(format!(
+                "Already inside a worktree at {} — call ExitWorktree before entering another.",
+                cur.display()
+            ));
+        }
+    }
+    // 必须是 git 仓库（`rev-parse --show-toplevel` 在非仓库里失败）。
+    let toplevel = run_git(&ctx.cwd, &["rev-parse", "--show-toplevel"]).map_err(|e| {
+        format!(
+            "Not a git repository (or git is unavailable) at {}: {e}",
+            ctx.cwd.display()
+        )
+    })?;
+    if toplevel.is_empty() {
+        return Err(format!("Not a git repository at {}.", ctx.cwd.display()));
+    }
+    let dir = worktree_root().join(worktree_dir_name(&toplevel, name));
+    if dir.exists() {
+        return Err(format!(
+            "Worktree path already exists: {} — remove it or pick another name.",
+            dir.display()
+        ));
+    }
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let dir_s = dir.to_string_lossy().to_string();
+    run_git(&ctx.cwd, &["worktree", "add", "-b", name, &dir_s])
+        .map_err(|e| format!("git worktree add failed: {e}"))?;
+    if let Ok(mut g) = ctx.worktree.lock() {
+        *g = Some(dir.clone());
+    }
+    crate::log::info(format!(
+        "EnterWorktree：有效工作目录切到 {}（新分支 {}，仓库根 {}）",
+        dir.display(),
+        name,
+        toplevel
+    ));
+    Ok(format!(
+        "Entered a git worktree. Your effective working directory is now:\n{}\n\
+         (new branch \"{}\"; repo root {}). The worktree lives under the app's data root, \
+         outside your workspace — so it does not show up as an untracked directory in the repo. \
+         Relative paths and shell commands now resolve inside this worktree; absolute paths are \
+         unchanged and the original workspace stays readable. Call ExitWorktree to go back to {}. \
+         Nothing is forced or deleted — the worktree and its branch are left on disk; remove it \
+         later with `git worktree remove <path>` if you no longer need it.",
+        dir.display(),
+        name,
+        toplevel,
+        ctx.cwd.display()
+    ))
+}
+
+/// `ExitWorktree`（A13，2026-10-11）：离开 `EnterWorktree` 建的 worktree，把**有效工作目录**
+/// 切回原来的工作区根。**保守**：不删 worktree、不删分支（留给用户 `git worktree remove`）；
+/// 未进入就调用 ⇒ 清晰报错，状态不变。
+fn exit_worktree(ctx: &Ctx) -> Result<String, String> {
+    let cur = match ctx.worktree.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+    let Some(cur) = cur else {
+        return Err("Not currently inside a worktree — nothing to exit.".into());
+    };
+    if let Ok(mut g) = ctx.worktree.lock() {
+        *g = None;
+    }
+    crate::log::info(format!(
+        "ExitWorktree：有效工作目录回到 {}（worktree {} 保留在磁盘，未删除）",
+        ctx.cwd.display(),
+        cur.display()
+    ));
+    Ok(format!(
+        "Left the worktree. Your effective working directory is back to:\n{}\n\
+         The worktree at {} and its branch were LEFT ON DISK (nothing deleted). Remove it later \
+         with `git worktree remove <path>` when you no longer need it.",
+        ctx.cwd.display(),
+        cur.display()
     ))
 }
 
@@ -2683,6 +3606,34 @@ pub fn prepare_output_dir() -> PathBuf {
     dir
 }
 
+/// worktree 落点根：`<exe 根>\temp\worktrees`（2026-10-11，落点从工作区根改到数据根）。
+///
+/// 与 [`output_dir`] / `image::image_dir` 同法 —— **不新增环境变量**，从 `log::log_dir()`
+/// 的父目录派生（`LUNAC_LOG_DIR` 优先，否则回退 `<agent.exe 目录>\temp\logs`），取父目录即
+/// `<exe 根>\temp`。
+///
+/// **为什么不建在 `<cwd>\.lunac-worktrees`**：那会在用户仓库里显出一个未跟踪目录。改到
+/// 应用自己的数据根后，用户仓库保持干净（对应 `EnterWorktree` 的迁移，见 [`enter_worktree`]）。
+pub fn worktree_root() -> PathBuf {
+    crate::log::log_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("worktrees")
+}
+
+/// 启动时调用：建目录并返回路径 —— main.rs 要把它塞进 `Ctx.add_dirs`。
+///
+/// 理由同 [`prepare_output_dir`]：worktree 落在**工作区之外**（数据根），不进 `add_dirs`
+/// 的话，默认 project 档的工作区锁（`guard`）会把 worktree 内的写直接拒掉。
+pub fn prepare_worktree_dir() -> PathBuf {
+    let dir = worktree_root();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        crate::log::warn(format!("worktrees: 建目录失败 {}: {e}", dir.display()));
+    }
+    dir
+}
+
 /// 清理超过 `KEEP_DAYS` 的落盘输出（与落盘日志同口径，按修改时间）。失败一律忽略。
 fn purge_old(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -2755,6 +3706,8 @@ mod tests {
             add_dirs: Vec::new(),
             read_only: false,
             locked: false,
+            // 单测默认不在 worktree 里（有效工作目录 = cwd）：`effective_cwd` 返回 `.`。
+            worktree: Arc::new(Mutex::new(None)),
             plan_phase: Arc::new(AtomicBool::new(false)),
             // 单测不装实时回传：drain 的行为回到「只读干管道」。
             // 实时控制（后台运行 / 停止）同样不装 —— `None` 时 `run_shell` 的循环里那
@@ -2845,9 +3798,27 @@ mod tests {
             names(&all).contains(&"Agent".to_string()),
             "Agent 必须在内置工具表里"
         );
+        assert!(
+            names(&all).contains(&"PetControl".to_string()),
+            "PetControl（桌宠动作）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"NotebookEdit".to_string()),
+            "NotebookEdit（notebook 编辑）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"EnterWorktree".to_string())
+                && names(&all).contains(&"ExitWorktree".to_string()),
+            "EnterWorktree / ExitWorktree（worktree，2026-10-11）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"SendUserFile".to_string())
+                && names(&all).contains(&"PushNotification".to_string()),
+            "SendUserFile / PushNotification（agent→用户呈递，2026-10-11）必须在内置工具表里"
+        );
         assert_eq!(
-            total, 17,
-            "内置工具应为 17 件（15 件原有 + ListPeers + SendMessage，A13 多代理通信）"
+            total, 23,
+            "内置工具应为 23 件（21 件 + SendUserFile + PushNotification，2026-10-11）"
         );
 
         let cut = defs(&["Agent".to_string()]);
@@ -2856,6 +3827,442 @@ mod tests {
             "disallowed 必须能裁掉 Agent"
         );
         assert_eq!(cut.len(), total - 1);
+    }
+
+    /// `NotebookEdit`（2026-10-11）的口径：
+    ///   · 在 `defs()` 里（无条件注册，与 `Edit` 同族）；
+    ///   · **要审批**（写盘）、不进只读并行白名单、只读档不放行；
+    ///   · schema 钉住 Claude Code 口径（`notebook_path` + `new_source` 必填）。
+    #[test]
+    fn notebook_edit_tool_is_registered_and_gated() {
+        let all = defs(&[]);
+        assert!(names(&all).contains(&"NotebookEdit".to_string()));
+        assert!(needs_approval("NotebookEdit"), "写盘要审批");
+        assert!(!parallel_safe("NotebookEdit"), "写盘不进只读并行白名单");
+        assert!(!gated_in_read_only("NotebookEdit"), "只读档不放行");
+
+        let t = all
+            .iter()
+            .find(|d| d.get("name").and_then(Value::as_str) == Some("NotebookEdit"))
+            .expect("NotebookEdit 必须在 defs() 里");
+        let req = t
+            .pointer("/input_schema/required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(req.contains(&json!("notebook_path")) && req.contains(&json!("new_source")));
+
+        // 只读档：直接拒，且措辞指向「去设置里改档位」（file 未读就拒，故路径不存在也无妨）
+        let mut ctx = test_ctx();
+        ctx.read_only = true;
+        let why = notebook_edit(&ctx, &json!({ "notebook_path": "x.ipynb", "new_source": "" }))
+            .expect_err("只读档必须拒");
+        assert!(why.contains("settings"), "拒因应指向去设置里改档位：{why}");
+    }
+
+    /// `EnterWorktree` / `ExitWorktree`（2026-10-11）的口径：
+    ///   · 都在 `defs()` 里（无条件注册）；
+    ///   · 都按**写类**归类（`needs_approval` 真、不进只读并行白名单、不进 `gated_in_read_only`）；
+    ///   · 只读档下由 `run()` 的分派闸直接拒（不碰 git）；
+    ///   · `effective_cwd` 在未进 worktree 时 = `cwd`、进了 = worktree 路径；
+    ///   · `ExitWorktree` 未进入就调用 ⇒ 清晰报错。
+    #[test]
+    fn worktree_tools_are_registered_and_gated() {
+        let all = defs(&[]);
+        for n in ["EnterWorktree", "ExitWorktree"] {
+            assert!(names(&all).contains(&n.to_string()), "{n} 必须在 defs() 里");
+            assert!(needs_approval(n), "{n} 改仓库状态，按写类要审批");
+            assert!(!parallel_safe(n), "{n} 改共享的有效工作目录，必须串行");
+            assert!(!gated_in_read_only(n), "{n} 只读档该直接拒（不是问了再做）");
+        }
+
+        // 只读档：`run()` 的分派闸直接拒（不会走到 git），措辞指向去设置里改档位。
+        let mut ro = test_ctx();
+        ro.read_only = true;
+        let why = run(&ro, "EnterWorktree", &json!({ "name": "wt1" }))
+            .expect_err("只读档必须拒 EnterWorktree");
+        assert!(why.contains("settings"), "拒因应指向去设置里改档位：{why}");
+        let why = run(&ro, "ExitWorktree", &json!({}))
+            .expect_err("只读档必须拒 ExitWorktree");
+        assert!(why.contains("settings"), "拒因应指向去设置里改档位：{why}");
+
+        // 有效工作目录：默认 = cwd；置覆盖后 = worktree 路径。
+        let ctx = test_ctx();
+        assert_eq!(effective_cwd(&ctx), ctx.cwd);
+        *ctx.worktree.lock().unwrap() = Some(PathBuf::from("C:/x/wt"));
+        assert_eq!(effective_cwd(&ctx), PathBuf::from("C:/x/wt"));
+
+        // 未进入就退出 ⇒ 清晰报错、状态不变。
+        let plain = test_ctx();
+        let why = exit_worktree(&plain).expect_err("不在 worktree 里退出必须报错");
+        assert!(why.contains("Not currently inside a worktree"), "{why}");
+        assert!(effective_cwd(&plain) == plain.cwd, "报错后状态不变");
+
+        // 已在 worktree 里再进 ⇒ 报错要求先退出（不碰 git）。
+        let inwt = test_ctx();
+        *inwt.worktree.lock().unwrap() = Some(PathBuf::from("C:/x/wt"));
+        let why = enter_worktree(&inwt, &json!({ "name": "other" }))
+            .expect_err("已在 worktree 里再进必须报错");
+        assert!(why.contains("Already inside a worktree"), "{why}");
+
+        // 名称非法 / 空 ⇒ 在碰 git 之前就报错。
+        let c = test_ctx();
+        assert!(enter_worktree(&c, &json!({ "name": "" })).is_err());
+        assert!(enter_worktree(&c, &json!({ "name": "../escape" })).is_err());
+    }
+
+    /// worktree 目录名带**仓库前缀**（防跨仓库撞名，2026-10-11）：`<仓库目录名>-<name>`；
+    /// 仓库根末段取不到时回退 `repo`。分支名不加前缀（分支是每仓库独立的 ref）。
+    #[test]
+    fn worktree_dir_name_prefixes_the_repo() {
+        assert_eq!(worktree_dir_name("D:/a/b/myproj", "wt1"), "myproj-wt1");
+        assert_eq!(
+            worktree_dir_name(r"D:\x\repo-name", "feat/one"),
+            "repo-name-feat/one"
+        );
+        // 末段取不到（空 / 根）⇒ 回退 `repo`
+        assert_eq!(worktree_dir_name("", "wt"), "repo-wt");
+        assert_eq!(worktree_dir_name("/", "wt"), "repo-wt");
+    }
+
+    /// `SendUserFile`（2026-10-11）：路径处理与 `Read` 同源、返回**可读的元信息**；
+    /// 不存在的文件 / 目录都要**报错**（绝不静默成功）。
+    #[test]
+    fn send_user_file_reports_metadata_and_errors() {
+        let dir = std::env::temp_dir().join(format!("lunac-userfile-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("report.txt");
+        fs::write(&file, "hello world\n").unwrap();
+
+        let ctx = test_ctx();
+        let (receipt, payload) = send_user_file(
+            &ctx,
+            &json!({ "file_path": file.to_str().unwrap() }),
+        )
+        .expect("存在的文件应当成功");
+        assert!(receipt.contains("Presented"), "回执应说明已呈递：{receipt}");
+        assert_eq!(payload["kind"], json!("text"));
+        assert_eq!(payload["name"], json!("report.txt"));
+        assert_eq!(payload["size"], json!(12));
+        // 未要求预览 ⇒ 不带 preview 字段（大文件 / 二进制默认不塞内容）
+        assert!(payload.get("preview").is_none(), "默认不应有 preview：{payload}");
+
+        // 分类：按扩展名
+        let img = dir.join("pic.png");
+        fs::write(&img, [0x89u8, 0x50, 0x4E, 0x47]).unwrap();
+        let (_, ip) = send_user_file(&ctx, &json!({ "file_path": img.to_str().unwrap() })).unwrap();
+        assert_eq!(ip["kind"], json!("image"));
+
+        // 不存在的文件 ⇒ 可读错误（含路径），**不是** Ok
+        let missing = dir.join("nope.txt");
+        let err = send_user_file(&ctx, &json!({ "file_path": missing.to_str().unwrap() }))
+            .expect_err("不存在的文件必须报错");
+        assert!(err.contains("nope.txt"), "错误里应能看出是哪个文件：{err}");
+
+        // 目录 ⇒ 明确拒绝（本工具只递单个文件）
+        let err = send_user_file(&ctx, &json!({ "file_path": dir.to_str().unwrap() }))
+            .expect_err("目录必须被拒");
+        assert!(err.contains("is a directory"), "应当说明是目录：{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SendUserFile` 的可选预览**严格有界**：文本被截断到字符上限，二进制 / 图片**永不**带正文。
+    #[test]
+    fn send_user_file_preview_is_bounded_and_binary_excluded() {
+        let dir = std::env::temp_dir().join(format!("lunac-userfile-prev-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let big = dir.join("big.txt");
+        let text: String = "x".repeat(FILE_PREVIEW_CHARS + 500);
+        fs::write(&big, &text).unwrap();
+
+        let ctx = test_ctx();
+        let (_, payload) = send_user_file(
+            &ctx,
+            &json!({ "file_path": big.to_str().unwrap(), "preview": true }),
+        )
+        .unwrap();
+        let prev = payload["preview"].as_str().expect("文本应带预览");
+        assert_eq!(prev.chars().count(), FILE_PREVIEW_CHARS, "预览必须截断到上限");
+
+        // 二进制（.png）：即使 preview=true 也不给正文
+        let bin = dir.join("blob.png");
+        fs::write(&bin, vec![0u8; 64]).unwrap();
+        let (_, payload) =
+            send_user_file(&ctx, &json!({ "file_path": bin.to_str().unwrap(), "preview": true }))
+                .unwrap();
+        assert!(payload.get("preview").is_none(), "二进制不应带预览：{payload}");
+        assert_eq!(payload["kind"], json!("image"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `PushNotification` 的节流判据（纯函数）：间隔内要等、到点即放行。
+    #[test]
+    fn push_notification_wait_ms_is_a_pure_gate() {
+        let t = Instant::now();
+        assert!(push_notification_wait_ms(t, None).is_none(), "首次一定放行");
+        assert_eq!(
+            push_notification_wait_ms(t, Some(t - Duration::from_millis(1))),
+            Some(PUSH_NOTIFICATION_MIN_INTERVAL_MS - 1),
+            "刚发过应当要等剩余时间"
+        );
+        assert!(
+            push_notification_wait_ms(t, Some(t - Duration::from_millis(PUSH_NOTIFICATION_MIN_INTERVAL_MS as u64)))
+                .is_none(),
+            "到点即放行"
+        );
+    }
+
+    /// `PushNotification`：首次成功且标题/正文被截断，**紧接着的第二次被节流拒绝**（防刷屏）。
+    /// 用 `LAST_PUSH_NOTIFICATION` 复位保证这条断言与其他单测互不影响。
+    #[test]
+    fn push_notification_throttles_and_truncates() {
+        if let Ok(mut g) = LAST_PUSH_NOTIFICATION.lock() {
+            *g = None;
+        }
+        let long_title = "T".repeat(PUSH_TITLE_MAX_CHARS + 50);
+        let long_body = "B".repeat(PUSH_BODY_MAX_CHARS + 50);
+        let (receipt, payload) = push_notification(
+            &json!({ "title": long_title, "body": long_body }),
+        )
+        .expect("首次通知应当成功");
+        assert_eq!(payload["title"].as_str().unwrap().chars().count(), PUSH_TITLE_MAX_CHARS);
+        assert_eq!(payload["body"].as_str().unwrap().chars().count(), PUSH_BODY_MAX_CHARS);
+        assert!(receipt.contains("Notification sent"), "回执：{receipt}");
+
+        // 紧接着再来一条 ⇒ 被节流（同一次测试内，无并发干扰）
+        let err = push_notification(&json!({ "title": "again", "body": "again" }))
+            .expect_err("间隔内第二次必须被拒");
+        assert!(err.contains("rate-limited"), "应当说明被节流：{err}");
+
+        // 空标题 / 空正文也要拒
+        if let Ok(mut g) = LAST_PUSH_NOTIFICATION.lock() {
+            *g = None;
+        }
+        assert!(push_notification(&json!({ "title": "", "body": "x" })).is_err());
+        assert!(push_notification(&json!({ "title": "x", "body": "  " })).is_err());
+        if let Ok(mut g) = LAST_PUSH_NOTIFICATION.lock() {
+            *g = None;
+        }
+    }
+
+    /// `NotebookEdit` 必须**只动目标 cell**，并保住 `nbformat` / `metadata` / 其它 cell，
+    /// 缩进沿用原文件（避免整文件 diff 噪声）。
+    #[test]
+    fn notebook_edit_replaces_only_the_target_cell() {
+        let dir = std::env::temp_dir().join(format!("lunac-nbedit-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("nb.ipynb");
+        // 手写一份 Jupyter 落盘风格（indent=1、sort_keys）的 fixture
+        let original = [
+            "{",
+            " \"cells\": [",
+            "  {",
+            "   \"cell_type\": \"code\",",
+            "   \"execution_count\": null,",
+            "   \"id\": \"keep-me\",",
+            "   \"metadata\": {},",
+            "   \"outputs\": [],",
+            "   \"source\": [",
+            "    \"print(1)\\n\"",
+            "   ]",
+            "  },",
+            "  {",
+            "   \"cell_type\": \"markdown\",",
+            "   \"id\": \"edit-me\",",
+            "   \"metadata\": {},",
+            "   \"source\": [",
+            "    \"old\\n\"",
+            "   ]",
+            "  }",
+            " ],",
+            " \"metadata\": {},",
+            " \"nbformat\": 4,",
+            " \"nbformat_minor\": 5",
+            "}",
+            "",
+        ]
+        .join("\n");
+        fs::write(&path, &original).unwrap();
+
+        let ctx = test_ctx();
+        let out = notebook_edit(
+            &ctx,
+            &json!({
+                "notebook_path": path.to_str().unwrap(),
+                "cell_id": "edit-me",
+                "new_source": "line1\nline2\n"
+            }),
+        )
+        .expect("NotebookEdit 应当成功");
+        assert!(out.contains("Replaced"), "回执应说明做了什么：{out}");
+
+        let after = fs::read_to_string(&path).unwrap();
+        let doc: Value = serde_json::from_str(&after).unwrap();
+        // 目标 cell 变了
+        assert_eq!(doc.pointer("/cells/1/source"), Some(&json!(["line1\n", "line2\n"])));
+        assert_eq!(
+            doc.pointer("/cells/1/cell_type").and_then(Value::as_str),
+            Some("markdown")
+        );
+        // 其它 cell / 顶层字段原样
+        assert_eq!(doc.pointer("/cells/0/source"), Some(&json!(["print(1)\n"])));
+        assert_eq!(doc.pointer("/cells/0/id").and_then(Value::as_str), Some("keep-me"));
+        assert_eq!(doc.pointer("/cells/0/execution_count"), Some(&Value::Null));
+        assert_eq!(doc.pointer("/nbformat"), Some(&json!(4)));
+        assert_eq!(doc.pointer("/metadata"), Some(&json!({})));
+        // 风格：缩进沿用 1 空格、末尾换行保留、未改动的 cell 逐字节不变
+        assert!(after.contains("\n \"cells\": [\n"), "缩进应沿用原文件：{after}");
+        assert!(after.ends_with("}\n"), "末尾换行应保留");
+        assert!(
+            after.contains("    \"print(1)\\n\"\n"),
+            "未改动 cell 应逐字节不变：{after}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `NotebookEdit` 的 insert / delete 两档：结构、id、其它 cell 同样保住。
+    #[test]
+    fn notebook_edit_inserts_and_deletes_cells() {
+        let dir = std::env::temp_dir().join(format!("lunac-nbedit-id-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("nb.ipynb");
+        let original = [
+            "{",
+            " \"cells\": [",
+            "  {",
+            "   \"cell_type\": \"code\",",
+            "   \"execution_count\": null,",
+            "   \"id\": \"c0\",",
+            "   \"metadata\": {},",
+            "   \"outputs\": [],",
+            "   \"source\": [",
+            "    \"a\"",
+            "   ]",
+            "  }",
+            " ],",
+            " \"metadata\": {},",
+            " \"nbformat\": 4,",
+            " \"nbformat_minor\": 5",
+            "}",
+            "",
+        ]
+        .join("\n");
+        fs::write(&path, &original).unwrap();
+        let ctx = test_ctx();
+
+        // insert：在 index 0 插一个 markdown cell（用 id 的 notebook ⇒ 新 cell 也要带 id）
+        notebook_edit(
+            &ctx,
+            &json!({
+                "notebook_path": path.to_str().unwrap(),
+                "cell_type": "markdown",
+                "cell_number": 0,
+                "new_source": "# Title",
+                "edit_mode": "insert"
+            }),
+        )
+        .expect("insert 应当成功");
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc.pointer("/cells/0/cell_type").and_then(Value::as_str),
+            Some("markdown")
+        );
+        assert_eq!(doc.pointer("/cells/0/source"), Some(&json!(["# Title"])));
+        assert!(
+            doc.pointer("/cells/0/id")
+                .and_then(Value::as_str)
+                .map_or(false, |s| !s.is_empty()),
+            "用 id 的 notebook，新 cell 必须带 id"
+        );
+        assert_eq!(
+            doc.pointer("/cells/1/id").and_then(Value::as_str),
+            Some("c0"),
+            "原 cell 后移且不变"
+        );
+
+        // delete：按 id 删掉 c0
+        notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": path.to_str().unwrap(), "cell_id": "c0", "edit_mode": "delete" }),
+        )
+        .expect("delete 应当成功");
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc.pointer("/cells").and_then(Value::as_array).map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            doc.pointer("/cells/0/cell_type").and_then(Value::as_str),
+            Some("markdown")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `NotebookEdit` 的错误必须清晰、不崩：缺文件 / 非 notebook / 找不到 cell / 参数非法。
+    #[test]
+    fn notebook_edit_reports_clear_errors() {
+        let dir = std::env::temp_dir().join(format!("lunac-nbedit-err-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let ctx = test_ctx();
+
+        let missing = dir.join("nope.ipynb");
+        let why = notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": missing.to_str().unwrap(), "new_source": "" }),
+        )
+        .expect_err("缺文件要报错");
+        assert!(why.contains("nope.ipynb"), "{why}");
+
+        let bad = dir.join("bad.ipynb");
+        fs::write(&bad, "not json").unwrap();
+        let why = notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": bad.to_str().unwrap(), "new_source": "" }),
+        )
+        .expect_err("非法 JSON 要报错");
+        assert!(why.contains("not a valid notebook"), "{why}");
+
+        let empty = dir.join("empty.json");
+        fs::write(&empty, "{\"foo\": 1}").unwrap();
+        let why = notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": empty.to_str().unwrap(), "new_source": "x" }),
+        )
+        .expect_err("没有 cells 要报错");
+        assert!(why.contains("cells"), "{why}");
+
+        let nb = dir.join("ok.ipynb");
+        fs::write(
+            &nb,
+            "{\n \"cells\": [],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}\n",
+        )
+        .unwrap();
+        let why = notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": nb.to_str().unwrap(), "cell_id": "ghost", "new_source": "x" }),
+        )
+        .expect_err("找不到 cell 要报错");
+        assert!(why.contains("ghost"), "{why}");
+
+        let why = notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": nb.to_str().unwrap(), "new_source": "x", "edit_mode": "rename" }),
+        )
+        .expect_err("非法 edit_mode 要报错");
+        assert!(why.contains("edit_mode"), "{why}");
+
+        let why = notebook_edit(
+            &ctx,
+            &json!({ "notebook_path": nb.to_str().unwrap(), "new_source": "x", "edit_mode": "insert" }),
+        )
+        .expect_err("insert 缺 cell_type 要报错");
+        assert!(why.contains("cell_type"), "{why}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// 多代理通信两件（A13，2026-10-05）的口径：
@@ -3214,5 +4621,89 @@ mod tests {
             .map(|(_, r)| matches!(r, Ok(n) if *n > 0))
             .unwrap_or(false);
         assert!(rss_ok, "Bing RSS 兜底挂了（UA / Accept-Language 失效或对方改版）：{results:?}");
+    }
+
+    /// 子目录记忆懒加载的**触发判据**（2026-10-12，§待办 3-1a 子目录级）：
+    /// 只认显式路径参数 —— 文件类取父目录、目录类取自身、其余工具与缺参一律 None。
+    #[test]
+    fn touched_dir_is_derived_only_from_explicit_path_args() {
+        let cwd = Path::new(r"D:\ws");
+        // Read/Write/Edit（file_path）→ 父目录；相对路径按 cwd 解析
+        assert_eq!(
+            touched_dir(cwd, "Read", &json!({ "file_path": r"D:\ws\sub\a.txt" })),
+            Some(PathBuf::from(r"D:\ws\sub"))
+        );
+        assert_eq!(
+            touched_dir(cwd, "Edit", &json!({ "file_path": r"sub\deep\b.txt" })),
+            Some(PathBuf::from(r"D:\ws\sub\deep"))
+        );
+        // NotebookEdit 的 notebook_path 同理；SendUserFile 的 file_path 同理
+        assert_eq!(
+            touched_dir(cwd, "NotebookEdit", &json!({ "notebook_path": r"D:\ws\nb\x.ipynb" })),
+            Some(PathBuf::from(r"D:\ws\nb"))
+        );
+        assert_eq!(
+            touched_dir(cwd, "SendUserFile", &json!({ "file_path": r"D:\ws\out\report.txt" })),
+            Some(PathBuf::from(r"D:\ws\out"))
+        );
+        // Glob/Grep 的 path 本身是目录
+        assert_eq!(
+            touched_dir(cwd, "Grep", &json!({ "path": r"D:\ws\sub" })),
+            Some(PathBuf::from(r"D:\ws\sub"))
+        );
+        // `..` 被 normalize 吃掉，不会伪造出一个「更深」的目录
+        assert_eq!(
+            touched_dir(cwd, "Read", &json!({ "file_path": r"D:\ws\sub\..\a.txt" })),
+            Some(PathBuf::from(r"D:\ws"))
+        );
+        // 缺参 / 空参 / 非字符串 → None
+        assert_eq!(touched_dir(cwd, "Read", &json!({})), None);
+        assert_eq!(touched_dir(cwd, "Read", &json!({ "file_path": "   " })), None);
+        assert_eq!(touched_dir(cwd, "Read", &json!({ "file_path": 5 })), None);
+        // 不解析命令行的工具 → None（Cmd/PowerShell 不改「当前触达目录」，见 path_arg_kind 注释）
+        assert_eq!(touched_dir(cwd, "Cmd", &json!({ "command": "cd sub && dir" })), None);
+        assert_eq!(touched_dir(cwd, "PowerShell", &json!({ "command": "ls" })), None);
+        // 工具名不在判据表里 → None
+        assert_eq!(touched_dir(cwd, "Agent", &json!({ "file_path": r"D:\ws\sub\x" })), None);
+    }
+
+    /// 「够格子目录」的三条判据：在 cwd 内且严格更深 / 任一层不在忽略名单 / 深度不超上限。
+    #[test]
+    fn eligible_subdir_enforces_boundary_ignores_and_depth() {
+        let cwd = Path::new(r"D:\ws");
+        // 正例
+        assert!(eligible_subdir(cwd, Path::new(r"D:\ws\sub")));
+        assert!(eligible_subdir(cwd, Path::new(r"D:\ws\a\b\c")));
+        // 边界：cwd 自己、工作区之外、同前缀但不是子目录、父级/盘根
+        assert!(!eligible_subdir(cwd, cwd), "cwd 本身不算子目录（那是固定前缀那一层）");
+        assert!(!eligible_subdir(cwd, Path::new(r"D:\other\sub")), "工作区之外不算");
+        assert!(!eligible_subdir(cwd, Path::new(r"D:\ws-evil")), "同前缀但不是子目录");
+        assert!(!eligible_subdir(cwd, Path::new(r"D:\")), "父级/盘根不算");
+        // 忽略名单：命中**任一层**即跳过（含其子目录）
+        for bad in [
+            ".git", "node_modules", "target", "dist", "out", "build", "__pycache__",
+        ] {
+            assert!(
+                !eligible_subdir(cwd, &Path::new(r"D:\ws").join(bad)),
+                "{bad} 在忽略名单里"
+            );
+            assert!(
+                !eligible_subdir(cwd, &Path::new(r"D:\ws").join(bad).join("deep")),
+                "{bad} 的子目录同样跳过"
+            );
+        }
+        assert!(
+            !eligible_subdir(cwd, Path::new(r"D:\ws\Node_Modules")),
+            "忽略名单大小写无关"
+        );
+        // 深度上限：恰好到上限可以、再多一层不行
+        let at_max: PathBuf = (1..=MAX_SUBDIR_MEMORY_DEPTH)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let over: PathBuf = (1..=MAX_SUBDIR_MEMORY_DEPTH + 1)
+            .map(|i| format!("d{i}"))
+            .collect();
+        assert!(eligible_subdir(cwd, &Path::new(r"D:\ws").join(at_max)), "恰好到上限可以");
+        assert!(!eligible_subdir(cwd, &Path::new(r"D:\ws").join(over)), "超过深度上限要跳过");
     }
 }

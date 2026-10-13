@@ -1161,6 +1161,64 @@ pub async fn media_remove_root(path: String) -> Result<Vec<MediaRootDto>, String
     .await
 }
 
+/// 从库里删除**单个文件**（同时删磁盘文件、库中那一行、以及它的封面缓存）。
+///
+/// 安全边界（缺一就有「拿任意路径删别人文件」的口子）：
+///   ① **只认库里已有的曲目路径** —— 先按 `path` 查库，**查不到直接报错、不删任何东西**
+///      （这一条同时挡住「把任意路径传进来删文件」）；
+///   ② **只删文件**（`std::fs::remove_file`），**绝不删目录**（`is_file()` 先判一次）；
+///   ③ 目标文件若**已不存在**（用户手动删过），**仍然**把库里那行与封面缓存清掉，
+///      按「已清理索引」处理、**不报错**（否则用户对着一条删不掉的幽灵条目干瞪眼）。
+///
+/// 顺序与失败策略：**先删库行（查库时顺手拿到 `cover` 文件名）→ 删磁盘文件 → 删封面缓存**。
+/// 先把索引清掉，界面立刻不再列出这首；后两步即使失败也只是「文件 / 缓存没删掉」，
+/// 每步失败记 `warn` 但不把整体判失败 —— 反过来（先删文件后删索引）一旦索引那步失败，
+/// 用户会看到「报错了、但歌已经没了」这种半死不活的状态。
+///
+/// 与扫描互斥：照 `media_remove_root`，扫描进行中拒绝（半路删行会被那次扫描的收尾再核一遍）。
+#[tauri::command]
+pub async fn media_delete_file(path: String) -> Result<(), String> {
+    crate::commands::run_blocking(move || {
+        if scan_state().lock().map(|s| s.running).unwrap_or(false) {
+            return Err("ERR_SCAN_RUNNING".into());
+        }
+        let conn = open_db()?;
+        // ① 先查库：拿封面文件名，同时确认这条路径确实在库里（查不到就不删任何东西）。
+        let cover: String = conn
+            .query_row(
+                "SELECT cover FROM tracks WHERE path = ?1",
+                rusqlite::params![path],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => format!("曲目不在库中：{path}"),
+                other => other.to_string(),
+            })?;
+        // 再删库行（已拿到 cover）；删完界面就不会再列出它。
+        conn.execute("DELETE FROM tracks WHERE path = ?1", rusqlite::params![path])
+            .map_err(|e| format!("删除索引失败: {e}"))?;
+        // ② 只删**文件**、绝不删目录（目录即便同名也一律跳过）。
+        let target = Path::new(&path);
+        if target.is_file() {
+            if let Err(e) = std::fs::remove_file(target) {
+                crate::log::warn(&format!("media: 删除文件失败 {path}: {e}"));
+            }
+        } else {
+            crate::log::info(&format!("media: 目标文件已不存在，仅清理索引 {path}"));
+        }
+        // ③ 封面缓存（库里存的是**文件名**，不是全路径）。删不掉只记 warn。
+        if !cover.is_empty() {
+            let cover_path = covers_dir().join(&cover);
+            if let Err(e) = std::fs::remove_file(&cover_path) {
+                crate::log::warn(&format!("media: 删除封面缓存失败 {}: {e}", cover_path.display()));
+            }
+        }
+        crate::log::info(&format!("media: 已删除文件 {path}"));
+        Ok(())
+    })
+    .await
+}
+
 /// 开始扫描（后台线程，立刻返回）。`root` 空 = 扫全部。
 #[tauri::command]
 pub fn media_scan_start(root: Option<String>) -> Result<ScanStatusDto, String> {

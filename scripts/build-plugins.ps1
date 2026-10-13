@@ -71,7 +71,7 @@ $OutDir = "$Root\release\plugin-packages"
 # 见下面 Get-PluginVersion 那一段的完整理由）。**只有真的改了这个插件，才动它这一行。**
 $Plugins = @{
   music = @{
-    version      = "0.9.27"
+    version      = "0.9.36"
     name         = "音乐"
     description  = "LRCLIB 歌词抓取 + Spotify 播放控制"
     keywords     = @("music", "音乐", "歌词", "music 音乐", "spotify", "lyrics", "lrclib")
@@ -165,7 +165,7 @@ $Plugins = @{
   # **控制台**面板，桌宠窗由控制台里的「显示桌宠」按钮开（理由见 pet.ts 文件头：
   # 穿透开着时桌宠窗收不到鼠标事件，开关必须落在另一个窗口里）。
   pet = @{
-    version      = "0.9.9"
+    version      = "0.9.54"
     name         = "桌宠"
     description  = "桌宠 —— 独立透明置顶的桌面形象窗（图片或 Live2D 模型，由你自己导入）"
     keywords     = @("桌宠", "宠物", "桌面宠物", "pet", "desktop pet", "live2d", "看板娘", "吉祥物")
@@ -206,6 +206,38 @@ $Plugins = @{
           @{ src = "licenses\live2d-cubism-core\RedistributableFiles.txt"; dest = "engine/RedistributableFiles.txt" }
         )
       }
+      # 桌宠的语音资产（ZipVoice 零样本克隆 TTS，2026-10-12）：一整棵「运行库 + 模型」树
+      #   （sherpa-onnx 的 dll + onnxruntime + ZipVoice 权重 + espeak-ng 数据 + Vocos 声码器），
+      #   所以走 `archive`（与 ocr 的 PaddleOCR / local-model 的 llama-server 同款）。
+      # `dest = "zipvoice"` ⇒ 解到 `<插件目录>\zipvoice\`（宿主 tts_zipvoice.rs 的 zipvoice_dir()
+      #   认这条路径；`assets_ready()` 要求同级存在 sherpa-onnx-c-api.dll / vocos_24khz.onnx /
+      #   model\encoder.int8.onnx / model\decoder.int8.onnx）。压缩包内是**单层 `zipvoice\`**，
+      #   安装器会把它摊平（plugin_market 的 flatten_single_top_dir）。
+      # **授权**：ZipVoice 权重为 CC-BY-NC（仅非商用），espeak-ng 数据为 GPL-3.0 —— 授权全文与
+      #   声明随包放 `zipvoice\LICENSES\` + `zipvoice\THIRD_PARTY_NOTICES.md`（见下面的 notices）；
+      #   两份原文在仓库 `licenses\zipvoice\`（取上游原文，勿转述）。
+      # `sha256` 是**压缩包本身**的校验和（不是解压产物）；换版本时用
+      #   `Get-FileHash <7z> -Algorithm SHA256` 重取，并同步更新 url 标签与本行。
+      # `local` = 打包机上**已解开的目录**（只用于给安装包 / dev 暂存，写清单时摘掉）。
+      @{
+        type   = "archive"
+        url    = "https://github.com/LythrumMoon/lunac-plugins/releases/download/zipvoice-1.13.8/zipvoice-1.13.8.7z"
+        dest   = "zipvoice"
+        sha256 = "DE25D3192B9C6C34DF642F1FB58852ED4991E604AFA95754499627D8C03FFEE2"
+        local  = "deps\zipvoice\_stage\zipvoice"
+        # **第三方授权随附义务**（2026-10-12，照 Live2D 的 notices 先例）：CC-BY-NC 要求署名 +
+        #   附许可全文，GPL-3.0 要求附许可证全文，MIT / Apache-2.0 要求保留声明。这些文件与
+        #   archive 内的 LICENSES/ 内容一致；**缺一份就打包失败**（见第 ② 步）—— 宁可不打包，
+        #   也不发一个没有授权文件的包。
+        notices = @(
+          @{ src = "licenses\zipvoice\CC-BY-NC-4.0.txt";       dest = "zipvoice/LICENSES/CC-BY-NC-4.0.txt" },
+          @{ src = "licenses\zipvoice\Apache-2.0.txt";         dest = "zipvoice/LICENSES/Apache-2.0.txt" },
+          @{ src = "licenses\zipvoice\ONNX-Runtime-MIT.txt";   dest = "zipvoice/LICENSES/ONNX-Runtime-MIT.txt" },
+          @{ src = "licenses\zipvoice\GPL-3.0.txt";            dest = "zipvoice/LICENSES/GPL-3.0.txt" },
+          @{ src = "licenses\zipvoice\Vocos-MIT.txt";          dest = "zipvoice/LICENSES/Vocos-MIT.txt" },
+          @{ src = "licenses\zipvoice\THIRD_PARTY_NOTICES.md"; dest = "zipvoice/THIRD_PARTY_NOTICES.md" }
+        )
+      }
     )
     # **附加入口**：`<插件目录内的相对路径> = <源码路径>`。
     # 桌宠的 Live2D 引擎（pixi + pixi-live2d-display）必须在 **Cubism Core 之后**才敢求值 —— 那个库
@@ -218,13 +250,72 @@ $Plugins = @{
     # `resizable = $false` ⇒ 禁手动缩放（尺寸由形象与控制台决定）。
     # 三个缺省值反过来的写法（不写这一段）就是历史上所有插件的样子 —— 别把这一段复制给它们。
     window       = @{
-      width       = 300
-      height      = 400
+      width       = 320
+      height      = 510
       minWidth    = 160
       minHeight   = 200
       resizable   = $false
       skipTaskbar = $true
       chrome      = $false
+    }
+  }
+  # 本地决策模型（S1 形态 B，2026-10-09）：**自带本机进程** `llama-server` —— 进程由宿主按
+  # 下面的 `sidecar` 段托管（契约见 core-agent/src/decide.rs 与 app/src-tauri/src/plugin_sidecar.rs）。
+  # **形态已改（2026-10-09 用户定，v0.10.0）= headless 基础设施插件**：不再是可搜索 / 可打开的
+  #   工具插件（搜索里没有它、市场行也不给「打开」按钮），开关搬去「设置 → AI → 本地模型决策」；
+  #   但**仍留在插件市场**可下载 / 卸载。判据见 app/src/plugins/kinds.ts 的 `isHeadlessPlugin`。
+  #   （它服务两处决策：桌宠消息发送 + agent 对话流输入门 —— 判定都在 core-agent/src/decide.rs。）
+  # ⚠️ **`sidecar` 必须与 `permissions: ["process.spawn"]` 同时出现**（2026-10-09 补齐，v0.9.1）：
+  #    `plugin_market::validate_sidecar` 是 **fail-closed** 的 —— 声明了 sidecar 却缺这条权限
+  #    ⇒ **整包拒装**（不是「起了但没权限」）。此前 `permissions = @()` 是空的，走市场/zip 安装
+  #    管线**根本装不上**，只因本地是手工铺进 `Modules\` 才没暴露。
+  # **模型进 dependencies（2026-10-09 用户定，v0.9.1）**：GGUF 有 468MB，做成 `type:"file"` 硬依赖
+  #    = 「装这个插件就自动下 468MB 并校验 sha256」——用户明确选了**强制随装下载**（而非面板按需下）。
+  #    `dest` 的相对路径与 `sidecar.args` 的 `--model` **必须逐字一致**；`sha256` 是本地实算的
+  #    （`Get-FileHash`），对不上时宿主**整包拒绝**。llama-server 本体很小（18.6MB），走 archive
+  #    依赖随装随下 —— zip 里是「exe + 一堆 DLL」，所以用 `archive` 而不是 `file`（与 ocr 的 PaddleOCR 同款）。
+  # ⚠️ `MAX_DEP_BYTES` 2026-10-09 已由 512MB 提到 **4 GiB**（`plugin_market.rs`）—— 3B/4B 的 Q4_K_M
+  #    约 2–3 GiB；`file` 依赖现在走**流式落盘**（不再整包读进内存）。别找超过 4 GiB 的档。
+  "local-model" = @{
+    version      = "0.11.0"
+    name         = "本地决策模型"
+    description  = "本地小模型（llama-server）—— 只参与「要不要把消息发给云模型」的决策，省钱"
+    keywords     = @("本地模型", "本地模型决策", "local model", "llama", "llama-server", "决策", "离线", "gguf", "省钱")
+    icon         = "🧠"
+    homepage     = "https://github.com/LythrumMoon/Lunac"
+    permissions  = @("process.spawn")
+    dependencies = @(
+      @{
+        type   = "archive"
+        url    = "https://github.com/ggml-org/llama.cpp/releases/download/b11524/llama-b11524-bin-win-cpu-x64.zip"
+        dest   = "bin"
+        sha256 = "66AAE07A0A7E37028ADBC391ADE7EFC9693B2015C3D31FFB19FC3C8BFA8787AE"
+      }
+      @{
+        type   = "file"
+        url    = "https://hf-mirror.com/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        dest   = "models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        sha256 = "3605803B982CB64AEAD44F6C1B2AE36E3ACDB41D8E46C8A94C6533BC4C67E597"
+      }
+    )
+    # `transport = "http"` ⇒ 插件用 `__lunac_host.sidecar.http()` 打它的 OpenAI 兼容端点；
+    # `autostart = $false` ⇒ **懒启动**（空转白占内存），由面板 / 决策路径按需拉起。
+    # `readyTimeoutSec = 180` ⇒ **必须**：`llama-server` 不会说宿主的 NDJSON 握手行，宿主的
+    #   就绪信号退化为「端口可连」；而 4B 模型 CPU 冷启要几十秒，缺省 10s 会被误判成失败
+    #   并**杀掉进程**（2026-10-09 实测「拉起几秒后闪退」的真因）。
+    sidecar      = @{
+      command        = "bin/llama-server.exe"
+      # `-np 1` ⇒ **单槽**：llama-server 默认 `-np 4`，会按 4 × ctx 分配 KV（`-c 8192` 时约 4.7GB）；
+      #   本地决策模型同时只有一个调用方，单槽够用，直接把 KV 降到 ~1.2GB。
+      args           = @("-m", "models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "-c", "8192", "-np", "1", "--port", "8090")
+      transport      = "http"
+      # ⚠️ **必须写 port（2026-10-09 修）**：宿主的就绪判定靠「端口可连」（第三方服务不会说 NDJSON
+      #    握手行，见 ai-spec 规则 95）。之前只把 `--port` 放进了 args、没写这个 `port` 字段 ⇒
+      #    `spec.port = 0` ⇒ 端口探测用不上 ⇒ 一直等到 readyTimeoutSec 超时才失败（用户报的
+      #    「开启后一直在处理中」就是这个）。
+      port           = 8090
+      autostart      = $false
+      readyTimeoutSec = 180
     }
   }
 }
@@ -331,6 +422,11 @@ foreach ($id in $Ids) {
   # 也就是这一段加进来之前所有插件的样子 —— **别给它们补一个空对象**，
   # 空对象与不写在这里是等价的，写了只会让人以为是必需的。
   if ($meta.window) { $manifest.window = $meta.window }
+  # `sidecar` 段（2026-10-09 补）：**插件自带本机进程**（契约与字段见 `plugin_sidecar.rs`：
+  # command / args / transport / cwd / env / autostart + exe 的 sha256）。与 `window` 同理 ——
+  # **只在声明了才写**（空对象与不写等价，写了只会让人以为是必需的）。
+  # ⚠️ 补这一段之前，生成器**从没输出过** `sidecar` ⇒ 磁盘插件的 sidecar 一直是断的。
+  if ($meta.sidecar) { $manifest.sidecar = $meta.sidecar }
   # UTF-8 无 BOM：Rust 侧读清单时对 BOM 有容错，但**别依赖容错**
   $json = $manifest | ConvertTo-Json -Depth 6
   [IO.File]::WriteAllText((Join-Path $dir "lunac-plugin.json"), $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -382,30 +478,122 @@ foreach ($id in $Ids) {
 #     表现是「改了插件、dev 里怎么点都没反应」，而日志一行报错都没有 ——
 #     **插件的改动必须先在 dev 里生效**，这是能精准调试的前提（用户 2026-10-01 要求）。
 #     `release\ext-plugins\` 那份只服务安装包，它新鲜**不代表** dev 新鲜，两者不能互相顶替。
-function Stage-PluginDir([string]$id, [string]$dst) {
+# ── 依赖内容「下载污染」前置校验（2026-10-12，见 docs/todo.md §待办 1-4 补）──
+# 拦什么：gh-proxy 之类的 GitHub 加速镜像会用 HTML 落地页顶替原件，**总尺寸可与上游完全相同**
+#   ⇒ 只比大小 / 只比「文件在不在」都漏。ONNX Runtime 解析到 HTML 头会抛 `Protobuf parsing
+#   failed`（MSVC 下是未捕获的 0xe06d7363），宿主被直接杀掉 —— 桌宠「试听」闪退的真因。
+# 怎么拦（只看头，不整读大文件）：
+#   ① 通用 HTML 污染：读每个文件**前 512 字节**，以 <!DOCTYPE / <html 开头（大小写不敏感、
+#      容忍 BOM 与前导空白）⇒ 当场 throw，错误信息给出**文件路径 + 首 40 字节 + 诊断**；
+#   ② ZipVoice 必需文件存在且非空（只针对 pet 的 archive 依赖，直白断言，不做通用框架）；
+#   ③ 已知合法 vocos_24khz.onnx 的 sha256 钉死校验。
+# 为什么放在这里：Stage-PluginDir 是**唯一**把 `local` 拷进插件目录（ext-plugins / dev）的入口，
+#   在拷贝**之前**校验，污染文件就进不了产物。
+function Read-FileHeadText([string]$path, [int]$maxBytes) {
+  $fs = [IO.File]::OpenRead($path)
+  try {
+    $n = [int][Math]::Min([int64]$maxBytes, $fs.Length)
+    $buf = New-Object byte[] $n
+    if ($n -gt 0) { [void]$fs.Read($buf, 0, $n) }
+  } finally { $fs.Dispose() }
+  # UTF8 解码（GetString 不自动去 BOM，手动剥一份 UTF-8 BOM）
+  $s = [Text.Encoding]::UTF8.GetString($buf)
+  if ($s.Length -gt 0 -and [int][char]$s[0] -eq 0xFEFF) { $s = $s.Substring(1) }
+  return $s
+}
+# 取头 N 字节的可读预览（不可打印字符以 . 代），用于 throw 信息里的「首 40 字节」
+function Get-FileHeadPreview([string]$path, [int]$maxBytes) {
+  $s = Read-FileHeadText $path $maxBytes
+  $out = ""
+  foreach ($ch in $s.ToCharArray()) {
+    $c = [int][char]$ch
+    if ($c -lt 32 -or $c -gt 126) { $out += "." } else { $out += $ch }
+  }
+  return $out
+}
+function Assert-DepInputClean([string]$id, $dep, [string]$localPath) {
+  # 待检文件：file = 单文件；archive = 已解开的目录（递归）
+  if ($dep.type -eq "archive") {
+    if (-not (Test-Path -LiteralPath $localPath -PathType Container)) {
+      throw "$id 的 archive 依赖 local 应是已解开的目录，但不存在或不是目录：$localPath"
+    }
+    $files = @(Get-ChildItem -LiteralPath $localPath -Recurse -File -ErrorAction Stop)
+  } else {
+    if (-not (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+      throw "$id 的 file 依赖 local 不是文件：$localPath"
+    }
+    $files = @(Get-Item -LiteralPath $localPath)
+  }
+  $nl = [Environment]::NewLine
+  foreach ($f in $files) {
+    $head = Read-FileHeadText $f.FullName 512
+    if ($head -match '^\s*<!doctype' -or $head -match '^\s*<html') {
+      throw ("疑似被 GitHub 加速镜像/gh-proxy 的 HTML 落地页污染：文件总尺寸可能与上游相同但内容不是原文件；请核对 sha256 或更换下载通道。" + $nl +
+             "  文件：" + $f.FullName + $nl +
+             "  该文件首 40 字节（不可打印字符以 . 代）：" + (Get-FileHeadPreview $f.FullName 40))
+    }
+  }
+  # ZipVoice：仅针对 pet 的 archive 依赖，直白断言（不做多引擎注册表式的通用框架）
+  if ($id -eq "pet" -and $dep.type -eq "archive" -and $dep.dest -eq "zipvoice") {
+    $required = @("sherpa-onnx-c-api.dll", "model\encoder.int8.onnx", "model\decoder.int8.onnx", "vocos_24khz.onnx")
+    foreach ($rel in $required) {
+      $p = Join-Path $localPath $rel
+      if (-not (Test-Path -LiteralPath $p -PathType Leaf) -or (Get-Item -LiteralPath $p).Length -le 0) {
+        throw "ZipVoice 资产缺必需文件或为空：$p（$id 的 archive 依赖 local 应为运行期布局）"
+      }
+    }
+    # 已知合法 vocos_24khz.onnx 的 sha256 —— ⚠️ 换模型/换版本时必须同步更新此常量
+    $vocosSha256 = "BCB3B970E384161C4D634F0BB9E999FF1C471B34C9BC0B1049A5014065ED3CC0"
+    $got = (Get-FileHash (Join-Path $localPath "vocos_24khz.onnx") -Algorithm SHA256).Hash
+    if ($got -ne $vocosSha256) {
+      throw "vocos_24khz.onnx 的 sha256 与钉死值不一致（期望 $vocosSha256 / 实得 $got）—— 疑似下载污染，或换了模型/版本而没同步更新本脚本内的常量"
+    }
+  }
+}
+function Stage-PluginDir([string]$id, [string]$dst, [switch]$NoClean) {
   $meta = $Plugins[$id]
   $src = Join-Path $DistDir $id
-  if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+  # `-NoClean`（dev 那份用）：**不整目录删**，只覆盖构建产物。
+  # 为什么（2026-10-09 实测踩到）：dev 的插件目录里躺着**本地铺的依赖**（本地模型 2.5GB 的
+  #   `models\`、`bin\` 等），整目录删会连它们一起清掉 —— 而且大模型文件常因被占用而
+  #   `Remove-Item` 报「Access denied」，把整个构建**中断**。release 那份没有这类本地依赖，
+  #   继续用「先清后拷」以保证干净。构建产物（index.js / 清单 / engine）覆盖式拷贝即可新鲜。
+  if ((Test-Path $dst) -and -not $NoClean) { Remove-Item $dst -Recurse -Force }
   New-Item -ItemType Directory -Path $dst -Force | Out-Null
   Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force
   # `dependencies` 只对**市场安装**生效（宿主下载 + 校验 sha256）—— 这两条暂存路都**不会**下载。
-  # 所以凡是有本机副本（`local`）的 `file` 依赖，必须在这里预先进目标目录；否则
-  # 「安装器里勾了桌宠」的用户、以及 dev 实例，一开 Live2D 只会看到「引擎文件加载失败」。
-  # **逐字节校验**：同一份文件好几条分发路，暂存的那份必须与清单钉死的 sha256 一致。
+  # 所以凡是有本机副本（`local`）的依赖，必须在这里预先进目标目录；否则
+  # 「安装器里勾了桌宠」的用户、以及 dev 实例，一开 Live2D / 语音会看到「引擎文件加载失败」。
+  #   · `file` 的 `local` = 单个文件，**逐字节校验**（同一份文件好几条分发路，暂存的那份必须
+  #     与清单钉死的 sha256 一致）；
+  #   · `archive` 的 `local` = 打包机上**已解开的目录**（如 `deps\zipvoice\_stage\zipvoice`）——
+  #     archive 的 sha256 校验的是**压缩包本身**（那是市场安装器的事），这里只把整棵树拷进
+  #     dest，让 dev / 安装包的插件目录与「市场装完」的形状一致。
   foreach ($dep in $meta.dependencies) {
-    if ($dep.type -ne "file" -or -not $dep.local) { continue }
-    $file = Join-Path "$Root\release" $dep.local
-    if (-not (Test-Path $file)) {
+    if (-not $dep.local) { continue }
+    $src = Join-Path "$Root\release" $dep.local
+    if (-not (Test-Path $src)) {
       Write-Host "  [!] 缺本机副本 $($dep.local) —— $id 的暂存里**没有**这份依赖（市场安装不受影响）" -ForegroundColor Yellow
       continue
     }
-    $got = (Get-FileHash $file -Algorithm SHA256).Hash
+    # 前置内容校验（**在拷贝之前**）：拦 HTML 落地页污染 + ZipVoice 必需文件/sha256（见上面的函数）。
+    Assert-DepInputClean $id $dep $src
+    $target = Join-Path $dst $dep.dest
+    if ($dep.type -eq "archive") {
+      if (-not (Test-Path $src -PathType Container)) {
+        Write-Host "  [!] $($dep.local) 不是目录 —— archive 依赖的 local 应是已解开的目录，已跳过" -ForegroundColor Yellow
+        continue
+      }
+      New-Item -ItemType Directory -Path $target -Force | Out-Null
+      Copy-Item -Path (Join-Path $src "*") -Destination $target -Recurse -Force
+      continue
+    }
+    $got = (Get-FileHash $src -Algorithm SHA256).Hash
     if ($got -ne $dep.sha256.ToUpper()) {
       throw "$($dep.local) 的 sha256 与清单钉死的不一致（期望 $($dep.sha256) / 实得 $got）—— 换版本时两处必须一起改"
     }
-    $target = Join-Path $dst $dep.dest
     New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
-    Copy-Item -Path $file -Destination $target -Force
+    Copy-Item -Path $src -Destination $target -Force
   }
 }
 
@@ -422,7 +610,7 @@ $DevRoot = "$AppDir\src-tauri\target\debug"
 if (Test-Path (Join-Path $DevRoot "lunac.exe")) {
   Write-Host "[5/5] 同步给 dev 实例（app\src-tauri\target\debug\Modules）..." -ForegroundColor Yellow
   foreach ($id in $Ids) {
-    Stage-PluginDir $id (Join-Path $DevRoot "Modules\$id")
+    Stage-PluginDir $id (Join-Path $DevRoot "Modules\$id") -NoClean
     Write-Host "  Modules\$id" -ForegroundColor DarkGray
   }
 } else {
@@ -437,10 +625,18 @@ Write-Host "       licenses\live2d-cubism-core\LICENSE.md licenses\live2d-cubism
 Write-Host "       -R LythrumMoon/lunac-plugins -t 'Live2D Cubism Core 5.1.0'"
 Write-Host "   · 三份缺一不可：只挂 Core 不挂授权文件 = 没满足协议 5.1 的随附条件" -ForegroundColor DarkGray
 Write-Host ""
+Write-Host "⓪ 桌宠的 ZipVoice 语音资产传过没有？它也是一次再分发（CC-BY-NC / GPL-3.0 随附义务）：" -ForegroundColor Yellow
+Write-Host "     gh release create zipvoice-1.13.8 ^"
+Write-Host "       release\deps\zipvoice\zipvoice-1.13.8.7z ^"
+Write-Host "       -R LythrumMoon/lunac-plugins -t 'ZipVoice 语音资产 1.13.8'"
+Write-Host "   · 标签(`zipvoice-1.13.8`)与文件名(`zipvoice-1.13.8.7z`)必须与 pet 清单里的 url/sha256" -ForegroundColor DarkGray
+Write-Host "     逐字一致，否则市场安装会因 sha256 对不上而整包拒装" -ForegroundColor DarkGray
+Write-Host "   · 授权全文已随包（zipvoice\LICENSES\ + THIRD_PARTY_NOTICES.md），不必单独挂" -ForegroundColor DarkGray
+Write-Host ""
 Write-Host "下一步：把它发布到**公开**插件仓库（终端用户要能免鉴权直链下载）。" -ForegroundColor Yellow
 Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1"
 Write-Host "  · 默认目标仓库：LythrumMoon/lunac-plugins（公开；不存在时先用 gh repo create 建）"
-Write-Host "  · 它会把 zip 放进 packages\ 并生成 index.json，然后 commit + push"
+Write-Host "  · 它会把 zip 按分类放进 packages\<分类>\ 并生成 index.json，然后 commit + push"
 Write-Host "  · 宿主常量 INDEX_URL 指向该仓库的 index.json（见 src-tauri/src/plugin_market.rs）"
 Write-Host ""
 Write-Host "只想本机试装（不进市场）：把 zip 解到 <exe 根>\Modules\<id>\，再在 设置 → 插件 → 重新扫描。" -ForegroundColor DarkGray

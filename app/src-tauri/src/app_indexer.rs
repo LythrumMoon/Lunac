@@ -104,6 +104,9 @@ pub fn refresh_in_background() {
         return;
     }
     std::thread::spawn(|| {
+        // 启动扫盘降级（2026-10-09）：本线程切进 Windows 后台模式（CPU + I/O 优先级同时
+        // 下调），扫盘给游戏 / 前台应用让路。搜索路径不受影响 —— 它只读缓存文件。
+        crate::win_proc::enter_background_mode();
         write_cache(&scan_all_uncached());
         REFRESHING.store(false, Ordering::SeqCst);
     });

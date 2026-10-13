@@ -1,7 +1,7 @@
 {
   "name": "lunac",
   "private": true,
-  "version": "0.9.33",
+  "version": "0.9.36",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,7 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@pixi/unsafe-eval": "^7.4.3",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.1",

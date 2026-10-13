@@ -3132,7 +3132,7 @@ fn exe_name_matches(name: &str) -> bool {
 pub fn spotify_desktop_running() -> bool {
     #[cfg(target_os = "windows")]
     {
-        win_proc::process_names().iter().any(|n| exe_name_matches(n))
+        process_names().iter().any(|n| exe_name_matches(n))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -3140,76 +3140,15 @@ pub fn spotify_desktop_running() -> bool {
     }
 }
 
-/// 进程枚举（raw FFI）。**刻意不引 `sysinfo` 这类新依赖**，也不 spawn `tasklist`：
-/// 后者每 3 秒起一个进程、输出还是本地化文本（`tasklist /FI` 无匹配时打的那句
-/// 「信息: 没有运行的任务…」随系统语言变，按文本判会误判）。`hotkey.rs` 里已经有一批
-/// 手写 `extern "system"` 的同类写法（`user32` / `kernel32` / `shell32`），这里是同一套。
+/// 当前所有进程的**映像名**（不含路径，如 `Spotify.exe`）。读不到就返回空表 ——
+/// 调用方只关心「有没有」，把失败当「没在跑」比抛错更合适（拿不到快照不该打断任何事）。
+///
+/// **实现在 `crate::win_proc`**（2026-10-08 搬出）：同一个 Win32 符号在一个 crate 里
+/// 只能有一种声明 —— 两处各写一份不同签名的 `Process32FirstW` 会让 rustc 报
+/// `clashing_extern_declarations`。
 #[cfg(target_os = "windows")]
-mod win_proc {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-    const INVALID_HANDLE_VALUE: isize = -1;
-    /// `MAX_PATH`。`szExeFile` 是定长数组，进程映像名（不含路径）不可能超过它。
-    const MAX_PATH: usize = 260;
-
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct PROCESSENTRY32W {
-        dwSize: u32,
-        cntUsage: u32,
-        th32ProcessID: u32,
-        th32DefaultHeapID: usize,
-        th32ModuleID: u32,
-        cntThreads: u32,
-        th32ParentProcessID: u32,
-        pcPriClassBase: i32,
-        dwFlags: u32,
-        szExeFile: [u16; MAX_PATH],
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
-        fn Process32FirstW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
-        fn Process32NextW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
-        fn CloseHandle(handle: isize) -> i32;
-    }
-
-    /// 当前所有进程的**映像名**（不含路径，如 `Spotify.exe`）。读不到就返回空表 ——
-    /// 调用方只关心「有没有」，把失败当「没在跑」比抛错更合适（拿不到快照不该打断任何事）。
-    pub fn process_names() -> Vec<String> {
-        let mut out = Vec::new();
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == 0 || snap == INVALID_HANDLE_VALUE {
-                return out;
-            }
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            // `dwSize` 必须在第一次调用前填好，否则 Process32FirstW 直接失败
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            if Process32FirstW(snap, &mut entry) != 0 {
-                loop {
-                    let len = entry
-                        .szExeFile
-                        .iter()
-                        .position(|&c| c == 0)
-                        .unwrap_or(MAX_PATH);
-                    out.push(
-                        OsString::from_wide(&entry.szExeFile[..len])
-                            .to_string_lossy()
-                            .to_string(),
-                    );
-                    if Process32NextW(snap, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-            CloseHandle(snap);
-        }
-        out
-    }
+fn process_names() -> Vec<String> {
+    crate::win_proc::list().into_iter().map(|e| e.name).collect()
 }
 
 // ── 单元测试 ──────────────────────────────────────────────────────

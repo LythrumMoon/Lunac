@@ -19,3 +19,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------
+
+第三方组件（Third-Party Components）
+
+上述 MIT 许可仅覆盖本项目（Lunac）的原创代码。本项目另行下载 / 分发的第三方组件
+各自适用其自身许可，**不受**本 MIT 许可覆盖，例如：
+
+  · ZipVoice 预训练权重       CC BY-NC 4.0（仅限非商用，不得商用）
+  · eSpeak NG 数据            GPL-3.0
+  · sherpa-onnx               Apache-2.0
+  · ONNX Runtime              MIT
+  · Vocos                     MIT
+  · Live2D Cubism Core        Live2D 专有许可
+
+各组件许可全文与义务清单见仓库 `licenses/` 目录（README 的「第三方组件与许可」一节
+有完整列表）。下游使用者须自行遵守相应许可；涉及商业用途时须向对应权利方取得授权。

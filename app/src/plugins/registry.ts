@@ -10,7 +10,7 @@
 //    e.g. "jisuan" / "js" → matches "计算" (jì suàn)
 
 import { pinyin } from "pinyin-pro";
-import { isMergedPlugin } from "./kinds";
+import { isMergedPlugin, isHeadlessPlugin } from "./kinds";
 
 export interface Plugin {
   id: string;
@@ -184,7 +184,9 @@ class PluginRegistry {
     // ai 插件中」）。判据用 `isMergedPlugin()`，与市场表那侧（`showsInMarket`）同源 ——
     // 它**仍然注册在 registry 里**（设置页那条入口与 `__lunac_execute_tool_editor` 桥
     // 要靠它），所以只在这里挡，不动注册。
-    const pool = this.plugins.filter(p => !isMergedPlugin(p.id));
+    // 基础设施插件（`isHeadlessPlugin`，如 local-model）**也不进搜索结果** —— 它没有用户入口，
+    // 开关在「设置 → AI」，但**仍留在插件市场**（判据分开的原因见 kinds.ts）。
+    const pool = this.plugins.filter(p => !isMergedPlugin(p.id) && !isHeadlessPlugin(p.id));
     if (!q) return pool.slice(0, 6);
 
     const scored: { plugin: Plugin; score: number }[] = [];

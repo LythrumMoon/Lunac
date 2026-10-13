@@ -30,6 +30,9 @@ export interface UsageHourTotals {
 }
 export interface UsageModelTotals {
   model: string;
+  /** 这一桶用量**来自哪个入口**（来源归因）：空串 = 普通聊天（旧记录的缺省），
+   *  `"pet"` = 桌宠发起的那一轮。面板的「来源」下拉据此过滤（见 `UsageSourceFilter`）。 */
+  source?: string;
   turns: number;
   /** 真实 API 请求数（见 `UsageHourTotals.requests`） */
   requests?: number;
@@ -145,6 +148,23 @@ export function parseUsageRangeValue(v: string): UsageRange {
  *  多模型混用（换过模型 / 用过子代理）时它才是一个可选项，单一模型时只把名字显示出来。 */
 export type UsageModelFilter = string | null;
 
+/** 面板里「当前统计的来源」（来源归因分区）：`null` = 全部；`"pet"` = 桌宠发起；`"chat"` = 普通聊天。
+ *  与「模型」正交 —— 两个筛选各切一刀，金额仍走同一套算法（只是先按来源裁一次模型桶）。 */
+export type UsageSourceFilter = "pet" | "chat" | null;
+
+/** 记录里的来源 → 面板分区键：只有 `"pet"` 单列一档，其余（含空串）都算普通聊天。 */
+function sourcePartition(source: string | undefined): "pet" | "chat" {
+  return source === "pet" ? "pet" : "chat";
+}
+
+/** 分区键 ↔ 下拉 value（一进一出成对写在一处，别两头各拼一套，同 `usageRangeValue`）。 */
+export function usageSourceValue(f: UsageSourceFilter): string {
+  return f === null ? "all" : f;
+}
+export function parseUsageSourceValue(v: string): UsageSourceFilter {
+  return v === "pet" ? "pet" : v === "chat" ? "chat" : null;
+}
+
 /** 这批数据里出现过的模型名（去重、升序）。**取自未裁剪的那份** ——
  *  否则「选了某一天 → 别的模型从选项里消失 → 切不回去」。 */
 export function usageModels(d: UsageCostData): string[] {
@@ -153,11 +173,18 @@ export function usageModels(d: UsageCostData): string[] {
   return [...set].sort((a, b) => a.localeCompare(b));
 }
 
-/** 把一天裁到只留某个模型。**日级那几个合计必须按留下的模型重算** ——
+/** 把一天裁到只留满足条件的模型桶。**日级那几个合计必须按留下的模型重算** ——
  *  它们原本是跨模型累加的，不重算就会出现「表里只有 A 的行，合计却是 A+B」。
- *  这天没有该模型的量 ⇒ 返回 `null`（整行不显示，别留一个全零行）。 */
-function keepModel(day: UsageDay, model: string): UsageDay | null {
-  const models = day.models.filter((m) => m.model === model);
+ *  这天没有符合条件的量 ⇒ 返回 `null`（整行不显示，别留一个全零行）。
+ *
+ *  两个筛选正交：`model`（模型名，`null` = 全部）与 `source`（来源分区，`null` = 全部）。
+ *  同一个模型名下可能有两个来源桶（桌宠 / 普通聊天），两者各自独立成行、各自计价。 */
+function keepModel(day: UsageDay, model: UsageModelFilter, source: UsageSourceFilter): UsageDay | null {
+  const models = day.models.filter(
+    (m) =>
+      (model === null || m.model === model) &&
+      (source === null || sourcePartition(m.source) === source),
+  );
   if (models.length === 0) return null;
   const sum = (pick: (m: UsageModelTotals) => number) => models.reduce((a, m) => a + pick(m), 0);
   return {
@@ -172,12 +199,13 @@ function keepModel(day: UsageDay, model: string): UsageDay | null {
   };
 }
 
-/** 把读回来的那份（近 `COST_RANGE_DAYS` 天）裁到所选范围 + 所选模型 —— 面板的头
+/** 把读回来的那份（近 `COST_RANGE_DAYS` 天）裁到所选范围 + 所选模型 + 所选来源 —— 面板的头
  *  （未定价）与表格必须看同一段，否则会出现「表格里没有的量却把模型列进未定价」。 */
 export function scopedUsageData(
   d: UsageCostData,
   r: UsageRange,
   model: UsageModelFilter = null,
+  source: UsageSourceFilter = null,
 ): UsageCostData {
   const keep =
     r.kind === "today" ? new Set([costDateKey(new Date())])
@@ -185,7 +213,7 @@ export function scopedUsageData(
     : new Set(lastNDates(r.days));
   const days = d.days
     .filter((x) => keep.has(x.date))
-    .map((x) => (model === null ? x : keepModel(x, model)))
+    .map((x) => (model === null && source === null ? x : keepModel(x, model, source)))
     .filter((x): x is UsageDay => x !== null);
   return { ...d, days };
 }
@@ -560,6 +588,21 @@ function rangeSelectHtml(d: UsageCostData, range: UsageRange): string {
   return `<select class="cost-range-select" id="cost-range-select" aria-label="${esc(t("settings.cost_col_time"))}">${parts.join("")}</select>`;
 }
 
+/** 右上角「来源」下拉框（来源归因分区）：全部 / 桌宠 / 普通聊天。与「日期」下拉**同一形态**
+ *  （`.cost-range-select`）、**同一容器**（`.cost-range`，用既有的 `.cost-kv` 给出间距）。
+ *  切换后由 `scopedUsageData` 按来源裁模型桶 —— 逐日表格与合计都跟着变，金额仍走 `dayCost`。 */
+function sourceSelectHtml(source: UsageSourceFilter): string {
+  const cur = usageSourceValue(source);
+  const opt = (v: string, label: string) =>
+    `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label)}</option>`;
+  const parts = [
+    opt("all", t("settings.cost_source_all")),
+    opt("pet", t("settings.cost_source_pet")),
+    opt("chat", t("settings.cost_source_chat")),
+  ];
+  return `<select class="cost-range-select" id="cost-source-select" aria-label="${esc(t("settings.cost_k_source"))}">${parts.join("")}</select>`;
+}
+
 /** 左上角「当前统计的模型」那一格（2026-10-06 用户定）：
  *  没有模型 → `—`；只有一个 → 直接显示名字（不必给一个只有一项的下拉框）；
  *  多个（混用过模型 / 子代理）→ 下拉框，第一项是「总计」。 */
@@ -584,13 +627,14 @@ function modelChipHtml(d: UsageCostData, model: UsageModelFilter): string {
 
 /** 表盘展开面板的正文：**只有数据，没有说明文字**（用户 2026-09-29 定：
  *  「只是移入数据，并不是移入说明」）—— 左上角数据（最后更新价格日期 / 当前统计的模型 /
- *  未定价 / 候选文件路径）、右上角时间范围下拉框，中间是逐日或逐小时的表格（含合计行）。 */
+ *  未定价 / 候选文件路径）、右上角时间范围与来源两个下拉框，中间是逐日或逐小时的表格（含合计行）。 */
 export function renderUsageCostPanel(
   d: UsageCostData,
   range: UsageRange,
   model: UsageModelFilter = null,
+  source: UsageSourceFilter = null,
 ): string {
-  const scoped = scopedUsageData(d, range, model);
+  const scoped = scopedUsageData(d, range, model, source);
   const hasPrices = Object.keys(d.pricing?.models || {}).length > 0;
   const tot = sumUsageCost(scoped);
   const cells: string[] = [];
@@ -616,6 +660,6 @@ export function renderUsageCostPanel(
     );
   }
   return `<div class="cost-head"><div class="cost-data">${cells.join("")}</div>` +
-    `<div class="cost-range">${rangeSelectHtml(d, range)}</div></div>` +
+    `<div class="cost-range"><span class="cost-kv">${sourceSelectHtml(source)}${rangeSelectHtml(d, range)}</span></div></div>` +
     renderUsageCostTable(scoped, range);
 }

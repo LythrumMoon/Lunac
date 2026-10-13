@@ -5,9 +5,15 @@
 #
 # 为什么需要它：插件包与市场索引必须放在**公开、可直链**的地方 —— 私有仓库的 Release 与
 # raw 链接，终端用户下载时要鉴权，等于下不到。所以：
-#   · 插件仓库（默认 LythrumMoon/lunac-plugins，公开）里放 packages\<id>-<ver>.zip + index.json
+#   · 插件仓库（默认 LythrumMoon/lunac-plugins，公开）里放 packages\<分类>\<id>-<ver>.zip + index.json
 #   · 宿主常量 INDEX_URL 指向它的 index.json（见 src-tauri/src/plugin_market.rs）
 #   · 每个包的 url 用 raw.githubusercontent.com 直链（https，无需鉴权）
+#
+# 关于**按分类**（2026-10-13 加）：包落到 packages\<分类>\，index.json 里那条 url 写成
+#   .../packages/<分类>/<id>-<版本>.zip。宿主**直接用这条完整 url**去下（见 plugin_market.rs 的
+#   parse_index / commands.rs 的 install_plugin_from_url 与前端 settings.ts），**不拼「基址 + 固定
+#   路径」** —— 所以放进子目录**不会**影响用户拉取，只要 url 里同步带上分类目录即可（本脚本自动带）。
+#   分类由下面的 $Categories 表决定；没登记的 id 落到 other\。
 #
 # 前置：① 先跑 scripts\build-plugins.ps1 产出 release\plugin-packages\*.zip
 #       ② 本机已 `gh auth login`（用 gh 建仓库 / 探活；推送本身走 git）
@@ -17,6 +23,8 @@
 #   -Repo LythrumMoon/lunac-plugins   换目标仓库
 #   -WorkDir D:\cc\lunac-plugins      换本地克隆位置（缺省用仓库的兄弟目录）
 #   -NoPush                           只生成 index.json 与拷贝，不 commit / push（先看一眼）
+#
+# 分类由脚本内的 $Categories 表决定（id → 目录名）；新插件不登记则落到 other\。
 
 param(
   [string]$Repo = "LythrumMoon/lunac-plugins",
@@ -28,6 +36,26 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $PkgDir = "$Root\release\plugin-packages"
 $DistDir = "$Root\app\plugin-dist"
+
+# ── 分类表（2026-10-13）：插件 id → packages\<分类>\ 的目录名 ──────────────
+# 只影响**包里放哪、url 长什么样、README 里怎么归类**，不改变安装 / 升级语义
+# （宿主只认 index.json 里那条完整 url）。**新增插件必须在这里登记**，否则落到 other\。
+# 现有的 7 个官方插件（music / clipboard-history / ocr / convert / proxy / pet / local-model）
+# 全覆盖；与 lunac-plugins 仓库 README 的「分类」一节保持一致。
+$Categories = @{
+  "convert"           = "productivity"   # 文件转换
+  "clipboard-history" = "productivity"   # 剪贴板历史
+  "music"             = "media"          # 音乐
+  "ocr"               = "ocr"            # 文字识别
+  "pet"               = "pet"            # 桌宠
+  "local-model"       = "ai"             # 本地决策模型
+  "proxy"             = "system"         # 系统代理
+}
+function Get-PluginCategory([string]$id) {
+  if ($Categories.ContainsKey($id)) { return $Categories[$id] }
+  Write-Host "  [!] 插件 '$id' 没登记分类 —— 落到 other\" -ForegroundColor Yellow
+  return "other"
+}
 
 if (-not $WorkDir) {
   $WorkDir = Join-Path (Split-Path -Parent $Root) (Split-Path -Leaf $Repo)
@@ -81,11 +109,26 @@ if (Test-Path (Join-Path $WorkDir ".git")) {
 $PkgOut = Join-Path $WorkDir "packages"
 New-Item -ItemType Directory -Path $PkgOut -Force | Out-Null
 
-# ── 2. 拷包 ────────────────────────────────────────────────────────
+# ── 2. 拷包（按分类进子目录 packages\<分类>\）──────────────────────────
 Write-Host "[2/4] 拷贝插件包..." -ForegroundColor Yellow
+$keptNames = @{}
 foreach ($z in $zips) {
-  Copy-Item $z.FullName -Destination $PkgOut -Force
-  Write-Host "  $($z.Name)" -ForegroundColor DarkGray
+  $id = $z.BaseName -replace '-[\d.]+$', ''
+  $cat = Get-PluginCategory $id
+  $destDir = Join-Path $PkgOut $cat
+  New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+  Copy-Item $z.FullName -Destination $destDir -Force
+  $keptNames[$z.Name] = $true
+  Write-Host "  $cat\$($z.Name)" -ForegroundColor DarkGray
+}
+# **只留最新版**（2026-10-13 强化）：清掉 packages\ 下所有**不在本次发布集合里**的 zip —— 覆盖两种残留：
+#   ① 同一个 id 的旧版本（如 pet-0.9.8）；② 早先平铺在 packages\ 根、如今已改到子目录的旧包。
+#   删完靠下面的 `git add packages` 一并登记删除（git ≥ 2.0 的 `git add <pathspec>` 会暂存删除）。
+$orphans = @(Get-ChildItem $PkgOut -Recurse -File -Filter *.zip -ErrorAction SilentlyContinue) |
+  Where-Object { -not $keptNames.ContainsKey($_.Name) }
+foreach ($o in $orphans) {
+  Write-Host "  删除旧包 $($o.FullName.Substring($PkgOut.Length + 1))（已被新版本 / 新布局取代）" -ForegroundColor DarkGray
+  Remove-Item $o.FullName -Force
 }
 
 # ── 3. 生成 index.json ─────────────────────────────────────────────
@@ -98,6 +141,7 @@ $entries = @()
 foreach ($z in $zips) {
   # 从构建产物里读清单（app\plugin-dist\<id>\lunac-plugin.json）—— zip 名就是 <id>-<version>
   $id = $z.BaseName -replace '-[\d.]+$', ''
+  $cat = Get-PluginCategory $id
   $manifestPath = Join-Path (Join-Path $DistDir $id) "lunac-plugin.json"
   if (-not (Test-Path $manifestPath)) {
     throw "找不到 $manifestPath —— 插件包与构建产物不一致，先重跑 build-plugins.ps1"
@@ -108,7 +152,7 @@ foreach ($z in $zips) {
     name        = $m.name
     description = $m.description
     version     = $m.version
-    url         = "$RawBase/$($z.Name)"
+    url         = "$RawBase/$cat/$($z.Name)"
     keywords    = $m.keywords
     icon        = $m.icon
     homepage    = $m.homepage

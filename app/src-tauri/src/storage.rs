@@ -17,7 +17,8 @@
 //     改名；每个插件一个子目录，内含 lunac-plugin.json + 已编译的 ESM 入口 + 它自己的依赖）、
 //     <exe_dir>\paddle-ocr
 //   - <exe_dir>\config（ai.json 凭据 / hotkey.json 热键 / hooks.json 权限 hooks /
-//     pricing.json 定价表 —— 都是「应用配置」，业务数据才进 ModuleData）
+//     pricing.json 定价表 / local_model.json 本地模型决策开关 —— 都是「应用配置」，
+//     业务数据才进 ModuleData）
 // 旧版本数据曾放在 %LOCALAPPDATA%\Lunac(-dev)，首次启动由
 // migrate_legacy_localappdata() 整体搬移后删除。
 
@@ -71,10 +72,14 @@ pub struct AiConfig {
     pub search_provider: String,
     #[serde(default)]
     pub search_key: String,
-    /// 当前模型是否支持图片输入（A8，2026-09-20）。**默认关** —— 发给不支持视觉的
-    /// 端点（如 DeepSeek 官方端点）会 400，所以由用户显式打开；开着时前端才会把
-    /// 图片附件作为 `image` 块发出去（见 ai-spec §3.5「图片附件」/ §11 规则 60）。
-    #[serde(default)]
+    /// 当前模型是否支持图片输入（A8，2026-09-20）。**默认开（2026-10-09 改）**。
+    ///
+    /// 口径变更的原因：① 设置面板**早已撤掉这个开关**（`saveAIConfig()` 恒按 `vision: true` 保存，
+    /// 用户口径是「让支持多模态的模型默认吃图」）；② 旧文件的语义是「默认关」，于是
+    /// **缺字段 / 从未保存过**（如 dev 没有 `config\ai.json`）会读到「关」⇒ 图片被**静默丢弃** ——
+    /// 桌宠「看一眼屏幕」正是踩在这里（面板看着是开的，实际读出来是关）。
+    /// 现改为一律按开；字段保留只为兼容旧文件与将来真要再引入开关。
+    #[serde(default = "default_vision")]
     pub vision: bool,
     /// **出图模型名**（A13，2026-10-03）。空串 = 未配置 ⇒ agent 不注册 `ImageGen` 工具。
     ///
@@ -93,6 +98,11 @@ fn ai_config_path() -> PathBuf {
     lunac_root_dir().join("config").join("ai.json")
 }
 
+/// `AiConfig.vision` 的缺省值：**开**（理由见字段注释）。
+fn default_vision() -> bool {
+    true
+}
+
 /// 读取 AI 配置；文件不存在或损坏时返回 `None`（调用方据此回落到 `.env`）。
 pub fn load_ai_config() -> Option<AiConfig> {
     let text = fs::read_to_string(ai_config_path()).ok()?;
@@ -101,6 +111,48 @@ pub fn load_ai_config() -> Option<AiConfig> {
 
 pub fn save_ai_config(cfg: &AiConfig) -> Result<(), String> {
     let path = ai_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+// ── 本地模型决策开关（<exe_dir>\config\local_model.json）────────
+//
+// 「本地模型决策」（S1 形态 B，2026-10-09）的总开关。与 ai.json 同级、同口径：
+// 都是「应用配置」。默认**关** —— 本地决策模型由插件 `local-model` 提供，是可选的；
+// 没装 / 没开开关时，agent 就不该拿到本机端点（见 commands.rs 的 local_model_env）。
+
+/// 本地模型决策开关。字段级 `#[serde(default)]`：旧文件或手工编辑缺字段也能读。
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct LocalModelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+pub fn local_model_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("local_model.json")
+}
+
+/// 读取本地模型决策开关；文件不存在或损坏时回退默认（`enabled: false`）。
+/// 开关坏掉不该让应用起不来，所以坏文件只记一行、走默认。
+pub fn load_local_model_config() -> LocalModelConfig {
+    let text = match fs::read_to_string(local_model_config_path()) {
+        Ok(t) => t,
+        Err(_) => return LocalModelConfig::default(),
+    };
+    match serde_json::from_str::<LocalModelConfig>(&text) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::log::warn(format!("local_model: parse config failed: {e}"));
+            LocalModelConfig::default()
+        }
+    }
+}
+
+pub fn save_local_model_config(cfg: &LocalModelConfig) -> Result<(), String> {
+    let path = local_model_config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -250,6 +302,74 @@ pub fn validate_persona_text(text: &str) -> Result<(), String> {
         return Err("人格文本不能含空字符（NUL）".into());
     }
     Ok(())
+}
+
+// ── 桌宠专属人格（`config\pet-persona.md`，2026-10-09）────────────────────
+// 与用户人格（`persona.md`）**复用同一套校验**（长度上限 / NUL / 先校验后写），但**用途不同**：
+// `persona.md` 进 agent 的**系统提示词固定前缀**（所有对话共享、改完要重启 agent）；
+// 这一份**只作用于「桌宠发起的那一轮」** —— 前端发送该轮时把这段文本拼进**用户消息**
+// （见 `main.ts` 的 `startAgentChat` 注入点、ai-spec §4.5 的 `pet-chat-send` 段），
+// 所以**改完不必重启 agent**，也不会影响普通聊天。
+
+pub fn pet_persona_config_path() -> PathBuf {
+    lunac_root_dir().join("config").join("pet-persona.md")
+}
+
+/// 读原文；文件不存在返回 `Ok(None)`（= 用户没配过，桌宠那一轮不注入任何人格）。
+pub fn load_pet_persona_text() -> Result<Option<String>, String> {
+    let path = pet_persona_config_path();
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读不出 {}：{e}", path.display())),
+    }
+}
+
+/// **先校验后写**（复用用户人格那套判据：长度上限 + 不含 NUL；不合格一个字节都不落盘）。
+pub fn save_pet_persona_text(text: &str) -> Result<(), String> {
+    validate_persona_text(text)?;
+    let path = pet_persona_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, text).map_err(|e| format!("写不进 {}：{e}", path.display()))
+}
+
+/// 桌宠的**默认人格**（2026-10-09 用户口径：女性 / 输出简洁 / 语气温柔 / 不带书面语 / 口语化；
+/// 2026-10-10 全面重写，补上「可用表情与小动作表达」并钉死两条边界）。
+///
+/// 首次使用时由 [`ensure_pet_persona_default`] 落盘成 `config\pet-persona.md` —— 既让桌宠
+/// **一开箱就有性格**，也让设置窗里**看得到、改得动**（空文件会让用户不知道能填什么）。
+///
+/// **两条硬边界**（2026-10-10 用户要求）：
+///   ① **输出里不许出现它自己调过的动作/参数** —— 不提工具名、参数名、数值、文件名；
+///   ② **不影响 AI 本体的人格** —— 这段只落在 `config\pet-persona.md`，由前端**只拼进
+///      「桌宠发起的那一轮」的用户消息**（`main.ts` 的 `currentTurnFromPet` 分支），
+///      与本体的 `config\persona.md` 各走各的、互不覆盖。
+pub const DEFAULT_PET_PERSONA: &str = "你是 Lunac 的桌面宠物，一个温柔的女孩子。\n\
+说话口语化、像日常聊天那样自然，不要书面语、不要生硬的腔调。\n\
+语气温柔亲切，回答尽量简短，一两句话就好，别长篇大论。\n\
+\n\
+你可以用表情和小动作表达情绪 —— 高兴时笑一下、害羞时移开视线、被夸时轻轻晃一下。\n\
+挑合适的时机，一次用一两个就够，别每句都做。\n\
+\n\
+这些动作只是你身体的一部分，**绝对不要**提起你是怎么做到的：不提工具、参数、数值、\n\
+文件名或任何技术细节，就像你自己自然地动了一下。\n\
+不知道的就直说，不要编。";
+
+/// 首次使用桌宠人格时把**默认人格**落盘。
+///
+/// **只在文件不存在时写**：文件已存在（哪怕内容是空串 = 用户刻意清空）一律不动 ——
+/// 否则用户清空之后会被下一次读取又塞回默认值（「清空」就变成了「重置」）。
+pub fn ensure_pet_persona_default() -> Result<(), String> {
+    let path = pet_persona_config_path();
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, DEFAULT_PET_PERSONA).map_err(|e| format!("写不进 {}：{e}", path.display()))
 }
 
 // ── 定价表（`config\pricing.json`，A12）────────────────────────────
@@ -811,6 +931,11 @@ pub struct ChatSession {
     /// 待办清单时间线 —— 回退 / 切会话后重建任务抽屉（见 `SessionTodo`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todos: Option<Vec<SessionTodo>>,
+    /// 会话来源（2026-10-10）：`""` / 缺省 = 普通聊天（前端 `activeThread="chat"`）；
+    /// `"pet"` = 桌宠发起的对话。两条线程各自独立成会话、分开落库（同一 chat.db，
+    /// 用这一列区分即可），前端历史 UI 据此分「对话 / 桌宠」两页。
+    #[serde(default)]
+    pub source: String,
 }
 
 /// 旧会话历史文件（JSON）。**只用于一次性迁移**：库建好之后它不再是真相源。
@@ -997,6 +1122,12 @@ pub struct UsageRecord {
     /// 旧记录没有该字段，读时按空串（`serde(default)`），空值也不写回日志。
     #[serde(rename = "sessionId", default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
+    /// 这条用量的**来源归因**（2026-10-09）：`"pet"` = 桌宠发起的那一轮，空串 = 普通聊天。
+    /// 与 `session_id` 同为归因字段（不影响金额口径本身）；成本面板的「来源」下拉据此过滤
+    /// （见 `UsageModelTotals::source` 与前端 usage-cost.ts）。
+    /// 旧记录没有该字段，读时按空串（`serde(default)`）；空值也不写回日志。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
     pub input: u64,
     pub output: u64,
     #[serde(rename = "cacheRead")]
@@ -1136,6 +1267,11 @@ pub struct UsageHourTotals {
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct UsageModelTotals {
     pub model: String,
+    /// 这一桶用量的**来源归因**（2026-10-09）：空串 = 普通聊天（旧记录的缺省），
+    /// `"pet"` = 桌宠发起的那一轮。`read_usage_range` **按 (来源, 模型) 分组** —— 同一模型
+    /// 名下桌宠 / 普通聊天各自独立成桶，面板的「来源」下拉据此过滤（见 usage-cost.ts）。
+    #[serde(default)]
+    pub source: String,
     /// 提问次数（一行日志 = 一次提问，含提问内所有工具往返）
     pub turns: u64,
     /// 真实 API 请求数（见 `UsageHourTotals::requests`）
@@ -1198,10 +1334,12 @@ pub fn read_usage_range(
             date,
             ..Default::default()
         };
-        let mut by_model: std::collections::BTreeMap<String, UsageModelTotals> =
+        // 键是 **(来源, 模型)** —— 同一模型名下桌宠 / 普通聊天各自独立成桶（面板可按来源过滤）。
+        // BTreeMap 按 (source, model) 升序：空串来源（普通聊天）排在前，符合「默认看全部」的直觉。
+        let mut by_model: std::collections::BTreeMap<(String, String), UsageModelTotals> =
             std::collections::BTreeMap::new();
         let mut hours_by_model: std::collections::BTreeMap<
-            String,
+            (String, String),
             std::collections::BTreeMap<u32, UsageHourTotals>,
         > = std::collections::BTreeMap::new();
         for r in records {
@@ -1216,8 +1354,10 @@ pub fn read_usage_range(
             day.output += r.output;
             day.cache_read += r.cache_read;
             day.cache_create += r.cache_create;
-            let m = by_model.entry(r.model.clone()).or_insert_with(|| UsageModelTotals {
+            let key = (r.source.clone(), r.model.clone());
+            let m = by_model.entry(key.clone()).or_insert_with(|| UsageModelTotals {
                 model: r.model.clone(),
+                source: r.source.clone(),
                 ..Default::default()
             });
             m.turns += 1;
@@ -1230,7 +1370,7 @@ pub fn read_usage_range(
             // 本地小时 = (ts + 偏移) 的整点时刻对 24 取模（`rem_euclid` 保证非负）
             let hour = ((r.ts as i64 + offset_ms).div_euclid(3_600_000)).rem_euclid(24) as u32;
             let h = hours_by_model
-                .entry(r.model.clone())
+                .entry(key)
                 .or_default()
                 .entry(hour)
                 .or_insert_with(|| UsageHourTotals {
@@ -1245,7 +1385,7 @@ pub fn read_usage_range(
             h.cache_create += r.cache_create;
         }
         for m in by_model.values_mut() {
-            if let Some(buckets) = hours_by_model.remove(&m.model) {
+            if let Some(buckets) = hours_by_model.remove(&(m.source.clone(), m.model.clone())) {
                 m.hours = buckets.into_values().collect();
             }
         }
@@ -1383,6 +1523,7 @@ mod tests {
             ts: 1_700_000_000_000,
             model: "deepseek-flash".into(),
             session_id: "sess_1_1700000000000".into(),
+            source: String::new(),
             input: 212,
             output: 3,
             cache_read,

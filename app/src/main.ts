@@ -4,7 +4,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LogicalSize } from "@tauri-apps/api/dpi";
-import { listen, emit } from "@tauri-apps/api/event";
+import { listen, emit, emitTo } from "@tauri-apps/api/event";
 import { invoke as tauriInvoke, convertFileSrc } from "@tauri-apps/api/core";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
@@ -12,15 +12,17 @@ import { attachPluginListeners } from "./plugins/attach";
 import { refreshMarketPlugins, hasDiskPlugin } from "./plugins/market";
 import { isBasePlugin } from "./plugins/kinds";
 import { installHostBridge } from "./plugins/host";
-import { createSidecarBridge, activatePluginSidecar, deactivatePluginSidecar, maybeAutoStartSidecar } from "./plugins/sidecar";
+import { createSidecarBridge, activatePluginSidecar, deactivatePluginSidecar, maybeAutoStartSidecar, pluginSidecarRunning } from "./plugins/sidecar";
 import { getSearchEngine, getSearchEngineName, setSearchEngine } from "./plugins/builtin/web-search";
 import {
   loadUsageCost,
   renderUsageCostPanel,
   parseUsageRangeValue,
+  parseUsageSourceValue,
   DEFAULT_USAGE_RANGE,
   type UsageRange,
   type UsageModelFilter,
+  type UsageSourceFilter,
 } from "./usage-cost.js";
 import { lineDiff } from "./text-diff.js";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
@@ -182,6 +184,8 @@ const drawerSibling = resultsList;
 const chatNewBtn = el("chat-new-btn");
 const chatMoreBtn = el("chat-more-btn");
 const chatMoreMenu = el("chat-more-menu");
+/** 斜杠命令候选菜单（输入 `/` 时随输入过滤；贴输入行上方弹出）。 */
+const chatSlashMenu = el("chat-slash-menu");
 const chatMoreThinkIc = el("chat-more-think-ic");
 const chatMoreThinkLabel = el("chat-more-think-label");
 const chatMoreWorkspaceLabel = el("chat-more-workspace-label");
@@ -205,6 +209,9 @@ const chatPersonaText = el("chat-persona-text") as HTMLTextAreaElement;
 const chatPersonaSave = el("chat-persona-save") as HTMLButtonElement;
 const chatPersonaReset = el("chat-persona-reset") as HTMLButtonElement;
 const chatPersonaRestart = el("chat-persona-restart") as HTMLButtonElement;
+// 阶段状态栏（L4 调试）的开关行节点
+const chatDebugPhaseLabel = el("chat-debugphase-label");
+const chatDebugPhaseSeg = el("chat-debugphase-seg");
 const chatPersonaMsg = el("chat-persona-msg");
 // 任务抽屉（2026-09-21）：输入框上方那条小抽屉的六个节点，见 renderTodoDrawer()
 const todoDrawer = el("todo-drawer");
@@ -303,6 +310,40 @@ function syncUiMode() {
 // 提问**：agent 是单线程顺序吃 stdin 的，顺序反了这一问仍然是零上文。
 let pendingAgentHistory: { role: string; content: string }[] | null = null;
 
+/** 「CLI 未就绪」时挂起的**待发轮次**（FIFO，每项自带「是不是桌宠发起」与图片附件）。
+ *
+ *  为什么不是原来那个 `window.__agent_pending_query` 字符串单槽（2026-10-10 用户报障）：
+ *  「agent 正在启动」是一段真实窗口期，桌宠轮与聊天轮可能先后撞进来 —— 单槽会被**后来者覆盖**，
+ *  先来的那一问永远发不出去（桌宠侧于是永远停在「思考中」，聊天侧那句「agent 正在加载」也永不消失）。
+ *  而且单槽只存 query：**图片附件丢了**、「这一轮是谁发起的」也丢了 —— 后者会让冲刷出来的那一轮
+ *  被 `petTurnActive` 的**当前值**误判来源（回复发错窗口）。 */
+type PendingTurn = { query: string; imagePaths: string[]; fromPet: boolean };
+let pendingTurns: PendingTurn[] = [];
+/** 冲刷中标志：挡住「stdout 冲刷」与「收尾再冲刷」两条路同时进来重复起轮。 */
+let drainingPendingTurns = false;
+
+/** 冲刷挂起的待发轮次 —— **一次只起一轮**（`startAgentChat` 不防重入、`isStreaming` 又是全局的），
+ *  并把「这一轮是谁发起的」还原回 `petTurnActive`（`startAgentChat` 会认领进 `currentTurnFromPet`）。
+ *  正在流式 / 队列空 ⇒ 直接返回，等下一次触发（stdout、上一轮收尾、取消那一轮）再来。 */
+function drainPendingTurns(): void {
+  if (drainingPendingTurns || isStreaming || !pendingTurns.length) return;
+  const item = pendingTurns.shift();
+  if (!item) return;
+  drainingPendingTurns = true;
+  petTurnActive = item.fromPet;
+  void Promise.resolve(startAgentChat(item.query, item.imagePaths)).finally(() => {
+    drainingPendingTurns = false;
+  });
+}
+
+/** 丢掉队列里全部挂起的轮次（agent 起不来 / 被取消时用）—— 桌宠发起的那几轮必须**各回一句**，
+ *  否则它会永远停在「思考中」（非桌宠轮不用回，界面上本来就有「正在加载 / 已失败」的提示）。 */
+function dropPendingTurns(reason: string): void {
+  const items = pendingTurns;
+  pendingTurns = [];
+  for (const it of items) if (it.fromPet) emitPetReply(reason);
+}
+
 /** 历史只保留用户 / 助手的**纯文本** —— 工具调用细节本来就不落前端，这是有意的近似。 */
 async function sendAgentHistory(messages: { role: string; content: string }[]) {
   const payload = JSON.stringify({
@@ -317,6 +358,9 @@ async function sendAgentHistory(messages: { role: string; content: string }[]) {
 
 /** 把历史同步给 agent；CLI 未就绪时挂起，等 `cli-status:stdout` 再发。 */
 function queueAgentHistory(messages: { role: string; content: string }[]) {
+  // 整份 history 即将被替换 ⇒ agent 侧那条「上次注入的打开的插件」随之消失。忘掉本地快照，
+  // 让下一轮重新评估（有插件开着就补一条）。见 startAgentChat 的 openPluginsCtx。
+  lastOpenPluginsSent = null;
   if (!cliReady) {
     pendingAgentHistory = messages.map(m => ({ ...m }));
     return;
@@ -1109,6 +1153,133 @@ const turnUsage = {
   firstTs: 0,
 };
 
+/** 本轮用量的**来源**（归因，2026-10-09）：`"pet"` = 桌宠发起的那一轮，`""` = 普通聊天。
+ *  由 `appendUsageLog` 随用量一起落盘（Rust `UsageRecord.source`）；成本面板的「来源」
+ *  下拉据此过滤（见 usage-cost.ts）。**每轮在 `startAgentChat` 开头按当前标志重设** ——
+ *  上一轮的兜底落账（下一轮开头那次 `flushTurnUsage`）读到的正是上一轮留下的值。 */
+let turnUsageSource = "";
+
+/** 桌面宠物发起的、**尚未被某一轮认领**的一次请求（一次性）。
+ *  聊天窗收到 `pet-chat-send` 消费暂存后置 true；`startAgentChat` 开头把它认领进
+ *  `currentTurnFromPet` 并清掉。清掉后新一轮不会误认领。 */
+let petTurnActive = false;
+/** 当前**正在跑**的这一轮是不是桌宠发起的（收尾时据此定向回传最终回复，见 `replyToPet`）。
+ *  每轮在 `startAgentChat` 开头由 `petTurnActive` 重设 —— 所以上一轮的残留不会带到下一轮。 */
+let currentTurnFromPet = false;
+
+/** 桌宠轮**不渲染进聊天窗可见对话区**（2026-10-10）—— 那轮的对话只在桌宠窗显示。
+ *  判定口径必须盖住整轮：petTurnActive 在桌宠点发送 / 「看一眼屏幕」时置位（此时
+ *  currentTurnFromPet 还没被 startAgentChat 认领，而用户气泡就在这之前插）；
+ *  currentTurnFromPet 覆盖认领之后到 replyPetTurn 收尾。普通聊天轮两个都恒为假。 */
+function suppressChatRender(): boolean {
+  return currentTurnFromPet || petTurnActive;
+}
+
+/** 桌宠轮的渲染落点：一个挂在 body 下、**不进可见会话流**的隐藏容器。
+ *  agent 的流式 / 思考 / 工具卡照样往 agentView.flow 里画，只是用户看不到。 */
+let petHiddenHostEl: HTMLElement | null = null;
+function petHiddenHost(): HTMLElement {
+  if (!petHiddenHostEl || !petHiddenHostEl.isConnected) {
+    petHiddenHostEl = doc("div");
+    petHiddenHostEl.id = "pet-hidden-flow";
+    petHiddenHostEl.hidden = true;
+    document.body.appendChild(petHiddenHostEl);
+  }
+  return petHiddenHostEl;
+}
+
+/** 本轮会话流该挂到哪：桌宠轮 → 隐藏容器；普通轮 → 可见的 chat-log 容器。
+ *  只此一处判据，startAgentChat 的两处（未就绪提示 / 正常回合）共用它。 */
+function chatFlowHost(): HTMLElement {
+  return suppressChatRender() ? petHiddenHost() : ensureChatLog();
+}
+
+// ── 两条线程（普通聊天 / 桌宠，2026-10-10）──────────────────────────
+// 目标：桌宠发起的对话 = **独立会话 + 独立上下文**，与普通聊天互不污染。
+// 聊天窗的渲染 / 用量 / 过程 / 快照 / 待办这些代码路径全部按下面这六个**全局名**操作
+// （`chatHistory` / `currentSessionId` / `usageTotals` / `sessionSteps` /
+// `sessionFileSnapshots` / `sessionTodoTimeline`），所以「桌宠轮」期间把全局换成桌宠那套
+// （`switchThread`），轮次结束再换回普通那套 —— 两条线程的数据天然隔离，而 DOM 渲染
+// 代码一行都不用改（本任务刻意不重构渲染，桌宠轮仍在聊天窗里被渲染）。
+// 说明：会话 id 不参与 swap（`currentSessionId` 恒指普通线程、`petSessionId` 恒指桌宠），
+// 由 `activeSid()` 取当前线程的 id —— 避免异步落账回写 id 时串到另一条线程。
+let activeThread: "chat" | "pet" = "chat";
+let petChatHistory: Array<{ role: string; content: string }> = [];
+let petSessionId: string | null = null;
+let petUsage: SessionUsage = { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 };
+let petSteps: SessionProcess[] = [];
+let petFrames: FileSnapshot[] = [];
+let petTodos: SessionTodoSnapshot[] = [];
+
+/** 普通线程被换出时的暂存（切到桌宠线程期间，普通那套六个全局存在这里）。 */
+interface ChatThreadPark {
+  history: Array<{ role: string; content: string }>;
+  usage: SessionUsage;
+  steps: SessionProcess[];
+  frames: FileSnapshot[];
+  todos: SessionTodoSnapshot[];
+}
+let parkedChat: ChatThreadPark | null = null;
+
+/** 当前线程的会话 id（普通线程恒走 `currentSessionId`，桌宠线程恒走 `petSessionId`）。 */
+function activeSid(): string | null {
+  return activeThread === "pet" ? petSessionId : currentSessionId;
+}
+
+/** 切换「当前线程」：把聊天窗那六个全局名换成目标线程持有的那份，原线程的状态存回它自己的变量。
+ *  — 切到桌宠：普通那套存进 `parkedChat`，全局换成 `pet*`。
+ *  — 切回普通：把全局（此刻是桌宠那份）存回 `pet*`，再从 `parkedChat` 换回普通那套。
+ *  幂等：目标就是当前线程时什么都不做。 */
+function switchThread(to: "chat" | "pet") {
+  if (to === activeThread) return;
+  if (to === "pet") {
+    parkedChat = {
+      history: chatHistory,
+      usage: usageTotals,
+      steps: sessionSteps,
+      frames: sessionFileSnapshots,
+      todos: sessionTodoTimeline,
+    };
+    chatHistory = petChatHistory;
+    usageTotals = petUsage;
+    sessionSteps = petSteps;
+    sessionFileSnapshots = petFrames;
+    sessionTodoTimeline = petTodos;
+  } else {
+    petChatHistory = chatHistory;
+    petUsage = usageTotals;
+    petSteps = sessionSteps;
+    petFrames = sessionFileSnapshots;
+    petTodos = sessionTodoTimeline;
+    const parked = parkedChat ?? {
+      history: [] as Array<{ role: string; content: string }>,
+      usage: { hit: 0, miss: 0, total: 0, elided: 0, dropped: 0 },
+      steps: [] as SessionProcess[],
+      frames: [] as FileSnapshot[],
+      todos: [] as SessionTodoSnapshot[],
+    };
+    chatHistory = parked.history;
+    usageTotals = parked.usage;
+    sessionSteps = parked.steps;
+    sessionFileSnapshots = parked.frames;
+    sessionTodoTimeline = parked.todos;
+    parkedChat = null;
+  }
+  activeThread = to;
+  updateTokenDashboard();
+}
+
+/** agent 进程当前装载的是哪条线程的历史（`null` = 未知 / 刚重启，下一轮必须重灌）。
+ *  切线程时，若非同一个值，就把目标线程的 history 通过 `set_history` 发给 agent
+ *  （只替换 history、不触发模型调用）—— 这就是「桌宠轮看不到普通聊天的上文、反之亦然」
+ *  的实现点。**调用前必须先 `switchThread(target)`**，这样 `chatHistory` 就是目标线程那份。 */
+let agentThread: "chat" | "pet" | null = null;
+function ensureAgentThread(target: "chat" | "pet") {
+  if (agentThread === target) return;
+  agentThread = target;
+  queueAgentHistory(chatHistory);
+}
+
 /** 归零累计器 —— 回合开始、以及收尾落账之后各调一次（两道保险，防上一轮的值漏进来）。 */
 function resetTurnUsage() {
   turnUsage.input = 0;
@@ -1195,6 +1366,80 @@ function renderChatModeSeg() {
   });
 }
 
+// ── 阶段状态栏（L4 调试，默认关）──────────────────────────────────
+// 目标：用一个**开关控制**的浮标展示 agent 当前处于哪个阶段，供调试。
+// 纪律（照 docs/todo.md §待办 3-4 / docs/ui-style.md）：
+//   · 开关关闭时**零副作用、零开销**：setDebugPhase 第一行即返回，不建 DOM、不更新；
+//   · 开关是 localStorage 键 lunac-debug-phase（沿用既有 lunac-* 命名；值 "1" 为开）；
+//   · 颜色全走四类自定义变量（--surface-glass / --border-glass / --text），不写色值；
+//   · 定位 fixed + pointer-events:none：不占布局、不挡输入框 / 结果区、不抢焦点；
+//   · 阶段**全部由既有 stream-json 事件派生**（不改 agent，也不新增任何事件）。
+// 与 .sys-note / 状态行不重叠：.sys-note 是**对话流内**的历史记录（会随对话滚走），
+// 状态行（statusText）是常显的一句话；本浮标是**当前态**的独立浮标、且默认关。
+// 三者共用同一批事件源（statusText 与本浮标由同一处事件驱动），因此不会互相打架。
+const DEBUG_PHASE_KEY = "lunac-debug-phase";
+type DebugPhase =
+  | "starting" | "idle" | "requesting" | "thinking" | "responding"
+  | "tool" | "approval" | "compacting" | "subagent" | "done" | "error";
+
+let debugPhaseOn = false;
+try { debugPhaseOn = localStorage.getItem(DEBUG_PHASE_KEY) === "1"; } catch { /* 隐私模式：保持关 */ }
+let debugPhaseEl: HTMLElement | null = null;
+/** 最近一次阶段（开关从关到开时拿它立即起一条，避免空窗）。 */
+let debugPhaseCur: { phase: DebugPhase; detail?: string } | null = null;
+
+function debugPhaseText(p: DebugPhase, detail?: string): string {
+  if (p === "tool") return t("debugphase.tool", { tool: detail || "..." });
+  return t("debugphase." + p);
+}
+
+/** 移除浮标（开关关闭时调用）；内存态一并归零。 */
+function teardownDebugPhase() {
+  debugPhaseEl?.remove();
+  debugPhaseEl = null;
+  debugPhaseCur = null;
+}
+
+/** 更新阶段浮标。**开关关闭时第一行即返回**（热路径零开销）。
+ *  只在聊天独立窗出浮标（agent 事件本就只服务该窗）—— 主窗即使误触开关也不建节点。 */
+function setDebugPhase(phase: DebugPhase, detail?: string) {
+  if (!debugPhaseOn || !IS_CHAT_WINDOW) return;
+  debugPhaseCur = { phase, detail };
+  if (!debugPhaseEl || !debugPhaseEl.isConnected) {
+    debugPhaseEl = document.createElement("div");
+    debugPhaseEl.id = "debug-phase-bar";
+    document.body.appendChild(debugPhaseEl);
+  }
+  debugPhaseEl.textContent = t("debugphase.title") + ": " + debugPhaseText(phase, detail);
+}
+
+/** 阶段状态栏分段（「更多」菜单里的两档：开 / 关）。 */
+function renderDebugPhaseSeg() {
+  if (!chatDebugPhaseSeg) return;
+  chatDebugPhaseSeg.querySelectorAll<HTMLButtonElement>("button[data-mode]").forEach((b) => {
+    const on = b.dataset.mode === "on";
+    b.textContent = t(on ? "chat.mode_on" : "chat.mode_off");
+    b.title = t(on ? "debugphase.enable" : "debugphase.disable");
+    b.classList.toggle("active", on === debugPhaseOn);
+  });
+}
+chatDebugPhaseSeg?.querySelectorAll<HTMLButtonElement>("button[data-mode]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const on = b.dataset.mode === "on";
+    if (on === debugPhaseOn) return;
+    debugPhaseOn = on;
+    try { localStorage.setItem(DEBUG_PHASE_KEY, on ? "1" : "0"); } catch { /* 隐私模式 */ }
+    if (on) {
+      // 用最近一次阶段（首次开启时没有 ⇒ 落 idle）立即起一条，开着就有显示。
+      const cur = debugPhaseCur;
+      setDebugPhase(cur?.phase ?? "idle", cur?.detail);
+    } else {
+      teardownDebugPhase();
+    }
+    renderDebugPhaseSeg();
+  });
+});
+
 /** 「更多」菜单的静态文案与行图标（语言切换时也要重刷）。 */
 function renderMoreMenuLabels() {
   if (chatMoreBtn) {
@@ -1206,10 +1451,12 @@ function renderMoreMenuLabels() {
   if (chatMoreThinkLabel) chatMoreThinkLabel.textContent = t("chat.more_thinking");
   if (chatMoreWorkspaceLabel) chatMoreWorkspaceLabel.textContent = t("settings.workspace");
   if (chatProfileLabel) chatProfileLabel.textContent = t("settings.security_profile");
+  if (chatDebugPhaseLabel) chatDebugPhaseLabel.textContent = t("chat.more_debug_phase");
   renderProfileUI();
   renderWorkspaceMenuLabels();
   renderToolsBlacklistLabels();
   renderPersonaLabels();
+  renderDebugPhaseSeg();
 }
 
 /** 打开菜单时把各行的动态状态刷新一遍。 */
@@ -1304,6 +1551,9 @@ interface ChatSession {
   steps?: SessionProcess[];
   /** 待办清单时间线；旧记录没有该字段（2026-10-02） */
   todos?: SessionTodoSnapshot[];
+  /** 会话来源（2026-10-10）：`""` / 缺省 = 普通聊天；`"pet"` = 桌宠发起的对话。
+   *  两条线程分开存（同一 chat.db），历史 UI 据它分「对话 / 桌宠」两页。 */
+  source?: string;
 }
 
 /** 待办清单在某一回合的快照 —— 回退 / 切会话后重建任务抽屉用（2026-10-02）。
@@ -1405,6 +1655,7 @@ async function deleteChatSession(id: string): Promise<ChatSession[]> {
   // If the deleted session was the active one, force a fresh id on next save
   // so a deleted conversation can't be silently resurrected by upsert.
   if (currentSessionId === id) currentSessionId = null;
+  if (petSessionId === id) petSessionId = null;
   return filtered;
 }
 
@@ -1416,6 +1667,7 @@ async function deleteChatSession(id: string): Promise<ChatSession[]> {
 async function persistCurrentSessionInner(
   snapshotChat: Array<{ role: string; content: string }>,
   snapshotId: string | null,
+  source: string,
   snapshotUsage: SessionUsage,
   snapshotSteps: SessionProcess[],
   snapshotFrames: FileSnapshot[],
@@ -1447,7 +1699,10 @@ async function persistCurrentSessionInner(
 
   // Reuse session ID to avoid creating duplicate sessions per conversation
   const sid = snapshotId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
-  currentSessionId = sid;
+  // 回写到**本条线程**的 id 槽：桌宠 → `petSessionId`，普通 → `currentSessionId`。
+  // 不能写死 `currentSessionId` —— 它是异步落账，此时用户可能已经切回另一条线程。
+  if (source === "pet") petSessionId = sid;
+  else currentSessionId = sid;
   const updatedAt = Date.now();
 
   const sessions = await loadSessions();
@@ -1465,6 +1720,8 @@ async function persistCurrentSessionInner(
     // 空时间线写 `undefined`（Rust 侧 `skip_serializing_if` → 该行写 NULL），
     // 免得给每个没待办的会话都塞一个空数组。
     todos: snapshotTodos.length ? snapshotTodos : undefined,
+    // 来源（2026-10-10）：`"pet"` = 桌宠线程的会话，`""` = 普通聊天。历史分页据此筛。
+    source: source || "",
   };
   if (idx >= 0) {
     sessions[idx] = session; // update in place
@@ -1483,7 +1740,9 @@ function saveCurrentSession() {
   // callers (ensureChatLog/newConversation) clear chatHistory immediately,
   // so reading globals inside the queue would silently drop the old chat.
   const snapshot = chatHistory.map(m => ({ ...m }));
-  const snapshotId = currentSessionId;
+  // 本条线程的 id / 来源**当场取**（理由同上：排队里再读可能已被切走）。
+  const source = activeThread === "pet" ? "pet" : "";
+  const snapshotId = activeSid();
   const snapshotUsage: SessionUsage = { ...usageTotals };
   const snapshotSteps = sessionSteps.map(g => ({
     turn: g.turn,
@@ -1500,6 +1759,7 @@ function saveCurrentSession() {
     persistCurrentSessionInner(
       snapshot,
       snapshotId,
+      source,
       snapshotUsage,
       snapshotSteps,
       snapshotFrames,
@@ -1509,10 +1769,17 @@ function saveCurrentSession() {
 }
 
 function restoreSession(session: ChatSession) {
+  // 恢复会话 = 离开当前这一轮 —— **必须排在 `switchThread` 之前**：那一轮的半截正文要落进
+  // **它自己的**线程（见 `cancelInflightTurn`；它会按需切回普通线程）。
+  cancelInflightTurn(t("pet.chat_reply_interrupted"));
+  // 恢复哪条线程的会话，就把聊天窗切到哪条线程（下面所有全局读写因此天然落进对的线程）。
+  const isPet = session.source === "pet";
+  switchThread(isPet ? "pet" : "chat");
   // Continue writing to the SAME session record when the user keeps typing
   // after restore — otherwise the next save generates a brand-new id and
   // the original record is never updated (duplicate history, point 4/17).
-  currentSessionId = session.id;
+  if (isPet) petSessionId = session.id;
+  else currentSessionId = session.id;
   // 表盘口径 = 当前对话，且**从会话记录里读回来**（表盘数值随会话落盘，见
   // SessionUsage）—— 历史回顾时能看到当时那次对话的命中率/总量/压缩次数。
   // 旧记录没有 usage 字段 → 归零。
@@ -1528,14 +1795,8 @@ function restoreSession(session: ChatSession) {
   }));
   // 待办时间线读回来（2026-10-02）：恢复会话后任务抽屉由它重建 —— 旧记录没有该字段 → 空表。
   sessionTodoTimeline = (session.todos ?? []).map(t => ({ turn: t.turn, todos: [...t.todos] }));
-  // Cancel any active streaming before restoring
-  if (isStreaming) {
-    streamId++;
-    isStreaming = false;
-    setStreamingUI(false);
-    cliTextCallback = null;
-    cliDoneCallback = null;
-  }
+  // 在飞的那一轮已在函数开头由 `cancelInflightTurn` 收干净（清前端 + 停 agent + 给桌宠回一句）；
+  // 这里只保证两个「当前回合」指针为空，供下面重建界面。
   agentView = null;
   agentTurn = null;
   // 只剥发送期注入的关键词提示词；**刻意不剥 `[Attached files]` 块** —— 它是附件清单的
@@ -1580,7 +1841,13 @@ function restoreSession(session: ChatSession) {
   void (async () => {
     try {
       const frames = await invoke<FileSnapshot[]>("snapshots_load", { sessionId: session.id });
-      if (framesEpoch === framesEpochAt && currentSessionId === session.id) {
+      // 代守卫 + id 守卫之外再加**线程守卫**：读盘期间用户可能已切到另一条线程，
+      // 这时 `sessionFileSnapshots` 指的是别条线程的表，绝不能把这份旧盘读写进去。
+      if (
+        framesEpoch === framesEpochAt &&
+        (isPet ? petSessionId : currentSessionId) === session.id &&
+        (activeThread === "pet") === isPet
+      ) {
         sessionFileSnapshots = frames ?? [];
       }
     } catch (e) {
@@ -1591,8 +1858,9 @@ function restoreSession(session: ChatSession) {
   statusText.textContent = t("status.history_restored");
   // 把该会话的历史灌回 agent：恢复只是重建了 DOM，agent 侧还留着它自己上一段对话的
   // 上下文（甚至是另一个会话的）—— 不灌的话「恢复旧会话后追问」必然是零上文
-  // （2026-09-17，见 queueAgentHistory 的注释）。
+  // （2026-09-17，见 queueAgentHistory 的注释）。此刻 `chatHistory` 就是本条线程那份。
   queueAgentHistory(chatHistory);
+  agentThread = isPet ? "pet" : "chat";
   applyWindowSize();
   // Focus chat input so user can continue conversation immediately
   requestAnimationFrame(() => chatInput.focus());
@@ -2101,6 +2369,7 @@ async function rollbackChat(idx: number) {
     try { await invoke("start_cli"); } catch {}
   }
   queueAgentHistory(chatHistory);
+  agentThread = activeThread; // agent 上下文已重灌为当前线程
   // 4) 文件回退（2026-09-30）：把 agent 在被丢掉那几轮里改过的磁盘文件还原回去。
   //    K = **保留下来的助手消息条数**；`turn >= K` 的快照就是被丢掉那几轮的改动。
   //    还原按回合倒序执行 ⇒ 落点 = 回退点的状态（见 revertFileSnapshots）。
@@ -2173,35 +2442,69 @@ async function onRollbackClick(idx: number, btn: HTMLElement) {
   }, 4000);
 }
 
+// ── 历史视图的「对话 / 桌宠」分页（2026-10-10）──────────────────────
+// 桌宠发起的对话自成一条线程（`ChatSession.source === "pet"`），与普通聊天分开存、
+// 分开展示。分段控件**自绘**（禁止原生 `<select>`，见 code-rules §5.2），样式对齐
+// `.music-seg` / `.music-tab`。
+let historyTab: "chat" | "pet" = "chat";
+
+/** 分段控件 HTML（两个按钮；选中态走 `.on` + `aria-pressed`）。 */
+function historyTabBarHtml(): string {
+  const on = (tab: "chat" | "pet") => (historyTab === tab ? " on" : "");
+  const press = (tab: "chat" | "pet") => (historyTab === tab ? "true" : "false");
+  return `<div class="chat-hist-tabs">
+    <button type="button" class="chat-hist-tab${on("chat")}" data-tab="chat" aria-pressed="${press("chat")}">${esc(t("chat.history_tab_chat"))}</button>
+    <button type="button" class="chat-hist-tab${on("pet")}" data-tab="pet" aria-pressed="${press("pet")}">${esc(t("chat.history_tab_pet"))}</button>
+  </div>`;
+}
+
+/** 给容器里的分段按钮挂切换（切换后调用 `onSwitch` 重绘该视图）。 */
+function bindHistoryTabs(root: ParentNode, onSwitch: () => void) {
+  root.querySelectorAll<HTMLElement>(".chat-hist-tab").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const tab: "chat" | "pet" = btn.dataset.tab === "pet" ? "pet" : "chat";
+      if (tab === historyTab) return;
+      historyTab = tab;
+      onSwitch();
+    });
+  });
+}
+
+/** 按当前分页过滤会话：桌宠页只留 `source === "pet"`，对话页留其余。 */
+function filterSessionsByTab(sessions: ChatSession[]): ChatSession[] {
+  return sessions.filter(s => (s.source === "pet") === (historyTab === "pet"));
+}
+
 async function showChatHistory() {
-  // Cancel any active streaming before showing history
-  if (isStreaming) {
-    streamId++;
-    isStreaming = false;
-    setStreamingUI(false);
-  }
+  // 看历史 = 离开当前这一轮 —— **成套**收尾（清前端 + 停 agent + 给桌宠回一句），
+  // 见 `cancelInflightTurn`：此前这里只把 `isStreaming` 清零，于是 agent 继续把它那条
+  // `result` 打给**下一轮**的回调，桌宠的消息就永远等不到回复了。
+  cancelInflightTurn(t("pet.chat_reply_interrupted"));
   isChatHistoryView = true;
   pluginActive = true;
   activePluginId = "ai-agent";
   setPluginBar(t("chat.ai_entry"));
   searchInput.disabled = true;
   invoke("set_ui_mode", { mode: "plugin" }).catch(() => {});
-  const sessions = await loadSessions();
+  const sessions = filterSessionsByTab(await loadSessions());
   resultsContainer.classList.remove("hidden");
   searchBar.classList.add("has-results");
 
+  const tabBar = historyTabBarHtml();
   if (sessions.length === 0) {
-    resultsList.innerHTML = `
+    resultsList.innerHTML = `${tabBar}
       <div class="plugin-result">
         <div class="plugin-result-content" style="color:var(--text-dim);padding:16px 12px;">
-          ${t("chat.no_history")}</div>
+          ${t(historyTab === "pet" ? "chat.no_history_pet" : "chat.no_history")}</div>
       </div>`;
+    bindHistoryTabs(resultsList, () => { void showChatHistory(); });
     statusText.textContent = t("chat.session_count", { count: "0" });
     applyWindowSize();
     return;
   }
 
-  let html = `<div class="plugin-result">`;
+  let html = `${tabBar}<div class="plugin-result">`;
 
 
   for (const s of sessions) {
@@ -2225,6 +2528,7 @@ async function showChatHistory() {
   html += '</div>';
   resultsList.innerHTML = html;
   statusText.textContent = t("chat.session_count", { count: String(sessions.length) });
+  bindHistoryTabs(resultsList, () => { void showChatHistory(); });
 
   // Bind click: first click opens drawer, second click restores
   resultsList.querySelectorAll(".history-item").forEach(el => {
@@ -2351,6 +2655,20 @@ function startUpdateCheckOnBoot(): void {
   // 让「插件 N」把第三方也算上（结果区能搜到的就是这一份）。失败不抛（只记控制台）。
   await refreshMarketPlugins();
   statusText.textContent = t("status.plugin_count", { count: String(pluginRegistry.getAll().length) });
+
+  // 本地模型决策（2026-10-09，见设置 → AI 的开关）：开关为开且插件在盘 ⇒ 启动时确保 sidecar 在跑。
+  // 这里**不弹信任卡**（首次开启时已在设置里弹过并落盘信任）—— 未信任就静默不起；
+  // 此时 agent 仍会拿到指向死端口的端点，但 `decide()` 一律 fail-open ⇒ **照发**，不会吞消息。
+  void (async () => {
+    try {
+      if (!(await invoke<boolean>("local_model_config_get"))) return;
+      if (!hasDiskPlugin("local-model")) return;
+      if (await pluginSidecarRunning("local-model")) return;
+      await invoke("plugin_sidecar_start", { pluginId: "local-model" });
+    } catch (e) {
+      console.warn("[lunac] 本地模型 sidecar 启动失败（不影响其它功能）", e);
+    }
+  })();
 
   // 预热备忘录标识检索索引（供搜索栏“标识直达编辑”使用）
   import("./plugins/builtin/memo").then(m => m.refreshMemoIndex()).catch(() => {});
@@ -2648,8 +2966,19 @@ function updateAgentStatus(status: "idle" | "loading" | "ready" | "error", msg?:
 async function newConversation(skipCliRestart = false) {
   // Save current session if exists
   await saveCurrentSession().catch(() => {});
+  // 「新对话」永远开的是**普通线程**：若当前在桌宠线程，先把桌宠状态换出（parked），
+  // 再切回普通那套 —— 下面这一整段清零操作的语义是「普通线程开一段新对话」。
+  switchThread("chat");
+  agentThread = null; // agent 上下文即将被重置（见下面的 stop_cli），下一轮必须重灌
   currentSessionId = null;  // start a fresh session
   chatHistory = [];
+  // 新对话 = agent 上下文将重启（下面 stop_cli）⇒ 忘掉「上次注入的打开的插件」快照，
+  // 下一轮若有插件开着就补一条（见 startAgentChat 的 openPluginsCtx）。
+  lastOpenPluginsSent = null;
+  // 挂起的「回灌历史」也必须清掉：恢复会话时若 CLI 未就绪，restoreSession() 会把上一段
+  // 会话挂进 pendingAgentHistory，等 agent 就绪时冲刷 —— 而新对话启动的正是那个 agent，
+  // 不清就会把旧会话灌进新对话（表现就是思考里出现上个对话的痕迹）。
+  pendingAgentHistory = null;
   if (isStreaming) {
     streamId++;
     isStreaming = false;
@@ -2657,6 +2986,8 @@ async function newConversation(skipCliRestart = false) {
   }
   cliTextCallback = null;
   cliDoneCallback = null;
+  // 若被丢弃的正是桌宠那一轮，也要让它结束「思考中」（`replyPetTurn` 只对桌宠轮生效）。
+  replyPetTurn(t("pet.chat_reply_interrupted"));
   agentView = null;
   agentTurn = null;
   pendingMessages = [];
@@ -2983,6 +3314,9 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   { name: "Read" },
   { name: "Write" },
   { name: "Edit" },
+  // NotebookEdit（2026-10-11）：按 cell 编辑 `.ipynb` 的写类工具。列出来与 Write/Edit 同理
+  // —— 用户可以在设置里把它整个关掉（`--disallowedTools NotebookEdit`）。
+  { name: "NotebookEdit" },
   { name: "Cmd" },
   { name: "PowerShell" },
   { name: "Glob" },
@@ -3017,6 +3351,18 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   // 列出来同样只是给用户一个开关。
   { name: "ListPeers" },
   { name: "SendMessage" },
+  // 桌宠动作（2026-10-10）：`PetControl` 只让桌宠形象动一下（效果全在前端广播给桌宠窗，
+  // agent 侧不碰本机）。列出来是给用户一个「别让模型自己驱动桌宠」的开关。
+  { name: "PetControl" },
+  // git worktree（2026-10-11，A13）：`EnterWorktree` / `ExitWorktree` 会改仓库状态
+  // （建 worktree + 分支、切换 agent 的有效工作目录）。列出来与 Write/Edit 同理 ——
+  // 用户可以在设置里把它们整个关掉（`--disallowedTools EnterWorktree ExitWorktree`）。
+  { name: "EnterWorktree" },
+  { name: "ExitWorktree" },
+  // agent → 用户的呈递（2026-10-11，A13）：`SendUserFile` 递一张文件卡、`PushNotification`
+  // 弹一条桌面通知。两件都**不碰本机**（读元信息 / 发一条本机通知），列出来只是给用户开关。
+  { name: "SendUserFile" },
+  { name: "PushNotification" },
 ];
 
 function loadCustomBlacklist(): string[] {
@@ -3056,6 +3402,8 @@ function renderToolsBlacklist() {
 // 行内的 ×/✓ 切换（icon-style.md §3 的「取消 ✕」「保存 ✓」，加一点残影/高光）
 const CHECK_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/><circle cx="19.6" cy="5.4" r=".9" opacity=".28"/></svg>`;
 const X_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/><circle cx="19.6" cy="5.4" r=".9" opacity=".28"/></svg>`;
+// 文件卡图标（agent→用户呈递，2026-10-11）：折角文件 + 残影圆点（线性 SVG，ui-style §界面 4）
+const FILE_SVG = `<svg class="ai-ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.8 3.4H7.4a1.9 1.9 0 0 0-1.9 1.9v13.4a1.9 1.9 0 0 0 1.9 1.9h9.2a1.9 1.9 0 0 0 1.9-1.9V8.1Z"/><path d="M13.8 3.4V8.1h4.7"/><circle cx="19.8" cy="5.2" r=".9" opacity=".28"/></svg>`;
 // 点一下切一格：× = 已禁用（红），✓ = 启用（暗）
 chatToolsList?.addEventListener("click", (e) => {
   const btn = (e.target as HTMLElement).closest(".chat-tools-toggle") as HTMLButtonElement | null;
@@ -3491,12 +3839,19 @@ function chatTurnLabel(content: string): string {
  *  点某一轮时 `restoreSession` 只重建 DOM（默认渲染尾部窗口），**必须再 `jumpToChatMsg`**
  *  —— 它自己会把渲染窗口往前挪（见那里的注释）。 */
 function renderDrawerHistory(sessions: ChatSession[]) {
-  chatDrawerList.innerHTML = "";
-  if (sessions.length === 0) {
-    chatDrawerList.innerHTML = `<div style="padding:16px;text-align:center;color:var(--text-dim);font-size:0.78rem;">${t("chat.no_history_short")}</div>`;
+  // 顶部「对话 / 桌宠」分段（2026-10-10）；递归调用一律传**未过滤的完整列表**，
+  // 过滤只发生在渲染入口，切页签时重绘即可。
+  chatDrawerList.innerHTML = historyTabBarHtml();
+  bindHistoryTabs(chatDrawerList, () => renderDrawerHistory(sessions));
+  const visible = filterSessionsByTab(sessions);
+  if (visible.length === 0) {
+    const empty = doc("div");
+    empty.className = "history-empty";
+    empty.textContent = t(historyTab === "pet" ? "chat.no_history_pet" : "chat.no_history_short");
+    chatDrawerList.appendChild(empty);
     return;
   }
-  sessions.forEach((s, i) => {
+  visible.forEach((s) => {
     const item = doc("div");
     item.className = "history-item";
     const firstMsg = cleanUserContent(s.messages[0]?.content || t("chat.empty_session"));
@@ -3596,6 +3951,14 @@ attachTodoDrawer();
 function sendChatMessage() {
   const text = chatInput.value.trim();
   if (!text && attachedFiles.length === 0) return;
+  // 斜杠命令（会话内操作）拦截点 = 聊天输入框提交这一处。**命令不进模型**（不当普通文本
+  // 送出去）；只有命中已知集合才拦截，未识别的 `/xxx` 照常当普通文本发（见 parseSlashCommand）。
+  if (parseSlashCommand(text)) {
+    chatInput.value = "";
+    autoResizeChatTextarea();
+    void runSlashCommand(text);
+    return;
+  }
   // Queue messages while streaming — don't silently drop them
   if (isStreaming) {
     pendingMessages.push(text || "(files only)");
@@ -3609,6 +3972,309 @@ function sendChatMessage() {
   autoResizeChatTextarea();
   startAIChat(text);
 }
+
+// ── 斜杠命令（会话内操作，2026-10-11）──────────────────────────────
+// 范围：只做「与能力相关的一小撮」会话内操作 —— `/rewind`、`/memory`、`/compact`、`/help`。
+// 拦截点 = 聊天输入框的提交（sendChatMessage）：命令**不进模型**、不写 chatHistory。
+// 解析规则（宁可交给模型，也不吞用户内容）：
+//   · 首字符必须是 `/`（trim 之后）；命令名 = 到第一个空白为止、**大小写不敏感**；
+//   · 命令名**命中已知集合**才拦截，未识别的 `/xxx` 一律当普通文本发（正常文本里的 `/`
+//     不会命中集合，故不会被误判）；
+//   · 参数按空白切分、忽略多余空白；空参数与多参数由各命令自行解释。
+// 破坏性命令（`/rewind`、`/memory clear`）走就地二次确认（slashConfirm）。
+// 候选菜单的条目 = 命令清单的**唯一真相源**（`SLASH_COMMANDS` 由它派生，不另抄一份）：
+//   · `fill` = 采纳后填入输入框的内容（`/memory` 带一个尾空格，方便用户接着补 `clear` / `show`）；
+//   · `name` = 命令名（用于过滤与「已知集合」判定 = `fill` 的首个词）；
+//   · `descKey` = 候选菜单里的一句说明（走 t()，五语言）。
+interface SlashMenuItem { fill: string; name: string; descKey: string; }
+const SLASH_MENU: SlashMenuItem[] = [
+  { fill: "/help", name: "help", descKey: "chat.slash_menu_help" },
+  { fill: "/rewind", name: "rewind", descKey: "chat.slash_menu_rewind" },
+  { fill: "/memory ", name: "memory", descKey: "chat.slash_menu_memory" },
+  { fill: "/memory clear", name: "memory", descKey: "chat.slash_menu_memory_clear" },
+  { fill: "/compact", name: "compact", descKey: "chat.slash_menu_compact" },
+];
+const SLASH_COMMANDS = new Set(SLASH_MENU.map(i => i.name));
+
+/** 解析 `/name args`；命令名不在已知集合 / 首字符不是 `/` ⇒ 返回 null（= 不拦截）。 */
+function parseSlashCommand(text: string): { name: string; args: string[] } | null {
+  if (!text.startsWith("/")) return null;
+  const body = text.slice(1);
+  const sp = body.search(/\s/);
+  const name = (sp < 0 ? body : body.slice(0, sp)).toLowerCase();
+  if (!SLASH_COMMANDS.has(name)) return null;
+  const rest = sp < 0 ? "" : body.slice(sp + 1);
+  return { name, args: rest.split(/\s+/).filter(Boolean) };
+}
+
+/** 把一行系统旁注插进对话流。形态同「上下文压缩提示」（`.sys-note sys-note-line`，
+ *  **独立节点、不进 textAll / chatHistory** ⇒ 不会被当成助手正文回灌给模型）。 */
+function appendSlashNote(text: string) {
+  const host = chatFlowHost();
+  const note = doc("div");
+  note.className = "sys-note sys-note-line";
+  note.textContent = text;
+  host.appendChild(note);
+  resultsList.scrollTop = resultsList.scrollHeight;
+}
+
+/** `/memory` 的展示块：可展开的 details（记忆上限 6000 字符，直接铺开会很长）。
+ *  形态复用 hooks / 附件提示那一族（`<details class="sys-note">` + `pre.sys-note-body`）。 */
+function appendSlashDetails(summary: string, body: string) {
+  const host = chatFlowHost();
+  const det = doc("details");
+  det.className = "sys-note";
+  det.innerHTML = `<summary></summary><pre class="sys-note-body"></pre>`;
+  const sum = det.querySelector("summary");
+  if (sum) sum.textContent = summary;
+  const pre = det.querySelector<HTMLElement>(".sys-note-body");
+  if (pre) pre.textContent = body;
+  host.appendChild(det);
+  resultsList.scrollTop = resultsList.scrollHeight;
+}
+
+/** 斜杠命令的**就地二次确认**（破坏性操作专用）：复用运行方式自动档那条确认的形态
+ *  （`.run-mode-confirm`，语义红确认，见 styles.css）。确认 / 取消后摘掉，返回用户选择。 */
+function slashConfirm(message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const wrap = doc("div");
+    wrap.className = "sys-note sys-note-line";
+    const box = doc("div");
+    box.className = "run-mode-confirm";
+    const msg = doc("span");
+    msg.className = "run-mode-confirm-msg";
+    msg.textContent = message;
+    const ok = doc("button") as HTMLButtonElement;
+    ok.type = "button";
+    ok.className = "run-mode-confirm-ok";
+    ok.textContent = t("chat.slash_confirm_ok");
+    const cancel = doc("button") as HTMLButtonElement;
+    cancel.type = "button";
+    cancel.className = "run-mode-confirm-cancel";
+    cancel.textContent = t("chat.slash_confirm_cancel");
+    const done = (v: boolean) => { wrap.remove(); resolve(v); };
+    ok.addEventListener("click", () => done(true));
+    cancel.addEventListener("click", () => done(false));
+    box.append(msg, ok, cancel);
+    wrap.appendChild(box);
+    chatFlowHost().appendChild(wrap);
+    resultsList.scrollTop = resultsList.scrollHeight;
+  });
+}
+
+async function runSlashCommand(text: string) {
+  const parsed = parseSlashCommand(text);
+  if (!parsed) return;
+  console.log(`[slash] run /${parsed.name} ${parsed.args.join(" ")}`.trim());
+  switch (parsed.name) {
+    case "help":
+      appendSlashNote(t("chat.slash_help_body"));
+      break;
+    case "compact":
+      await runSlashCompact();
+      break;
+    case "rewind":
+      await runSlashRewind();
+      break;
+    case "memory":
+      await runSlashMemory(parsed.args);
+      break;
+  }
+}
+
+/** `/compact`：请求 agent 立刻压缩一次上下文。走既有发消息通道把一条原始
+ *  `{"type":"compact"}` 写进 agent stdin（**不是**一次提问 —— 不产生回答、不写 chatHistory）；
+ *  agent 压完回 `system/context_compacted`，由既有渲染落一条旁注。命令本身不进模型。 */
+async function runSlashCompact() {
+  appendSlashNote(t("chat.slash_compact_requested"));
+  try {
+    await invoke("send_message", { message: JSON.stringify({ type: "compact" }) });
+    console.log("[slash] compact requested");
+  } catch (e) {
+    console.warn("[slash] compact request failed", e);
+    appendSlashNote(t("chat.slash_compact_failed"));
+  }
+}
+
+/** `/rewind`：撤销最近一轮用户提问（回到它之前）。复用既有 `rollbackChat(idx)` 的闭区间语义
+ *  （idx = 最后一条用户消息的下标 - 1；为 0 时 idx=-1 ⇒ 回到空对话）。破坏性、不可撤销 ⇒ 先确认。 */
+async function runSlashRewind() {
+  let lastUser = -1;
+  for (let i = chatHistory.length - 1; i >= 0; i--) {
+    if (chatHistory[i].role === "user") { lastUser = i; break; }
+  }
+  if (lastUser < 0) { appendSlashNote(t("chat.slash_rewind_empty")); return; }
+  const idx = lastUser - 1;
+  const files = new Set(pendingFileReverts(keptAssistantCountFor(idx)).map(s => s.path));
+  const warn = files.size
+    ? t("chat.rollback_files_armed", { n: String(files.size) })
+    : t("chat.rollback_armed");
+  if (!(await slashConfirm(warn))) return;
+  await rollbackChat(idx);
+  console.log("[slash] rewind done");
+}
+
+/** `/memory [show|clear]`：查看 / 清空长期记忆（`ModuleData\memory\MEMORY.md`）。
+ *  查看走只读宿主命令 `get_memory`；清空走 `clear_memory`，破坏性 ⇒ 先确认。 */
+async function runSlashMemory(args: string[]) {
+  const sub = (args[0] || "").toLowerCase();
+  if (sub === "" || sub === "show") {
+    let text = "";
+    try {
+      text = await invoke<string>("get_memory");
+    } catch {
+      appendSlashNote(t("chat.slash_memory_read_failed"));
+      return;
+    }
+    if (!text.trim()) { appendSlashNote(t("chat.slash_memory_empty")); return; }
+    appendSlashDetails(t("chat.slash_memory_view_summary"), text);
+    return;
+  }
+  if (sub === "clear") {
+    if (!(await slashConfirm(t("chat.slash_memory_clear_confirm")))) return;
+    try {
+      await invoke("clear_memory");
+      appendSlashNote(t("chat.slash_memory_cleared"));
+      console.log("[slash] memory cleared");
+    } catch {
+      appendSlashNote(t("chat.slash_memory_clear_failed"));
+    }
+    return;
+  }
+  appendSlashNote(t("chat.slash_memory_usage"));
+}
+
+// ── 斜杠命令候选菜单（2026-10-11）──────────────────────────────
+// 触发：**光标之前**的文本匹配 `^\s*\/\S*$`（= 首个非空白 token 以 `/` 开头、光标在命令名内）。
+//   —— 与 `parseSlashCommand` 的「整条消息 trim 后以 `/` 开头」口径一致，故普通文本里的
+//   `/`（如 `a/b`）不会误弹；一旦空格出现（进入参数位）菜单即自动收起。
+// 过滤：按命令名前缀（大小写不敏感）筛选 `SLASH_MENU`。
+// 键盘：↑↓ 选择、Enter/Tab 采纳、Esc 关闭；**组合输入期（isComposing）不触发、不拦截**。
+// 鼠标：点条目采纳（mousedown 阻止默认以保住输入框焦点）；hover 同步高亮。
+// **取舍**：菜单打开时 Enter = 采纳（不是发送）—— 采纳只把命令填进输入框、**不执行**
+//   （避免误触 `/rewind` / `/memory clear` 这类破坏性命令，它们本就要二次确认）；
+//   采纳后菜单关闭，再按一次 Enter 才真正发送。Esc 可先关菜单、保持既有 Enter=发送。
+let slashMenuItems: SlashMenuItem[] = [];
+let slashMenuIndex = 0;
+/** 组合输入（IME）进行中：期间既不更新候选、也不让 keydown 采纳（见 composition* 监听）。 */
+let slashComposing = false;
+
+function slashMenuOpen(): boolean {
+  return !chatSlashMenu.classList.contains("hidden");
+}
+
+/** 光标前文本是否处于「命令位置」；是则返回待过滤的命令名（小写），否则 null。 */
+function slashMenuQuery(): string | null {
+  const value = chatInput.value;
+  const caret = chatInput.selectionStart ?? value.length;
+  const m = value.slice(0, caret).match(/^\s*\/(\S*)$/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function highlightSlashSel() {
+  const rows = chatSlashMenu.children;
+  for (let i = 0; i < rows.length; i++) rows[i].classList.toggle("active", i === slashMenuIndex);
+}
+
+function closeSlashMenu() {
+  chatSlashMenu.classList.add("hidden");
+  chatSlashMenu.replaceChildren();
+  slashMenuItems = [];
+  slashMenuIndex = 0;
+}
+
+function updateSlashMenu() {
+  if (slashComposing) return;   // 组合输入期间不弹 / 不更新（compositionend 时再补一次）
+  const q = slashMenuQuery();
+  const items = q === null ? [] : SLASH_MENU.filter(i => i.name.startsWith(q));
+  if (items.length === 0) {
+    if (slashMenuOpen()) closeSlashMenu();
+    return;
+  }
+  const same = items.length === slashMenuItems.length
+    && items.every((it, i) => it.fill === slashMenuItems[i].fill);
+  if (!same) {
+    slashMenuItems = items;
+    if (slashMenuIndex >= items.length) slashMenuIndex = 0;
+    chatSlashMenu.replaceChildren(...items.map((it, i) => {
+      const row = doc("div");
+      row.className = "chat-slash-item" + (i === slashMenuIndex ? " active" : "");
+      const name = doc("span");
+      name.className = "chat-slash-name";
+      name.textContent = it.fill.trim();
+      const desc = doc("span");
+      desc.className = "chat-slash-desc";
+      desc.textContent = t(it.descKey);
+      row.append(name, desc);
+      return row;
+    }));
+  }
+  highlightSlashSel();
+  chatSlashMenu.classList.remove("hidden");
+}
+
+function moveSlashSel(delta: number) {
+  const n = slashMenuItems.length;
+  if (n === 0) return;
+  slashMenuIndex = (slashMenuIndex + delta + n) % n;
+  highlightSlashSel();
+}
+
+/** 采纳当前选中项：把输入框**整体**替换成该命令、光标置于末尾，**不执行**。 */
+function adoptSlashItem() {
+  const item = slashMenuItems[slashMenuIndex];
+  if (!item) return;
+  closeSlashMenu();
+  chatInput.value = item.fill;
+  autoResizeChatTextarea();
+  chatInput.setSelectionRange(item.fill.length, item.fill.length);
+  chatInput.focus();
+}
+
+/** 菜单打开时接管键盘；返回 true = 已消费（既有 Enter=发送 分支不得再处理该键）。 */
+function slashMenuKeydown(e: KeyboardEvent): boolean {
+  if (e.isComposing) return false;          // 组合输入期间不拦截（不影响既有行为）
+  if (!slashMenuOpen()) return false;
+  switch (e.key) {
+    case "Escape": e.preventDefault(); closeSlashMenu(); return true;
+    case "ArrowDown": e.preventDefault(); moveSlashSel(1); return true;
+    case "ArrowUp": e.preventDefault(); moveSlashSel(-1); return true;
+    case "Tab": e.preventDefault(); adoptSlashItem(); return true;
+    case "Enter":
+      if (e.shiftKey) return false;         // Shift+Enter 仍换行（随后 input 事件自动收菜单）
+      e.preventDefault(); adoptSlashItem(); return true;
+    default: return false;
+  }
+}
+
+chatInput.addEventListener("compositionstart", () => { slashComposing = true; });
+chatInput.addEventListener("compositionend", () => { slashComposing = false; updateSlashMenu(); });
+chatInput.addEventListener("input", updateSlashMenu);
+chatInput.addEventListener("click", updateSlashMenu);
+chatInput.addEventListener("keyup", (e) => {
+  if (e.key === "Escape" || e.key === "Enter" || e.key === "Tab") return;
+  updateSlashMenu();
+});
+chatInput.addEventListener("blur", () => closeSlashMenu());
+chatSlashMenu.addEventListener("mousedown", (e) => e.preventDefault());  // 保住输入框焦点
+chatSlashMenu.addEventListener("mousemove", (e) => {
+  const row = (e.target as HTMLElement).closest(".chat-slash-item");
+  if (!row) return;
+  const idx = Array.prototype.indexOf.call(chatSlashMenu.children, row);
+  if (idx >= 0 && idx !== slashMenuIndex) { slashMenuIndex = idx; highlightSlashSel(); }
+});
+chatSlashMenu.addEventListener("click", (e) => {
+  const row = (e.target as HTMLElement).closest(".chat-slash-item");
+  if (!row) return;
+  const idx = Array.prototype.indexOf.call(chatSlashMenu.children, row);
+  if (idx >= 0) slashMenuIndex = idx;
+  adoptSlashItem();
+});
+document.addEventListener("click", (e) => {
+  if (slashMenuOpen() && !chatSlashMenu.contains(e.target as Node) && e.target !== chatInput) {
+    closeSlashMenu();
+  }
+});
 
 // ── 待发送队列（2026-09-30）─────────────────────────────────────
 // 队列本身是既有的 pendingMessages（生成中按下发送即入队，本轮结束后按序发出）。
@@ -3745,6 +4411,9 @@ let usagePanelDirty = false;
 let usageRange: UsageRange = DEFAULT_USAGE_RANGE;
 /** 面板左上角「当前统计的模型」（2026-10-06，用户定）：`null` = 总计（全部模型）。同样跨开关保留。 */
 let usageModel: UsageModelFilter = null;
+/** 面板右上角「当前统计的来源」（2026-10-09）：`null` = 全部；`"pet"` = 桌宠；`"chat"` = 普通聊天。
+ *  与「模型 / 日期」正交、同样跨开关保留。 */
+let usageSource: UsageSourceFilter = null;
 
 function updateTokenDashboard() {
   const { hit, miss, total, elided, dropped } = usageTotals;
@@ -3794,6 +4463,8 @@ function appendUsageLog(info: ChatDoneInfo, ts?: number) {
       model: agentModel,
       // 归因用（A11）：同一条记录属于哪一次 agent 运行；旧 agent 没有这个字段 → 空串
       sessionId: agentSessionId,
+      // 来源归因（2026-10-09）：`"pet"` = 桌宠发起的那一轮；空串 = 普通聊天（旧记录同为缺省）
+      source: turnUsageSource,
       input: info.input_tokens,
       output: info.output_tokens,
       cacheRead: info.cache_read_input_tokens ?? 0,
@@ -3855,8 +4526,8 @@ async function refreshTokenUsagePanel(): Promise<void> {
     do {
       usagePanelDirty = false;
       const data = await loadUsageCost();
-      tokenUsagePanel.innerHTML = renderUsageCostPanel(data, usageRange, usageModel);
-      // 两个下拉框都是**每次重排后重新绑**的（innerHTML 换了节点，旧监听跟着没了）。
+      tokenUsagePanel.innerHTML = renderUsageCostPanel(data, usageRange, usageModel, usageSource);
+      // 三个下拉框都是**每次重排后重新绑**的（innerHTML 换了节点，旧监听跟着没了）。
       // 改动就再刷一轮 —— 那份数据本来就是每次刷新都重读的（对话中每落一次用量
       // 都会走这里），多读一次没有额外代价。
       const bind = (id: string, apply: (v: string) => void) => {
@@ -3868,6 +4539,7 @@ async function refreshTokenUsagePanel(): Promise<void> {
       bind("#cost-range-select", (v) => { usageRange = parseUsageRangeValue(v); });
       // 模型下拉的第一项（空串）就是「总计」
       bind("#cost-model-select", (v) => { usageModel = v === "" ? null : v; });
+      bind("#cost-source-select", (v) => { usageSource = parseUsageSourceValue(v); });
     } while (usagePanelDirty && usagePanelOpen);
   } finally {
     usagePanelBusy = false;
@@ -3944,7 +4616,8 @@ function finalizeInterruptedTurn(opts: { manualStop?: boolean } = {}) {
   //（`finalText` 为空则不 push，同正常收尾的 `if (finalText)`）。⚠️ 这意味着它会写进
   // `chat.db` 的 messages（进 FTS 索引）并随后续 `set_history` 回灌给模型，**这是用户
   // 明确要的**：「被中断的那段输出也要成为对话历史的一部分」。
-  const finalText = v.textAll.trim();
+  // 桌宠轮被中断也走同一处收尾：抽情绪标签 + 去标签（见 `consumePetTags`）。
+  const finalText = consumePetTags(v.textAll.trim());
   if (finalText) chatHistory.push({ role: "assistant", content: finalText });
   // 与正常收尾同口径：先按同一上限裁剪上下文（否则每中断一次就多留一条、无界增长），
   // 再固化过程快照 —— `hasMsg` 决定历史渲染时过程块挂助手气泡还是自己的用户气泡之后。
@@ -3953,6 +4626,9 @@ function finalizeInterruptedTurn(opts: { manualStop?: boolean } = {}) {
   shiftRenderedMsgIdx(beforePrune - chatHistory.length);
   recordTurnSteps(v.flow, !!finalText);
   saveCurrentSession().catch(() => {});
+  // 桌宠发起的那一轮被中断：也要给桌宠一个收尾（有半截正文就回它，否则回「已中断」文案），
+  // 否则它会永远停在「思考中」。非桌宠轮次这是空操作（见 `replyPetTurn`）。
+  replyPetTurn(finalText || t("pet.chat_reply_interrupted"));
 }
 
 /** 用户按「停止」掐掉这一轮后，在过程末尾留一行明示（由 `finalizeInterruptedTurn` 调）。
@@ -3987,6 +4663,9 @@ async function stopAIChat(opts: { drainQueue?: boolean } = {}) {
   // 之前，否则这一轮永远走不到 cliDoneCallback 的收尾，内容只留在实时 DOM 里会丢。
   // `manualStop: drainQueue`：只有用户点「停止」（drainQueue 为真）才追加「已手动终止输出」旁注。
   finalizeInterruptedTurn({ manualStop: drainQueue });
+  // 中断的若是桌宠轮，切回普通线程（该轮的用量 / 过程已按上一步归进桌宠线程，不会丢）。
+  if (activeThread === "pet") switchThread("chat");
+  agentThread = null; // 下面 stop_cli 会重启 agent（上下文清空），下一轮必须重灌
 
   // Stop the CLI (agent mode) — kills agent.exe and clears its context.
   await invoke("stop_cli").catch(() => {});
@@ -3997,6 +4676,8 @@ async function stopAIChat(opts: { drainQueue?: boolean } = {}) {
   agentView = null;
   agentTurn = null;
   clearPermissionCards();
+  // 用户主动停止 ⇒ 本回合结束，阶段浮标回落空闲（下一条 cli-status/会话事件会再纠正）。
+  setDebugPhase("idle");
 
   // Remove loading cursor from last message
   const loading = resultsList.querySelector(".cursor-blink");
@@ -4030,6 +4711,9 @@ chatStopBtn.addEventListener("click", () => void stopAIChat());
 chatSendBtn.addEventListener("click", sendChatMessage);
 
 chatInput.addEventListener("keydown", (e) => {
+  // 斜杠候选菜单打开时优先接管（↑↓/Enter/Tab/Esc）；返回 true 则该键不再往下走，
+  // 保证「菜单选中」与既有「Enter 发送」不互相踩（见 slashMenuKeydown）。
+  if (slashMenuKeydown(e)) return;
   // Backspace on empty → remove last chip（与搜索栏一致：省略泡泡折叠态下
   // 视为删除该省略分支，即同步到省略号内“一键删除”按钮，仅作用于省略号内容）
   if (e.key === "Backspace" && !chatInput.value && attachedFiles.length > 0) {
@@ -4582,6 +5266,10 @@ async function closePluginView() {
   agentView = null;
   agentTurn = null;
   currentSessionId = null;
+  petSessionId = null;
+  // 退出 AI 时回到普通线程（桌宠状态存进 parked），别把窗口留在桌宠态。
+  switchThread("chat");
+  agentThread = null; // 下面 stop_cli 重启 agent ⇒ 上下文清空
   // Clean up drawer if still present
   closeDrawer();
   // Await Rust state sync — prevents race: next ESC sees correct UI_MODE=main
@@ -4669,6 +5357,12 @@ interface CliEventLine {
   hook_event?: string;
   tool_name?: string;
   items?: { kind?: string; text?: string; command?: string }[];
+  /** system/user_file（2026-10-11，A13）：`SendUserFile` 的载荷 —— 本地文件的元信息，
+   *  前端据此落一张文件卡（路径 / 名称 / 大小 / 类型，可选文本预览）。见 `showUserFileCard`。 */
+  file?: { path?: string; name?: string; size?: number; kind?: string; preview?: string };
+  /** system/push_notification（2026-10-11，A13）：`PushNotification` 的载荷 —— 标题 + 正文，
+   *  前端据此弹一条应用内桌面通知。见 `showPushNotification`。 */
+  notification?: { title?: string; body?: string };
   request?: {
     subtype?: string;
     tool_name?: string;
@@ -4689,6 +5383,15 @@ interface CliEventLine {
      *  的 `ask_mcp_trust` 与 main.ts 的 `showMcpTrustCard`。 */
     project?: string;
     servers?: unknown;
+    /** `subtype=mcp_sampling`（2026-10-11）专用：要借本机模型的服务器名 + 请求概要
+     *  （消息条数 / 最大 token）。见 core-agent/src/main.rs 的 `open_sampling_approval`
+     *  与 main.ts 的 `showSamplingCard`。
+     *  `viaHttp`（2026-10-11 第 3 轮）= 这条请求是不是**服务器经 HTTP 主动推来**的反向请求
+     *  —— 为真时渲染**警告样式**的卡（与 stdio 路径的常规卡区分）。 */
+    server?: string;
+    messageCount?: number;
+    maxTokens?: number;
+    viaHttp?: boolean;
   };
   /** system/task_started|task_progress|task_done（子代理事件，A14）：`task_id` 归组，
    *  `description` 只在 started 上、`tool`/`round` 只在 progress 上、`ok`/`ms` 只在 done 上。
@@ -4732,9 +5435,11 @@ interface CliEventLine {
    *  `tool_use_id` 指到哪张卡，`stream` 只有 `stdout` / `stderr` 两个取值。 */
   tool_use_id?: string;
   /** `background_started` / `background_done`（2026-10-01）：后台命令的自增 id
-   *  （形态 `bg_<pid>_<seq>`）与命令原文（已截断，给待办清单那一行显示）。 */
+   *  （形态 `bg_<pid>_<seq>`）与命令原文（已截断，给待办清单那一行显示）。
+   *  `pid`（2026-10-08）：那条命令**进程自己的 pid** —— 用户按它在任务管理器里定位。 */
   id?: string;
   label?: string;
+  pid?: number;
   stream?: string;
   chunk?: string;
 }
@@ -4791,6 +5496,9 @@ interface AgentTurn {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
+  /** 本轮是否跑过命令类工具（`Cmd` / `PowerShell`）—— ⑤ 脚本产出探测的开关（2026-10-10）。
+   *  只有跑过才值得在收尾时扫一遍工作目录找「脚本生成的文件」（见 `registerScriptArtifacts`）。 */
+  scriptRan?: boolean;
 }
 
 let agentTurn: AgentTurn | null = null;
@@ -5437,7 +6145,13 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
 // 那个文件，语义精确，而且**零协议改动**。
 
 /** 会改动文件的工具 → 入参里那条可信的路径字段。 */
-const WRITE_TOOLS: Record<string, string> = { Write: "file_path", Edit: "file_path" };
+const WRITE_TOOLS: Record<string, string> = {
+  Write: "file_path",
+  Edit: "file_path",
+  // NotebookEdit（2026-10-11）改的是 `.ipynb`，路径字段叫 `notebook_path`。
+  // 收进这里 ⇒ 工具卡可点定位、回退按钮也采得到快照（与 Write/Edit 同一条路）。
+  NotebookEdit: "notebook_path",
+};
 
 /** 本次会话改动过的文件（按首次出现顺序去重）；恢复 / 回退历史时由 `sessionSteps` 重建。 */
 let sessionChangedFiles: string[] = [];
@@ -5537,6 +6251,11 @@ interface FileSnapshot {
   existed: boolean;
   /** 原内容；`existed && content === null` = 读不出来（二进制 / 超上限）⇒ 拒绝还原 */
   content: string | null;
+  /** **无改前内容**（2026-10-10，⑤）：这条不是「工具卡采到的原件」，而是**脚本（Cmd /
+   *  PowerShell）生成 / 改写**的文件的**事后登记**（见 `registerScriptArtifacts`）。它**只
+   *  用于「已改动文件」列表里看得见**，**一律不参与回退** —— 我们不知道改前是什么，硬回退
+   *  只可能误删用户原有的文件。回退 / 审阅的每一条写盘路径都必须先剔除 `unknown`。 */
+  unknown?: boolean;
 }
 
 let sessionFileSnapshots: FileSnapshot[] = [];
@@ -5564,9 +6283,10 @@ function keptAssistantCountFor(idx: number): number {
   return n;
 }
 
-/** `turn >= kept` 的快照 = 这次回退要还原的文件。 */
+/** `turn >= kept` 的快照 = 这次回退要还原的文件。
+ *  **剔除 `unknown`**（脚本产出登记）：它们没有改前内容，永远不进回退流程（2026-10-10）。 */
 function pendingFileReverts(kept: number): FileSnapshot[] {
-  return sessionFileSnapshots.filter(s => s.turn >= kept);
+  return sessionFileSnapshots.filter(s => s.turn >= kept && !s.unknown);
 }
 
 /** 把一个快照表写到盘上（**显式传 id 与表**：有的调用点要提交「调用那一刻」的副本，
@@ -5582,7 +6302,7 @@ async function saveFrames(sessionId: string, frames: FileSnapshot[]): Promise<vo
 /** 把**当前内存这份**快照表写回盘（用当前会话 id）。回退之后要立刻调它 —— 见回退流程第 4 步。
  *  还没有会话 id 时什么都不做：那时没有可挂靠的记录，下一次 `saveCurrentSession()` 会带上。 */
 async function persistSessionFrames(): Promise<void> {
-  const sid = currentSessionId;
+  const sid = activeSid(); // 当前线程的 id（桌宠轮里 `currentSessionId` 不是它）
   if (!sid) return;
   await saveFrames(sid, sessionFileSnapshots);
 }
@@ -5610,6 +6330,46 @@ async function captureFileSnapshot(card: AgentToolCard, file: string) {
   }
 }
 
+/** ⑤ 脚本产出登记（2026-10-10，用户要求「生成大的脚本所生成的文件也应该进入已改动的文件」）。
+ *
+ *  **要解决什么**：AI 用 `Cmd` / `PowerShell` 跑脚本**生成 / 改写**的文件不走 `Write` / `Edit`，
+ *  `captureFileSnapshot`（按工具卡的 `file_path` 入参采原件）根本看不见它们 ⇒ 那些文件永远不
+ *  出现在「已改动文件」列表里。
+ *
+ *  **怎么找**：本轮跑过命令类工具（`turn.scriptRan`）时，收尾按 mtime 扫一遍 agent 的可写工作
+ *  目录（宿主命令 `scan_agent_writes`，只回路径、不读内容），把 `sinceMs` 之后被写过的文件
+ *  登记成 `unknown` 帧 —— **只进列表、不参与回退**（没有改前内容，硬回退只会误删用户原有文件）。
+ *
+ *  ⚠️ **必须当场捕获目标线程的引用再异步写回**：这条扫描在桌宠轮收尾时才跑，而收尾紧接着
+ *  `switchThread("chat")` 会把 `sessionFileSnapshots` / `sessionChangedFiles` 换成另一条线程的
+ *  那份。用捕获的引用写入，落盘的 `sid` 也用捕获的 `activeSid()`，才不会被换线程串台。 */
+function registerScriptArtifacts(turn: number, sinceWallMs: number): void {
+  const frames = sessionFileSnapshots;
+  const changed = sessionChangedFiles;
+  const sid = activeSid();
+  void (async () => {
+    try {
+      const paths = await invoke<string[]>("scan_agent_writes", { sinceMs: sinceWallMs, limit: 200 });
+      if (!paths.length) return;
+      let added = 0;
+      for (const p of paths) {
+        // 已经有真快照（工具卡采过原件）就不重复登记 —— 真快照能回退，别被降级成 unknown
+        if (frames.some(s => s.turn === turn && s.path === p)) continue;
+        frames.push({ turn, path: p, existed: true, content: null, unknown: true });
+        if (!changed.includes(p)) changed.push(p);
+        added++;
+      }
+      if (!added) return;
+      framesEpoch++;
+      todoDismissed = false; // 有新登记 ⇒ 抽屉该回来（与 noteChangedFile 一致）
+      renderTodoDrawer();
+      if (sid) await saveFrames(sid, frames);
+    } catch (e) {
+      console.warn("[lunac] scan_agent_writes failed:", e);
+    }
+  })();
+}
+
 /** 把给到的快照**逐条**写回，按回合**倒序**。
  *
  *  **这是唯一实现**（U1 起）：`revertFileSnapshots`（按回合批量回退）与变更审阅的
@@ -5621,6 +6381,9 @@ async function restoreSnapshots(
 ): Promise<{ restored: number; deleted: number; skipped: number; failed: number; paths: Set<string> }> {
   const stat = { restored: 0, deleted: 0, skipped: 0, failed: 0, paths: new Set<string>() };
   for (const s of [...doomed].sort((a, b) => b.turn - a.turn)) {
+    // `unknown` = 脚本产出的事后登记，**没有改前内容** ⇒ 一个字节都不许写、也不许删
+    //（2026-10-10，⑤）。这里是**最后一道闸**：调用方本该先过滤，但写盘路径宁可多重一层。
+    if (s.unknown) continue;
     stat.paths.add(s.path);
     // 原文件在、内容却没留下来（二进制 / 超上限）⇒ 一个字节都不许写，也不许删
     if (s.existed && s.content === null) {
@@ -5763,6 +6526,8 @@ function changeSides(
   const idx = turn === null ? 0 : g.entries.findIndex((e) => e.turn === turn);
   const base = g.entries[idx];
   if (!base) return null;
+  // 脚本产出登记：**没有改前内容** ⇒ 这一条/这个文件没法 diff（调用方据此显示说明文案）
+  if (base.unknown) return null;
   const oldText = sideText(base);
   if (oldText === null) return null;
   // 单条：新侧 = **下一条改动之前**的内容（= 这条改动之后的状态）；
@@ -5820,6 +6585,7 @@ function changeReviewHtml(): string {
     .map((g) => {
       const open = changeOpen.has(g.path);
       const allAccepted = changeAllAccepted(g.entries);
+      const allUnknown = g.entries.length > 0 && g.entries.every((e) => e.unknown);
       // 汇总统计（最早快照 → 现在）
       const s = changeSides(g, null);
       if (s) {
@@ -5832,14 +6598,18 @@ function changeReviewHtml(): string {
         .map((e) => {
           const accepted = changeAccepted.has(changeKey(e.turn, e.path));
           const shown = changeShow.path === g.path && changeShow.turn === e.turn;
+          // 脚本产出登记（无改前内容）：**只显示、不提供接受 / 拒绝** —— 没有原件可写回。
+          const actions = e.unknown
+            ? `<span class="cr-script-note" title="${esc(t("agent.cr_script_hint"))}">${esc(t("agent.cr_script_note"))}</span>`
+            : accepted
+              ? `<span class="cr-done">${esc(t("agent.cr_accepted"))}</span>`
+              : crBtn("accept", g.path, t("agent.cr_accept"), "accept", t("agent.cr_accept"), e.turn) +
+                crBtn("reject", g.path, t("agent.cr_reject"), "reject", t("agent.cr_reject_hint"), e.turn);
           return (
             `<div class="cr-entry${shown ? " active" : ""}${accepted ? " accepted" : ""}">` +
             `<button type="button" class="cr-entry-label" data-cr="show" data-crpath="${esc(g.path)}" data-crturn="${e.turn}">` +
             `${esc(t("agent.cr_turn", { n: String(e.turn + 1) }))}</button>` +
-            (accepted
-              ? `<span class="cr-done">${esc(t("agent.cr_accepted"))}</span>`
-              : crBtn("accept", g.path, t("agent.cr_accept"), "accept", t("agent.cr_accept"), e.turn) +
-                crBtn("reject", g.path, t("agent.cr_reject"), "reject", t("agent.cr_reject_hint"), e.turn)) +
+            actions +
             `</div>`
           );
         })
@@ -5860,10 +6630,12 @@ function changeReviewHtml(): string {
         `<a class="file-link" data-path="${esc(g.path)}" title="${hint}">${esc(pathBase(g.path))}</a>` +
         `<span class="changed-file-dir" title="${esc(g.path)}">${esc(pathDir(g.path))}</span>` +
         changeStatHtml(g) +
-        (allAccepted
-          ? `<span class="cr-done">${esc(t("agent.cr_accepted"))}</span>`
-          : crBtn("accept", g.path, t("agent.cr_accept"), "accept", t("agent.cr_accept")) +
-            crBtn("reject", g.path, t("agent.cr_reject"), "reject", t("agent.cr_reject_file_hint"))) +
+        (allUnknown
+          ? `<span class="cr-script-note" title="${esc(t("agent.cr_script_hint"))}">${esc(t("agent.cr_script_note"))}</span>`
+          : allAccepted
+            ? `<span class="cr-done">${esc(t("agent.cr_accepted"))}</span>`
+            : crBtn("accept", g.path, t("agent.cr_accept"), "accept", t("agent.cr_accept")) +
+              crBtn("reject", g.path, t("agent.cr_reject"), "reject", t("agent.cr_reject_file_hint"))) +
         `</div>` +
         (open ? `<div class="cr-body">${body}</div>` : "") +
         `</li>`
@@ -5911,12 +6683,13 @@ async function applyChangeAction(act: string, path: string, turn: number | undef
     return;
   }
   // ── 拒绝：真的写盘 ──────────────────────────────────────────────
+  // **一律剔除 `unknown`**（脚本产出登记）：它们没有改前内容，写盘就是误删（2026-10-10，⑤）。
   let doomed: FileSnapshot[];
   if (act === "rejectAll") {
-    doomed = [...sessionFileSnapshots];
+    doomed = sessionFileSnapshots.filter((s) => !s.unknown);
   } else {
     doomed = sessionFileSnapshots.filter(
-      (s) => s.path === path && (turn === undefined || s.turn >= turn),
+      (s) => s.path === path && !s.unknown && (turn === undefined || s.turn >= turn),
     );
   }
   if (!doomed.length) return;
@@ -6053,6 +6826,10 @@ function renderTodoDrawer() {
       ([id, v]) =>
         `<li class="todo-item bg-cmd">` +
         `<span class="bg-cmd-label" title="${esc(v.label)}">${esc(v.label)}</span>` +
+        // `PID xxxxx`（2026-10-08）：任务管理器默认只显示**映像名**、不显示命令行，而 AI
+        // 起的是 `cmd /C ...`（真正干活的常常是它的孙进程）⇒ 光给命令原文，用户在任务
+        // 管理器里对不上号。PID 是**语言无关的标识符**（同路径 / 命令 / API 名），不进 i18n。
+        (v.pid ? `<span class="bg-cmd-pid">PID ${v.pid}</span>` : "") +
         `<button type="button" class="bg-cmd-cancel" data-bg="${esc(id)}">${esc(t("agent.bg_cancel"))}</button>` +
         `</li>`
     )
@@ -6820,7 +7597,7 @@ function sendToolControl(action: "background" | "stop" | "stdin", toolUseId: str
 }
 
 /** 后台运行中的命令：后台 id → `{ toolUseId, label }`。待办清单那一区就是它。 */
-const backgroundCmds = new Map<string, { toolUseId: string; label: string }>();
+const backgroundCmds = new Map<string, { toolUseId: string; label: string; pid?: number }>();
 
 // ── Continuous-command merging (Trae-style approval) ──────────────
 // Consecutive simple Cmd/PowerShell commands in the same turn fold into
@@ -6916,7 +7693,13 @@ function renderGroupTitle(item: CmdGroupItem) {
 
 /** AskUserQuestion 的选项界面：单选用互斥高亮、多选可叠加；选中结果写进
  *  item._buildUpdatedInput，由 finish() 经 `updatedInput` 回传给 agent
- *  （agent 侧只把 answers 排成 tool_result，见 core-agent/src/tools.rs）。 */
+ *  （agent 侧只把 answers 排成 tool_result，见 core-agent/src/tools.rs）。
+ *
+ *  **「其他 / 补充说明」（2026-10-10 用户要求）**：固定选项之外给一条自由输入的通道 ——
+ *  ① 每题多一枚「其他（自己输入）」，选中就地展开一个输入框（最多 1000 字），其内容**取代**
+ *     该题被选中的 label；② 卡底再给一个大文本框「补充说明」（最多 1000 字、约 200px 高），
+ *  非空时以 **`agent.ask_extra_key` 为键**加进 `answers` —— agent 的 `ask_user_question` 会把
+ *  没对上题的键**补在后面**输出（`"键" = "值"`），于是这段补充也随 tool_result 递给模型。 */
 function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupItem) {
   const inp = (input ?? {}) as Record<string, unknown>;
   const questions = Array.isArray(inp.questions)
@@ -6924,6 +7707,9 @@ function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupIte
     : [];
   // 题目原文 → 已选中的 label 列表（answers 的键就是题目原文）
   const picked = new Map<string, string[]>();
+  // 题目原文 → 「其他」那枚输入框里的自定义文本
+  const otherText = new Map<string, string>();
+  const OTHER = t("agent.ask_other");
 
   for (const q of questions) {
     const qText = String(q.question ?? "");
@@ -6946,20 +7732,42 @@ function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupIte
 
     const opts = document.createElement("div");
     opts.className = "approval-ask-opts";
-    for (const o of list) {
-      const label = String(o.label ?? "");
+
+    // 「其他」那枚的就地输入框（选中才展开）。放在 opts 之后 —— 与「其他」按钮同属该题。
+    const otherWrap = document.createElement("div");
+    otherWrap.className = "approval-ask-other-wrap hidden";
+    const otherInput = document.createElement("textarea");
+    otherInput.className = "approval-ask-other-input";
+    otherInput.maxLength = 1000;
+    otherInput.rows = 2;
+    otherInput.placeholder = t("agent.ask_other_ph");
+    otherInput.addEventListener("input", () => otherText.set(qText, otherInput.value));
+    otherWrap.appendChild(otherInput);
+
+    /** 重画该题的选中态（含「其他」按钮与它下面的输入框）。 */
+    const repaint = () => {
+      const now = picked.get(qText) ?? [];
+      opts.querySelectorAll(".approval-ask-opt").forEach((el) => {
+        const l = el.querySelector(".approval-ask-opt-label")?.textContent ?? "";
+        el.classList.toggle("picked", now.includes(l));
+      });
+      otherWrap.classList.toggle("hidden", !now.includes(OTHER));
+      if (now.includes(OTHER)) otherInput.focus();
+    };
+
+    const makeOpt = (label: string, desc: unknown, extraClass = "") => {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "approval-ask-opt";
+      btn.className = "approval-ask-opt" + (extraClass ? ` ${extraClass}` : "");
       const lab = document.createElement("span");
       lab.className = "approval-ask-opt-label";
       lab.textContent = label;
       btn.appendChild(lab);
-      if (o.description) {
-        const desc = document.createElement("span");
-        desc.className = "approval-ask-opt-desc";
-        desc.textContent = String(o.description);
-        btn.appendChild(desc);
+      if (desc) {
+        const d = document.createElement("span");
+        d.className = "approval-ask-opt-desc";
+        d.textContent = String(desc);
+        btn.appendChild(d);
       }
       btn.addEventListener("click", () => {
         const cur = picked.get(qText) ?? [];
@@ -6971,25 +7779,51 @@ function renderAskQuestions(host: HTMLElement, input: unknown, item: CmdGroupIte
               : [...cur, label]
             : [label],
         );
-        const now = picked.get(qText) ?? [];
-        opts.querySelectorAll(".approval-ask-opt").forEach((el) => {
-          const l = el.querySelector(".approval-ask-opt-label")?.textContent ?? "";
-          el.classList.toggle("picked", now.includes(l));
-        });
+        repaint();
       });
       opts.appendChild(btn);
+      return btn;
+    };
+
+    for (const o of list) {
+      // 模型自己若就给了一条叫「其他」的选项，不重复追加（避免两枚同名按钮）
+      if (String(o.label ?? "") === OTHER) continue;
+      makeOpt(String(o.label ?? ""), o.description);
     }
+    makeOpt(OTHER, "", "approval-ask-other");
+
     wrap.appendChild(opts);
+    wrap.appendChild(otherWrap);
     host.appendChild(wrap);
   }
+
+  // 卡底「补充说明」大文本框（非空时随答案一并发给 AI）。
+  const extra = document.createElement("div");
+  extra.className = "approval-ask-extra";
+  const extraTitle = document.createElement("div");
+  extraTitle.className = "approval-ask-extra-title";
+  extraTitle.textContent = t("agent.ask_extra_title");
+  const extraInput = document.createElement("textarea");
+  extraInput.className = "approval-ask-extra-input";
+  extraInput.maxLength = 1000;
+  extraInput.placeholder = t("agent.ask_extra_ph");
+  extra.append(extraTitle, extraInput);
+  host.appendChild(extra);
 
   item._buildUpdatedInput = () => {
     const answers: Record<string, string | string[]> = {};
     for (const [qText, labels] of picked) {
       if (!labels.length) continue; // 没选的题不带答案，agent 会看到「漏答」
       const multi = questions.find((x) => String(x.question ?? "") === qText)?.multiSelect === true;
-      answers[qText] = multi ? labels : labels[0];
+      // 「其他」⇒ 用输入框里的文本取代那枚 label（空文本 = 这一项不算数）。
+      const vals = labels
+        .map((l) => (l === OTHER ? (otherText.get(qText) ?? "").trim() : l))
+        .filter((v) => v.length > 0);
+      if (!vals.length) continue;
+      answers[qText] = multi ? vals : vals[0];
     }
+    const note = extraInput.value.trim();
+    if (note) answers[t("agent.ask_extra_key")] = note;
     // 必须带上 questions：agent 只认「非空对象」为覆盖，空对象 = 用原参数
     return { ...inp, answers };
   };
@@ -7532,6 +8366,216 @@ function showMcpTrustCard(requestId: string, project: string, servers: unknown) 
   agentScroll();
 }
 
+/** MCP sampling 授权卡（2026-10-11）：某台 MCP 服务器要借本机模型
+ *  （`sampling/createMessage`）时，用户在这张卡上点「允许（本会话）」。
+ *  与 `can_use_tool` **同一条审批通道**（`subtype = mcp_sampling`），回包复用
+ *  `respondPermission`（`behavior: allow` = 同意，`deny` = 拒绝）。
+ *
+ *  **本会话记住**：点「允许」后，本会话内该服务器再请求 sampling 直接放行、不再弹卡
+ *  （agent 侧 `MCP_SAMPLING_APPROVED`，进程重启即忘）—— 故按钮与提示都点明「本会话」，
+ *  绝不悄悄变成长期静默。
+ *
+ *  **反向（HTTP）警告样式**（`viaHttp`）：这条请求是服务器**经 HTTP 主动推来**的反向请求，
+ *  用警告语义色 `--yellow`（§界面 11 白名单语义色）加左缘描边 + 一行警示文案，与 stdio
+ *  路径的常规卡区分开。
+ *
+ *  与其它卡的关键差别（**不得回退**）：只给「允许（本会话）/ 拒绝」两个按钮 —— 刻意**没有**
+ *  「始终允许」，也**不**进 `classifyRequest()` 的白名单 / 自动档。它是「高底线授权」，
+ *  且不可被 `--dangerously-skip-permissions` / hook / 白名单跳过（判据见 core-agent 的
+ *  `open_sampling_approval`）。 */
+const pendingSamplingCards = new Map<string, HTMLElement>();
+
+function showSamplingCard(
+  requestId: string,
+  server: string,
+  messageCount: unknown,
+  maxTokens: unknown,
+  viaHttp: boolean,
+) {
+  pendingSamplingCards.get(requestId)?.remove();
+  const host = agentView?.flow ?? resultsList;
+  const card = document.createElement("div");
+  // 反向（HTTP）路径走**警告样式**（左缘 --yellow），与 stdio 常规卡区分
+  card.className = viaHttp
+    ? "approval-card mcp-sampling-card mcp-sampling-warn"
+    : "approval-card mcp-sampling-card";
+
+  const title = document.createElement("div");
+  title.className = "approval-title";
+  title.innerHTML = `<b>${esc(t("agent.sampling_title"))}</b>`;
+  card.appendChild(title);
+
+  const body = document.createElement("div");
+  body.className = "approval-body";
+  const mc = Number(messageCount ?? 0);
+  const mt = Number(maxTokens ?? 0);
+  // 反向（HTTP）卡先亮明「服务器经 HTTP 主动推来」，再给服务器名与概要
+  const warnLine = viaHttp
+    ? `<div class="mcp-sampling-warn-line">${esc(t("agent.sampling_http_banner"))}</div>`
+    : "";
+  body.innerHTML =
+    warnLine +
+    `<div class="mcp-sampling-server">${esc(server || "MCP")}</div>` +
+    `<div class="mcp-sampling-stat">${esc(t("agent.sampling_messages"))}: ${mc}　` +
+    `${esc(t("agent.sampling_max_tokens"))}: ${mt}</div>` +
+    `<div class="mcp-sampling-hint">${esc(t("agent.sampling_body"))}</div>` +
+    // 「允许 = 本会话内不再询问」必须在卡上明说，不能悄悄变长期静默
+    `<div class="mcp-sampling-hint">${esc(t("agent.sampling_session"))}</div>`;
+  card.appendChild(body);
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  actions.innerHTML = `
+    <button class="approval-btn approval-allow">${esc(t("agent.sampling_allow"))}</button>
+    <button class="approval-btn approval-deny">${esc(t("agent.sampling_deny"))}</button>`;
+  card.appendChild(actions);
+
+  const done = (allow: boolean) => {
+    card.remove();
+    pendingSamplingCards.delete(requestId);
+    respondPermission(requestId, allow);
+  };
+  actions.querySelector(".approval-allow")!.addEventListener("click", () => done(true));
+  actions.querySelector(".approval-deny")!.addEventListener("click", () => done(false));
+
+  host.appendChild(card);
+  pendingSamplingCards.set(requestId, card);
+  agentScroll();
+}
+
+// ── agent → 用户的呈递（A13，2026-10-11）───────────────────────────
+// 两件工具的效果都在这里：`SendUserFile` ⇒ `system/user_file` ⇒ 一张文件卡；
+// `PushNotification` ⇒ `system/push_notification` ⇒ 一条应用内桌面通知。
+// agent 侧只给**元信息**（路径 / 大小 / 类型，可选文本预览），前端不读文件内容 ——
+// 「打开 / 在资源管理器中显示」都由宿主命令完成（见 `open_path` / `reveal_in_explorer`）。
+
+/** 字节数 → 人读大小（B / KB / MB / GB）。仅展示，不参与任何判定。 */
+function formatFileSize(bytes: number): string {
+  const n = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v >= 10 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
+/** 文件类型标签（`kind` 由 agent 按扩展名给出，见 core-agent 的 `classify_media_kind`）。 */
+function userFileKindLabel(kind: string): string {
+  const known = ["image", "text", "code", "pdf", "archive", "audio", "video"];
+  return t(`agent.user_file_kind_${known.includes(kind) ? kind : "other"}`);
+}
+
+/** 把 `SendUserFile` 的载荷落成对话流里的一张文件卡。 */
+function showUserFileCard(file: NonNullable<CliEventLine["file"]>) {
+  const host = agentView?.flow ?? resultsList;
+  const path = String(file.path ?? "");
+  const name = String(file.name ?? "").trim() || path;
+  const kind = String(file.kind ?? "other");
+  const size = typeof file.size === "number" ? file.size : 0;
+  const preview = typeof file.preview === "string" ? file.preview : "";
+
+  const card = document.createElement("div");
+  card.className = "file-handoff-card";
+
+  const title = document.createElement("div");
+  title.className = "file-handoff-title";
+  title.innerHTML = `<span class="file-handoff-ic">${FILE_SVG}</span>` +
+    `<span>${esc(t("agent.user_file_title"))}</span>`;
+  card.appendChild(title);
+
+  const body = document.createElement("div");
+  body.className = "file-handoff-body";
+  body.innerHTML =
+    `<div class="file-handoff-name">${esc(name)}</div>` +
+    `<div class="file-handoff-path">${esc(path)}</div>` +
+    `<div class="file-handoff-meta">${esc(
+      t("agent.user_file_meta", { size: formatFileSize(size), kind: userFileKindLabel(kind) }),
+    )}</div>`;
+  card.appendChild(body);
+
+  if (preview) {
+    const det = document.createElement("details");
+    det.className = "file-handoff-preview";
+    det.innerHTML =
+      `<summary>${esc(t("agent.user_file_preview"))}</summary>` +
+      `<pre class="file-handoff-preview-body"></pre>`;
+    det.querySelector(".file-handoff-preview-body")!.textContent = preview;
+    card.appendChild(det);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "file-handoff-actions";
+  actions.innerHTML =
+    `<button type="button" class="file-handoff-btn" data-act="open">${esc(t("agent.user_file_open"))}</button>` +
+    `<button type="button" class="file-handoff-btn" data-act="reveal">${esc(t("agent.reveal_in_explorer"))}</button>`;
+  actions.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-act]");
+    if (!btn || !path) return;
+    if (btn.dataset.act === "open") {
+      invoke("open_path", { path }).catch((err) => {
+        console.warn("[lunac] open_path failed:", err);
+        statusText.textContent = t("agent.user_file_open_failed");
+      });
+    } else {
+      invoke("reveal_in_explorer", { path }).catch((err) => {
+        console.warn("[lunac] reveal_in_explorer failed:", err);
+        statusText.textContent = t("agent.reveal_failed");
+      });
+    }
+  });
+  card.appendChild(actions);
+
+  host.appendChild(card);
+  agentScroll();
+}
+
+/** 把 `PushNotification` 的载荷弹成一条**应用内桌面通知**（自动消失，不阻塞）。
+ *
+ *  为什么不做成 OS 级 toast：项目当前**没有**任何桌面通知设施（唯一相关的是宿主
+ *  `notify_sound` 的一声提示音，不是通知），加 OS toast 要引 `tauri-plugin-notification`
+ *  或 WinRT，超出本工具的最小配套。这里落在应用内浮层（`system/push_notification` 驱动），
+ *  节流由 agent 侧保证（见 `tools::PUSH_NOTIFICATION_MIN_INTERVAL_MS`）。 */
+function showPushNotification(title: string, body: string) {
+  const host = document.getElementById("push-toast-host") ?? (() => {
+    const h = document.createElement("div");
+    h.id = "push-toast-host";
+    document.body.appendChild(h);
+    return h;
+  })();
+
+  const toast = document.createElement("div");
+  toast.className = "push-toast";
+  const head = document.createElement("div");
+  head.className = "push-toast-head";
+  head.innerHTML = `<span class="push-toast-title">${esc(title)}</span>`;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "push-toast-close";
+  close.title = t("agent.notify_dismiss");
+  close.setAttribute("aria-label", t("agent.notify_dismiss"));
+  close.innerHTML = X_SVG;
+  head.appendChild(close);
+  toast.appendChild(head);
+
+  const text = document.createElement("div");
+  text.className = "push-toast-body";
+  text.textContent = body;
+  toast.appendChild(text);
+
+  const dismiss = () => {
+    toast.remove();
+    if (host.childElementCount === 0) host.remove();
+  };
+  close.addEventListener("click", dismiss);
+  // 6s 自动收起（通知不该长期占屏；用户仍能在对话流里看到那次工具调用）
+  window.setTimeout(dismiss, 6000);
+  host.appendChild(toast);
+}
+
 function showPermissionCard(
   requestId: string,
   toolName: string,
@@ -7816,14 +8860,36 @@ listen<{ line: string }>("cli-output", (event) => {
         if (cb?.type === "thinking") {
           agentNewBlock("thinking");
           statusText.textContent = t("agent.thinking");
+          setDebugPhase("thinking");
         } else if (cb?.type === "tool_use") {
           // Track tool call in turn (Pi: structured tool lifecycle)
           agentTurn?.toolCalls.push({ name: cb.name || "unknown", status: "running" });
-          agentNewBlock("tool", cb.name, cb.id);
-          statusText.textContent = t("agent.tool", { tool: cb.name || "..." });
+          // ⑤ 脚本产出探测（2026-10-10）：本轮跑过命令类工具 ⇒ 收尾时按 mtime 扫一遍工作目录。
+          if (cb.name === "Cmd" || cb.name === "PowerShell") {
+            if (agentTurn) agentTurn.scriptRan = true;
+          }
+          // `PetControl`（桌宠动作，2026-10-10）：**不建命令卡** —— 它的效果由前端广播给
+          // 桌宠窗（见 handlePetControl），而卡上那行 `action=… name=…` 正是不该给用户看的
+          // 技术细节。不建块 ⇒ 后续 `input_json_delta` 因 `currentKind !== "tool"` 自然忽略；
+          // 入参改由**整包 assistant 消息**那条路径截获。
+          // `SendUserFile` / `PushNotification`（2026-10-11）：同样**不建命令卡** —— 它们的
+          // 效果由 `system/user_file` / `system/push_notification` 事件单独渲染（见
+          // showUserFileCard / showPushNotification），这里只更新状态行。
+          if (cb.name === "PetControl") {
+            statusText.textContent = t("agent.working");
+            setDebugPhase("tool", "PetControl");
+          } else if (cb.name === "SendUserFile" || cb.name === "PushNotification") {
+            statusText.textContent = t("agent.tool", { tool: cb.name });
+            setDebugPhase("tool", cb.name);
+          } else {
+            agentNewBlock("tool", cb.name, cb.id);
+            statusText.textContent = t("agent.tool", { tool: cb.name || "..." });
+            setDebugPhase("tool", cb.name || "...");
+          }
         } else {
           agentNewBlock("text");
           statusText.textContent = t("agent.generating");
+          setDebugPhase("responding");
         }
       } else if (ev?.type === "content_block_delta") {
         if (ev.delta?.type === "text_delta" && ev.delta.text) {
@@ -7842,6 +8908,8 @@ listen<{ line: string }>("cli-output", (event) => {
         // calls. `result` is the true end-of-query marker.
         agentCloseBlock();
         statusText.textContent = t("agent.working");
+        // 本轮内容块已收口，下一步要么执行工具、要么再次请求模型 ⇒ 归入「请求模型」。
+        setDebugPhase("requesting");
       }
     }
     // 逐请求用量（2026-10-06）：agent 每完成一次 API 请求就报一条（主循环与子代理都报）。
@@ -7881,6 +8949,7 @@ listen<{ line: string }>("cli-output", (event) => {
     // API retry — surface silent backoff loops (e.g. auth/network failures)
     else if (data.type === "system" && data.subtype === "api_retry") {
     statusText.textContent = t("agent.retry", { attempt: String(data.attempt ?? "?"), max: String(data.max_retries ?? "?") });
+    setDebugPhase("requesting");
     }
     // Context compaction — agent trimmed history to fit the window.
     // 每次压缩都会改写请求前缀、作废端点侧缓存，所以既提示也计数：
@@ -7891,6 +8960,7 @@ listen<{ line: string }>("cli-output", (event) => {
       liveCompaction.elided += elided;
       liveCompaction.dropped += dropped;
       statusText.textContent = t("agent.compacted", { elided: String(elided), dropped: String(dropped) });
+      setDebugPhase("compacting");
       // 压缩是**改写上下文**的大事（2026-10-06 用户要求可见）：在对话流里留一条记录，
       // 别让人只在状态行一闪而过时才发现「模型怎么忘了前面的事」。
       //
@@ -7921,6 +8991,7 @@ listen<{ line: string }>("cli-output", (event) => {
     // 两条都要写状态行 —— 用户得知道「AI 为什么突然收尾了」，以及可以继续追问。
     else if (data.type === "system" && data.subtype === "budget_extended") {
     statusText.textContent = t("agent.budget_extended");
+    setDebugPhase("compacting");
     }
     else if (data.type === "system" && data.subtype === "budget_exhausted") {
     statusText.textContent = t("agent.budget_exhausted");
@@ -7938,7 +9009,11 @@ listen<{ line: string }>("cli-output", (event) => {
     else if (data.type === "system" && data.subtype === "background_started") {
     const bid = String(data.id ?? "");
     const tid = String(data.tool_use_id ?? "");
-    backgroundCmds.set(bid, { toolUseId: tid, label: String(data.label ?? "") });
+    backgroundCmds.set(bid, {
+      toolUseId: tid,
+      label: String(data.label ?? ""),
+      pid: typeof data.pid === "number" ? data.pid : undefined,
+    });
     markCardBackground(tid);
     renderTodoDrawer();
     }
@@ -7964,6 +9039,19 @@ listen<{ line: string }>("cli-output", (event) => {
         items: Array.isArray(data.items) ? data.items : [],
       });
     }
+    // agent → 用户的呈递（A13，2026-10-11）：`SendUserFile` 落一张文件卡、`PushNotification`
+    // 弹一条应用内桌面通知。载荷都是 agent 算好的元信息，前端不读文件内容。
+    else if (data.type === "system" && data.subtype === "user_file") {
+      if (data.file) showUserFileCard(data.file);
+    }
+    else if (data.type === "system" && data.subtype === "push_notification") {
+      if (data.notification) {
+        showPushNotification(
+          String(data.notification.title ?? ""),
+          String(data.notification.body ?? ""),
+        );
+      }
+    }
     // MCP elicitation（A13）：用户工具声明了 `elicit`，服务端在 `tools/call` 执行前
     // 向用户收集输入 —— 与审批卡同一条通道，但渲染成一张表单（见 showElicitationCard）。
     else if (data.type === "control_request" && data.request?.subtype === "elicitation" && data.request_id) {
@@ -7982,12 +9070,25 @@ listen<{ line: string }>("cli-output", (event) => {
         data.request.servers,
       );
     }
+    // MCP sampling 授权（2026-10-11）：某台 MCP 服务器要借本机模型。走的是同一条审批通道，
+    // 独立渲染（见 showSamplingCard）。用户同意一次即**本会话内记住**该服务器（不再弹卡，重启即忘）；
+    // 经 HTTP 反向通道到达的请求渲染成**警告样式**的卡（`viaHttp`）。
+    else if (data.type === "control_request" && data.request?.subtype === "mcp_sampling" && data.request_id) {
+      showSamplingCard(
+        data.request_id,
+        typeof data.request.server === "string" ? data.request.server : "",
+        data.request.messageCount,
+        data.request.maxTokens,
+        data.request.viaHttp === true,
+      );
+    }
     // Permission request — CLI blocks until we answer: render approval card
     else if (data.type === "control_request" && data.request?.subtype === "can_use_tool" && data.request_id) {
       // 空闲时收到的审批来自**后台复盘 fork**（A4）：它按轮次门槛在**提问之间**跑，
       // 不是任何一次提问的一部分 —— 因此不推状态机（`idle → approval` 本就是非法迁移），
       // 卡片照常显示/自动放行（**自动放行不落任何提示行**，见 showPermissionCard 的 `cls.auto` 分支）。
       if (agentState !== "idle") agentTransition("approval");
+      setDebugPhase("approval");
       showPermissionCard(
         data.request_id,
         data.request.tool_name || "unknown tool",
@@ -8007,7 +9108,11 @@ listen<{ line: string }>("cli-output", (event) => {
       // 项目 MCP 信任卡（q3）同理
       pendingMcpTrustCards.get(data.request_id)?.remove();
       pendingMcpTrustCards.delete(data.request_id);
+      // MCP sampling 授权卡（2026-10-11）同理
+      pendingSamplingCards.get(data.request_id)?.remove();
+      pendingSamplingCards.delete(data.request_id);
       if (agentState === "approval") agentTransition("running");
+      setDebugPhase("requesting");
     }
     // Subagent / task progress — surface instead of silent waiting.
     // A14：一轮里可能有多个子任务并发，三个事件全部交给 `agentSubtaskEvent` 按 `task_id`
@@ -8019,6 +9124,8 @@ listen<{ line: string }>("cli-output", (event) => {
         data.subtype === "task_done")
     ) {
       agentSubtaskEvent(data);
+      // task_done 后主代理立刻继续（下次请求模型）⇒ 归回「请求模型」。
+      setDebugPhase(data.subtype === "task_done" ? "requesting" : "subagent");
     }
     // Whole assistant message: block fallback (only when no partial stream
     // events arrived, to avoid double rendering) + tool_use status
@@ -8034,6 +9141,7 @@ listen<{ line: string }>("cli-output", (event) => {
           agentCloseBlock();
         } else if (block.type === "tool_use") {
           statusText.textContent = `Agent tool: ${block.name || "..."}`;
+          setDebugPhase("tool", block.name || "...");
           // 本回合是否碰过插件目录（AI 自建 / 自改插件）→ 收尾自动重扫，见 `notePluginDirWrite`
           notePluginDirWrite(block.name, block.input);
           // TodoWrite 优先用整包入参画面板：端点可能直接在 content_block_start
@@ -8041,6 +9149,17 @@ listen<{ line: string }>("cli-output", (event) => {
           if (block.name === "TodoWrite") {
             const todos = todosFromInput(block.input);
             if (todos) renderTodoPanel(todos);
+          }
+          // `PetControl`（桌宠动作，2026-10-10）：截获入参后广播给桌宠窗执行，**不建命令卡**
+          // （同流式路径的理由：卡上的技术细节不该给用户看）。`continue` 顺带跳过建卡。
+          // `SendUserFile` / `PushNotification`（2026-10-11）：同样跳过建卡 —— 它们的卡 /
+          // 通知由对应的 `system` 事件渲染（树上的入参在这里不需要再做什么）。
+          if (block.name === "PetControl") {
+            handlePetControl(block.input, block.id || "");
+            continue;
+          }
+          if (block.name === "SendUserFile" || block.name === "PushNotification") {
+            continue;
           }
           // **工具卡不按 `cliSawStreamDelta` 跳过**（2026-09-27 修）：那个标志只说明
           // 「这一轮出现过流式分片」，与「这张卡建过没有」是两件事。旧写法在
@@ -8091,7 +9210,16 @@ listen<{ line: string }>("cli-output", (event) => {
           const lastTool = tc && tc[tc.length - 1];
           // TodoWrite 的成功回执就是那块面板本身 —— 再贴一条「✓ 完成」只会把
           // 整份清单原样重复一遍；失败仍照常显示。
-          if (!(lastTool?.name === "TodoWrite" && !block.is_error)) {
+          // `PetControl`（桌宠动作，2026-10-10）：它**没有卡片**，回执一律丢弃 ——
+          // 否则 agentToolResult 会按「最近一张未完成的卡」兜底，把回执填到**上一张卡**上。
+          // `SendUserFile` / `PushNotification`（2026-10-11）：同理**没有命令卡**（效果由
+          // `system` 事件渲染），回执也一律丢弃，避免填错卡。
+          if (
+            !(lastTool?.name === "TodoWrite" && !block.is_error) &&
+            lastTool?.name !== "PetControl" &&
+            lastTool?.name !== "SendUserFile" &&
+            lastTool?.name !== "PushNotification"
+          ) {
             agentToolResult(
               !!block.is_error,
               block.content,
@@ -8105,6 +9233,8 @@ listen<{ line: string }>("cli-output", (event) => {
           }
         }
       }
+      // 工具回执到了 ⇒ agent 把结果发回模型、再请求一次 ⇒ 归入「请求模型」。
+      setDebugPhase("requesting");
     }
     // Result — true end of one query (success or error): finish the stream
     else if (data.type === "result") {
@@ -8133,6 +9263,9 @@ listen<{ line: string }>("cli-output", (event) => {
         agentNewBlock("text");
         agentAppend("text", `[${t("agent.error_inline", { err: `${data.subtype}${data.result ? ` — ${data.result}` : ""}` })}]`);
         agentCloseBlock();
+        setDebugPhase("error");
+      } else {
+        setDebugPhase("done");
       }
       clearPermissionCards();
       agentTransition("done");
@@ -8177,21 +9310,23 @@ listen<{ state: string; message: string; instance?: number }>("cli-status", (eve
     cliReady = false;
     statusText.textContent = t("status.ai", { mode: currentModeLabel() });
     updateAgentStatus("loading");
+    setDebugPhase("starting");
   } else if (event.payload.state === "stdout") {
     cliReady = true;
+    // agent 是**新起的进程**（start_cli 后第一次 stdout）⇒ 它内部历史是空的，
+    // 我们记的「agent 当前装的是哪条线程」随之失效，置 null 逼下一轮重新灌
+    // （见 `ensureAgentThread`）—— 否则重灌会被误判成「已经是这条线程」而跳过。
+    agentThread = null;
     if (event.payload.instance) cliCurrentInstance = event.payload.instance;
     statusText.textContent = t("status.ai", { mode: currentModeLabel() });
     updateAgentStatus("ready");
+    setDebugPhase("idle");
     // 顺序：**先灌历史、再放行挂起的提问**。agent 是单线程顺序吃 stdin 的，反了这一问
     // 仍然是在零上文里发出的 —— 而「回退 / 恢复历史后立刻追问」正是这个场景
     // （2026-09-17，见 queueAgentHistory 的注释）。
     void flushPendingAgentHistory().then(() => {
-      // Retry pending agent chat if CLI just became ready
-      const retryQuery = (window as any).__agent_pending_query;
-      if (retryQuery) {
-        (window as any).__agent_pending_query = null;
-        startAgentChat(retryQuery);
-      }
+      // agent 刚就绪：把「未就绪时挂起的那几轮」放行（先灌历史、再放行提问 —— 见队列那段的注释）
+      drainPendingTurns();
     });
   } else if (event.payload.state === "closed") {
     // Stale close from a previous agent.exe instance (stop + fast restart) →
@@ -8214,6 +9349,9 @@ listen<{ state: string; message: string; instance?: number }>("cli-status", (eve
     if (lastCliStderr) {
       statusText.textContent = t("status.ai", { mode: currentModeLabel() });
       updateAgentStatus("error", lastCliStderr);
+      setDebugPhase("error");
+    } else {
+      setDebugPhase("idle");
     }
   }
 });
@@ -8231,13 +9369,15 @@ listen<string>("cli-stderr", (event) => {
 /** 本轮开始时间，用于回合汇总里的「耗时」。 */
 let turnStartAt = 0;
 
+/** 本轮开始的**墙钟**时间（`Date.now()`）与**本轮的回合下标**（见 `completedTurnCount`）。
+ *  ⑤ 脚本产出探测用：`scan_agent_writes` 按 epoch 毫秒比 mtime，而 `turnStartAt` 是
+ *  `performance.now()`（进程内相对时间）不能比；回合下标则必须与 `captureFileSnapshot`
+ *  用的那一个口径一致（都是「本轮助手消息一旦入列后的下标」）。 */
+let turnStartWall = 0;
+let turnIdxAtStart = 0;
+
 const runtimeNoteBuffer: string[] = [];
 let runtimeNoteEl: HTMLDetailsElement | null = null;
-
-/** 回合完成后是否自动折叠过程（设置面板可关，默认开）。 */
-function agentAutoFold(): boolean {
-  return localStorage.getItem("lunac-agent-autofold") !== "0";
-}
 
 /** 回合开始时重置运行端输出的累积（每轮一条提示块）。 */
 function resetRuntimeNote() {
@@ -8878,6 +10018,14 @@ async function executePlugin(plugin: Plugin) {
     await openPluginWindow(plugin.id);
     return;
   }
+  // 桌宠（2026-10-09 用户要求）：**入口一律开那扇独立设置窗**，主窗**不留任何页面**
+  //（与 AI 助手 / 音乐同一形态）。必须在 `plugin.execute` 之前返回 —— 否则主窗会多出一个面板。
+  // 桌宠的入口窗是**带 key 的附属窗**（`plugin-pet-settings`），不是它自己的形象窗，
+  // 所以不能靠 `window.float` 声明，只能在这里按 id 特判（同 ai-agent）。
+  if (plugin.id === "pet") {
+    await invoke("open_plugin_window", { pluginId: "pet", key: "settings", input: null });
+    return;
+  }
   if (_execGuard) return;
   _execGuard = true;
   setTimeout(() => { _execGuard = false; }, 500); // longer: plugin execute can take time
@@ -9188,6 +10336,39 @@ No exceptions: delete any code written before its test exists.`);
   return hints.join('\n\n');
 }
 
+// ── L3「当前打开的插件」可变上下文（2026-10-11）───────────────────
+// 与 buildSystemPromptHint() 同为**发送期拼进 user 消息**的可变层，区别：hint 随 query
+// 关键词变，这里随「哪些插件窗开着」变（前端猜不出，只能问宿主 open_plugin_ids）。
+// **绝不进系统提示词** —— 插件开/关是高频事件，放进固定前缀会把端点前缀缓存整段作废。
+//
+// 幂等：只在「相对上一次发生变化」时才带。上一轮那条消息仍在 agent history 里，状态没变
+// 就不重复堆叠；lastOpenPluginsSent = 我们记着的「上一次」快照（null = 未知，agent history
+// 刚被整体替换过 / 尚未发过 ⇒ 下一轮重新评估）。体积：只放**标识**，绝不塞内容。
+const OPEN_PLUGIN_MAX = 8;         // 最多列 8 个插件
+const OPEN_PLUGIN_TEXT_MAX = 300;  // 整段 ≤ 300 字符
+let lastOpenPluginsSent: string | null = null;
+
+/** 把宿主返回的「开着的插件窗 id」映射成给模型看的短标识。
+ *  id 可能是附属窗（`music-curve` / `pet-settings`）—— 取能匹配到的**最长**插件 id。 */
+function describeOpenPlugins(ids: string[]): string {
+  if (!ids.length) return "";
+  const all = pluginRegistry.getAll();
+  const names: string[] = [];
+  for (const id of ids) {
+    let bestId = "";
+    let bestName = "";
+    for (const p of all) {
+      if ((id === p.id || id.startsWith(p.id + "-")) && p.id.length > bestId.length) {
+        bestId = p.id;
+        bestName = pluginName(p.id, p.name);
+      }
+    }
+    names.push(bestId ? `${bestName} (${bestId})` : id);
+  }
+  const uniq = [...new Set(names)];
+  return uniq.slice(0, OPEN_PLUGIN_MAX).join(", ").slice(0, OPEN_PLUGIN_TEXT_MAX);
+}
+
 /** Context pruning pipeline (Pi reference: transformContext).
  *  Before sending to the agent CLI, trim the conversation history to
  *  fit within a reasonable context window and inject relevant context.
@@ -9238,10 +10419,15 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
   // If CLI not ready, start it and queue this query for retry
   if (!cliReady) {
     agentTransition("starting");
-    (window as any).__agent_pending_query = finalQuery;
+    // 挂进**队列**（不是单槽）：连身份（是不是桌宠轮）与图片附件一起存，等 agent 就绪后原样放行。
+    // 认领权一并移交队列 —— 否则之后任何一轮都会把 `petTurnActive=true` 当成自己的（回复发错窗口）。
+    const fromPet = petTurnActive;
+    pendingTurns.push({ query: finalQuery, imagePaths: [...imagePaths], fromPet });
+    petTurnActive = false;
     resultsContainer.classList.remove("hidden");
     searchBar.classList.add("has-results");
-    const log = ensureChatLog();
+    // 桌宠轮那条提示必须落进**隐藏容器**（用户口径：桌宠轮的对话只在桌宠窗显示）。
+    const log = fromPet ? petHiddenHost() : chatFlowHost();
     let hint = document.getElementById("agent-loading-hint");
     if (!hint) {
       hint = doc("div");
@@ -9263,7 +10449,8 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
       hint.className = "plugin-result-content error";
       hint.textContent = t("agent.start_failed", { err: err?.toString() || "Unknown error" });
       statusText.textContent = t("agent.failed");
-      (window as any).__agent_pending_query = null;
+      // 起不来 ⇒ 队列里那几轮全发不出去了：桌宠发起的那几轮必须**各回一句**，否则永远停在「思考中」。
+      dropPendingTurns(t("pet.chat_reply_failed"));
       agentTransition("idle");
     }
     return;
@@ -9273,12 +10460,25 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
   // 这里覆盖了绝大部分异常收尾：取消 / 回退 / 切会话 / 重试之后，用户总要再问一句 ——
   // 那一刻上一轮的钱才终于记上。正常收尾的轮次累计器已被 recordTurnUsage 清空，这里是空转。
   flushTurnUsage();
+  // 认领「本轮来源」与「是否桌宠发起」——**必须排在 `flushTurnUsage()` 之后**：
+  // 上面那条兜底落账要读的仍是**上一轮**留下的 `turnUsageSource`（见其声明处）。
+  currentTurnFromPet = petTurnActive;
+  petTurnActive = false;
+  turnUsageSource = currentTurnFromPet ? "pet" : "";
+  // 线程切换：桌宠轮把聊天窗切到桌宠那套状态；普通轮切回普通那套（幂等）。
+  // 必须排在「push 本轮用户消息」之前 —— 否则消息会落进错的线程。
+  switchThread(currentTurnFromPet ? "pet" : "chat");
+  // agent 上下文随线程切：换线程时把目标线程的 history 用 set_history 灌回去
+  // （只替换历史、不触发模型调用）—— 见 `ensureAgentThread`。
+  ensureAgentThread(currentTurnFromPet ? "pet" : "chat");
   isStreaming = true;
   setStreamingUI(true);
   userScrolledUp = false;
   const myStreamId = ++streamId;
   searchInput.disabled = true;
   statusText.textContent = t("agent.thinking");
+  // 回合开始 = 已把提问递给 agent ⇒ agent 即将请求模型（阶段浮标口径，见 setDebugPhase）。
+  setDebugPhase("requesting");
 
   // Create structured turn (Pi: turn_start)
   const turn: AgentTurn = {
@@ -9301,7 +10501,7 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
   resultsContainer.classList.remove("hidden");
   searchBar.classList.add("has-results");
   document.getElementById("agent-loading-hint")?.remove();
-  const log = ensureChatLog();
+  const log = chatFlowHost();
   const flowEl = doc("div");
   flowEl.className = "agent-flow";
   flowEl.dataset.turnId = turn.id;
@@ -9316,6 +10516,9 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
 
   cliSawStreamDelta = false; // new query — reset double-render guard
   turnStartAt = performance.now();
+  // ⑤ 脚本产出探测的起点（墙钟 + 本轮回合下标）—— 见 `registerScriptArtifacts`。
+  turnStartWall = Date.now();
+  turnIdxAtStart = completedTurnCount();
   resetRuntimeNote();
 
   agentView = {
@@ -9343,7 +10546,9 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
 
     agentCloseBlock();
     const v = agentView;
-    const finalText = v ? v.textAll.trim() : "";
+    // 桌宠轮的「情绪标签」回退：正文里的 `[名字]` 当场落成动作、并从正文里去掉
+    //（见 `consumePetTags`）—— 之后的历史 / 复制 / 气泡 / 朗读都拿不到那几个标签。
+    const finalText = consumePetTags(v ? v.textAll.trim() : "");
     if (v) {
       v.flow.querySelector(".plugin-result-loading")?.remove();
       // Render LaTeX across all text blocks
@@ -9351,6 +10556,12 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     }
     agentView = null;
     agentTurn = null;
+
+    // ⑤ 脚本产出登记：本轮跑过 `Cmd` / `PowerShell`（`turn.scriptRan`）⇒ 扫一遍工作目录，
+    // 把脚本生成 / 改写的文件登记进「已改动文件」（`unknown` 帧，只列、不回退）。
+    // **必须在这里**（收尾、`switchThread` 之前）调用 —— `registerScriptArtifacts` 会当场
+    // 捕获当前线程的快照 / 列表引用，切线程之后就串台了。
+    if (turn.scriptRan) registerScriptArtifacts(turnIdxAtStart, turnStartWall);
 
     /** 本轮助手消息在 `chatHistory` 里的下标（回合页脚的回退点，A11）；没有助手消息时 -1。
      *  必须在下面的裁剪**之后**算：裁剪会把下标整体前移（见 `shiftRenderedMsgIdx`）。 */
@@ -9439,7 +10650,7 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
         });
         footer.appendChild(foldBtn);
         // 默认折叠门槛（agent-ui-spec §3.5）：工具调用 ≥2 或过程块 ≥3
-        setFolded(agentAutoFold() && (turn.toolCalls.length >= 2 || processEls.length >= 3));
+        setFolded(turn.toolCalls.length >= 2 || processEls.length >= 3);
       }
       flowEl.appendChild(footer);
     }
@@ -9463,11 +10674,26 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
       // 或 `result` 里没有 usage 字段 ⇒ 用逐请求累计值兜底，否则这一轮的钱就白烧了。
       flushTurnUsage();
     }
+    // 桌宠发起的那一轮：把**最终回复**定向回传给桌宠窗（没有正文就给一句说明性文案，
+    // 免得桌宠永远停在「思考中」）。非桌宠轮次这是空操作 —— 见 `replyPetTurn`。
+    // `wasPet` 必须在 `replyPetTurn` **之前**取：它会把 `currentTurnFromPet` 清掉。
+    const wasPet = currentTurnFromPet;
+    replyPetTurn(finalText);
     cliTextCallback = null;
     cliDoneCallback = null;
 
+    // 桌宠轮：**先落盘、再切回普通线程**，且必须排在 `processQueue()` 之前 ——
+    // 排队里的普通消息一开跑就会 `switchThread("chat")`，会把还没保存的桌宠状态冲掉。
+    // `saveCurrentSession()` 是**当场快照**，所以紧接着切线程不会影响它。
+    if (wasPet) {
+      saveCurrentSession().catch(() => {});
+      switchThread("chat");
+    }
+
     // Process queued messages
     processQueue();
+    // 本轮结束 ⇒ 把「未就绪时挂起的那几轮」放行（上一次 drain 可能因为 `isStreaming` 被挡下）
+    drainPendingTurns();
 
     // Auto-save the completed turn so history survives even if the panel
     // is closed without triggering newConversation/ensureChatLog.
@@ -9486,7 +10712,57 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
   // 思考模式三档（fast/think/deep）已由 Rust 环境变量控制，前端统一走
   // 完整 agent 提示词（不再按 simple/agent 二选一）。
   const hint = buildSystemPromptHint(finalQuery);
-  const wrappedQuery = hint ? `${hint}\n\n---\n\n${finalQuery}` : finalQuery;
+  // 桌宠专属人格（2026-10-09，方案 A）：**只作用于「桌宠发起的那一轮」** —— 把
+  // `config\pet-persona.md` 的文本当作前置提示拼进**用户消息**（不是系统提示词）。
+  // 为什么这样：系统提示词是**启动时冻结**的固定前缀（改它要重启 agent、还会波及所有对话）；
+  // 而「桌宠轮」在前端已被 `currentTurnFromPet` 唯一标识 ⇒ 拼进消息天然「按轮」，不必重启 agent。
+  // 读盘失败 / 没配 ⇒ 不注入（不影响这一轮）。
+  let petPersona = "";
+  if (currentTurnFromPet) {
+    try {
+      const st = await invoke<{ text?: string }>("get_pet_persona");
+      petPersona = (st?.text ?? "").trim();
+    } catch {
+      /* 读不到就不注入 */
+    }
+  }
+  // 桌宠轮：把「可用的动作名字词表」注入给模型（`PetControl` 的名字全从这份清单里取），
+  // 并把名字集合**留存**下来供收尾时抽「情绪标签」（见 `consumePetTags`）。普通轮不注入 ——
+  // 避免每轮都多背一段与当前任务无关的 token；非桌宠轮这两项一律留空 / 归零。
+  let petActions = "";
+  petControlUsedThisTurn = false;
+  petTagNamesThisTurn = new Set<string>();
+  if (currentTurnFromPet) {
+    const pa = await buildPetActionHint();
+    petActions = pa.text;
+    petTagNamesThisTurn = pa.names;
+  }
+  // L3（2026-10-11）：「当前打开的插件」可变上下文。前端只能问宿主（open_plugin_ids）——
+  // 发送只发生在聊天窗（见 startAIChat 的 IS_CHAT_WINDOW 早退），故这里也只聊天窗查。
+  // 只在**相对上一次发生变化**时才带（状态没变就不重复堆叠，见 lastOpenPluginsSent 注释）。
+  // 可观测：注入内容就在发出去的那条 user 消息里（LUNAC_DUMP_API 开时见 api-dump.jsonl 请求体）。
+  let openPluginsCtx = "";
+  if (IS_CHAT_WINDOW) {
+    try {
+      const snapshot = describeOpenPlugins(await invoke<string[]>("open_plugin_ids"));
+      if (snapshot !== lastOpenPluginsSent) {
+        const prev = lastOpenPluginsSent;
+        lastOpenPluginsSent = snapshot;
+        // 空快照只在「上一次非空」时带（纠偏）；首次（prev=null）不带 —— 否则每次新对话
+        // 首问都会多背一句 (none)。非空则一律带。
+        if (snapshot || prev) {
+          openPluginsCtx = `## Open plugin (this turn only)\n- ${snapshot || "(none)"}`;
+        }
+      }
+    } catch { /* 查询失败 ⇒ 本轮不注入、也不动记忆（不影响这一轮） */ }
+  }
+  const prefix = [
+    hint,
+    openPluginsCtx,
+    petPersona ? `## Pet persona (this turn only)\n${petPersona}` : "",
+    petActions ? `## Pet avatar control (this turn only)\n${petActions}` : "",
+  ].filter(Boolean).join("\n\n---\n\n");
+  const wrappedQuery = prefix ? `${prefix}\n\n---\n\n${finalQuery}` : finalQuery;
 
   // Store the CLEAN query (without the injected hint prefix) in history —
   // the hint is a send-time wrapper only and must not leak into saved
@@ -9525,6 +10801,9 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
         content
       },
       parent_tool_use_id: null,
+      // 按轮思考覆盖（2026-10-09）：**桌宠那一轮一律关 thinking**（省推理 token / 更快）。
+      // 普通轮不带这个字段 ⇒ agent 用全局思考开关（见 ai-spec §3.5 / §4.5）。
+      ...(currentTurnFromPet ? { thinking: "off" } : {}),
     });
     await invoke("send_message", { message: msg });
   } catch (err: any) {
@@ -9536,6 +10815,10 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     isStreaming = false;
     setStreamingUI(false);
     statusText.textContent = t("agent.error");
+    // 发送就失败了 —— 同样要给桌宠一个收尾（否则它永远停在「思考中」）。
+    replyPetTurn(t("pet.chat_reply_failed"));
+    // 这一轮若在桌宠线程里，切回普通线程（用户消息已 push 进桌宠线程，随它一起留在那）。
+    if (activeThread === "pet") switchThread("chat");
     cliTextCallback = null;
     cliDoneCallback = null;
   }
@@ -9550,6 +10833,7 @@ function ensureChatLog(): HTMLElement {
   if (!log) {
     saveCurrentSession().catch(() => {}); // fire-and-forget: archive old session
     chatHistory = [];
+    pendingAgentHistory = null; // 新对话：别把上一段会话的挂起历史回灌给 agent
     resultsList.innerHTML = `<div class="ai-response" id="chat-log"></div>`;
     log = document.getElementById("chat-log")!;
   }
@@ -9559,6 +10843,8 @@ function ensureChatLog(): HTMLElement {
 /** Append a user bubble to the chat log. `idx` = its chatHistory index so the
  *  roll-back button (需求4) targets the right node. */
 function appendUserMsg(text: string, idx?: number) {
+  // 桌宠轮：用户气泡**不进可见对话区**（那轮只在桌宠窗显示）。
+  if (suppressChatRender()) return;
   const log = ensureChatLog();
   const div = doc("div");
   div.className = "chat-msg-user";
@@ -9582,10 +10868,13 @@ function appendUserMsg(text: string, idx?: number) {
  *  全部复用插件窗那一套。
  *
  *  窗口已经开着时宿主走**复用路径**（`unminimize + show + set_focus`）并推一条
- *  `plugin-window-input` ⇒ 聊天窗把它当成「又送来一句话」（见聊天窗那条监听）。 */
-async function openChatWindow(query = "") {
+ *  `plugin-window-input` ⇒ 聊天窗把它当成「又送来一句话」（见聊天窗那条监听）。
+ *
+ *  hidden = true（2026-10-10）：**桌宠发起的那一轮** —— 只让宿主把入参推进去悄悄跑，
+ *  不弹窗 / 不前置 / 不广播可见性（复用路）或建成隐藏窗（新建路）。普通入口不传。 */
+async function openChatWindow(query = "", hidden = false) {
   try {
-    await invoke("open_plugin_window", { pluginId: "chat", key: null, input: query });
+    await invoke("open_plugin_window", { pluginId: "chat", key: null, input: query, hidden });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     statusText.textContent = t("plugin.float_failed", { error: msg });
@@ -9615,8 +10904,11 @@ async function startAIChat(query: string, files?: string[]) {
   // chat continues the last conversation instead of starting blank.
   if (!userText && !hasAttach) {
     const sessions = await loadSessions();
-    if (sessions.length > 0) {
-      restoreSession(sessions[0]);
+    // 自动续接只挑**普通线程**的最近一段会话 —— 桌宠会话是另一条线程，
+    // 不该因为「它最新」就被普通开窗顺带载入（见桌宠线程的 switchThread）。
+    const recentChat = sessions.find(s => s.source !== "pet");
+    if (recentChat) {
+      restoreSession(recentChat);
       return;
     }
     pluginActive = true;
@@ -9657,6 +10949,7 @@ async function startAIChat(query: string, files?: string[]) {
     await saveCurrentSession().catch(() => {});
     currentSessionId = null;  // fresh session id on next save
     chatHistory = [];
+    pendingAgentHistory = null; // 新对话：别把上一段会话的挂起历史回灌给 agent
     document.getElementById("chat-log")?.remove();
   }
 
@@ -9672,6 +10965,424 @@ async function startAIChat(query: string, files?: string[]) {
   await startAgentChat(finalQuery, hasAttach ? fileArr.filter(f => VISION_IMAGE_RE.test(f)) : []);
 }
 
+/** 桌宠「看一眼屏幕」的暂存载荷落点。与 `plugins/builtin/pet.ts` 的 `LOOK_SCREEN_KEY`
+ *  **必须同值** —— 桌宠窗把「那句话 + 截图 PNG 路径」写在这里，聊天窗取走即删。 */
+const PET_LOOK_SCREEN_KEY = "lunac.pet.look-screen.v1";
+
+/** 取走桌宠留下的「看一眼屏幕」载荷（take 语义：读到即删）。没有就返回 null。
+ *  **只在聊天窗消费**（见文件末尾 `IS_CHAT_WINDOW` 那条启动块与 `plugin-window-input`
+ *  监听）—— 桌宠窗自己加载的是插件产物、没有 `startAIChat`，逐请求拼装也一律不在这。 */
+function consumePendingPetLookScreen(): { query: string; path: string } | null {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(PET_LOOK_SCREEN_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    localStorage.removeItem(PET_LOOK_SCREEN_KEY);
+  } catch {
+    /* 删不掉也不影响本次：下面按 take 处理 */
+  }
+  try {
+    const o = JSON.parse(raw) as { query?: string; path?: string };
+    if (o && typeof o.path === "string" && o.path) {
+      return { query: typeof o.query === "string" ? o.query : "", path: o.path };
+    }
+  } catch {
+    /* 坏载荷忽略 */
+  }
+  return null;
+}
+
+/** 桌宠窗的窗口 label（宿主按 `plugin-<id>` 命名）—— 回复**定向**发到这里（不给别的窗广播）。 */
+const PET_WINDOW_LABEL = "plugin-pet";
+/** 桌宠「发一句话给 AI」的暂存载荷落点。与 `plugins/builtin/pet.ts` 对应 key **必须同值**。 */
+const PET_CHAT_KEY = "lunac.pet.chat-send.v1";
+/** 桌宠 → AI 的**广播**事件名（接收）；AI → 桌宠的**定向**回传事件名（发出）。见 pet.ts 的收发契约。 */
+const PET_CHAT_SEND_EVENT = "pet-chat-send";
+const PET_CHAT_REPLY_EVENT = "pet-chat-reply";
+/** 桌宠输入行的「中止对话」按钮 → **广播**（2026-10-11）。桌宠只负责发这一条，
+ *  收尾由持有在跑那一轮的窗口复用既有实现（见下方 `listen(PET_CHAT_STOP_EVENT, …)`）。 */
+const PET_CHAT_STOP_EVENT = "pet-chat-stop";
+
+/** AI → 桌宠窗的**广播**事件名（`PetControl` 工具的效果出口，见 pet.ts 的 `runAiAction`）。 */
+const PET_CONTROL_EVENT = "pet-control";
+/** 已执行过的 `PetControl` 调用 id —— 「整包 assistant 消息」可能到两次，按它去重。 */
+const petControlDone = new Set<string>();
+
+/** 本轮是否已经走过 `PetControl` 工具（用过就不再吃「情绪标签」，避免同一动作被施加两次 ——
+ *  表情 / 热键是**开关**语义，连按两次等于取消）。每轮在 `startAgentChat` 开头清零。 */
+let petControlUsedThisTurn = false;
+/** 本轮「情绪标签」能认的名字集合（小写）。桌宠轮开头备好，收尾时**同步**取用
+ *（`cliDoneCallback` 是同步回调，不能再 await 读一遍词表）。 */
+let petTagNamesThisTurn = new Set<string>();
+
+/** 截获 `PetControl` 的 `tool_use` → **广播** `ai-action` 给桌宠窗执行（见 pet.ts `runAiAction`）。
+ *  agent 侧只回一句回执、**不碰本机**；真正的效果在这里（与 TodoWrite 同型：效果全在前端）。
+ *  没有桌宠窗 / 桌宠没挂模型时**静默**（广播是 fire-and-forget，不去打扰用户）。 */
+function handlePetControl(input: unknown, toolId: string): void {
+  const o = input as { action?: unknown; name?: unknown; value?: unknown } | null;
+  const action = typeof o?.action === "string" ? o.action : "";
+  const name = typeof o?.name === "string" ? o.name : "";
+  if (!action || !name) return; // 入参不全（异常端点）⇒ 不动
+  if (toolId) {
+    if (petControlDone.has(toolId)) return;
+    petControlDone.add(toolId);
+    if (petControlDone.size > 200) petControlDone.clear(); // 防无限增长
+  }
+  // 这一轮已经走了工具通道 ⇒ 收尾时不再吃「情绪标签」，否则同一动作会被施加两次。
+  petControlUsedThisTurn = true;
+  void emit(PET_CONTROL_EVENT, {
+    type: "ai-action",
+    action,
+    name,
+    value: typeof o?.value === "number" ? o.value : undefined,
+  }).catch(() => {});
+}
+
+/** 桌宠配置 / 运行时 id 表的 localStorage 键 —— 与 `plugins/builtin/pet.ts` 的 `CFG_KEY` /
+ *  `CORE_IDS_KEY` **必须同值**（两个窗口同源，共享同一份 localStorage）。 */
+const PET_CFG_KEY = "lunac.pet.v1";
+const PET_CORE_IDS_KEY = "lunac.pet.coreids.v1.";
+
+/** 一条热键动作的**短标签**（只给模型挑名字用，不出现在用户可见的任何地方）。 */
+function petActionLabel(a: unknown): string {
+  const type = typeof (a as { type?: unknown })?.type === "string" ? (a as { type: string }).type : "";
+  switch (type) {
+    case "expression": return "expression";
+    case "motion": return "motion";
+    case "chain": return "motion chain";
+    case "param": return "parameter";
+    case "artmesh": return "art-mesh opacity";
+    case "artmeshColor": return "art-mesh tint";
+    case "part": return "part opacity";
+    case "physics": return "physics on/off";
+    default: return "action";
+  }
+}
+
+/** 桌宠动作的**名字词表**（两条入口共用同一份，必须同源）：
+ *   · `PetControl` 工具 —— 把清单拼成提示注入给模型（`buildPetActionHint`）；
+ *   · 「情绪标签」回退 —— 判断正文里的 `[名字]` 能不能落到动作上（`consumePetTags`）。
+ *  不同源就会出现「注入了却认不出」的错位，所以读盘 / 读 localStorage 只在这一处。 */
+type PetActionVocab = {
+  hotkeys: { keys: string; label: string }[];
+  motions: string[];
+  /** 动作链名（`lunac.chains.json`）：`action="chain"` / `auto` 按名字整条播（2026-10-10）。 */
+  chains: string[];
+  expressions: string[];
+  params: string[];
+  drawables: string[];
+};
+
+/** 读一遍本机现成的东西拼出词表：热键键串、动作文件名、同层表情名、运行时参数 / ArtMesh id。
+ *  没配模型 / 全读不到 ⇒ `null`（调用方据此不注入、不吃标签）。 */
+async function collectPetActionVocab(): Promise<PetActionVocab | null> {
+  let modelPath = "";
+  try {
+    const raw = localStorage.getItem(PET_CFG_KEY);
+    if (raw) modelPath = String((JSON.parse(raw) as { model?: unknown })?.model ?? "").trim();
+  } catch {
+    /* 坏配置当没有 */
+  }
+  if (!modelPath) return null;
+  const v: PetActionVocab = { hotkeys: [], motions: [], chains: [], expressions: [], params: [], drawables: [] };
+  // 热键：AI 按**键串**（`keys`）触发
+  try {
+    const raw = await invoke<string | null>("read_pet_hotkeys", { modelPath });
+    const list = raw ? (JSON.parse(raw) as { hotkeys?: unknown }).hotkeys : null;
+    if (Array.isArray(list)) {
+      v.hotkeys = list
+        .map(h => {
+          const o = h as { keys?: unknown; action?: unknown } | null;
+          const keys = typeof o?.keys === "string" ? o.keys.trim() : "";
+          return keys ? { keys, label: petActionLabel(o?.action) } : null;
+        })
+        .filter((x): x is { keys: string; label: string } => !!x)
+        .slice(0, 60);
+    }
+  } catch {
+    /* 读不到就不列 */
+  }
+  // 动作（**行 = 文件**，2026-10-10）：按动作文件名（词干）触发
+  try {
+    const dir = modelPath.replace(/[\\/][^\\/]*$/, ""); // 模型文件所在目录
+    const files = await invoke<{ name?: unknown }[]>("list_motion_files", { dir });
+    v.motions = (Array.isArray(files) ? files : [])
+      .map(f => (typeof f?.name === "string" ? f.name.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 60);
+  } catch {
+    /* 同上 */
+  }
+  // 动作链（2026-10-10，backlog ㉝②）：`lunac.chains.json` 里的链名 —— 按名字整条播。
+  try {
+    const raw = await invoke<string | null>("read_pet_chains", { modelPath });
+    const list = raw ? (JSON.parse(raw) as { chains?: unknown }).chains : null;
+    if (Array.isArray(list)) {
+      v.chains = list
+        .map(c => (typeof (c as { name?: unknown })?.name === "string" ? (c as { name: string }).name.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 60);
+    }
+  } catch {
+    /* 读不到就不列 */
+  }
+  // 表情：模型同层 *.exp3.json 的 Name（`value` 1 开 / 0 关）
+  try {
+    const files = await invoke<{ name?: unknown }[]>("list_expression_files", { modelPath });
+    v.expressions = (Array.isArray(files) ? files : [])
+      .map(f => (typeof f?.name === "string" ? f.name.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 60);
+  } catch {
+    /* 同上 */
+  }
+  // 参数 / ArtMesh：同一份运行时 id 表（localStorage，桌宠窗挂载模型时写的）——
+  // 参数给 `param` 用，ArtMesh 给 `artmeshColor`（染色）用。两条都可能很多 ⇒ 注入时截断。
+  try {
+    const raw = localStorage.getItem(PET_CORE_IDS_KEY + modelPath.toLowerCase());
+    const o = raw ? (JSON.parse(raw) as { parameters?: unknown; drawables?: unknown }) : null;
+    const onlyStr = (x: unknown): string[] =>
+      Array.isArray(x) ? x.filter((s): s is string => typeof s === "string") : [];
+    v.params = onlyStr(o?.parameters);
+    v.drawables = onlyStr(o?.drawables);
+  } catch {
+    /* 同上 */
+  }
+  return v;
+}
+
+/** 桌宠轮要注入的「可用动作」注入包：`text` 拼进用户消息，`names` 供收尾时抽情绪标签。 */
+type PetTurnActions = { text: string; names: Set<string> };
+
+/** 给「桌宠那一轮」拼一段**可用动作清单**，读不到就返回空包。
+ *  两条通道共用同一份词表：① `PetControl` 工具（有 tool-calling 的模型）；
+ *  ② 「情绪标签」回退 —— 没有 tool-calling 的模型直接在正文里写 `[名字]`。
+ *  **只在桌宠轮注入**（普通轮不注入，避免每轮多背一段无关 token）。
+ *  用户把 `PetControl` 拉进工具黑名单 ⇒ 两条通道一起关（那正是「别让模型自己驱动桌宠」的意思）。 */
+async function buildPetActionHint(): Promise<PetTurnActions> {
+  const none: PetTurnActions = { text: "", names: new Set<string>() };
+  try {
+    if (loadCustomBlacklist().includes("PetControl")) return none;
+  } catch {
+    /* 读不到黑名单当没禁 */
+  }
+  const v = await collectPetActionVocab();
+  if (!v) return none;
+  const lines: string[] = [];
+  if (v.hotkeys.length) {
+    lines.push(`- hotkeys (action="hotkey", name = the key string): ${v.hotkeys.map(h => `${h.keys} = ${h.label}`).join("; ")}`);
+  }
+  if (v.motions.length) lines.push(`- motions (action="motion", name): ${v.motions.join(", ")}`);
+  if (v.chains.length) lines.push(`- motion chains (action="chain", name; plays the whole timeline): ${v.chains.join(", ")}`);
+  if (v.expressions.length) lines.push(`- expressions (action="expression", name; value=1 on / 0 off): ${v.expressions.join(", ")}`);
+  if (v.params.length) {
+    const names = v.params.slice(0, 120);
+    const more = v.params.length > names.length ? ` …(+${v.params.length - names.length} more)` : "";
+    lines.push(`- parameters (action="param", name = id, value = number): ${names.join(", ")}${more}`);
+  }
+  if (v.drawables.length) {
+    const names = v.drawables.slice(0, 120);
+    const more = v.drawables.length > names.length ? ` …(+${v.drawables.length - names.length} more)` : "";
+    lines.push(
+      `- art-meshes (action="artmeshColor", name = id, value = RGB packed as 0xRRGGBB; 0xFFFFFF = no tint): ${names.join(", ")}${more}`,
+    );
+  }
+  if (!lines.length) return none;
+  // 供「情绪标签」回退查表：只收**能落到动作上**的三类名字（参数没有值就没意义，不收）。
+  const names = new Set<string>();
+  for (const h of v.hotkeys) names.add(h.keys.trim().toLowerCase());
+  for (const m of v.motions) names.add(m.trim().toLowerCase());
+  for (const c of v.chains) names.add(c.trim().toLowerCase());
+  for (const e of v.expressions) names.add(e.trim().toLowerCase());
+  const text =
+    "You can move your avatar with the PetControl tool. Use only these names:\n" +
+    lines.join("\n") +
+    "\nIf you have no tool access, write a name from the list in square brackets anywhere in your " +
+    "reply instead (for example [name]) — it is applied and hidden from the user. " +
+    "Either way keep it natural and sparse; never mention the tool, these names, brackets, or any value.";
+  return { text, names };
+}
+
+/** 取走桌宠留下的「发一句话给 AI」载荷（take 语义：读到即删）。没有就返回 null。
+ *  **只在聊天窗消费** —— 桌宠窗加载的是插件产物、没有 `startAIChat`，逐请求拼装也一律不在这。 */
+function consumePendingPetChat(): { query: string; files: string[] } | null {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(PET_CHAT_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    localStorage.removeItem(PET_CHAT_KEY);
+  } catch {
+    /* 删不掉也不影响本次：下面按 take 处理 */
+  }
+  try {
+    const o = JSON.parse(raw) as { query?: unknown; files?: unknown };
+    const query = typeof o?.query === "string" ? o.query : "";
+    const files = Array.isArray(o?.files)
+      ? o.files.filter((f): f is string => typeof f === "string")
+      : [];
+    if (query.trim() || files.length > 0) return { query, files };
+  } catch {
+    /* 坏载荷忽略 */
+  }
+  return null;
+}
+
+/** 「情绪标签」回退（2026-10-10，差距分析结论第 1 项）：模型**没有 tool-calling** 时，
+ *  允许它在正文里用 `[名字]` 表达情绪 / 动作（名字取自注入给它的那份词表）。
+ *
+ *  **只有名字真在 `petTagNamesThisTurn` 里才认** —— 认不出的方括号原样保留，所以
+ *  markdown 链接 `[文字](url)`、`[1]` 这类引用不会被误删。命中的名字按到达顺序返回。 */
+function extractPetTags(text: string): { text: string; names: string[] } {
+  if (!text || !petTagNamesThisTurn.size) return { text, names: [] };
+  const names: string[] = [];
+  const cleaned = text.replace(/\[([^\[\]\n]{1,40})\]/g, (whole, raw: string) => {
+    const key = raw.trim();
+    if (!key || !petTagNamesThisTurn.has(key.toLowerCase())) return whole;
+    names.push(key);
+    return "";
+  });
+  if (!names.length) return { text, names };
+  return { text: cleaned.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim(), names };
+}
+
+/** 抽出的情绪标签 → 广播给桌宠窗（`action:"auto"` 由它按「键串 / 动作名 / 表情名」解析）。 */
+function applyPetTags(names: string[]): void {
+  for (const n of names) {
+    void emit(PET_CONTROL_EVENT, { type: "ai-action", action: "auto", name: n }).catch(() => {});
+  }
+}
+
+/** 桌宠轮收尾的**统一一处**：抽情绪标签 + 广播，返回去掉标签后的正文。
+ *  两个收尾口（正常 `cliDoneCallback` / 被中断 `finalizeInterruptedTurn`）共用它 ——
+ *  正文去掉标签之后才进历史 / 气泡 / 朗读，用户看不到那几个方括号。
+ *  **本轮已用过 `PetControl` 就不再抽**：否则同一动作被施加两次（表情 / 热键是开关
+ *  语义，连按两次等于取消）。非桌宠轮、空正文直接原样返回。 */
+function consumePetTags(text: string): string {
+  if (!currentTurnFromPet || !text || petControlUsedThisTurn) return text;
+  const tag = extractPetTags(text);
+  if (!tag.names.length) return text;
+  applyPetTags(tag.names);
+  return tag.text;
+}
+
+/** 把一段**纯文本**定向回传给桌宠窗（结束它的「思考中」）。
+ *  **只发 `pet-chat-reply` 这一条，且是定向** —— 不给桌宠窗广播任何 `cli-*`（ai-spec §4.8）。 */
+function emitPetReply(text: string) {
+  void emitTo(PET_WINDOW_LABEL, PET_CHAT_REPLY_EVENT, { text }).catch(() => {});
+}
+
+/** 桌宠那一轮**收尾**时回传最终回复 —— 只在这里回传，所以天然只回「最终回复」：
+ *  流式增量 / 思考过程 / 工具过程都不经过这里（`cliTextCallback` 那条路从不调它）。
+ *  非桌宠轮次直接返回（`currentTurnFromPet` 只描述当前这一轮）。空回复给一句说明性文案。 */
+function replyPetTurn(text: string) {
+  if (!currentTurnFromPet) return;
+  currentTurnFromPet = false;
+  emitPetReply(text && text.trim() ? text : t("pet.chat_reply_empty"));
+}
+
+/** **掐掉在飞的这一轮，并把状态收干净** —— `showChatHistory` / `restoreSession` 这类
+ *  「用户离开当前这一轮去看别的东西」的入口共用。返回是否真的掐掉了一轮。
+ *
+ *  为什么**必须成套**做三件事（少任一件都会留下「桌宠永远得不到输出」的坑）：
+ *   ① **前端**：`streamId++` + 清 `cliTextCallback`/`cliDoneCallback` + `isStreaming=false`；
+ *   ② **真正停掉 agent**（`stop_cli` + `cliReady=false`）：只改前端、让 agent 继续生成，
+ *      它那条 `result` 会打到**下一轮**刚装上的 `cliDoneCallback` 上 —— 于是下一轮的真实回复
+ *      被一个已被消费掉的收尾吃掉，桌宠**永远收不到回复**。用户 2026-10-10 报的正是这条：
+ *      「在 AI 插件里清除了桌宠侧的历史记录之后，桌宠发的消息永远得不到输出」
+ *      —— `showChatHistory()`（打开历史视图 / 每删一条会话都会重绘一次）此前只做了 ① 的一半。
+ *   ③ **若是桌宠轮，回它一句收尾** —— 否则桌宠永远停在「思考中」（同 `stopAIChat` 的口径）。
+ *
+ *  **不**用于 `newConversation` / `stopAIChat` / `rollbackChat`：那几处各有自己的完整流程。 */
+function cancelInflightTurn(reason: string): boolean {
+  if (!isStreaming) return false;
+  streamId++;
+  cliTextCallback = null;
+  cliDoneCallback = null;
+  isStreaming = false;
+  setStreamingUI(false);
+  flushTurnUsage(); // 已经花掉的钱当场落账（同 stopAIChat）
+  const wasPet = currentTurnFromPet; // 必须在 replyPetTurn **之前**取：它会清掉这一位
+  markFlyingCardsStopped(agentView); // 飞行中的工具卡当场收尾（agent 马上就被停掉）
+  replyPetTurn(reason);
+  agentView = null;
+  agentTurn = null;
+  // 真正停掉 agent.exe —— 见上面 ②，这是「下一轮回复不会被错位吃掉」的关键。
+  void invoke("stop_cli").catch(() => {});
+  cliReady = false;
+  agentThread = null; // agent 重启 ⇒ 它内部历史清空，下一轮必须重灌
+  if (wasPet && activeThread === "pet") switchThread("chat");
+  // 在飞的那一轮没了 ⇒ 把「未就绪时挂起的那几轮」放行（这条路径不走 `cliDoneCallback`，
+  // 不在这里补一次的话队列会一直干等到下一次 `cli-status:stdout`）。
+  drainPendingTurns();
+  return true;
+}
+
+/** 聊天窗：取走桌宠的暂存并发起这一轮（异步等 `startAIChat` 走完开工那几步）。
+ *  取到就返回 true（不管是否真的开跑）。take 语义 ⇒ 两条入口里只会有一条真的发出。 */
+async function startPendingPetChat(): Promise<boolean> {
+  const p = consumePendingPetChat();
+  if (!p) return false;
+  // 上一轮还在跑：不排队（桌宠没有「插队」语义）——直接回一句让它结束「思考中」。
+  if (isStreaming) {
+    emitPetReply(t("pet.chat_reply_busy"));
+    return true;
+  }
+  petTurnActive = true; // 本轮来自桌宠 —— 由 `startAgentChat` 认领，收尾时 `replyPetTurn` 回传
+  await startAIChat(p.query, p.files.length > 0 ? p.files : undefined);
+  return true;
+}
+
+/** 收到桌宠的 `pet-chat-send`（**广播**，两个窗口都会收到）。保证「只发一次」的分工如下：
+ *
+ *  · **聊天窗**（真正的发送方）：只做一件事 —— 取走暂存并发起（`startPendingPetChat`）。
+ *    两个窗都会收到这条广播，但只有聊天窗会 `startAIChat`；主窗只写暂存、不发送。
+ *  · **主窗**：**不自己发**。写一份暂存 + 开（或前置）聊天窗，把 `{query, files}` 交给聊天窗消费。
+ *    `openChatWindow` 这里传**空串**：真正的话在暂存里，免得复用路径再把 query 当普通输入二次发送。
+ *
+ *  **为什么只发一次**：写暂存**只有主窗这一处**；消费它的两条入口（聊天窗的本条广播 + 宿主
+ *  复用聊天窗推来的 `plugin-window-input`）共用 `consumePendingPetChat` 的 **take 语义** ——
+ *  先到的取走、后到的取空 ⇒ 无论两窗 / 两条通路谁先谁后，`startAIChat` 只会被调一次。 */
+function handlePetChatSend(payload: unknown) {
+  const o = (payload ?? {}) as { query?: unknown; files?: unknown };
+  const query = typeof o.query === "string" ? o.query : "";
+  const files = Array.isArray(o.files)
+    ? o.files.filter((f): f is string => typeof f === "string")
+    : [];
+  if (!query.trim() && files.length === 0) return;
+  if (IS_CHAT_WINDOW) {
+    void startPendingPetChat();
+  } else {
+    try {
+      localStorage.setItem(PET_CHAT_KEY, JSON.stringify({ query, files }));
+    } catch {
+      /* 存不下（无痕 / 配额满）：仍开窗，但聊天窗取不到 —— 退化为空白开聊 */
+    }
+    void openChatWindow("", true);
+  }
+}
+
+// 两个窗口都监听这条广播（谁在谁处理，见 `handlePetChatSend`）。载荷不合法就静默忽略。
+void listen(PET_CHAT_SEND_EVENT, (e) => handlePetChatSend(e.payload));
+
+// 桌宠输入行的「中止对话」按钮（2026-10-11）：桌宠只广播这一条，收尾**复用聊天侧既有实现**，
+// 而不是让桌宠自己 `invoke("stop_cli")` —— 后者会留下「agent 被杀了、但聊天窗的流式状态没清」
+// 的不同步（按钮 / 光标卡住），也可能让桌宠永远停在「思考中」。
+// 真正跑这一轮的是**聊天窗**（见 `handlePetChatSend` → `startPendingPetChat` → `startAIChat`），
+// 所以只有它收尾；主窗不持有那条流，什么都不做，避免两窗重复 `stop_cli`。
+// `stopAIChat()` 本身就是「若是桌宠轮，回它一句收尾」的同口径实现（同 `cancelInflightTurn`）。
+void listen(PET_CHAT_STOP_EVENT, () => {
+  if (!IS_CHAT_WINDOW) return;
+  void stopAIChat();
+});
+
 // Make startAIChat accessible from plugins (ai-agent.ts)
 (window as any).__lunac_start_ai_chat = startAIChat;
 (window as any).__lunac_show_chat_history = showChatHistory;
@@ -9684,6 +11395,27 @@ async function startAIChat(query: string, files?: string[]) {
   cliReady = false;
   try { await invoke("start_cli"); return "ok"; } catch (e) { return "error: " + String(e); }
 };
+
+// ── 桌宠侧「重启 AI」（2026-10-09）────────────────────────────────────
+// 桌宠设置窗是**插件窗**，没有 `window.__lunac_reload_agent` 这条桥（它只在 main.ts 里定义）。
+// 所以桌宠窗只发一条广播事件，这里（**主窗**）接住并复用同一套重启路径 ——
+// 「先存会话 → stop_cli → start_cli」，与 AI 侧人格窗口的「立即重启 AI」完全同源。
+// 两扇窗都加载 main.ts ⇒ 用 `IS_CHAT_WINDOW` 挡一道，保证只重启一次。
+const PET_AGENT_RESTART_EVENT = "pet-agent-restart";
+const PET_AGENT_RESTART_DONE_EVENT = "pet-agent-restart-done";
+const PET_SETTINGS_LABEL = "plugin-pet-settings";
+void listen(PET_AGENT_RESTART_EVENT, async () => {
+  if (IS_CHAT_WINDOW) return; // 只由主窗处理（两扇窗都加载 main.ts，别重启两遍）
+  let ok = true;
+  try {
+    const fn = (window as any).__lunac_reload_agent;
+    if (typeof fn === "function") await fn();
+    else ok = false;
+  } catch {
+    ok = false;
+  }
+  void emitTo(PET_SETTINGS_LABEL, PET_AGENT_RESTART_DONE_EVENT, { ok }).catch(() => {});
+});
 // 工具黑名单保存流程（第19点）：按用户要求顺序 —
 // 1) localStorage 持久化用户自定义清单
 // 2) 交给 Rust 合并默认黑名单（set_tool_blacklist）
@@ -10454,6 +12186,62 @@ function resolveBaseOverride(): { hex: string; triplet: string; hoverTriplet: st
   return appearance.baseColor ? resolveCustomColor(appearance.baseColor) : null;
 }
 
+/** 「四类颜色」的**收尾派生**（2026-10-11）：把**文字 / 图标 / 描边 / 中性底**
+ *  也并入四类，使「四类全设 #000000」时除白名单语义色外没有任何别的颜色。
+ *  取代旧的 `--border-glass`（主题 token）、`--ctx-*`（仅自定义底色时覆盖）。
+ *
+ *  · 文字（--text / --text-dim / --text-muted）与中性叠加基色（--ink-rgb）：
+ *    **色相 / 饱和 ← 蒙版色（overlay）**；**亮度档** = 默认可读档 × (overlay 明度 …
+ *    参考明度 69) + 文字明度滑块（滑块在缩放**前**加，故全黑蒙版 ⇒ 三档文字恒为黑，
+ *    滑块拉到极端也仍是黑 —— 这是「四类全黑」验收通过的关键）。
+ *  · 面板 / 文本框描边（--border-glass / --ctx-border-glass）← **按钮线条**（α 固定 0.10）。
+ *  · 中性黑遮罩（--shade-rgb）← **底色**的暗变体（近黑）；`--shade-scale` 暗底 1、亮底 0.35。
+ *  · 反差四件套（--ctx-*）同源：叠加基色取 ink、凹陷基色取 shade、描边取 line。
+ *
+ *  三个颜色字段空串 ⇒ 调用方已传 accent，故默认（未自定义）时与改造前基本一致，
+ *  仅文字 / 描边带上了主题色的轻微色相（用户已裁定「默认观感可变、但必须可读」）。 */
+function applyFourClassNeutrals(
+  overlayHex: string, lineHex: string, surfaceTriplet: string, textDelta: number,
+) {
+  // 底色明暗（决定文字档位方向 + 遮罩强度）
+  const bp = surfaceTriplet.split(",").map(x => Number(x.trim()));
+  const ok = bp.length === 3 && bp.every(Number.isFinite);
+  const light = ok ? (relativeLuminance(toHex(bp[0], bp[1], bp[2])) ?? 0) > 0.5 : false;
+
+  // ① 文字 / 图标色相 ← overlay；亮度档 ← overlay 明度（69 = 默认 --accent 的 HSL L）
+  const ov = hexToRgb(overlayHex);
+  const oh = ov ? rgbToHsl(ov.r, ov.g, ov.b) : { h: 0, s: 0, l: 0 };
+  const k = Math.max(0, oh.l) / 69;
+  const cl = (v: number) => Math.max(0, Math.min(100, Math.round(v)));
+  // 亮底（浅色主题）时把文字亮度**反过来**，保证「浅底 + 深字」可读；
+  // 暗底（含四类全黑）照直缩放 ⇒ 全黑蒙版时 0 × k ≡ 0（恒黑，滑块极端也不越界）。
+  const L = (base: number) => {
+    const raw = (base + textDelta) * k;
+    return light ? cl(100 - Math.min(100, Math.max(0, raw))) : cl(raw);
+  };
+  const textL = L(89), dimL = L(68), mutedL = L(50);
+  const s = Math.min(oh.s, 30);                    // 正文饱和度收敛，避免整屏彩色字
+  setVar("--text", `hsl(${oh.h}, ${s}%, ${textL}%)`);
+  setVar("--text-dim", `hsl(${oh.h}, ${Math.round(s * 0.85)}%, ${dimL}%)`);
+  setVar("--text-muted", `hsl(${oh.h}, ${Math.round(s * 0.7)}%, ${mutedL}%)`);
+  setVar("--ink-rgb", hslTriplet(oh.h, s, textL)); // 半透明叠加基色，与文字同色
+
+  // ② 描边 ← 按钮线条（固定 α 0.10，接近改造前 rgba(232,216,202,0.10) 的观感）
+  const ln = hexToRgb(lineHex);
+  const line = ln ? `${ln.r}, ${ln.g}, ${ln.b}` : "0, 0, 0";
+  setVar("--border-glass", `rgba(${line}, 0.1)`);
+  setVar("--ctx-border-glass", `rgba(${line}, 0.1)`);
+
+  // ③ 中性遮罩 / 反差四件套 ← 底色
+  const dark = ok ? bp.map(x => Math.round(Math.min(255, Math.max(0, x)) * 0.25)).join(", ") : "0, 0, 0";
+  setVar("--shade-rgb", dark);
+  setVar("--shade-scale", light ? "0.35" : "1");
+  setVar("--ctx-shade-rgb", dark);
+  setVar("--ctx-shade-scale", light ? "0.35" : "1");
+  setVar("--ctx-ink-rgb", hslTriplet(oh.h, s, textL));
+  setVar("--ctx-rgb", hslTriplet(oh.h, s, textL));
+}
+
 /** 写一个 CSS 变量；值为空串时**删除**该内联变量（回落到 :root 的默认值）。
  *  CSSOM 规定 `setProperty(name, "")` 等价于 `removeProperty` —— 靠这条语义
  *  实现「切回默认主题 = 清掉主题包留下的形状/花纹」，不必逐个记变量名。 */
@@ -10576,15 +12364,9 @@ function applyAppearance() {
     setVar("--surface-rgb", baseOv.triplet);
     setVar("--surface-rgb-hover", baseOv.hoverTriplet);
   }
-  // ⑤b 「反差四件套」（分类区域 / 文本框 / 取色器框格 / 结果区选中项）：底色暗 ⇒ 这四处
-  //     亮、底色亮 ⇒ 这四处暗。见 styles.css `:root` 的 --ctx-* 注释与 ai-spec 规则 45。
-  //     没有自定义底色（或开关开着）时**清空**内联值 ⇒ 回落 `:root`，与改造前逐像素一致。
-  const ctx = baseOv ? contrastFor(appearance.baseColor) : null;
-  setVar("--ctx-rgb", ctx ? ctx.rgb : "");
-  setVar("--ctx-ink-rgb", ctx ? ctx.inkRgb : "");
-  setVar("--ctx-shade-rgb", ctx ? ctx.inkRgb : "");
-  setVar("--ctx-shade-scale", ctx ? ctx.shadeScale : "");
-  setVar("--ctx-border-glass", ctx ? ctx.borderGlass : "");
+  // ⑤b 「反差四件套」与「中性底 / 描边」已统一挪到 ⑤f（applyFourClassNeutrals）：
+  //     旧实现只在「自定义底色」时覆盖 --ctx-*，其余回落 :root；现在**无条件**由
+  //     底色 / 按钮线条派生（这样「四类全黑」时它们也全黑，见 ⑤f）。
   // ⑤c 按钮线条（设置 → 风格 ·「按钮自定义」）：只写这两个变量，消费方（切换开关 +
   //     若干图标按钮的描边）各自按 α 配方取值。
   //     **颜色**受「恢复默认主题」管辖：开关开着时清掉内联值、回落 `:root` 里的主题配方
@@ -10609,6 +12391,16 @@ function applyAppearance() {
   const oOverlay = colorsOn && appearance.overlayColor ? resolveCustomColor(appearance.overlayColor) : null;
   setVar("--other-overlay-rgb", oOverlay ? oOverlay.triplet : "");
   setVar("--other-overlay-alpha", String(appearance.overlayAlpha));
+  // ⑤f 「四类颜色」收尾（2026-10-11）：**文字 / 图标 / 描边 / 中性底**也并入四类。
+  //     · overlayHex / lineHex 的「空串 ⇒ 跟随主题色」与 ⑤c/⑤d/⑤e **同一条哨兵约定**
+  //       （tintBase 开着时同样归零，回落 accent）—— 所以默认态两者都是 accent。
+  //     · surfaceTriplet 取「用户底色 > 主题包 surface > 派生底色」，与上面 --surface-* 同源。
+  //     · textDelta 在缩放前加 ⇒ 全黑 overlay 时三档文字恒为 0（黑），滑块极端也不破。
+  const overlayHex = colorsOn && appearance.overlayColor ? appearance.overlayColor : accent;
+  const lineHex = colorsOn && appearance.btnLineColor ? appearance.btnLineColor : accent;
+  const surfaceTriplet = baseOv ? baseOv.triplet : (surface ?? pal?.["--surface-rgb"] ?? "28, 26, 32");
+  applyFourClassNeutrals(overlayHex, lineHex, surfaceTriplet, textDelta);
+
   // 注意 `--surface-alpha`（底色透明度）在 ② 步**无条件**写：它是玻璃质感、不随底色颜色
   // 变化，且历史上属于「背景」组、老配置里可能是非默认值 —— 归进那个开关的失效范围
   // 会把老用户的透明度静默改回 0.88。见 ai-spec 规则 45「失效范围」那一段。
@@ -11098,7 +12890,18 @@ if (IS_CHAT_WINDOW) {
     } catch {
       /* 没有待取载荷 —— 正常，空白开聊 */
     }
-    await startAIChat(seed);
+    // 桌宠发起的这一轮（`pet-chat-send` 落下的暂存）优先：先到先得（take 语义）。
+    // 「看一眼屏幕」（query + 截图路径）次之 —— 有没有那张图，决定走 `startAIChat(query,[path])`
+    // 还是纯文本；都没有才用 `plugin_window_init` 的种子文本。
+    const startedPet = await startPendingPetChat();
+    if (!startedPet) {
+      const look = consumePendingPetLookScreen();
+      if (look) {
+        // 「看一眼屏幕」同样是**桌宠发起的一轮** ⇒ 同样吃桌宠专属人格与来源归因（`pet`）。
+        petTurnActive = true;
+        await startAIChat(look.query, [look.path]);
+      } else await startAIChat(seed);
+    }
     // 借主窗「分离态」那套外观当本窗口的壳：`#app.detached` = padding 2px +
     // `#results-container` 圆角玻璃底 + 撑满 + `#detached-header` 当窗口标题栏。
     // 必须在 startAIChat 之后 —— 那一步才把 `activePluginId` 置成 `ai-agent`，
@@ -11117,7 +12920,42 @@ if (IS_CHAT_WINDOW) {
   // （同 plugin-window.ts 的做法）—— 否则「第二次带话进来」会被静默丢掉。
   void win.listen<string>("plugin-window-input", (e) => {
     const q = typeof e.payload === "string" ? e.payload.trim() : "";
-    if (q) void startAIChat(q);
+    // 桌宠发起的一轮（`pet-chat-send`）：主窗复用本窗时推来的 input 是空串，真正的话在暂存里 ——
+    // 取到就起这一轮。take 语义 ⇒ 与本窗那条 `pet-chat-send` 广播**只会有一条**真的发出。
+    void (async () => {
+      if (await startPendingPetChat()) return;
+      // 桌宠「看一眼屏幕」复用了「窗口已开着 → 推 input」这条路：暂存里带图就走带图那条，
+      // 否则退回纯文本（同 `startAIChat(q)`）。
+      const look = consumePendingPetLookScreen();
+      if (look) {
+        petTurnActive = true; // 桌宠发起的「看一眼屏幕」轮：同样吃桌宠人格与来源归因
+        void startAIChat(look.query, [look.path]);
+      } else if (q) void startAIChat(q);
+    })();
+  });
+  // 关窗收尾（2026-10-11，见 code-standards.md §规范 6「窗口消失时，在飞轮次必须有收尾方」）：
+  // 用户点标题栏 × / Alt+F4 / 任务栏关闭都走 Tauri 的 CloseRequested；注册这个监听后，宿主
+  // 会把这次关闭交给这里裁决（见 tauri 的 on_window_event：有 JS 监听就 prevent_close 并转发）。
+  // 不注册的话，被关掉的那一轮**永远没人收尾** —— agent 跑完那条 result 会打到下一个窗口刚装上的
+  // cliDoneCallback 上，吃掉下一轮的真实回复；桌宠也会一直停在「思考中」（同 cancelInflightTurn
+  // 注释里记的历史报障）。
+  //
+  // 只在「这一轮真的在飞」时才收尾：空闲关窗原样放行，agent 保持热上下文 —— 无条件杀 agent 会让
+  // 「关掉聊天窗再打开」白白重灌历史、多花 token（用户成本敏感）。
+  void win.onCloseRequested(async (event) => {
+    if (!isStreaming) return;
+    // 有在飞轮次 ⇒ 先拦住这次关闭，收尾跑完再真关。
+    event.preventDefault();
+    try {
+      // 复用既有收尾（清前端 + stop_cli + 给桌宠回一句），不另造一套。
+      cancelInflightTurn(t("pet.chat_reply_interrupted"));
+      // cancelInflightTurn 里的 stop_cli 是 fire-and-forget；这里再 await 一次，确保「杀掉 agent」
+      // 在窗口销毁之前落地（agent 一死，就不会再吐那条会错投到下一轮的 result）。
+      await invoke("stop_cli").catch(() => {});
+    } finally {
+      // 无论收尾成败都必须真关，绝不能让窗口卡住不关。
+      await win.destroy().catch(() => {});
+    }
   });
 } else {
   syncUiMode();

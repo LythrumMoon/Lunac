@@ -108,6 +108,12 @@ pub struct FrameDto {
     pub existed: bool,
     /// 原内容；`existed && content === null` = 读不出来（二进制 / 超上限）⇒ 拒绝还原
     pub content: Option<String>,
+    /// **无改前内容**（2026-10-10）：这条不是「工具卡采到的原件」，而是**脚本（Cmd / PowerShell）
+    /// 生成 / 改写**的文件的**事后登记**（见 `commands::scan_agent_writes`）。
+    /// 它**只用于「已改动文件」列表里看得见**，**一律不参与回退** —— 我们不知道改前是什么，
+    /// 硬回退只可能误删用户原有的文件。`#[serde(default)]` ⇒ 加字段前的旧帧文件照常解析。
+    #[serde(default)]
+    pub unknown: bool,
 }
 
 fn frames_root() -> std::path::PathBuf {

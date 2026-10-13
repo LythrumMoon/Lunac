@@ -50,9 +50,13 @@ pub const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 192 * 1024 * 1024;
 /// 条目数上限（防「十万个空文件」）。
 pub const MAX_ENTRIES: usize = 4000;
-/// 单个依赖文件的体积上限（2026-09-28）。依赖里的引擎比插件包本身大得多
-/// （PaddleOCR 模型 / librespot 二进制都在几十 MB 量级），所以给到 512 MB 仍要拦住「几个 GB」。
-pub const MAX_DEP_BYTES: u64 = 512 * 1024 * 1024;
+/// 单个依赖文件的体积上限（2026-09-28；2026-10-09 由 512 MB 提到 4 GiB）。
+/// 依赖里的引擎 / 模型比插件包本身大得多（PaddleOCR 模型、librespot 二进制都在几十 MB 量级），
+/// **2026-10-09 本地决策模型换成 3B 级后单体到 2.5 GiB** ⇒ 512 MB 的旧闸会直接把它拒掉。
+/// 4 GiB 覆盖 3B–4B 的 Q4_K_M（约 2–3 GiB）并留余量；仍能拦住「几十 GB 的怪物」。
+/// ⚠️ 这个闸只对 `file` 形态生效；大文件走的是 **流式落盘**（见 `download_to_file_with_progress`），
+/// 不再把整包读进内存 —— 否则 2.5 GiB 的分配会直接把安装过程顶爆。
+pub const MAX_DEP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// 依赖条目数上限（防清单里写一万条把安装拖死）。
 pub const MAX_DEP_ENTRIES: usize = 32;
 /// `archive` 依赖**解压后**的总量上限（2026-09-30）。比插件包那档（192MB）宽：
@@ -343,7 +347,22 @@ pub struct SidecarSpec {
     /// 授权访问**任意** loopback 端口（信任卡上会显著标注）。缺省 false。
     #[serde(default)]
     pub allow_local_any: bool,
+    /// **就绪超时（秒，缺省 10）**：宿主起进程后等「就绪信号」的上限。
+    /// `http` 通道下有两个就绪信号，**任一**成立即可：① 进程吐出 NDJSON `{"method":"ready"}`
+    /// （自研 sidecar 的握手约定）；② **清单写的固定 `port` 可连** —— 第三方 http 服务
+    /// （`llama-server` 等 OpenAI 兼容服务）**不会说我们的握手行**，只在模型加载完后开始监听。
+    /// 大模型冷启要几十秒 ⇒ 清单里写大些（如 180），否则会被误判成失败并杀掉进程。
+    #[serde(default = "default_ready_timeout_sec")]
+    pub ready_timeout_sec: u64,
 }
+
+/// `sidecar.readyTimeoutSec` 的缺省值（秒）—— 与旧行为一致。
+fn default_ready_timeout_sec() -> u64 {
+    10
+}
+
+/// `sidecar.readyTimeoutSec` 上限（1 小时；够任何本地服务冷启动）。
+const MAX_SIDECAR_READY_TIMEOUT_SEC: u64 = 3600;
 
 /// sidecar.env 条数上限。
 const MAX_SIDECAR_ENV: usize = 32;
@@ -379,6 +398,13 @@ fn validate_sidecar(spec: &SidecarSpec, permissions: &[String]) -> Result<(), St
     let r = spec.restart.trim();
     if !matches!(r, "" | "never" | "on-failure") {
         return Err(format!("sidecar.restart 只支持 never / on-failure，收到：{r}"));
+    }
+    // 3.1) 就绪超时：只接受 1..=3600（0 会被解释成「立刻超时」，明显是笔误）
+    if spec.ready_timeout_sec == 0 || spec.ready_timeout_sec > MAX_SIDECAR_READY_TIMEOUT_SEC {
+        return Err(format!(
+            "sidecar.readyTimeoutSec 需在 1..={MAX_SIDECAR_READY_TIMEOUT_SEC} 秒之间，收到：{}",
+            spec.ready_timeout_sec
+        ));
     }
     // 4) cwd：不写 = 插件目录；写了就必须在插件目录内
     let cwd = spec.cwd.trim();
@@ -1012,6 +1038,10 @@ pub fn install_dependencies_with_progress(
 ///
 /// 三道闸与插件包同源：**只 https**、**体积上限**、**落点必须留在插件目录内**（`safe_join`）；
 /// 另外多一道 **sha256**（清单写了就必须对上）。先写 `.part` 再改名 —— 半截文件不能被当成装好的。
+///
+/// **2026-10-09：改为流式落盘**。原实现把整包读进 `Vec<u8>` 再写盘 —— 本地决策模型换成 3B 级
+/// （约 2.5 GiB）后那是一次 2.5 GiB 的分配，安装过程会被顶爆。现在边读边写 `.part`、同时
+/// 增量算 sha256，内存占用回到常量级（64 KiB 缓冲）。
 fn install_file_dependency(
     plugin_dir: &Path,
     d: &PluginDependency,
@@ -1019,26 +1049,24 @@ fn install_file_dependency(
 ) -> Result<(), String> {
     let dest = safe_join(plugin_dir, &d.dest)
         .ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
-    let bytes = download_bytes_with_progress(&d.url, MAX_DEP_BYTES, report)?;
-    let want = d.sha256.trim();
-    if want.is_empty() {
-        crate::log::warn(format!(
-            "依赖 {} 没有 sha256，已按「只校验 https」安装 —— 作者最好补上校验和",
-            d.url
-        ));
-    } else {
-        let got = hex_sha256(&bytes);
-        if !got.eq_ignore_ascii_case(want) {
-            return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
-        }
-    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("建依赖目录失败：{e}"))?;
     }
     let mut tmp = dest.clone().into_os_string();
     tmp.push(".part");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, &bytes).map_err(|e| format!("写依赖文件失败：{e}"))?;
+
+    let got = download_to_file_with_progress(&d.url, MAX_DEP_BYTES, &tmp, report)?;
+    let want = d.sha256.trim();
+    if want.is_empty() {
+        crate::log::warn(format!(
+            "依赖 {} 没有 sha256，已按「只校验 https」安装 —— 作者最好补上校验和",
+            d.url
+        ));
+    } else if !got.eq_ignore_ascii_case(want) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
+    }
     fs::rename(&tmp, &dest).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("落盘依赖失败：{e}")
@@ -1339,6 +1367,62 @@ fn download_bytes_with_progress(
     Ok(bytes)
 }
 
+/// **流式**下载到文件并**边写边算 sha256**（2026-10-09，大依赖专用）。
+///
+/// 与 `download_bytes_with_progress` 的分工：那个把整包读进内存（`archive` 依赖要用字节做
+/// 魔数识别 + 解压，包都不大）；**`file` 形态的模型动辄 2–3 GiB，必须落盘流式** —— 否则
+/// 一次 GB 级分配会把安装过程顶爆。返回 sha256 十六进制小写，调用方据此与清单比对。
+///
+/// 闸与超时口径完全一致：只 https（`open_https_stream` 内判）、体积上限、无总超时（只有建连 30s）。
+/// **任何失败都尽力删掉半截文件** —— 半截文件绝不能被当成装好的。
+fn download_to_file_with_progress(
+    url: &str,
+    limit: u64,
+    dest: &Path,
+    report: &mut dyn FnMut(&str, u64, u64),
+) -> Result<String, String> {
+    let mut resp = open_https_stream(url)?;
+    let over = || format!("依赖文件超过上限（{} MB）", limit / 1024 / 1024);
+    if let Some(len) = resp.content_length() {
+        if len > limit {
+            return Err(over());
+        }
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = fs::File::create(dest).map_err(|e| format!("建临时文件失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = match resp.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = fs::remove_file(dest);
+                return Err(format!("读取出错：{e}"));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        written += n as u64;
+        if written > limit {
+            let _ = fs::remove_file(dest);
+            return Err(over());
+        }
+        hasher.update(&buf[..n]);
+        if let Err(e) = file.write_all(&buf[..n]) {
+            let _ = fs::remove_file(dest);
+            return Err(format!("写依赖文件失败：{e}"));
+        }
+        report("download", written, total);
+    }
+    if let Err(e) = file.flush() {
+        let _ = fs::remove_file(dest);
+        return Err(format!("写依赖文件失败：{e}"));
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
 /// 发一个 https GET 并返回响应流（非 2xx 直接报错）。超时口径见 `download_bytes` 的注释。
 ///
 /// 抽出来是为了让「依赖下载」与 commands.rs 里的「插件包下载」共用同一套超时口径 ——
@@ -1360,9 +1444,13 @@ pub fn open_https_stream(url: &str) -> Result<reqwest::blocking::Response, Strin
 
 /// sha256 的十六进制小写表示（用于依赖校验和比对）。
 fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut s = String::with_capacity(64);
-    for b in digest {
+    hex_digest(Sha256::digest(bytes).as_slice())
+}
+
+/// 把一段摘要字节转成十六进制小写（`Sha256::finalize()` / `Sha256::digest()` 的结果）。
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
     s

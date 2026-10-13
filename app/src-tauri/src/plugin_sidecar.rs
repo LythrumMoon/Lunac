@@ -22,15 +22,20 @@
 //!
 //! `stdio`（缺省）：宿主 ↔ 进程走 stdin/stdout 的 **NDJSON**（每行一个 JSON 对象）；
 //! `http` / `both`：进程监听 `127.0.0.1:<port>`，**由宿主代请求**（`http()`）。
-//! 起进程后必须先收到一条 `{"method":"ready", ...}`（`http` 时带 `port`）才算起好了，超时 10s。
+//!
+//! **就绪判定（2026-10-09 修）**：`http` 通道下两个信号**任一**成立即算就绪 ——
+//! ① 进程吐出 `{"method":"ready","params":{"port":N}}`（**自研 sidecar 的握手约定**）；
+//! ② 清单写的固定 `port` **可连**（**第三方 http 服务不会说我们的握手行** —— `llama-server`
+//!    只在模型加载完后才开始监听，之前这条链路把它误判成「握手超时」并杀掉）。
+//! 超时 = `sidecar.readyTimeoutSec`（清单可配，缺省 10s；大模型冷启要写大些）。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -39,8 +44,6 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::plugin_market::{self, SidecarSpec};
 
-/// 握手超时：起进程后等 `ready` 行。
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// 单条 `request` 的默认超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Windows `CREATE_NO_WINDOW`：不弹控制台（stdio 管道照常可用）。
@@ -386,12 +389,7 @@ fn spawn_proc(
         ready_tx,
     );
 
-    let ready = match ready_rx.recv_timeout(READY_TIMEOUT) {
-        Ok(Ok(port)) => Ok(port),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("sidecar 握手超时（未收到 ready）".into()),
-    };
-    let ready_port = match ready {
+    let ready_port = match wait_ready(&spec, &ready_rx) {
         Ok(p) => p,
         Err(e) => {
             let _ = child.kill();
@@ -413,6 +411,48 @@ fn spawn_proc(
     };
 
     Ok(Proc { child, stdin, port })
+}
+
+/// 等「就绪」。**两个信号任一成立即可**（见模块头注释）：
+///   ① 进程吐出 NDJSON `{"method":"ready"}` 行（自研 sidecar 的握手约定）；
+///   ② `transport` 含 http **且清单写了固定 `port`** 时，该端口**可连** ——
+///      第三方 http 服务（`llama-server` / 各类 OpenAI 兼容服务）不会说我们的握手行，
+///      只能靠「端口起来了」判就绪（2026-10-09：本地决策模型换 4B 后暴露 ——
+///      之前 sidecar 这条链路其实从没对 `llama-server` 真跑通）。
+/// 超时取 `sidecar.readyTimeoutSec`（缺省 10s；大模型冷启要几十秒，清单里写大些）。
+fn wait_ready(spec: &SidecarSpec, ready_rx: &mpsc::Receiver<Result<Option<u16>, String>>) -> Result<Option<u16>, String> {
+    let wants_http = matches!(spec.transport.trim(), "http" | "both");
+    let probe_port = wants_http && spec.port != 0;
+    let deadline = Instant::now() + Duration::from_secs(spec.ready_timeout_sec.max(1));
+    loop {
+        match ready_rx.try_recv() {
+            Ok(Ok(p)) => return Ok(p),
+            Ok(Err(e)) => return Err(e), // 读线程报「进程未握手就退出」
+            Err(TryRecvError::Disconnected) => return Err("sidecar 进程未握手就退出了".into()),
+            Err(TryRecvError::Empty) => {}
+        }
+        if probe_port && tcp_port_open(spec.port) {
+            return Ok(Some(spec.port));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "sidecar 未就绪（{}s 内既没收到 ready 行，端口 {} 也没起来）",
+                spec.ready_timeout_sec.max(1),
+                spec.port
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// 回环端口是否已在监听（就绪探测用）。**只连 `127.0.0.1`**，不发请求、不解析端口白名单 ——
+/// 这只是一次「起来没起来」的探测，真正代请求仍走 `http()` 的端口授权那条路。
+fn tcp_port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    )
+    .is_ok()
 }
 
 /// 会话活着检查 + `restart = on-failure` 的**惰性重起**（下一次调用时探测并重起；

@@ -15,7 +15,12 @@
   --surface-rgb-hover: 48, 44, 54;
   --surface-glass: rgba(var(--surface-rgb), var(--surface-alpha, 0.88));
   --surface-glass-hover: rgba(var(--surface-rgb-hover), calc(var(--surface-alpha, 0.88) - 0.08));
-  --border-glass: rgba(232, 216, 202, 0.10);
+  /* 面板 / 文本框描边（2026-10-11 翻牌）：**归「按钮线条」** —— 由 `--btn-line-rgb`
+   *  派生，α 固定 0.10（接近改造前 rgba(232,216,202,0.10) 的观感）。
+   *  于是「四类全设 #000000」时面板描边随之变黑；默认（btn-line 空串 = 主题色）
+   *  时 = rgba(var(--accent-rgb), 0.10)。main.ts 的 applyFourClassNeutrals 也会写
+   *  一份内联值（供插件悬浮窗转发），此处只管首帧兜底。 */
+  --border-glass: rgba(var(--btn-line-rgb), 0.10);
   --text: #eae2da;
   --text-dim: #b2a9a3;
   --text-muted: #837a78;
@@ -71,15 +76,19 @@
      两者都由 main.ts 的 `derivePalette()` 按主色明暗写出。 */
   --ink-rgb: 255, 255, 255;
   --shade-scale: 1;
+  /* 中性**遮罩**基色（2026-10-11）：`rgba(var(--shade-rgb), calc(α * var(--shade-scale)))`
+   *  是「凹陷 / 压暗」的统一出口。归「底色」—— 由 `--surface-rgb` 的暗变体派生
+   *  （main.ts 的 applyFourClassNeutrals 写出；暗底 ≈ 近黑）。默认 0,0,0 == 改造前。 */
+  --shade-rgb: 0, 0, 0;
   /* ── 「反差四件套」的上下文 token（2026-09-20 新增）────────────────
      「恢复默认主题」（字段 `tintBase`）**关掉**时由 main.ts 覆盖这四个，用来表达
      「底色暗 ⇒ 这四处亮一档、底色亮 ⇒ 这四处暗一档」。消费方只有四处：
      ① 风格里的分类区域 `.settings-group-title` ② 文本框 ③ 取色器的框格
      ④ 结果区当前选中项（清单见 ai-spec 规则 45）。
      默认值 = 各自跟随主色派生的那一项 ⇒ 开关开着时逐像素等于改造前。 */
-  --ctx-rgb: var(--accent-rgb);
+  --ctx-rgb: var(--ink-rgb);
   --ctx-ink-rgb: var(--ink-rgb);
-  --ctx-shade-rgb: 0, 0, 0;
+  --ctx-shade-rgb: var(--shade-rgb);
   --ctx-shade-scale: var(--shade-scale);
   --ctx-border-glass: var(--border-glass);
   /* ── 按钮线条（2026-09-20，设置 → 风格 ·「按钮自定义」）────────────
@@ -215,7 +224,7 @@ html, body {
   padding: 4px;
   min-width: 160px;
   z-index: 1000;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, calc(0.5 * var(--shade-scale)));
+  box-shadow: 0 8px 24px rgba(var(--shade-rgb), calc(0.5 * var(--shade-scale)));
   pointer-events: auto;
 }
 
@@ -243,7 +252,7 @@ html, body {
   white-space: nowrap;
 }
 .context-menu-item:hover {
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
 }
 .context-menu-item.danger {
@@ -254,7 +263,7 @@ html, body {
 }
 .context-menu-item-active {
   color: var(--text) !important;
-  background: var(--accent-bg) !important;
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha)) !important;
 }
 /* 置灰项（如无选区时的「复制/剪切」）：仍占位、点击无反应、hover 不高亮，
    与 macOS/Windows 原生菜单的 disabled 语义一致。 */
@@ -300,15 +309,15 @@ html, body {
   flex-shrink: 0;
   padding: 2px 8px;
   font-size: 0.68rem;
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
-  border: 1px solid var(--accent-border);
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 4px;
   cursor: pointer;
   transition: background 0.1s;
 }
 .clip-item-copy:hover {
-  background: rgba(var(--accent-rgb), 0.2);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 
 /* ── Search bar ────────────────────────────────────────────────── */
@@ -328,7 +337,7 @@ html, body {
   min-height: 38px;
   /* 搜索路径无开合/过渡动画：结果出现/收起即时切换，避免打字时过渡重绘导致卡顿 */
   transition: none;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, calc(0.45 * var(--shade-scale)));
+  box-shadow: 0 8px 32px rgba(var(--shade-rgb), calc(0.45 * var(--shade-scale)));
   flex-shrink: 0;
   pointer-events: auto;
   margin: 0; /* edge-to-edge glass — no invisible border */
@@ -355,8 +364,8 @@ html, body {
 }
 
 #search-bar:focus-within {
-  border-color: var(--accent-border);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, calc(0.5 * var(--shade-scale))), 0 0 0 1px rgba(var(--accent-rgb), 0.12);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  box-shadow: 0 8px 32px rgba(var(--shade-rgb), calc(0.5 * var(--shade-scale))), 0 0 0 1px rgba(var(--other-overlay-rgb), 0.12);
 }
 
 #search-bar.has-results {
@@ -382,7 +391,7 @@ html, body {
   font-size: 1.05rem;
   line-height: 1.3;
   outline: none;
-  caret-color: var(--accent);
+  caret-color: rgb(var(--other-overlay-rgb));
   resize: none;
 }
 
@@ -425,8 +434,8 @@ html, body {
   align-items: center;
   gap: 4px;
   padding: 3px 10px;
-  background: rgba(var(--accent-rgb), 0.1);
-  border: 1px solid rgba(var(--accent-rgb), 0.25);
+  background: rgba(var(--other-overlay-rgb), 0.1);
+  border: 1px solid rgba(var(--other-overlay-rgb), 0.25);
   border-radius: 12px;
   font-size: 0.72rem;
   color: var(--text);
@@ -436,7 +445,7 @@ html, body {
 }
 
 .file-chip:hover {
-  background: rgba(var(--accent-rgb), 0.18);
+  background: rgba(var(--other-overlay-rgb), 0.18);
 }
 
 .file-chip-icon {
@@ -492,8 +501,8 @@ html, body {
 }
 .file-chip-more-btn {
   padding: 3px 10px;
-  background: rgba(var(--accent-rgb), 0.12);
-  border: 1px dashed rgba(var(--accent-rgb), 0.4);
+  background: rgba(var(--other-overlay-rgb), 0.12);
+  border: 1px dashed rgba(var(--other-overlay-rgb), 0.4);
   border-radius: 12px;
   font-size: 0.72rem;
   color: var(--text);
@@ -501,7 +510,7 @@ html, body {
   transition: background 0.1s;
 }
 .file-chip-more-btn:hover {
-  background: rgba(var(--accent-rgb), 0.24);
+  background: rgba(var(--other-overlay-rgb), 0.24);
 }
 .file-chip-more-clear {
   padding: 3px 10px;
@@ -522,14 +531,14 @@ html, body {
   gap: 4px;
   margin: 2px 0 2px 8px;
   padding-left: 10px;
-  border-left: 1px dashed rgba(var(--accent-rgb), 0.35);
+  border-left: 1px dashed rgba(var(--other-overlay-rgb), 0.35);
 }
 
 /* ── Drag-over highlight ──────────────────────────────────── */
 #search-bar.drag-over,
 #chat-input-bar.drag-over {
-  border-color: rgba(var(--accent-rgb), 0.6) !important;
-  box-shadow: 0 0 12px rgba(var(--accent-rgb), 0.2) !important;
+  border-color: rgba(var(--other-overlay-rgb), 0.6) !important;
+  box-shadow: 0 0 12px rgba(var(--other-overlay-rgb), 0.2) !important;
 }
 
 /* ── Plugin bar (replaces input when plugin active) ──────────── */
@@ -593,7 +602,7 @@ html, body {
 }
 #plugin-bar-float:hover {
   opacity: 1;
-  color: var(--accent);
+  color: rgb(var(--other-overlay-rgb));
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
@@ -630,7 +639,7 @@ html, body {
    见 #plugin-bar-exit 上方那段说明。 */
 #settings-btn:hover {
   opacity: 1;
-  color: var(--accent);
+  color: rgb(var(--other-overlay-rgb));
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
@@ -650,7 +659,7 @@ html, body {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: rgb(var(--accent-rgb));
+  background: rgb(var(--other-overlay-rgb));
 }
 
 .hidden { display: none !important; }
@@ -712,6 +721,34 @@ html[data-window-kind="chat"] #status-hint {
 html[data-window-kind="chat"] #detail-panel {
   /* 详细搜索大界面是主窗的（本窗口没有搜索栏，进不去）—— 留着只是防御性收口 */
   display: none !important;
+}
+
+/* ── 阶段状态栏（L4 调试浮标，默认关；见 main.ts 的 setDebugPhase）────────
+   只在开关打开时由 JS 创建节点并挂到 body，所以这里不需要初始隐藏。
+   定位 fixed + pointer-events:none：不占布局、不拦点击、不抢焦点；锚在窗口右上、
+   标题栏下方（聊天窗恒为 #app.detached，标题栏高约 42）。
+   颜色一律走四类自定义变量（底色派生的 --surface-glass / 按钮线条派生的 --border-glass /
+   蒙版派生的 --text），不写任何色值；是一条单行文本、overflow:hidden 无滚动条
+   （全局唯一那条滚动条规则与本浮标无关）。 */
+#debug-phase-bar {
+  position: fixed;
+  top: 46px;
+  right: 10px;
+  z-index: 400;
+  max-width: 62%;
+  padding: 3px 8px;
+  font-size: 0.66rem;
+  line-height: 1.4;
+  border-radius: 6px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  color: var(--text);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── 插件悬浮窗标题栏（2026-09-27，plugin.html 专用）──────────────
@@ -894,13 +931,13 @@ body:has(.music-root.music-player-on) #plugin-titlebar { margin: 0; }
 }
 /* 播放态那个按钮其实是「← 回退」而不是关闭（图标由 music.ts 的 syncTitlebarClose
    换掉）—— hover 不能再用警示红，否则用户会以为点下去要关掉整个悬浮窗。 */
-body:has(.music-root.music-player-on) #plugin-close:hover { color: var(--accent); }
+body:has(.music-root.music-player-on) #plugin-close:hover { color: rgb(var(--other-overlay-rgb)); }
 /* 置顶是**持续态**，不能只靠 hover 表达：常亮主题色 + 半透明底。
    初值由 plugin-window.ts 问宿主（plugin_window_pin_state）后写上 ——
    建窗时就是 always_on_top(true)，前端不许自己猜。 */
 #plugin-pin.active {
   opacity: 1;
-  color: var(--accent);
+  color: rgb(var(--other-overlay-rgb));
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
@@ -979,7 +1016,7 @@ html.no-chrome #results-list {
    前端不许自己猜（否则会出现「按钮没亮、实际已置顶」的错位）。 */
 #detached-pin-btn.active {
   opacity: 1;
-  color: var(--accent);
+  color: rgb(var(--other-overlay-rgb));
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-btn-alpha));
 }
 
@@ -1043,7 +1080,7 @@ html.no-chrome #results-list {
   max-height: 100%;
   object-fit: contain;
   border-radius: 6px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  box-shadow: 0 2px 12px rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
 }
 
 .ocr-image-actions {
@@ -1096,7 +1133,7 @@ html.no-chrome #results-list {
 
 #shot-box {
   position: fixed;
-  border: 1px solid var(--accent);
+  border: 1px solid rgb(var(--other-overlay-rgb));
   background: transparent;
   /* 框外压暗、框内保持原亮度（一个 9999px 的 spread 就是那块「挖洞」） */
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
@@ -1146,13 +1183,13 @@ html.no-chrome #results-list {
 }
 
 .ocr-primary-btn {
-  border-color: var(--accent-border);
-  background: var(--accent-bg);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
 }
 
 .ocr-primary-btn:hover {
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   filter: brightness(1.2);
 }
 
@@ -1201,7 +1238,7 @@ html.no-chrome #results-list {
 
 .ocr-copy-btn.ocr-copied {
   color: var(--text);
-  border-color: var(--accent-border);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 
 .ocr-textarea {
@@ -1233,7 +1270,7 @@ html.no-chrome #results-list {
   flex-direction: column;
   gap: 0;
   border-top: 1px solid var(--border-glass);
-  background: rgba(0, 0, 0, calc(0.15 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.15 * var(--shade-scale)));
   flex-shrink: 0;
   pointer-events: auto;
   overflow: visible; /* allow mode dropdown to extend above */
@@ -1431,7 +1468,7 @@ body.plan-open #todo-drawer {
   font-size: 0.82rem;
   line-height: 1.3;
   outline: none;
-  caret-color: var(--accent);
+  caret-color: rgb(var(--other-overlay-rgb));
   resize: none;
   min-width: 0;
   /* 动态高度 30~60px */
@@ -1440,7 +1477,7 @@ body.plan-open #todo-drawer {
   overflow-y: auto;
 }
 #chat-input:focus {
-  border-color: var(--accent-border);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 #chat-input::placeholder {
   color: var(--text-dim);
@@ -1624,6 +1661,12 @@ body.plan-open #todo-drawer {
   right: 14px;
   bottom: 40px;
   z-index: 40;
+  /* **必须显式 `auto`**（2026-10-10 用户报障「打开价格表后整页点不动、鼠标穿过去」）：
+     `#app` 是 `pointer-events: none`（透明窗要让空白处把点击放行给桌面），
+     所以每个直接子元素都得自己把它打开 —— `#results-container` / `#status-bar` /
+     `#context-menu` 都声明了，本面板当初漏了这一条：面板画得出来，鼠标却整个穿过去。
+     `pointer-events` 是可继承属性，漏写就跟着 `#app` 变成 `none`。 */
+  pointer-events: auto;
   box-sizing: border-box;
   max-width: min(560px, calc(100vw - 28px));
   max-height: 56vh;
@@ -1635,7 +1678,7 @@ body.plan-open #todo-drawer {
   backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid var(--border-glass);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 12px 32px rgba(var(--shade-rgb), 0.28);
   font-size: 0.7rem;
   color: var(--text-muted);
 }
@@ -1804,7 +1847,7 @@ body.plan-open #todo-drawer {
 .result-item-badge {
   font-size: 0.65rem;
   padding: 2px 8px;
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
   border-radius: 4px;
   flex-shrink: 0;
@@ -1872,8 +1915,8 @@ body.plan-open #todo-drawer {
   align-items: center;
   gap: 5px;
   padding: 4px 10px;
-  background: rgba(var(--accent-rgb), 0.12);
-  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  background: rgba(var(--other-overlay-rgb), 0.12);
+  border: 1px solid rgba(var(--other-overlay-rgb), 0.3);
   border-radius: 8px;
   color: var(--text);
   font-size: 0.74rem;
@@ -1881,7 +1924,7 @@ body.plan-open #todo-drawer {
   transition: background 0.12s;
 }
 .ql-add-btn:hover {
-  background: rgba(var(--accent-rgb), 0.24);
+  background: rgba(var(--other-overlay-rgb), 0.24);
 }
 .ql-empty {
   padding: 14px 4px;
@@ -1964,8 +2007,8 @@ body.plan-open #todo-drawer {
   padding: 5px 10px;
   font-size: 0.72rem;
   color: var(--blue);
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 8px;
   cursor: pointer;
   transition: background 0.12s, border-color 0.12s, color 0.12s;
@@ -1991,7 +2034,7 @@ body.plan-open #todo-drawer {
   display: none;
   align-items: center;
   justify-content: center;
-  background: rgba(10, 8, 12, 0.72);
+  background: rgba(var(--shade-rgb), 0.72);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   pointer-events: auto;
@@ -2006,7 +2049,7 @@ body.plan-open #todo-drawer {
   object-fit: contain;
   border-radius: 10px;
   border: 1px solid var(--border-glass);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, calc(0.6 * var(--shade-scale)));
+  box-shadow: 0 16px 48px rgba(var(--shade-rgb), calc(0.6 * var(--shade-scale)));
 }
 
 /* Thinking — small, collapsed-by-default expandable header (Hermes-style) */
@@ -2043,7 +2086,7 @@ body.plan-open #todo-drawer {
      因为它是叙述性正文而不是机器输出。 */
   padding: 6px 8px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.22 * var(--shade-scale)));
   color: var(--text-dim);
   font-size: 11px;
   line-height: 1.55;
@@ -2059,7 +2102,7 @@ body.plan-open #todo-drawer {
   color: var(--text-dim);
   font-size: 12px;
   padding: 3px 8px;
-  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale)));
   border-radius: 6px;
   white-space: nowrap;
   overflow: hidden;
@@ -2132,7 +2175,7 @@ body.plan-open #todo-drawer {
   padding: 3px 8px;
   font-size: 0.7rem;
   color: var(--text-dim);
-  background: rgba(0, 0, 0, calc(0.14 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.14 * var(--shade-scale)));
   border-radius: 6px;
   cursor: pointer;
   list-style: none;
@@ -2173,7 +2216,7 @@ body.plan-open #todo-drawer {
 
 .tool-card {
   margin: 3px 0;
-  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale)));
   border: 1px solid transparent;
   border-radius: 6px;
   font-size: 12px;
@@ -2230,7 +2273,7 @@ body.plan-open #todo-drawer {
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;
-  background: rgba(0, 0, 0, calc(0.24 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.24 * var(--shade-scale)));
   border-radius: 5px;
 }
 .tool-card .tool-cmd-full:empty { display: none; }
@@ -2260,7 +2303,7 @@ body.plan-open #todo-drawer {
   /* 卡内正文再深一档（0.26 > 卡片自身的 0.18）—— 「卡头 → 卡内」的层次由
      **底色深度**表达，不再只靠一条内边线（2026-10-01 用户要求）。
      圆角跟着卡片收底，否则加深的底色会从卡片圆角外面露出来。 */
-  background: rgba(0, 0, 0, calc(0.26 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.26 * var(--shade-scale)));
   border-radius: 0 0 6px 6px;
 }
 
@@ -2296,7 +2339,7 @@ body.plan-open #todo-drawer {
   max-width: 100%;
   border-radius: 4px;
   border: 1px solid rgba(var(--ink-rgb), 0.12);
-  background: rgba(0, 0, 0, calc(0.2 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.2 * var(--shade-scale)));
 }
 /* ── 正在执行的命令：实时控制（2026-10-01，用户要求「命令卡上加后台运行 / 停止」）──
    只长在**运行中**的命令卡上；命令一返回就整块撤掉（见 `agentToolResult`），
@@ -2342,7 +2385,7 @@ body.plan-open #todo-drawer {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.22 * var(--shade-scale)));
 }
 .todo-item.bg-cmd .bg-cmd-label {
   flex: 1 1 auto;
@@ -2352,6 +2395,16 @@ body.plan-open #todo-drawer {
   white-space: nowrap;
   font-family: ui-monospace, Consolas, monospace;
   font-size: 11px;
+}
+/* PID（2026-10-08）：让用户能在任务管理器里按号定位这条命令的进程。
+   `flex: none` 且不许收缩 —— 命令原文可以省略号截断，PID 截了就没用了。 */
+.todo-item.bg-cmd .bg-cmd-pid {
+  flex: none;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  user-select: text;
 }
 .todo-item.bg-cmd .bg-cmd-cancel {
   flex: none;
@@ -2598,7 +2651,7 @@ body.plan-open #todo-drawer {
   overscroll-behavior: contain;
 }
 /* 状态**不用图标**（用户要求）：进行中 = 强调色，已完成 = 弱化，未开始 = 次要 */
-.todo-item.in_progress { color: var(--accent); }
+.todo-item.in_progress { color: rgb(var(--other-overlay-rgb)); }
 .todo-item.completed { color: var(--text-muted); }
 .todo-item.pending { color: var(--text-dim); }
 
@@ -2693,7 +2746,7 @@ body.plan-open #todo-drawer {
   font-family: ui-monospace, Consolas, monospace;
   font-size: 10px;
 }
-.cr-add { color: var(--accent); }
+.cr-add { color: rgb(var(--other-overlay-rgb)); }
 .cr-del { color: var(--red); }
 .cr-unknown { color: var(--text-muted); }
 
@@ -2702,6 +2755,17 @@ body.plan-open #todo-drawer {
   flex: none;
   color: var(--text-muted);
   font-size: 10px;
+}
+
+/* ⑤ 脚本产出登记（2026-10-10）：由 Cmd / PowerShell 生成 / 改写的文件没有「改前内容」，
+   只列进「已改动文件」、不参与回退 —— 用中性说明文字替掉接受 / 拒绝按钮，别让用户对着
+   灰按钮猜为什么点不了。 */
+.cr-script-note {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: italic;
+  white-space: nowrap;
 }
 
 /* 接受 / 拒绝按钮 */
@@ -2735,7 +2799,7 @@ body.plan-open #todo-drawer {
 .cr-body {
   margin: 0 0 4px 22px;
   padding: 4px 6px;
-  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale)));
   border-radius: 6px;
 }
 .cr-diff-head {
@@ -2752,7 +2816,7 @@ body.plan-open #todo-drawer {
 }
 /* 「这一条 / 净变化」选中态（按钮自身，不在 .cr-entry 里也有） */
 .cr-entry-label.active {
-  color: var(--accent);
+  color: rgb(var(--other-overlay-rgb));
 }
 .cr-entry-label {
   flex: 1 1 auto;
@@ -2778,7 +2842,7 @@ body.plan-open #todo-drawer {
   font-family: ui-monospace, Consolas, monospace;
   font-size: 10.5px;
   line-height: 1.45;
-  background: rgba(0, 0, 0, calc(0.28 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.28 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
 }
@@ -2789,8 +2853,8 @@ body.plan-open #todo-drawer {
   color: var(--text-dim);
 }
 .diff-add {
-  color: var(--accent);
-  background: rgba(var(--accent-rgb), 0.10);
+  color: rgb(var(--other-overlay-rgb));
+  background: rgba(var(--other-overlay-rgb), 0.10);
 }
 .diff-del {
   color: var(--red);
@@ -2883,8 +2947,8 @@ body.plan-open #todo-drawer {
 .approval-card {
   margin: 8px 12px;
   padding: 12px 14px;
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 10px;
   white-space: normal;
 }
@@ -2915,7 +2979,7 @@ body.plan-open #todo-drawer {
 
 .elicit-input {
   padding: 5px 8px;
-  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
   color: var(--text);
@@ -2977,6 +3041,220 @@ body.plan-open #todo-drawer {
   color: var(--text-muted);
 }
 
+/* ── MCP sampling 授权卡（2026-10-11）────────────────────────────
+   某台 MCP 服务器发 `sampling/createMessage` 要借本机模型时的确认卡
+   （见 app/src/main.ts 的 showSamplingCard）。只给「允许 / 拒绝」。 */
+.mcp-sampling-server {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.mcp-sampling-stat {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.mcp-sampling-hint {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* 反向（HTTP）警告卡：服务器**经 HTTP 主动推来**的 sampling 请求（反向往返），
+   与 stdio 路径的常规卡区分。左缘用警告语义色 --yellow（§界面 11 白名单语义色，
+   不新造颜色；与命令卡「无法静态判定」同一条强调口径 —— 都是「要人看一眼」）。 */
+.mcp-sampling-warn {
+  border-left: 2px solid var(--yellow);
+}
+
+.mcp-sampling-warn-line {
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--yellow);
+}
+
+/* ── agent → 用户的呈递（A13，2026-10-11）────────────────────────
+   两件工具的前端效果：`SendUserFile` ⇒ 一张文件卡（.file-handoff-*）、
+   `PushNotification` ⇒ 一条应用内桌面通知（.push-toast-*，见 main.ts 的
+   showUserFileCard / showPushNotification）。颜色全走四类变量 / 语义色白名单，
+   不新造字面量；滚动条走 §界面 6 的全局规则（新容器 overflow-y:auto 即自动获得）。 */
+
+.file-handoff-card {
+  margin: 8px 12px;
+  padding: 12px 14px;
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  border-radius: 10px;
+  white-space: normal;
+}
+
+.agent-flow .file-handoff-card {
+  margin: 4px 0;
+}
+
+.file-handoff-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.file-handoff-ic {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-dim);
+}
+
+.file-handoff-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.file-handoff-path {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.file-handoff-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.file-handoff-preview {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.file-handoff-preview > summary {
+  cursor: pointer;
+  color: var(--text-dim);
+}
+
+.file-handoff-preview > summary::-webkit-details-marker {
+  display: none;
+}
+
+.file-handoff-preview-body {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow-y: auto;
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.file-handoff-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.file-handoff-btn {
+  flex: 1;
+  padding: 6px 0;
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  border-radius: 6px;
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.file-handoff-btn:hover {
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.08));
+}
+
+/* 应用内桌面通知（PushNotification）：右下角浮层，队列式堆叠，6s 自动收起。 */
+#push-toast-host {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 4800;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 300px;
+  pointer-events: none;
+}
+
+.push-toast {
+  pointer-events: auto;
+  padding: 10px 12px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(var(--shade-rgb), calc(0.5 * var(--shade-scale)));
+}
+
+.push-toast-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.push-toast-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.push-toast-close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.push-toast-close:hover {
+  color: var(--text);
+}
+
+.push-toast-body {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .approval-danger {
   color: var(--red);
   font-size: 12px;
@@ -2998,7 +3276,7 @@ body.plan-open #todo-drawer {
   padding: 8px 10px;
   max-height: 120px;
   overflow-y: auto;
-  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
   border-radius: 6px;
   color: var(--text-dim);
   font-size: 11px;
@@ -3116,6 +3394,49 @@ body.plan-open #todo-drawer {
   line-height: 1.4;
 }
 
+/* ── AskUserQuestion：固定选项之外的自由输入（2026-10-10 用户要求）───────
+   「其他」那枚与模型给的选项同形、但加一点区分（斜体标签）；选中后就地展开一个输入框。
+   卡底的「补充说明」是**大文本框**（用户口径：限 1000 字、渲染高约 200px 即可）。 */
+.approval-ask-other .approval-ask-opt-label {
+  font-style: italic;
+}
+.approval-ask-other-wrap {
+  margin-top: 6px;
+}
+.approval-ask-other-input,
+.approval-ask-extra-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.approval-ask-other-input {
+  min-height: 48px;
+}
+.approval-ask-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.approval-ask-extra-title {
+  font-size: 12px;
+  color: var(--text);
+}
+.approval-ask-extra-input {
+  height: 200px;
+  max-height: 40vh;
+}
+
 /* ── A14 子任务分组面板 ────────────────────────────────────────── */
 /* 一轮里并发的每个子代理一行，随事件就地更新（子代理不流式，这是它在 UI 上的唯一落点）。
    刻意**不给** max-height / overflow-y：新增一层滚动条、以及限制结果区高度都是本项目
@@ -3131,7 +3452,7 @@ body.plan-open #todo-drawer {
   margin-left: 14px;
   padding: 6px 8px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale)));
   border-left: 2px solid rgba(var(--ink-rgb), 0.16);
 }
 .subtask-panel .subtask-head {
@@ -3293,7 +3614,7 @@ body.plan-open #todo-drawer {
   /* 上层 `.approval-batch-body` 是唯一滚动容器（见 has-plan 那段注释），
      所以这里只给 min-height: 0、**不给自己加限高与滚动**。 */
   min-height: 0;
-  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
   border-radius: 6px;
   padding: 8px 10px;
   margin: 0;
@@ -3329,7 +3650,7 @@ body.plan-open #todo-drawer {
 
 .approval-batch-card .approval-plan-toggle:hover {
   color: var(--text);
-  border-color: var(--accent-border);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 
 /* 计划比普通审批卡需要更长的阅读窗口（几十行是常态）—— 放宽**外层**上限，
@@ -3355,13 +3676,13 @@ body.plan-open #todo-drawer {
   padding: 2px 9px;
   font-size: 11px;
   border-radius: 5px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--ink-rgb), 0.04);
   color: var(--text);
   cursor: pointer;
 }
 .approval-batch-card .plan-nav:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(var(--ink-rgb), 0.1);
 }
 .approval-batch-card .plan-nav:disabled {
   opacity: 0.35;
@@ -3388,8 +3709,8 @@ body.plan-open #todo-drawer {
   resize: vertical;
   padding: 6px 8px;
   border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
   color: var(--text);
   font-family: inherit;
   font-size: 11.5px;
@@ -3450,7 +3771,7 @@ body.plan-open #todo-drawer {
      用户看到的就是「空白区域」（还以为是模型输出带了空行）。
      注意：仍**不是**固定 height —— 短命令不留空档这条不能回退。 */
   min-height: 0;
-  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
   border-radius: 6px;
   padding: 4px 8px;
   margin: 0;
@@ -3515,7 +3836,7 @@ body.plan-open #todo-drawer {
 .ai-response .cursor-blink::after {
   content: '▌';
   animation: blink 1s step-end infinite;
-  color: var(--accent);
+  color: rgb(var(--other-overlay-rgb));
   font-weight: 100;
 }
 
@@ -3538,9 +3859,15 @@ body.plan-open #todo-drawer {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+  /* 轨道**不描边** —— 2026-10-11 更正（用户口径：先前要求「轨道描边」是误判，已撤销）。
+     滚动条恢复为：**滑块实心无 border、轨道也不加 border**。见 ui-style.md §界面 6 的
+     「2026-10-11 更正」条。滚动条是本文件**唯一**的全局规则（禁止按容器单写）。 */
+  border: none;
 }
 ::-webkit-scrollbar-thumb {
   background: rgba(var(--ink-rgb), 0.18);
+  /* 滑块**实心、无 border**（border 归上面的轨道）。 */
+  border: none;
   border-radius: 2px;
 }
 ::-webkit-scrollbar-thumb:hover {
@@ -3548,6 +3875,24 @@ body.plan-open #todo-drawer {
 }
 ::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+/* ── 数字上下选择按钮（`input[type=number]` 的原生 spinner）────────────
+   2026-10-11：WebView2 / Chromium 的 `::-webkit-inner-spin-button` 是 **UA 绘制的位图
+   箭头**，只能整块隐藏、**无法换成四类自定义色**（设 background 只会让箭头消失、留下空壳；
+   尺寸 / 颜色 / hover 都改不动）。所以全局策略 = **隐藏原生 spinner**（去控件、不去语义：
+   输入框仍是 number，键盘 ↑↓ / 滚轮照样增减），需要「看得见、可点、且跟随主题」的步进按钮
+   时改用**自绘** `+` / `−`（完整规范见 docs/ui-style.md §界面 13）。
+   为什么写全局而不是逐个容器（与滚动条同一条纪律）：逐个声明必漏，且此前只有 proxy 面板
+   局部隐藏过 —— 桌宠「动作」页的数字框就漏在默认外观里（用户点名）。 */
+input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 /* ── AI Chat messages ─────────────────────────────────────────── */
@@ -3582,8 +3927,8 @@ body.plan-open #todo-drawer {
 
 .chat-msg-user {
   position: relative;
-  background: rgba(var(--accent-rgb), 0.08);
-  border: 1px solid rgba(var(--accent-rgb), 0.15);
+  background: rgba(var(--other-overlay-rgb), 0.08);
+  border: 1px solid rgba(var(--other-overlay-rgb), 0.15);
   border-radius: 10px;
   padding: 8px 12px;
   margin: 6px 0;
@@ -3639,7 +3984,7 @@ body.plan-open #todo-drawer {
 .msg-actions button:hover {
   opacity: 1 !important;
   color: var(--text);
-  background: rgba(var(--accent-rgb), 0.15);
+  background: rgba(var(--other-overlay-rgb), 0.15);
 }
 
 /* 回退按钮的「待确认」态（2026-09-30）—— 本次回退会连带还原磁盘文件时的二次确认。
@@ -3676,7 +4021,7 @@ body.plan-open #todo-drawer {
 .flow-copy:hover {
   opacity: 1 !important;
   color: var(--text);
-  background: rgba(var(--accent-rgb), 0.15);
+  background: rgba(var(--other-overlay-rgb), 0.15);
 }
 
 /* System message in chat log (new conversation / ready banner) */
@@ -3686,6 +4031,36 @@ body.plan-open #todo-drawer {
   color: var(--text-dim);
   padding: 12px 0 4px;
   opacity: 0.6;
+}
+
+/* ── 历史视图「对话 / 桌宠」分页（2026-10-10）─────────────────────────
+   桌宠发起的对话自成一条线程（ChatSession.source="pet"），与普通聊天分开存、分页展示。
+   分段控件**自绘**（透明窗口禁原生 `<select>`，code-rules §5.2），样式对齐 `.music-seg` / `.music-tab`。 */
+.chat-hist-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 2px 4px 8px;
+}
+.chat-hist-tab {
+  padding: 4px 14px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-glass);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.chat-hist-tab:hover { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+.chat-hist-tab.on {
+  color: var(--text);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+}
+.history-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.78rem;
 }
 
 /* ── Chat History items (drawer-style) ────────────────────────── */
@@ -3709,8 +4084,8 @@ body.plan-open #todo-drawer {
 }
 
 .history-item-header:hover {
-  background: rgba(var(--accent-rgb), 0.06);
-  border-color: rgba(var(--accent-rgb), 0.2);
+  background: rgba(var(--other-overlay-rgb), 0.06);
+  border-color: rgba(var(--other-overlay-rgb), 0.2);
 }
 
 .history-item-info {
@@ -3798,7 +4173,7 @@ body.plan-open #todo-drawer {
   transition: transform 0.12s;
 }
 .history-turns-toggle.expanded::before { transform: rotate(90deg); }
-.history-turns-toggle:hover { color: var(--accent); opacity: 1; }
+.history-turns-toggle:hover { color: rgb(var(--other-overlay-rgb)); opacity: 1; }
 .history-turns {
   margin: 2px 8px 4px;
   padding-left: 12px;
@@ -3819,7 +4194,7 @@ body.plan-open #todo-drawer {
   text-align: left;
   cursor: pointer;
 }
-.history-turns-item:hover { background: rgba(var(--accent-rgb), 0.12); }
+.history-turns-item:hover { background: rgba(var(--other-overlay-rgb), 0.12); }
 .history-turns-idx {
   flex: 0 0 auto;
   color: var(--text-dim);
@@ -3844,7 +4219,7 @@ body.plan-open #todo-drawer {
   text-align: left;
   cursor: pointer;
 }
-.history-turns-earlier:hover { color: var(--accent); }
+.history-turns-earlier:hover { color: rgb(var(--other-overlay-rgb)); }
 
 .history-item.open .history-item-preview {
   display: block;
@@ -3885,7 +4260,7 @@ body.plan-open #todo-drawer {
   right: 0;
   width: 61.8%;
   height: 100%;
-  background: rgba(0, 0, 0, calc(0.35 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.35 * var(--shade-scale)));
   z-index: 19;
   pointer-events: none;
   opacity: 0;
@@ -4019,9 +4394,9 @@ body.plan-open #todo-drawer {
   cursor: pointer;
   transition: background 0.15s, transform 0.15s;
 }
-.chat-node-dot:hover { background: rgba(var(--accent-rgb), 0.75); transform: scale(1.5); }
+.chat-node-dot:hover { background: rgba(var(--other-overlay-rgb), 0.75); transform: scale(1.5); }
 /* 现在所在的那条：实心高亮 + 稍大，扫一眼就能定位（用户要求「否则就展示现在在哪个节点」）。 */
-.chat-node-dot.current { background: var(--accent); transform: scale(1.6); }
+.chat-node-dot.current { background: rgb(var(--other-overlay-rgb)); transform: scale(1.6); }
 #chat-node-list {
   flex: 1;
   overflow-y: auto;
@@ -4044,8 +4419,8 @@ body.plan-open #todo-drawer {
   text-align: left;
   cursor: pointer;
 }
-.chat-node-item:hover { background: rgba(var(--accent-rgb), 0.12); }
-.chat-node-item.active { background: rgba(var(--accent-rgb), 0.18); }
+.chat-node-item:hover { background: rgba(var(--other-overlay-rgb), 0.12); }
+.chat-node-item.active { background: rgba(var(--other-overlay-rgb), 0.18); }
 .chat-node-idx {
   flex: 0 0 auto;
   color: var(--text-dim);
@@ -4093,8 +4468,8 @@ body.plan-open #todo-drawer {
 /* 跳转落点闪一下（用 box-shadow 而不是背景 —— 助手气泡本来没有底色，
    改 background 会让「闪一下」把整块涂上色、看起来像被选中）。 */
 @keyframes chat-flash {
-  0%   { box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.45); }
-  100% { box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0); }
+  0%   { box-shadow: 0 0 0 3px rgba(var(--other-overlay-rgb), 0.45); }
+  100% { box-shadow: 0 0 0 3px rgba(var(--other-overlay-rgb), 0); }
 }
 .chat-msg-flash { animation: chat-flash 1.1s ease-out 1; }
 
@@ -4171,12 +4546,70 @@ body.plan-open #todo-drawer {
   background: var(--surface-glass);
   border: 1px solid var(--border-glass);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, calc(0.4 * var(--shade-scale)));
+  box-shadow: 0 8px 24px rgba(var(--shade-rgb), calc(0.4 * var(--shade-scale)));
   backdrop-filter: blur(16px);
   pointer-events: auto;
 }
 #chat-more-menu.hidden {
   display: none;
+}
+
+/* ── 斜杠命令候选菜单（2026-10-11）──────────────────────────────
+   形态复用「更多」菜单（#chat-more-menu：贴输入行上方、玻璃底 + 描边 + 圆角 + 阴影）
+   与 .custom-select 的选项（未选中 = text-dim 透明底；悬停 / 选中 = 按钮蒙版）。
+   颜色全走四类自定义变量；滚动条走 §界面 6 那条唯一全局规则（此处不另写）。
+   定位 absolute + bottom:100% ⇒ **贴底时自然向上弹**，不挡输入框、不改布局尺寸。 */
+#chat-slash-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 8px;
+  right: 8px;
+  z-index: 60;
+  max-height: 216px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(var(--shade-rgb), calc(0.4 * var(--shade-scale)));
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  pointer-events: auto;
+}
+#chat-slash-menu.hidden {
+  display: none;
+}
+.chat-slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 0.73rem;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.chat-slash-item:hover,
+.chat-slash-item.active {
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha));
+}
+.chat-slash-name {
+  flex-shrink: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+.chat-slash-desc {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+  opacity: 0.8;
 }
 
 .chat-more-row {
@@ -4272,7 +4705,7 @@ body.plan-open #todo-drawer {
 }
 .chat-more-seg button.active {
   color: var(--text);
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
 }
 
 /* 运行方式：图标 + 三格档位点阵（不写文字，语义走 title / aria-label） */
@@ -4466,13 +4899,13 @@ body.plan-open #todo-drawer {
   font-size: 0.7rem;
   border-radius: 6px;
   border: 1px solid var(--border-glass);
-  background: rgba(var(--accent-rgb), 0.15);
+  background: rgba(var(--other-overlay-rgb), 0.15);
   color: var(--text);
   cursor: pointer;
   transition: background 0.1s, color 0.1s;
 }
 #chat-tools-save:hover {
-  background: rgba(var(--accent-rgb), 0.28);
+  background: rgba(var(--other-overlay-rgb), 0.28);
 }
 #chat-tools-save:disabled {
   opacity: 0.6;
@@ -4509,9 +4942,9 @@ body.plan-open #todo-drawer {
   border-radius: 6px;
   color: var(--text);
   outline: none;
-  caret-color: var(--accent);
+  caret-color: rgb(var(--other-overlay-rgb));
 }
-.chat-persona-text:focus { border-color: var(--accent-border); }
+.chat-persona-text:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .chat-persona-text::placeholder { color: var(--text-dim); opacity: 0.6; }
 .chat-persona-foot {
   display: flex;
@@ -4577,7 +5010,7 @@ body.plan-open #todo-drawer {
 }
 .memo-history-btn:hover,
 .memo-back-btn:hover {
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
 }
 .memo-back-btn { margin-left: 0; }
@@ -4630,8 +5063,8 @@ body.plan-open #todo-drawer {
   gap: 3px;
   font-size: 0.68rem;
   color: var(--text);
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 10px;
   padding: 1px 8px;
   max-width: 180px;
@@ -4642,9 +5075,9 @@ body.plan-open #todo-drawer {
 /* 标识编辑对话框 */
 .memo-tag-dialog {
   margin-top: 4px;
-  border: 1px solid var(--accent-border);
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 8px;
-  background: rgba(0, 0, 0, calc(0.28 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.28 * var(--shade-scale)));
   padding: 10px;
 }
 .memo-tag-dialog-title {
@@ -4661,13 +5094,13 @@ body.plan-open #todo-drawer {
   padding: 6px 10px;
   font-size: 0.76rem;
   color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
   outline: none;
-  caret-color: var(--accent);
+  caret-color: rgb(var(--other-overlay-rgb));
 }
-.memo-tag-input:focus { border-color: var(--accent-border); }
+.memo-tag-input:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .memo-tag-actions {
   display: flex;
   gap: 6px;
@@ -4681,8 +5114,8 @@ body.plan-open #todo-drawer {
   padding: 4px 12px;
   font-size: 0.72rem;
   border-radius: 5px;
-  border: 1px solid var(--accent-border);
-  background: var(--accent-bg);
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
   cursor: pointer;
 }
@@ -4723,7 +5156,7 @@ body.plan-open #todo-drawer {
   justify-content: center;
   border-radius: 50%;
   border: 1px solid var(--border-glass);
-  background: rgba(0, 0, 0, calc(0.65 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.65 * var(--shade-scale)));
   color: var(--red);
   cursor: pointer;
   padding: 0;
@@ -4759,7 +5192,7 @@ body.plan-open #todo-drawer {
   outline: none;
 }
 .memo-textarea:focus {
-  border-color: rgba(var(--accent-rgb), 0.5);
+  border-color: rgba(var(--other-overlay-rgb), 0.5);
 }
 
 .memo-actions {
@@ -4769,8 +5202,8 @@ body.plan-open #todo-drawer {
 }
 
 .memo-save-btn {
-  background: rgba(var(--accent-rgb), 0.14);
-  border: 1px solid rgba(var(--accent-rgb), 0.25);
+  background: rgba(var(--other-overlay-rgb), 0.14);
+  border: 1px solid rgba(var(--other-overlay-rgb), 0.25);
   color: var(--text);
   border-radius: 6px;
   padding: 5px 12px;
@@ -4779,7 +5212,7 @@ body.plan-open #todo-drawer {
   transition: background 0.1s;
 }
 .memo-save-btn:hover {
-  background: rgba(var(--accent-rgb), 0.24);
+  background: rgba(var(--other-overlay-rgb), 0.24);
 }
 
 .memo-autosave-hint {
@@ -4876,7 +5309,7 @@ body.plan-open #todo-drawer {
 }
 .memo-item-actions .memo-edit:hover {
   color: var(--text);
-  border-color: var(--accent-border);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 .memo-item-actions .memo-del:hover {
   color: var(--red);
@@ -4901,7 +5334,7 @@ body.plan-open #todo-drawer {
   min-height: 60px;
   resize: vertical;
   background: rgba(var(--ink-rgb), 0.04);
-  border: 1px solid var(--accent-border);
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 6px;
   color: var(--text);
   font-size: 0.82rem;
@@ -4910,12 +5343,12 @@ body.plan-open #todo-drawer {
   outline: none;
 }
 .memo-item-edit:focus {
-  border-color: rgba(var(--accent-rgb), 0.6);
+  border-color: rgba(var(--other-overlay-rgb), 0.6);
 }
 
 .memo-item.editing {
-  border-color: rgba(var(--accent-rgb), 0.4);
-  background: rgba(var(--accent-rgb), 0.06);
+  border-color: rgba(var(--other-overlay-rgb), 0.4);
+  background: rgba(var(--other-overlay-rgb), 0.06);
 }
 
 .memo-empty {
@@ -4964,6 +5397,11 @@ body.plan-open #todo-drawer {
 #plugin-pin,
 #plugin-min,
 #plugin-close {
+  /* 默认态**透明**（与上面这组的口径「默认/hover 均透明」一致）：顶栏这几个纯图标按钮
+     常驻不该有底色 —— 底色只在 hover 时由「按钮蒙版」`--other-overlay-*` 给。
+     ⚠️ 必须同时让文件末尾那条「按钮底色全覆盖」`#app button:where(...)` 常驻规则**放过**它们
+     （它特异性 (1,0,1) 会压过这里的 id 规则 (1,0,0)；见那里的放行名单），否则本条无效。 */
+  background: none;
   background-image: none;
   box-shadow: none;
 }
@@ -5060,7 +5498,7 @@ body.plan-open #todo-drawer {
    会被下面那条 hover 规则统一成同一套主题底色 —— 各按钮 hover 时**颜色 /
    边框**的变化照旧保留，只有底色被统一。 */
 #app button:where(
-  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"])
+  :not(.tool-refusal-btn):not(.approval-btn):not(.memo-save-btn):not(.file-chip-more-clear):not(.file-chip-remove):not(.result-item-remove):not(.run-mode-confirm-ok):not(.ocr-copy-btn):not(.settings-save-btn):not(.active):not([data-armed="1"]):not(#settings-btn):not(#plugin-bar-exit):not(#plugin-bar-float):not(#detached-back-btn):not(#detached-vscode-btn):not(#detached-pin-btn):not(#detached-min-btn):not(#detached-close-btn):not(#plugin-pin):not(#plugin-min):not(#plugin-close)
 ) {
   background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
 }
@@ -5100,7 +5538,7 @@ body.plan-open #todo-drawer {
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid var(--border-glass);
   border-radius: var(--radius);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, calc(0.45 * var(--shade-scale)));
+  box-shadow: 0 8px 32px rgba(var(--shade-rgb), calc(0.45 * var(--shade-scale)));
   overflow: hidden;
 }
 
@@ -5148,7 +5586,7 @@ body.plan-open #todo-drawer {
   font-family: inherit;
   font-size: 1.15rem;
   line-height: 1.3;
-  caret-color: var(--accent);
+  caret-color: rgb(var(--other-overlay-rgb));
 }
 
 #detail-input::placeholder {
@@ -5196,8 +5634,8 @@ body.plan-open #todo-drawer {
 }
 
 .detail-chip.active {
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   color: var(--text);
 }
 
@@ -5305,15 +5743,15 @@ body.plan-open #todo-drawer {
   padding: 5px 8px;
   font-size: 0.72rem;
   border-radius: 6px;
-  border: 1px solid var(--accent-border);
-  background: var(--accent-bg);
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
   color: var(--text);
   cursor: pointer;
   transition: background 0.12s;
 }
 
 .detail-preview-actions button:hover {
-  background: rgba(var(--accent-rgb), 0.25);
+  background: rgba(var(--other-overlay-rgb), 0.25);
 }
 
 .detail-preview-empty {
@@ -5350,7 +5788,7 @@ body.plan-open #todo-drawer {
   width: 14px;
   height: 14px;
   border: 2px solid var(--border-glass);
-  border-top-color: var(--accent);
+  border-top-color: rgb(var(--other-overlay-rgb));
   border-radius: 50%;
   animation: lunac-spin 0.75s linear infinite;
 }
@@ -5393,7 +5831,7 @@ body.plan-open #todo-drawer {
      做成局部 token 而不是直接改全局 `--border-glass`：那个变量全应用几十处
      都在用，为音乐插件调淡会连带改掉别处的框线；也**不能三处各写一遍字面值**
      —— 那样迟早只剩两处跟着改。 */
-  --music-panel-line: rgba(232, 216, 202, 0.055);
+  --music-panel-line: rgba(var(--btn-line-rgb), 0.055);
 }
 
 /* ── 顶部工具条（默认态）：头像 + 账号名 + 搜索框 + 两个按钮 ──────
@@ -5422,8 +5860,8 @@ body.plan-open #todo-drawer {
   background: rgba(var(--ink-rgb), 0.08);
   cursor: pointer;
 }
-.music-avatar:hover { border-color: var(--accent-border); }
-.music-avatar:focus-visible { outline: 1px solid var(--accent-border); outline-offset: 1px; }
+.music-avatar:hover { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+.music-avatar:focus-visible { outline: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha)); outline-offset: 1px; }
 .music-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .music-acc {
   flex: 0 1 auto;
@@ -5453,7 +5891,7 @@ body.plan-open #todo-drawer {
   appearance: none;
 }
 .music-search::placeholder { color: var(--text-muted); }
-.music-search:focus { border-color: var(--accent-border); }
+.music-search:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 
 /* 搜索框的**定位壳**（2026-09-28）。两件事：
    ① 让下拉预览能挂成「输入框正下方」的绝对定位层 —— 直接挂工具条上会与输入框错位；
@@ -5490,7 +5928,7 @@ body.plan-open #todo-drawer {
   color: var(--text-dim);
   cursor: pointer;
 }
-.music-ghost-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-ghost-btn:hover { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-icon-btn { padding: 4px 5px; }
 
 /* 两态容器：都留在 DOM 里，靠 .hidden 切 —— 这样窗口高度才量得准（display:none 不参与布局） */
@@ -5552,13 +5990,13 @@ body.plan-open #todo-drawer {
   padding: 5px 9px;
   font-size: 0.74rem;
   color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
   outline: none;
   caret-color: var(--accent);
 }
-.music-field input[type="text"]:focus { border-color: var(--accent-border); }
+.music-field input[type="text"]:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-field-port input[type="text"] { width: 96px; }
 /* 串流质量：三档互斥按钮。**不能用原生 `<select>`** —— WebView2 透明窗口里它不渲染
    弹出层（code-rules §5.2）。选中态走 `aria-pressed` + 主题色变量，不新增 accent 例外。 */
@@ -5575,11 +6013,11 @@ body.plan-open #todo-drawer {
   border-radius: 5px;
   cursor: pointer;
 }
-.music-seg-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-seg-btn:hover { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-seg-btn[aria-pressed="true"] {
   color: var(--text);
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 
 /* 通道槽（P5-2，2026-10-03）：一排「全局 + 每条声道」的按钮。8 声道时有 9 个 ⇒ 必须允许
@@ -5604,11 +6042,11 @@ body.plan-open #todo-drawer {
   border-radius: 5px;
   cursor: pointer;
 }
-.music-preset-item:hover { color: var(--text); border-color: var(--accent-border); }
+.music-preset-item:hover { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-preset-item[aria-pressed="true"] {
   color: var(--text);
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 
 /* 我的预设（P5-1，2026-10-03）：一行 = 用它 + 重命名 + 删除。 */
@@ -5643,8 +6081,8 @@ body.plan-open #todo-drawer {
 }
 .music-preset-icon:hover {
   color: var(--text);
-  border-color: var(--accent-border);
-  background: var(--accent-bg);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
 }
 /* 命名行（保存 / 重命名 / 删除确认三态共用）。WebView2 **没有 `window.prompt`**，
    所以名字只能在这一行里输（见 music.ts 的 `TunePresetEdit`）。 */
@@ -5655,7 +6093,7 @@ body.plan-open #todo-drawer {
   padding: 5px 8px;
   font-size: 0.72rem;
   color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
 }
@@ -5684,14 +6122,14 @@ body.plan-open #todo-drawer {
   border-radius: 5px;
   cursor: pointer;
 }
-.music-tune-zoom:hover { color: var(--text); border-color: var(--accent-border); }
+.music-tune-zoom:hover { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-tune-zoom-label { min-width: 40px; text-align: center; font-size: 0.7rem; color: var(--text-dim); }
 .music-tune-plot canvas {
   display: block;
   width: 100%;
   height: 170px;
   box-sizing: border-box;
-  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.22 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 8px;
 }
@@ -5702,7 +6140,7 @@ body.plan-open #todo-drawer {
   flex-direction: column;
   gap: 4px;
   padding: 5px 7px;
-  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 7px;
 }
@@ -5745,7 +6183,9 @@ body.plan-open #todo-drawer {
   direction: rtl;
   width: 20px;
   height: var(--tf-slider-h, 120px);
-  accent-color: var(--accent);
+  /* 拉条的圆形按钮（滑块）= **按钮线条**（风格 · 按钮自定义）：原生 range 由 accent-color 上色，
+     默认 rgb(var(--btn-line-rgb)) == rgb(var(--accent-rgb)) == 改造前的 var(--accent)，逐像素不变。 */
+  accent-color: rgb(var(--btn-line-rgb));
 }
 /* 该类型没有增益（一阶高通 / 低通）：占位保持整排高度一致 —— 不给拉条，也就无从改增益。 */
 .music-tune-vslider-na { width: 20px; height: var(--tf-slider-h, 120px); border: 1px dashed var(--border-glass); border-radius: 4px; }
@@ -5836,7 +6276,7 @@ body.plan-open #todo-drawer {
 /* ── 全局效果器（P5-4，2026-10-03）：延迟 / 声道复制 / 卷积 ───────────────
    延迟 = 数字框 + **横向**拉条（现成的 `.music-tune-vslider` 是立起来的，用不上）；
    声道复制 = 一行「源 → 目标 + 删除」，两侧按钮复用 `.music-tune-kind` 那一族。 */
-.music-tune-hslider { flex: 1 1 auto; min-width: 120px; accent-color: var(--accent); }
+.music-tune-hslider { flex: 1 1 auto; min-width: 120px; accent-color: rgb(var(--btn-line-rgb)); }
 .music-copy-list { display: flex; flex-direction: column; gap: 4px; }
 .music-copy-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 /* 箭头只是分隔符，别让它抢走点击面积（行内的控件都是按钮，这一格不是）。 */
@@ -5854,7 +6294,7 @@ body.plan-open #todo-drawer {
   border-radius: 5px;
   cursor: pointer;
 }
-.music-tune-sw[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-border); }
+.music-tune-sw[aria-pressed="true"] { color: rgb(var(--other-overlay-rgb)); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-tune-kind {
   flex: 0 0 auto;
   display: inline-flex;
@@ -5870,8 +6310,8 @@ body.plan-open #todo-drawer {
   border-radius: 5px;
   cursor: pointer;
 }
-.music-tune-kind:hover { border-color: var(--accent-border); }
-.music-tune-kind[aria-expanded="true"] { border-color: var(--accent-border); color: var(--text); }
+.music-tune-kind:hover { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+.music-tune-kind[aria-expanded="true"] { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); color: var(--text); }
 .music-tune-num {
   flex: 0 0 auto;
   width: 60px;
@@ -5879,13 +6319,13 @@ body.plan-open #todo-drawer {
   padding: 4px 7px;
   font-size: 0.7rem;
   color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 5px;
   outline: none;
   caret-color: var(--accent);
 }
-.music-tune-num:focus { border-color: var(--accent-border); }
+.music-tune-num:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-tune-del {
   flex: 0 0 auto;
   margin-left: auto;
@@ -5918,13 +6358,13 @@ body.plan-open #todo-drawer {
   padding: 0;
   /* 关 = 明显暗色（2026-10-03 用户报「开/关状态分别不明显」）：轨道近全黑、
      边框压到极低、滑块也是灰的 —— 与「开」形成一眼可辨的明暗差。 */
-  background: rgba(0, 0, 0, calc(0.62 * var(--shade-scale)));
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--shade-rgb), calc(0.62 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
   border-radius: 10px;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
 }
-.music-switch:hover { border-color: var(--accent-border); }
+.music-switch:hover { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-switch[aria-checked="true"] {
   /* 开 = 明显亮色：整条轨道铺满 accent（不只是半透明的 accent-bg），并带一点辉光。 */
   background: var(--accent);
@@ -5938,12 +6378,12 @@ body.plan-open #todo-drawer {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.32);
+  background: rgba(var(--ink-rgb), 0.32);
   transition: transform 0.15s, background 0.15s;
 }
 .music-switch[aria-checked="true"] .music-switch-knob {
   transform: translateX(18px);
-  background: #fff;
+  background: rgb(var(--ink-rgb));
 }
 
 /* 「测量」那一块（按钮 + 一行结果摘要）。按钮置灰表示正在跑 ——
@@ -5973,7 +6413,7 @@ body.plan-open #todo-drawer {
   padding: 5px 9px;
   font-size: 0.7rem;
   color: var(--text-dim);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
   user-select: all;
@@ -5991,7 +6431,7 @@ body.plan-open #todo-drawer {
   cursor: pointer;
 }
 .music-btn:hover { color: var(--text); }
-.music-btn.music-primary { border-color: var(--accent-border); color: var(--text); }
+.music-btn.music-primary { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); color: var(--text); }
 /* A-B 盲测（2026-10-06）：两个快照槽 + 随机映射 + 揭晓。
    `active` 同时用在「当前正放的那个槽」与「盲测开关」上。 */
 .music-tune-ab {
@@ -6005,39 +6445,80 @@ body.plan-open #todo-drawer {
 .music-tune-ab .music-btn.active {
   border-color: var(--accent);
   color: var(--accent);
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
 }
 .music-tune-ab .music-btn:disabled { opacity: 0.45; cursor: default; }
-.music-msg {
-  min-height: 0.9rem;
-  font-size: 0.66rem;
-  color: var(--text-dim);
-  opacity: 0.85;
-}
-/* 播放态：提示行**不占布局**（浮在长条底部）—— 用户要求播放态窗口严格 130 高。
-   它只在出错时出现 8 秒（music.ts 的 `MSG_TTL_MS`），压住控制条一会儿可以接受；
-   `pointer-events: none` 保证它不挡住底下的按钮。
+/* 一次性提示行（加载中 / 错误 / 限流…）。**不再占布局高度**：绝对定位浮在底部
+   控制栏那条进度线附近（2026-10-09 用户口径：底部那块「警告/状态」区占了一大片
+   空白 ⇒ 改成不占位 + 移到进度条位置 + 只显示约 5 秒，定时器在 music.ts 的 setMsg）。
    ⚠️ **没字时不许着色**（2026-09-28 用户报的「播放态底下有个透明黑色蒙版」就是它）：
-   背景色挂在元素上，而元素自带 `min-height` + `padding` ⇒ 即使一个字都没有，
-   那条 `rgba(0,0,0,.62)` 也照样铺在控制条底部（`sweepMsg` 清空的是文本，不是元素）。
-   `:empty` 匹配「连文本节点都没有」的状态 —— 清空走的是 `textContent = ""`，正好命中。 */
-.music-root.music-player-on .music-msg {
+   背景色挂在元素上、元素自带 padding ⇒ 即使一个字都没有，那条 rgba(0,0,0,.62)
+   也照样铺出来。`:empty` 匹配「连文本节点都没有」的状态 —— 清空走 textContent = ""，
+   正好命中。
+   几何：底部控制栏高 54、进度盒 top:-8 高 18 ⇒ 进度线下沿约在根盒底往上 44px；
+   气泡底端落在 40px 处，向上展开，**压在进度条附近**而不是页面底部单占一行。 */
+.music-msg {
   position: absolute;
   left: 8px;
   right: 8px;
-  bottom: 2px;
+  bottom: 40px;
   margin: 0;
   padding: 2px 8px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, calc(0.62 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.62 * var(--shade-scale)));
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  opacity: 0.85;
   text-align: center;
+  /* 浮层不吃指针：底下的进度条照样能点、能拖。 */
   pointer-events: none;
 }
-.music-root.music-player-on .music-msg:empty {
+.music-msg:empty {
   background: none;
   padding: 0;
-  min-height: 0;
 }
+/* 播放态（长条 550×130）：提示浮在底部控制条下沿那一点 —— 同一条「不占布局」纪律。 */
+.music-root.music-player-on .music-msg { bottom: 2px; }
+
+/* ── 歌曲行的右键上下文菜单（2026-10-11 用户第 4 条）──────────────────
+   单例节点 `#music-ctx`，在鼠标位置弹出（`position: absolute`，定位基准 = 相对定位的 `.music-root`，
+   与桌宠窗那枚 pet-menu 同一条做法；坐标由 JS 按 root 矩形换算）。视觉**逐条对齐 pet-menu**
+   （玻璃底 + 同一套描边 / 圆角 / 模糊 / 阴影 + 同样的项样式），不另造第二套观感。 */
+.music-ctx {
+  position: absolute;
+  display: none;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 8px 24px rgba(var(--shade-rgb), 0.28);
+  z-index: 40;
+  /* **必须显式 `auto`**（与 `#token-usage-panel` / `#context-menu` 同一条教训，见 ㉜）：
+     `#app` 是 `pointer-events: none`（透明窗空白处要放行给桌面），而 `pointer-events`
+     是可继承属性 —— 菜单节点漏写就会跟着变成 `none`：画得出来、鼠标却整个穿过去（点不动项）。 */
+  pointer-events: auto;
+}
+.music-ctx.open { display: flex; }
+.music-ctx-item {
+  appearance: none;
+  background: none;
+  border: 0;
+  text-align: left;
+  font: inherit;
+  font-size: 0.72rem;
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.music-ctx-item:hover { background: var(--border-glass); }
+/* 危险操作（从队列中移除）：hover 染成警示红（与 `#music-local-del:hover` 同色）。 */
+.music-ctx-item.danger:hover { color: var(--red); }
 
 /* ── 小节标题（歌单列 / 播放列表共用）── */
 .music-sec-head {
@@ -6117,7 +6598,7 @@ body.plan-open #todo-drawer {
 /* Spotify 那种行 hover：一层很淡的底，不换色相 */
 .music-pl:hover { background: rgba(var(--ink-rgb), 0.05); }
 /* 正在播的就是这个歌单 / 专辑 / 歌手：**只提亮名字**（不再画强调色边） */
-.music-pl.playing .music-pl-name { color: var(--accent); }
+.music-pl.playing .music-pl-name { color: rgb(var(--other-overlay-rgb)); }
 /* 主区正在看的那一项（选中态）。与 `.playing` 是两件事：选中 ≠ 在播。
    底色刻意压得比 hover 还淡 —— 它只是「主区现在是谁」的标记，不是一块卡片。 */
 .music-pl.on { background: rgba(var(--ink-rgb), 0.06); }
@@ -6131,7 +6612,7 @@ body.plan-open #todo-drawer {
   background: rgba(var(--accent-rgb), 0.14);
   box-shadow: inset 2px 0 0 0 var(--accent);
 }
-.music-pl.sel .music-pl-name { color: var(--accent); }
+.music-pl.sel .music-pl-name { color: rgb(var(--other-overlay-rgb)); }
 /* 收藏夹读取失败（多半是缺 `user-library-read`）：原因已经在副标题那行写着，
    这里把副标题染成警示色即可 —— 整行加红框比一行小字更像「这个面板坏了」。 */
 .music-pl.err .music-pl-sub { color: var(--red); opacity: 1; }
@@ -6145,6 +6626,11 @@ body.plan-open #todo-drawer {
   text-align: left;
   color: var(--text-dim);
   cursor: pointer;
+  /* 去掉 `<button>` 的 **UA 默认外框**（2026-10-11 用户第 A 条：**两个页面左栏的歌单行**
+     —— 在线页歌单 / 本地页目录 / 本地页「自定义队列」—— 都不要「外围那条线」）。
+     这一行本身是 `<div class="music-pl">`（无边框），用户看到的线来自其内这个 `<button>`
+     的浏览器默认边框；清零它即等于把整行的外框拿掉（内边距 / 悬停底色一律不动）。 */
+  border: none;
 }
 .music-pl-btn:hover { color: var(--text); }
 .music-pl-cover {
@@ -6207,9 +6693,25 @@ body.plan-open #todo-drawer {
   font-size: 0.72rem;
   color: var(--text-dim);
   cursor: pointer;
+  /* 去掉 `<button>` 的 **UA 默认外框**（2026-10-11 用户第 A 条：这一行不要「外围那条线」）。
+     本类此前**没有自己的 border** —— 用户看到的那圈细线就是浏览器给 `<button>` 的默认边框；
+     显式写 `border: none` 才能把它清掉（内边距 / 悬停底色等既有观感一律不动）。 */
+  border: none;
 }
 .music-tr:hover { color: var(--text); background: rgba(var(--ink-rgb), 0.05); }
-.music-tr.playing { color: var(--accent); }
+.music-tr.playing { color: rgb(var(--other-overlay-rgb)); }
+/* 在线曲目行被「选中」（2026-10-11 用户第 5 条：单击 = 选中）。
+   **2026-10-11 第三轮收编**：选中框属「选中态」⇒ 整圈色框改走**按钮蒙版**
+   （`rgb(var(--other-overlay-rgb))`），淡填充同步改走蒙版低 α。此前是 `--yellow`
+   四边 2px 框（用 `inset` 的 box-shadow 而非 `border`：后者会把内容整体推 2px、
+   单击选中时行内会跳一下，与 `.music-pl.sel` 的取舍同源）。
+   **与「正在播放」的可区分性**：`playing` 用**文字强调**（`rgb(var(--other-overlay-rgb))`
+   衬在歌名上），选中用**2px 外框**；两者同色相但**形态不同**（文字 vs 外框），可同时存在
+   且一眼可分（选中这里**不写 `color`**，在放那首的文字强调照样透出来）。 */
+.music-tr.sel {
+  background: rgba(var(--other-overlay-rgb), 0.14);
+  box-shadow: inset 0 0 0 2px rgb(var(--other-overlay-rgb));
+}
 .music-tr-i {
   flex: 0 0 auto;
   width: 16px;
@@ -6316,15 +6818,19 @@ body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
   height: 2px;
   margin-top: -1px;
   border-radius: 2px;
-  background: rgba(var(--ink-rgb), 0.14);
+  /* 轨道**归「底色」派生**的中性黑（与本地播放条 `.music-progress` 同源）：
+     2026-10-11 收编 —— 此前是 `rgba(var(--ink-rgb), 0.14)`（中性叠加基色），
+     现与 `.music-progress` 轨道、`.music-vol` 轨道统一走底色暗变体。 */
+  background: rgba(var(--shade-rgb), calc(0.14 * var(--shade-scale)));
   transition: top 0.12s ease, height 0.12s ease, margin-top 0.12s ease, border-radius 0.12s ease;
 }
-/* 拖动中：轨道与填充一起铺满命中区。它们本来就是「能点的那块」，
-   平时只画中间 2px 只是不想让一条细线看起来那么粗。 */
+/* 拖动中：轨道与填充一起**加粗到命中区的一半**（2026-10-09 用户口径：
+   拖动态那条「展示条」的高度缩到现在的一半 —— 命中区仍是 18px，只是画出来的
+   条矮了一半并居中）。它们本来就是「能点的那块」，平时只画中间 2px。 */
 .music-bp.music-dragging::before {
-  top: 0;
-  height: 100%;
-  margin-top: 0;
+  top: 50%;
+  height: 9px;
+  margin-top: -4.5px;
   border-radius: 9px;
 }
 .music-bp-fill {
@@ -6335,14 +6841,16 @@ body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
   margin-top: -1px;
   width: var(--seek-pct);
   border-radius: 2px;
-  background: var(--accent);
+  /* 填充**归「按钮线条」**（2026-10-11 收编）：与滚动条 / 音量条 / range 滑块同一族。
+     此前是 `var(--accent)`（白名单之外但用了主题色字面）。 */
+  background: rgb(var(--btn-line-rgb));
   transition: width 0.3s linear, top 0.12s ease, height 0.12s ease, margin-top 0.12s ease,
     border-radius 0.12s ease;
 }
 .music-bp.music-dragging .music-bp-fill {
-  top: 0;
-  height: 100%;
-  margin-top: 0;
+  top: 50%;
+  height: 9px;
+  margin-top: -4.5px;
   border-radius: 9px;
   transition: none;
 }
@@ -6531,7 +7039,7 @@ body:has(.music-root):not(:has(.music-player-on)) #music-v-default {
   transition: background 0.12s ease, width 0.12s ease;
 }
 .music-split:hover::before,
-body.music-resizing .music-split::before { width: 2px; background: var(--accent-border); }
+body.music-resizing .music-split::before { width: 2px; background: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 /* 拖动期间：光标锁成 col-resize、禁止选中。**用后代通配**——
    指针离开那 6px 之后底下的元素各有各的 cursor，不锁就会看到光标一路闪回箭头。 */
 body.music-resizing { cursor: col-resize; user-select: none; }
@@ -6636,12 +7144,12 @@ body.music-resizing * { cursor: col-resize !important; }
    `.music-tr` / `SideKind` 那套里（那是两套数据被缝在一起的样子）。 */
 
 /* 工具条上那枚入口按钮的按下态（进本地页时亮着，好知道自己在哪一页） */
-#music-local-btn.on { color: var(--accent); border-color: var(--accent-border); }
+#music-local-btn.on { color: rgb(var(--other-overlay-rgb)); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 
 /* 「本地与 Spotify 同时出声」那把开关（2026-10-01）。
    **两枚按钮共用这一个类**（Spotify 底部栏 + 本地播放条），所以状态色写在这里一处
    —— 它们是同一个状态的两个视图，颜色不许分叉。 */
-.music-dual-btn.on { color: var(--accent); border-color: var(--accent-border); }
+.music-dual-btn.on { color: rgb(var(--other-overlay-rgb)); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 
 /* 左栏头：与那排 Spotify 页签**互斥显示**（一个标题 + 添加 / 扫描两枚按钮） */
 .music-local-head {
@@ -6661,6 +7169,10 @@ body.music-resizing * { cursor: col-resize !important; }
   white-space: nowrap;
 }
 .music-local-head-btns { display: flex; gap: 4px; flex: 0 0 auto; position: relative; }
+/* 注：那头排正常态只剩两枚（＋ / ✎）——「⟳ 重扫」2026-10-10 已删（用户口径：扫描只留一枚，
+   保留主区筛选行那枚），它的图标本来就是 12px（见 music.ts 的 SVG.plus/edit）。
+   「自定义队列」那枚状态按钮已挪进**主区筛选行 `.music-local-head-row` 的最右侧**（2026-10-10），
+   与本排无关，所以这里没有为它归一尺寸的规则（开启态的高亮见 `.music-local-qmode.on`）。 */
 
 /* `＋` 的二选一浮层（目录 / 播放列表文件，2026-10-01）。定位参照是上面那排按钮：
    `.music-dd` 默认 `top: calc(100% + 6px)`，这里只需把它钉在右缘、给个宽度。
@@ -6671,7 +7183,26 @@ body.music-resizing * { cursor: col-resize !important; }
 /* 编辑态里那枚垃圾桶是**危险操作**：hover 染成警示红（与 `.music-pl-x:hover` 同色）。
    退出并保存那枚则是「完成」的动作，用主题强调色，与那两枚灰按钮拉开。 */
 #music-local-del:hover { color: var(--red); }
-#music-local-editdone:hover { color: var(--accent); }
+#music-local-editdone:hover { color: rgb(var(--other-overlay-rgb)); }
+
+/* 「自定义队列」那枚**状态按钮**（2026-10-09 用户口径）：开启时高亮 —— 与
+   `.music-dual-btn.on` / `#music-local-btn.on` 同一套语言（同上一个状态色只写一处）。 */
+.music-local-qmode.on { color: rgb(var(--other-overlay-rgb)); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+
+/* 左栏「自定义队列」那一段（2026-10-11 用户口径）：接在目录列表之后，同一条左栏里的第二块。
+   行复用 `.music-pl`（名字 / 曲目数），这里只补一个小标题与空态提示。
+   **行内不放删除按钮**（2026-10-11 用户澄清）：队列的增删改与媒体库那套「修改列表」编辑态是同一套
+   （点进队列 → ✎ 修改列表 → 勾选 → 🗑 → × 保存），所以这里不再有 `.music-pl-x`。 */
+.music-lqs { display: flex; flex-direction: column; margin-top: 6px; }
+.music-lqs-head {
+  padding: 6px 8px 2px;
+  font-size: 0.62rem;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+/* `.music-lqs-empty`（空态提示行）**已删除**（2026-10-11 用户第 2 条：段下方那行提示去掉、
+   不留空占位）—— 空列表时那一段只有标题，不再画任何提示文案。 */
 
 /* 目录行左侧那块「封面」位（本地目录不是图片，画一个图标） */
 .music-pl-dir {
@@ -6702,7 +7233,23 @@ body.music-resizing * { cursor: col-resize !important; }
 
 /* 主区那一页：筛选框那一行 + 进度 + 曲目表 */
 .music-local-page { display: flex; flex-direction: column; gap: 8px; }
-.music-local-head-row { display: flex; align-items: center; gap: 6px; }
+/* 筛选标题行**常驻**（2026-10-11 用户口径）：本地曲目列表向下滚时它钉在滚动区顶部。
+   滚动容器是 `.music-main`（它自己 `overflow-y:auto`，见上面那条）—— sticky 相对它生效，
+   **不给面板再加第二层滚动容器**（本仓明令禁止嵌套双滚动条）。
+   背景用 `--surface-glass` 把底下滚上来的行盖住；`padding-bottom` + 负 `margin-bottom`
+   把 `.music-local-page` 的 8px 行间距也一起涂上，免得列表从那条缝里透出来。
+   `z-index` 让它压在行之上（行是普通流内 button，没有自己的层叠上下文）。 */
+.music-local-head-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--surface-glass);
+  padding-bottom: 8px;
+  margin-bottom: -8px;
+}
 .music-local-q {
   flex: 1 1 auto;
   /* 同 `.music-search`：`min-width: 0` 是必需的，否则输入框会被 placeholder
@@ -6730,7 +7277,7 @@ body.music-resizing * { cursor: col-resize !important; }
   height: 26px;
   padding: 0 4px 0 10px;
   border-radius: 13px;
-  border: 1px solid var(--accent-border);
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   background: rgba(var(--ink-rgb), 0.05);
   color: var(--text);
   font-size: 0.72rem;
@@ -6745,9 +7292,11 @@ body.music-resizing * { cursor: col-resize !important; }
   height: 4px;
   border-radius: 2px;
   overflow: hidden;
-  background: rgba(var(--ink-rgb), 0.1);
+  /* 轨道归「底色」派生的中性黑（2026-10-11 收编，与播放进度条轨道同源）。 */
+  background: rgba(var(--shade-rgb), calc(0.1 * var(--shade-scale)));
 }
-.music-scan-fill { display: block; height: 100%; background: var(--accent); transition: width 0.25s ease; }
+/* 扫描填充**归「按钮线条」**（2026-10-11 收编）：此前是 `rgb(var(--other-overlay-rgb))`。 */
+.music-scan-fill { display: block; height: 100%; background: rgb(var(--btn-line-rgb)); transition: width 0.25s ease; }
 .music-scan-txt { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .music-scan-done { color: var(--text-dim); }
 .music-scan-err { color: var(--red); white-space: normal; line-height: 1.5; }
@@ -6777,11 +7326,20 @@ body.music-resizing * { cursor: col-resize !important; }
   color: var(--text-dim);
   text-align: left;
   cursor: pointer;
+  /* 圆角对齐**在线歌单**的曲目行（2026-10-11 用户口径：「本地音乐里具体歌曲那行的圆角
+     与在线歌单具体歌曲行相同」）：`.music-tr` 是 `border-radius: 10px`，而本类此前
+     **没有自己的圆角声明**（= 0，所以看起来是方角）⇒ 这里补成同一个 10px。
+     **只补圆角这一条**：在线行左右各 4px 的 margin「缺口」+ `width: calc(100% - 8px)`
+     是另一件事（缺口 / 宽度），本轮不动。悬停 / 选中态本就不另写圆角 ⇒ 自动跟随这一条。 */
+  border-radius: 10px;
+  /* 去掉 `<button>` 的 **UA 默认外框**（2026-10-11 用户第 A 条：本地行不要「外围那条线」）。
+     同 `.music-tr` —— 此前没有自己的 border，那圈细线来自浏览器默认样式。 */
+  border: none;
 }
 .music-mt:hover { background: rgba(var(--ink-rgb), 0.05); }
 /* 「正在放的这一首」。与 `.music-tr.playing` 同一条视觉语言（同一个 `--accent`），
    好让两套列表在「哪一首在放」这件事上读起来是一回事。 */
-.music-mt.playing { color: var(--accent); }
+.music-mt.playing { color: rgb(var(--other-overlay-rgb)); }
 .music-mt-i { flex: 0 0 auto; width: 16px; text-align: right; font-size: 0.62rem; color: var(--text-muted); }
 .music-mt-cover {
   flex: 0 0 auto;
@@ -6803,6 +7361,34 @@ body.music-resizing * { cursor: col-resize !important; }
   white-space: nowrap;
 }
 .music-mt-d { flex: 0 0 auto; font-size: 0.62rem; color: var(--text-muted); }
+/* 「自定义队列」编辑态里被勾中的行（2026-10-11 用户口径）。
+   **2026-10-11 第三轮收编**：选中框属「选中态」⇒ 与在线 `.music-tr.sel` **同一套语言** ——
+   四边 2px 实线走**按钮蒙版**（`rgb(var(--other-overlay-rgb))`，`inset` 的 box-shadow，
+   不用 `border`，理由同上：避免内容被推 2px），淡填充同步走蒙版低 α。此前是 `--yellow`。
+   **与「正在播放」的可区分性**：`playing` 用**文字强调**（`rgb(var(--other-overlay-rgb))`），
+   选中用**2px 外框**；同色相但形态不同，可同时存在且可分（这里**不写 `color`**）。 */
+.music-mt.sel {
+  background: rgba(var(--other-overlay-rgb), 0.14);
+  box-shadow: inset 0 0 0 2px rgb(var(--other-overlay-rgb));
+}
+/* 编辑态下行首那枚勾选框（顶替序号那一位）。未勾 = 一个空心小方框的占位，勾中 = 强调色 + 勾。
+   总占位与 `.music-mt-i`（16px）对齐：14px 盒 + 2px 右距 ⇒ 进 / 出编辑态整列不跳。 */
+.music-mt-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-right: 2px;
+  border: 1px solid var(--border-glass);
+  border-radius: 3px;
+  color: transparent;
+}
+.music-mt-check.on {
+  color: var(--accent);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  background: rgba(var(--accent-rgb), 0.12);
+}
 
 /* ── 本地文件播放条（2026-10-01）────────────────────────────────────
    与上面那条 Spotify 控制栏（`.music-nowbar`）**同构但不同源**：这里是
@@ -6839,7 +7425,7 @@ body.music-resizing * { cursor: col-resize !important; }
   -webkit-backdrop-filter: blur(20px) saturate(160%);
   border: 1px solid var(--border-glass);
   border-radius: 10px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, calc(0.45 * var(--shade-scale)));
+  box-shadow: 0 10px 28px rgba(var(--shade-rgb), calc(0.45 * var(--shade-scale)));
 }
 #music-search-dd { left: 0; right: 0; }
 #music-dev-dd {
@@ -6851,6 +7437,15 @@ body.music-resizing * { cursor: col-resize !important; }
 /* 队列浮层：比设备弹层宽（要放「序号 + 歌名 + 歌手 + 时长」四列），
    底边与设备弹层对齐。里面的行就是 `renderQueue` 那套 `play-uri` 行。 */
 #music-q-dd {
+  top: auto;
+  bottom: calc(100% + 8px);
+  right: 0;
+  width: 360px;
+  max-height: 320px;
+}
+/* 本地队列浮层（2026-10-11 用户口径）：与上面 `#music-q-dd` **同一套定位**（同一条栏的同一位置、
+   向上弹、同样 360 宽），因为用户要的就是「与在线同形态同界面的下拉浮层」。 */
+#music-lq-dd {
   top: auto;
   bottom: calc(100% + 8px);
   right: 0;
@@ -6878,6 +7473,52 @@ body.music-resizing * { cursor: col-resize !important; }
 }
 .music-dd-all:hover { color: var(--text); }
 
+/* ── 「添加队列」的居中编辑小窗（2026-10-09 用户口径）─────────────────────
+   它是插件页面**正中的浮层**（不是下拉）：遮罩铺满 .music-root，卡片居中。
+   遮罩底色走主题变量（同 `.music-dd` 的玻璃层），别硬编码颜色。 */
+.music-dlg-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(var(--shade-rgb), calc(0.4 * var(--shade-scale)));
+}
+.music-dlg {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 360px;
+  max-width: 78%;
+  max-height: 82%;
+  padding: 14px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(var(--shade-rgb), calc(0.5 * var(--shade-scale)));
+}
+.music-dlg-title { font-size: 0.8rem; color: var(--text); }
+/* 「删除本地文件」二次确认卡里的说明文字（带上曲目名、写明不可恢复）。
+   复用 `.music-dlg` 那套卡；这里只给这段正文一个可读的正文样式。 */
+.music-del-text { font-size: 0.72rem; color: var(--text-dim); line-height: 1.6; word-break: break-word; }
+.music-queue-pickrow { display: flex; align-items: center; gap: 8px; }
+.music-queue-pickrow .music-hint { flex: 1 1 auto; min-width: 0; }
+/* 已选文件清单：只放文件名（完整路径在 title 上）、超出就滚。 */
+.music-queue-files {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 24px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+.music-queue-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .music-dev-row {
   display: flex;
   align-items: center;
@@ -6891,7 +7532,7 @@ body.music-resizing * { cursor: col-resize !important; }
 }
 .music-dev-row:hover { background: rgba(var(--ink-rgb), 0.05); color: var(--text); }
 /* 「正在用的那台」＝ Spotify 回的 active，或我们本机播放的 librespot 在跑 */
-.music-dev-row.on { color: var(--accent); }
+.music-dev-row.on { color: rgb(var(--other-overlay-rgb)); }
 .music-dev-row.disabled { opacity: 0.6; cursor: default; }
 .music-dev-ico { flex: 0 0 auto; display: inline-flex; color: inherit; }
 .music-dev-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
@@ -6934,7 +7575,7 @@ body.music-resizing * { cursor: col-resize !important; }
      内容盒（550→548），右侧列就被压成 448、连 `height: 130` 也会比内容盒高 2px 而溢出。
      inset 阴影不参与布局，长条的**内容盒**才正好是 550×130。 */
   box-shadow: inset 0 0 0 1px var(--music-panel-line);
-  background: rgba(0, 0, 0, calc(0.16 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.16 * var(--shade-scale)));
   overflow: hidden;
 }
 .music-pv-cover {
@@ -6945,7 +7586,7 @@ body.music-resizing * { cursor: col-resize !important; }
      `overflow: hidden` 裁成一个和大圆角对不上的弧，看着像封面缺了一角。 */
   border-radius: 6px;
   border: 1px solid var(--music-panel-line);
-  background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
   overflow: hidden;
 }
 .music-pv-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -7094,15 +7735,26 @@ body.music-resizing * { cursor: col-resize !important; }
   padding: 9px 0;
   box-sizing: content-box;
   border-radius: 2px;
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   background-clip: content-box;
   --seek-pct: 0%;
   cursor: pointer;
 }
-/* 拖动中：底色铺满整个命中区（与 `.music-bp` 同一条纪律 —— 用户要求
-   「调进度条时视觉拓宽至触发区域」）。平时只画中间那 3px，可拖的范围却有 21px。 */
+/* 拖动中：底色**加粗到命中区的一半**（与 `.music-bp` 同一条纪律 —— 用户要求
+   「调进度条时视觉拓宽至触发区域」；2026-10-09 又要求把拖动态那条「展示条」
+   的高度缩到现在的一半）。命中区仍是 21px（padding 一个数都不动），只是改用一层
+   定尺的背景图片把那条底色**居中画成 10.5px 高**。平时只画中间那 3px。 */
 .music-progress.music-dragging {
-  background: rgba(var(--ink-rgb), 0.14);
+  background-color: transparent;
+  /* 拖动态底色与静态轨道同源（底色派生的中性黑），2026-10-11 收编：
+     此前是 `rgba(var(--ink-rgb), 0.14)`，与静态轨道 `--shade-rgb` 不一致。 */
+  background-image: linear-gradient(
+    rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale))),
+    rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)))
+  );
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 100% 10.5px;
   background-clip: border-box;
   border-radius: 10px;
 }
@@ -7110,15 +7762,16 @@ body.music-resizing * { cursor: col-resize !important; }
   height: 3px;
   width: var(--seek-pct);
   border-radius: 2px;
-  background: var(--accent);
+  /* 填充归「按钮线条」（2026-10-11 收编）：此前是 `var(--accent)`。 */
+  background: rgb(var(--btn-line-rgb));
   transition: width 0.3s linear;
 }
 /* 拖动中：① 填充必须**逐帧跟手**（`.3s` 的补间会让它落后于指针）；
-   ② 连同底色一起**长到命中区的高度** —— 21px 是上面算出来的整盒高，
-   `margin-top: -9px` 把它从内容区顶格提到盒子最上沿。 */
+   ② 连同底色一起长到**命中区的一半**（2026-10-09 用户口径）—— 21px 是整盒高，
+   半高 10.5px 居中：内容区顶在 9px 处，故 `margin-top: -3.75px` 把它提到居中位。 */
 .music-progress.music-dragging .music-progress-fill {
-  height: 21px;
-  margin-top: -9px;
+  height: 10.5px;
+  margin-top: -3.75px;
   border-radius: 10px;
   transition: none;
 }
@@ -7133,7 +7786,9 @@ body.music-resizing * { cursor: col-resize !important; }
   height: 9px;
   margin: -3px 0 0 -4.5px;
   border-radius: 50%;
-  background: var(--accent);
+  /* 拉条圆形滑块归「按钮线条」（2026-10-11 收编，与 `.music-vol` 的拇指同族）：
+     此前是 `var(--accent)`。 */
+  background: rgb(var(--btn-line-rgb));
   border: 1px solid var(--border-glass);
   opacity: 0;
   transform: scale(0.6);
@@ -7151,8 +7806,8 @@ body.music-resizing * { cursor: col-resize !important; }
   transform: translate(-50%, -2px);
   padding: 1px 5px;
   border-radius: 5px;
-  border: 1px solid var(--accent-border);
-  background: var(--bg-panel, rgba(18, 18, 22, 0.94));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+  background: var(--bg-panel, rgba(var(--surface-rgb), 0.94));
   color: var(--text);
   font-size: 0.6rem;
   font-variant-numeric: tabular-nums;
@@ -7181,10 +7836,10 @@ body.music-resizing * { cursor: col-resize !important; }
      免得首帧先画成 0% 再跳一下。 */
   background: linear-gradient(
     to right,
-    var(--accent) 0,
-    var(--accent) var(--vol-pct, 0%),
-    rgba(0, 0, 0, calc(0.55 * var(--shade-scale))) var(--vol-pct, 0%),
-    rgba(0, 0, 0, calc(0.55 * var(--shade-scale))) 100%
+    rgb(var(--btn-line-rgb)) 0,
+    rgb(var(--btn-line-rgb)) var(--vol-pct, 0%),
+    rgba(var(--shade-rgb), calc(0.55 * var(--shade-scale))) var(--vol-pct, 0%),
+    rgba(var(--shade-rgb), calc(0.55 * var(--shade-scale))) 100%
   );
   border-radius: 2px;
   outline: none;
@@ -7196,7 +7851,7 @@ body.music-resizing * { cursor: col-resize !important; }
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: var(--accent);
+  background: rgb(var(--btn-line-rgb));
   border: none;
 }
 
@@ -7266,19 +7921,22 @@ body.music-resizing * { cursor: col-resize !important; }
   color: var(--text-dim);
   cursor: pointer;
 }
-.music-round-btn:hover { color: var(--text); border-color: var(--accent-border); }
+.music-round-btn:hover { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-play-btn { width: 30px; height: 30px; }
 .music-round-btn:disabled { opacity: 0.4; cursor: default; }
 /* 三态按钮：关 = 暗、随机 / 单曲循环 = 主题色；单曲循环多一个小「1」。
    本地那条栏上那枚（`#music-l-mode`）是**四态**（多一档 `repeat_all` 循环列表），
-   与这枚共用同一套类名和配色 —— 所以 `repeat_all` 要一起列进强调色分组。 */
-.music-mode-btn { position: relative; }
+   与这枚共用同一套类名和配色 —— 所以 `repeat_all` 要一起列进强调色分组。
+   **2026-10-11 收编**：线条（描边）归「按钮线条」（α 走统一 token `--btn-line-alpha`，
+   此前 off 态继承 `.music-round-btn` 的 `--border-glass` = α 0.10）；常驻底由全局
+   `#app button:where(...)` 给「按钮背景」；激活态（`data-mode` 非 off）强调色归「按钮蒙版」。 */
+.music-mode-btn { position: relative; border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .music-mode-btn[data-mode="off"] { opacity: 0.5; }
 .music-mode-btn[data-mode="shuffle"],
 .music-mode-btn[data-mode="repeat_all"],
 .music-mode-btn[data-mode="repeat_one"] {
-  color: var(--accent);
-  border-color: var(--accent-border);
+  color: rgb(var(--other-overlay-rgb));
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   opacity: 1;
 }
 .music-mode-btn[data-mode="repeat_one"]::after {
@@ -7293,7 +7951,10 @@ body.music-resizing * { cursor: col-resize !important; }
 /* 播放列表按钮的「按下」态。**选择器落在按钮上、不是 `.music-bar-end`** ——
    2026-09-27 起 `.music-bar-end` 变成了**容器**（里面还有音量条），
    而 `.on` 是 `syncPlayerBody()` 打在 `#music-queue-btn` 上的。 */
-#music-queue-btn.on { color: var(--accent); border-color: var(--accent-border); }
+#music-queue-btn.on { color: rgb(var(--other-overlay-rgb)); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+/* 本地队列两枚按钮的「按下」态（2026-10-11）：`renderLocalQueueDD` 会在浮层开着时给它们打
+   `.on`。与上面那枚同一条语言（同一个强调色只写一处）。 */
+#music-l-queue.on, #music-lp-queue.on { color: rgb(var(--other-overlay-rgb)); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 
 /* 插件悬浮窗里的音乐插件：**默认态的内容正好 1280 宽**（用户 2026-09-28 定的定尺）。
    外层能垫的只有这三处，全在这一条里收窄 —— 换掉任何一条都要回来改这里：
@@ -7338,7 +7999,7 @@ body.music-resizing * { cursor: col-resize !important; }
 }
 .convert-btn:hover { color: var(--text); }
 .convert-btn:disabled { opacity: 0.45; cursor: default; }
-.convert-btn.convert-primary { border-color: var(--accent-border); color: var(--text); }
+.convert-btn.convert-primary { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); color: var(--text); }
 
 .convert-source {
   font-size: 0.74rem;
@@ -7363,9 +8024,9 @@ body.music-resizing * { cursor: col-resize !important; }
 .convert-chip:hover { color: var(--text); }
 /* 选中态用语义色描边表达 —— 底色仍归全局规则管 */
 .convert-chip.active {
-  border-color: var(--accent-border);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   color: var(--text);
-  background: var(--accent-bg);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
 }
 
 .convert-actions { display: flex; align-items: center; gap: 8px; }
@@ -7376,13 +8037,13 @@ body.music-resizing * { cursor: col-resize !important; }
   flex: 1 1 auto;
   height: 4px;
   border-radius: 2px;
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   overflow: hidden;
 }
 .convert-progress-fill {
   height: 100%;
   width: 0;
-  background: var(--accent);
+  background: rgb(var(--other-overlay-rgb));
   transition: width 0.3s linear;
 }
 /* 时长未知（图片）时的**不确定态**：不编假百分比，改为来回扫的一条 */
@@ -7460,7 +8121,7 @@ body.music-resizing * { cursor: col-resize !important; }
 }
 .xl-input:focus {
   outline: none;
-  border-color: var(--accent-border);
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 .xl-row {
   display: flex;
@@ -7483,16 +8144,16 @@ body.music-resizing * { cursor: col-resize !important; }
 .xl-go {
   margin-left: auto;
   padding: 5px 14px;
-  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  border: 1px solid rgba(var(--other-overlay-rgb), 0.3);
   border-radius: 8px;
-  background: rgba(var(--accent-rgb), 0.12);
+  background: rgba(var(--other-overlay-rgb), 0.12);
   color: var(--text);
   font-size: 0.76rem;
   cursor: pointer;
   transition: background 0.12s;
 }
 .xl-go:hover {
-  background: rgba(var(--accent-rgb), 0.2);
+  background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06));
 }
 .xl-result {
   display: flex;
@@ -7595,7 +8256,7 @@ body.music-resizing * { cursor: col-resize !important; }
 }
 .dl-ring-fill {
   fill: none;
-  stroke: var(--accent);
+  stroke: rgb(var(--other-overlay-rgb));
   stroke-width: 3;
   stroke-linecap: round;
   /* pathLength="100" ⇒ dasharray 固定 100，dashoffset = 剩下的百分比 */
@@ -7664,8 +8325,8 @@ body.music-resizing * { cursor: col-resize !important; }
   border-radius: 6px;
   cursor: pointer;
 }
-.proxy-nav-btn:hover { color: var(--text); background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale))); }
-.proxy-nav-btn.on { color: var(--text); background: var(--accent-bg); }
+.proxy-nav-btn:hover { color: var(--text); background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale))); }
+.proxy-nav-btn.on { color: var(--text); background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha)); }
 .proxy-pages { flex: 1 1 auto; min-width: 0; }
 .proxy-page { display: none; flex-direction: column; gap: 8px; }
 .proxy-page.on { display: flex; }
@@ -7677,7 +8338,7 @@ body.music-resizing * { cursor: col-resize !important; }
   gap: 2px;
   align-self: flex-start;
   padding: 2px;
-  background: rgba(0, 0, 0, calc(0.22 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.22 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 7px;
 }
@@ -7692,7 +8353,7 @@ body.music-resizing * { cursor: col-resize !important; }
   cursor: pointer;
 }
 .proxy-seg-btn:hover:not(:disabled) { color: var(--text); }
-.proxy-seg-btn.on { color: var(--text); background: var(--accent-bg); }
+.proxy-seg-btn.on { color: var(--text); background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha)); }
 .proxy-seg-btn:disabled { opacity: 0.5; cursor: default; }
 .proxy-head { display: flex; flex-direction: column; gap: 3px; }
 .proxy-title { font-size: 0.86rem; color: var(--text); }
@@ -7707,11 +8368,11 @@ body.music-resizing * { cursor: col-resize !important; }
   align-items: center;
   gap: 8px;
   padding: 7px 10px;
-  background: rgba(0, 0, 0, calc(0.18 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.18 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 7px;
 }
-.proxy-row.on { border-color: var(--accent-border); background: var(--accent-bg); }
+.proxy-row.on { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha)); }
 .proxy-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .proxy-row-label {
   display: flex;
@@ -7736,8 +8397,8 @@ body.music-resizing * { cursor: col-resize !important; }
   padding: 1px 6px;
   font-size: 0.62rem;
   color: var(--text);
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
   border-radius: 4px;
 }
 .proxy-btn {
@@ -7750,9 +8411,9 @@ body.music-resizing * { cursor: col-resize !important; }
   border-radius: 5px;
   cursor: pointer;
 }
-.proxy-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent-border); }
+.proxy-btn:hover:not(:disabled) { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 .proxy-btn:disabled { opacity: 0.5; cursor: default; }
-.proxy-btn.primary { color: var(--text); border-color: var(--accent-border); }
+.proxy-btn.primary { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 /* 删除是危险操作：hover 走红系（同 `.tool-card.failed` 那一族的语义色） */
 .proxy-btn.danger:hover:not(:disabled) { color: var(--red); border-color: rgba(192, 138, 138, 0.4); }
 .proxy-empty { padding: 10px 2px; font-size: 0.72rem; color: var(--text-dim); }
@@ -7762,13 +8423,13 @@ body.music-resizing * { cursor: col-resize !important; }
   padding: 5px 9px;
   font-size: 0.72rem;
   color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
   outline: none;
-  caret-color: var(--accent);
+  caret-color: rgb(var(--other-overlay-rgb));
 }
-.proxy-form input[type="text"]:focus { border-color: var(--accent-border); }
+.proxy-form input[type="text"]:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 #proxy-label { flex: 0 0 150px; }
 #proxy-server { flex: 1 1 240px; }
 .proxy-link {
@@ -7791,29 +8452,21 @@ body.music-resizing * { cursor: col-resize !important; }
 }
 .proxy-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 /* 端口是 number 输入，样式与上面那批 text 对齐（同一副观感）。
-   2026-10-06：**去掉 Chromium 的原生 spinner**（输入框右侧那对上下小箭头）—— 它是
-   WebView2 的默认形态，与本文件顶部那套全局细滚动条不搭（用户点名）。只去掉控件、
-   不去掉语义：键盘上下键照样能增减。 */
+   原生 spinner（右侧那对上下小箭头）的隐藏已提为**全局规则**（文件顶部 `input[type="number"]`，
+   见 docs/ui-style.md §界面 13）—— 这里不再重复声明 appearance / spin-button。 */
 .proxy-panel input[type="number"] {
   box-sizing: border-box;
   flex: 0 0 110px;
   padding: 5px 9px;
   font-size: 0.72rem;
   color: var(--text);
-  background: rgba(0, 0, 0, calc(0.3 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.3 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
   outline: none;
-  caret-color: var(--accent);
-  appearance: textfield;
-  -moz-appearance: textfield;
+  caret-color: rgb(var(--other-overlay-rgb));
 }
-.proxy-panel input[type="number"]::-webkit-outer-spin-button,
-.proxy-panel input[type="number"]::-webkit-inner-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
-}
-.proxy-panel input[type="number"]:focus { border-color: var(--accent-border); }
+.proxy-panel input[type="number"]:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 #mihomo-release { flex: 1 1 240px; }
 /* 延迟：好/差/未知三档用语义色，一眼能扫出来 */
 .proxy-delay { font-size: 0.68rem; font-variant-numeric: tabular-nums; color: var(--text-dim); }
@@ -7830,9 +8483,106 @@ body.music-resizing * { cursor: col-resize !important; }
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--text-dim);
-  background: rgba(0, 0, 0, calc(0.35 * var(--shade-scale)));
+  background: rgba(var(--shade-rgb), calc(0.35 * var(--shade-scale)));
   border: 1px solid var(--border-glass);
   border-radius: 6px;
 }
 .proxy-log:empty { display: none; }
+
+/* ── 自绘下拉框（.custom-select，2026-10-11 提为**共享组件**）─────────
+   全项目**唯一**的标准下拉组件：原生 `<select>` 在透明 WebView2 窗里不渲染弹层
+   （见 docs/forbidden.md §禁用 2 · docs/ui-style.md §界面 6 / §界面 12）。
+   行为在 `src/plugins/builtin/custom-select.ts`（markup + attachCustomSelect）；
+   颜色归属见 §界面 11 / §界面 12：
+     · 本体 trigger = 按钮背景色 + 按钮线条描边（α0.10）+ `--text`；箭头走 `currentColor`；
+     · 面板 dropdown = 底色（`--surface-glass`）+ 按钮线条描边；
+     · 选项 = 未选中透明底 + `--text-dim`，hover / 选中 = 按钮蒙版。
+   写在这里而不是各插件内联 <style>：插件悬浮窗（plugin.html）链接同一份 styles.css
+   （见 plugin.html 头注释），于是任何插件渲染本组件都自动拿到同一副外观。 */
+.custom-select {
+  position: relative;
+  flex: 1;
+  max-width: 220px;
+  height: 26px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  user-select: none;
+}
+.custom-select-trigger {
+  width: 100%;
+  height: 26px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  font-size: 0.73rem;
+  font-family: inherit;
+  /* 本体 = 按钮族：底走按钮背景（全局 #app button:where(...) 给的也是这个值，
+     这里显式写同值、不依赖那条规则的次序）、描边走按钮线条 α0.10、文字 --text。 */
+  background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
+  border: 1px solid var(--ctx-border-glass);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  outline: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.custom-select-trigger:hover { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+.custom-select-arrow {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  transition: transform 0.15s;
+}
+.custom-select.open .custom-select-arrow { transform: rotate(180deg); }
+.custom-select-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 滚轮不穿透到外层列表 */
+  background: var(--surface-glass);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  z-index: 999;
+  display: none;
+  margin-top: 0;
+  box-shadow: 0 4px 16px rgba(var(--shade-rgb), calc(0.4 * var(--shade-scale)));
+  /* 滚动条外观走全局唯一那条 ::-webkit-scrollbar（本文件顶部）。
+     这里**不要**写 scrollbar-width / scrollbar-color —— 在 WebView2 里它们会让
+     ::-webkit-scrollbar 整段失效、退回系统默认样式。 */
+}
+.custom-select.open .custom-select-dropdown { display: block; }
+.custom-select-option {
+  padding: 6px 10px;
+  font-size: 0.73rem;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.custom-select-option:hover { background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha)); color: var(--text); }
+.custom-select-option.selected { background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha)); color: var(--text); font-weight: 600; }
+.cs-del {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 3px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  border-radius: 3px;
+  cursor: pointer;
+  opacity: 0.6;
+}
+.custom-select-option:hover .cs-del { opacity: 1; color: var(--red, #c08a8a); }
+.cs-del:hover { background: rgba(192,138,138,0.2); }
 

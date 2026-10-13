@@ -16,7 +16,16 @@
 //          --permission-prompt-tool stdio → 写类工具先发 can_use_tool 请前端审批
 //          --disallowedTools <name…>      → 这些工具不进请求体
 //          --mcp-server stdio:<exe 路径>  → 拉起该 exe 的 MCP server，接入其工具（P3）
+//          --print / -p [query]           → 单发：跑恰好一轮提问后退出（见下）
+//          --output-format text|json|stream-json → 单发模式的 stdout 形态（默认 text）
+//          --input-format stream-json     → 常驻 stdio 流式输入模式的标志（宿主一直传它）
 //          其余 CLI 风格参数接受并忽略
+//
+//   单发模式（--print）：只在「带 --print 且未显式声明 --input-format stream-json」时生效
+//   —— 后者是上游常驻 stdio 流式输入模式（宿主的 start_cli_process 一直这么传），
+//   必须保持常驻，绝不能退化成单发。query 来源：--print 紧跟的那个非 flag 值；
+//   没给就从 stdin 读一次（整段当一条 query）。单发无审批回包通道 ⇒ 需审批的工具
+//   默认直接拒绝（非 0 退出），除非 --dangerously-skip-permissions。详见 CliArgs::single_shot。
 //   stdin  每行一条 JSON
 //            {"type":"user","session_id":"","message":{"role":"user",
 //             "content":[{"type":"text","text":"…"}]},"parent_tool_use_id":null}
@@ -54,9 +63,9 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
@@ -67,6 +76,9 @@ use serde_json::{json, Value};
 
 mod bash_safety;
 mod content_safety;
+// 「要不要把这条输入发给云模型」的决策边界（S1 第一步）。**当前没有调用点，是刻意的** ——
+// 调用点 = L10 桌宠常驻输入；核心 agent 接线另议。见 docs/agent-feature-backlog.md §4.1.1 / §4.1.3。
+mod decide;
 mod hooks;
 mod image;
 mod log;
@@ -172,7 +184,12 @@ const TURN_BUDGET_ENV: &str = "LUNAC_TURN_BUDGET_TOKENS";
 /// 通常是长任务，所以给得更宽。
 const DEFAULT_TURN_BUDGET_TOKENS: u64 = 500_000;
 /// 撞预算后最多续命几次（用户 2026-10-01 定 2 次）。最坏累计 ≈ 3 × 预算。
+/// **它只是「没有未完成任务清单」时的硬上限** —— 有计划且计划未完成时放宽到
+/// `MAX_BUDGET_EXTENSIONS_HARD`（2026-10-09 用户口径「预算撞顶不中止」，见 backlog §4.1.3）。
 const MAX_BUDGET_EXTENSIONS: usize = 2;
+/// 计划**未完成**时允许的续命上限（2026-10-09）。长任务不该因为撞一次预算就被砍断；
+/// 但仍是硬上限，防失控（最坏累计 ≈ 7 × 预算）。
+const MAX_BUDGET_EXTENSIONS_HARD: usize = 6;
 /// 预算用尽时的收口指令。与 `TOOL_BUDGET_HINT` 同款措辞、同一个落点纪律。
 const TURN_BUDGET_HINT: &str =
     "This turn's cost budget is used up. Stop calling tools and give the user your final \
@@ -272,24 +289,35 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── 后台复盘 fork（A4：长期记忆的**触发点**）──────────────────────
 //
-// 按**轮次门槛**触发：每完成 `nudge_interval`（默认 10，Hermes 的 `nudge_interval`
-// 默认值）次用户提问，就派一个后台 fork 去复盘这段对话，把值得留的结论用 `Remember`
-// 写进长期记忆。
+// 触发条件（2026-10-11 方案 B：由「进程内每 N 轮」改为「按会话 + 按时间」）：
+//   ① 本轮确实完成了一次用户提问（判定点就在 user 分支、run_query 返回之后）；
+//   ② 距上次复盘 ≥ REVIEW_MIN_GAP_SECS（30 分钟）；
+//   ③ 本次会话（= 本 agent 进程）尚未复盘过（每会话 ≤ 1 次）。
+// 三条全满足才派一个后台 fork 去复盘这段对话，把值得留的结论用 Remember 写进长期记忆。
 //
-// **不引定时器**（backlog 硬约束）：按轮次门槛触发。定时器会在用户什么都没干的时候空转
-// （每次都真花钱），而「跑不跑」与「这段时间有没有值得留的东西」完全无关。
+// 为什么放弃「进程内每 N 轮」：旧的 questions 是**进程内局部变量**，而 agent 频繁重启
+// （换模型 / 换档位 / 新对话 / 中断 / App 重启都会重启 agent）⇒ 计数归零，阈值（默认 10）
+// 永远够不着，写入侧事实上从未触发过（2026-10-11 运行时证据）。改成「按会话 + 按时间」后，
+// 门槛不再依赖单进程活多久。
 //
-// 「后台」的确切含义：**在提问之间**跑。`run_query` 返回（答案已交付前端）之后才 spawn，
+// 频次硬上限（用户成本敏感）：**每会话 ≤ 1 次**（会话 = 本进程）+ **距上次复盘 ≥ 30 分钟**
+// （时间戳落盘、跨进程重启有效）⇒ 单次触发只 spawn 一个后台线程、无循环重试 ⇒ 单次 ≤ 1 次
+// 云调用。
+//
+// **不引定时器**（backlog 硬约束）：定时器会在用户什么都没干的时候空转（每次都真花钱）。
+//
+// 「后台」的确切含义：**在提问之间**跑。run_query 返回（答案已交付前端）之后才 spawn，
 // 下一次提问进来之前 join —— 所以它**不占任何一次回答的时延**，用户读答案/打字的那几秒
 // 正好把复盘跑完。它不是「随时并发」：agent 的 stdout 契约是逐行 JSON，两条线程同时
-// `emit` 会交错（见 run_review_fork 的注释）。
+// emit 会交错（见 run_review_fork 的注释）。
 //
-// 为什么值得：取回侧（`SessionSearch` + 往期会话索引）2026-09-19 就通了，但**一直只有
-// 取回、没有写回** —— 用户每次都要重新交代一遍相同的偏好与约定。
+// 为什么值得：取回侧（SessionSearch）2026-09-19 就通了，但**一直只有取回、没有写回**
+// —— 用户每次都要重新交代一遍相同的偏好与约定。
 
-/// 轮次门槛的开关/取值：`0` 关闭，其余为间隔（提问数）。默认 10。
-const NUDGE_INTERVAL_ENV: &str = "LUNAC_NUDGE_INTERVAL";
-const DEFAULT_NUDGE_INTERVAL: u64 = 10;
+/// 距上次复盘的最小间隔（秒）。方案 B 的「按时间」那一半 —— 与「每会话 ≤ 1 次」叠加，
+/// 共同封顶复盘频次。取 30 分钟：一次复盘真调模型（预算 12 万 token），用户成本敏感，
+/// 一天至多几次足够；再密只是把同样的结论反复写。
+const REVIEW_MIN_GAP_SECS: i64 = 30 * 60;
 
 /// 复盘 fork 的轮次上限与 token 预算。比子代理（8 轮 / 30 万）更小：它只做
 /// 「判断 + 写几条」，正常一两轮就结束；上限只是防它失控烧钱。
@@ -298,7 +326,7 @@ const REVIEW_BUDGET_TOKENS: u64 = 120_000;
 /// 送进复盘的对话快照上限（字符）。复盘看的是**结论**，不需要逐字原文 ——
 /// 快照太大只会让这次后台调用变贵。
 const REVIEW_TRANSCRIPT_CHARS: usize = 6_000;
-/// 一次复盘最多写几条记忆（写在提示词里）。每 10 轮跑一次，贪多必然灌进一堆琐事。
+/// 一次复盘最多写几条记忆（写在提示词里）。复盘频次低（每会话至多一次），贪多必然灌进一堆琐事。
 const REVIEW_MAX_ITEMS: usize = 3;
 
 /// 复盘 fork 的**白名单工具集**（backlog A4 原文：「只放白名单工具（写记忆 / 改技能）」）。
@@ -313,20 +341,41 @@ const REVIEW_MAX_ITEMS: usize = 3;
 const REVIEW_TOOL_WHITELIST: [&str; 7] =
     ["Read", "Glob", "Grep", "Write", "Edit", "Skill", "Remember"];
 
-/// 复盘 fork 的系统提示词（**角色段**）。与 `SUBAGENT_SYSTEM` 一样是给模型看的元信息，
-/// 不进 i18n。它在 `main()` 里拼一次（角色段 + 环境块 + 技能清单），所有复盘共享同一段前缀。
+/// 复盘 fork 的系统提示词（**角色段**）。与 SUBAGENT_SYSTEM 一样是给模型看的元信息，
+/// 不进 i18n。它在 main() 里拼一次（角色段 + 环境块 + 技能清单），所有复盘共享同一段前缀。
+///
+/// 2026-10-11（方案甲）：从泛化复盘升级为**结构化抽取** —— 写明抽取分类、不抽清单与
+/// **禁写凭据**四类口径；触发条件、频次、工具集、写回通道一行未动。这段只出现在复盘
+/// 自己那一次请求的 system 上（见 build_review_system 的唯一调用点），与主对话的固定
+/// 前缀不是同一段，改它不影响主对话缓存。
 const REVIEW_SYSTEM: &str = "\
-You are Lunac's background reviewer. A conversation has just finished and you are deciding what, \
-if anything, deserves to be kept in the user's LONG-TERM MEMORY.
+You are Lunac's background reviewer. A conversation has just finished and you are extracting \
+what, if anything, deserves to be kept in the user's LONG-TERM MEMORY. This is structured \
+extraction with a fixed scope, not a free-form retrospective.
 
-Long-term memory means: durable facts that stay true across conversations — the user's stated \
-preferences and working style, project conventions, how their environment is set up, decisions \
-that were reached and the reason behind them. It is loaded into the assistant's context at the \
-start of every future session.
+Long-term memory means: durable facts that stay true across conversations and that nobody should \
+have to be told twice. It is loaded into the assistant's context at the start of every future \
+session.
 
-Do NOT write: one-off details of the finished task, progress or to-do state, anything already \
-present in the memory shown below, or anything you are merely guessing. A wrong memory is worse \
-than a missing one, because it silently misleads every future session.
+Extract ONLY these categories:
+- User preferences and working style: stated language, tone, tools, habits.
+- Project conventions and rules: how this project is built, tested, laid out, or named.
+- Environment and toolchain facts: which tools or SDKs are installed, exact versions, and paths \
+that matter later.
+- Background and decisions for long-running work: what was decided, and the reason behind it.
+
+Do NOT extract:
+- One-off details of the task just finished, or a play-by-play of what was done.
+- Anything that can be read back from the repository or files at any time (existing code, file \
+contents) — it does not need to be remembered.
+- Temporary state, progress, or to-do items.
+- Anything already present in the memory shown below.
+- Chit-chat, and anything you are merely guessing. A wrong memory is worse than a missing one, \
+because it silently misleads every future session.
+
+NEVER write credentials. If the conversation contains any API key, token, password, private key, \
+connection string, or similar secret, do NOT write it to memory under any circumstance, and not \
+even partially. Leave it out entirely.
 
 Rules:
 - Judge first, act second. Most conversations contain NOTHING worth remembering — that is the \
@@ -637,6 +686,22 @@ fn latest_todo_snapshot(history: &[Value]) -> Option<String> {
         }
     }
     None
+}
+
+/// 任务清单里是否还有**未完成项**（`pending` / `in_progress`）。
+///
+/// 判据就是任务快照的渲染格式 `N. [status] content`（见 `latest_todo_snapshot`）——
+/// 不去解析 `TodoWrite` 的原始 JSON，因为快照是压缩后**唯一幸存**的那份（两者同源）。
+/// **没有清单 ⇒ false**（保守：没计划就不放宽预算闸门）。
+///
+/// 用途见 `MAX_BUDGET_EXTENSIONS_HARD`：预算撞顶时，只有「计划未完成」才允许继续续命。
+fn todo_has_unfinished(history: &[Value]) -> bool {
+    match latest_todo_snapshot(history) {
+        Some(s) => s
+            .lines()
+            .any(|l| l.contains("[pending]") || l.contains("[in_progress]")),
+        None => false,
+    }
 }
 
 /// 判断 400 是否由「上下文超限」引起 —— 只有这类才值得压缩后重试
@@ -989,6 +1054,83 @@ fn compact_history(
     }
 }
 
+/// 主循环认的 stdin 输入类型（2026-10-11 起新增 compact）。
+///
+/// 抽成枚举只为可单测「哪些类型被识别」；判定与主循环那处 match **逐字一致** ——
+/// 不带 compact 时行为与改造前逐字节相同，未知类型仍落 Unknown（照旧打「忽略输入类型」）。
+enum StdinKind<'a> {
+    User,
+    SetHistory,
+    ControlResponse,
+    Compact,
+    Unknown(Option<&'a str>),
+}
+
+fn stdin_kind(msg: &Value) -> StdinKind<'_> {
+    match msg.get("type").and_then(Value::as_str) {
+        Some("user") => StdinKind::User,
+        Some("set_history") => StdinKind::SetHistory,
+        Some("control_response") => StdinKind::ControlResponse,
+        Some("compact") => StdinKind::Compact,
+        other => StdinKind::Unknown(other),
+    }
+}
+
+/// 手动压缩一次（stdin 输入类型 compact，2026-10-11）。
+///
+/// **复用自动压缩的同一条路径**（PreCompact hook -> compact_history(Force) -> 摘要压缩）——
+/// 它只是 Force 档的第三个调用点（前两个：预算续命、400 兜底），不再抄一份压缩逻辑。
+///
+/// 护栏：
+///   · 空历史：**不**调 compact_history。Force 档会给「开头不是 user 文本消息」的历史插一条
+///     TRIMMED_MARKER 合成消息，空历史会因此被无中生有地塞一条 ⇒ 直接回 elided/dropped 均为 0
+///     的回执，既不崩也不污染历史。
+///   · read_only / plan 档：**允许**压缩。它只改内存里的 history，不写盘、不新增落点；自动路径
+///     （预算闸 / 400 兜底）同样不看 read_only ⇒ 这里保持同一语义（PreCompact hook 照发）。
+///   · 压不动（elided + dropped 均为 0）：compact_history 内部**只在真压动时才发**
+///     context_compacted，这里补发一条 0/0 的 —— 前端「已请求压缩」的占位一定能收到明确回执。
+///   · 并发：本函数在**主循环**里调用；跑回合时主循环正阻塞在 run_query ⇒ 压缩期间到达的
+///     compact 只会在 stdin 队列里排队、**等本回合收尾后才执行**（不打断流式 / 审批）。选最安全的排队。
+///
+/// 返回需要**补发**的回执事件；None = compact_history 已经发过，别重复发。
+/// 抽成函数便于单测：空历史 / 压不动两条路径都不联网、不发 stdout。
+fn manual_compact(cfg: &Cfg, history: &mut Vec<Value>, cwd: &Path) -> Option<Value> {
+    if history.is_empty() {
+        log::info("手动压缩：历史为空，无可压缩内容");
+        return Some(json!({
+            "type": "system",
+            "subtype": "context_compacted",
+            "elided": 0,
+            "dropped": 0,
+        }));
+    }
+    fire_plain_hook("PreCompact", cwd, json!({ "trigger": "manual" }));
+    let measured = cfg.last_input.get();
+    let out = compact_history(history, Compact::Force, measured);
+    // 摘要压缩：与自动路径同款（Force 档丢弃量最大，摘要最值钱）。返回值只用来修正调用方的
+    // 回滚锚点，本路径没有回滚锚点 ⇒ 忽略。
+    let _ = pin_summary_of_dropped(cfg, history, &out.dropped_msgs);
+    // last_input 清零（与自动路径一致）：下一次请求重新按实测水位判断。
+    cfg.last_input.set(0);
+    if out.elided + out.dropped > 0 {
+        // 只有真压动才推进滞回时钟 —— 「扫了一圈但没动」不该白等一个增长窗口。
+        cfg.last_compact.set(measured);
+    }
+    log::info(format!(
+        "手动压缩：瘦身 {} 个 tool_result，丢弃 {} 条旧消息",
+        out.elided, out.dropped
+    ));
+    if out.elided + out.dropped == 0 {
+        return Some(json!({
+            "type": "system",
+            "subtype": "context_compacted",
+            "elided": 0,
+            "dropped": 0,
+        }));
+    }
+    None
+}
+
 /// 摘要压缩是否启用（backlog §8.2）。默认开，只有显式关才关。
 fn summary_compact_enabled() -> bool {
     match std::env::var(SUMMARY_COMPACT_ENV) {
@@ -1117,6 +1259,20 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
         "messages": [{ "role": "user", "content": [{ "type": "text", "text": transcript }] }],
     });
     let started = Instant::now();
+    // 调试转储（LUNAC_DUMP_API）：摘要请求非流式，request/response 各一行。摘要用量本就
+    // 不落任何账，req_id 用时间戳生成、仅供人工区分（不与 usage 明细对应）。
+    let dump_on = log::dump_api_enabled();
+    let dump_rid = if dump_on {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let rid = format!("summarize-{ms}");
+        log::dump_api("request", &rid, &cfg.model, None, None, &body);
+        rid
+    } else {
+        String::new()
+    };
     let resp = cfg
         .client
         .post(&cfg.endpoint)
@@ -1130,12 +1286,22 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
+            if dump_on {
+                log::dump_api(
+                    "response",
+                    &dump_rid,
+                    &cfg.model,
+                    None,
+                    Some(&e.to_string()),
+                    &Value::Null,
+                );
+            }
             log::warn(format!("摘要压缩失败（网络层）：{e}"));
             return None;
         }
     };
-    if !resp.status().is_success() {
-        let status = resp.status();
+    let status = resp.status();
+    if !status.is_success() {
         let detail: String = resp
             .text()
             .unwrap_or_default()
@@ -1143,6 +1309,16 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
             .chars()
             .take(200)
             .collect();
+        if dump_on {
+            log::dump_api(
+                "response",
+                &dump_rid,
+                &cfg.model,
+                Some(status.as_u16()),
+                None,
+                &Value::String(detail.clone()),
+            );
+        }
         log::warn(format!("摘要压缩失败：HTTP {status} {detail}"));
         return None;
     }
@@ -1153,6 +1329,9 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
             return None;
         }
     };
+    if dump_on {
+        log::dump_api("response", &dump_rid, &cfg.model, Some(status.as_u16()), None, &v);
+    }
     let text = v
         .get("content")
         .and_then(Value::as_array)
@@ -1185,23 +1364,104 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
     Some(format!("{SUMMARY_HEADER}\n{text}"))
 }
 
-/// 摘要压缩的落点：把摘要钉回历史开头（`compact_history` 之后调用）。
+/// 摘要压缩的落点：把摘要（或兜底清单）钉回历史开头（`compact_history` 之后调用）。
 ///
-/// 与任务快照同一个位置策略 —— **插在第一条之后**，不抢「开头那条用户提问 = 任务目标」。
+/// 与任务快照同一个位置策略 —— **插在第一条之后**，不抢「开头那条用户提问」的位置。
 /// 两者同时存在时的顺序是 [摘要][任务快照]：摘要是「过去发生了什么」，任务快照是「现在要做什么」，
 /// 读起来正好由远及近。
+///
+/// **2026-10-10 改：拿不到模型摘要时必须退到确定性兜底**。`compact_history` 是**先 drain 再让
+/// 模型写摘要**，原先模型摘要失败（或输入太短被跳过、或该档被关掉）就 `return false` ——
+/// 被丢的那几十条**永久没有顶替物**，模型手里只剩「开头那条最早的用户提问」+ 尾部，于是把
+/// **最早的那个诉求**当成当前任务往下做。用户报障原话：「只要压缩上下文直接回到了上一次人格修改」
+/// ——现场对得上：那段会话第一条是「为桌宠设置一个人格」，而当天 agent 日志 7 次压缩里 5 次是
+/// 「摘要压缩失败：模型返回空摘要」，所以每次压缩后助手都回头重写人格。
 fn pin_summary_of_dropped(cfg: &Cfg, history: &mut Vec<Value>, dropped: &[Value]) -> bool {
-    if !summary_compact_enabled() || dropped.is_empty() {
+    if dropped.is_empty() {
         return false;
     }
-    let Some(summary) = summarize_dropped(cfg, dropped) else {
-        return false;
+    let text = if summary_compact_enabled() {
+        match summarize_dropped(cfg, dropped) {
+            Some(s) => s,
+            None => {
+                let d = fallback_digest_of_dropped(dropped);
+                log::warn(format!(
+                    "摘要压缩不可用（模型摘要失败 / 输入过短）⇒ 退到确定性兜底清单（{} 字），\
+                     保证被丢弃的 {} 条有顶替物",
+                    d.chars().count(),
+                    dropped.len()
+                ));
+                d
+            }
+        }
+    } else {
+        fallback_digest_of_dropped(dropped)
     };
+    if text.trim().is_empty() {
+        return false;
+    }
     history.insert(
         1.min(history.len()),
-        json!({ "role": "user", "content": [{ "type": "text", "text": summary }] }),
+        json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
     );
     true
+}
+
+/// 摘要压缩的**确定性兜底清单**（不调模型、不会失败）。
+///
+/// 取**被丢区间里的用户文本消息**（「用户一路想要什么」的最直接载体），逐条压成一行、
+/// 按原序排列，并显式声明「最新的那条用户消息才是当前任务、最早那条只是背景」——
+/// 于是模型看到的是「先后提过这些」，而不是「最早那一件」。
+/// 末尾补一行工具活动计数，免得那段读起来像空白。
+/// 我们的合成消息（`TRIMMED_MARKER` / 摘要头 / 任务快照 / 本兜底自身）都以 `[` 开头，一律跳过。
+fn fallback_digest_of_dropped(dropped: &[Value]) -> String {
+    const MAX_ASKS: usize = 40;
+    const ASK_CHARS: usize = 140;
+    let mut asks: Vec<String> = Vec::new();
+    let mut tool_results = 0usize;
+    for msg in dropped {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let is_user = msg.get("role").and_then(Value::as_str) == Some("user");
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_result") => tool_results += 1,
+                Some("text") if is_user => {
+                    let Some(t) = block.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let one = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if one.is_empty() || one.starts_with('[') {
+                        continue; // 合成消息，不是用户的话
+                    }
+                    asks.push(one.chars().take(ASK_CHARS).collect());
+                }
+                _ => {}
+            }
+        }
+    }
+    if asks.is_empty() && tool_results == 0 {
+        return String::new();
+    }
+    let total = asks.len();
+    let shown = total.min(MAX_ASKS);
+    let mut out = String::from(
+        "[digest of a trimmed region — the user's requests over that span, in order. \
+         The LATEST user message of this session is the current task; the earliest is background only.]",
+    );
+    for (i, a) in asks.iter().take(shown).enumerate() {
+        out.push_str(&format!("\n{}. {a}", i + 1));
+    }
+    if total > shown {
+        out.push_str(&format!("\n…(+{} earlier requests omitted)", total - shown));
+    }
+    if tool_results > 0 {
+        out.push_str(&format!(
+            "\n({tool_results} tool results from that span were dropped; re-read or re-run as needed)"
+        ));
+    }
+    out
 }
 
 /// 有工具之后，系统提示词改为鼓励「先看再改」的最小操作风格。
@@ -1212,10 +1472,19 @@ fn pin_summary_of_dropped(cfg: &Cfg, history: &mut Vec<Value>, dropped: &[Value]
 /// 只读调用放进**同一个响应**里并发执行（上限 `TOOL_PARALLELISM`）——**一次请求带 N 个
 /// `tool_use`**，不是发 N 份请求。省的是往返次数，不是并发度：原先只差一句提示词，
 /// 模型每轮只发一个调用，白跑了好几趟。
+///
+/// **2026-10-07 加「Edit 优先于 Write」**（L6 成本归因与降本 · 输出侧）：当日用量对账显示
+/// **Lunac 的账单里输出 token 占 61.7%**（同口径 Trae 只占 35.7%），而 agent 的输出大头
+/// 不是散文、是**工具参数** —— 对已存在的文件全量重写一次就是几千 token，改两行却要
+/// 复述整个文件。`Edit`（exact-string replace）本就是这个形态，缺的只是「优先用它」这句话。
+/// 参照：search-replace 已是 13 个主流 agent 里 6 个的默认编辑形态。
 const SYSTEM_PROMPT: &str = "You are Lunac's built-in assistant, running inside a Windows desktop launcher. \
 Answer in the user's language and keep it concise. \
 You can inspect and modify the local machine with the provided tools: prefer Read/Glob/Grep \
 before editing, make the smallest change that solves the problem, and say what you changed. \
+To change an existing file, use Edit -- patch only the lines that differ. Reserve Write for files \
+you are creating and for whole-file rewrites you actually intend; re-emitting an unchanged file \
+is pure cost. \
 Batch independent lookups: when several reads or searches do not depend on one another, issue \
 them as multiple tool calls in the SAME response instead of one per turn -- they run \
 concurrently and each saved round-trip is a re-sent prefix you do not pay for. \
@@ -1234,6 +1503,13 @@ Relative paths resolve against your working directory.";
 /// 那会让系统提示词每轮都变，把整个固定前缀的缓存打掉（这正是原先那份不能留在这里的原因：
 /// 它按关键词条件拼接）。关键词条件块（调试方法论 / TDD / 代码审查）**仍留在用户消息里**，
 /// 它们本来就随 query 变，且只占自己那几十 token。
+///
+/// **2026-10-08 加「阶段小结」（用户要求，L6 的唯一例外）**：让模型在**多轮工具任务**里
+/// 每段思考后说一行结论、并在最终答复里把这几行汇总。为什么它值得花这点输出 token：
+/// 思考块**不回灌**（回灌会 400，见 `hist.push` 那一段）⇒ 一轮工具往返之后，模型的推理
+/// 在上下文里**凭空消失**，只能从 tool_result 重新推。而 `text` 块**会**进历史
+/// （main.rs 的 `hist.push(blk)`），所以那一行小结是**把决策带进下一轮的唯一载体**。
+/// 范围刻意收窄到「多于一次工具往返」：单步问答与闲聊一律不加（那才是 L6 要压的铺垫）。
 const PERSONA_AND_STYLE: &str = r#"## Personality (fixed — always apply)
 You are "Lunac", a sharp, fast desktop AI assistant built into a launcher. Stay in character every turn.
 - Thinking style: before acting, briefly structure your reasoning as Context → Analysis → Decision, then execute. Do not second-guess after deciding.
@@ -1243,7 +1519,8 @@ You are "Lunac", a sharp, fast desktop AI assistant built into a launcher. Stay 
 
 ## Output Style
 Remove AI writing patterns: no "stands as / testament / pivotal / crucial / underscoring / delve / tapestry / landscape / fostering / moreover / furthermore / in conclusion". No emoji decorations. No "I hope this helps / let me know / great question". No boldface headers in lists. Use simple "is/are/has" instead of "serves as/stands as/represents". Vary sentence rhythm. Have opinions.
-Spend output tokens only on the answer (2026-09-29, L6): no preamble before tool calls, no announcing what you are about to do, no restating the plan, no recap of what you just read. Answer only what was asked -- skip extra findings and unrequested analysis. Never paste back content the user can already see. Keep the closing note to what changed, in one line."#;
+Spend output tokens only on the answer (2026-09-29, L6): no preamble before tool calls, no announcing what you are about to do, no restating the plan, no recap of what you just read. Answer only what was asked -- skip extra findings and unrequested analysis. Never paste back content the user can already see. Keep the closing note to what changed, in one line.
+Phase summaries (2026-10-08 -- the single exception to the rule above): when a task needs more than one tool round, close each round with ONE short line -- the conclusion you reached, not a plan and not a promise. Your thinking is dropped from the context between rounds; that line is kept, so it is what carries the decision into the next round. When the task is done, sum those lines up in 2-4 lines at the start of the final answer. A single-step answer emits none of this."#;
 
 /// 用户人格 / 自定义提示词的来源文件（宿主注入的绝对路径，L2，2026-09-21）。
 ///
@@ -1304,33 +1581,43 @@ fn persona_block(persona: &str) -> String {
     format!("\n\n{USER_PERSONA_HEADER}\n{text}")
 }
 
-// ── 项目记忆（AGENTS.md，2026-10-01）────────────────────────────────
+// ── 项目记忆（AGENTS.md，2026-10-01；多层向上递归，2026-10-11）──────
 //
-// 为什么需要它：`MEMORY.md`（`Remember` 工具）是**跨项目**的长期记忆 —— 「这个仓库要
-// 怎么构建、目录有什么规矩、哪些东西不许动」混进去会被别的项目读到；而这些恰恰是
-// 每进一个仓库就要重新说一遍的东西。业界已把 **`AGENTS.md`** 当成这件事的约定
-// （OpenAI 主导、多家 IDE / agent 采纳），所以直接读工作目录下那一份，不另发明文件名。
+// 为什么需要它：MEMORY.md（Remember 工具）是跨项目的长期记忆 —— 「这个仓库要怎么构建、
+// 目录有什么规矩、哪些东西不许动」混进去会被别的项目读到；而这些恰恰是每进一个仓库就要
+// 重新说一遍的东西。业界已把 AGENTS.md 当成这件事的约定，所以直接读这个名字，不另发明。
 //
-// **只在启动时读一次**：它进的是系统提示词固定前缀（规则 18 / 23），热读会把整段缓存
-// 打掉 —— 改完 `AGENTS.md` 要重启 agent（或切换一次思考开关）才生效，与 persona 同一条纪律。
+// 分层规则（2026-10-11，「哪一级算数」的裁定）：
+//   · 从工作目录逐级向上到**盘根**，每一级只要有 AGENTS.md 就收（见 collect_agents_md）；
+//   · 越靠近工作目录的越具体 ⇒ 排在越后，冲突时它说了算（「都注入、后来者优先」）；
+//   · 加向上这一层是为了「用户把子目录当工作区、约定的文件放在仓库根」这种常见情形 ——
+//     没有它，那种情形的约定永远读不到。
 //
-// **不做向上递归**：「取工作目录下那一份」是一条明确规则；往上找会引出「哪一级算数 /
-// 找到几份算几份」这类没有答案的问题。要覆盖子目录就让用户在自己那级写。
+// **只在启动时读一次**：它进的是系统提示词固定前缀，热读会把整段缓存打掉 —— 改完
+// AGENTS.md 要重启 agent（或切换一次思考开关）才生效，与 persona 同一条纪律。工作目录在
+// 进程生命周期内是常量、文件集合读一次即定 ⇒ 固定前缀在一个进程内逐字节稳定（缓存纪律）。
 //
-// **与「没这个功能」逐字节等价**：没有文件 / 文件是空白 ⇒ 一个字节都不加（不给空行、
-// 不给表头），与 persona 的空白口径一致。
+// **不做「子目录级」的按需加载**：那要先知道「模型此刻在动哪个目录」，而 agent 没有这个
+// 状态（工具只收到显式路径），只能靠每次工具调用去扫、把结果拼进当轮消息 —— 那属于可变层
+// （不进固定前缀，故不直接废缓存），但扫描时机与注入位置的代价要单独设计。故本层只做
+// 「启动时确定集合」，子目录级留在 todo.md 作为独立子项（见 §待办 3-1）。
+//
+// **与「没这个功能」逐字节等价**：一个 AGENTS.md 都没有 ⇒ 一个字节都不加。
 const AGENTS_MD_FILE: &str = "AGENTS.md";
-/// 项目记忆段的表头。英文的原因同 `USER_PERSONA_HEADER`：这是**给模型看的元信息**。
+/// 项目记忆段的表头。英文的原因同 USER_PERSONA_HEADER：这是给模型看的元信息。
 /// 它同时是判据锚点 —— 单测靠它判断「这段进没进提示词」。
-const AGENTS_MD_HEADER: &str =
-    "## Project instructions (from AGENTS.md in the working directory — always apply)";
-/// 项目记忆上限（字符）。理由同 `MAX_PERSONA_CHARS`：这段进**每次请求都要发的固定前缀**，
-/// 截断只是防御（用户可能往 `AGENTS.md` 里堆一整篇开发手册）。
+const AGENTS_MD_HEADER: &str = "## Project instructions (from AGENTS.md — always apply)";
+/// 单份 AGENTS.md 上限（字符）。理由同 MAX_PERSONA_CHARS：这段进每次请求都要发的固定
+/// 前缀，截断只是防御（用户可能往 AGENTS.md 里堆一整篇开发手册）。
 const MAX_AGENTS_MD_CHARS: usize = 8_000;
+/// 多层项目记忆的**总**上限（字符）—— 向上递归可能凑出好几份，不能让它们无限叠加。
+const MAX_AGENTS_TOTAL_CHARS: usize = 16_000;
+/// 向上递归的层级上限（防御：异常深的目录树 / 符号链接环）。
+const MAX_AGENTS_MD_LEVELS: usize = 12;
 
-/// 读工作目录下的 `AGENTS.md`。没有这个文件是**正常状态**（大多数目录都没有）⇒ `None`。
-fn read_agents_md(cwd: &std::path::Path) -> Option<String> {
-    let path = cwd.join(AGENTS_MD_FILE);
+/// 读某一级目录下的 AGENTS.md。没有这个文件是**正常状态**（大多数目录都没有）⇒ None。
+fn read_agents_md(dir: &std::path::Path) -> Option<String> {
+    let path = dir.join(AGENTS_MD_FILE);
     match std::fs::read_to_string(&path) {
         Ok(raw) => Some(raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1341,37 +1628,264 @@ fn read_agents_md(cwd: &std::path::Path) -> Option<String> {
     }
 }
 
-/// 把 `AGENTS.md` 正文拼成固定追加段。抽出来是为了能单测「空白 → 空串」与「超长截断」。
-fn project_block_from(text: &str) -> String {
-    let text = text.trim();
-    if text.is_empty() {
-        return String::new();
+/// 收集「工作目录 → 盘根」链路上每一级的 AGENTS.md（**浅→深**，即先父级后本级）。
+///
+/// 只收**非空白**的正文；一个都没有 ⇒ 空 vec。文件集合在进程生命周期内固定 ⇒ 前缀稳定。
+/// 依赖 std 的 Path::parent() 逐级上溯（Windows 上到 C:\ 为止，其 parent 为 None）。
+fn collect_agents_md(cwd: &std::path::Path) -> Vec<(PathBuf, String)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut cur = Some(cwd.to_path_buf());
+    while let Some(d) = cur {
+        dirs.push(d.clone());
+        cur = d.parent().map(std::path::Path::to_path_buf);
+        if dirs.len() >= MAX_AGENTS_MD_LEVELS {
+            break;
+        }
     }
-    let text: String = if text.chars().count() > MAX_AGENTS_MD_CHARS {
-        log::warn(format!(
-            "AGENTS.md 超过 {MAX_AGENTS_MD_CHARS} 字符 —— 固定前缀不适合放长文，已截断"
-        ));
-        text.chars().take(MAX_AGENTS_MD_CHARS).collect()
-    } else {
-        text.to_string()
-    };
-    format!("\n\n{AGENTS_MD_HEADER}\n{text}")
+    dirs.reverse(); // 浅 → 深
+    let mut files = Vec::new();
+    for d in dirs {
+        if let Some(raw) = read_agents_md(&d) {
+            if !raw.trim().is_empty() {
+                files.push((d.join(AGENTS_MD_FILE), raw));
+            }
+        }
+    }
+    files
 }
 
-/// 项目记忆固定段（读盘 + 拼装 + 落一行日志）。拿不到就返回空串，绝不阻断启动。
-fn project_block(cwd: &std::path::Path) -> String {
-    let Some(raw) = read_agents_md(cwd) else {
+/// 把「浅→深」的项目记忆拼成固定追加段（纯函数，便于单测）。
+///
+/// 单份文件时输出与单层实现**逐字节相同**（不带来源标签）；多份时每份前面加一行来源路径，
+/// 让「冲突时谁更具体」在提示词里可读。总量超上限时**丢最浅的**（保留更贴近工作目录的）。
+fn project_block_from_chain(files: &[(PathBuf, String)]) -> String {
+    // 逐份 trim + 单份截断，丢掉空文件
+    let mut present: Vec<(String, String)> = Vec::new();
+    for (path, raw) in files {
+        let text = raw.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let text: String = if text.chars().count() > MAX_AGENTS_MD_CHARS {
+            log::warn(format!(
+                "AGENTS.md 超过 {MAX_AGENTS_MD_CHARS} 字符（{}）—— 固定前缀不适合放长文，已截断",
+                path.display()
+            ));
+            text.chars().take(MAX_AGENTS_MD_CHARS).collect()
+        } else {
+            text.to_string()
+        };
+        present.push((path.display().to_string(), text));
+    }
+    if present.is_empty() {
         return String::new();
-    };
-    let block = project_block_from(&raw);
+    }
+    if present.len() == 1 {
+        return format!("\n\n{AGENTS_MD_HEADER}\n{}", present[0].1);
+    }
+    // 多份：从深到浅累加预算，超出的（更浅的）丢掉
+    let mut kept: Vec<&(String, String)> = Vec::new();
+    let mut total = 0usize;
+    let mut dropped = 0usize;
+    for item in present.iter().rev() {
+        let n = item.1.chars().count();
+        if total + n > MAX_AGENTS_TOTAL_CHARS {
+            dropped += 1;
+            continue;
+        }
+        total += n;
+        kept.push(item);
+    }
+    kept.reverse(); // 浅 → 深
+    if dropped > 0 {
+        log::warn(format!(
+            "项目记忆共 {} 份、超过总上限 {MAX_AGENTS_TOTAL_CHARS} 字符 —— 已丢掉最浅的 {dropped} 份（保留更具体的）",
+            present.len()
+        ));
+    }
+    let mut s = format!("\n\n{AGENTS_MD_HEADER}");
+    for (path, text) in kept {
+        s.push_str(&format!("\n\n### {path}\n{text}"));
+    }
+    s
+}
+
+/// 项目记忆固定段（读盘 + 拼装 + 落一行日志）。一份都没有就返回空串，绝不阻断启动。
+///
+/// 日志列出**这次用了哪几层**（可观测），路径是排障时「到底读了哪些文件」的凭据。
+fn project_block(cwd: &std::path::Path) -> String {
+    let files = collect_agents_md(cwd);
+    let block = project_block_from_chain(&files);
     if !block.is_empty() {
         log::info(format!(
-            "项目记忆已注入系统提示词固定段：{} 字（{}）",
+            "项目记忆已注入系统提示词固定段：{} 份、{} 字 [{}]",
+            files.len(),
             block.chars().count(),
-            cwd.join(AGENTS_MD_FILE).display()
+            files
+                .iter()
+                .map(|(p, _)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" | ")
         ));
     }
     block
+}
+
+// ── 子目录记忆：懒加载（2026-10-12，§待办 3-1a 的「子目录级」那一半）────────
+//
+// 语义（§3-1a 原话）：agent **实际触碰到某个子目录**时，才把**该子目录自己的记忆文件**
+// （AGENTS.md）注入上下文；**没碰到的目录永远不注入**。固定前缀那层（向上递归）行为不变。
+//
+// 为什么只能懒加载、且**必须进可变层**：固定前缀一旦多一个字，整段缓存从第 0 个 token 起
+// 全 miss（每加一个目录就废一次缓存，成本暴涨）——这正是当初没做的根因。所以本层的内容
+// **只拼进「本轮刚产生、还没被发出去过」的 tool_result 文本内部**（同 `TOOL_BUDGET_HINT` /
+// 后台输出回流那条落点纪律）：不动 `system`、不动消息条数、不动 content 块数量
+// ⇒ 固定前缀逐字节不变，且改动只落在尾部新内容上（ai-spec 规则 23 的「零代价落点」）。
+//
+// 触达判据 / 忽略名单 / 深度上限见 `tools::path_arg_kind` / `tools::eligible_subdir`。
+// 去重 = **每会话每个子目录只注一次**（判据取自 `history` 里的来源行，天然能扛 set_history
+// 回退 —— 回退后该条随之消失，下次触碰到会补回，与 `context_block_message` 同一条纪律）。
+
+/// 子目录记忆段的表头。英文原因同 AGENTS_MD_HEADER：给模型看的元信息。
+/// 它同时是「本会话已注入几个子目录」的计数锚点（见 [`subdir_memory_count`]）。
+const SUBDIR_MEMORY_HEADER: &str =
+    "## Directory instructions (from AGENTS.md — loaded because you accessed this directory)";
+/// 单份子目录 AGENTS.md 上限（字符）。理由同 MAX_AGENTS_MD_CHARS：懒加载同样进上下文。
+const MAX_SUBDIR_MEMORY_CHARS: usize = 8_000;
+/// 每会话最多懒加载几个子目录（防御「一路深挖、把可变层灌满」）。超过即不再注入、落一行 warn。
+const MAX_SUBDIR_MEMORY_DIRS: usize = 16;
+
+/// 把某个子目录的 AGENTS.md 拼成一段**注入文本**（读一个文件；空文件 / 读不出 ⇒ None）。
+///
+/// 形态与固定前缀那层的「多份」分支一致：`### <来源路径>` 加正文，便于模型判读来源。
+fn subdir_memory_block(dir: &Path) -> Option<String> {
+    let raw = read_agents_md(dir)?;
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let text: String = if text.chars().count() > MAX_SUBDIR_MEMORY_CHARS {
+        log::warn(format!(
+            "子目录 AGENTS.md 超过 {MAX_SUBDIR_MEMORY_CHARS} 字符（{}）—— 已截断",
+            dir.join(AGENTS_MD_FILE).display()
+        ));
+        text.chars().take(MAX_SUBDIR_MEMORY_CHARS).collect()
+    } else {
+        text.to_string()
+    };
+    Some(format!(
+        "\n\n{SUBDIR_MEMORY_HEADER}\n### {}\n{text}",
+        dir.join(AGENTS_MD_FILE).display()
+    ))
+}
+
+/// 取出这条消息里所有「模型看得见的文本」（`text` 块 / `tool_result` 的文本）—— 纯文本判据用。
+fn message_visible_texts(msg: &Value) -> Vec<&str> {
+    msg.get("content")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .flat_map(|b| {
+                    // text 块走 `text`；tool_result 的正文走 `content`（字符串形态）
+                    [b.get("text").and_then(Value::as_str), b.get("content").and_then(Value::as_str)]
+                        .into_iter()
+                        .flatten()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 本会话是否**已经注入过**某个子目录的记忆（去重判据 = history 里含该目录的来源行）。
+fn subdir_memory_injected(history: &[Value], dir: &Path) -> bool {
+    let marker = format!("### {}", dir.join(AGENTS_MD_FILE).display());
+    history
+        .iter()
+        .any(|m| message_visible_texts(m).iter().any(|t| t.contains(&marker)))
+}
+
+/// 本会话已注入的子目录**个数**（判据 = 表头出现次数），用于 `MAX_SUBDIR_MEMORY_DIRS` 上限。
+fn subdir_memory_count(history: &[Value]) -> usize {
+    history
+        .iter()
+        .map(|m| {
+            message_visible_texts(m)
+                .iter()
+                .filter(|t| t.contains(SUBDIR_MEMORY_HEADER))
+                .count()
+        })
+        .sum()
+}
+
+/// 把一段文本**拼进某条 `tool_result` 的文本内部**（不新增消息 / 不新增内容块，规则 23）。
+/// `content` 不是字符串（如图片块数组）⇒ 不拼、返回 false。
+fn append_text_to_tool_result(block: &mut Value, text: &str) -> bool {
+    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return false;
+    }
+    let Some(prev) = block.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+    block["content"] = json!(format!("{prev}{text}"));
+    true
+}
+
+/// 对本轮工具调用做**子目录记忆懒加载**：只对**真正触碰过**的合格子目录，把其 AGENTS.md
+/// 拼进该调用自身的 `tool_result` 文本内部（不新增消息 / 块 ⇒ 固定前缀一字不动）。
+///
+/// 判据链：调用未被拒 → `tools::touched_dir` 取触达目录 → `tools::eligible_subdir` 过筛
+/// （在 cwd 内 / 更深 / 不在忽略名单 / 不超深度）→ 本轮与 `history` 双重去重 → 会话目录数
+/// 未达上限 → 文件非空。
+fn inject_subdir_memory(
+    cwd: &Path,
+    history: &[Value],
+    calls: &[(String, String, Value)],
+    run_inputs: &[Value],
+    denieds: &[Option<String>],
+    results: &mut [Value],
+) {
+    let mut injected_this_round: Vec<PathBuf> = Vec::new();
+    let mut count = subdir_memory_count(history);
+    let mut capped = false;
+    for (i, (_id, name, _input)) in calls.iter().enumerate() {
+        // 被审批 / hook 拒掉的调用没真正触碰到任何东西 ⇒ 不注入
+        if denieds.get(i).map_or(false, |d| d.is_some()) {
+            continue;
+        }
+        let Some(input) = run_inputs.get(i) else {
+            continue;
+        };
+        let Some(dir) = tools::touched_dir(cwd, name, input) else {
+            continue;
+        };
+        if !tools::eligible_subdir(cwd, &dir) {
+            continue;
+        }
+        if injected_this_round.contains(&dir) || subdir_memory_injected(history, &dir) {
+            continue; // 同一目录每会话只注一次（本轮 + 历史双重去重）
+        }
+        if count >= MAX_SUBDIR_MEMORY_DIRS {
+            capped = true;
+            continue;
+        }
+        let Some(block) = subdir_memory_block(&dir) else {
+            continue;
+        };
+        if append_text_to_tool_result(&mut results[i], &block) {
+            log::info(format!(
+                "子目录记忆已懒加载注入（进可变层、不碰固定前缀）：{}（{} 字）",
+                dir.join(AGENTS_MD_FILE).display(),
+                block.chars().count()
+            ));
+            injected_this_round.push(dir);
+            count += 1;
+        }
+    }
+    if capped {
+        log::warn(format!(
+            "子目录记忆已达每会话上限 {MAX_SUBDIR_MEMORY_DIRS} 个目录，本轮新触碰的未注入"
+        ));
+    }
 }
 
 /// 主系统提示词的装配 = 角色段 + 人格段 + 环境块 + 技能清单 —— **只在启动时调一次**
@@ -1380,11 +1894,11 @@ fn project_block(cwd: &std::path::Path) -> String {
 /// 抽成函数的唯一理由：让「用户人格**只**进主提示词」这条不变量能被单测钉住
 /// （见 `user_persona_reaches_only_the_main_prompt`）。
 ///
-/// ⚠️ **刻意不含「往期会话索引」与「长期记忆」**（2026-10-06 挪出，M2-16 方案 D）：
-/// 那两块随会话 / 记忆增长而变，留在 `system` 里会让**每次重启后** system 前缀整个变掉
-/// ⇒ 端点侧缓存从第 0 个 token 起全 miss（实测一天里 system hash 变了 4 次，每次重启后
-/// 首问命中率只有 11.7%–62%）。现在它们作为**一条 `user` 消息**注在 history 开头
-/// （见 [`context_block_message`]），system 从此**跨重启逐字节稳定**。
+/// ⚠️ **刻意不含「长期记忆」**（2026-10-06 挪出，M2-16 方案 D）：它随记忆增长而变，留在
+/// `system` 里会让**每次重启后** system 前缀整个变掉 ⇒ 端点侧缓存从第 0 个 token 起全
+/// miss（实测一天里 system hash 变了 4 次，每次重启后首问命中率只有 11.7%–62%）。现在它
+/// 作为**一条 `user` 消息**注在 history 开头（见 [`context_block_message`]），system 从此
+/// **跨重启逐字节稳定**。
 fn build_system_prompt(persona: &str, env: &str, skills: &str) -> String {
     format!(
         "{SYSTEM_PROMPT}\n\n{PERSONA_AND_STYLE}{}{env}{skills}",
@@ -1392,14 +1906,17 @@ fn build_system_prompt(persona: &str, env: &str, skills: &str) -> String {
     )
 }
 
-/// 上下文块（往期会话索引 + 长期记忆）的表头。
+/// 上下文块（长期记忆）的表头。
 ///
 /// 它同时是**幂等注入的判据**（见 [`is_context_block_msg`]）：`set_history`（回退 / 恢复
 /// 会话）会整份换掉 history，注过的那条随之消失 —— 下一问必须能认出「没有它」并补回去，
 /// 否则表现为「回退之后模型突然不记得长期记忆」。
 const CONTEXT_BLOCK_HEADER: &str = "# Background context (fixed for this session)";
 
-/// 把「往期会话索引」与「长期记忆」拼成**一条 `user` 消息**（两者都空 ⇒ `None`）。
+/// 把「长期记忆」拼成**一条 `user` 消息**（空 ⇒ `None`）。
+///
+/// **2026-10-07**：往期会话索引**不再进这里**（原先与记忆同块）—— 新建对话必须与上个对话
+/// 在模型侧隔离。要回忆往期会话，模型自己调 `SessionSearch`。
 ///
 /// **为什么是 `user` 消息、且注在 history 开头**（2026-10-06，M2-16 方案 D，三个位置逐一体检）：
 ///   · 留在 `system` ⇒ 重启后 system 变 ⇒ 端点缓存从 0 起全 miss（**这正是要修的**）；
@@ -1407,15 +1924,14 @@ const CONTEXT_BLOCK_HEADER: &str = "# Background context (fixed for this session
 ///     会让端点缓存单元整体失配（`read` 从 11776 掉到 2560，2026-09-20 实测、不得回退）；
 ///   · 注在**开头** ⇒ 只动一次、之后结构恒定，不碰那条红线，且换来 system 稳定。
 ///
-/// **代价（如实记）**：模型把它们当**用户说的话**看，不再有「系统级背景」的权威感 ——
+/// **代价（如实记）**：模型把它当**用户说的话**看，不再有「系统级背景」的权威感 ——
 /// 段内措辞已按「背景，不属于当前请求」写好，但仍不如 system 里硬。
-fn context_block_message(history_block: &str, memory_block: &str) -> Option<Value> {
-    let h = history_block.trim();
+fn context_block_message(memory_block: &str) -> Option<Value> {
     let m = memory_block.trim();
-    if h.is_empty() && m.is_empty() {
+    if m.is_empty() {
         return None;
     }
-    let text = format!("{CONTEXT_BLOCK_HEADER}\n{h}\n{m}");
+    let text = format!("{CONTEXT_BLOCK_HEADER}\n{m}");
     Some(json!({
         "role": "user",
         "content": [{ "type": "text", "text": text }],
@@ -1488,6 +2004,31 @@ fn env_block(cwd: &std::path::Path) -> String {
             std::path::Path::new(&modules_dir).join("README.md").display()
         )
     };
+    // 「东西该放哪」的四分法（2026-10-07）。**必须写死这块**：模型做 PS 插件时把整个项目
+    // 直接建在了 `skills\` 下 —— 它只看到「有这么个目录、能写」，就顺手用了。
+    // 四类目录各有唯一用途、宿主都会扫；放错 = 要么不生效，要么污染能力清单。
+    // tools\ 与 skills\ 同根（`<exe 根>\tools`），从 skills_dir 的父目录推出来，不另开环境变量。
+    let tools_dir = if skills_dir == "(not configured)" {
+        "(not configured)".to_string()
+    } else {
+        std::path::Path::new(&skills_dir)
+            .parent()
+            .map(|p| p.join("tools").display().to_string())
+            .unwrap_or_else(|| "(not configured)".into())
+    };
+    let placement_line = format!(
+        "- Where to put what you create — this app has FOUR directories, each with ONE purpose; \
+         never mix them and never invent a fifth:\n\
+         ○ Lunac plugin (a UI module for this app): {modules_dir}\n\
+         ○ AI skill (an instruction folder FOR YOU: a folder containing SKILL.md): {skills_dir}\n\
+         ○ MCP tool (a tool definition this app exposes to you as `mcp__*`): {tools_dir}\n\
+         ○ Anything else — standalone project / tool / script / experiment that is NOT one of the \
+         three above (e.g. a Photoshop CEP panel, a Python generator, a helper CLI): create it \
+         under the working directory above (or a folder under it). Do NOT put it in `skills\\`, \
+         `Modules\\` or `tools\\`.\n\
+         Rule of thumb: unless it is (a) loaded by Lunac's search panel, (b) an instruction file \
+         for you, or (c) a tool definition for you to call, it does not belong in those three.\n"
+    );
     format!(
         "\n\nEnvironment:\n\
          - Host: Lunac, a Windows desktop launcher. You are Lunac's built-in agent — not a \
@@ -1497,94 +2038,33 @@ fn env_block(cwd: &std::path::Path) -> String {
          user says \"my skills\", \"我自己的 skills\" or similar, they mean the skills of this app \
          (the ones listed below, if any) or this directory.\n\
          {}\
+         {}\
          - Other files on disk are ordinary files. If the workspace happens to contain another \
          agent/tool framework's repository, config or skills, do not treat it as Lunac's setup \
          and do not answer as if you were that product.",
         cwd.display(),
         skills_dir,
-        modules_line
+        modules_line,
+        placement_line
     )
 }
 
-// ── 往期会话索引（A2，2026-09-19）──────────────────────────────────
-//
-// 会话库（`<exe 根>\ModuleData\history\chat.db`）本来就带着 FTS5 索引，但从建库起
-// **一直没有调用方**。这里把它接上：启动时取一份「最近若干条会话」的窄表，拼进系统提示词，
-// 让模型知道「用户以前聊过什么」，从而在用户说「上次那个」时去调 `SessionSearch` 检索正文。
-//
-// **为什么是「启动时取一次」而不是每轮取**：这段进的是系统提示词，而系统提示词一旦
-// 变化，端点侧的整段前缀缓存就作废（ai-spec §11 规则 18 / 23）。每轮都重取 = 每轮都
-// cache-miss，代价远大于这点信息量。所以做成**冻结快照**：进程生命周期内逐字节不变，
-// 本次会话新存的会话只落盘，下次重启 agent 才可见。
-
-/// 开关：`0` / `false` / `off` / `no` 关闭。**默认开**（写法与 `LUNAC_SUMMARY_COMPACT` 一致）。
-const HISTORY_INDEX_ENV: &str = "LUNAC_HISTORY_INDEX";
-
-/// 往期会话索引是否启用。
-fn history_index_enabled() -> bool {
-    match std::env::var(HISTORY_INDEX_ENV) {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
-}
-
-/// 取「往期会话索引」固定段（带前导空行，直接拼进系统提示词）。
-///
-/// `search_tool_on` = `SessionSearch` 没有被 `--disallowedTools` 裁掉。**必须传**：
-/// 索引段里明确写着「去调 `SessionSearch` 读正文」，工具被禁用还注入索引，等于
-/// 让模型去调一个不存在的工具（与技能清单遇 `Skill` 被禁就不列是同一个道理）。
-///
-/// 拿不到就返回**空串**，任何情况都不报错、不阻断启动：索引是锦上添花 ——
-/// 桥没接通、库是空的（全新安装）、方法报错，都只是「这段不注入」而已。
-fn history_index_block(bridge: Option<&mut mcp::McpSet>, search_tool_on: bool) -> String {
-    if !search_tool_on {
-        eprintln!("[agent] SessionSearch 已被 --disallowedTools 禁用：不注入往期会话索引");
-        return String::new();
-    }
-    if !history_index_enabled() {
-        eprintln!("[agent] 往期会话索引已关闭（{HISTORY_INDEX_ENV}=0）");
-        return String::new();
-    }
-    let Some(b) = bridge else {
-        return String::new();
-    };
-    match b.history_index() {
-        Ok(text) => {
-            let text = text.trim();
-            if text.is_empty() {
-                return String::new();
-            }
-            eprintln!("[agent] 往期会话索引已注入（{} 字）", text.chars().count());
-            format!("\n\n{text}")
-        }
-        Err(e) => {
-            eprintln!("[agent] 往期会话索引不可用（跳过）: {e}");
-            String::new()
-        }
-    }
-}
-
-
 // ── 长期记忆（A4，2026-09-20）────────────────────────────────────
 //
-// 与**往期会话索引**（A2）是两层不同的东西，别混：
-//   · 往期会话索引 = `chat.db` 里的**原始流水**。注入的只是一张「标题 + 首句」的窄表，
-//     正文要靠模型自己调 `SessionSearch` 现查；
-//   · 长期记忆 = 从流水里**提炼出来的少量结论**（用户偏好 / 项目约定 / 踩过的坑），
-//     整段注入（服务端上限 6000 字符）。
-// 为什么结论要注入、而流水只给索引：结论是每轮都可能用到的背景（现查既慢又贵），
-// 而流水太长、只能现查。
+// **注意**：往期会话索引（A2）自 2026-10-07 起**不再注入** —— 新建对话必须与上个对话在
+// 模型侧隔离（每次重启都会把刚结束的那个会话列进索引 ⇒ 思考里带上个对话的痕迹，用户报的
+// 就是这个）。取回侧保留：要回忆往期会话，模型自己调 `SessionSearch`（`lunac/history_search`）。
+//
+// 长期记忆 = 从流水里**提炼出来的少量结论**（用户偏好 / 项目约定 / 踩过的坑），整段注入
+// （服务端上限 6000 字符）。结论是每轮都可能用到的背景（现查既慢又贵），所以注入。
 //
 // 写入侧（`Remember` 工具 + 每 N 轮的后台复盘 fork）见 `main()` 的装配与 `run_review_fork`。
 //
-// 冻结快照纪律（规则 18 / 53，与往期会话索引同）：**只在启动时读一次**。会话中新写的
+// 冻结快照纪律（规则 18 / 53）：**只在启动时读一次**。会话中新写的
 // 记忆**只落盘**，本次进程的系统提示词逐字节不变；下次重启 agent 才可见。
 // 反面做法（「保存记忆后刷新提示词」）会让每一轮都 cache-miss，代价远大于这点信息量。
 
-/// 开关：`0` / `false` / `off` / `no` 关闭（写法与 `LUNAC_HISTORY_INDEX` 一致）。**默认开**。
+/// 开关：`0` / `false` / `off` / `no` 关闭（与 `LUNAC_SUMMARY_COMPACT` 同写法）。**默认开**。
 const MEMORY_ENV: &str = "LUNAC_MEMORY";
 
 fn memory_enabled() -> bool {
@@ -1637,17 +2117,47 @@ fn memory_block(bridge: Option<&mut mcp::McpSet>, remember_tool_on: bool) -> Str
         eprintln!("[agent] 长期记忆已关闭（{MEMORY_ENV}=0）");
         return String::new();
     }
-    let Some(text) = fetch_memory(bridge) else {
-        return String::new();
-    };
-    // 超限时保留**较早**的部分（`truncate_chars` 留头部）：较早的条目是更established的
-    // 约定，尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入
-    // 已按同值封顶），只有用户手工把文件改大才会触发。
-    let body = if text.chars().count() > MEMORY_INJECT_CHARS {
-        crate::log::truncate_chars(&text, MEMORY_INJECT_CHARS)
+    // 记忆正文（可能为空）。**空记忆不再直接返回空串**：改造前那样写，全新安装时系统提示词
+    // 里完全没有 Remember 引导，模型不知道可以主动写、而唯一能播种的复盘又没触发 ⇒ 冷启动
+    // 死锁（2026-10-11 修，方案 D）。改为「正文可空、引导照发」。
+    //
+    // 超限时保留**较早**的部分（truncate_chars 留头部）：较早的条目是更 established 的约定，
+    // 尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入已按同值封顶），
+    // 只有用户手工把文件改大才会触发。
+    let body = fetch_memory(bridge)
+        .map(|text| {
+            if text.chars().count() > MEMORY_INJECT_CHARS {
+                crate::log::truncate_chars(&text, MEMORY_INJECT_CHARS)
+            } else {
+                text
+            }
+        })
+        .unwrap_or_default();
+    let block = memory_block_text(remember_tool_on, &body);
+    if block.is_empty() {
+        return block;
+    }
+    if body.is_empty() {
+        eprintln!("[agent] 长期记忆为空，已注入 Remember 引导（冷启动）");
     } else {
-        text
-    };
+        eprintln!("[agent] 长期记忆已注入（{} 字）", body.chars().count());
+    }
+    block
+}
+
+/// 组装长期记忆注入段（纯函数：只依赖「写侧引导是否可用」与「记忆正文」，便于单测）。
+///
+/// 缓存纪律（2026-10-11 方案 D 明确）：表头与引导句是**固定前缀**，记忆正文永远拼在它们
+/// 之后（顺序固定为 表头 + 引导 + 空行 + 正文）。于是「空记忆 → 有记忆」时，块首到引导末尾
+/// 逐字节不变 —— 端点按最长公共前缀命中，只有正文那一段 miss，而不是从块首整段作废。
+/// 反面做法（正文插到引导之前 / 引导里回显正文）会让**每写一次记忆就打掉一次缓存**。
+///
+/// 空记忆 + 写侧不可用 ⇒ 空串：没有正文可注、也没有可写的工具，拿一句「记忆是空的」去占
+/// 前缀只是纯噪音（也是改造前的行为）。
+fn memory_block_text(remember_tool_on: bool, body: &str) -> String {
+    if body.is_empty() && !remember_tool_on {
+        return String::new();
+    }
     let tail = if remember_tool_on {
         "- Add a fact with the `Remember` tool (one concise fact per call). Do not use it for \
          one-off details or for the current task's progress."
@@ -1655,7 +2165,6 @@ fn memory_block(bridge: Option<&mut mcp::McpSet>, remember_tool_on: bool) -> Str
         "- (The `Remember` tool is disabled in this session, so this memory can only be \
          extended outside this app.)"
     };
-    eprintln!("[agent] 长期记忆已注入（{} 字）", body.chars().count());
     format!(
         "\n\n# Long-term memory\n\
          Durable facts saved in earlier sessions. Treat them as background you already know; \
@@ -1711,6 +2220,16 @@ fn thinking_from(value: Option<&str>) -> Thinking {
     }
 }
 
+/// 「按轮思考覆盖」（2026-10-09）：用户消息里带 `"thinking":"off"` ⇒ 该轮**强制关** thinking，
+/// 与全局开关（`LUNAC_THINKING` / `cfg.thinking`）无关。**只认 `off`** —— 其余值（含 `on`）
+/// 一律返回 `None` = 不覆盖、用全局档。目的只有一个：让桌宠那一轮不烧推理 token。
+fn thinking_override_from(value: Option<&str>) -> Option<Thinking> {
+    match value.map(str::trim) {
+        Some("off") | Some("0") | Some("false") => Some(Thinking::Disabled),
+        _ => None,
+    }
+}
+
 impl Thinking {
     fn from_env() -> Self {
         thinking_from(std::env::var("LUNAC_THINKING").ok().as_deref())
@@ -1736,11 +2255,24 @@ impl Thinking {
     }
 }
 
+/// 思考档在 `budget_tokens` 之外留给**答复本体**的余量。
+///
+/// `budget_tokens` 只约束「想多久」；**想的 token 与答复 / 工具参数的 token 共用
+/// `max_tokens` 这一个池子**，所以 `budget + 4096` 等于把答复挤到 4096 以内。
+/// 2026-10-07 的实测把这条钉死了：当天 `usage-2026-10-07.jsonl` 里 **2 次请求的输出正好
+/// 落到 12288**（= 8192 预算 + 4096），即**撞上上限被截断** —— 一次没写完，模型得重来，
+/// 是纯浪费（写出去的半截照样按输出计费）。端点侧上限是 384K，余量给到 16384 仍远低于它。
+const THINKING_HEADROOM_TOKENS: u32 = 16_384;
+
 /// 端点要求 `budget_tokens < max_tokens`，故开档必须抬高 max_tokens，
 /// 否则 8192 的预算配 8192 的上限会被判参数非法。
+///
+/// ⚠️ 这个值**只是上限、不是目标** —— 抬高它不直接增加花费（计费按实际生成量），
+/// 只是不再把「思考 + 答复」挤断。关档路径仍用 `BASE_MAX_TOKENS`：那条路径上没有思考
+/// 抢池子，收紧上限正是「答案本分」纪律的一部分。
 fn max_tokens_for(plan: Thinking) -> u32 {
     match plan {
-        Thinking::Budget(n) => (n + 4096).max(BASE_MAX_TOKENS),
+        Thinking::Budget(n) => (n + THINKING_HEADROOM_TOKENS).max(BASE_MAX_TOKENS),
         _ => BASE_MAX_TOKENS,
     }
 }
@@ -1942,10 +2474,100 @@ impl Cfg {
 
 // ── stdout 输出（前端逐行 JSON.parse）────────────────────────────
 
+/// 单发模式（--print）的 stdout 形态（2026-10-11）。
+/// 常驻模式恒为 StreamJson（现行为，逐字节不变）——只有单发才可能切到 Text / Json。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    /// 现有事件流：每行一条 JSON 事件（常驻模式与 --output-format stream-json 都用它）。
+    StreamJson,
+    /// 只把最终助手文本原样打到 stdout，不带任何 JSON 包装。
+    Text,
+    /// 只把**一条** result JSON 打到 stdout（含最终文本 + usage + 是否 error）。
+    Json,
+}
+
+/// 单发模式（无审批回包通道）下「需审批工具」的处置策略（2026-10-11）。
+/// 常驻模式恒为 Stdio（现状，逐字节不变）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalPolicy {
+    /// 常驻：需审批的工具发 control_request，等前端回 control_response（现状）。
+    Stdio,
+    /// 单发默认：需审批的工具**直接拒绝**，绝不阻塞等待（无回包通道，等就是卡死）。
+    UnattendedDeny,
+    /// 单发 + --dangerously-skip-permissions：需审批的工具**直接放行**（用户显式承担）。
+    UnattendedAllow,
+}
+
+static OUTPUT_MODE: AtomicU8 = AtomicU8::new(0);
+static APPROVAL_POLICY: AtomicU8 = AtomicU8::new(0);
+/// 单发模式下「本轮失败（需非 0 退出）」的标志：任何 is_error 的 result 或
+/// 因单发策略被拒的审批都会置它。常驻模式只写不读，对外不可见。
+static SINGLE_SHOT_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn set_output_mode(m: OutputMode) {
+    OUTPUT_MODE.store(m as u8, Ordering::Relaxed);
+}
+
+fn output_mode() -> OutputMode {
+    match OUTPUT_MODE.load(Ordering::Relaxed) {
+        1 => OutputMode::Text,
+        2 => OutputMode::Json,
+        _ => OutputMode::StreamJson,
+    }
+}
+
+fn set_approval_policy(p: ApprovalPolicy) {
+    APPROVAL_POLICY.store(p as u8, Ordering::Relaxed);
+}
+
+fn approval_policy() -> ApprovalPolicy {
+    match APPROVAL_POLICY.load(Ordering::Relaxed) {
+        1 => ApprovalPolicy::UnattendedDeny,
+        2 => ApprovalPolicy::UnattendedAllow,
+        _ => ApprovalPolicy::Stdio,
+    }
+}
+
 fn emit(line: Value) {
+    // 任何 is_error 的 result 都意味着「本轮失败」⇒ 单发模式据此非 0 退出。
+    if line.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+        SINGLE_SHOT_FAILED.store(true, Ordering::Relaxed);
+    }
+    match output_mode() {
+        // 常驻 / stream-json：每行一条 JSON 事件（现状）
+        OutputMode::StreamJson => write_stdout_line(&line),
+        // 单发 json：只落**最终 result** 一行（形状沿用既有 result 事件），其余事件不出 stdout
+        OutputMode::Json => {
+            if line.get("type").and_then(Value::as_str) == Some("result") {
+                write_stdout_line(&line);
+            }
+        }
+        // 单发 text：只把最终助手文本原样打出去（不带 JSON 包装）
+        OutputMode::Text => {
+            if line.get("type").and_then(Value::as_str) == Some("result") {
+                if let Some(t) = line.get("result").and_then(Value::as_str) {
+                    write_stdout_text(t);
+                }
+            }
+        }
+    }
+}
+
+fn write_stdout_line(v: &Value) {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = writeln!(lock, "{line}");
+    let _ = writeln!(lock, "{v}");
+    let _ = lock.flush();
+}
+
+/// 把一段文本原样写到 stdout（末尾没有换行就补一个）。
+fn write_stdout_text(t: &str) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = write!(lock, "{t}");
+    if !t.ends_with('\n') {
+        let _ = writeln!(lock);
+    }
     let _ = lock.flush();
 }
 
@@ -2068,6 +2690,11 @@ struct BgCmd {
 pub fn hand_off_to_background(job: BackgroundJob) -> String {
     let BackgroundJob { mut child, h_out, h_err, prog, label, ctl } = job;
     let id = format!("bg_{}_{}", std::process::id(), BG_SEQ.fetch_add(1, Ordering::Relaxed));
+    // 命令进程的 PID（2026-10-08，用户要求「AI 跑的命令要能在任务管理器里找到」）：
+    // 起的是 `cmd /C ...`，**真正干活的程序常常是它的孙进程**，而任务管理器默认只显示
+    // 映像名（`cmd.exe`）、不显示命令行 ⇒ 用户找不到。把 PID 一起交出去，前端那一行就能
+    // 显示「PID xxxxx」，用户按这个号在任务管理器里精确定位。
+    let pid = child.id();
     let shown: String = label.chars().take(120).collect();
     if let Ok(mut m) = BACKGROUND_CMDS.lock() {
         m.insert(id.clone(), BgCmd { tool_use_id: ctl.tool_use_id.clone(), label: shown.clone() });
@@ -2076,10 +2703,11 @@ pub fn hand_off_to_background(job: BackgroundJob) -> String {
         "type": "system",
         "subtype": "background_started",
         "id": id,
+        "pid": pid,
         "tool_use_id": ctl.tool_use_id,
         "label": shown,
     }));
-    log::info(format!("shell[{prog}] 转后台 id={id} cmd={shown}"));
+    log::info(format!("shell[{prog}] 转后台 id={id} pid={pid} cmd={shown}"));
 
     let id2 = id.clone();
     std::thread::spawn(move || {
@@ -2316,9 +2944,15 @@ struct Pending {
 ///
 /// `Write` 取 `content`；`Edit` 取 `new_string` —— **不取 `old_string`**：那是要被删掉的
 /// 内容，扫它会把「正在清理凭据」的操作也标成可疑，正好反了。
+/// `NotebookEdit`（2026-10-11）取 `new_source`；`delete` 档没有这个字段 ⇒ 返回 `None`，
+/// 不扫（删 cell 不写入任何新内容）。
 /// 返回 `None` = 入参缺字段（工具执行时会自己报参数错误，这里不重复判定）。
 fn written_payload<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
-    let key = if tool_name == "Edit" { "new_string" } else { "content" };
+    let key = match tool_name {
+        "Edit" => "new_string",
+        "NotebookEdit" => "new_source",
+        _ => "content",
+    };
     input.get(key).and_then(Value::as_str)
 }
 
@@ -2329,10 +2963,10 @@ fn written_payload<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
 /// 单独算一次（而不是把审批的结果捎过来）是**有意**的：hook 预先放行时 `open_approval`
 /// 根本不会被调用，那条路也必须有告警。
 ///
-/// 只覆盖 `Write` / `Edit`。`Cmd` / `PowerShell` 扫的是**命令**、走 `bash_safety`，
-/// 那是另一套规则集（见 §13.1「两个方向别混」）。
+/// 只覆盖 `Write` / `Edit` / `NotebookEdit`。`Cmd` / `PowerShell` 扫的是**命令**、走
+/// `bash_safety`，那是另一套规则集（见 §13.1「两个方向别混」）。
 fn security_warnings(tool_name: &str, input: &Value) -> Value {
-    if !matches!(tool_name, "Write" | "Edit") {
+    if !matches!(tool_name, "Write" | "Edit" | "NotebookEdit") {
         return json!([]);
     }
     match written_payload(tool_name, input) {
@@ -2401,7 +3035,7 @@ fn open_approval(
     // 只做「凭据 / 密钥泄漏」这一类 —— 审批卡是用户唯一能看见内容的地方，
     // 把可疑点抽出来显式标出，否则「扫一眼就点允许」等于没有审批。
     // 前端把它当「必须人看一档」处理：不自动放行、也不给「始终允许」。
-    if matches!(tool_name, "Write" | "Edit") {
+    if matches!(tool_name, "Write" | "Edit" | "NotebookEdit") {
         if let Some(text) = written_payload(tool_name, input) {
             let report = content_safety::analyze(text);
             if !report.is_clean() {
@@ -2463,6 +3097,392 @@ fn await_approval(pending: Pending, original: &Value) -> Decision {
     }
 }
 
+// ── MCP sampling（服务端反向调用模型，默认声明）────────────────────
+//
+// 处理服务端 `sampling/createMessage`：**复用既有模型调用入口** —— 与摘要压缩同一套
+// 「非流式 Messages 请求 + `usage` 归因」的写法（见 `summarize_dropped`），不新开 HTTP 通道。
+//
+// **执行顺序**（2026-10-11 用户裁决，本任务题眼）：
+//   ① 无审批通道（单发 `--print`）⇒ **明确拒绝** —— `--dangerously-skip-permissions` 也
+//      **不能**放行（它只让「工具审批」直接过，对 sampling 这道高底线闸无效）；
+//   ② **高底线审批卡**：用户**明确同意**才继续（不可被 hook 的 `allow` / 白名单 / 自动档跳过；
+//      卡上只给「允许（本会话）/ 拒绝」，**没有**「始终允许」）。**本会话记住**：用户点过一次
+//      「允许」后，**本会话内该服务器**再请求 sampling 直接放行、不再弹卡（进程重启即忘）；
+//      拒绝**不**记入，故下一次仍要卡。经 **HTTP 反向通道**到达的请求弹**警告样式**的卡；
+//   ③ **成本护栏（第二层兜底）**：单次 token 预算 + 会话内次数上限，超限即拒并说明。
+//
+// 任何一条不满足都**明确拒绝**（`mcp_sampling_create` 返回 Err，由 `mcp.rs` 的
+// `answer_server_request` 包成带说明的 JSON-RPC error），绝不静默挂起。
+// 「本会话记住」只跳过**审批卡**这一道；①③ 两道照旧（单发仍拒、预算与次数仍计）。
+
+/// 单次 sampling 的 token 预算上限（请求里的 `maxTokens` 超过它即拒）。
+const MCP_SAMPLING_MAX_TOKENS_ENV: &str = "LUNAC_MCP_SAMPLING_MAX_TOKENS";
+const MCP_SAMPLING_DEFAULT_MAX_TOKENS: u64 = 4096;
+/// 会话内（进程级）sampling 次数上限。
+const MCP_SAMPLING_MAX_CALLS_ENV: &str = "LUNAC_MCP_SAMPLING_MAX_CALLS";
+const MCP_SAMPLING_DEFAULT_MAX_CALLS: u64 = 8;
+/// 单次 sampling 的 HTTP 超时（与摘要压缩同量级；不占共享客户端的 1800s）。
+const MCP_SAMPLING_TIMEOUT_SECS: u64 = 120;
+
+/// sampling 用的独立 `Cfg`（`detached()` 出来、与主循环**共享** `sub` 用量账）。
+///
+/// 为什么走全局：`Bridge` 里的钩子是 `'static`，捕获不了主循环那份 `&Cfg`（含 `Cell`、非
+/// `Sync`）；而钩子在 `McpSet::connect` 时就装好，那时主 `cfg` 还没建（见 `main`）。故
+/// `cfg` 建好后放一份进来，钩子取用。未就绪时（握手阶段就收到 sampling）如实报「未就绪」。
+static MCP_SAMPLING_CFG: Mutex<Option<Cfg>> = Mutex::new(None);
+/// 本会话已处理的 sampling 次数（进程重启即归零）。
+static MCP_SAMPLING_CALLS: AtomicU64 = AtomicU64::new(0);
+/// 本会话已同意 sampling 的服务器集合（**仅记本会话**：进程重启即清空）。键见
+/// [`sampling_approval_key`]。**只在用户显式点过「允许」之后写入**（拒绝不写）——
+/// 这是「用户同意一次、本会话内该服务器不再弹卡」的唯一来源，绝不由自动放行写入。
+static MCP_SAMPLING_APPROVED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// sampling 授权「本会话记住」的键 = 传输 + 服务器名。
+///
+/// **为什么带上传输**：stdio 与 HTTP 是两条不同的信任路径（后者是服务器**经 HTTP 主动推来**的
+/// 反向请求）。若只按名字记，一个与已同意的 stdio 服务器**同名**的恶意 HTTP 服务器就会被静默
+/// 放行、连警告卡都不弹 —— 故两者分开记。
+fn sampling_approval_key(server: &str, via_http: bool) -> String {
+    format!("{}\u{1}{}", if via_http { "http" } else { "stdio" }, server)
+}
+
+/// 为某台服务器构造一个 sampling 处理钩子（每台一份，闭包捕获服务器名与传输用于审批卡）。
+/// 直接作为 [`mcp::SamplingFactoryFn`] 传给 `McpSet` —— 见 `McpSet::connect` / `add_project`。
+/// `via_http` = 这条是不是**远端 HTTP 服务器**（其 sampling 经响应 SSE 流的反向通道到达）⇒
+/// 审批卡渲染成**警告样式**。
+fn sampling_handler_for(server: &str, via_http: bool) -> Option<mcp::SamplingHandler> {
+    let name = server.to_string();
+    Some(Box::new(move |params: &Value| {
+        mcp_sampling_create(&name, params, via_http)
+    }))
+}
+
+/// 读一个正整数 env（缺失 / 非法 / ≤0 一律回落默认值）。
+fn mcp_sampling_u64(env: &str, default: u64) -> u64 {
+    std::env::var(env)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// 从一条 Messages 回包的 `usage` 取四类 token（缺字段 = 0）；顺序与 `SubagentUsage::record` 对齐。
+fn sampling_usage_quad(u: Option<&Value>) -> (u64, u64, u64, u64) {
+    let n = |k: &str| {
+        u.and_then(|v| v.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    (
+        n("input_tokens"),
+        n("cache_read_input_tokens"),
+        n("cache_creation_input_tokens"),
+        n("output_tokens"),
+    )
+}
+
+/// MCP `SamplingMessage[]` → Anthropic `messages[]`（只认 text / image 两种内容块）。
+fn mcp_sampling_messages(params: &Value) -> Result<Vec<Value>, String> {
+    let arr = params
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| "sampling refused: missing or empty `messages`".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for m in arr {
+        let role = match m.get("role").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            other => return Err(format!("sampling refused: bad message role {other:?}")),
+        };
+        let content = m
+            .get("content")
+            .ok_or_else(|| "sampling refused: message has no content".to_string())?;
+        out.push(json!({ "role": role, "content": [mcp_sampling_content_block(content)?] }));
+    }
+    Ok(out)
+}
+
+/// 单个 MCP 内容块 → Anthropic 内容块。认不出的类型**一律拒** —— 宁可拒，也不把不明内容当文本塞进去。
+fn mcp_sampling_content_block(content: &Value) -> Result<Value, String> {
+    match content.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(json!({
+            "type": "text",
+            "text": content.get("text").and_then(Value::as_str).unwrap_or(""),
+        })),
+        Some("image") => Ok(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": content.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                "data": content.get("data").and_then(Value::as_str).unwrap_or(""),
+            }
+        })),
+        other => Err(format!(
+            "sampling refused: unsupported content type {other:?} (only text/image supported)"
+        )),
+    }
+}
+
+/// 高底线审批卡：服务端要借本机模型（`sampling`）时才问。
+///
+/// 走的是与 `open_elicitation` / `ask_mcp_trust` **同一条**审批通道（`control_request` /
+/// `control_response`），但载荷形状与语义是独立的：`subtype = "mcp_sampling"`。
+///
+/// **本会话记住**：用户点过「允许」后，本会话内**同一服务器**（键含传输，见
+/// [`sampling_approval_key`]）再请求 sampling **直接放行、不再弹卡**；拒绝**不**记入，
+/// 故下一次仍要卡。集合只写在这里（用户显式允许），进程重启即清空。
+///
+/// **不可被自动放行跳过**（本任务核心约束）：
+///   · `--dangerously-skip-permissions` —— 调用方在进入本函数前已按 `approval_policy()`
+///     把它挡在门外（`UnattendedAllow` 与 `UnattendedDeny` 同样拒绝），到不了这里；
+///   · hook 的 `allow` —— hooks 只挂在「工具调用」路径（`PreToolUse` / `PermissionRequest`），
+///     sampling 是**服务端反向请求**、不是工具调用，根本不经过 hooks；
+///   · 白名单 / `always-allow` —— 本卡只给「允许（本会话）/ 拒绝」两个按钮，**不提供**「始终允许」，
+///     前端也不会把它交给 `classifyRequest()`（那条路只管 `can_use_tool`）；
+///   · 自动档 —— 不经过 `classifyRequest()`，本卡照弹（除非本会话已记住，那是**用户此前显式允许**的）。
+///
+/// 返回 `true` = 用户显式点了「允许」（或本会话此前已允许该服务器）；
+/// `false` = 用户拒绝 / 超时 / 卡被撤（一律按拒绝）。
+fn open_sampling_approval(server: &str, params: &Value, via_http: bool) -> bool {
+    let key = sampling_approval_key(server, via_http);
+    // 本会话已同意过该服务器 ⇒ 直接放行、不再弹卡（**只由用户显式点过「允许」写入**）。
+    if MCP_SAMPLING_APPROVED
+        .lock()
+        .map(|s| s.iter().any(|k| k == &key))
+        .unwrap_or(false)
+    {
+        log::info(format!(
+            "MCP sampling：本会话已同意（{key}），直接放行、不再弹卡"
+        ));
+        return true;
+    }
+    let request_id = next_request_id();
+    let (tx, rx) = mpsc::channel::<Value>();
+    if let Ok(mut reg) = pending_approvals().lock() {
+        reg.insert(request_id.clone(), tx);
+    }
+    let message_count = params
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let max_tokens = params.get("maxTokens").and_then(Value::as_u64).unwrap_or(0);
+    let label = if server.trim().is_empty() { "MCP" } else { server };
+    log::info(format!(
+        "MCP sampling 授权询问：server={label} via_http={via_http} messages={message_count} maxTokens={max_tokens}"
+    ));
+    emit(json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "mcp_sampling",
+            "server": label,
+            "messageCount": message_count,
+            "maxTokens": max_tokens,
+            // 反向（HTTP）路径标记：前端据此渲染**警告样式**的卡（与 stdio 常规卡区分）。
+            "viaHttp": via_http,
+        }
+    }));
+    let allowed = matches!(
+        await_approval(Pending { request_id, rx }, &json!({})),
+        Decision::Allow(_)
+    );
+    if allowed {
+        if let Ok(mut s) = MCP_SAMPLING_APPROVED.lock() {
+            if !s.iter().any(|k| k == &key) {
+                s.push(key);
+            }
+        }
+    }
+    allowed
+}
+
+/// 处理一次服务端 `sampling/createMessage`（护栏与复用点见本节文件头注释）。
+///
+/// 入参 = MCP `CreateMessageRequest` 的 `params`（`{messages, systemPrompt?, maxTokens, …}`）；
+/// 返回 `Ok(CreateMessageResult)`，或 `Err(拒绝原因)`（会变成带说明的 JSON-RPC error）。
+fn mcp_sampling_create(server: &str, params: &Value, via_http: bool) -> Result<Value, String> {
+    // 高底线闸①：没有审批回包通道（单发 `--print` 的 `UnattendedDeny` / `UnattendedAllow`）
+    // ⇒ 直接拒。**关键**：`UnattendedAllow`（= `--dangerously-skip-permissions`）在这里与
+    // `UnattendedDeny` **同等**被拒 —— 借用户的模型这件事不可被 skip-permissions 静默放行。
+    if approval_policy() != ApprovalPolicy::Stdio {
+        SINGLE_SHOT_FAILED.store(true, Ordering::Relaxed);
+        log::warn("单发模式（--print）无审批通道，sampling 直接拒绝");
+        return Err(
+            "sampling refused: no user-approval channel (single-shot / --print mode); \
+             borrowing the model needs an interactive consent this mode cannot provide"
+                .into(),
+        );
+    }
+    // 高底线闸②：弹卡（用户明确同意才继续）。**本会话记住**：本会话内已同意过该服务器
+    // ⇒ 在 `open_sampling_approval` 内部直接放行、不再弹卡（只跳过卡，不跳过①③两道）。
+    if !open_sampling_approval(server, params, via_http) {
+        return Err("sampling refused: the user denied this request".into());
+    }
+
+    // 成本护栏（第二层兜底，见本节文件头）：单次 token 预算 + 会话内次数上限。
+    let budget = mcp_sampling_u64(MCP_SAMPLING_MAX_TOKENS_ENV, MCP_SAMPLING_DEFAULT_MAX_TOKENS);
+    let max_calls = mcp_sampling_u64(MCP_SAMPLING_MAX_CALLS_ENV, MCP_SAMPLING_DEFAULT_MAX_CALLS);
+
+    // 把请求翻成 Anthropic Messages 形状（**不带 tools**，见护栏③）。翻不动就拒。
+    let msgs = mcp_sampling_messages(params)?;
+    let in_chars: usize = msgs.iter().map(|m| m.to_string().chars().count()).sum();
+
+    // 护栏②：成本上限 —— 单次 token 预算 + 会话内次数上限，任一超限即拒并说明。
+    let requested = params
+        .get("maxTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(budget);
+    if requested > budget {
+        return Err(format!(
+            "sampling refused: requested maxTokens={requested} exceeds the per-call budget \
+             {budget} ({MCP_SAMPLING_MAX_TOKENS_ENV})"
+        ));
+    }
+    // 输入侧粗算（≈4 字符/token，与固定前缀那条口径同）：服务端不该拿超大 prompt 烧钱。
+    if in_chars > (budget as usize) * 4 {
+        return Err(format!(
+            "sampling refused: input too large (~{in_chars} chars) for the {budget}-token budget"
+        ));
+    }
+    let n = MCP_SAMPLING_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > max_calls {
+        return Err(format!(
+            "sampling refused: session call limit reached ({max_calls}, {MCP_SAMPLING_MAX_CALLS_ENV})"
+        ));
+    }
+
+    // 采样上下文未就绪 = 握手期就收到了 sampling ⇒ 明确报错，绝不干等。
+    let guard = MCP_SAMPLING_CFG
+        .lock()
+        .map_err(|_| "sampling refused: model context is poisoned".to_string())?;
+    let cfg = guard.as_ref().ok_or_else(|| {
+        "sampling refused: model context is not ready yet \
+         (request arrived before startup finished)"
+            .to_string()
+    })?;
+
+    // 组装请求体。**不带 `tools`** ⇒ 护栏③：模型不可能产生 tool_use，服务端无法借
+    // sampling 驱动本机工具。服务端的 `modelPreferences` **一律忽略** —— 模型只能由本机
+    // 配置决定（成本 / 安全，服务端不得指定我们要花多少钱）。
+    let mut body = json!({
+        "model": cfg.model,
+        "max_tokens": requested,
+        "stream": false,
+        "messages": msgs,
+    });
+    if let Some(sys) = params.get("systemPrompt").and_then(Value::as_str) {
+        if !sys.trim().is_empty() {
+            body["system"] = json!(sys);
+        }
+    }
+    if let Some(t) = params.get("temperature").and_then(Value::as_f64) {
+        body["temperature"] = json!(t);
+    }
+    if let Some(s) = params.get("stopSequences") {
+        if s.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            body["stop_sequences"] = s.clone();
+        }
+    }
+
+    // 调试转储（LUNAC_DUMP_API）：非流式，request/response 各一行，req_id = `sampling-<ms>`。
+    let dump_on = log::dump_api_enabled();
+    let dump_rid = if dump_on {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let rid = format!("sampling-{ms}");
+        log::dump_api("request", &rid, &cfg.model, None, None, &body);
+        rid
+    } else {
+        String::new()
+    };
+
+    let resp = cfg
+        .client
+        .post(&cfg.endpoint)
+        .timeout(Duration::from_secs(MCP_SAMPLING_TIMEOUT_SECS))
+        .header("authorization", format!("Bearer {}", cfg.token))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            if dump_on {
+                log::dump_api(
+                    "response",
+                    &dump_rid,
+                    &cfg.model,
+                    None,
+                    Some(&e.to_string()),
+                    &Value::Null,
+                );
+            }
+            return Err(format!("sampling model call failed: {e}"));
+        }
+    };
+    let status = resp.status();
+    let raw = resp
+        .text()
+        .map_err(|e| format!("sampling response read failed: {e}"))?;
+    if dump_on {
+        log::dump_api(
+            "response",
+            &dump_rid,
+            &cfg.model,
+            Some(status.as_u16()),
+            None,
+            &Value::String(raw.clone()),
+        );
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "sampling model call failed (HTTP {status}): {}",
+            log::truncate_chars(&raw, 200)
+        ));
+    }
+    let parsed: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("sampling response is not JSON: {e}"))?;
+
+    // 护栏④：用量归因 —— 记进**主循环那本账**（`SubagentUsage` ⇒ `usage_delta` +
+    // `result.usage.subagent`），并在日志里标明来源是 MCP 服务端的反向调用
+    //（成本不能记到用户头上还不说）。
+    let (r_in, r_read, r_create, r_out) = sampling_usage_quad(parsed.get("usage"));
+    cfg.sub.record(r_in, r_read, r_create, r_out);
+    log::info(format!(
+        "MCP sampling 用量：来源=MCP 服务端反向调用（会话第 {n}/{max_calls} 次）\
+         in={r_in} read={r_read} create={r_create} out={r_out}"
+    ));
+
+    let text = parsed
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("sampling model returned no text".into());
+    }
+
+    Ok(json!({
+        "role": "assistant",
+        "content": { "type": "text", "text": text },
+        "model": cfg.model,
+        "stopReason": "endTurn",
+    }))
+}
+
 /// 处理服务端反向发来的 `elicitation/create`（A13）：把「向用户提问」这件事接到
 /// **既有的审批通道**上 —— 前端照常收 `control_request` / 回 `control_response`，
 /// agent 侧不必为它另开一条协议。
@@ -2474,6 +3494,11 @@ fn await_approval(pending: Pending, original: &Value) -> Decision {
 /// 返回 MCP 规范要求的 elicitation 结果：`accept` + `content`（用户填的值）/
 /// `decline`（用户点了拒绝或超时）。
 fn open_elicitation(params: &Value) -> Value {
+    // 单发模式没有审批回包通道 ⇒ 直接拒绝，绝不对着无人应答的通道干等（会卡满超时）。
+    if approval_policy() != ApprovalPolicy::Stdio {
+        log::warn("单发模式（--print）无审批通道，elicitation 直接拒绝");
+        return json!({ "action": "decline" });
+    }
     let request_id = next_request_id();
     let (tx, rx) = mpsc::channel::<Value>();
     if let Ok(mut reg) = pending_approvals().lock() {
@@ -2600,7 +3625,7 @@ fn connect_project_servers(
     }
     let added = bridge
         .get_or_insert_with(mcp::McpSet::empty)
-        .add_project(servers, disallowed);
+        .add_project(servers, disallowed, sampling_handler_for);
     if added.is_empty() {
         return;
     }
@@ -2720,7 +3745,7 @@ fn hook_allow_needs_card(tool: &str, input: &Value) -> bool {
             return !bash_safety::analyze(cmd).dangerous.is_empty();
         }
     }
-    if matches!(tool, "Write" | "Edit") {
+    if matches!(tool, "Write" | "Edit" | "NotebookEdit") {
         if let Some(text) = written_payload(tool, input) {
             return !content_safety::analyze(text).is_clean();
         }
@@ -2751,7 +3776,10 @@ fn fire_plain_hook(event: &str, cwd: &Path, payload: Value) -> hooks::Run {
 //   --dangerously-skip-permissions 忽略工作区锁（full 档）
 //   --permission-prompt-tool stdio 审批走 stdout/stdin 的 control 协议（P2）
 //   --disallowedTools <name…>      variadic：这些工具不进请求体
-// 其余（--print / --verbose / --input-format …）一律接受并忽略。
+//   --print / -p [query]           单发：跑恰好一轮提问后退出（见 single_shot）
+//   --output-format <fmt>          单发模式的 stdout 形态（text / json / stream-json）
+//   --input-format stream-json     常驻 stdio 流式输入模式标志（宿主一直传它）
+// 其余（--verbose / --include-partial-messages …）一律接受并忽略。
 #[derive(Default)]
 struct CliArgs {
     add_dirs: Vec<PathBuf>,
@@ -2762,6 +3790,14 @@ struct CliArgs {
     /// `--mcp-server stdio:<exe 路径>` —— 上游把 lunac.exe 路径交给我们，
     /// 由 agent 侧拉起它的 MCP server（见 mcp.rs）
     mcp_server: Option<String>,
+    /// `--print` / `-p`：单发模式。是否真生效还要看 `input_stream_json`（见 single_shot）。
+    print: bool,
+    /// `--print` 紧跟的那个非 flag 值（就是 query）。没给 = 从 stdin 读一次。
+    print_query: Option<String>,
+    /// `--output-format`（`text` / `json` / `stream-json`），默认 `text`。只在单发模式生效。
+    output_format: String,
+    /// `--input-format stream-json` —— 常驻 stdio 流式输入模式的标志（宿主 / e2e 脚本都传它）。
+    input_stream_json: bool,
 }
 
 impl CliArgs {
@@ -2791,6 +3827,29 @@ impl CliArgs {
                     }
                 }
                 "--dangerously-skip-permissions" => out.skip_permissions = true,
+                "--print" | "-p" => {
+                    out.print = true;
+                    // 只有**紧跟在后面且不是 flag** 的那个 token 才算 query —— 否则
+                    // `--print --verbose …`（宿主形态）会把 --verbose 误当提问。
+                    if let Some(v) = args.get(i + 1) {
+                        if !v.starts_with('-') {
+                            out.print_query = Some(v.clone());
+                            i += 1;
+                        }
+                    }
+                }
+                "--output-format" => {
+                    if let Some(v) = args.get(i + 1) {
+                        out.output_format = v.clone();
+                        i += 1;
+                    }
+                }
+                "--input-format" => {
+                    if let Some(v) = args.get(i + 1) {
+                        out.input_stream_json = v == "stream-json";
+                        i += 1;
+                    }
+                }
                 "--mcp-server" => {
                     if let Some(v) = args.get(i + 1) {
                         out.mcp_server = Some(v.clone());
@@ -2810,7 +3869,19 @@ impl CliArgs {
             }
             i += 1;
         }
+        if out.output_format.is_empty() {
+            out.output_format = "text".to_string();
+        }
         out
+    }
+
+    /// 单发模式（--print）是否生效。
+    ///
+    /// 例外：`--print` + `--input-format stream-json` = 上游常驻 stdio 流式输入模式
+    /// （宿主的 `start_cli_process` 一直这么传），必须保持常驻、绝不能退化成单发。
+    /// 于是判据是「带 --print 且未显式声明 stream-json 输入」。
+    fn single_shot(&self) -> bool {
+        self.print && !self.input_stream_json
     }
 }
 
@@ -2826,6 +3897,43 @@ fn main() {
     // 没有控制台，下面所有 eprintln 线上都拿不到 —— 出问题只能靠这个文件回溯。
     log::init("agent");
     let cli = CliArgs::parse(&args);
+    // 单发模式（--print）在解析后立刻定型：全局 stdout 形态与审批策略只有单发才改，
+    // 常驻模式保持恒默认（StreamJson / Stdio）⇒ 行为逐字节不变。
+    let single_shot = cli.single_shot();
+    let print_query: Option<String> = if single_shot {
+        match cli.print_query.clone() {
+            Some(q) => Some(q),
+            None => {
+                // --print 没带值 ⇒ 从 stdin 读**一次**（整段当一条 query，读到 EOF 为止）。
+                let mut buf = String::new();
+                match std::io::stdin().read_to_string(&mut buf) {
+                    Ok(_) => Some(buf),
+                    Err(e) => {
+                        eprintln!("[agent] --print 读取 stdin 失败: {e}");
+                        Some(String::new())
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if single_shot {
+        set_output_mode(match cli.output_format.as_str() {
+            "json" => OutputMode::Json,
+            "stream-json" => OutputMode::StreamJson,
+            "text" => OutputMode::Text,
+            other => {
+                eprintln!("[agent] 未知 --output-format: {other}（按 text 处理）");
+                OutputMode::Text
+            }
+        });
+        set_approval_policy(if cli.skip_permissions {
+            ApprovalPolicy::UnattendedAllow
+        } else {
+            ApprovalPolicy::UnattendedDeny
+        });
+    }
     // 落盘目录（<exe 根>\temp\tool-outputs）必须进可访问范围：单条工具输出超预算时
     // 全文落在那里，模型要自己 Read/Grep 取回 —— 工作区锁会拦工作区外的路径。
     let output_dir = tools::prepare_output_dir();
@@ -2837,6 +3945,13 @@ fn main() {
     let image_dir = image::prepare_image_dir();
     log::info(format!("出图落盘目录: {}", image_dir.display()));
     add_dirs.push(image_dir);
+    // worktree 落盘根（A13，2026-10-11）：`<exe 根>\temp\worktrees`。与 output_dir / image_dir
+    // 同理进可访问范围 —— 它**在用户工作区之外**（落点从 `<cwd>\.lunac-worktrees` 改到数据根，
+    // 就是为了别在用户仓库里显出未跟踪目录），不进这个名单，工作区锁（`guard`）会把 worktree
+    // 内的写直接拒掉。**只放行这一个应用自己的目录**，不放宽用户工作区的边界。
+    let worktree_dir = tools::prepare_worktree_dir();
+    log::info(format!("worktree 落盘根: {}", worktree_dir.display()));
+    add_dirs.push(worktree_dir);
     // 技能目录（A4，2026-09-20）也要进可访问范围：复盘 fork 的白名单里有「改技能」
     // （`Write` / `Edit`），而技能目录在**工作区之外** —— 不进这个名单，最外层的工作区锁
     // 会把它直接拒掉（不是弹审批，是拒），「改技能」那半就永远不会发生。
@@ -2863,6 +3978,9 @@ fn main() {
         read_only: cli.permission_mode == "plan",
         locked: std::env::var("LUNAC_WORKSPACE_LOCKED").ok().as_deref() == Some("1")
             && !cli.skip_permissions,
+        // 有效工作目录的覆盖层（`EnterWorktree` / `ExitWorktree`，2026-10-11）：起手不在
+        // 任何 worktree 里 ⇒ `None`（有效工作目录 = `cwd`）。见 `tools::Ctx::worktree`。
+        worktree: Arc::new(Mutex::new(None)),
         // 计划相位（A7）：**进程内**的状态，起手恒为「不在计划相位」——
         // 只读档是另一回事（那是用户档位，见 `read_only` 的注释）。
         plan_phase: Arc::new(AtomicBool::new(false)),
@@ -2876,10 +3994,9 @@ fn main() {
     // 连不上只是少一批工具 —— 内置工具必须照常可用，所以这里只记一行。
     //
     // **plan（只读）档也建桥，但不把 `mcp__*` 工具放进工具池**（2026-09-19 调整）：
-    // 建桥的理由是桥上还挂着两个**自定义方法**（`lunac/history_index` /
-    // `lunac/history_search`），它们支撑只读工具 `SessionSearch` —— 只读档查自己的历史
-    // 完全正当。不列工具的理由没变：MCP 工具在只读档一律会被 `dispatch_tool` 拒掉，
-    // 列出来只会让工具清单随档位漂移、白占固定前缀。
+    // 建桥的理由是桥上还挂着一个**自定义方法** `lunac/history_search`，它支撑只读工具
+    // `SessionSearch` —— 只读档查自己的历史完全正当。不列工具的理由没变：MCP 工具在只读档
+    // 一律会被 `dispatch_tool` 拒掉，列出来只会让工具清单随档位漂移、白占固定前缀。
     // 远端 MCP 服务器（2026-10-01）：配置写在 `config\mcp.json`，宿主任一情况都注入
     // 路径（`LUNAC_MCP_FILE`，文件不存在 = 没配）。与宿主那条 stdio 桥一起汇进 `McpSet`：
     // 上层只认这一个集合（有没有工具 / 调哪个工具），内部按工具名路由到对应的连接。
@@ -2932,12 +4049,21 @@ fn main() {
     let bridge_roots = vec![dir_to_file_uri(&tools_ctx.cwd)];
     let bridge_elicit: Option<mcp::ElicitHandler> =
         Some(Box::new(|params: &Value| open_elicitation(params)));
+    // sampling（服务端反向调用模型）：**默认声明**，每一台连上的服务器都装一份钩子
+    // （宿主桥 / `.mcp.json` 外部 stdio / 远端 HTTP）—— 由 `sampling_handler_for` 每台现场构造。
+    // 钩子体 `mcp_sampling_create` 含「高底线审批卡 + 成本护栏」；未就绪时明确拒绝。
+    log::info(format!(
+        "MCP sampling 默认声明：单次上限 {} tokens、会话上限 {} 次（用户同意一次即本会话内记住，重启即忘）",
+        mcp_sampling_u64(MCP_SAMPLING_MAX_TOKENS_ENV, MCP_SAMPLING_DEFAULT_MAX_TOKENS),
+        mcp_sampling_u64(MCP_SAMPLING_MAX_CALLS_ENV, MCP_SAMPLING_DEFAULT_MAX_CALLS),
+    ));
     let mcp_set = mcp::McpSet::connect(
         cli.mcp_server.as_deref(),
         &remote_servers,
         &cli.disallowed,
         bridge_roots,
         bridge_elicit,
+        sampling_handler_for,
     );
     if !mcp_set.is_empty() {
         let defs = mcp_set.defs();
@@ -2976,11 +4102,10 @@ fn main() {
                 .join(",")
         );
     }
-    // 往期会话索引（A2，2026-09-19）：**只在启动时取一次**，拼进固定前缀。
-    // 「启动之后新存的会话不会出现在这里」这条纪律写在 `history_index_block` 的注释里。
-    let session_search_on = !cli.disallowed.iter().any(|d| d == "SessionSearch");
-    let history_block = history_index_block(mcp_bridge.as_mut(), session_search_on);
-    // 长期记忆（A4，2026-09-20）：与上一行同为**启动时取一次**的冻结快照。
+    // 往期会话索引（A2）**自 2026-10-07 起不再注入**：新建对话必须与上个对话在模型侧隔离
+    // （每次重启都会把刚结束的那个会话列进索引，模型思考里就带上个对话的痕迹 —— 用户报的
+    // 就是这个）。取回侧保留：模型需要时自己调 `SessionSearch`（`lunac/history_search`）。
+    // 长期记忆（A4，2026-09-20）：**启动时取一次**的冻结快照。
     // 「写侧工具是否真的在池里」先算出来 —— 注入文案与条件注册必须同源，否则会出现
     // 「提示词让模型调 Remember，但它不在工具表里」这种自相矛盾的组合。
     let remember_on = memory_enabled()
@@ -3012,9 +4137,9 @@ fn main() {
     );
     let skills_section = skills::listing(if skills_on { &skills } else { &[] });
     let system_prompt = build_system_prompt(&user_persona, &env_section, &skills_section);
-    // 上下文块（往期会话索引 + 长期记忆）：**不进 system**（2026-10-06，M2-16 方案 D，
+    // 上下文块（长期记忆）：**不进 system**（2026-10-06，M2-16 方案 D，
     // 位置与代价见 `context_block_message`）。它由 `run_query` 幂等注入 history 开头。
-    let ctx_block = context_block_message(&history_block, &memory_section);
+    let ctx_block = context_block_message(&memory_section);
     // 复盘 fork 的系统提示词 = 角色段 + 环境块 + 技能清单（与子代理同构，**不含记忆**：
     // 当前记忆每次都不同，放进复盘的**用户消息**里，系统提示词才能跨次逐字节相同）。
     let review_system = build_review_system(&env_section, &skills_section);
@@ -3106,10 +4231,10 @@ fn main() {
         ask_permission: cli.ask_permission,
         // `--mcp-server` 的原样值：复盘拿它连自己那条桥（只为此用 `lunac/memory_write`）
         bridge_spec: cli.mcp_server.clone(),
-        // 关卡：`remember_on` 为假（没桥 / 记忆被关 / `Remember` 被黑名单裁掉）时把间隔
-        // 设成 0 = **不跑复盘**。理由：它的**唯一产品是记忆条目** —— 写不进去还每 N 轮
-        // 花一次 API 调用，是纯粹的浪费（`should_review` 把 `interval == 0` 当关闭）。
-        interval: if remember_on { nudge_interval() } else { 0 },
+        // 写侧是否可用：remember_on 为假（没桥 / 记忆被关 / `Remember` 被黑名单裁掉）时置假
+        // = **不跑复盘**。理由：它的**唯一产品是记忆条目** —— 写不进去还每会话花一次 API
+        // 调用，是纯粹的浪费（`should_review` 把 `enabled == false` 当关闭）。
+        enabled: remember_on,
     };
 
     // ── 固定前缀体积自检 ───────────────────────────────────────────
@@ -3125,8 +4250,11 @@ fn main() {
             .sum();
         let ctx = max_context_tokens();
         let total_tokens = (sys_chars + tools_chars) as f64 / CHARS_PER_TOKEN;
+        // 带上 system 的**指纹**：子目录记忆懒加载（2026-10-12）只进可变层、**绝不碰固定前缀**，
+        // 这条哈希与「请求前缀」行里的 system 哈希同源（`log::hash64`）—— 两者相等即证据「前缀未变」。
         log::info(format!(
-            "固定前缀 system={sys_chars}字 tools={}个/{tools_chars}字 合计≈{} tokens（budget={ctx}，占 {:.1}%）",
+            "固定前缀 system={sys_chars}字/{:016x} tools={}个/{tools_chars}字 合计≈{} tokens（budget={ctx}，占 {:.1}%）",
+            log::hash64(&system_prompt),
             tool_defs.len(),
             total_tokens.round() as u64,
             total_tokens / ctx as f64 * 100.0,
@@ -3173,6 +4301,19 @@ fn main() {
         if cfg.token.is_empty() { "(empty)" } else { "(set)" }
     ));
 
+    // MCP sampling 的采样上下文（`detached()` 的副本，与主循环共享 `sub` 用量账）——
+    // 钩子在 `McpSet::connect` 时就装好，但那时 `cfg` 还没建，故这一步补上。
+    match cfg.detached() {
+        Ok(c) => {
+            if let Ok(mut g) = MCP_SAMPLING_CFG.lock() {
+                *g = Some(c);
+            }
+        }
+        Err(e) => log::warn(format!(
+            "MCP sampling 上下文准备失败（sampling 将直接拒绝）：{e}"
+        )),
+    }
+
     // ── SessionStart hook（A9）──
     // 落点：配置就绪、还没开始收 stdin。此时发出的 stdout 事件前端**可能还没挂上监听**
     // （宿主刚 spawn 出 agent ⇒ 这一条的产出以落盘日志为主，前端可见为辅）。
@@ -3182,35 +4323,62 @@ fn main() {
     // 解耦的意义：查询线程在等审批回包时会阻塞，stdin 必须另有线程持续 drain，
     // 否则 control_response 根本读不到（这正是 P2 的前提）。
     let (tx, rx) = mpsc::channel::<Value>();
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Value>(trimmed) {
-                Ok(v) => {
-                    // 审批回包直接投给等它的工具调用，不进主队列
-                    if route_control_response(&v) {
-                        continue;
-                    }
-                    // 运行中命令的实时指令（2026-10-01，`tool_control`）：同样是「不占
-                    // 对话、只改某个正在跑的东西的状态」，所以也不进主队列 ——
-                    // 进队列只会让它排在用户消息后面，等轮到它时那条命令早跑完了。
-                    if route_tool_control(&v) {
-                        continue;
-                    }
-                    if tx.send(v).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => eprintln!("[agent] 忽略非法 JSON 输入行: {e}"),
-            }
+    if single_shot {
+        // 单发（--print）：不读 stdin 循环，直接把这一条 query 投进队列、随后**丢掉投递端**
+        // —— 主循环处理完这一条后下一拍就收到 Disconnected，与「stdin 关闭」同路优雅退出
+        // （复用同一套收尾：collect_review / SessionEnd / 退出码判定）。
+        let q = print_query.clone().unwrap_or_default();
+        if q.trim().is_empty() {
+            eprintln!("[agent] --print 单发模式没有 query（既未给 --print 后的值，stdin 也为空）");
+            emit(json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": true,
+                "num_turns": 0,
+                "result": "--print requires a query argument or non-empty stdin",
+                "session_id": session_id(),
+                "total_cost_usd": 0.0,
+            }));
+            std::process::exit(2);
         }
-        // stdin 关闭 ⇒ 上游（lunac.exe）已退出
-    });
+        let _ = tx.send(json!({
+            "type": "user",
+            "session_id": "",
+            "message": { "role": "user", "content": [{ "type": "text", "text": q }] },
+            "parent_tool_use_id": null,
+        }));
+        drop(tx);
+    } else {
+        thread::spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) => {
+                        // 审批回包直接投给等它的工具调用，不进主队列
+                        if route_control_response(&v) {
+                            continue;
+                        }
+                        // 运行中命令的实时指令（2026-10-01，`tool_control`）：同样是「不占
+                        // 对话、只改某个正在跑的东西的状态」，所以也不进主队列 ——
+                        // 进队列只会让它排在用户消息后面，等轮到它时那条命令早跑完了。
+                        if route_tool_control(&v) {
+                            continue;
+                        }
+                        if tx.send(v).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => eprintln!("[agent] 忽略非法 JSON 输入行: {e}"),
+                }
+            }
+            // stdin 关闭 ⇒ 上游（lunac.exe）已退出
+        });
+    }
 
     // system/init 由 run_query 每轮发出（前端据此推进 agentState），启动时不必发
     let mut history: Vec<Value> = Vec::new();
@@ -3219,18 +4387,19 @@ fn main() {
     // 原先它声明在 `run_query` 内部（局部）⇒ 每一问的首请求都看不到上一问末请求的
     // 指纹，日志里只剩 `公共前缀=0/0条`，于是「两次提问之间本侧有没有改写 history」
     // 这件事**在日志里根本没有证据**（这正是 A16 一开始卡住的地方）。
-    // `question_seq` = 第几次用户提问（刻意**不复用** `questions`：那个只为复盘门槛
-    // 计数、递增时机不同），只进日志，让离线时能一眼认出「本问首请求」。
+    // `question_seq` = 第几次用户提问（只进日志，让离线时能一眼认出「本问首请求」）。
     let mut prev_hist_hashes: Vec<u64> = Vec::new();
     let mut question_seq: u64 = 0;
     // ── 后台复盘（A4）的装配状态 ────────────────────────────────────
-    // `questions` = 已完成的**用户提问**数（不是工具轮次：一次提问内部可以有 16 轮工具
-    // 往返，按那个计数会在一次长提问中途触发复盘，而那时复盘看到的还是半截对话）。
-    // `pending` = 上一次复盘还没收回来。**收的时机是「处理下一条消息之前」，且只收
+    // `pending_review` = 上一次复盘还没收回来。**收的时机是「处理下一条消息之前」，且只收
     // 已经跑完的**（见 `collect_review`）—— 复盘是后台事务，不许它决定前台时延。
-    let mut questions: u64 = 0;
+    // `reviewed_this_session` = 本次会话（= 本进程）是否已复盘过（每会话 ≤ 1 次，方案 B）。
+    // `last_review_ts` = 上次复盘时间（epoch 秒），**启动时从 temp\review-last 读一次** ——
+    // 跨进程重启有效，这正是「按时间」那一半不再被重启清零的关键。
     let mut review_seq: u64 = 0;
     let mut pending_review: Option<thread::JoinHandle<Result<String, String>>> = None;
+    let mut reviewed_this_session = false;
+    let mut last_review_ts: Option<i64> = load_last_review_ts();
     // 项目 MCP 的信任门**只过一次**（首次真实提问前）：接上后工具表就是固定前缀的一部分，
     // 之后不再变（见 `connect_project_servers`）。
     let mut project_trust_done = false;
@@ -3251,8 +4420,8 @@ fn main() {
             Err(RecvTimeoutError::Disconnected) => break,
         };
         collect_review(&mut pending_review);
-        match msg.get("type").and_then(Value::as_str) {
-            Some("user") => {
+        match stdin_kind(&msg) {
+            StdinKind::User => {
                 let images = extract_user_images(&msg);
                 let mut prompt = extract_user_text(&msg);
                 if prompt.trim().is_empty() && images.is_empty() {
@@ -3275,7 +4444,8 @@ fn main() {
                 // ── 项目 MCP：首次查询前过信任门并接通（q3 第 3 步）──
                 // **只做一次**（`project_trust_done`）：工具表是固定前缀，接上后就不再变。
                 // 放在这里（而不是启动时）是因为信任询问要走审批通道、那条通道要 stdin 就绪。
-                if !project_trust_done {
+                // 单发模式跳过：信任门要弹卡等回包，而无头单发没有回包通道（见 unattended_deny_reason）。
+                if !single_shot && !project_trust_done {
                     project_trust_done = true;
                     connect_project_servers(
                         &tools_ctx.cwd,
@@ -3314,6 +4484,12 @@ fn main() {
                     continue;
                 }
                 question_seq += 1;
+                // 「按轮思考覆盖」（2026-10-09，用户口径）：**桌宠那一轮一律关 thinking**。
+                // 前端在该轮消息里带 `"thinking":"off"`；缺省（普通聊天）= 用全局开关
+                // （`cfg.thinking`）。语义**只认 `off`**（其余值 = 不覆盖）—— 目的就是「按轮关」，
+                // 不需要「按轮开」（全局开关已经能开）。
+                let thinking_override =
+                    thinking_override_from(msg.get("thinking").and_then(Value::as_str));
                 run_query(
                     &cfg,
                     &mut history,
@@ -3330,21 +4506,43 @@ fn main() {
                     &system_prompt,
                     &subagent_system,
                     ctx_block.as_ref(),
+                    thinking_override,
                 );
-                // 复盘的三个前置：① 到轮次门槛；② 不是只读（plan）档、也不在计划相位
-                // （复盘的唯一产品就是一条 `Remember` 写入，那两档下 `write_blocked` 会
-                // 直接拒 ⇒ 派出去也是白烧一次 API）；③ 上一轮那次已经收干净。
+                // 复盘的四个前置（方案 B，2026-10-11）：① 本轮确实完成了一次用户提问
+                // （本代码位置即保证 —— 它在 run_query 返回之后，不在工具轮中途）；
+                // ② 不是只读（plan）档、也不在计划相位（复盘的唯一产品就是一条 `Remember`
+                // 写入，那两档下 `write_blocked` 会直接拒 ⇒ 派出去也是白烧一次 API）；
+                // ③ 写侧可用 + 距上次复盘 ≥ 30 分钟 + 本会话还没复盘过（见 should_review）；
+                // ④ 上一轮那次已经收干净（pending 非空就不再派，防两条复盘并发）。
                 // 「当前记忆」在主线程读（那条桥归主线程）—— 复盘靠它避免重复写。
-                questions += 1;
-                if pending_review.is_none()
+                // 单发模式不派复盘：进程马上就要退出，后台线程会被直接杀掉，
+                // 那次云调用纯属白烧（单发的语义就是「跑一轮、拿结果、退出」）。
+                if !single_shot
+                    && pending_review.is_none()
                     && !tools_ctx.read_only
                     && !tools_ctx.plan_phase.load(Ordering::Relaxed)
-                    && should_review(questions, review_setup.interval)
+                    && should_review(
+                        review_setup.enabled,
+                        reviewed_this_session,
+                        last_review_ts,
+                        now_epoch_secs(),
+                    )
                 {
                     let memory = fetch_memory(mcp_bridge.as_mut()).unwrap_or_default();
                     review_seq += 1;
-                    pending_review =
-                        review_setup.spawn(&cfg, &tools_ctx, &history, &memory, review_seq);
+                    // spawn 前先吃掉本会话配额（无论派没派成，本会话都不再重试）——「每会话
+                    // ≤ 1 次」是硬上限。只有**真派出去**了才记「上次复盘时间」（写侧发生了
+                    // 一次云调用，下一次要隔 30 分钟）；派不出去（配置副本建不出 / 快照为空）
+                    // 不记时间，于是下个会话仍可再来一次。
+                    reviewed_this_session = true;
+                    if let Some(handle) =
+                        review_setup.spawn(&cfg, &tools_ctx, &history, &memory, review_seq)
+                    {
+                        pending_review = Some(handle);
+                        let now = now_epoch_secs();
+                        last_review_ts = Some(now);
+                        save_last_review_ts(now);
+                    }
                 }
             }
             // 会话历史整体替换（宿主 → agent，2026-09-17）。
@@ -3353,7 +4551,7 @@ fn main() {
             // 的上文也一起丢了 —— 用户表现为「回退后引用不到上文」。
             // ② 从磁盘恢复一个旧会话后把它的消息灌回来（恢复只重建了 DOM，agent 侧为空）。
             // **只替换历史、不触发模型调用**：这不是一次提问，不该产生回答与 token。
-            Some("set_history") => {
+            StdinKind::SetHistory => {
                 let msgs = msg
                     .get("messages")
                     .and_then(Value::as_array)
@@ -3370,8 +4568,15 @@ fn main() {
                 }));
             }
             // 没被认领的 control_response（如请求已超时）在这里丢弃即可
-            Some("control_response") => {}
-            other => eprintln!("[agent] 忽略输入类型: {other:?}"),
+            StdinKind::ControlResponse => {}
+            // 手动压缩一次（2026-10-11，stdin 输入 {"type":"compact"}）：复用自动压缩的
+            // Force 路径，压动与否都保证回一条 system/context_compacted（前端已有该事件渲染）。
+            StdinKind::Compact => {
+                if let Some(ev) = manual_compact(&cfg, &mut history, &tools_ctx.cwd) {
+                    emit(ev);
+                }
+            }
+            StdinKind::Unknown(other) => eprintln!("[agent] 忽略输入类型: {other:?}"),
         }
     }
     // 同 set_history：两处同文本，只留 agent 日志那一份
@@ -3382,11 +4587,20 @@ fn main() {
             log::info("退出：后台复盘仍在运行，不等它");
         }
     }
-    log::info("=== agent exit (stdin closed) ===");
+    log::info(if single_shot {
+        "=== agent exit (single-shot) ==="
+    } else {
+        "=== agent exit (stdin closed) ==="
+    });
     // ── SessionEnd hook（A9）──
     // 上游（lunac.exe）已退出 / 主动关了 stdin ⇒ 这个 agent 进程的生命周期结束。
     // 同样是「只做事、拦不住」的一类：脚本可以用它清理临时资源、发通知。
     fire_plain_hook("SessionEnd", &tools_ctx.cwd, json!({}));
+    // 单发（--print）退出码：成功 0；模型 / 网络 / 审批被拒等失败非 0
+    // （任何 is_error 的 result 或未放行的需审批工具都会置 SINGLE_SHOT_FAILED）。
+    if single_shot {
+        std::process::exit(if SINGLE_SHOT_FAILED.load(Ordering::Relaxed) { 1 } else { 0 });
+    }
 }
 
 /// 把宿主送来的「用户 / 助手」纯文本消息列表转成 API 历史。
@@ -3602,6 +4816,25 @@ fn needs_approval(name: &str) -> bool {
     tools::needs_approval(name) || mcp::is_mcp(name)
 }
 
+/// 单发模式（--print，无审批回包通道）下，一个「需审批的工具」被拒绝时的原因文本。
+///
+/// 为什么默认拒绝而不是默认放行：单发没有前端回 control_response 的通道，若照常发
+/// control_request 就会**静默挂起**到 APPROVAL_TIMEOUT_SECS（300s）才按拒绝收场 ——
+/// 用户看到的是「卡死」。默认拒绝 + 明确告知 + 非 0 退出，是最安全的默认：
+/// 放行写类工具是危险动作，绝不能因为「无人值守」就默默降级为自动允许。
+/// 确需放行的场景（如自建的无头流水线）用 --dangerously-skip-permissions 显式承担。
+fn unattended_deny_reason(tool_name: &str) -> String {
+    SINGLE_SHOT_FAILED.store(true, Ordering::Relaxed);
+    eprintln!(
+        "[agent] 单发模式（--print）无审批通道，已拒绝需审批的工具: {tool_name}\
+         （如确需放行，加 --dangerously-skip-permissions）"
+    );
+    format!(
+        "Denied: {tool_name} needs user approval, but --print single-shot mode has no approval \
+         channel. Re-run with --dangerously-skip-permissions if this tool is intended."
+    )
+}
+
 /// 分发一次工具调用：技能（P4）→ MCP 桥（P3）→ 内置实现（P1）。
 ///
 /// 三类工具都从这里过，所以**日志也打在这里**：名称 + 参数摘要（脱敏）+ 结果或
@@ -3789,19 +5022,55 @@ fn run_subagent(
         if let Some(t) = plan.to_json() {
             body["thinking"] = t;
         }
-        let resp = cfg
+        // 调试转储（LUNAC_DUMP_API）：子代理非流式，request/response 各一行。
+        // req_id = sub-<task_id>-r<round> —— 子代理用量落在 result.usage.subagent.requests[]
+        // （那是个扁平列表、按完成顺序排，按下标对不准），req_id 自带 task_id 与轮次更精确。
+        let dump_on = log::dump_api_enabled();
+        let dump_rid = if dump_on {
+            let rid = format!("sub-{task_id}-r{round}");
+            log::dump_api("request", &rid, &cfg.model, None, None, &body);
+            rid
+        } else {
+            String::new()
+        };
+        let sent = cfg
             .client
             .post(&cfg.endpoint)
             .header("authorization", format!("Bearer {}", cfg.token))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
-            .send()
-            .map_err(|e| format!("子代理请求发送失败: {e}"))?;
+            .send();
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                if dump_on {
+                    log::dump_api(
+                        "response",
+                        &dump_rid,
+                        &cfg.model,
+                        None,
+                        Some(&e.to_string()),
+                        &Value::Null,
+                    );
+                }
+                return Err(format!("子代理请求发送失败: {e}"));
+            }
+        };
         let status = resp.status();
         let raw = resp
             .text()
             .map_err(|e| format!("子代理响应读取失败: {e}"))?;
+        if dump_on {
+            log::dump_api(
+                "response",
+                &dump_rid,
+                &cfg.model,
+                Some(status.as_u16()),
+                None,
+                &Value::String(raw.clone()),
+            );
+        }
         if !status.is_success() {
             return Err(format!(
                 "子代理请求失败（HTTP {status}）: {}",
@@ -3888,23 +5157,34 @@ fn run_subagent(
                 gate => {
                     let allowed =
                         matches!(gate, HookGate::Allow) && !hook_allow_needs_card(name, input);
-                    if !allowed
-                        && spec.ask_permission
-                        && tools::needs_approval(name)
-                        && (!tctx.read_only || tools::gated_in_read_only(name))
-                    {
-                        match hook_tool_gate("PermissionRequest", &tctx.cwd, name, id, input) {
-                            HookGate::Deny(r) => {
-                                Some(format!("Denied by PermissionRequest hook: {r}"))
+                    let needs_card = tools::needs_approval(name)
+                        && (!tctx.read_only || tools::gated_in_read_only(name));
+                    if !allowed && needs_card {
+                        match approval_policy() {
+                            ApprovalPolicy::UnattendedDeny => Some(unattended_deny_reason(name)),
+                            ApprovalPolicy::UnattendedAllow => None,
+                            ApprovalPolicy::Stdio if spec.ask_permission => {
+                                match hook_tool_gate(
+                                    "PermissionRequest",
+                                    &tctx.cwd,
+                                    name,
+                                    id,
+                                    input,
+                                ) {
+                                    HookGate::Deny(r) => {
+                                        Some(format!("Denied by PermissionRequest hook: {r}"))
+                                    }
+                                    HookGate::Allow if !hook_allow_needs_card(name, input) => None,
+                                    _ => match await_approval(
+                                        open_approval(name, id, input, Some(task_id)),
+                                        input,
+                                    ) {
+                                        Decision::Allow(_) => None,
+                                        Decision::Deny(msg, _) => Some(msg),
+                                    },
+                                }
                             }
-                            HookGate::Allow if !hook_allow_needs_card(name, input) => None,
-                            _ => match await_approval(
-                                open_approval(name, id, input, Some(task_id)),
-                                input,
-                            ) {
-                                Decision::Allow(_) => None,
-                                Decision::Deny(msg, _) => Some(msg),
-                            },
+                            ApprovalPolicy::Stdio => None,
                         }
                     } else {
                         None
@@ -4169,21 +5449,72 @@ fn run_forked_skill(
 
 // ── 后台复盘 fork 的实现（A4）──────────────────────────────────────
 //
-// 装配在 `main()` 的提问循环里（门槛计数 + spawn/join），判断与落盘在这里。
+// 装配在 main() 的提问循环里（触发判定 + spawn/join），判断与落盘在这里。
 
-/// 轮次门槛：`LUNAC_NUDGE_INTERVAL`（`0` = 关闭，其余为间隔），默认 `DEFAULT_NUDGE_INTERVAL`。
-/// 非法值（不是数字）回落默认 —— 一个打错的开关不该让复盘彻底消失。
-fn nudge_interval() -> u64 {
-    std::env::var(NUDGE_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_NUDGE_INTERVAL)
+/// 当前时间（epoch 秒）。只用 std（本 crate 不引 chrono）。
+fn now_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-/// 第 `questions` 次提问结束后该不该复盘（纯函数，便于单测）。
-/// `interval == 0` = 关；`questions == 0`（还没问过）永远不触发。
-fn should_review(questions: u64, interval: u64) -> bool {
-    interval > 0 && questions > 0 && questions % interval == 0
+/// 「上次复盘时间」的持久化落点：`<exe 根>\temp\review-last`（单行 epoch 秒）。
+///
+/// 选型理由（2026-10-11 方案 B）——「跨进程重启」这一条决定了必须落盘：
+///   · **不写进 MEMORY.md**：那是给模型看的记忆正文（进固定前缀），塞时间戳既污染记忆、
+///     又让每次变化都动摇上下文块的缓存前缀；
+///   · **不新增宿主通道**：memory 桥只有 memory_read / memory_write 两个方法，为一条时间戳
+///     加方法要同时动宿主与协议；让宿主 spawn 时注入「上次时间」则要求宿主知道复盘何时跑过
+///     （跨层更多）。相比之下这条最轻。
+///   · agent 本就往 `<exe 根>\temp\` 写自己的东西（images / logs 都从 log_dir 的父目录派生，
+///     见 image_dir），这条沿用同一推导：零新增依赖、零宿主改动、不碰 ModuleData。
+/// 读不出来 / 解析失败一律当作「从未复盘」—— 宁可多复盘一次，也不要因为读到脏数据而永不复盘。
+fn review_state_path() -> PathBuf {
+    crate::log::log_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("review-last")
+}
+
+fn load_last_review_ts() -> Option<i64> {
+    let text = std::fs::read_to_string(review_state_path()).ok()?;
+    text.trim().parse::<i64>().ok()
+}
+
+fn save_last_review_ts(ts: i64) {
+    let path = review_state_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, format!("{ts}\n")) {
+        // 写不进去只是「下次可能重复复盘一次」，不该影响主流程（同记忆读取失败的纪律）。
+        log::warn(format!("写复盘时间戳失败（下次可能重复复盘一次）: {e}"));
+    }
+}
+
+/// 现在该不该复盘（纯函数，便于单测）：四个条件**全满足**才为真。
+///
+///   · `enabled` —— 写侧可用（没桥 / 记忆关 / Remember 被黑名单裁掉时为假：复盘写不进
+///     任何东西，只会白烧一次 API）；
+///   · `fired_this_session` —— 本会话是否已复盘过（每会话 ≤ 1 次）；
+///   · `last_ts` —— 上次复盘时间（epoch 秒；None = 从未）；
+///   · `now_ts` —— 当前时间（epoch 秒）。
+///
+/// 第 4 个条件（「本轮确实完成了一次用户提问」）由**调用点**保证 —— 本函数只在 user 分支、
+/// run_query 返回之后被调用，不会在一次提问的工具轮中途触发。
+/// 时钟回拨（now_ts < last_ts）用 saturating_sub 得到 0，恒 < 间隔 ⇒ 当作「还没到时间」，
+/// 走安全侧（宁可少复盘，不要时钟一乱就狂调模型）。
+fn should_review(
+    enabled: bool,
+    fired_this_session: bool,
+    last_ts: Option<i64>,
+    now_ts: i64,
+) -> bool {
+    enabled
+        && !fired_this_session
+        && last_ts.map_or(true, |t| now_ts.saturating_sub(t) >= REVIEW_MIN_GAP_SECS)
 }
 
 /// 把最近的对话压成给复盘看的快照：`角色: 文本` 若干行，**从最早处**丢到 `max_chars` 内。
@@ -4248,6 +5579,9 @@ fn review_transcript(history: &[Value], max_chars: usize) -> String {
 ///
 /// 「当前记忆」放进用户消息而不是系统提示词：系统提示词要**跨次复盘逐字节相同**
 /// （同一种 fork 共享一段前缀，规则 18），而记忆每次都不同。
+///
+/// 2026-10-11（方案甲）：指令段升级为结构化抽取口径（分类写在这里、禁写清单在两个提示词
+/// 里各写一份）；出口 NOTHING_TO_REMEMBER 与 REVIEW_MAX_ITEMS 两条上限语义不变。
 fn review_prompt(transcript: &str, memory: &str) -> String {
     let memory = memory.trim();
     let memory = if memory.is_empty() {
@@ -4256,12 +5590,15 @@ fn review_prompt(transcript: &str, memory: &str) -> String {
         memory
     };
     format!(
-        "The conversation below just finished. Decide what, if anything, is worth keeping in \
+        "The conversation below just finished. Extract what, if anything, is worth keeping in \
          long-term memory, then act.\n\n\
          ## Long-term memory right now\n{memory}\n\n\
          ## The conversation (oldest first; tool calls and results are trimmed)\n{transcript}\n\n\
-         ## Your task\nSave at most {REVIEW_MAX_ITEMS} durable facts with the `Remember` tool, \
-         or reply exactly `NOTHING_TO_REMEMBER` if nothing qualifies."
+         ## Your task\nSave at most {REVIEW_MAX_ITEMS} durable facts that match the categories in \
+         your instructions, with the `Remember` tool, one per call.\n\
+         Never write credentials (API keys, tokens, passwords, private keys, connection strings): \
+         if the conversation contains any, leave them out entirely — not even partially.\n\
+         If nothing qualifies, reply exactly `NOTHING_TO_REMEMBER` and call no tool."
     )
 }
 
@@ -4293,7 +5630,7 @@ fn run_review_fork(job: ReviewJob) -> Result<String, String> {
     // 为它去连一批远端服务器是纯浪费（而且那些服务器根本没有这个方法）。
     let mut bridge = match job.bridge_spec.as_deref() {
         Some(spec) => {
-            let set = mcp::McpSet::connect(Some(spec), &[], &[], Vec::new(), None);
+            let set = mcp::McpSet::connect(Some(spec), &[], &[], Vec::new(), None, sampling_handler_for);
             if set.has_lunac() {
                 Some(set)
             } else {
@@ -4325,7 +5662,7 @@ fn run_review_fork(job: ReviewJob) -> Result<String, String> {
 }
 
 /// 复盘 fork 的**启动期常量部分**：工具集 / 技能 / 系统提示词 / 审批开关 / 桥的 spec /
-/// 门槛间隔。每一样都在启动时算好后复用 —— 提问循环里只补「这一次的工作面」
+/// 写侧可用性。每一样都在启动时算好后复用 —— 提问循环里只补「这一次的工作面」
 /// （历史快照、当前记忆、配置副本）。
 struct ReviewSetup {
     defs: Vec<Value>,
@@ -4334,8 +5671,8 @@ struct ReviewSetup {
     ask_permission: bool,
     /// `--mcp-server` 的原样值：复盘用它连**自己那条**桥（见 `run_review_fork`）
     bridge_spec: Option<String>,
-    /// 轮次门槛（提问数）；`0` = 关闭
-    interval: u64,
+    /// 写侧是否可用（= remember_on）；假 ⇒ 不跑复盘（见装配处注释）
+    enabled: bool,
 }
 
 impl ReviewSetup {
@@ -4550,6 +5887,20 @@ fn dispatch_tool(
                 "{other} 的桥实现缺失：tools::BRIDGE_TOOLS 与 dispatch_tool 不同步"
             )),
         };
+    }
+    // SendUserFile / PushNotification（A13，2026-10-11）：效果全在**前端**（一张文件卡 /
+    // 一条桌面通知）。`tools.rs` 是纯实现层、拿不到 `emit`，所以结构化载荷在这里发成
+    // `system` 事件，前端 `main.ts` 据此落卡 / 弹通知 —— 与 `PetControl` 同型。
+    // 两件都免审批（判据见 `tools::needs_approval`），在只读档 / 计划相位下也放行。
+    if name == "SendUserFile" {
+        let (text, payload) = tools::send_user_file(tctx, input)?;
+        emit(json!({ "type": "system", "subtype": "user_file", "file": payload }));
+        return Ok(text);
+    }
+    if name == "PushNotification" {
+        let (text, payload) = tools::push_notification(input)?;
+        emit(json!({ "type": "system", "subtype": "push_notification", "notification": payload }));
+        return Ok(text);
     }
     if !mcp::is_mcp(name) {
         return tools::run(tctx, name, input);
@@ -4797,6 +6148,8 @@ fn plan_tool_batches(
 /// |---|---|
 /// | `Agent` | 防无限递归（约束⑤）—— 子代理不能再派子代理 |
 /// | `EnterPlanMode` / `ExitPlanMode`（A7） | 计划相位是**主循环**的状态。子代理**问不了用户**（它的提示词就是这么写的），`ExitPlanMode` 在里面只会弹一张无人能负责的卡；而 `EnterPlanMode` 若被子代理调用，等于它替主代理改了全局相位 —— 一个只该由主循环做的决定 |
+/// | `EnterWorktree` / `ExitWorktree`（2026-10-11） | 有效工作目录是**主循环**的状态（`Ctx::worktree` 跨线程共享）。子代理若改它，会把主代理的相对路径解析一起带走 —— 同 `EnterPlanMode` 的判据 |
+/// | `PetControl`（2026-10-10） | 它的效果由**主进程前端**读 `tool_use` 后广播给桌宠窗执行；子代理的 tool_use 不进前端助手流 ⇒ 在里面调它是**保证的空操作** |
 /// | 走 MCP 桥的（`tools::needs_bridge`） | 子代理**不接 MCP 桥**（`run_one_tool(…, None, …)`：桥是 `&mut` 单线程 stdio 通道，主循环还持有它）。留在工具表里就是**保证失败**：`mcp__*` 的 `needs_approval` 恒真 ⇒ 会先弹一张注定白问的审批卡，然后回 `MCP bridge is not connected`；`SessionSearch` / resources 读侧同样无桥可用 |
 ///
 /// 桥那一类走 `tools::BRIDGE_TOOLS` 这个**唯一真相源**，不在这里另写字符串 ——
@@ -4807,7 +6160,22 @@ fn subagent_tool_defs(tool_defs: &[Value]) -> Vec<Value> {
         .iter()
         .filter(|d| {
             let name = d.get("name").and_then(Value::as_str).unwrap_or("");
-            !matches!(name, "Agent" | "EnterPlanMode" | "ExitPlanMode")
+            !matches!(
+                name,
+                // `PetControl`（2026-10-10）：效果由**主进程前端**读 `tool_use` 后广播给桌宠窗；
+                // 子代理的 tool_use 不进前端的助手流（只以 `task_progress` 呈现）⇒ 在里面
+                // 调它是**保证的空操作**，与走桥那一类同理，剔掉。
+                "Agent" | "EnterPlanMode" | "ExitPlanMode" | "PetControl"
+                    // `EnterWorktree` / `ExitWorktree`（2026-10-11）：有效工作目录是**主循环**的
+                    // 状态（`Ctx::worktree` 跨线程共享），子代理改它会把主代理的相对路径解析
+                    // 一起带走 —— 同 `EnterPlanMode` 的判据，剔掉。
+                    | "EnterWorktree" | "ExitWorktree"
+                    // `SendUserFile` / `PushNotification`（2026-10-11）：效果是**主进程前端**
+                    // 的卡片 / 桌面通知（由 `dispatch_tool` 发 `system` 事件驱动）；子代理的
+                    // 工具调用不进前端助手流 ⇒ 在里面调它只会**凭空冒出一张无上下文的卡**。
+                    // 同 `PetControl` 的判据，剔掉。
+                    | "SendUserFile" | "PushNotification"
+            )
                 && !tools::needs_bridge(name)
                 && !mcp::is_mcp(name)
         })
@@ -4889,11 +6257,16 @@ fn run_query(
     skill_list: &[skills::Skill],
     system_prompt: &str,
     subagent_system: &str,
-    // 上下文块（往期会话索引 + 长期记忆，见 `context_block_message`）。**不在 system 里**
+    // 上下文块（长期记忆，见 `context_block_message`）。**不在 system 里**
     // —— 它随本问幂等注入 history 开头（2026-10-06，M2-16 方案 D）。
     ctx_block: Option<&Value>,
+    // 「按轮思考覆盖」（2026-10-09）：`Some(_)` = 本条提问**只用这个形态**（不读全局开关；
+    // 400 降级也只在本轮内前进、**不写回** `cfg.thinking` 缓存）；`None` = 用全局开关（现状）。
+    thinking_override: Option<Thinking>,
 ) {
     let started = Instant::now();
+    // 本条提问的思考覆盖（可变：400 降级时在本轮内推进）。
+    let mut thinking_override = thinking_override;
     emit_init(&cfg.model, tool_names);
 
     // 图片附件（A8）：先按路径解析成 base64 块，再在 init 之后**如实上报**没能发出的那些
@@ -5028,8 +6401,17 @@ fn run_query(
     let mut rounds = 0usize;
     let mut hint_sent = false;
 
+    // 调试转储开关（LUNAC_DUMP_API，默认关）：关时本问全程零开销 —— 下面的 req_id 拼接
+    // 与报文序列化都被它短路（见 log::dump_api）。
+    let dump_on = log::dump_api_enabled();
+
     loop {
         turns += 1;
+        // 本次请求的转储关联 id：q<第几次提问>-r<本问第几个请求>。r 的序号与
+        // result.usage.requests[] 同序（本问第 K 个请求 = requests[K-1]，同为本问第 K 条
+        // usage_delta）；同一次请求的重试再加 -a<n> 区分（a1 = 首次尝试）。
+        let dump_seq = req_log.len() + 1;
+        let mut dump_attempt: u32 = 0;
 
         // ── 端点侧缓存还热不热（2026-10-01）──────────────────────
         // 距上次**发出请求**已超过 TTL ⇒ 端点侧那份前缀缓存本来就过期了 ⇒ 此时
@@ -5135,18 +6517,31 @@ fn run_query(
                 cfg.last_compact.set(measured_now);
                 out.elided + out.dropped > 0
             };
-            if compressed && budget_extensions < MAX_BUDGET_EXTENSIONS {
+            // 「计划未完成 ⇒ 预算只当**节流阀**，不当**终止符**」（2026-10-09 用户口径
+            // 「预算撞顶不中止」，见 backlog §4.1.3）。判据 = 最近的 TodoWrite 清单里还有
+            // `pending` / `in_progress` 的项。**检查点就是压缩本身** —— `Compact::Force`
+            // 会把最近一条清单钉回历史（`latest_todo_snapshot`），所以续跑不丢任务方向。
+            // 对**没有计划**的提问保持原上限（2 次），避免把普通问答也变成无底洞。
+            let unfinished = todo_has_unfinished(history);
+            let cap = if unfinished {
+                MAX_BUDGET_EXTENSIONS_HARD
+            } else {
+                MAX_BUDGET_EXTENSIONS
+            };
+            if compressed && budget_extensions < cap {
                 budget_extensions += 1;
                 turn_tokens = 0;
                 emit(json!({
                     "type": "system",
                     "subtype": "budget_extended",
                     "times": budget_extensions,
-                    "max": MAX_BUDGET_EXTENSIONS,
+                    "max": cap,
+                    "task_unfinished": unfinished,
                 }));
                 log::info(format!(
-                    "成本预算撞顶（{turn_budget} tokens）⇒ 压缩续命 第 \
-                     {budget_extensions}/{MAX_BUDGET_EXTENSIONS} 次，计点清零继续"
+                    "成本预算撞顶（{turn_budget} tokens）⇒ {}续命 第 \
+                     {budget_extensions}/{cap} 次，计点清零继续",
+                    if unfinished { "计划未完成，" } else { "" }
                 ));
             } else {
                 // 续不动了：给模型一次收口机会（与 `TOOL_BUDGET_HINT` 同一落点纪律）
@@ -5160,7 +6555,7 @@ fn run_query(
                 log::info(format!(
                     "成本预算用尽（{}），要求模型收口作答",
                     if compressed {
-                        format!("续命已用满 {budget_extensions}/{MAX_BUDGET_EXTENSIONS}")
+                        format!("续命已用满 {budget_extensions}/{cap}")
                     } else {
                         "且压不动（体积在对话本身）".to_string()
                     }
@@ -5177,11 +6572,14 @@ fn run_query(
         let mut compacted_for_retry = false;
         // 本轮已用掉的「瞬时失败重试」次数（每轮重置；见 MAX_API_RETRIES）
         let mut transient_attempt = 0usize;
+        // 本次请求（含重试尝试）的转储关联 id：循环内赋值，循环外（流式响应转储）要读。
+        let mut dump_rid = String::new();
 
         // 发送（思考形态可降级重试 / 瞬时失败退避重试）：只有「与 thinking 相关的
         // 400」才沿降级链前进一次，并把可用形态写回 cfg 缓存，后续轮次不再试错。
         let resp = loop {
-            let plan = cfg.thinking.get();
+            // 按轮覆盖优先（2026-10-09）：桌宠轮 = `Disabled`，与全局开关无关。
+            let plan = thinking_override.unwrap_or_else(|| cfg.thinking.get());
             let mut body = json!({
                 "model": cfg.model,
                 "max_tokens": max_tokens_for(plan),
@@ -5194,6 +6592,18 @@ fn run_query(
             }
             if let Some(t) = plan.to_json() {
                 body["thinking"] = t;
+            }
+
+            // 调试转储：本次发送的请求体（已脱敏；请求头一个都不记，见 log::dump_api）。
+            // req_id 供与 usage_delta / result.usage.requests[] 对账（同序）。
+            if dump_on {
+                dump_attempt += 1;
+                dump_rid = if dump_attempt == 1 {
+                    format!("q{question_seq}-r{dump_seq}")
+                } else {
+                    format!("q{question_seq}-r{dump_seq}-a{dump_attempt}")
+                };
+                log::dump_api("request", &dump_rid, &cfg.model, None, None, &body);
             }
 
             // ── 请求前缀指纹（2026-09-17，ai-spec §11 规则 23 的归因埋点）──────
@@ -5255,6 +6665,16 @@ fn run_query(
             let r = match sent {
                 Ok(r) => r,
                 Err(e) => {
+                    if dump_on {
+                        log::dump_api(
+                            "response",
+                            &dump_rid,
+                            &cfg.model,
+                            None,
+                            Some(&e.to_string()),
+                            &Value::Null,
+                        );
+                    }
                     // 网络层瞬时故障（连接失败 / 重置 / 超时）→ 退避重试。
                     // builder 类错误（URL 非法、TLS 配置错）重试也不会成功，直接失败。
                     if !e.is_builder() && transient_attempt < MAX_API_RETRIES {
@@ -5285,10 +6705,25 @@ fn run_query(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok());
             let detail = r.text().unwrap_or_default();
+            if dump_on {
+                log::dump_api(
+                    "response",
+                    &dump_rid,
+                    &cfg.model,
+                    Some(status.as_u16()),
+                    None,
+                    &Value::String(detail.clone()),
+                );
+            }
             if status == 400 && thinking_related_error(&detail) {
                 if let Some(next) = plan.next() {
                     eprintln!("[agent] 端点不接受 thinking={plan:?} → 降级为 {next:?}");
-                    cfg.thinking.set(next);
+                    // 按轮覆盖时**只在本轮内**前进（不污染全局缓存 —— 否则桌宠轮的降级会
+                    // 把普通聊天已跑通的形态改掉）；全局档照旧写回缓存，后续提问不再试错。
+                    match thinking_override.as_mut() {
+                        Some(ov) => *ov = next,
+                        None => cfg.thinking.set(next),
+                    }
                     continue;
                 }
             }
@@ -5319,6 +6754,8 @@ fn run_query(
             let detail: String = detail.trim().chars().take(800).collect();
             return finish_error(history, base, &format!("HTTP {status}: {detail}"), started, turns);
         };
+        // 成功响应（2xx）的状态码，供转储用；下面 BufReader::new(resp) 会消费 resp。
+        let resp_status = resp.status().as_u16();
 
         // ── 流式解析：把每个 content block 收齐 ──────────────────
         let mut blocks: Vec<Block> = Vec::new();
@@ -5568,6 +7005,31 @@ fn run_query(
             }
         }
 
+        // 调试转储：流式响应记「累积后的最终报文」（content 块 + usage），不记原始 SSE 行。
+        // 为什么不记原始行：一轮回复的 text/thinking 增量可达数千行，tool_use 的
+        // input_json_delta 更是逐字符事件，原始行会把转储撑大几十倍且几乎不可读；最终报文
+        // 既能看清端点回了什么，又天然被体积上限兜住。需要逐字时序时另有 stream.jsonl。
+        if dump_on {
+            let content: Vec<Value> = blocks
+                .iter()
+                .filter_map(|b| match b.kind.as_str() {
+                    "text" if !b.text.is_empty() => Some(json!({ "type": "text", "text": b.text })),
+                    "thinking" if !b.text.is_empty() => {
+                        Some(json!({ "type": "thinking", "thinking": b.text }))
+                    }
+                    "tool_use" => Some(json!({
+                        "type": "tool_use", "id": b.id, "name": b.name, "input_json": b.json,
+                    })),
+                    _ => None,
+                })
+                .collect();
+            let resp_body = json!({
+                "content": content,
+                "usage": { "in": cur_in, "read": cur_read, "create": cur_create, "out": cur_out },
+            });
+            log::dump_api("response", &dump_rid, &cfg.model, Some(resp_status), None, &resp_body);
+        }
+
         if let Some(err) = api_error {
             return finish_error(history, base, &err, started, turns);
         }
@@ -5664,19 +7126,31 @@ fn run_query(
                     // hook 放行 ⇒ 只剩「安全分析命中」这一种情况还能把卡叫回来
                     let allowed = matches!(gate, HookGate::Allow)
                         && !hook_allow_needs_card(name, input);
-                    let ask = !allowed
-                        && ask_permission
-                        && needs_approval_with(name, input, skill_list)
+                    let needs_card = needs_approval_with(name, input, skill_list)
                         && (!tctx.read_only || tools::gated_in_read_only(name));
-                    if ask {
-                        // PermissionRequest（A9）：只在「本来就要弹卡」的这一刻问 ——
-                        // 它能替用户答这一问（allow = 免卡，deny = 直接拒）
-                        match hook_tool_gate("PermissionRequest", &tctx.cwd, name, id, input) {
-                            HookGate::Deny(r) => {
-                                denied = Some(format!("Denied by PermissionRequest hook: {r}"))
+                    if !allowed && needs_card {
+                        match approval_policy() {
+                            // 单发：没有回包通道 ⇒ 需审批的工具直接拒（绝不静默挂起）
+                            ApprovalPolicy::UnattendedDeny => {
+                                denied = Some(unattended_deny_reason(name))
                             }
-                            HookGate::Allow if !hook_allow_needs_card(name, input) => {}
-                            _ => pending = Some(open_approval(name, id, input, None)),
+                            // 单发 + --dangerously-skip-permissions：用户显式承担 ⇒ 放行、不弹卡
+                            ApprovalPolicy::UnattendedAllow => {}
+                            // 常驻：现状（需 stdio 审批开关）
+                            ApprovalPolicy::Stdio if ask_permission => {
+                                // PermissionRequest（A9）：只在「本来就要弹卡」的这一刻问 ——
+                                // 它能替用户答这一问（allow = 免卡，deny = 直接拒）
+                                match hook_tool_gate("PermissionRequest", &tctx.cwd, name, id, input)
+                                {
+                                    HookGate::Deny(r) => {
+                                        denied =
+                                            Some(format!("Denied by PermissionRequest hook: {r}"))
+                                    }
+                                    HookGate::Allow if !hook_allow_needs_card(name, input) => {}
+                                    _ => pending = Some(open_approval(name, id, input, None)),
+                                }
+                            }
+                            ApprovalPolicy::Stdio => {}
                         }
                     }
                 }
@@ -5911,6 +7385,18 @@ fn run_query(
             })
             .collect();
 
+        // ── 子目录记忆懒加载（2026-10-12，§待办 3-1a 子目录级）──────────────
+        // 对本轮**真正触碰过**的合格子目录，把其 AGENTS.md 拼进**对应 tool_result 的文本内部**
+        // （不新增消息 / 块 ⇒ 固定前缀一字不动；判据链与落点纪律见 `inject_subdir_memory`）。
+        inject_subdir_memory(
+            &tctx.cwd,
+            history.as_slice(),
+            &calls,
+            &run_inputs,
+            &denieds,
+            &mut results,
+        );
+
         // ── 后台结果回流（2026-10-01，用户选的形态：「攒着，下次工具调用时带上」）──
         // 已跑完的后台命令，输出在这里**随 tool_result 一起**交给模型。
         // **不单独 push 一条消息**：那会改变 `history` 末尾的消息形态，把端点侧前缀缓存
@@ -6100,6 +7586,40 @@ fn finish_error(
 mod tests {
     use super::*;
 
+    /// 单发模式（--print）的参数判定（2026-10-11）。
+    /// 钉住四件事：① 带值形态把紧跟的非 flag 当 query；② 不带值形态（后面是别的 flag）
+    /// 不误吃、且仍判定为单发；③ `--print` + `--input-format stream-json` = 常驻（宿主形态），
+    /// 绝不能退化成单发；④ --output-format 默认 text。
+    #[test]
+    fn cli_print_single_shot_detection() {
+        let parse = |v: &[&str]| CliArgs::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let a = parse(&["--print", "Reply with the single word: PONG"]);
+        assert!(a.print && a.single_shot());
+        assert_eq!(a.print_query.as_deref(), Some("Reply with the single word: PONG"));
+        assert_eq!(a.output_format, "text");
+
+        // 短选项 + 后面的参数不被误当 query
+        let b = parse(&["-p", "--output-format", "json"]);
+        assert!(b.print && b.single_shot());
+        assert_eq!(b.print_query, None);
+        assert_eq!(b.output_format, "json");
+
+        // 宿主形态：--print 后面紧跟的是 flag ⇒ 不吃；带 --input-format stream-json ⇒ 常驻
+        let c = parse(&[
+            "--print",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            ".",
+        ]);
+        assert!(c.print && c.input_stream_json);
+        assert!(!c.single_shot());
+        assert_eq!(c.print_query, None);
+    }
+
     /// 计划相位 / 档位判据的单测用最小上下文（与 `tools.rs` 里那份同形）：
     /// 只关心两个标志，不碰磁盘。
     fn test_ctx() -> tools::Ctx {
@@ -6108,6 +7628,7 @@ mod tests {
             add_dirs: Vec::new(),
             read_only: false,
             locked: false,
+            worktree: Arc::new(Mutex::new(None)),
             plan_phase: Arc::new(AtomicBool::new(false)),
             tool_output: None,
             shell_control: None,
@@ -6129,8 +7650,9 @@ mod tests {
     }
 
     /// A17：结果卡上的安全告警载荷 —— 判据与审批卡**同源**（`written_payload` + `analyze`）。
-    /// 四条边界：`Write` 取 `content`、`Edit` 取 `new_string`（**不取 `old_string`**：
-    /// 那是要被删掉的内容，扫它会把「正在清理凭据」标成可疑）、非写入类工具一律空、
+    /// 边界：`Write` 取 `content`、`Edit` 取 `new_string`（**不取 `old_string`**：
+    /// 那是要被删掉的内容，扫它会把「正在清理凭据」标成可疑）、`NotebookEdit` 取
+    /// `new_source`（delete 档没有该字段 ⇒ 不扫）、非写入类工具一律空、
     /// 干净内容也是空（前端据此决定「有没有这个键」）。
     #[test]
     fn security_warnings_only_cover_written_payloads() {
@@ -6159,6 +7681,23 @@ mod tests {
             hits(security_warnings("Edit", &json!({ "new_string": secret }))).len(),
             1,
             "Edit 扫 new_string"
+        );
+        assert_eq!(
+            hits(security_warnings(
+                "NotebookEdit",
+                &json!({ "notebook_path": "n.ipynb", "new_source": secret })
+            ))
+            .len(),
+            1,
+            "NotebookEdit 扫 new_source"
+        );
+        assert!(
+            hits(security_warnings(
+                "NotebookEdit",
+                &json!({ "notebook_path": "n.ipynb", "edit_mode": "delete" })
+            ))
+            .is_empty(),
+            "delete 档没有 new_source ⇒ 不扫"
         );
         assert!(hits(security_warnings("Cmd", &json!({ "command": "echo hi" }))).is_empty());
         assert!(hits(security_warnings("Write", &json!({ "content": "fn main() {}" }))).is_empty());
@@ -6260,15 +7799,44 @@ mod tests {
         assert!(!a.contains(USER_PERSONA_HEADER), "没配用户人格时不该多出这一段");
     }
 
-    /// 「往期会话索引 + 长期记忆」**不在 system 里、只在上下文块里**（2026-10-06，M2-16 方案 D）。
+    /// 「阶段小结」是 L6 输出纪律的**唯一例外**，且必须写明**只对多轮工具任务生效**（2026-10-08）。
     ///
-    /// 这是方案 D 的核心不变量，两个方向都要钉住：
-    /// ① **反面** —— 它们不在 `build_system_prompt` 的产物里（否则 system 随会话 / 记忆增长而变，
-    ///    每次重启后端点缓存从 0 起全 miss，正是要修的病灶）；
-    /// ② **正面** —— `context_block_message` 把它们合成**一条 `user` 消息**、且表头可被
-    ///    `is_context_block_msg` 认出（幂等注入的判据）。两者皆空 ⇒ `None`（不加空壳）。
+    /// 两条都要钉住，因为它们互为前提：
+    /// ① **例外本身在**（`Phase summaries` 那句）—— 用户要的「每段思考后一次小输出」就靠它；
+    /// ② **范围收窄也在**（`single-step` 那句）—— 一旦丢了，模型会给每个单步问答都加一段小结，
+    ///    正好把 2026-09-29 的 L6 降本成果吃回去（那个例外之所以能开，就是因为只覆盖多轮任务）。
     #[test]
-    fn index_and_memory_live_in_the_context_block_not_the_system_prompt() {
+    fn phase_summaries_are_scoped_to_multi_round_tasks() {
+        assert!(
+            PERSONA_AND_STYLE.contains("Phase summaries"),
+            "「阶段小结」这条丢了 —— 每段思考后的小输出就没人要求了"
+        );
+        assert!(
+            PERSONA_AND_STYLE.contains("more than one tool round"),
+            "「阶段小结」的范围没说清（多轮工具任务），模型可能给单步问答也加"
+        );
+        assert!(
+            PERSONA_AND_STYLE.contains("A single-step answer emits none of this"),
+            "「单步问答不加」这条丢了 —— 会把 L6 的降本成果吃回去"
+        );
+        // L6 主体不得被这次改动顺手删掉（例外是加在它之后的，不是替代它）。
+        assert!(
+            PERSONA_AND_STYLE.contains("no preamble before tool calls"),
+            "L6 的输出纪律主体丢了"
+        );
+    }
+
+    /// 「长期记忆」**不在 system 里、只在上下文块里**（2026-10-06，M2-16 方案 D）。
+    ///
+    /// 两个方向都要钉住：
+    /// ① **反面** —— 它不在 `build_system_prompt` 的产物里（否则 system 随记忆增长而变，
+    ///    每次重启后端点缓存从 0 起全 miss，正是要修的病灶）；
+    /// ② **正面** —— `context_block_message` 把它合成**一条 `user` 消息**、且表头可被
+    ///    `is_context_block_msg` 认出（幂等注入的判据）。空 ⇒ `None`（不加空壳）。
+    ///
+    /// **2026-10-07**：往期会话索引不再注入（新对话与上个对话模型侧隔离），本块只剩记忆。
+    #[test]
+    fn memory_lives_in_the_context_block_not_the_system_prompt() {
         let env = env_block(std::path::Path::new("C:/work"));
         let system = build_system_prompt("", &env, "");
         assert!(
@@ -6276,26 +7844,22 @@ mod tests {
             "上下文块表头不该出现在 system 里"
         );
 
-        // 两者皆空 ⇒ 没有上下文块（不凭空多一条消息）
-        assert!(context_block_message("", "   ").is_none(), "两块都空应返回 None");
+        // 空记忆 ⇒ 没有上下文块（不凭空多一条消息）
+        assert!(context_block_message("   ").is_none(), "空记忆应返回 None");
 
-        let cb = context_block_message("HIST-INDEX", "LONG-MEM").expect("非空时应生成块");
+        let cb = context_block_message("LONG-MEM").expect("非空时应生成块");
         assert_eq!(cb.get("role").and_then(Value::as_str), Some("user"), "必须是 user 消息");
         let text = cb
             .pointer("/content/0/text")
             .and_then(Value::as_str)
             .expect("应有 text 块");
         assert!(text.starts_with(CONTEXT_BLOCK_HEADER), "必须以表头开头（幂等判据）");
-        assert!(text.contains("HIST-INDEX") && text.contains("LONG-MEM"), "两块正文都在");
+        assert!(text.contains("LONG-MEM"), "记忆正文在");
         assert!(is_context_block_msg(&cb), "自产的块必须能被幂等判据认出");
 
         // 普通用户消息不能被误判成上下文块（否则幂等逻辑会漏注）
         let normal = json!({ "role": "user", "content": [{ "type": "text", "text": "你好" }] });
         assert!(!is_context_block_msg(&normal), "普通用户消息不该被认成上下文块");
-
-        // 只有一块非空也照样生成
-        assert!(context_block_message("HIST", "").is_some());
-        assert!(context_block_message("", "MEM").is_some());
     }
 
     /// 用户人格（L2）：**逐字进主提示词、位置在内置人格之后、且只进主提示词**。
@@ -6347,11 +7911,12 @@ mod tests {
         assert!(one.contains("Be terse.") && !one.ends_with(' ') && !one.ends_with('\n'));
     }
 
-    /// 项目记忆（`AGENTS.md`，2026-10-01）：逐字进提示词、三份提示词同源、空文件零字节。
+    /// 项目记忆（AGENTS.md）：逐字进提示词、三份提示词同源、空文件零字节。
     #[test]
     fn agents_md_reaches_all_three_prompts_verbatim() {
-        let body = "# 项目约定\n- 构建：`npm run build`\n- 保留 {braces} 字面量";
-        let block = project_block_from(body);
+        let body = "# 项目约定\n- 构建：npm run build\n- 保留 {braces} 字面量";
+        let block =
+            project_block_from_chain(&[(PathBuf::from("C:/work/AGENTS.md"), body.to_string())]);
         assert!(block.contains(AGENTS_MD_HEADER), "表头丢了");
         assert!(block.contains(body), "正文必须逐字进提示词");
         assert!(block.contains("{braces}"), "花括号是字面量，不该被当占位符");
@@ -6366,24 +7931,75 @@ mod tests {
         }
     }
 
-    /// 没有 `AGENTS.md` / 文件全空白 = 完全不存在：不加表头、不加换行。
+    /// 没有 AGENTS.md / 文件全空白 = 完全不存在：不加表头、不加换行。
     /// 否则每个没有这个文件的目录都会凭空多一段**每轮都要发**的空壳。
     #[test]
     fn blank_agents_md_adds_nothing_to_the_prompt() {
-        assert_eq!(project_block_from(""), "");
-        assert_eq!(project_block_from("  \n\t  "), "");
-        // 纯函数层再钉一次「没文件 ⇒ 空串」（读到不存在路径）
-        let missing = std::env::temp_dir().join("lunac-agents-md-does-not-exist-9231");
-        assert_eq!(project_block(&missing), "");
+        assert_eq!(project_block_from_chain(&[]), "");
+        assert_eq!(
+            project_block_from_chain(&[(PathBuf::from("x/AGENTS.md"), "  \n\t  ".to_string())]),
+            ""
+        );
     }
 
-    /// `AGENTS.md` 超长必须截断 —— 它进的是每次请求都要发的固定前缀。
+    /// 单份 AGENTS.md 超长必须截断 —— 它进的是每次请求都要发的固定前缀。
     #[test]
     fn oversized_agents_md_is_truncated() {
         let long = "x".repeat(MAX_AGENTS_MD_CHARS + 500);
-        let block = project_block_from(&long);
+        let block = project_block_from_chain(&[(PathBuf::from("x/AGENTS.md"), long)]);
         let body = block.split(AGENTS_MD_HEADER).nth(1).unwrap().trim_start_matches('\n');
         assert_eq!(body.chars().count(), MAX_AGENTS_MD_CHARS, "必须截到上限");
+    }
+
+    /// 多层 / 向上递归（2026-10-11）：工作目录 → 盘根 链路上每一级的 AGENTS.md 都收到，
+    /// 顺序**浅→深**（越深越具体、排在越后）；并证明同一状态下逐字节可复现（前缀缓存纪律）。
+    #[test]
+    fn multi_level_agents_md_is_chained_shallow_to_deep_and_stable() {
+        let root = std::env::temp_dir().join(format!("lunac-agents-multi-{}", std::process::id()));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join(AGENTS_MD_FILE), "ROOT-RULE").unwrap();
+        std::fs::write(sub.join(AGENTS_MD_FILE), "SUB-RULE").unwrap();
+
+        let files = collect_agents_md(&sub);
+        assert_eq!(
+            files.len(),
+            2,
+            "两级都应收到：{:?}",
+            files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        assert_eq!(files[0].1.trim(), "ROOT-RULE", "先浅（父级）");
+        assert_eq!(files[1].1.trim(), "SUB-RULE", "后深（本级）");
+
+        let block = project_block(&sub);
+        let ri = block.find("ROOT-RULE").expect("父级规则在");
+        let si = block.find("SUB-RULE").expect("本级规则在");
+        assert!(ri < si, "越深越具体 ⇒ 排在越后");
+        // 同一状态下两次调用逐字节一致（不改文件、不重扫 ⇒ 固定前缀不抖）
+        assert_eq!(block, project_block(&sub), "同一状态下前缀必须逐字节相同");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 总量上限：多份叠加超过总预算时丢**最浅**的，保留更贴近工作目录的那份。
+    #[test]
+    fn agents_md_chain_drops_shallowest_when_over_total_budget() {
+        // 两份各顶到单文件上限：8000 + 8000 = 16000 = 总上限，两份都要
+        let shallow = "a".repeat(MAX_AGENTS_MD_CHARS);
+        let deep = "b".repeat(MAX_AGENTS_MD_CHARS);
+        let two = project_block_from_chain(&[
+            (PathBuf::from("C:/p/AGENTS.md"), shallow.clone()),
+            (PathBuf::from("C:/p/q/AGENTS.md"), deep.clone()),
+        ]);
+        assert!(two.contains(&shallow) && two.contains(&deep), "刚好到上限时两份都留");
+        // 再加一份就会超：最浅的那份被丢掉，更深的两份保留
+        let deeper = "c".repeat(MAX_AGENTS_MD_CHARS);
+        let three = project_block_from_chain(&[
+            (PathBuf::from("C:/p/AGENTS.md"), shallow.clone()),
+            (PathBuf::from("C:/p/q/AGENTS.md"), deep.clone()),
+            (PathBuf::from("C:/p/q/r/AGENTS.md"), deeper.clone()),
+        ]);
+        assert!(!three.contains(&shallow), "最浅的那份应被丢掉");
+        assert!(three.contains(&deep) && three.contains(&deeper), "更深的应保留");
     }
 
     /// 子代理工具集的守门测试（2026-09-20 复查补，A7 扩了一类）。
@@ -6427,6 +8043,18 @@ mod tests {
                 "{plan_tool} 改的是主循环的全局相位，且子代理问不了用户"
             );
         }
+        for wt_tool in ["EnterWorktree", "ExitWorktree"] {
+            assert!(
+                !names.contains(&wt_tool.to_string()),
+                "{wt_tool} 改的是主循环的有效工作目录（跨线程共享），子代理改它会把主代理的解析带走"
+            );
+        }
+        for fe_tool in ["SendUserFile", "PushNotification"] {
+            assert!(
+                !names.contains(&fe_tool.to_string()),
+                "{fe_tool} 的效果是主进程前端的卡片 / 通知，子代理里调用只会冒出一张无上下文的卡"
+            );
+        }
         assert!(
             !names.iter().any(|n| n.starts_with("mcp__")),
             "MCP 工具在子代理里必然失败（无桥 + 白问一次审批）"
@@ -6444,7 +8072,17 @@ mod tests {
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str).map(String::from))
             .filter(|n| {
-                !matches!(n.as_str(), "Agent" | "EnterPlanMode" | "ExitPlanMode")
+                !matches!(
+                    n.as_str(),
+                    "Agent"
+                        | "EnterPlanMode"
+                        | "ExitPlanMode"
+                        | "PetControl"
+                        | "EnterWorktree"
+                        | "ExitWorktree"
+                        | "SendUserFile"
+                        | "PushNotification"
+                )
                     && !tools::needs_bridge(n)
                     && !n.starts_with("mcp__")
             })
@@ -6515,19 +8153,61 @@ mod tests {
         assert!(ctx.plan_phase.load(Ordering::Relaxed), "被拒时相位不得被清掉");
     }
 
-    /// 轮次门槛（A4）。三条边界：`interval == 0` 是**关闭**而不是「每次都跑」；
-    /// 还没问过（0）不触发；到整数倍才触发。
+    /// 复盘触发（A4，2026-10-11 方案 B：按会话 + 按时间）。四类边界：
+    /// 写侧不可用（enabled=false）永不触发；本会话已复盘过（≤ 1 次）不再触发；
+    /// 距上次不到 30 分钟不触发、到点触发；从未复盘过（None）且写侧可用则触发；
+    /// 时钟回拨（last_ts 在未来）按「还没到时间」处理。
     #[test]
-    fn nudge_gate_fires_on_multiples_only() {
-        for q in 1..10u64 {
-            assert!(!should_review(q, 10), "第 {q} 问不该复盘");
-        }
-        for q in [10u64, 20, 30] {
-            assert!(should_review(q, 10), "第 {q} 问该复盘");
-        }
-        assert!(!should_review(0, 10), "一次都没问过时不触发");
-        assert!(!should_review(10, 0), "interval=0 是关闭");
-        assert!(should_review(1, 1), "interval=1 时每次都触发（允许，但代价自负）");
+    fn review_gate_is_per_session_and_time_capped() {
+        let gap = REVIEW_MIN_GAP_SECS;
+        let now = 1_700_000_000i64;
+        // 正常触发：写侧可用、本会话没复盘过、从未复盘 or 已过间隔。
+        assert!(should_review(true, false, None, now), "从未复盘 + 本会话未复盘 ⇒ 触发");
+        assert!(
+            should_review(true, false, Some(now - gap), now),
+            "恰好满 30 分钟 ⇒ 触发"
+        );
+        // 不到间隔 ⇒ 不触发（差 1 秒也不行）。
+        assert!(
+            !should_review(true, false, Some(now - gap + 1), now),
+            "差 1 秒不满间隔 ⇒ 不触发"
+        );
+        // 每会话 ≤ 1 次 ⇒ 本会话已复盘过一律不触发（即便过了很久）。
+        assert!(
+            !should_review(true, true, Some(now - gap * 10), now),
+            "本会话已复盘过 ⇒ 不再触发"
+        );
+        // 写侧不可用（没桥 / 记忆关 / Remember 被裁）⇒ 永不触发。
+        assert!(!should_review(false, false, None, now), "写侧不可用 ⇒ 不触发");
+        // 时钟回拨（last_ts 在未来）按「没到时间」处理，不狂调模型。
+        assert!(
+            !should_review(true, false, Some(now + 3600), now),
+            "时钟回拨 ⇒ 当作没到时间"
+        );
+    }
+
+    /// 长期记忆的冷启动死锁回归（方案 D，2026-10-11）：记忆为空但写侧可用时**仍要注入
+    /// Remember 引导**（否则全新安装永远学不会主动写）。引导是固定前缀、正文拼在其后。
+    #[test]
+    fn memory_block_injects_guidance_when_memory_is_empty() {
+        // 空记忆 + 写侧可用 ⇒ 注入表头 + 引导（没有正文）。
+        let empty = memory_block_text(true, "");
+        assert!(empty.contains("# Long-term memory"), "空记忆也要注入表头");
+        assert!(
+            empty.contains("Add a fact with the `Remember` tool"),
+            "空记忆也要注入 Remember 引导（冷启动死锁的回归防线）"
+        );
+        // 空记忆 + 写侧不可用 ⇒ 无可注入（不拿一句空话污染前缀）。
+        assert!(memory_block_text(false, "").is_empty(), "空记忆 + 写侧不可用 ⇒ 空串");
+        // 有正文时行为不变，且正文必须落在引导**之后**（缓存前缀纪律：前缀逐字节稳定）。
+        let full = memory_block_text(true, "- prefers tabs");
+        assert!(full.contains("Add a fact with the `Remember` tool"));
+        assert!(full.ends_with("- prefers tabs"), "正文必须拼在引导之后");
+        // 逐字节稳定性：空记忆的块必须是「有正文的块」的前缀（引导段一字不差）。
+        assert!(
+            full.starts_with(&empty),
+            "空记忆的块必须是有记忆块的前缀（引导段不随正文变）"
+        );
     }
 
     /// 复盘快照（A4）：只认三类块、工具结果有上限、超预算时**从最早处**丢。
@@ -7006,6 +8686,23 @@ mod tests {
         );
     }
 
+    /// 「预算撞顶不中止」的闸门判据（2026-10-09）：**只有清单里还有 `pending` /
+    /// `in_progress` 才放宽**（见 `MAX_BUDGET_EXTENSIONS_HARD`）。钉住四条，
+    /// 最后一条最要紧 —— 没有计划时必须**保守**，不能把普通问答也变成无底洞。
+    #[test]
+    fn budget_gate_opens_only_when_the_plan_is_unfinished() {
+        let mk = |status: &str| {
+            json!({"role":"assistant","content":[{
+                "type":"tool_use","id":"t","name":"TodoWrite",
+                "input":{"todos":[{"content":"做完这个","status":status,"activeForm":"做"}]}
+            }]})
+        };
+        assert!(todo_has_unfinished(&[mk("pending")]), "pending ⇒ 计划未完成");
+        assert!(todo_has_unfinished(&[mk("in_progress")]), "in_progress ⇒ 计划未完成");
+        assert!(!todo_has_unfinished(&[mk("completed")]), "全 completed ⇒ 计划已完成");
+        assert!(!todo_has_unfinished(&[]), "没有清单 ⇒ 不放宽（保守）");
+    }
+
     // ── 摘要式压缩（backlog §8.2）─────────────────────────────────────
 
     /// 测试用的 `Cfg`。端点指向一个必然连不上的本机端口 —— 只用于「**不该发请求**」的断言：
@@ -7417,9 +9114,95 @@ mod tests {
         // 开档的 budget 必须严格小于它抬起来的 max_tokens，否则端点判参数非法
         assert!(THINKING_BUDGET < max_tokens_for(Thinking::Budget(THINKING_BUDGET)));
 
+        // 思考与答复**共用一个 max_tokens 池子**：预算之外必须真给答复留出 HEADROOM，
+        // 否则「思考用满 + 大段代码」就会撞上限被截断。实测 2026-10-07 撞过 12288（旧值
+        // = 8192 + 4096），不得回退到那个数。
+        assert_eq!(
+            max_tokens_for(Thinking::Budget(THINKING_BUDGET)),
+            THINKING_BUDGET + THINKING_HEADROOM_TOKENS
+        );
+        assert!(THINKING_HEADROOM_TOKENS > 4096, "余量被改回会被截断的旧值");
+        // 关档（无思考抢池子）仍用手收紧的基线
+        assert_eq!(max_tokens_for(Thinking::Disabled), BASE_MAX_TOKENS);
+
         // 关档的降级终点是「不发字段」，绝不退到 adaptive（那等于反手把思考打开）
         assert_eq!(Thinking::Disabled.next(), Some(Thinking::Omit));
         assert_eq!(Thinking::Disabled.to_json(), Some(json!({ "type": "disabled" })));
+    }
+
+    /// 「按轮思考覆盖」（2026-10-09）：**只认 `off`** —— 其余值一律 `None`（用全局开关）。
+    /// 桌宠轮靠它强制关 thinking；按轮「开」刻意不支持（全局开关已经能开）。
+    #[test]
+    fn per_turn_thinking_override_only_turns_things_off() {
+        for off in ["off", " 0 ", "false"] {
+            assert_eq!(
+                thinking_override_from(Some(off)),
+                Some(Thinking::Disabled),
+                "{off} 应为「按轮关」"
+            );
+        }
+        for other in ["on", "", "8192", "whatever"] {
+            assert_eq!(thinking_override_from(Some(other)), None, "{other:?} 不该覆盖");
+        }
+        assert_eq!(thinking_override_from(None), None, "不带字段 ⇒ 用全局开关");
+    }
+
+    /// stdin 输入类型判定（2026-10-11）：compact 必须被识别；既有三种不变；
+    /// 未知 / 缺 type 仍落 Unknown（主循环照旧打「忽略输入类型」）。
+    #[test]
+    fn stdin_input_types_are_classified() {
+        assert!(matches!(stdin_kind(&json!({"type":"user"})), StdinKind::User));
+        assert!(matches!(
+            stdin_kind(&json!({"type":"set_history"})),
+            StdinKind::SetHistory
+        ));
+        assert!(matches!(
+            stdin_kind(&json!({"type":"control_response"})),
+            StdinKind::ControlResponse
+        ));
+        assert!(matches!(
+            stdin_kind(&json!({"type":"compact"})),
+            StdinKind::Compact
+        ));
+        assert!(matches!(
+            stdin_kind(&json!({"type":"foo"})),
+            StdinKind::Unknown(Some("foo"))
+        ));
+        assert!(matches!(stdin_kind(&json!({})), StdinKind::Unknown(None)));
+    }
+
+    /// 空历史手动压缩：必须回一条 elided/dropped 均为 0 的 context_compacted，
+    /// 且**不得**被塞进 TRIMMED_MARKER 之类的合成消息（Force 档对空历史会做那件事）。
+    #[test]
+    fn manual_compact_on_empty_history_receipts_zero_without_pollution() {
+        let cfg = cfg_for_tests();
+        let mut history: Vec<Value> = Vec::new();
+        let ev = manual_compact(&cfg, &mut history, &std::env::temp_dir())
+            .expect("空历史也必须补发一条回执");
+        assert_eq!(ev["type"], "system");
+        assert_eq!(ev["subtype"], "context_compacted");
+        assert_eq!(ev["elided"], 0);
+        assert_eq!(ev["dropped"], 0);
+        assert!(history.is_empty(), "空历史不得被插进合成消息");
+    }
+
+    /// 无可压缩内容时的手动压缩：历史逐字节不变，但仍补发 0/0 回执
+    /// （compact_history 只在真压动时才发事件，回执缺口由 manual_compact 补上）。
+    #[test]
+    fn manual_compact_receipts_zero_when_nothing_to_compress() {
+        let cfg = cfg_for_tests();
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"hello"}]}),
+        ];
+        let before = history.clone();
+        let ev = manual_compact(&cfg, &mut history, &std::env::temp_dir())
+            .expect("压不动也要补发回执");
+        assert_eq!(ev["type"], "system");
+        assert_eq!(ev["subtype"], "context_compacted");
+        assert_eq!(ev["elided"], 0);
+        assert_eq!(ev["dropped"], 0);
+        assert_eq!(history, before, "没有可压缩内容时历史必须逐字节不变");
     }
 
     fn call(name: &str) -> (String, String, Value) {

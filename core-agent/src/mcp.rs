@@ -9,7 +9,7 @@
 // 握手顺序（MCP 2025-06-18）：
 //   initialize → notifications/initialized → tools/list → （模型调用时）tools/call
 //
-// 除工具调用外，本桥还承载两组**自定义方法**（`lunac/history_index` / `lunac/history_search`
+// 除工具调用外，本桥还承载两组**自定义方法**（`lunac/history_search`
 // 与 `lunac/memory_read` / `lunac/memory_write`）—— 它们**不列进 `tools/list`**，因此不出现在
 // 用户的工具列表里、也不弹审批卡；支撑的是内置工具 `SessionSearch`（往期会话检索，2026-09-19）
 // 与 `Remember`（长期记忆，2026-09-20）。
@@ -24,11 +24,40 @@
 // `elicitation/create`（客户端弹卡收集用户输入，供工具 JSON 里声明了 `elicit` 的用户工具用）。
 // 这两条只在**声明了对应能力**的桥上发生；远端 HTTP 服务器不声明、也不处理（见 `handshake`）。
 //
+// `sampling/createMessage`（服务端反向调用模型）同属这一类：客户端**默认声明**该能力、
+// 并对**每一台**连上的服务器都装上处理钩子（宿主桥 / `.mcp.json` 外部 stdio / 远端 HTTP）。
+// 钩子由**宿主**（`main.rs`）提供 —— 反向调用模型要走既有模型调用入口 + 成本闸 + **一次
+// 高底线审批卡**，那是宿主层的职责。契约与护栏见 `SamplingHandler` 与 `answer_server_request`。
+//
+// 两条传输都有反向通道，形态不同：
+//   · **stdio**：服务端请求直接插在 stdout 的行流里，`Bridge::request` 的就地应答循环接住
+//     （见 `Bridge::request`）；
+//   · **HTTP（Streamable HTTP）**：规范给了两条通道，两条都做 ——
+//     ① **POST 响应 SSE 流**：一次 POST 的响应可以被服务器当成 `text/event-stream` 返回，
+//        并在流里夹带服务端→客户端的请求（见 `Bridge::request_http` / `read_http_sse`）；
+//     ② **客户端 GET 独立 SSE 流**：客户端在 `initialize` 之后**另开一条** `Accept:
+//        text/event-stream` 的 GET 长连接，服务器在它上面**主动推送**（见 `stream_loop`）。
+//
+// **反向请求的处理一律在独立线程**（`start_reverse_channel` 起的「服务端请求处理线程」）：
+// 主线程（POST 请求-响应路径）只把服务端请求**转发**过去，自己不等待 —— 于是「审批卡上等
+// 用户」的时间**不计入任何一次 `tools/call` 的超时预算**。GET 流线程本身也是常驻线程，
+// 它与工具调用无关，天然解耦。
+//
+// GET 流的三件工程件：**心跳容忍**（SSE 注释行 / keep-alive / 空行都被 `SseDecoder` 忽略，
+// 不算事件、也不会让读取循环退出）、**断线重连**（指数退避，见 `stream_retry_delay`）、
+// **401 刷新后重建**（`HttpChannel::open_stream` 里 OAuth 模式 401 刷新令牌重试一次）。
+// 服务器不支持时按规范回 405 / 404 ⇒ 只记一行、**不重连**。
+//
+// **如实记的边界**：① 同一台服务器的多个反向请求由**一个处理线程串行**处理（不会同时弹
+// 两张卡）；② 每台 HTTP 服务器**一条** GET 流；③ 若服务器把某次 `tools/call` 的响应**扣住**
+// 直到收到我们的反向响应（gate），那么那次工具调用的收尾仍受**服务器**决定（网络读受
+// `CALL_TIMEOUT` 约束）—— 客户端侧的审批等待已不再算进去，GET 流那条通道则完全不受影响。
+//
 // 工具名统一加 `mcp__` 前缀，避免与内置工具重名；前缀必须稳定，因为
 // 前端审批卡的「始终允许」是按完整工具名记进 localStorage 白名单的。
 //
 // 桥是尽力而为：连不上 / 握手失败只往 stderr 记一行，内置工具照常工作
-// （往期会话索引也只是不注入，不影响任何其它能力）。
+// （`SessionSearch` / 长期记忆也只是取不到，不影响任何其它能力）。
 //
 // ── 远端服务器（Streamable HTTP，2026-10-01）─────────────────────────
 //
@@ -53,12 +82,15 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
+use crate::log;
 use crate::mcp_oauth;
 
 const PREFIX: &str = "mcp__";
@@ -69,6 +101,11 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 单次 tools/call 上限（shell handler 自身 60s 超时，http 可能更慢）
 const CALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// 客户端 GET 独立 SSE 流**断线重连**的指数退避：基数 × 2^attempt，封顶。
+const STREAM_RETRY_BASE: Duration = Duration::from_secs(1);
+const STREAM_RETRY_MAX: Duration = Duration::from_secs(30);
+/// 退避 sleep 的粒度：每次最多睡这么久就看一眼 `stop`，让收尾不必干等整段退避。
+const STREAM_RETRY_TICK: Duration = Duration::from_millis(200);
 /// 工具名限字符集与 ≤64 长度（Anthropic 兼容端点的校验），故原名上限要减去前缀
 const MAX_RAW_NAME: usize = 64 - PREFIX.len();
 /// 远端服务器配置文件的路径来源（宿主**无条件**注入，文件不存在 = 没配）。
@@ -78,6 +115,8 @@ const PROJECT_MCP_FILE: &str = ".mcp.json";
 /// 单台服务器最多接入的工具数。一份坏清单（或恶意服务器）不该把固定前缀撑爆 ——
 /// tools 数组是每次请求都要发的一部分。
 const MAX_TOOLS_PER_SERVER: usize = 100;
+/// 宿主那条 stdio 桥在 sampling 审批卡上显示的名字（它不是用户配的外部服务器）。
+const SAMPLING_HOST_LABEL: &str = "Lunac";
 
 /// 是否为本桥接进来的 MCP 工具（按名字前缀判定）
 pub fn is_mcp(name: &str) -> bool {
@@ -307,25 +346,36 @@ fn parse_auth(item: &Value) -> Option<AuthMode> {
     }
 }
 
+/// URL 的主机名（小写、剥 scheme / userinfo / 端口 / IPv6 方括号）；解析不出回空串。
+fn url_host(url: &str) -> String {
+    let lower = url.trim().to_ascii_lowercase();
+    let Some((_, rest)) = lower.split_once("://") else {
+        return String::new();
+    };
+    let host = rest.split(['/', '?']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    if let Some(inner) = host.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("").to_string()
+    } else {
+        host.split(':').next().unwrap_or(host).to_string()
+    }
+}
+
+/// 目标是不是**本机回环**（`localhost` / `127.0.0.1` / `[::1]`）。
+fn is_loopback_url(url: &str) -> bool {
+    matches!(url_host(url).as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
 /// 明文 `http://` 是否放行：**只给本机**。
 fn url_allowed(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     if lower.starts_with("https://") {
         return true;
     }
-    let Some(rest) = lower.strip_prefix("http://") else {
+    if !lower.starts_with("http://") {
         return false;
-    };
-    // 剥 userinfo 与端口（`user@host:1234/path?x`）。IPv6 是 `[::1]:3000` 这种带方括号的，
-    // 不能按第一个 `:` 切 —— 那样会把它切成 `[`。
-    let host = rest.split(['/', '?']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or(host);
-    let host = if let Some(inner) = host.strip_prefix('[') {
-        inner.split(']').next().unwrap_or("")
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    }
+    is_loopback_url(url)
 }
 
 // ── 项目级 MCP 配置（`<工作目录>\.mcp.json`，2026-10-06，q3 第 2 步）────
@@ -676,13 +726,32 @@ enum Kind {
 }
 
 struct HttpTransport {
-    client: reqwest::blocking::Client,
+    /// 跨线程共享的传输句柄：主线程（POST 请求-响应）+ 反向线程（GET 流 / 服务端请求处理）。
+    channel: Arc<HttpChannel>,
+    /// 反向通道句柄（GET 独立 SSE 流 + 服务端请求处理）。`None` = 没装 sampling 钩子、或
+    /// 握手后开流那一组线程没起来（那时服务端不会发 sampling —— 我们没声明该能力）。
+    reverse: Option<ReverseChannel>,
+}
+
+/// 远端 HTTP 服务器的**可跨线程共享**传输句柄。
+///
+/// 为什么要把 `client` / `url` / `headers` / `session` / `oauth` 从 `Bridge` 里抽出来：
+/// 客户端 GET 独立 SSE 流要有一条**常驻线程**（长连接），它拿不到主线程那条 `&mut Bridge`
+/// （同 `run_review_fork` 的「桥归主线程所有」约束）⇒ 只能共享一个 `Arc` 句柄。
+/// `session` 与 `oauth` 会被两条线程写（请求回包可能带会话头、反向线程回包可能触发 401
+/// 刷新），故各自包 `Mutex`；`client` / `url` / `headers` 只读，无需锁。
+struct HttpChannel {
+    /// 请求-响应主路径用的 client（默认 `CALL_TIMEOUT`）。
+    post: reqwest::blocking::Client,
+    /// **不设总超时**的 client，专供长连接 GET SSE 流 —— 用带 180s 超时的 client 会让流每
+    /// 180s 被 reqwest 掐断（那是给单次请求的预算，不是给长连接的）。
+    stream: reqwest::blocking::Client,
     url: String,
     headers: Vec<(String, String)>,
     /// `initialize` 回包给的 `Mcp-Session-Id`，后续每个请求都要带回去。
-    session: Option<String>,
+    session: Mutex<Option<String>>,
     /// `auth: oauth` 时的令牌管理（`static` 时为 `None`，只用 `headers`）。
-    oauth: Option<OAuthState>,
+    oauth: Mutex<Option<OAuthState>>,
 }
 
 /// 一台远端服务器的 OAuth 令牌状态。
@@ -707,19 +776,59 @@ impl OAuthState {
     }
 }
 
-impl HttpTransport {
-    /// 组装并发出一次 POST（静态 `headers` + 会话头 + OAuth 的 `Authorization`）。
+impl HttpChannel {
+    /// 在一条已建好的请求上补齐三样东西：静态 `headers`、会话头、OAuth 的 `Authorization`。
     ///
     /// OAuth 模式下**忽略配置里静态的 `Authorization` 头**（同一个头出现两份会被服务器拒，
     /// 而以令牌为准才是用户配 `auth: oauth` 的本意）；其余自定义头照常带。
-    fn send(
+    fn build(
+        &self,
+        mut req: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        let oauth_on = self.oauth.lock().map(|o| o.is_some()).unwrap_or(false);
+        for (k, v) in &self.headers {
+            if oauth_on && k.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Ok(s) = self.session.lock() {
+            if let Some(s) = s.as_ref() {
+                req = req.header("mcp-session-id", s.as_str());
+            }
+        }
+        if let Ok(o) = self.oauth.lock() {
+            if let Some(oa) = o.as_ref() {
+                if !oa.tokens.access_token.is_empty() {
+                    req = req.header("authorization", format!("Bearer {}", oa.tokens.access_token));
+                }
+            }
+        }
+        req
+    }
+
+    /// 记住回包里的 `Mcp-Session-Id`（可能正是这一条回包新给的）。
+    fn remember_session(&self, resp: &reqwest::blocking::Response) {
+        if let Some(s) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Ok(mut g) = self.session.lock() {
+                *g = Some(s.to_string());
+            }
+        }
+    }
+
+    /// 组装并发出一次 POST（静态头 + 会话头 + OAuth 授权头）。
+    fn post_json(
         &self,
         body: &Value,
         timeout: Option<Duration>,
     ) -> Result<reqwest::blocking::Response, String> {
         let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
         let mut req = self
-            .client
+            .post
             .post(&self.url)
             .header("content-type", "application/json")
             // 规范要求同时接受两种回包（服务器二选一）
@@ -728,21 +837,227 @@ impl HttpTransport {
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
-        for (k, v) in &self.headers {
-            if self.oauth.is_some() && k.eq_ignore_ascii_case("authorization") {
-                continue;
+        self.build(req).send().map_err(|e| format!("请求失败: {e}"))
+    }
+
+    /// POST 并在 401 时（**仅 OAuth 模式**）刷新令牌后原样重发一次，返回**尚未读 body** 的响应。
+    ///
+    /// 401 只在 OAuth 模式下重试：先刷新令牌（**不开浏览器**）再原样重发；刷新不出来就如实
+    /// 报错 —— 用户重启 agent 时会重新走一遍浏览器授权。
+    fn post_start(
+        &self,
+        body: &Value,
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::blocking::Response, String> {
+        let mut resp = self.post_json(body, timeout)?;
+        if resp.status().as_u16() == 401 && self.refresh_oauth()? {
+            resp = self.post_json(body, timeout)?;
+        }
+        Ok(resp)
+    }
+
+    /// 刷新 OAuth 令牌；非 OAuth 模式返回 `false`（此时不该重发）。
+    fn refresh_oauth(&self) -> Result<bool, String> {
+        let mut g = self
+            .oauth
+            .lock()
+            .map_err(|_| "OAuth 状态已损坏".to_string())?;
+        match g.as_mut() {
+            Some(oa) => {
+                oa.refresh()?;
+                Ok(true)
             }
-            req = req.header(k.as_str(), v.as_str());
+            None => Ok(false),
         }
-        if let Some(s) = &self.session {
-            req = req.header("mcp-session-id", s.as_str());
+    }
+
+    /// 打开客户端 **GET 独立 SSE 流**（服务端主动推送通道）。401 时刷新令牌重试一次。
+    ///
+    /// **不设总超时**（长连接），也不解析 body —— 由 `read_stream` 逐行读。服务器不支持时
+    /// 按规范回 405 / 404，交由调用方判停（不重连）。
+    fn open_stream(&self) -> Result<reqwest::blocking::Response, String> {
+        let mut resp = self
+            .build(self.stream.get(&self.url).header("accept", "text/event-stream"))
+            .send()
+            .map_err(|e| format!("GET 流失败: {e}"))?;
+        if resp.status().as_u16() == 401 && self.refresh_oauth()? {
+            resp = self
+                .build(self.stream.get(&self.url).header("accept", "text/event-stream"))
+                .send()
+                .map_err(|e| format!("GET 流重试失败: {e}"))?;
         }
-        if let Some(oa) = &self.oauth {
-            if !oa.tokens.access_token.is_empty() {
-                req = req.header("authorization", format!("Bearer {}", oa.tokens.access_token));
+        Ok(resp)
+    }
+}
+
+/// 一条**服务端→客户端**反向请求（带 `method` + `id`，如 `sampling/createMessage`）。
+struct ReverseJob {
+    method: String,
+    id: Value,
+    params: Option<Value>,
+}
+
+/// 一条 HTTP 桥的反向通道句柄：GET SSE 流线程 + 服务端请求处理线程。
+struct ReverseChannel {
+    /// 把服务端请求投给处理线程（主线程 POST 路径与 GET 流线程都用它）。
+    tx: mpsc::Sender<ReverseJob>,
+    /// 收尾标志：Drop 时置真 ⇒ 流线程不再重连、退避 sleep 尽快醒。
+    stop: Arc<AtomicBool>,
+}
+
+/// 起反向通道的两条常驻线程，返回其句柄。
+///
+/// ① **处理线程**：串行接服务端请求 → `answer_server_request`（内含采样钩子：高底线审批卡
+///    + 成本护栏）→ 另发一次 POST 回 JSON-RPC response。**审批卡等用户的时间在这里**，与任何
+///    一次 `tools/call` 无关（这是「180s 边界」的解法）。
+/// ② **流线程**：常驻读客户端 GET 独立 SSE 流（`stream_loop`），把服务端请求转给①。
+fn start_reverse_channel(
+    channel: Arc<HttpChannel>,
+    handler: SamplingHandler,
+    name: String,
+) -> ReverseChannel {
+    let (tx, rx) = mpsc::channel::<ReverseJob>();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // ① 处理线程（一个服务器的多个反向请求**串行**：不会同时弹两张卡）
+    let worker_name = name.clone();
+    let worker_ch = channel.clone();
+    thread::spawn(move || {
+        let mut none_elicit: Option<ElicitHandler> = None;
+        let mut sampling = Some(handler);
+        while let Ok(job) = rx.recv() {
+            let reply = answer_server_request(
+                &job.method,
+                job.id,
+                job.params.as_ref(),
+                &[],
+                &mut none_elicit,
+                &mut sampling,
+            );
+            if let Err(e) = worker_ch.post_start(&reply, None) {
+                eprintln!("[agent] MCP {worker_name}：回服务端请求失败（{e}）");
             }
         }
-        req.send().map_err(|e| format!("请求失败: {e}"))
+    });
+
+    // ② 流线程
+    let stream_stop = stop.clone();
+    let stream_tx = tx.clone();
+    thread::spawn(move || stream_loop(channel, stream_tx, stream_stop, name));
+
+    ReverseChannel { tx, stop }
+}
+
+/// GET 独立 SSE 流的常驻读取：断线退避重连、心跳容忍、401 重建（见 `HttpChannel::open_stream`）。
+fn stream_loop(
+    channel: Arc<HttpChannel>,
+    tx: mpsc::Sender<ReverseJob>,
+    stop: Arc<AtomicBool>,
+    name: String,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match channel.open_stream() {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.as_u16() == 404 || status.as_u16() == 405 {
+                    // 规范允许服务器对客户端 GET 回 405（不支持该通道）—— 就此停手、**不重连**，
+                    // 否则会对不支持的服务器无限重连。
+                    log::info(format!(
+                        "MCP {name}: 服务器不支持客户端 GET SSE 流（HTTP {}），反向推送不可用",
+                        status.as_u16()
+                    ));
+                    return;
+                }
+                if !status.is_success() {
+                    log::warn(format!(
+                        "MCP {name}: GET SSE 流被拒（HTTP {}），{}s 后重连",
+                        status.as_u16(),
+                        stream_retry_delay(attempt).as_secs()
+                    ));
+                } else {
+                    attempt = 0;
+                    read_stream(resp, &tx, &stop, &name);
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    log::warn(format!(
+                        "MCP {name}: GET SSE 流结束，{}s 后重连",
+                        stream_retry_delay(attempt).as_secs()
+                    ));
+                }
+            }
+            Err(e) => log::warn(format!("MCP {name}: 打开 GET SSE 流失败（{e}），稍后重连")),
+        }
+        let delay = stream_retry_delay(attempt);
+        attempt = attempt.saturating_add(1);
+        sleep_interruptible(delay, &stop);
+    }
+}
+
+/// 读一条 GET SSE 流直到结束（服务器关闭 / 网络断 / stop）。**心跳容忍**：SSE 注释行
+/// （`:` 开头）/ 空行 / `keep-alive` 只被解码器忽略，既不算事件、也不会让本循环退出。
+fn read_stream(
+    resp: reqwest::blocking::Response,
+    tx: &mpsc::Sender<ReverseJob>,
+    stop: &AtomicBool,
+    name: &str,
+) {
+    let mut reader = BufReader::new(resp);
+    let mut dec = SseDecoder::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return, // 服务器关闭了流
+            Ok(_) => {}
+            Err(e) => {
+                log::warn(format!("MCP {name}: 读 GET SSE 流出错（{e}）"));
+                return;
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(msg) = dec.feed_line(&line) {
+            if let Some(m) = msg.get("method").and_then(Value::as_str) {
+                if let Some(id) = msg.get("id").cloned() {
+                    let job = ReverseJob {
+                        method: m.to_string(),
+                        id,
+                        params: msg.get("params").cloned(),
+                    };
+                    if tx.send(job).is_err() {
+                        return; // 处理线程没了（桥在收尾）
+                    }
+                }
+                // 无 id 的是通知：GET 流上的协议通知，按规范忽略
+            }
+            // GET 流上不该出现「对我们的响应」（我们不在它上面发请求）—— 忽略
+        }
+    }
+}
+
+/// 退避时长：`基数 × 2^attempt`，封顶 `STREAM_RETRY_MAX`。
+fn stream_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.min(8);
+    let base = STREAM_RETRY_BASE.as_millis() as u64;
+    let ms = (base << shift).min(STREAM_RETRY_MAX.as_millis() as u64);
+    Duration::from_millis(ms)
+}
+
+/// 可被打断的 sleep：每 `STREAM_RETRY_TICK` 醒一次看 `stop`，让收尾不必干等整段退避。
+fn sleep_interruptible(total: Duration, stop: &AtomicBool) {
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        thread::sleep(remain.min(STREAM_RETRY_TICK));
     }
 }
 
@@ -752,6 +1067,29 @@ impl HttpTransport {
 /// 由**宿主**（`main.rs`）提供 —— 弹卡与等用户输入要走审批通道，那是宿主层的职责，
 /// 传输层只负责把结果塞回 JSON-RPC 回包（见 `handle_server_request`）。
 pub type ElicitHandler = Box<dyn FnMut(&Value) -> Value>;
+
+/// 处理一次服务端 `sampling/createMessage`（入参 = MCP `CreateMessageRequest` 的 `params`）。
+///
+/// 返回 `Ok(result)` = MCP `CreateMessageResult`（`{role, content, model, stopReason?}`）；
+/// `Err(说明)` = 拒绝（关闭 / 超单次 token 预算 / 超会话次数上限 / 模型调用失败）——
+/// 会被包成带这段说明的 JSON-RPC error 回给服务端，服务端因此拿得到清晰原因。
+///
+/// 由**宿主**（`main.rs`）提供，理由同 [`ElicitHandler`]：反向调用模型要走既有模型调用入口
+/// 与成本闸（预算 / 次数 / 归因），那是宿主层职责；传输层只负责把结果塞回 JSON-RPC 回包。
+///
+/// **必须 `Send`**：HTTP 路径的钩子会被移交给**反向处理线程**（见 `start_reverse_channel`），
+/// 于是审批卡等用户的时间与任何一次 `tools/call` 解耦。
+pub type SamplingHandler = Box<dyn FnMut(&Value) -> Result<Value, String> + Send>;
+
+/// 为**某台**服务器构造一个 [`SamplingHandler`]。
+///
+/// · `server` = 服务器名，供审批卡显示「是谁在借你的模型」；
+/// · `via_http` = 这条请求是不是经 **HTTP 反向通道**（POST 响应 SSE 流 / GET 独立 SSE 流）到达的
+///   —— 前端据此渲染**警告样式**的卡，与 stdio 路径的常规卡区分开（见 `main.rs` 的
+///   `open_sampling_approval`）。
+///
+/// **每台一份**：钩子是 `Box<dyn FnMut>`，捕获各自的服务器名与传输，不能跨桥共享同一份。
+pub type SamplingFactoryFn = fn(&str, bool) -> Option<SamplingHandler>;
 
 pub struct Bridge {
     kind: Kind,
@@ -768,6 +1106,10 @@ pub struct Bridge {
     roots: Vec<String>,
     /// `elicitation/create` 的处理钩子（宿主弹卡）。**仅宿主 stdio 桥**有。
     elicit: Option<ElicitHandler>,
+    /// `sampling/createMessage` 的处理钩子（反向调用模型）。**默认声明**：每一台连上的
+    /// 服务器都装上（宿主桥 / 外部 stdio / 远端 HTTP）；`None` = 接住即明确拒绝
+    /// （见 `answer_server_request`）。钩子体含「高底线审批卡 + 成本护栏」。
+    sampling: Option<SamplingHandler>,
 }
 
 impl Bridge {
@@ -776,12 +1118,15 @@ impl Bridge {
     ///
     /// `roots` / `elicit`（A13）只对**宿主这条桥**有意义：服务端据此把工作区根当 shell
     /// handler 的 cwd、并在工具声明了 `elicit` 时向用户弹卡收集输入。
+    ///
+    /// `sampling`（默认 `None`）同属「宿主这条桥才有」的反向请求钩子。
     pub fn connect_stdio(
         spec: &str,
         disallowed: &[String],
         taken: &[String],
         roots: Vec<String>,
         elicit: Option<ElicitHandler>,
+        sampling: Option<SamplingHandler>,
     ) -> Result<Self, String> {
         let exe = spec
             .strip_prefix("stdio:")
@@ -793,7 +1138,7 @@ impl Bridge {
         // 宿主桥的形态是写死的：把同一份 exe 以 `--mcp-server` 拉起。
         let mut cmd = Command::new(exe);
         cmd.arg("--mcp-server");
-        Self::connect_stdio_cmd(cmd, exe, true, disallowed, taken, roots, elicit)
+        Self::connect_stdio_cmd(cmd, exe, true, disallowed, taken, roots, elicit, sampling)
     }
 
     /// 连一台**普通** stdio MCP 服务器（`.mcp.json` 的 `mcpServers` 条目，q3 第 1 步）。
@@ -801,10 +1146,14 @@ impl Bridge {
     /// 与 [`Self::connect_stdio`] 只差两点：进程怎么起（`command` + `args` + `env`，
     /// 而不是写死的 `--mcp-server`），以及 `lunac: false` —— 它不是 Lunac 自己的 server，
     /// 因此不声明 roots / elicitation 能力、也不发 `lunac/*` 自定义方法。
+    ///
+    /// `sampling`（默认开）：外部 stdio 服务器**也声明**该能力并装上处理钩子 —— 见
+    /// `McpSet::connect` 的说明。
     pub fn connect_stdio_server(
         cfg: &StdioServerConfig,
         disallowed: &[String],
         taken: &[String],
+        sampling: Option<SamplingHandler>,
     ) -> Result<Self, String> {
         let command = cfg.command.trim();
         if command.is_empty() {
@@ -815,7 +1164,7 @@ impl Bridge {
         for (k, v) in &cfg.env {
             cmd.env(k, v);
         }
-        Self::connect_stdio_cmd(cmd, &cfg.name, false, disallowed, taken, Vec::new(), None)
+        Self::connect_stdio_cmd(cmd, &cfg.name, false, disallowed, taken, Vec::new(), None, sampling)
     }
 
     /// stdio 连接的**内核**：拉起进程、接管道、起读线程、握手。
@@ -830,6 +1179,7 @@ impl Bridge {
         taken: &[String],
         roots: Vec<String>,
         elicit: Option<ElicitHandler>,
+        sampling: Option<SamplingHandler>,
     ) -> Result<Self, String> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -874,62 +1224,102 @@ impl Bridge {
             lunac,
             roots,
             elicit,
+            sampling,
         };
         bridge.handshake(disallowed, taken)?;
         Ok(bridge)
     }
 
     /// 连一台远端 MCP 服务器（Streamable HTTP）。
+    ///
+    /// 握手（含 `initialize`、会话 id 就绪）**之后**起反向通道的两条常驻线程 —— 其中之一
+    /// 打开客户端 GET 独立 SSE 流（规范：客户端在 `initialized` 之后才用它收服务端主动消息）。
+    /// sampling 钩子在这里**移交**给反向处理线程（HTTP 路径不再就地应答，见 `start_reverse_channel`）。
     pub fn connect_http(
         cfg: &ServerConfig,
         disallowed: &[String],
         taken: &[String],
+        sampling: Option<SamplingHandler>,
     ) -> Result<Self, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(CALL_TIMEOUT)
+        let mut post_builder = reqwest::blocking::Client::builder().timeout(CALL_TIMEOUT);
+        // 长连接 GET 流专用：**不设总超时**（否则流会被 reqwest 按该超时掐断），只给连接超时。
+        let mut stream_builder =
+            reqwest::blocking::Client::builder().connect_timeout(HANDSHAKE_TIMEOUT);
+        if is_loopback_url(&cfg.url) {
+            // 回环一律绕过系统代理：reqwest 在 Windows 上会读系统代理却**不认绕过表**
+            // ⇒ 到 127.0.0.1 的本地 MCP server 会被系统代理接管（实测返回 502）。
+            // 只对回环关代理 —— 远端服务器仍走系统代理（本机代理环境需要它）。
+            post_builder = post_builder.no_proxy();
+            stream_builder = stream_builder.no_proxy();
+        }
+        let post = post_builder
             .build()
             .map_err(|e| format!("建 HTTP client 失败: {e}"))?;
+        let stream = stream_builder
+            .build()
+            .map_err(|e| format!("建流 HTTP client 失败: {e}"))?;
         // 交互式授权只在这里发生（连服务器那一步）—— 走到 handshake 时手上必然已有一份令牌
         let oauth = match cfg.auth {
             AuthMode::Static => None,
             AuthMode::OAuth => Some(acquire_oauth(cfg)?),
         };
+        let channel = Arc::new(HttpChannel {
+            post,
+            stream,
+            url: cfg.url.clone(),
+            headers: cfg.headers.clone(),
+            session: Mutex::new(None),
+            oauth: Mutex::new(oauth),
+        });
         let mut bridge = Bridge {
             kind: Kind::Http(HttpTransport {
-                client,
-                url: cfg.url.clone(),
-                headers: cfg.headers.clone(),
-                session: None,
-                oauth,
+                channel: channel.clone(),
+                reverse: None,
             }),
             next_id: 0,
             names: HashMap::new(),
             defs: Vec::new(),
             lunac: false,
             // 远端服务器不声明 roots / elicitation 能力（见 `handshake`），也就不会收到
-            // 这两条反向请求 —— 这里留空即可。
+            // 这两条反向请求 —— 这里留空即可。`sampling` 则**声明**（见文件头能力边界说明）。
             roots: Vec::new(),
             elicit: None,
+            sampling,
         };
         bridge
             .handshake(disallowed, taken)
             .map_err(|e| format!("{}: {e}", cfg.name))?;
+        // 握手后：把 sampling 钩子移交给反向处理线程（HTTP 路径不再就地在 `read_http_sse` 里
+        // 等用户 —— 那会把审批耗时算进这次 `tools/call`）。GET 流线程在 `stream_loop` 里自开，
+        // 服务器不支持时它自己判停。
+        if let Some(handler) = bridge.sampling.take() {
+            let rc = start_reverse_channel(channel, handler, cfg.name.clone());
+            if let Kind::Http(h) = &mut bridge.kind {
+                h.reverse = Some(rc);
+            }
+        }
         Ok(bridge)
     }
 
     /// 两种传输共用的握手：initialize → notifications/initialized → tools/list。
     fn handshake(&mut self, disallowed: &[String], taken: &[String]) -> Result<(), String> {
-        // 能力声明（A13）：只有宿主那条 stdio 桥支持**服务端反向请求**（`roots/list` /
-        // `elicitation/create`）。远端 HTTP 服务器声明了也没人处理（一次 POST 一收一发，
-        // 没有反向通道），干脆不声明 —— 免得它们发来一条我们答不上的请求。
-        let capabilities = if self.lunac {
-            json!({
-                "roots": { "listChanged": false },
-                "elicitation": {},
-            })
-        } else {
-            json!({})
-        };
+        // 能力声明（A13）：只有宿主那条 stdio 桥支持 `roots/list` / `elicitation/create`
+        // 这两条反向请求。远端 HTTP 服务器不声明（它们只经 POST 响应 SSE 流 / GET 独立 SSE
+        // 流发 sampling，不发这两条），干脆不声明 —— 免得它们发来一条我们答不上的请求。
+        //
+        // `sampling` 能力**默认声明**：只要装了处理钩子（现在每一台连上的服务器都装）就声明。
+        // 服务端据此知道可以反向请求调模型；真正执行前会走一道**高底线审批卡**（见 `main.rs`）。
+        // stdio 走行流就地应答；HTTP 走**反向处理线程**（POST 响应流 / GET 独立流都转发过去，
+        // 见 `start_reverse_channel`）。
+        let mut caps = serde_json::Map::new();
+        if self.lunac {
+            caps.insert("roots".into(), json!({ "listChanged": false }));
+            caps.insert("elicitation".into(), json!({}));
+        }
+        if self.sampling.is_some() {
+            caps.insert("sampling".into(), json!({}));
+        }
+        let capabilities = Value::Object(caps);
         self.request(
             "initialize",
             json!({
@@ -972,15 +1362,6 @@ impl Bridge {
             json!({ "name": raw, "arguments": input }),
             CALL_TIMEOUT,
         )?;
-        self.result_text(&res)
-    }
-
-    /// 取「往期会话索引」固定段（**自定义方法**，不列进 `tools/list`，见 mcp_server.rs）。
-    ///
-    /// 只在 agent 启动时调**一次**，结果拼进系统提示词：系统提示词在一次会话内必须
-    /// 逐字节不变（ai-spec §11 规则 18），中途新存的会话只落盘、不改本进程的提示词。
-    pub fn history_index(&mut self) -> Result<String, String> {
-        let res = self.request("lunac/history_index", json!({}), HANDSHAKE_TIMEOUT)?;
         self.result_text(&res)
     }
 
@@ -1233,6 +1614,7 @@ impl Bridge {
                                 msg.get("params"),
                                 &self.roots,
                                 &mut self.elicit,
+                                &mut self.sampling,
                             );
                             write_line(stdin, &reply)?;
                         }
@@ -1256,8 +1638,39 @@ impl Bridge {
         }
     }
 
+    /// 本桥的 HTTP 传输句柄（stdio 桥调用即报错）。
+    fn http_channel(&self) -> Result<Arc<HttpChannel>, String> {
+        match &self.kind {
+            Kind::Http(h) => Ok(h.channel.clone()),
+            Kind::Stdio { .. } => Err("不是 HTTP 传输".into()),
+        }
+    }
+
+    /// 把一条**服务端反向请求**转发给反向处理线程（不在这里等待 —— 见 `start_reverse_channel`）。
+    ///
+    /// 主线程的请求-响应路径（`read_http_sse`）与 GET 流线程都经这里投递；真正执行（审批卡 +
+    /// 模型 + 回 POST）在处理线程上，因此「用户在卡上耗多久」与任何一次 `tools/call` 无关。
+    fn forward_reverse(&self, method: &str, id: Value, params: Option<&Value>) {
+        let Kind::Http(h) = &self.kind else {
+            return;
+        };
+        let Some(rc) = &h.reverse else {
+            // 没装反向通道（未声明 sampling / 开流那一组没起来）时理论上收不到服务端请求；
+            // 真收到就记一行（不静默吞掉），但不阻塞本路径。
+            eprintln!("[agent] MCP：收到服务端请求 {method} 但没有反向通道，已忽略");
+            return;
+        };
+        let _ = rc.tx.send(ReverseJob {
+            method: method.to_string(),
+            id,
+            params: params.cloned(),
+        });
+    }
+
     /// Streamable HTTP 的一次请求：POST 出去，回包可能是 `application/json`（一条消息），
-    /// 也可能是 `text/event-stream`（SSE 流，里有若干条消息，取 id 对上的那条）。
+    /// 也可能是 `text/event-stream`（SSE 流）。SSE 流里服务器可以夹带**服务端→客户端**请求
+    /// （如 `sampling/createMessage`）—— 由 [`Self::dispatch_http_event`] **转发**给反向处理
+    /// 线程（不在本路径等待），随后继续读到我们那条 id。见 [`Self::read_http_sse`]。
     fn request_http(
         &mut self,
         method: &str,
@@ -1265,42 +1678,105 @@ impl Bridge {
         body: &Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let (msg, session) = self.http_post(body, Some(timeout))?;
-        if let Some(s) = session {
-            if let Kind::Http(h) = &mut self.kind {
-                h.session = Some(s);
-            }
+        let channel = self.http_channel()?;
+        let resp = channel.post_start(body, Some(timeout))?;
+        // 会话头先记下（可能正是这一条回包新给的）
+        channel.remember_session(&resp);
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !status.is_success() {
+            // 截断响应体：别把一整页 HTML 灌进日志与错误文本
+            let text = resp.text().unwrap_or_default();
+            let snip: String = text.chars().take(200).collect();
+            return Err(format!("HTTP {} {}", status.as_u16(), snip.trim()));
         }
-        let msg = msg.ok_or_else(|| {
-            format!("MCP {method} 没有返回结果（服务器只回了 202 / 空 body）")
-        })?;
+        if ctype.contains("text/event-stream") {
+            return self.read_http_sse(resp, method, id);
+        }
+        let text = resp.text().map_err(|e| format!("读回包失败: {e}"))?;
+        if text.trim().is_empty() {
+            return Err(format!("MCP {method} 没有返回结果（服务器只回了 202 / 空 body）"));
+        }
+        let msg: Value =
+            serde_json::from_str(&text).map_err(|e| format!("回包不是合法 JSON（{e}）"))?;
         if msg.get("id").and_then(Value::as_u64) != Some(id) {
-            // SSE 里可能只有服务端通知（没有我们那条响应）
+            // JSON 回包里没有我们那条响应（服务器发的是别的消息）
             return Err(format!("MCP {method} 的回包里没有 id={id} 的响应"));
         }
         unwrap_result(method, &msg)
     }
 
-    /// 一次 POST。返回 `(响应消息, 服务器新给的 session id)`。
+    /// 增量读一条 **SSE**（`text/event-stream`）回包，读到我们那条 id 的响应即返回。
+    ///
+    /// 途中遇到**服务端反向请求**就**转发**给反向处理线程（见 [`Self::dispatch_http_event`]），
+    /// 本路径不等待 —— 于是审批耗时不计入这次调用。心跳（注释行 / 空行）由 `SseDecoder` 忽略。
+    fn read_http_sse(
+        &mut self,
+        resp: reqwest::blocking::Response,
+        method: &str,
+        id: u64,
+    ) -> Result<Value, String> {
+        let mut reader = BufReader::new(resp);
+        let mut dec = SseDecoder::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| format!("读 SSE 失败: {e}"))?;
+            // 空行 = 一个事件结束；流结束（n == 0）时也要把残留事件收尾
+            let event = if n == 0 {
+                dec.finish()
+            } else {
+                dec.feed_line(&line)
+            };
+            if let Some(msg) = event {
+                if let Some(v) = self.dispatch_http_event(&msg, method, id)? {
+                    return Ok(v);
+                }
+            }
+            if n == 0 {
+                return Err(format!("MCP {method} 的 SSE 流已结束，未收到 id={id} 的响应"));
+            }
+        }
+    }
+
+    /// 处理一条 SSE 事件：服务端反向请求**转发**给处理线程；命中我们的 id 返回其结果；其余忽略。
+    fn dispatch_http_event(
+        &mut self,
+        msg: &Value,
+        method: &str,
+        id: u64,
+    ) -> Result<Option<Value>, String> {
+        if let Some(m) = msg.get("method").and_then(Value::as_str) {
+            // 服务端反向请求：转发（**不在本路径等待**，见 forward_reverse）
+            if let Some(rid) = msg.get("id").cloned() {
+                self.forward_reverse(m, rid, msg.get("params"));
+            }
+            // 无 id 的是通知，按规范丢弃
+            return Ok(None);
+        }
+        if msg.get("id").and_then(Value::as_u64) == Some(id) {
+            return Ok(Some(unwrap_result(method, msg)?));
+        }
+        Ok(None)
+    }
+
+    /// 一次 POST 并缓冲读回包。返回 `(响应消息, 服务器新给的 session id)`。
     /// `timeout = None` 时用 client 自带的超时（通知那条路）。
     ///
-    /// **401 只在 OAuth 模式下重试一次**：先刷新令牌（**不开浏览器**）再原样重发。
-    /// 刷新不出来就如实报错 —— 用户重启 agent 时会重新走一遍浏览器授权。
+    /// 用于**不需要**增量反向读取的 POST（通知）；请求-响应主路径走 [`Self::request_http`]。
     fn http_post(
         &mut self,
         body: &Value,
         timeout: Option<Duration>,
     ) -> Result<(Option<Value>, Option<String>), String> {
-        let Kind::Http(h) = &mut self.kind else {
-            return Err("不是 HTTP 传输".into());
-        };
-        let mut resp = h.send(body, timeout)?;
-        if resp.status().as_u16() == 401 {
-            if let Some(oa) = h.oauth.as_mut() {
-                oa.refresh()?;
-                resp = h.send(body, timeout)?;
-            }
-        }
+        let resp = self.http_channel()?.post_start(body, timeout)?;
         read_http_response(resp)
     }
 
@@ -1320,25 +1796,40 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        // stdio 那条是子进程，退出时一并收掉；HTTP 没有进程要收。
-        if let Kind::Stdio { child, .. } = &mut self.kind {
-            let _ = child.kill();
-            let _ = child.wait();
+        match &mut self.kind {
+            // stdio 那条是子进程，退出时一并收掉
+            Kind::Stdio { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // HTTP 反向通道：置 stop ⇒ 流线程不再重连、退避 sleep 尽快醒；处理线程因 tx
+            // 随本结构体一起被 drop 而退出。**正在阻塞的 GET 读**由进程退出收尾（reqwest
+            // blocking 无「按读超时」可设）—— 进程退出即终止全部线程，**不留孤儿**。
+            Kind::Http(h) => {
+                if let Some(rc) = &h.reverse {
+                    rc.stop.store(true, Ordering::Relaxed);
+                }
+            }
         }
     }
 }
 
-/// 应答一条**服务端反向请求**（仅 stdio 桥上会出现），返回要写回的一整条 JSON-RPC 消息。
+/// 应答一条**服务端反向请求**，返回要写回的一整条 JSON-RPC 消息。
 ///
-/// · `roots/list`        —— 回工作区根（`roots` 空则回空数组，规范允许）
-/// · `elicitation/create`—— 交给宿主钩子弹卡；没有钩子就回 `cancel`（工具因此不执行）
-/// · 其余方法            —— 回 `-32601 Method not found`
+/// 调用点：stdio 桥的就地循环（`Bridge::request`）、HTTP 反向处理线程（`start_reverse_channel`）。
+///
+/// · `roots/list`          —— 回工作区根（`roots` 空则回空数组，规范允许）
+/// · `elicitation/create`  —— 交给宿主钩子弹卡；没有钩子就回 `cancel`（工具因此不执行）
+/// · `sampling/createMessage` —— 交给宿主钩子反向调模型（**默认声明**，执行前走高底线审批卡）；
+///   没有钩子或钩子拒绝时，回一条**带说明**的 JSON-RPC error（明确拒绝，绝不静默挂起）
+/// · 其余方法              —— 回 `-32601 Method not found`
 fn answer_server_request(
     method: &str,
     id: Value,
     params: Option<&Value>,
     roots: &[String],
     elicit: &mut Option<ElicitHandler>,
+    sampling: &mut Option<SamplingHandler>,
 ) -> Value {
     match method {
         "roots/list" => json!({
@@ -1355,6 +1846,27 @@ fn answer_server_request(
             };
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
         }
+        "sampling/createMessage" => match sampling.as_mut() {
+            Some(f) => match f(params.unwrap_or(&Value::Null)) {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                // 已识别但在闸上被拒（关闭 / 超预算 / 超次数 / 调用失败）—— 用 server-error
+                // 码区间，附上可读原因，服务端据此能区分「不支持」与「本次被拒」。
+                Err(why) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32000, "message": why }
+                }),
+            },
+            None => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": "sampling/createMessage refused: this bridge has no sampling \
+                                handler installed"
+                }
+            }),
+        },
         other => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -1421,36 +1933,68 @@ fn read_http_response(
     }
 }
 
+/// SSE 逐行解码器（增量读用）。
+///
+/// 三处共用同一套口径：`Bridge::read_http_sse`（POST 响应流的增量读）、`read_stream`
+/// （GET 独立流的常驻读）、`parse_sse`（缓冲读）。
+///
+/// **心跳容忍**（本任务工程件之一）：SSE 注释行（`:` 开头，keep-alive 常这么发）/ `event:` /
+/// `id:` / `retry:` 一律**忽略**；空行才是「一个事件结束」。注释行因此**不算事件、也不会让
+/// 读取循环退出**。`data:` 行按行累积（一个事件的若干 `data:` 要拼成一份负载）。
+struct SseDecoder {
+    data: Vec<String>,
+}
+
+impl SseDecoder {
+    fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    /// 喂一行（可含行尾 `\r\n`）。空行 = 事件结束 ⇒ 返回解析出的 JSON（无 `data` 则 `None`）。
+    fn feed_line(&mut self, line: &str) -> Option<Value> {
+        let t = line.trim_end_matches(['\r', '\n']);
+        if t.is_empty() {
+            return flush_sse(&mut self.data);
+        }
+        if let Some(rest) = t.strip_prefix("data:") {
+            self.data
+                .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+        None
+    }
+
+    /// 流结束（EOF）时收尾残留事件。
+    fn finish(&mut self) -> Option<Value> {
+        flush_sse(&mut self.data)
+    }
+}
+
 /// 解析 SSE 文本，返回**第一条带 `id` 的消息**（服务端通知没有 id，跳过）。
 ///
 /// SSE 的事件以空行分隔，一个事件的若干条 `data:` 行要**按行拼**成一份负载
 /// （规范如此；把每个 `data:` 行都当独立 JSON 会在多行负载上解析失败）。
 fn parse_sse(text: &str) -> Option<Value> {
-    let mut data: Vec<String> = Vec::new();
-    let mut flush = |data: &mut Vec<String>| -> Option<Value> {
-        if data.is_empty() {
-            return None;
-        }
-        let payload = data.join("\n");
-        data.clear();
-        serde_json::from_str::<Value>(&payload).ok()
-    };
+    let mut dec = SseDecoder::new();
     for line in text.lines() {
-        if line.is_empty() {
-            if let Some(v) = flush(&mut data) {
-                if v.get("id").map_or(false, |i| !i.is_null()) {
-                    return Some(v);
-                }
+        if let Some(v) = dec.feed_line(line) {
+            if v.get("id").map_or(false, |i| !i.is_null()) {
+                return Some(v);
             }
-            continue;
         }
-        if let Some(rest) = line.strip_prefix("data:") {
-            data.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-        }
-        // event: / id: / retry: / `:` 注释行一律忽略
     }
-    let last = flush(&mut data);
-    last.filter(|v| v.get("id").map_or(false, |i| !i.is_null()))
+    dec.finish()
+        .filter(|v| v.get("id").map_or(false, |i| !i.is_null()))
+}
+
+/// 把累积的 `data:` 行拼成一份负载并解析成 JSON（空 / 非法 = `None`）。
+/// `parse_sse`（缓冲读）与 `SseDecoder`（增量读）共用同一套拼装口径。
+fn flush_sse(data: &mut Vec<String>) -> Option<Value> {
+    if data.is_empty() {
+        return None;
+    }
+    let payload = data.join("\n");
+    data.clear();
+    serde_json::from_str::<Value>(&payload).ok()
 }
 
 // ── 多连接集合（宿主 stdio 桥 + N 台远端服务器）──────────────────────
@@ -1466,17 +2010,22 @@ impl McpSet {
     ///
     /// `roots` / `elicit`（A13）只交给**宿主那条 stdio 桥** —— 服务端要用它们准备 shell
     /// handler 的 cwd 与 elicitation 弹卡。远端 HTTP 服务器用不上（也不声明这两项能力）。
+    /// `sampling`（`sampling` 工厂，**默认开**）对**每一台**服务器都构造一份钩子并声明该能力；
+    /// 工厂的第二个入参 = `via_http`（stdio 传 `false`、HTTP 传 `true`），供审批卡区分
+    /// 「常规卡 / 反向警告卡」—— 见 [`SamplingFactoryFn`] 与文件头「反向通道」。
     pub fn connect(
         spec: Option<&str>,
         servers: &[ServerConfig],
         disallowed: &[String],
         roots: Vec<String>,
         elicit: Option<ElicitHandler>,
+        sampling: SamplingFactoryFn,
     ) -> McpSet {
         let mut bridges: Vec<Bridge> = Vec::new();
         let mut taken: Vec<String> = Vec::new();
         if let Some(spec) = spec {
-            match Bridge::connect_stdio(spec, disallowed, &taken, roots, elicit) {
+            let s = sampling(SAMPLING_HOST_LABEL, false);
+            match Bridge::connect_stdio(spec, disallowed, &taken, roots, elicit, s) {
                 Ok(b) => {
                     taken.extend(b.names.keys().cloned());
                     bridges.push(b);
@@ -1485,7 +2034,8 @@ impl McpSet {
             }
         }
         for cfg in servers {
-            match Bridge::connect_http(cfg, disallowed, &taken) {
+            let s = sampling(&cfg.name, true);
+            match Bridge::connect_http(cfg, disallowed, &taken, s) {
                 Ok(b) => {
                     taken.extend(b.names.keys().cloned());
                     eprintln!(
@@ -1517,13 +2067,19 @@ impl McpSet {
     /// 与 [`Self::connect`] 分开的理由见 q3 第 3 步：项目服务器要先过**信任门**，而信任
     /// 询问要在 stdin 就绪之后才发得出去（启动时发没人回）⇒ 这一步推迟到**首次查询前**。
     /// 逐台尽力而为，单台失败只记一行、不影响其余（与 `connect` 同一条纪律）。
-    pub fn add_project(&mut self, servers: &ProjectServers, disallowed: &[String]) -> Vec<Value> {
+    pub fn add_project(
+        &mut self,
+        servers: &ProjectServers,
+        disallowed: &[String],
+        sampling: SamplingFactoryFn,
+    ) -> Vec<Value> {
         // 跨服务器去重的「已占用工具名」从**现有连接**起算 —— 项目工具与宿主工具重名时，
         // 宿主那份在前、优先（与 `connect` 里 stdio 桥在前同理）。
         let mut taken: Vec<String> = self.bridges.iter().flat_map(|b| b.names.keys().cloned()).collect();
         let mut added: Vec<Value> = Vec::new();
         for cfg in &servers.stdio {
-            match Bridge::connect_stdio_server(cfg, disallowed, &taken) {
+            let s = sampling(&cfg.name, false);
+            match Bridge::connect_stdio_server(cfg, disallowed, &taken, s) {
                 Ok(b) => {
                     taken.extend(b.names.keys().cloned());
                     eprintln!(
@@ -1538,7 +2094,8 @@ impl McpSet {
             }
         }
         for cfg in &servers.http {
-            match Bridge::connect_http(cfg, disallowed, &taken) {
+            let s = sampling(&cfg.name, true);
+            match Bridge::connect_http(cfg, disallowed, &taken, s) {
                 Ok(b) => {
                     taken.extend(b.names.keys().cloned());
                     eprintln!(
@@ -1582,10 +2139,6 @@ impl McpSet {
             .iter_mut()
             .find(|b| b.is_lunac())
             .ok_or_else(|| "MCP bridge is not connected".to_string())
-    }
-
-    pub fn history_index(&mut self) -> Result<String, String> {
-        self.lunac()?.history_index()
     }
 
     pub fn history_search(&mut self, query: &str, limit: u32) -> Result<String, String> {
@@ -1682,6 +2235,18 @@ mod tests {
         assert!(!url_allowed("ftp://example.com"));
         assert!(!url_allowed("file:///etc/passwd"));
         assert!(!url_allowed("mcp.example.com"), "没有 scheme 的一律拒");
+    }
+
+    /// 回环判定（决定是否对 HTTP client 关系统代理）：本机三种写法都算，远端不算。
+    #[test]
+    fn loopback_detection_covers_local_forms() {
+        assert!(is_loopback_url("http://127.0.0.1:8791/mcp"));
+        assert!(is_loopback_url("http://localhost/mcp"));
+        assert!(is_loopback_url("https://[::1]:8443/mcp"));
+        assert!(is_loopback_url("http://user@127.0.0.1:1/p"));
+        assert!(!is_loopback_url("https://mcp.example.com/mcp"));
+        assert!(!is_loopback_url("http://10.0.0.5/mcp"));
+        assert!(!is_loopback_url("mcp.example.com"));
     }
 
     /// 坏条目只丢自己：缺字段 / 明文远端 http 跳过，合法条目照常返回。
@@ -1848,5 +2413,44 @@ mod tests {
 
         let _ = std::fs::remove_file(&project);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 心跳容忍：SSE 注释行（keep-alive）/ `event:` / 空行**不算事件**，也不打断解码；
+    /// 只有真事件（空行收尾 + 有 `data:`）才产出 JSON。
+    #[test]
+    fn sse_decoder_ignores_keepalive_and_comments() {
+        let mut dec = SseDecoder::new();
+        // 一长串心跳：注释行 / 空行 / event: / id: / retry: —— 全都不该产出事件
+        for line in [": keep-alive\n", "\n", ":\n", "event: message\n", "id: 3\n", "retry: 5000\n", "\n"] {
+            assert!(dec.feed_line(line).is_none(), "心跳行不该产出事件: {line:?}");
+        }
+        // keep-alive 之后接一个真事件，仍要正常解析
+        assert!(dec.feed_line("data: {\"jsonrpc\":\"2.0\",\"id\":7,").is_none());
+        assert!(dec.feed_line("data: \"result\":{\"ok\":true}}").is_none());
+        let v = dec.feed_line("\n").expect("空行收尾要产出事件");
+        assert_eq!(v.get("id").and_then(Value::as_u64), Some(7));
+        assert_eq!(v["result"]["ok"].as_bool(), Some(true));
+        // 收尾（EOF）无残留时不产出
+        assert!(dec.finish().is_none());
+    }
+
+    /// 退避序列：指数增长、封顶 `STREAM_RETRY_MAX`，且全程单调不减。
+    #[test]
+    fn stream_retry_backoff_is_exponential_and_capped() {
+        assert_eq!(stream_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(stream_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(stream_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(stream_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(stream_retry_delay(4), Duration::from_secs(16));
+        // 封顶：再大的 attempt 都不超过 STREAM_RETRY_MAX
+        assert_eq!(stream_retry_delay(5), STREAM_RETRY_MAX);
+        assert_eq!(stream_retry_delay(99), STREAM_RETRY_MAX);
+        let mut prev = Duration::ZERO;
+        for a in 0..40 {
+            let d = stream_retry_delay(a);
+            assert!(d >= prev, "退避必须单调不减（attempt={a}）");
+            assert!(d <= STREAM_RETRY_MAX);
+            prev = d;
+        }
     }
 }

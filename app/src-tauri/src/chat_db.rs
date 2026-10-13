@@ -11,7 +11,7 @@
 //! 必须走 trigram（照 Hermes `state.db` 的做法）。
 //!
 //! 对外暴露 `load` / `save` / `import_legacy`（存取与迁移）以及
-//! `search` / `recent_sessions` / `render_digest`（往期会话检索，2026-09-19）——
+//! `search`（往期会话检索，2026-09-19）——
 //! 数据形状（`ChatSession`）留在 `storage.rs` —— 本模块不定义业务类型，
 //! 免得出现两份「会话长什么样」的真相。
 
@@ -53,7 +53,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             steps      TEXT,
             -- 待办清单时间线（2026-10-02，JSON 文本）——见 storage.rs 的 SessionTodo。
             -- 与 usage / steps 同一纪律：可选结构走一列 JSON，不各开一堆列。
-            todos      TEXT
+            todos      TEXT,
+            -- 会话来源（2026-10-10）：'' = 普通聊天，'pet' = 桌宠发起。两条线程分开存，
+            -- 前端历史 UI 据此分页。旧库由下面的 ALTER 补列。
+            source     TEXT NOT NULL DEFAULT ''
         );
 
         -- 有隐式 rowid（FTS 表用它对应行），(session_id, idx) 保证会话内消息有序且不重。
@@ -89,6 +92,14 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     // 这比引一套 `PRAGMA user_version` 版本簿记轻得多（现在仍只有 v1，簿记是纯负担）。
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN todos TEXT", []);
 
+    // 加列迁移（2026-10-10）：`source` 列同上 —— 老库没有它，必须显式 ALTER 补上。
+    // 带 `NOT NULL DEFAULT ''` 是为了让**已有行**读出来是空串（= 普通聊天），与
+    // storage.rs 的 `#[serde(default)]` 语义一致；列已存在时报 duplicate column，忽略即可。
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
     Ok(())
 }
 
@@ -110,8 +121,8 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
 
         let mut ins_s = conn
             .prepare(
-                "INSERT INTO sessions(id, pos, title, created_at, usage, steps, todos)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO sessions(id, pos, title, created_at, usage, steps, todos, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .map_err(|e| e.to_string())?;
         let mut ins_m = conn
@@ -147,7 +158,8 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
                     s.created_at as i64,
                     usage,
                     steps,
-                    todos
+                    todos,
+                    s.source
                 ])
                 .map_err(|e| e.to_string())?;
 
@@ -174,7 +186,7 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
     let mut out: Vec<ChatSession> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("SELECT id, title, created_at, usage, steps, todos FROM sessions ORDER BY pos ASC")
+            .prepare("SELECT id, title, created_at, usage, steps, todos, source FROM sessions ORDER BY pos ASC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -189,6 +201,8 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
                     usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
                     steps: steps.and_then(|s| serde_json::from_str(&s).ok()),
                     todos: todos.and_then(|s| serde_json::from_str(&s).ok()),
+                    // 老库该列为 NULL / 老记录没这个字段 ⇒ 一律空串（= 普通聊天）。
+                    source: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     messages: Vec::new(),
                 })
             })
@@ -372,126 +386,6 @@ fn search_like(conn: &Connection, q: &str, limit: usize) -> Result<Vec<HistoryHi
     Ok(out)
 }
 
-/// 一条会话的摘要（供「往期会话索引」注入用）。
-pub struct SessionBrief {
-    pub id: String,
-    pub title: String,
-    pub created_at: u64,
-    pub msgs: usize,
-    /// 首条 user 消息（已截断）—— 标题常是自动生成的泛泛之词，
-    /// 「这条会话到底在问什么」看开头第一句最准。
-    pub opening: String,
-}
-
-/// 取最近 N 条**非空**会话的摘要，按创建时间新→旧。
-pub fn recent_sessions(path: &Path, limit: usize) -> Result<Vec<SessionBrief>, String> {
-    let conn = open(path)?;
-    init_schema(&conn)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT s.id, s.title, s.created_at,
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                    COALESCE((SELECT substr(m2.content, 1, 300) FROM messages m2
-                              WHERE m2.session_id = s.id AND m2.role = 'user'
-                              ORDER BY m2.idx ASC LIMIT 1), '')
-             FROM sessions s
-             ORDER BY s.created_at DESC, s.pos ASC
-             LIMIT ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(rusqlite::params![limit as i64], |row| {
-            Ok(SessionBrief {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                created_at: row.get::<_, i64>(2)? as u64,
-                msgs: row.get::<_, i64>(3)?.max(0) as usize,
-                opening: row.get(4)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for r in rows {
-        let b = r.map_err(|e| e.to_string())?;
-        // 空会话（只有标题、没有消息）对模型没有任何价值，纯占前缀预算。
-        if b.msgs > 0 {
-            out.push(b);
-        }
-    }
-    Ok(out)
-}
-
-/// 单行里标题 / 开场白的字符上限。
-const DIGEST_TITLE_CHARS: usize = 60;
-const DIGEST_OPENING_CHARS: usize = 120;
-
-/// 把会话摘要渲染成**系统提示词里的固定段**。
-///
-/// 三条纪律：
-/// ① **英文**：与 `env_block` / 技能清单位于同一段，模型看到的身份与环境说明都是英文；
-/// ② **日期用相对天数**：Rust 标准库没有时区表（项目为此不引 chrono，见 `log.rs`），
-///    绝对日期只能是 UTC，会出现「本地已是今天、UTC 还是昨天」的错位；相对天数是纯差值，
-///    与本地时区无关 —— 而「上次 / 前几天」这类指代要的正是相对先后；
-/// ③ **总预算硬截断**：这段进的是**每轮都发**的固定前缀，必须封顶（预算由调用方给）。
-pub fn render_digest(briefs: &[SessionBrief], budget_chars: usize, now_ms: u64) -> String {
-    if briefs.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from(
-        "## Past sessions (newest first)\n\
-         These are the user's earlier conversations in this app. This list carries only titles \
-         and opening lines — you do NOT know what was actually discussed. Call the \
-         `SessionSearch` tool to read a session's real content, and never claim to remember \
-         something you have not read.\n",
-    );
-    let mut omitted = 0usize;
-    for b in briefs {
-        let line = format!(
-            "\n- [{}] {} ({} msgs) — {}",
-            age_label(b.created_at, now_ms),
-            clip(&b.title, DIGEST_TITLE_CHARS),
-            b.msgs,
-            clip(&b.opening, DIGEST_OPENING_CHARS)
-        );
-        if out.chars().count() + line.chars().count() > budget_chars {
-            omitted += 1;
-            continue;
-        }
-        out.push_str(&line);
-    }
-    if omitted > 0 {
-        out.push_str(&format!(
-            "\n\n({omitted} older session(s) omitted — narrow the question and search instead.)"
-        ));
-    }
-    out
-}
-
-/// 相对天数标签。`created_at` 是毫秒时间戳（前端 `Date.now()` 口径）。
-fn age_label(created_at: u64, now_ms: u64) -> String {
-    let days = now_ms.saturating_sub(created_at) / 86_400_000;
-    match days {
-        0 => "today".into(),
-        1 => "1d ago".into(),
-        n => format!("{n}d ago"),
-    }
-}
-
-/// 按**字符**（不是字节）截断并加省略号 —— 中文按字节截会切出半个字。
-fn clip(s: &str, max_chars: usize) -> String {
-    // 标题 / 开场白里的换行会把「一行一条」的列表结构打散，先压成单行。
-    let flat: String = s
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let flat = flat.trim();
-    if flat.chars().count() <= max_chars {
-        return flat.to_string();
-    }
-    let head: String = flat.chars().take(max_chars).collect();
-    format!("{head}…")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +408,7 @@ mod tests {
             }),
             steps: None,
             todos: None,
+            source: String::new(),
             messages: vec![
                 ChatMessage {
                     role: "user".into(),
@@ -592,6 +487,21 @@ mod tests {
         assert!(back[1].usage.is_none());
     }
 
+    /// 来源列要能原样往返（2026-10-10）：桌宠会话 `"pet"`、普通会话 `""` ——
+    /// 历史 UI 的分页全靠这一列，丢了就分不开两条线程。
+    #[test]
+    fn source_roundtrip_preserves_pet_and_plain() {
+        let c = mem();
+        let plain = session("plain", "普通", "问题", "回答");
+        let mut pet = session("pet", "桌宠", "你看到了什么", "我看到你在写代码");
+        pet.source = "pet".into();
+        write_all(&c, &[plain, pet]).unwrap();
+
+        let back = read_all(&c).unwrap();
+        assert_eq!(back[0].source, "");
+        assert_eq!(back[1].source, "pet");
+    }
+
     /// 待办清单时间线要能原样往返（2026-10-02）——「回退后任务列表不丢」全靠这一列。
     /// 同时钉住「不解构」这条纪律：条目里多余字段也必须原样带回来。
     #[test]
@@ -622,12 +532,12 @@ mod tests {
         assert_eq!(t[1].todos[0]["status"], "in_progress");
     }
 
-    /// 加列迁移：老库（没有 todos 列）打开后必须被补上，且已有数据原样还在。
+    /// 加列迁移：老库（没有 todos / source 列）打开后必须被补上，且已有数据原样还在。
     /// 这是 0.9.20 → 新版升级路径上唯一会碰老库的地方。
     #[test]
     fn legacy_db_gets_todos_column_added() {
         let c = Connection::open_in_memory().unwrap();
-        // 模拟 0.9.20 及以前建的库：有 sessions 表，但**没有** todos 列。
+        // 模拟 0.9.20 及以前建的库：有 sessions 表，但**没有** todos / source 列。
         c.execute_batch(
             "CREATE TABLE sessions (
                  id TEXT PRIMARY KEY, pos INTEGER NOT NULL DEFAULT 0, title TEXT NOT NULL DEFAULT '',
@@ -642,6 +552,7 @@ mod tests {
         assert_eq!(back.len(), 1, "迁移不能弄丢老会话");
         assert_eq!(back[0].id, "old");
         assert!(back[0].todos.is_none(), "老记录没有待办 → None");
+        assert_eq!(back[0].source, "", "老记录没有来源 → 空串（普通聊天）");
     }
 
     /// 覆盖写 = 上一次的内容必须彻底消失（含 FTS 索引里的行）——
@@ -694,7 +605,7 @@ mod tests {
         s
     }
 
-    /// 每个测试一个独立库文件（`search` / `recent_sessions` 的入参是路径）。
+    /// 每个测试一个独立库文件（`search` 的入参是路径）。
     fn tmp_db(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("lunac-chatdb-{}-{tag}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -785,59 +696,4 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// 空会话不进索引（没有信息量，纯占固定前缀预算）。
-    #[test]
-    fn digest_skips_empty_sessions_and_labels_relative_days() {
-        let p = tmp_db("digest");
-        let mut empty = session("e", "空会话", "x", "y");
-        empty.messages.clear();
-        save(&p, &[empty, at("n", "有内容", 0, "开场白第一句", "回答")]).unwrap();
-
-        let briefs = recent_sessions(&p, 10).unwrap();
-        assert_eq!(briefs.len(), 1);
-        assert_eq!(briefs[0].id, "n");
-        assert_eq!(briefs[0].msgs, 2);
-
-        let text = render_digest(&briefs, 4000, 86_400_000);
-        assert!(text.contains("[1d ago] 有内容 (2 msgs) — 开场白第一句"), "实际: {text}");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 固定前缀里的这段必须**封顶**，并把被截掉的行数如实写出来。
-    #[test]
-    fn digest_respects_budget() {
-        let briefs: Vec<SessionBrief> = (0..50)
-            .map(|i| SessionBrief {
-                id: format!("s{i}"),
-                title: format!("会话{i}"),
-                created_at: 0,
-                msgs: 2,
-                opening: "开场白".into(),
-            })
-            .collect();
-
-        let text = render_digest(&briefs, 600, 0);
-        assert!(text.chars().count() <= 700, "必须封顶在预算附近，实际 {}", text.chars().count());
-        assert!(text.contains("older session(s) omitted"), "被截掉的行数要如实说明");
-
-        let full = render_digest(&briefs[..1], 4000, 0);
-        assert!(!full.contains("omitted"), "没截断就不该出现省略提示");
-    }
-
-    /// 超长标题 / 带换行的开场白：按字符截断、换行压成空格（不能打散「一行一条」）。
-    #[test]
-    fn digest_clips_long_fields_and_flattens_newlines() {
-        let b = SessionBrief {
-            id: "s".into(),
-            title: "标题".repeat(40),
-            created_at: 0,
-            msgs: 3,
-            opening: "第一行\n第二行".into(),
-        };
-        let text = render_digest(std::slice::from_ref(&b), 4000, 5 * 86_400_000);
-        assert!(text.contains("[5d ago]"));
-        assert!(text.contains('…'), "超长标题必须截断");
-        assert!(text.contains("— 第一行 第二行"), "开场白的换行要压成空格");
-        assert_eq!(text.matches("\n- ").count(), 1, "一条会话只能占一行");
-    }
 }

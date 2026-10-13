@@ -40,7 +40,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 |---|---|---|
 | **P0** | 多轮上下文、SSE 增量打字、用量上报（input / output / cacheRead / cacheCreate）、错误回传（失败轮整体回滚历史） | `run_query` 主循环；用量口径见 ai-spec §3.5「用量与对账」 |
 | **P0** | 思考开关跨模型自适应 | `LUNAC_THINKING`（`off` / 其余=开）→ `Thinking` 形态；400 沿降级链 `enabled+budget → adaptive → 不带字段` 重试一次并缓存结果。**只有开 / 关两档** —— 端点无思考力度旋钮（预算不被 enforce、`effort` 被静默忽略），见 ai-spec §3.5 |
-| **P1** | 内置工具 + `tool_use` / `tool_result` 往返循环 | 17 件内置工具，见 §4.1 |
+| **P1** | 内置工具 + `tool_use` / `tool_result` 往返循环 | **19** 件内置工具（17 件 + `PetControl`（2026-10-10）+ `NotebookEdit`（2026-10-11）），见 §4.1 |
 | **P1** | 子代理框架（`Agent` 工具）：派生独立上下文的子代理跑自包含任务，主对话只收最终报告 | `run_subagent()` / `run_agent_tool()` / `subagent_tool_defs()`；**串行** + 轮次上限 8 + token 预算 30 万；工具集剔掉 `Agent` / `SessionSearch` / `mcp__*`（无桥的必然失败项）、生成参数与主循环同源（thinking + max_tokens）、系统提示词含环境块与技能清单、非流式；事件 `task_started` / `task_progress` / `task_done`。契约见 ai-spec §3.5「子代理」与 §11 规则 54 |
 | **P2** | 计划模式闭环（`EnterPlanMode` / `ExitPlanMode`）：模型先出计划、用户批准后才动手 | **计划相位**（`tools::Ctx.plan_phase: Arc<AtomicBool>`）与用户的**只读档位**是两回事；相位内写类工具一律硬拒（判据统一在 `tools::write_blocked()`，含四个绕开 `tools::run` 的早退分支），`ExitPlanMode` 经审批卡批准后**即时**解除、**不重启**；批准的计划落档 `ModuleData\plans\<本地时间戳>.md`；前端横幅只镜像 `system/plan_mode`。契约见 ai-spec §3.5「计划模式闭环」与 §11 规则 59 |
 | **P2** | 权限 hooks：用户脚本在 8 个事件上介入（拦工具 / 补上下文 / 拦提问） | `config\hooks.json`（`enabled` 缺省真、`matcher` 正则、`timeout` 秒）；agent 侧按 **mtime 热重载**（改完即时生效）、解析失败保留上一份有效配置；**只认显式拒绝**（退出码 2 / `{"decision":"deny"}`），超时与崩溃**放行但可见**；hook 的 `allow` **只等于跳过审批卡** —— 危险命令与凭据命中仍强制弹卡；`PostToolUse` 的文本只拼进 `tool_result` 内部。契约见 ai-spec §3.5「权限 hooks」与 §11 规则 61；UI 在 [agent-ui-spec.md](./agent-ui-spec.md) §9 |
@@ -67,16 +67,18 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 ### 4.1 当前实际注册（唯一真相源）
 
-`core-agent/src/tools.rs` 的 `defs()` 恒返回 **17 件内置工具**，再由 `main.rs` 条件追加 `Skill` 与 MCP 动态工具：
+`core-agent/src/tools.rs` 的 `defs()` 恒返回 **19 件内置工具**（17 件 + `PetControl`（2026-10-10）+ `NotebookEdit`（2026-10-11）），再由 `main.rs` 条件追加 `Skill` 与 MCP 动态工具：
 
 | 工具 | 说明 |
 |---|---|
 | `Cmd` / `PowerShell` | 命令执行（PowerShell 走 `-NoProfile -NonInteractive -Command` + 双 UTF-8 兜底） |
 | `Read` / `Write` / `Edit` | 文件读写与精确替换编辑 |
+| `NotebookEdit` | **按 cell 编辑 `.ipynb`**（2026-10-11）：`notebook_path` + `cell_id`/`cell_number`（0 基，`cell_id` 优先）+ `new_source` + `cell_type`（insert 必填）+ `edit_mode`（`replace` 默认 / `insert` / `delete`）。**要审批**（写类）、不进 `parallel_safe`（写盘）、不进 `gated_in_read_only`（只读档直接拒，拒因指向「去设置里改档位」） |
 | `Glob` / `Grep` | 文件与内容检索 |
 | `WebSearch` | 联网检索（主源 bocha / tavily / exa / firecrawl，兜底 Bing RSS → Bing HTML → 百度抓取） |
 | `WebFetch` | 抓取网页并转纯文本 |
 | `TodoWrite` | 长任务进度面板（**免审批**：只改前端那块面板，不碰本机） |
+| `PetControl` | **AI 驱动桌宠**（2026-10-10）：`{action, name, value?}`，效果全在前端（`tool_use` 由 `main.ts` 截获后广播给桌宠窗 `runAiAction`）。`run()` 只校验入参、**不碰本机** ⇒ **免审批**、收进 `parallel_safe`；子代理工具集**剔除** |
 | `AskUserQuestion` | 结构化提问（答案经 `can_use_tool` 的 `updatedInput` 回传） |
 | `SessionSearch` | **往期会话检索**（2026-09-19）：检索本机会话库（`ModuleData\history\chat.db` 的 FTS5 索引），结果按会话分组返回。**只读、免审批**，走 MCP 桥的 `lunac/history_search` 自定义方法；`plan` 档同样可用。契约见 ai-spec §3.5「往期会话检索」 |
 | `Skill` | **条件注册**：技能目录非空且未被黑名单裁掉时追加。**两种模式**（2026-09-20，A5）：inline 取回本地技能正文（渐进披露的取回端，免审批、plan 档可用），`context: fork` 的技能则**派子代理执行后回报告**（要审批、plan 档拒绝；与 `Agent` 同一族 ⇒ 同一轮里相邻时一起进并行批，A14；工具面受 `allowed-tools:` 收窄）。契约见 ai-spec §3.5 与 §11 规则 57 / 65 |
@@ -89,7 +91,7 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 | `Remember` | **条件注册**（2026-09-20，A4）：桥接通时追加。写**跨会话长期记忆**（`ModuleData\memory\MEMORY.md`，走桥的 `lunac/memory_write`），单条 ≤2000 字符、整文件 ≤6000 字符、按条去重。**要审批、串行、plan 档拒绝**（走 `needs_bridge` 早退分支 ⇒ 只读拒绝是分支内自判的）。填充它的**主要**是每 N 轮一次的后台复盘 fork（`LUNAC_NUDGE_INTERVAL`，默认 10）。契约见 ai-spec §3.5「长期记忆与后台复盘 fork」与 §11 规则 56 |
 | `ImageGen` | **条件注册**（2026-10-03，A13）：宿主注入 `LUNAC_IMAGE_MODEL` 时追加（该值 2026-10-05 起由**所选供应商预设**推导，见 `settings.ts` 的 `PROVIDER_PRESETS.image_model`，空 = 不启用）。**生成 / 编辑图片**（DashScope 多点编辑端点，**与文本侧端点不同**）并落盘到 `temp\images\`，返回 `![generated](路径)` 供前端渲染。**要审批**（外部数据出口 + 写文件 + 按张计费）、**串行**、plan 档由 `write_blocked` 拒绝。契约见 ai-spec §3.5「出图（A13）」 |
 
-**总数口径**：17（`defs()` 恒返回）+ `Skill`（0 或 1，条件）+ MCP 读侧四件（resources 两件 + prompts 两件，各 0 或 2，条件）+ `Remember`（0 或 1，条件）+ `ImageGen`（0 或 1，条件）+ N（`mcp__*` 用户工具）；`--disallowedTools` 可在注册后裁剪。条件注册的五类都**不进 `defs()`**，因此「17 件」这个数字在任何配置下都成立（守门单测 `agent_tool_is_registered_and_filterable` 钉住总数）。完整未实现工具清单见 [agent-feature-backlog.md](./agent-feature-backlog.md) §1。
+**总数口径**：19（`defs()` 恒返回：17 件 + `PetControl`（2026-10-10）+ `NotebookEdit`（2026-10-11））+ `Skill`（0 或 1，条件）+ MCP 读侧四件（resources 两件 + prompts 两件，各 0 或 2，条件）+ `Remember`（0 或 1，条件）+ `ImageGen`（0 或 1，条件）+ N（`mcp__*` 用户工具）；`--disallowedTools` 可在注册后裁剪。条件注册的五类都**不进 `defs()`**，因此「19 件」这个数字在任何配置下都成立（守门单测 `agent_tool_is_registered_and_filterable` 钉住总数）。完整未实现工具清单见 [agent-feature-backlog.md](./agent-feature-backlog.md) §1。
 
 ### 4.2 工具名口径提醒
 
@@ -169,6 +171,6 @@ Lunac 的 AI 对话**不是**「桌面启动器顺手带的一个小助手」。
 
 *同一次运行还确认了三条链路在真实进程里同时可用：`--mcp-server` 接通（`[agent] MCP 桥已接通，用户工具 0 个`）、技能加载 1 个（`my-skill`）、往期会话索引注入 372 字。*
 
-*2026-09-20 追加（同日第五批，**A4 长期记忆与后台复盘 fork**）：工具面新增**条件注册**的 `Remember`（桥接通时才进请求体，`defs()` 仍是 13 件）；`ModuleData\memory\MEMORY.md` 成为**跨会话记忆**的落点（服务端两个自定义方法 `lunac/memory_read` / `lunac/memory_write`，不进 `tools/list`）；每 `LUNAC_NUDGE_INTERVAL`（默认 10）次提问在**提问之间**跑一次后台复盘 fork（白名单工具，自己连桥、独立 `Cfg` 副本、不发 `task_*` 事件、审批随前端运行方式）。实测：启动时注入可用（模型逐字抄回预置的记忆文件）、`system/init` 出现 14 件工具、复盘写出两条 `Remember`（9 秒）、无桥时两件事都不发生。契约见 ai-spec §3.5「长期记忆与后台复盘 fork」、纪律见 §11 规则 56。*
+*2026-09-20 追加（同日第五批，**A4 长期记忆与后台复盘 fork**）：工具面新增**条件注册**的 `Remember`（桥接通时才进请求体，`defs()` 仍是 13 件 —— 此为 2026-09-20 当时口径，现为 19 件 = 17 件 + `PetControl`（2026-10-10）+ `NotebookEdit`（2026-10-11））；`ModuleData\memory\MEMORY.md` 成为**跨会话记忆**的落点（服务端两个自定义方法 `lunac/memory_read` / `lunac/memory_write`，不进 `tools/list`）；每 `LUNAC_NUDGE_INTERVAL`（默认 10）次提问在**提问之间**跑一次后台复盘 fork（白名单工具，自己连桥、独立 `Cfg` 副本、不发 `task_*` 事件、审批随前端运行方式）。实测：启动时注入可用（模型逐字抄回预置的记忆文件）、`system/init` 出现 14 件工具、复盘写出两条 `Remember`（9 秒）、无桥时两件事都不发生。契约见 ai-spec §3.5「长期记忆与后台复盘 fork」、纪律见 §11 规则 56。*
 
 *2026-10-05：内置工具 `Bash` 改名为 `Cmd`（用户要求；Windows 上实际执行 `cmd /C`）—— 旧名 `Bash` 不再注册，本文档与其他文档里的工具名、契约表已同步。*

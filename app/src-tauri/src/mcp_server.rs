@@ -539,7 +539,14 @@ fn write_memory_at(
     content: &str,
     replace: bool,
 ) -> Result<String, String> {
-    let text = content.trim();
+    // 凭据兜底（2026-10-11，与 A17 / M2-8 同类）：复盘 fork 可能把对话里出现的 API key /
+    // 私钥原样写进来，而 MEMORY.md 会被注入以后每一次对话 ⇒ 落盘前统一过 mask_secrets。
+    // 复用既有的 mask_secrets（log.rs，返回 String、纯字符串变换）：它只把明显的凭据值
+    // 打码成 *** / sk-***，其余字符（含换行）逐个保留 ⇒ 既不会弄坏多行 bullet 的续行缩进，
+    // 也不新增任何写失败路径（脱敏本身没有 Result，最坏只是内容里多两处码，记忆照样写下去）。
+    // 脱敏后再走原有的 trim / 长度闸 / 去重 / 落盘，判据与口径不变。
+    let masked = crate::log::mask_secrets(content);
+    let text = masked.trim();
     if text.is_empty() {
         return Err("缺少 content 参数：要记的内容不能为空".into());
     }
@@ -591,6 +598,28 @@ fn write_memory_at(
 
 fn write_memory_entry(content: &str, replace: bool) -> Result<String, String> {
     write_memory_at(&memory_path(), content, replace)
+}
+
+/// 把记忆文件截断为空（**文件不存在 ⇒ 幂等空操作**）。
+/// 拆出「只依赖 path」的形态，与 `read_memory_at` / `write_memory_at` 同理 ——
+/// 单测必须能指向临时目录，绝不碰真实的 `<exe 根>\ModuleData`（那是用户数据）。
+fn clear_memory_at(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::write(path, b"").map_err(|e| format!("清空记忆失败：{e}"))
+}
+
+/// 前端「查看长期记忆」（斜杠命令 `/memory`）的只读入口：只是 `read_memory` 的 pub 包装
+/// （文件不存在 ⇒ 空串）。给宿主 `#[tauri::command]` 调用。
+pub fn memory_read_text() -> Result<String, String> {
+    read_memory()
+}
+
+/// 前端「清空长期记忆」（斜杠命令 `/memory clear`）的入口：把记忆文件截断为空。
+/// 破坏性操作，前端已就地二次确认；这里只做确定性落盘，不新增提示路径。
+pub fn clear_memory_text() -> Result<(), String> {
+    clear_memory_at(&memory_path())
 }
 
 /// 分派长期记忆的自定义方法（形状与 `handle_history_method` 一致：错误走
@@ -1126,7 +1155,7 @@ fn build_tools_list(tools: &[ToolDef]) -> Value {
 
 // ── 往期会话检索（自定义方法，2026-09-19，A2）──────────────────────
 //
-// 这两个方法**不进 `tools/list`**，因此不会出现在用户的工具列表里、也不经过审批卡。
+// 这个方法**不进 `tools/list`**，因此不会出现在用户的工具列表里、也不经过审批卡。
 //
 // 为什么不做成 `<exe 根>\tools\*.json` 里的用户工具：
 //   ① 那是**用户**的工具目录 —— 内置能力混进去，用户能在 Tool Editor 里改坏或删掉；
@@ -1137,12 +1166,6 @@ fn build_tools_list(tools: &[ToolDef]) -> Value {
 /// `history_search` 单次返回的消息条数默认值与上限（上限防模型一次要太多把上下文吃掉）。
 const HISTORY_SEARCH_DEFAULT_LIMIT: usize = 10;
 const HISTORY_SEARCH_MAX_LIMIT: usize = 30;
-/// 注入系统提示词的「往期会话索引」：最多列多少条会话、总字符预算。
-///
-/// 预算刻意压得小（≈500 token）：这段属于**每轮都发**的固定前缀。虽然它会被前缀缓存
-/// 覆盖，但冷启动那一轮要实打实付这笔钱，而且它会挤占其它内容的可见度。
-const HISTORY_INDEX_SESSIONS: usize = 20;
-const HISTORY_INDEX_BUDGET_CHARS: usize = 2000;
 
 /// 现在（毫秒）。与前端 `Date.now()` 同口径 —— 会话的 `created_at` 就是这么存的。
 fn now_ms() -> u64 {
@@ -1152,7 +1175,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 相对天数标签（与 `chat_db::render_digest` 内部同口径，检索结果里也要用）。
+/// 相对天数标签（检索结果里用；Rust 标准库没有时区表，绝对日期只能是 UTC、会与本地错位）。
 fn rel_age(created_at: u64, now: u64) -> String {
     match now.saturating_sub(created_at) / 86_400_000 {
         0 => "today".into(),
@@ -1215,15 +1238,6 @@ fn handle_history_method(method: &str, params: Option<&Value>) -> Result<String,
                 .clamp(1, HISTORY_SEARCH_MAX_LIMIT as u64) as usize;
             let hits = crate::chat_db::search(&db, &query, limit)?;
             Ok(render_hits(&query, &hits, now_ms()))
-        }
-        "lunac/history_index" => {
-            // 库还不存在（全新安装）⇒ 空库、什么都不注入，属正常情况。
-            let briefs = crate::chat_db::recent_sessions(&db, HISTORY_INDEX_SESSIONS)?;
-            Ok(crate::chat_db::render_digest(
-                &briefs,
-                HISTORY_INDEX_BUDGET_CHARS,
-                now_ms(),
-            ))
         }
         other => Err(format!("未知历史方法: {other}")),
     }
@@ -1647,6 +1661,66 @@ mod tests {
         // ⑥ replace 模式：整体替换，旧内容不再保留
         assert!(write_memory_at(&file, "- 只剩这一条", true).is_ok());
         assert_eq!(read_memory_at(&file).unwrap(), "- 只剩这一条\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 凭据兜底（2026-10-11，与 A17 / M2-8 同类）：写进记忆的内容落盘前必须过 mask_secrets
+    /// —— 对话里出现的 API key 不能跟着 MEMORY.md 进入以后每一次系统提示词。同时钉住
+    /// 「脱敏不弄坏 bullet 形状」与「脱敏不引入写失败路径」两点（复用 log.rs 的 mask_secrets）。
+    /// 用临时目录而不是 memory_path()：测试不许碰真实 ModuleData。
+    #[test]
+    fn memory_masks_secrets_before_persisting() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-mcp-memsk-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = dir.join("MEMORY.md");
+
+        // 裸 key 与键值对两条路径都要打码；多行那条还要保住「- 起头 + 续行缩进」的 bullet 形状
+        assert!(write_memory_at(&file, "用户提到 key sk-live-99887766", false).is_ok());
+        assert!(write_memory_at(&file, "偏好中文\n第二行：token=abcdef123456", false).is_ok());
+        let text = read_memory_at(&file).unwrap();
+        assert!(!text.contains("99887766"), "裸 key 泄露：{text}");
+        assert!(!text.contains("abcdef123456"), "键值对凭据泄露：{text}");
+        assert!(text.starts_with("- "), "首条仍须是 bullet：{text}");
+        assert!(text.contains("\n  "), "多行续行缩进被破坏了：{text}");
+
+        // 普通内容逐字不变（不能被脱敏误伤）
+        assert!(write_memory_at(&file, "项目用 Rust 构建", false).is_ok());
+        assert!(read_memory_at(&file).unwrap().contains("- 项目用 Rust 构建"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 清空记忆（斜杠命令 `/memory clear` 的后端 `clear_memory_at`）：把文件截断为空，
+    /// 且对「本来就不存在」幂等。用临时目录而不是 `memory_path()`：测试不许碰真实 ModuleData。
+    #[test]
+    fn memory_clear_truncates_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-mcp-memclear-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = dir.join("MEMORY.md");
+
+        // 先写一条 ⇒ 再清空 ⇒ 读到空串（截断而非删除文件，路径保持不变）
+        assert!(write_memory_at(&file, "用户偏好中文", false).is_ok());
+        assert!(!read_memory_at(&file).unwrap().is_empty());
+        assert!(clear_memory_at(&file).is_ok());
+        assert_eq!(read_memory_at(&file).unwrap(), "");
+        assert!(file.exists(), "清空是截断，不是删文件");
+
+        // 文件本就不存在 ⇒ 空操作也返回 Ok（幂等）
+        let missing = dir.join("nope.md");
+        assert!(clear_memory_at(&missing).is_ok());
 
         let _ = fs::remove_dir_all(&dir);
     }

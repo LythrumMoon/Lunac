@@ -22,6 +22,8 @@ ui/dist/
 app/plugin-dist/
 app/src-tauri/target/
 app/src-tauri/target-e2e/
+# 临时靶目录（本地单次 `cargo check --target-dir target-check` 用；按需删）
+app/src-tauri/target-check/
 app/src-tauri/gen/
 # 自研 agent 核心（core-agent）的编译产物
 core-agent/target/

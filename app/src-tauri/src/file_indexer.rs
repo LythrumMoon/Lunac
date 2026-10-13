@@ -263,6 +263,9 @@ fn scan_and_save() {
     let Ok(_guard) = scan_mutex.try_lock() else {
         return; // 已有一个在扫 —— 直接返回，不排队
     };
+    // 启动扫盘降级（2026-10-09）：扫盘全程走 Windows 后台模式（CPU + I/O 优先级同时下调），
+    // 给游戏 / 前台应用让路。只影响本线程，不影响搜索线程（搜索只读内存索引，永不扫盘）。
+    crate::win_proc::enter_background_mode();
     if let Ok(mut st) = state().write() {
         st.scanning = true;
     }

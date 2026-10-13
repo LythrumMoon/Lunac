@@ -8,6 +8,26 @@
 
 ---
 
+## ⚠️ 先分清「你要做的是不是 Lunac 插件」（2026-10-07）
+
+本目录**只放 Lunac 的磁盘插件** —— 绝大多数是 UI 插件（搜索结果里能搜到、点开在结果区 /
+独立悬浮窗里渲染）；也有**基础设施（headless）插件**（只提供能力、没有面向用户的入口，如「本地决策模型」——
+开关在 设置 → AI）。四类东西各有各的家，别混：
+
+| 你要做的东西 | 放哪 |
+|---|---|
+| **Lunac 插件**（本应用搜索框里加载的 UI 模块） | **本目录**：`<插件 id>\lunac-plugin.json` + ESM 入口 |
+| **AI 技能**（给模型的说明文档，`SKILL.md`） | `<exe 根>\skills\<技能名>\` |
+| **MCP 工具**（`mcp__*` 工具定义） | `<exe 根>\tools\*.json` |
+| **其它一切**（独立工具 / 脚本 / 工程 —— 例如一个 **Photoshop CEP 面板**、一个 Python 生成器、一个自用 CLI） | **工作目录**（agent 的 cwd，默认 `<exe 根>\temp\transStorage`）下自建文件夹 |
+
+> **常见误区**（真踩过）：把「一个独立的工具 / 插件」—— 比如 Photoshop 的 CEP 面板、一段 Python
+> 生成器 —— 直接建在 `skills\` 或本目录里。它既不会被 Lunac 加载，也不符合本规范，只会把能力目录搅乱。
+> **判据**：Lunac 插件必须能被「设置 → 插件」扫到，并靠 `lunac-plugin.json` + ESM 入口在**本应用的界面里**渲染。
+> 做不到这两点，就不是 Lunac 插件 —— 请放到工作目录去。
+
+---
+
 ## 1. 插件是什么
 
 Lunac 的搜索结果里，除了内置功能，还能出现**插件**。
@@ -21,11 +41,13 @@ Lunac 的搜索结果里，除了内置功能，还能出现**插件**。
 | 分类 | 名单 | 随安装包 | 能装 / 能卸 | 代码在哪 |
 |---|---|---|---|---|
 | **基础** | 快速启动 / 设置 / 网页搜索 / AI 助手 / 备忘录 / 翻译 | ✅ 一定装 | ❌ 都不行 | 编译进主程序 |
-| **拓展** | 剪贴板历史 / OCR / 音乐歌词 / 文件转换，**以及今后新增的一切插件** | ❌ 默认不装（安装包里可勾选） | ✅ 市场下载 / 卸载 | `Modules\<id>\`（就是本目录里的东西） |
+| **拓展** | 剪贴板历史 / OCR / 音乐 / 文件转换 / 代理 / 桌宠 / 本地决策模型，**以及今后新增的一切插件** | ❌ 默认不装（安装包里可勾选） | ✅ 市场下载 / 卸载 | `Modules\<id>\`（就是本目录里的东西） |
 
-> 翻译是 2026-09-29 被**点名**加进基础插件的（它的联网与模型调用都在主程序里，
-> 见 `docs/ai-spec.md` §4.9）。「今后新增的一切都算拓展」这条规矩不变 ——
-> 那是默认值，只有明确指定的才例外。
+> 翻译是 2026-09-29 被**点名**加进基础插件的（它的联网与模型调用都在主程序里）。
+> 「今后新增的一切都算拓展」这条规矩不变 —— 那是默认值，只有明确指定的才例外。
+>
+> 拓展里还有一类**基础设施（headless）插件**：只提供能力、没有面向用户的入口 ——「本地决策模型」
+> 是第一个（不进搜索结果、市场行不给「打开」按钮，开关搬到 设置 → AI），但仍从市场下载 / 卸载。
 
 **所以：你要做的插件都算「拓展插件」**，放进本目录即可，不需要、也不可能改主程序。
 
@@ -170,6 +192,8 @@ Lunac 的搜索结果里，除了内置功能，还能出现**插件**。
    已经开着的那个窗不会被改形态。
 3. `chrome: false` 时那三个按钮不存在 —— **关闭 / 最小化要你自己提供入口**
    （右键菜单、面板上的按钮都行）。
+4. 尺寸只接受 `0`（= 用宿主缺省）或 `100~4000`（逻辑像素）；`minWidth` / `minHeight`
+   不许大于对应的 `width` / `height`。这些在**装包时静态校验**，越界直接拒装整包。
 
 ### 自带本机程序：`sidecar`（进阶，2026-10-06）
 
@@ -200,6 +224,8 @@ WebView 里做不了的事（跑 `ffmpeg` / `aria2` / `llama.cpp`、开串口 / 
 | `env` | 附加环境变量（在宿主环境之上**只增不删**） |
 | `autostart` | 面板打开时自动起（缺省 `false` = 你在 `attach` 里调 `start()`） |
 | `restart` | 崩溃重启：`never`（缺省）/ `on-failure`（最多 3 次） |
+| `protocol` | 消息协议，当前**只支持** `ndjson`（缺省） |
+| `readyTimeoutSec` | **就绪超时（秒，缺省 10，上限 3600）**：起进程后等「就绪信号」的上限。大模型 / 慢启动服务写大些（如 180），否则会被误判成失败并**杀掉进程** |
 | `sha256` | 可执行文件校验和（64 位十六进制，**建议写**；写了就必须对上） |
 | `allowLocalPorts` / `allowLocalAny` | **额外授权**访问的本机端口，见下 |
 
@@ -222,9 +248,12 @@ await sc.stop();                                // 收进程（面板关闭时�
 ```
 
 - **`stdio`**：宿主 ↔ 进程走 stdin/stdout 的 **NDJSON**（每行一个 JSON 对象）。进程**必须先发一行**
-  `{"method":"ready"}`（`http` 时带 `{"params":{"port":12345}}`），宿主收到才算起好了（超时 10s）。
+  `{"method":"ready"}`（`http` 时带 `{"params":{"port":12345}}`），宿主收到才算起好了。
 - **`http`**：进程在 `127.0.0.1:<port>` 上监听。**插件自己不能 `fetch()` 这个端口**（宿主 CSP 拦得住），
   必须走**宿主代请求**：`await sc.http({ method: "POST", path: "/v1/chat", body: "…" })` → `{ status, body }`。
+  就绪信号**两个、任一成立即可**：① 进程吐出 NDJSON `{"method":"ready"}`；② **清单里写的固定 `port` 可连** ——
+  第三方 http 服务（`llama-server` 等）不会说我们的握手行，只在加载完后开始监听。就绪超时见 `readyTimeoutSec`
+  （缺省 10s；冷启要几十秒的大模型务必写大，如 180），超时会**被杀进程**。
 
 **访问范围默认只有它自己的端口**。要访问**别的**本机应用（例如本机大模型 `http://127.0.0.1:11434`），
 必须在清单里声明 `allowLocalPorts: [11434]` 或 `allowLocalAny: true` —— 信任卡会把它**显著列出来**，
@@ -322,7 +351,7 @@ t("music.play");   // → 宿主当前语言的翻译
 | 桥字段 | 说明 |
 |---|---|
 | `t(key, params?)` | 宿主 i18n 的翻译函数（与内置插件共用同一份语言状态） |
-| `apiVersion` | 桥的协议版本，当前 `1`。可据此做兼容分支 |
+| `apiVersion` | 桥的协议版本，当前 `2`。可据此做兼容分支（`sidecar` 等新能力要 `>= 2`） |
 
 > 桥是**可选**的：插件完全可以用自己写死的文案（多语言插件再自己判断 `navigator.language`）。
 > **发现 `undefined` 时务必给兜底**（`??`），否则在旧版宿主上会整个插件报错。
@@ -340,8 +369,10 @@ t("music.play");   // → 宿主当前语言的翻译
 
 ### 4.3 样式
 
-宿主的结果区会自带主题变量（`--text` / `--text-dim` / `--bg` / `--border-glass` /
-`--accent` 等）。**用这些变量写内联样式**，插件才会跟着用户换主题：
+宿主的结果区会自带主题变量（`--text` / `--text-dim` / `--text-muted` / `--surface-glass` /
+`--border-glass` / `--accent` / `--accent-rgb`，以及语义色 `--green` / `--red` / `--yellow` /
+`--blue`）。**只用这些既有变量写内联样式**（别写死 `#rrggbb` / `rgb()` / `rgba()` 字面量），
+插件才会跟着用户换主题：
 
 ```js
 content: `<div style="color:var(--text-dim);padding:8px">…</div>`
@@ -364,7 +395,7 @@ WebView2 就是个 Chromium，React / Vue / Svelte / Solid / lit / petite-vue �
 
 四条注意：
 
-1. **必须和宿主主题变量对齐**：框架自绘的组件默认不认 `--text` / `--bg` / `--accent`（见 4.3），
+1. **必须和宿主主题变量对齐**：框架自绘的组件默认不认 `--text` / `--surface-glass` / `--accent`（见 4.3），
    明暗主题下容易和宿主割裂 —— 把框架的主题 token 接到宿主变量上，或至少留一个跟随
    `prefers-color-scheme` 的兜底。
 2. **`type:"html"` 是 `innerHTML` 插入**：框架要在 `attach(root)` 里 **mount 到 `root`**（别用
@@ -379,7 +410,7 @@ WebView2 就是个 Chromium，React / Vue / Svelte / Solid / lit / petite-vue �
 ## 5. 依赖：`dependencies`
 
 插件要用的**外部文件**（引擎二进制、模型、字体…）写在清单里，宿主会在**装插件时一并拉好**，
-失败就整体回滚。两种形态：
+失败就整体回滚。三种形态（`type` 决定，缺省 `file`）：
 
 ```json
 "dependencies": [
@@ -388,6 +419,12 @@ WebView2 就是个 Chromium，React / Vue / Svelte / Solid / lit / petite-vue �
     "url": "https://example.com/librespot.exe",
     "dest": "bin/librespot.exe",
     "sha256": "9f2c…"
+  },
+  {
+    "type": "archive",
+    "url": "https://example.com/engine-1.4.1.7z",
+    "dest": "paddle-ocr",
+    "sha256": "C091…"
   },
   {
     "type": "npm",
@@ -400,11 +437,22 @@ WebView2 就是个 Chromium，React / Vue / Svelte / Solid / lit / petite-vue �
 | 形态 | 字段 | 说明 |
 |---|---|---|
 | `file`（缺省） | `url` | **必须 https**。明文 http 会被直接拒绝 |
-| | `dest` | 相对插件目录的落点，如 `bin\librespot.exe`。**不许越界**（不能含 `..`、不能绝对路径） |
-| | `sha256` | 可选但要**强烈建议**写：写了就逐字节校验，不匹配即拒绝安装 |
+| | `dest` | **相对插件目录的落点文件**，如 `bin/librespot.exe`（宿主按 `safe_join(插件目录, dest)` 落盘）。**不许越界**（不能含 `..`、不能绝对路径、不能有盘符） |
+| | `sha256` | **必须钉**：写了就逐字节校验，不匹配即拒绝安装 |
+| `archive` | `url` | 同上，**必须 https** |
+| | `dest` | **相对插件目录的落点目录**（不是文件！），如 `paddle-ocr`。宿主把压缩包解到 `<插件目录>/<dest>/`，同样走 `safe_join`、不许越界 |
+| | `sha256` | **必须钉**；校验的是**压缩包本身**（不是解压产物） |
 | `npm` | `package` / `version` | 走 `npm install --prefix <插件目录>`，装进插件目录的 `node_modules\`。**要求用户机器上有 Node.js**，没有会如实报错 |
 
-单个依赖文件上限 512 MB、最多 32 条。装完之后插件用**相对路径**引用它们：
+- **单文件 / 单压缩包上限 4 GiB、依赖最多 32 条**。`file` 走**流式落盘**（不再整包读进内存）。
+- **`archive` 只支持 `.7z` / `.zip`**（按**魔数**识别，不看扩展名）；解压后总量上限 **1 GiB**、
+  条目数上限 20000。解压逐条校验落点（拒绝对路径 / `..`），先解到 `.dep-staging-*` 再原子替换 `dest`。
+- `local`：**打包机专用字段，写清单时会被自动摘掉**。它指向打包机上已就位的副本
+  （`file` = 单个文件、`archive` = **已解开的目录**），**只用于给安装包的勾选段与 dev 实例暂存**；
+  市场安装时宿主**只认 `url` + `sha256`、自己下载**，`local` 不会进清单、也不被安装器读取。
+- `notices`：同样是**打包机专用**（照 `licenses\` 拷随附授权文件进包，见第 7 节），写清单时一并摘掉。
+
+装完之后插件用**相对路径**引用它们：
 
 ```js
 // 插件自己怎么找到已装好的依赖：入口 URL 反推出插件目录
@@ -412,16 +460,42 @@ const dir = new URL(".", import.meta.url);            // .../Modules/pomodoro/
 const engine = new URL("bin/librespot.exe", dir).pathname;
 ```
 
-> **拿不准就别加依赖**：能纯 JS 实现的功能，写成单文件最省事也最不容易坏。
+> **大资产不进 git**（GitHub 单文件 100MB 上限）。引擎 / 模型这类几十 MB～几 GiB 的东西一律挂到
+> **公开仓库的 Release 资产**上，在 `dependencies` 里写死 `url` + `sha256` —— 本仓官方插件就是这么做的
+> （`LythrumMoon/lunac-plugins` 的 `librespot-0.8.0` / `live2dcubismcore-5.1.0` / `zipvoice-1.13.8`）。
+> `url` 必须是 **https + 免鉴权直链**（私有仓库的 raw / Release，终端用户下不到）。
 >
-> `file` 依赖的地址必须是 **https + 免鉴权直链**。上游不发预编译包的东西（如 librespot），
-> 要么自己构建后挂到**公开仓库的 Release 资产**上（本仓官方插件就是这么做的：
-> `LythrumMoon/lunac-plugins` 的 `librespot-0.8.0`），要么改用纯 JS 方案。
+> **拿不准就别加依赖**：能纯 JS 实现的功能，写成单文件最省事也最不容易坏。
+
+### 依赖输入的「下载污染」闸门（`build-plugins.ps1`）
+
+暂存（拷进 `release\ext-plugins\`、以及 dev 的 `Modules\<id>\`）**之前**，脚本会校验 `local` 指向的
+依赖输入，拦「文件总尺寸与上游相同、内容却是 GitHub 加速镜像（gh-proxy 之类）的 HTML 落地页」这类污染：
+
+1. 读**每个文件的前 512 字节**，以 `<!DOCTYPE` / `<html` 开头（大小写不敏感、容忍 BOM 与前导空白）
+   ⇒ 当场报错，并给出文件路径 + 首 40 字节；
+2. 对关键资产**断言文件存在且非空**；
+3. 对已知资产**钉死 `sha256`**（如 ZipVoice 的 `vocos_24khz.onnx`）。
+
+⇒ **写依赖时用可靠通道下载资产并核对 `sha256`**，别用会返回 HTML 插页的镜像；`sha256` 与上传的
+那一份**逐字节一致**，否则市场安装会整包拒装。
+
+### 运行期资产的最佳范例：桌宠
+
+桌宠把「依赖 + 运行期资产」拆得很干净，可直接照抄这条契约：资产（Live2D Core / ZipVoice 语音树）放
+**插件目录**下的**固定相对路径**（`engine\live2dcubismcore.min.js`、`zipvoice\`），宿主**只读**、从不改写；
+宿主侧有 `assets_ready()` 之类的**齐备性判定**，缺资产时**静默降级、不报错打扰用户**（那项功能不可用而已，
+面板照常打开）。
 
 ## 6. 怎么把它装进 Lunac
 
 **手工安装（开发 / 自用）**：把插件文件夹直接放进 `<exe 根>\Modules\<id>\`，
 然后打开「设置 → 插件 → 重新扫描」（或重启 Lunac）即可用。
+
+> **dev 实例的 `<exe 根>` = `app\src-tauri\target\debug\`**：官方插件的入口 `index.js` 是
+> vite（lib 模式）的打包产物，dev 真正读的是 `app\src-tauri\target\debug\Modules\<id>\`
+> （由 `scripts\build-plugins.ps1` 第 ⑤ 步同步过去）。**改完插件源码必须重跑 `build-plugins.ps1` 才生效** ——
+> 盘上跑的是编译好的 `index.js`，不是源码。
 
 **打包分发**：把**插件目录本身**压成 zip（`lunac-plugin.json` 在 zip 根，
 或多一层顶层目录，两种形状都认），传到任何 **https 可直链、无需鉴权**的地方
@@ -435,6 +509,16 @@ const engine = new URL("bin/librespot.exe", dir).pathname;
   "version": "1.0.0", "url": "https://example.com/pomodoro-1.0.0.zip",
   "keywords": ["pomodoro", "番茄"], "icon": "🍅", "homepage": "https://example.com" }
 ```
+
+> **市场索引的当前形态**：`index.json` 顶层是数组、**没有 `category` 字段**；包按分类放在插件仓库的
+> **`packages/<分类>/<id>-<版本>.zip`**，条目里的 `url` 写**整条**直链（如
+> `.../packages/media/music-0.9.36.zip`）。宿主**只用这条完整 `url`** 去下（不是「基址 + 固定路径」拼接）
+> ⇒ 目录怎么变都行、**加分类零宿主改动**。分类固定为 `productivity` / `media` / `ocr` / `pet` / `ai` / `system`，
+> **没登记的 id 落到 `other`**。
+>
+> **只留最新版**：`scripts\publish-plugins.ps1` 每次发布都会**删掉不在本次发布集合里的旧包**
+> （每个插件只保留最高版本，并清掉平铺在 `packages\` 根的旧布局）—— **旧版本会被清掉**，
+> 别指望市场里还能下到历史版本。
 
 > 官方插件的发布链**有序，且顺序不许跳**（改插件源码后一定走完）：
 > `scripts\build-plugins.ps1`（构建 + 生成清单 + 打 zip，**并且先把 dev 实例的
@@ -480,6 +564,14 @@ export default {
 - **同一 id 只能有一个目录**。想改内容就改这个目录，不要在别处再放一份。
 - 一个插件进程里只有**一个模块实例**（宿主按 id 缓存）。升级会清缓存，但**正在打开的面板
   不会被强制换掉** —— 重新点开即可。
+- **携带 / 依赖第三方组件必须随包附授权**：许可**全文**放插件目录下的 `LICENSES/`，并写一份
+  `THIRD_PARTY_NOTICES.md`（逐组件写清 组件 × 授权 × 来源 × 义务）。已知口径：**ZipVoice 预训练权重
+  = CC BY-NC 4.0（仅限非商用）**、`espeak-ng-data` = **GPL-3.0**、sherpa-onnx = Apache-2.0、
+  ONNX Runtime = MIT、Vocos = MIT、**Live2D Cubism Core = 专有**（须随附官方 `LICENSE.md` +
+  `RedistributableFiles.txt`）、librespot = MIT。**本项目为个人非商用项目**，下游商用须自行取得授权；
+  详见应用仓库 `README.md` 的「第三方组件与许可」节与 `licenses/`。
+- **模型 / 厂商数据不得入库**：涉及用户自有模型时（如 Live2D 模型自带的 `.cdi3.json` / `.vtube.json` /
+  `.physics3.json` / `.exp3.json`），**只运行期从模型目录读取**，**不复制进仓库、也不随插件分发**。
 
 ## 8. 让 Lunac 自己写一个插件（给 AI 的操作步骤）
 
@@ -490,6 +582,8 @@ export default {
    入口用**纯 ESM**，不要 TypeScript、不要构建步骤、不要外部 CDN。
    清单里凡是**要动窗口**的需求都写进 `permissions`（见第 2 节；不写就不生效）；
    要**照搬某个内置插件的面板与交互**就写 `reuse`（见第 2 节「复用内置插件监听」）。
+   要用引擎 / 模型等大资产，写进 `dependencies`（见第 5 节）：资产挂 **Release** 并写死 `url` + `sha256`，
+   **不要把大文件或厂商模型数据塞进插件包**；带了第三方组件就随包附授权（见第 7 节）。
 4. 需要交互就补 `attach(root)` / `detach()`；文案**直接写死**（宿主的 `t()` 不认识你起的 key）。
 5. **不用叫用户去点「重新扫描」** —— 宿主嗅探到本回合写入了 `Modules\<id>\`（Write / Edit / PowerShell 等），
    会在**这个回合结束时自动重扫**并注册，搜索框里立刻就能搜到。

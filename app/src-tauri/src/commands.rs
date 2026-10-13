@@ -441,6 +441,15 @@ fn start_cli_process(
         "LUNAC_MODULES_DIR",
         crate::plugin_market::plugins_dir().to_string_lossy().to_string(),
     ));
+    // 本地决策模型（S1 形态 B，2026-10-09）：**装了 `local-model` 插件才注入**端点。
+    // 走 `envs`（spawn 作用域）而不是 `configure_agent_env` 的 `set_var` —— 后者的语义是
+    // 「进程全局的凭据」，而这条**随插件装 / 卸而变化**：不注入（= 不在 envs 里）就等于
+    // 告诉 agent「本机没有本地决策模型」，它会退回桩后端 / fail-open。
+    if let Some(url) = local_model_env() {
+        // 落一行 —— 这条**随插件装 / 卸而变**，排障时要能一眼看到「这次到底喂没喂给 agent」。
+        crate::log::info(format!("本地决策模型端点 → agent: {url}"));
+        envs.push(("LUNAC_LOCAL_MODEL_URL", url));
+    }
     // 日志目录 → agent.exe：与宿主写同一份目录（<exe 根>\temp\logs），排障只需
     // 看一个地方。agent 没拿到该变量时会自行回退到 <agent.exe 目录>\temp\logs
     // （见 core-agent/src/log.rs）。
@@ -601,6 +610,37 @@ pub(crate) fn ai_credentials() -> Result<(String, String, String), String> {
     // 按 ai-spec §11 规则 16 一律用 flash（更快更省，只验链路）。
     let model = env::var("AI_MODEL").unwrap_or_else(|_| "deepseek-flash".into());
     Ok((api_url, api_key, model))
+}
+
+/// 本地决策模型（S1 形态 B）的端点 → agent.exe（2026-10-09）。
+///
+/// **只在插件装了才返回 `Some`** —— agent 侧 `decide::LocalHttpConfig::from_env()` 就认
+/// 「这个变量在不在」：没装 = 不注入 = agent 退回桩后端 / fail-open，**不会去连一个空地址**。
+///
+/// 端口**从插件清单的 `sidecar.args` 里读**（`--port <n>`）：清单是端口的**唯一真相源**
+/// （`plugin_sidecar.rs` 就是按它起进程的），宿主再写一份常量迟早与它漂移。
+/// 清单读不到 / 解析不出 ⇒ 缺省 8090（与插件面板里的常量一致）。
+fn local_model_env() -> Option<String> {
+    // 总开关关闭 = 不下发端点 = agent 不介入本地决策（退回远端 / 桩后端）。
+    if !crate::storage::load_local_model_config().enabled {
+        return None;
+    }
+    let manifest = crate::plugin_market::plugins_dir()
+        .join("local-model")
+        .join("lunac-plugin.json");
+    if !manifest.is_file() {
+        return None;
+    }
+    let port = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            let args = v.get("sidecar")?.get("args")?.as_array()?.clone();
+            let i = args.iter().position(|a| a.as_str() == Some("--port"))?;
+            args.get(i + 1)?.as_str().map(str::to_string)
+        })
+        .unwrap_or_else(|| "8090".into());
+    Some(format!("http://127.0.0.1:{port}"))
 }
 
 /// 把凭据注入自研 agent 后端（core-agent）读取的环境变量。
@@ -786,17 +826,29 @@ pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<Str
         env::set_var("USE_BUILTIN_RIPGREP", "0");
     }
 
-    // Only emit starting if the agent is not already running — avoid spurious
-    // cliReady=false with no follow-up stdout. ensure_agent_running()
-    // (called before ai-mode-changed) already handles the first spawn.
+    // 两种情形必须分开：唯一的「就绪信号」是 `cli-status:stdout`（前端据此把 cliReady 置真），
+    // 而它正常情况下只在 `start_cli_process` **真正拉起进程**后发一次。
+    //
+    // · **未在跑** ⇒ 发 `starting`，随后 `start_cli_process` 建进程并补发 `stdout`。
+    // · **已在跑** ⇒ 调用方必定是一个**新建的窗口**（同一 label 只会有一扇聊天窗，
+    //   旧窗关掉后 agent.exe 仍在，`cli_bridge::is_running()` 为真）。此时
+    //   `start_cli_process` 会提前返回、**不再发** `stdout` ⇒ 这个新窗的 `cliReady`
+    //   恒为假，它挂起的问句永远不冲刷。桌宠轮是这条最明显的受害者：关掉 AI 聊天窗后，
+    //   桌宠发的那一轮被塞进 `pendingTurns` 却永不发出（2026-10-11 用户报障）。
+    //   这里补发一次 `stdout`（语义正确：复用路径下 stdin 本就已就绪）。
     let already_running = cli_bridge::is_running();
-    if !already_running {
-        app.emit("cli-status", StatusPayload {
-            state: "starting".into(),
-            message: format!("Mode agent, agent.exe at {}", dir.display()),
-            instance: 0, // informational — not tied to a specific spawn
-        }).ok();
-    }
+    app.emit("cli-status", StatusPayload {
+        state: if already_running { "stdout".into() } else { "starting".into() },
+        message: if already_running {
+            "CLI stdin ready (reused running agent)".into()
+        } else {
+            format!("Mode agent, agent.exe at {}", dir.display())
+        },
+        // 复用路径下宿主不持有在跑进程的 instance（它由原建窗那次 spawn 分配）。
+        // 置 0 = 「不代表某一次具体 spawn」的既有语义（见 StatusPayload.instance），
+        // 前端据此不把它当作某个实例的 closed 过滤依据 —— 正是这里要的效果。
+        instance: 0,
+    }).ok();
 
     start_cli_process(&state, app.clone(), &dir)?;
     Ok("Agent started".into())
@@ -814,6 +866,23 @@ pub async fn stop_cli(_state: State<'_, AppState>) -> Result<String, String> {
 pub async fn send_message(_state: State<'_, AppState>, message: String) -> Result<String, String> {
     cli_bridge::write_to_cli(&message)?;
     Ok("Message sent".into())
+}
+
+// ── 长期记忆的前端入口（斜杠命令 /memory 与 /memory clear，2026-10-11）──
+// 记忆的真相源是 `ModuleData\memory\MEMORY.md`，读写逻辑一直在 mcp_server.rs（agent 桥那两条
+// 自定义方法的内存侧）。这两个命令只是把它 pub 出来给前端：读是只读、清空是破坏性（前端已
+// 就地二次确认）。**不新增第三个落点**，也不改 MEMORY.md 的格式与上限。
+
+/// 查看当前长期记忆全文（文件不存在 ⇒ 空串）。
+#[tauri::command]
+pub fn get_memory() -> Result<String, String> {
+    crate::mcp_server::memory_read_text()
+}
+
+/// 清空长期记忆（把记忆文件截断为空）。破坏性操作，调用方（前端）负责二次确认。
+#[tauri::command]
+pub fn clear_memory() -> Result<(), String> {
+    crate::mcp_server::clear_memory_text()
 }
 
 #[tauri::command]
@@ -1161,11 +1230,12 @@ pub async fn set_ai_config(
         // 否则会一直用旧值）。
         search_provider: search_provider.unwrap_or_default().trim().to_lowercase(),
         search_key: search_key.unwrap_or_default().trim().to_string(),
-        // 图片输入开关：缺省（老前端不带这个参数）按**关**处理 —— 与「默认不发图片块」
-        // 的取向一致，不会因为漏传参数就把图片发给一个可能不支持的端点。
-        vision: vision.unwrap_or(false),
+        // 图片输入开关：**缺省按开**（2026-10-09 改）—— 与 `get_ai_config` 的缺省口径一致。
+        // 面板已无此开关且恒显式传 `true`，所以这条只影响将来可能的其它调用方。
+        vision: vision.unwrap_or(true),
         // 出图模型 / 端点（A13）：缺省按空串（= 未配置 ⇒ agent 不注册 `ImageGen`）——
-        // 与 vision 同一条取向：漏传参数绝不能凭空开启一件会往外发请求的功能。
+        // 漏传参数绝不凭空开启一件会往外发请求的功能（`vision` 不同：它只是「允许把**用户已附**
+        // 的图作为 image 块发出」，本身不发起任何请求）。
         image_model: image_model.unwrap_or_default().trim().to_string(),
         image_url: image_url.unwrap_or_default().trim().to_string(),
     };
@@ -1196,12 +1266,101 @@ pub fn get_ai_config() -> serde_json::Value {
         "agent_url": env::var("AI_AGENT_URL").unwrap_or_default(),
         "search_provider": env::var("AI_SEARCH_PROVIDER").unwrap_or_default(),
         "search_key": env::var("AI_SEARCH_KEY").unwrap_or_default(),
-        // 图片输入开关（A8）：缺变量 = 关。前端据此决定要不要把图片附件发成 `image` 块。
-        "vision": env::var("AI_VISION").map(|v| v.trim() == "1").unwrap_or(false),
+        // 图片输入开关（A8）：**缺变量 = 开**（2026-10-09 改，理由见 storage.rs 的 `AiConfig.vision`）。
+        // 面板早已撤掉这个开关、恒按「支持多模态」保存 —— 再把「缺变量」当关，会让
+        // 「从未保存过 AI 配置」的环境（如 dev 没有 `config\ai.json`）读出「未开启图片输入」，
+        // 图片被静默丢弃（桌宠「看一眼屏幕」实测踩到）。
+        "vision": env::var("AI_VISION").map(|v| v.trim() == "1").unwrap_or(true),
         // 出图（A13）：前端回读用 —— 缺变量 = 未配置，面板显示为空、agent 也没有该工具。
         "image_model": env::var("AI_IMAGE_MODEL").unwrap_or_default(),
         "image_url": env::var("AI_IMAGE_URL").unwrap_or_default(),
     })
+}
+
+/// 「测试连通」（2026-10-09 用户要求）：用**表单当前值**打一次最小 OpenAI 兼容请求，
+/// 确认 provider / base URL / key / model 这套配置真的能用 —— 不必先保存再让 agent 去撞 401。
+///
+/// 形状与 [proxy_server.rs](proxy_server.rs) 的 provider 调用**一致**
+/// （`{base}/v1/chat/completions` + `Authorization: Bearer`），所以「测通」≈「真跑也通」。
+///
+/// 三条口径：
+///  · **不落盘**：只读传入值，不改 `config\ai.json`（要保存仍走 `set_ai_config`）。
+///  · **短超时 + 极小请求**：建连 10s / 总 20s、`max_tokens=1` —— 这是连通性探测，不是生成。
+///  · **只回「用户能做什么」**：成功 → 面板显示「连接正常」（文案在前端本地化）；失败 →
+///    状态码 + **截断**后的响应体（原始 body 进日志，别整段糊到界面上，见 §13.5）。
+///
+/// ⚠️ **为什么不套 `validate_public_https_url`**：AI 端点**可以是本机 / 局域网**
+/// （Ollama `http://127.0.0.1:11434`、自建 vLLM 等），且这是**用户自己的配置**、
+/// 不是插件派发的 URL —— 与「宿主替前端下载」那三条命令的威胁模型不同。这里只要求 http(s)。
+#[tauri::command]
+pub async fn test_ai_connection(
+    provider: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+) -> Result<(), String> {
+    run_blocking(move || test_ai_connection_blocking(&provider, &base_url, &model, &api_key)).await
+}
+
+fn test_ai_connection_blocking(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("Base URL 为空".into());
+    }
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("Base URL 必须是 http(s) 地址".into());
+    }
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("模型名为空".into());
+    }
+    if api_key.trim().is_empty() {
+        return Err("API Key 为空".into());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("HTTP client：{e}"))?;
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "ping" }],
+        "max_tokens": 1,
+        "stream": false,
+    });
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("请求失败：{e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        // 原始响应体**进日志**（可能含 provider 的细节），界面只给截断后的一段
+        crate::log::warn(format!(
+            "test_ai_connection: {provider} {base} HTTP {} body={}",
+            status.as_u16(),
+            crate::log::truncate_chars(&text, 500)
+        ));
+        let snippet: String = text.chars().take(300).collect();
+        return Err(format!("HTTP {}：{}", status.as_u16(), snippet.trim()));
+    }
+    crate::log::info(format!(
+        "test_ai_connection: {provider} {model} @ {base} 连通正常（HTTP {}）",
+        status.as_u16()
+    ));
+    Ok(())
 }
 
 // ── 权限 hooks（A9，2026-09-20）────────────────────────────────────
@@ -1301,6 +1460,75 @@ fn effective_workdir(state: &AppState) -> std::path::PathBuf {
     }
 }
 
+/// 递归收集 `root` 下 `mtime >= since` 的文件（深度 ≤ 6、最多看 20000 个条目）。
+///
+/// 跳过几个明显与「agent 产出」无关的重目录（`node_modules` / `.git` / `target`）——
+/// 不跳的话一次扫描就可能拖到几秒。**只看元数据、不读内容**。
+fn collect_recent_files(
+    root: &std::path::Path,
+    since: std::time::SystemTime,
+    out: &mut Vec<String>,
+    budget: &mut usize,
+    depth: usize,
+) {
+    if depth > 6 || *budget == 0 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let p = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_dir() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if matches!(name.as_str(), "node_modules" | ".git" | "target") {
+                continue;
+            }
+            collect_recent_files(&p, since, out, budget, depth + 1);
+        } else if md.is_file() {
+            if let Ok(m) = md.modified() {
+                if m >= since {
+                    out.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+}
+
+/// 「脚本生成 / 脚本改写」的文件探测（2026-10-10 用户要求）。
+///
+/// **为什么必须有它**：AI 用 `Cmd` / `PowerShell` 跑脚本**生成**的文件不走 `Write` / `Edit`，
+/// 前端那个「按工具卡的 `file` 参数采改前快照」的钩子（`captureFileSnapshot`）根本看不见它们 ⇒
+/// 「已改动文件」列表里永远不会出现（用户报障：「生成大的脚本所生成的文件也应该进入已改动的文件」）。
+///
+/// 这里只做**事实探测**：扫 agent 的可写工作目录（`effective_workdir`，未配工作区时就是
+/// `<exe 根>\temp\transStorage`），把 `mtime >= since_ms` 的文件路径回给前端。**不读内容** ——
+/// 这些文件没有「改前内容」，前端按 `unknown: true` 登记：**只列出来、不参与回退**。
+#[tauri::command]
+pub fn scan_agent_writes(
+    state: tauri::State<AppState>,
+    since_ms: u64,
+    limit: Option<usize>,
+) -> Vec<String> {
+    let root = effective_workdir(&state);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let since = std::time::UNIX_EPOCH + std::time::Duration::from_millis(since_ms);
+    let mut out = Vec::new();
+    let mut budget = 20_000usize;
+    collect_recent_files(&root, since, &mut out, &mut budget, 0);
+    out.sort();
+    let cap = limit.unwrap_or(200).min(2000);
+    out.truncate(cap);
+    out
+}
+
 /// 配了工作区 ⇒ 给 agent 设工作区锁（越界读写直接拒，见 core-agent `tools::guard()`）
 fn workspace_is_locked(state: &AppState) -> bool {
     !state
@@ -1376,6 +1604,364 @@ pub fn set_persona(text: String) -> Result<(), String> {
         text.chars().count()
     ));
     Ok(())
+}
+
+// ── 桌宠专属人格（`config\pet-persona.md`，2026-10-09）──────────────────
+// 与上面那条人格**同一套读写 + 校验**（复用 `storage::validate_persona_text`），但用途不同：
+// 这一段**只作用于「桌宠发起的那一轮」** —— 前端在发送该轮时把它拼进**用户消息**
+// （见 `main.ts` 的 `startAgentChat` 注入点、ai-spec §4.5 的 `pet-chat-send` 段）。
+// 因此**保存后不必重启 agent** —— 与 `set_persona` 的「重启才生效」恰好相反。
+#[tauri::command]
+pub fn get_pet_persona() -> Result<serde_json::Value, String> {
+    // 首次使用：把**默认人格**落盘（用户没配过才写，理由见 storage::ensure_pet_persona_default）。
+    crate::storage::ensure_pet_persona_default()?;
+    Ok(serde_json::json!({
+        "path": crate::storage::pet_persona_config_path().display().to_string(),
+        "text": crate::storage::load_pet_persona_text()?.unwrap_or_default(),
+        "maxChars": crate::storage::MAX_PERSONA_CHARS,
+    }))
+}
+
+/// 保存桌宠专属人格（空串 = 清空 ⇒ 桌宠那一轮不注入任何人格）。
+#[tauri::command]
+pub fn set_pet_persona(text: String) -> Result<(), String> {
+    crate::storage::save_pet_persona_text(&text)?;
+    crate::log::info(format!(
+        "桌宠人格已保存：{} 字（只作用于桌宠发起的对话）",
+        text.chars().count()
+    ));
+    Ok(())
+}
+
+// ── 桌宠热键定义（与模型**同目录**，2026-10-10）────────────────────
+// 用户口径：**每个热键、表情和模型都放在同一个文件夹里** —— 热键定义因此写成
+// `<模型目录>\lunac.hotkeys.json`（与 `.exp3.json` 并排）。换模型 / 换机器拷走整个
+// 文件夹就完整，不必再维护一份「模型路径 → 配置」的映射。
+//
+// **为什么必须有宿主命令**：WebView（插件窗）**不能写盘**。读其实可以走 asset 协议
+// （`readModelJson` 那条），但写只能由宿主做 ⇒ 这里成对提供读写。
+//
+// 口子收到最小（同 `list_expression_files` 的纪律）：只认**模型文件所在那一层**的
+// 固定文件名（`lunac.hotkeys.json` / `lunac.motions.json`），不接受任意路径 / 任意文件名。
+fn pet_hotkeys_path(model_path: &str) -> Result<std::path::PathBuf, String> {
+    pet_side_file_path(model_path, "lunac.hotkeys.json")
+}
+
+/// 模型同目录下某个**固定文件名**的旁挂配置。口子收到最小：只认文件名，不接受任意路径
+/// （同 `list_expression_files` 的纪律）。
+fn pet_side_file_path(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(model_path);
+    if !p.is_file() {
+        return Err("模型文件不存在".into());
+    }
+    let dir = p.parent().ok_or_else(|| "模型路径没有父目录".to_string())?;
+    Ok(dir.join(name))
+}
+
+/// 模型同目录下一个 `*.motion3.json` 的绝对路径。
+///
+/// **口子收最小**（同 `pet_side_file_path`）：`name` 只允许**纯文件名**（不含路径分隔符 /
+/// `..`），后缀必须是 `.motion3.json` —— 用这个名字既越不出去、也覆盖不到模型目录里别的东西。
+fn motion_file_path(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(model_path);
+    if !p.is_file() {
+        return Err("模型文件不存在".into());
+    }
+    let dir = p.parent().ok_or_else(|| "模型路径没有父目录".to_string())?;
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("文件名不能为空".into());
+    }
+    if n.contains('\\') || n.contains('/') || n.contains("..") {
+        return Err("文件名只能是不带路径的名字".into());
+    }
+    if !n.to_ascii_lowercase().ends_with(".motion3.json") {
+        return Err("文件必须叫 *.motion3.json".into());
+    }
+    Ok(dir.join(n))
+}
+
+/// 读热键定义。文件不存在 ⇒ `None`（不是错误：还没配过）。
+#[tauri::command]
+pub fn read_pet_hotkeys(model_path: String) -> Result<Option<String>, String> {
+    let p = pet_hotkeys_path(&model_path)?;
+    if !p.is_file() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&p)
+        .map(Some)
+        .map_err(|e| format!("读热键文件失败：{e}"))
+}
+
+/// 写热键定义，返回落点绝对路径（前端可展示「存到哪了」）。
+#[tauri::command]
+pub fn write_pet_hotkeys(model_path: String, json: String) -> Result<String, String> {
+    let p = pet_hotkeys_path(&model_path)?;
+    std::fs::write(&p, json).map_err(|e| format!("写热键文件失败：{e}"))?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+// ── 桌宠「动作链」缓存（与模型同目录，2026-10-10）────────────────────
+// 用户口径（backlog ㉝②/③）：动作链跟模型走、存在**模型文件夹里**的 lunac 配置里。
+// 与热键同一条最小口子纪律：**只认模型文件所在那一层的固定文件名**（经 `pet_side_file_path`），
+// 不接受任意路径 / 任意文件名。热键已有 `lunac.hotkeys.json`，动作链是 `lunac.chains.json`。
+fn pet_chains_path(model_path: &str) -> Result<std::path::PathBuf, String> {
+    pet_side_file_path(model_path, "lunac.chains.json")
+}
+
+/// 读动作链定义。文件不存在 ⇒ `None`（不是错误：还没配过）。
+#[tauri::command]
+pub fn read_pet_chains(model_path: String) -> Result<Option<String>, String> {
+    let p = pet_chains_path(&model_path)?;
+    if !p.is_file() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&p)
+        .map(Some)
+        .map_err(|e| format!("读动作链文件失败：{e}"))
+}
+
+/// 写动作链定义，返回落点绝对路径。
+#[tauri::command]
+pub fn write_pet_chains(model_path: String, json: String) -> Result<String, String> {
+    let p = pet_chains_path(&model_path)?;
+    std::fs::write(&p, json).map_err(|e| format!("写动作链文件失败：{e}"))?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+// ── 桌宠「调试参数 + 运行时 id 表」缓存（与模型同目录，2026-10-10）────────
+// 用户口径（backlog ㉝③）：把「运行时 id 表 + 调试参数」一并落进**模型文件夹里**的 lunac
+// 缓存，解决两件事 —— ①进入插件**读取之前**就能拿到上次的数据（不用先开一次桌宠）；
+// ②AI 可直接改这个文件、再反向同步进设置面板。与热键 / 动作链同一条最小口子纪律：
+// **只认模型文件所在那一层的固定文件名**（经 `pet_side_file_path`），不接受任意路径。
+fn pet_params_path(model_path: &str) -> Result<std::path::PathBuf, String> {
+    pet_side_file_path(model_path, "lunac.params.json")
+}
+
+/// 读调试参数缓存。文件不存在 ⇒ `None`（不是错误：还没配过）。
+#[tauri::command]
+pub fn read_pet_params(model_path: String) -> Result<Option<String>, String> {
+    let p = pet_params_path(&model_path)?;
+    if !p.is_file() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&p)
+        .map(Some)
+        .map_err(|e| format!("读参数缓存失败：{e}"))
+}
+
+/// 写调试参数缓存，返回落点绝对路径（前端可展示「存到哪了」）。
+#[tauri::command]
+pub fn write_pet_params(model_path: String, json: String) -> Result<String, String> {
+    let p = pet_params_path(&model_path)?;
+    std::fs::write(&p, json).map_err(|e| format!("写参数缓存失败：{e}"))?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+// ── 动作文件本身（`*.motion3.json`，2026-10-10）────────────────────
+// 「预设动作」页改成**按文件**列出（用户口径：行 = 文件），并且「新建动作」要在模型文件夹里
+// **生成一个覆盖全参数的 motion3 模板**给 AI 去编。于是需要三个最小的文件操作命令 ——
+// 三者都经 `motion_file_path` 收口：只认模型同目录 + 纯文件名 + `.motion3.json` 后缀。
+// （原先的 `lunac.motions.json` 预设表与其 `read_pet_motions` / `write_pet_motions` 已撤掉。）
+
+/// 写一个 `*.motion3.json`（「新建动作」落模板用）。**已存在则拒绝**（不覆盖用户/作者的动作）。
+#[tauri::command]
+pub fn write_motion_file(model_path: String, name: String, json: String) -> Result<String, String> {
+    let p = motion_file_path(&model_path, &name)?;
+    if p.exists() {
+        return Err(format!("{name} 已存在"));
+    }
+    std::fs::write(&p, json).map_err(|e| format!("写动作文件失败：{e}"))?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+/// 删一个 `*.motion3.json`（按名字，限模型同目录）。
+#[tauri::command]
+pub fn delete_motion_file(model_path: String, name: String) -> Result<(), String> {
+    let p = motion_file_path(&model_path, &name)?;
+    if !p.is_file() {
+        return Err("文件不存在".into());
+    }
+    std::fs::remove_file(&p).map_err(|e| format!("删除动作文件失败：{e}"))
+}
+
+/// 重命名一个 `*.motion3.json`（新旧名都限模型同目录）。返回新路径。
+#[tauri::command]
+pub fn rename_motion_file(model_path: String, from: String, to: String) -> Result<String, String> {
+    let a = motion_file_path(&model_path, &from)?;
+    let b = motion_file_path(&model_path, &to)?;
+    if !a.is_file() {
+        return Err("原文件不存在".into());
+    }
+    if b.exists() {
+        return Err(format!("{to} 已存在"));
+    }
+    std::fs::rename(&a, &b).map_err(|e| format!("重命名动作文件失败：{e}"))?;
+    Ok(b.to_string_lossy().to_string())
+}
+
+/// **递归**列出 `dir`（用户自己挑的一个文件夹）下所有 `*.exp3.json` —— 「导入表情文件夹」用。
+///
+/// 与 `list_expression_files` 的差别：那个**只扫模型同层、不递归**（模型自带的声明够用）；
+/// 而这个面对的是**用户挑的任意文件夹** —— 表情常放在 `Expressions/` 之类的**子目录**里，
+/// 不递归就「识别不到文件」。`name` 取 exp3 的 `Name`，缺失时用文件名词干。
+///
+/// 安全边界：**深度 ≤ 5、条目 ≤ 3000**，防止用户手滑选了盘根把整个盘扫一遍。
+#[tauri::command]
+pub fn list_exp3_files(dir: String) -> Result<Vec<ExpressionFile>, String> {
+    const MAX_DEPTH: usize = 5;
+    const MAX_FILES: usize = 3000;
+    let root = std::path::PathBuf::from(&dir);
+    if !root.is_dir() {
+        return Err("不是一个文件夹".into());
+    }
+    let mut out: Vec<ExpressionFile> = Vec::new();
+    // 广度优先：`(目录, 深度)`。只认文件名以 `.exp3.json` 结尾的普通文件，其余忽略。
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root, 0));
+    while let Some((d, depth)) = queue.pop_front() {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue; // 读不到就跳过这个目录（权限 / 已删除），不让整条命令失败
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth + 1 <= MAX_DEPTH {
+                    queue.push_back((p, depth + 1));
+                }
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !name.to_ascii_lowercase().ends_with(".exp3.json") {
+                continue;
+            }
+            // 展示名：exp3 的 `Name` 优先，缺失用文件名词干（与 list_expression_files 同口径）
+            let display = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("Name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| name.trim_end_matches(".exp3.json").to_string());
+            out.push(ExpressionFile {
+                path: p.to_string_lossy().to_string(),
+                name: display,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// 一个「模型文件夹里的文件」的通用形状（`{ 路径, 展示名 }`）—— 动作文件用。
+#[derive(Debug, serde::Serialize)]
+pub struct MotionFile {
+    pub path: String,
+    pub name: String,
+}
+
+/// **递归**列出 `dir` 下所有 `*.motion3.json` —— 「预设动作」页与桌宠窗挂载时的动作来源。
+///
+/// 用户口径（2026-10-10）：预设动作**不再读 `model3.json` 的 `Motions`**，改为**扫文件夹里
+/// 真实的 `*.motion3.json`**（与 `list_exp3_files` 同一套路：深度 ≤ 5、条目 ≤ 3000）。
+/// `name` 取**文件名词干**（去 `.motion3.json`；motion3 本身没有名字字段）。
+/// 返回**按路径排序**（前端按同一顺序编号 ⇒ 与桌宠窗注入的组内序号一一对应）。
+#[tauri::command]
+pub fn list_motion_files(dir: String) -> Result<Vec<MotionFile>, String> {
+    const MAX_DEPTH: usize = 5;
+    const MAX_FILES: usize = 3000;
+    let root = std::path::PathBuf::from(&dir);
+    if !root.is_dir() {
+        return Err("不是一个文件夹".into());
+    }
+    let mut out: Vec<MotionFile> = Vec::new();
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root, 0));
+    while let Some((d, depth)) = queue.pop_front() {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue; // 读不到就跳过这个目录（权限 / 已删除），不让整条命令失败
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth + 1 <= MAX_DEPTH {
+                    queue.push_back((p, depth + 1));
+                }
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !name.to_ascii_lowercase().ends_with(".motion3.json") {
+                continue;
+            }
+            out.push(MotionFile {
+                path: p.to_string_lossy().to_string(),
+                name: name.trim_end_matches(".motion3.json").to_string(),
+            });
+        }
+    }
+    // 按**路径**排序：前端编号（= 注入组里的序号）必须与这条顺序一致。
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// 一个模型文件夹里除表情外的三份关键文件（VTS「模型全貌」的入口）。
+#[derive(Debug, serde::Serialize, Default)]
+pub struct ModelFolderScan {
+    /// `*.model3.json`（模型定义；正常只有一个）
+    pub model3: Vec<String>,
+    /// `*.vtube.json`（VTS 模型配置：**作者预设的热键表** + 参数绑定）
+    pub vtube: Vec<String>,
+    /// `*.cdi3.json`（Cubism 显示信息：参数 / 部件 / ArtMesh 的**可读名字**）
+    pub cdi3: Vec<String>,
+}
+
+/// 扫**一个模型文件夹**（不递归：VTS 约定这三份就放在模型目录根上），列出
+/// `model3` / `vtube` / `cdi3` 三类文件的绝对路径（各按路径排序）。
+///
+/// 为什么一次扫三类（用户口径「更换模型时一并读取表情 / 热键 / 参数 / cdi3 / vtube」）：
+/// 光有 `model3.json` 拿不到作者配好的热键与参数绑定（那些在 `vtube.json`，见
+/// `VTS-Model-File`：无官方 schema、纯 JSON、就放在模型旁边），也拿不到参数 / 部件的
+/// **可读名字**（在 `cdi3.json`）。表情那份仍走已有的 `list_exp3_files`（递归）。
+#[tauri::command]
+pub fn scan_model_folder(dir: String) -> Result<ModelFolderScan, String> {
+    let root = std::path::PathBuf::from(&dir);
+    if !root.is_dir() {
+        return Err("不是一个文件夹".into());
+    }
+    let entries = std::fs::read_dir(&root).map_err(|e| format!("读文件夹失败：{e}"))?;
+    let mut out = ModelFolderScan::default();
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        let s = p.to_string_lossy().to_string();
+        if name.ends_with(".model3.json") {
+            out.model3.push(s);
+        } else if name.ends_with(".vtube.json") {
+            out.vtube.push(s);
+        } else if name.ends_with(".cdi3.json") {
+            out.cdi3.push(s);
+        }
+    }
+    out.model3.sort();
+    out.vtube.sort();
+    out.cdi3.sort();
+    Ok(out)
 }
 
 // ── 远端 MCP 服务器（`config\mcp.json`，2026-10-01）──────────────────
@@ -1708,6 +2294,83 @@ fn mcp_tools_dir() -> std::path::PathBuf {
     crate::storage::lunac_root_dir().join("tools")
 }
 
+// ── Live2D 模型表情（桌宠）──────────────────────────────────────
+// 桌宠的表情按钮过去只认 `*.model3.json` 里 `FileReferences.Expressions` 声明过的项；
+// 但很多模型把 `.exp3.json` 直接放在同一个目录里却没写进清单 —— 用户看得见文件、
+// 却切不了那个表情。这里补一条「以**实际目录**为准」的宿主命令。
+
+/// 一个实际存在的表情文件。`path` 为**绝对路径**（引擎改写成引用后直接喂给 Live2D
+/// 的 settings），`name` 为展示名（取自 exp3 的 `Name`，缺失时用文件名词干兜底）。
+#[derive(serde::Serialize)]
+pub struct ExpressionFile {
+    pub path: String,
+    pub name: String,
+}
+
+/// 列出 `model_path`（`*.model3.json`）**所在目录**里实际存在的所有 `*.exp3.json`。
+///
+/// 为什么**只做这一件事、不做成通用列目录**（刻意的收窄，别顺手扩）：
+/// 宿主目前没有任何「任意目录列举」的通用命令（`list_tool_files` 只认 tools 目录，
+/// `std::fs::read_dir` 只在各自模块内部用过）。桌上这只宠物真正需要的只是
+/// 「这一个模型旁边的表情」；一旦把它做成「给个路径就列目录」，就等于把**枚举磁盘任意
+/// 目录**的能力暴露给前端/插件 —— 远超实际需要。所以这里把口子收到最小：
+///   * 只扫 `model_path.parent()`（模型文件的**同一层**）—— **不递归**；
+///   * 只返回文件名以 `.exp3.json` 结尾的项，其余一律忽略；
+///   * **纯读，不写任何东西**。
+///
+/// `path` 返回**绝对路径**：契约是 `model_path` 本身为绝对路径（引擎侧改写而来），
+/// 于是 `parent()` 拼接出的条目路径仍是绝对路径 —— 相对路径在 WebView 里解析不对。
+///
+/// 边界即正常，**不报错**：
+///   * 没有 `parent()` / 目录不存在 / 读不到 ⇒ 返回**空数组**（很多模型就是没有表情）；
+///   * 单个 `.exp3.json` 读取或 JSON 解析失败、或缺 `Name` ⇒ 该条用文件名词干兜底，
+///     **不让整条命令失败**（一个坏文件不该让表情列表整体消失）。
+#[tauri::command]
+pub fn list_expression_files(model_path: String) -> Result<Vec<ExpressionFile>, String> {
+    let model_path = std::path::Path::new(&model_path);
+    // 只认模型文件所在的那一层目录
+    let Some(dir) = model_path.parent() else {
+        return Ok(Vec::new());
+    };
+    // 读不到目录（不存在 / 无权限）不是错误：当作「这个模型没有表情」
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut files: Vec<ExpressionFile> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 只要常规文件（跳过子目录等），且文件名以 `.exp3.json` 结尾
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = file_name.strip_suffix(".exp3.json") else {
+            continue;
+        };
+
+        // `Name` 取 exp3 顶层字段；读不到 / 解析失败 / 无该字段一律回退文件名词干
+        let name = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|json| json.get("Name").and_then(|v| v.as_str()).map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| stem.to_string());
+
+        files.push(ExpressionFile {
+            path: path.to_string_lossy().to_string(),
+            name,
+        });
+    }
+
+    // 排序稳定（同一目录内按路径排序即按文件名升序）：面板每次重绘的顺序不该随 read_dir 抖动
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(files)
+}
+
 // ── 已安装技能（设置「技能扩展」）──────────────────────────────
 // 固定技能目录：<exe_dir>\skills，布局 <技能名>/SKILL.md。
 // agent.exe 通过 LUNAC_SKILLS_DIR 环境变量读取同一目录；
@@ -1987,6 +2650,19 @@ pub fn plugins_dir_path() -> String {
     crate::plugin_market::plugins_dir()
         .to_string_lossy()
         .to_string()
+}
+
+/// 「本地模型决策」开关（2026-10-09）：读当前状态，供设置面板显示。
+#[tauri::command]
+pub fn local_model_config_get() -> bool {
+    crate::storage::load_local_model_config().enabled
+}
+
+/// 「本地模型决策」开关：写盘。**同步命令** —— 就是一次小文件读写，
+/// 与 updater 的 `update_config_set` 同款，不必搬阻塞池。
+#[tauri::command]
+pub fn local_model_config_set(enabled: bool) -> Result<(), String> {
+    crate::storage::save_local_model_config(&crate::storage::LocalModelConfig { enabled })
 }
 
 /// 拉取**插件市场索引**（`plugin_market::INDEX_URL` = 公开仓库 `LythrumMoon/lunac-plugins`
@@ -2332,7 +3008,10 @@ pub fn log_frontend(level: String, message: String) {
 /// 为什么不能只带 pid（A8，2026-09-20 修）：同一进程里连续两次粘贴会算到**同一个**
 /// 路径 —— 旧 chip 还指着它，内容却已经被第二次粘贴覆盖。做图片内容块时这会被放大成
 /// 「同一张附件在两次提问里内容不同」，所以在源头就让它唯一。
-fn temp_image_path(tag: &str, ext: &str) -> std::path::PathBuf {
+///
+/// `pub(crate)`：`screenshot.rs` 的 `screenshot_monitor` 也要落临时 PNG，复用同一条
+/// 命名规则（比各自抄一份好）。
+pub(crate) fn temp_image_path(tag: &str, ext: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let ms = std::time::SystemTime::now()

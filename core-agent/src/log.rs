@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::{json, Value};
+
 #[derive(Clone, Copy)]
 pub enum Level {
     Error = 1,
@@ -437,6 +439,104 @@ fn value_end(chars: &[char], mut i: usize) -> usize {
     i
 }
 
+// ── API 报文调试转储（LUNAC_DUMP_API，默认关）────────────────────────
+//
+// 目的：现有可观测性只有 usage 级（result.usage.requests[] + usage_delta + agent-*.log），
+// 看不到「端点到底收了什么、回了什么」。本转储把每次 API 调用的报文各写一行，供 AI 侧
+// 端到端 / 混测取证。
+//
+// 开关：LUNAC_DUMP_API 为真值（1 / true / on / yes，忽略大小写与首尾空白）才开；缺省关。
+// 关闭时调用方先经 dump_api_enabled() 短路，热路径不做任何序列化 / 字符串拼接。
+//
+// 落点：log_dir() 下的 api-dump.jsonl（目录解析与 agent-*.log 完全一致，见 log_dir()），
+// 一行一条 JSON，便于 grep / jq。
+//
+// 硬要求（见 docs/forbidden.md §禁用 6）：
+//   · 绝不落凭据 —— body 一律先过 mask_secrets() 再写；
+//   · 请求头一个都不记（连头名也不记）—— Authorization / x-api-key 这类承载 key 的头是
+//     本通道唯一的敏感面，记头名换不来排障价值，却要逐项论证「该头不含凭据」；一个头
+//     都不记是最省心的安全选择；
+//   · 单条 body 截断到 MAX_DUMP_BODY_CHARS 字符，超出补 truncated 与真实字符数。
+//
+// 失败纪律：写失败只 warn、绝不影响主流程（同 review-last 的纪律）。
+
+/// 单条 body 落盘前的字符上限。取值理由：一次主请求的 history 可达数十万字符，不设上限
+/// 会把磁盘写爆；64K 字符足以看清绝大多数单请求报文的结构（含工具 schema 与多轮历史），
+/// 越过部分由 truncated 与 body_chars 交代。
+const MAX_DUMP_BODY_CHARS: usize = 65_536;
+
+/// 调试转储是否开启。进程内读一次并缓存（env 在进程生命周期内不变）。
+pub fn dump_api_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| is_truthy(&std::env::var("LUNAC_DUMP_API").unwrap_or_default()))
+}
+
+/// env 布尔风格：1 / true / on / yes（忽略大小写与首尾空白）为真。
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+/// 写一行 API 转储。kind = request / response；status 仅 response 有（None = 网络层没
+/// 拿到响应，此时 error 给失败原因）；body 是本次报文（request = 请求体原文，
+/// response = 累积后的最终报文，流式响应的形态见调用点注释）。
+///
+/// 无论哪个分支都先过 mask_secrets()；写失败只 warn。本函数自带开关判断，关闭时立即返回。
+pub fn dump_api(
+    kind: &str,
+    req_id: &str,
+    model: &str,
+    status: Option<u16>,
+    error: Option<&str>,
+    body: &Value,
+) {
+    if !dump_api_enabled() {
+        return;
+    }
+    let raw = body.to_string();
+    let total = raw.chars().count();
+    let truncated = total > MAX_DUMP_BODY_CHARS;
+    let masked = mask_secrets(&raw);
+    let body_text = if truncated {
+        truncate_chars(&masked, MAX_DUMP_BODY_CHARS)
+    } else {
+        masked
+    };
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".into(), json!(utc_stamp()));
+    obj.insert("kind".into(), json!(kind));
+    obj.insert("req_id".into(), json!(req_id));
+    obj.insert("model".into(), json!(model));
+    obj.insert("status".into(), json!(status));
+    if let Some(e) = error {
+        obj.insert("error".into(), json!(mask_secrets(e)));
+    }
+    if truncated {
+        obj.insert("truncated".into(), json!(true));
+        obj.insert("body_chars".into(), json!(total));
+    }
+    obj.insert("body".into(), json!(body_text));
+    let line = Value::Object(obj).to_string();
+
+    let dir = log_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn(format!("API 转储写入失败（建目录 {}）：{e}", dir.display()));
+        return;
+    }
+    let path = dir.join("api-dump.jsonl");
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
+            let _ = f.flush();
+        }
+        Err(e) => warn(format!("API 转储写入失败（{}）：{e}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +582,15 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(10_957), (2000, 1, 1));
         assert_eq!(civil_from_days(20_709), (2026, 9, 13));
+    }
+
+    #[test]
+    fn dump_flag_truthy_forms() {
+        for v in ["1", "true", "TRUE", " on ", "Yes"] {
+            assert!(is_truthy(v), "{v} 应为真");
+        }
+        for v in ["", "0", "false", "off", "no", "2"] {
+            assert!(!is_truthy(v), "{v} 应为假");
+        }
     }
 }

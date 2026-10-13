@@ -69,9 +69,10 @@ function ensureUpdateProgressListener(): void {
 
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
-import { refreshMarketPlugins, fetchPluginIndex, type MarketPluginInfo, type MarketIndexEntry } from "../market";
-import { isBasePlugin, showsInMarket, basePluginOrder } from "../kinds";
+import { refreshMarketPlugins, fetchPluginIndex, hasDiskPlugin, type MarketPluginInfo, type MarketIndexEntry } from "../market";
+import { isBasePlugin, showsInMarket, basePluginOrder, isHeadlessPlugin } from "../kinds";
 import { detachPluginListeners } from "../attach";
+import { startPluginSidecarTrusted, stopPluginSidecar } from "../sidecar";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { t, setLanguage, resetToSystemLanguage, pluginName, pluginDesc } from "../../i18n.js";
@@ -92,6 +93,7 @@ import {
   type PricingState,
   type UsageDay,
 } from "../../usage-cost.js";
+import { attachCustomSelect, customSelectHtml, type CustomSelectOption } from "./custom-select";
 
 /** 打开**本地路径**（目录 / 文件）—— 一律走宿主命令 `open_path`。
  *
@@ -228,20 +230,10 @@ function buildGeneralPane(hotkey: string, autoStart: boolean, autoStartStale: bo
     </div>`;
 }
 
-/** Local variant of renderCustomSelect (general pane) — plain labels, no icons. */
+/** Local variant of renderCustomSelect (general pane) — plain labels, no icons.
+ *  2026-10-11 起 markup 交给**共享组件** `./custom-select`（单一真相源）。 */
 function renderCustomSelectInline(id: string, options: { value: string; label: string; selected: boolean }[]): string {
-  const optsHtml = options.map(o =>
-    `<div class="custom-select-option${o.selected ? ' selected' : ''}" data-value="${esc(o.value)}">${esc(o.label)}</div>`
-  ).join("");
-  const selectedLabel = options.find(o => o.selected)?.label || options[0]?.label || "";
-  return `
-    <div class="custom-select" id="${id}">
-      <button class="custom-select-trigger" type="button">
-        <span class="custom-select-label">${esc(selectedLabel)}</span>
-        <svg class="custom-select-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-      </button>
-      <div class="custom-select-dropdown">${optsHtml}</div>
-    </div>`;
+  return customSelectHtml(id, options);
 }
 
 // ── 外观 / 主题分区（「风格」，2026-09-19 新增）──────────────────
@@ -551,13 +543,13 @@ function formatAppearanceValue(field: string, v: number): string {
  *  取不到 / 写坏时返回中性灰：圆点宁可退化成灰，也不能让整个泡泡框渲染不出来。 */
 function themeAccentColor(raw: string | null | undefined): string {
   const s = (raw ?? "").trim();
-  if (!s) return "rgba(255, 255, 255, 0.22)";
+  if (!s) return "rgba(var(--ink-rgb), 0.22)";
   if (s.startsWith("#")) return s;
   const parts = s.split(",").map(x => Number(x.trim()));
   if (parts.length === 3 && parts.every(n => Number.isFinite(n) && n >= 0 && n <= 255)) {
     return `rgb(${parts.map(n => Math.round(n)).join(", ")})`;
   }
-  return "rgba(255, 255, 255, 0.22)";
+  return "rgba(var(--ink-rgb), 0.22)";
 }
 
 async function buildAppearancePane(): Promise<string> {
@@ -761,7 +753,6 @@ async function buildAppearancePane(): Promise<string> {
         </div>
       </div>
       <div id="ap-other-sliders" class="ap-sliders-panel${otherPanelOpen ? "" : " hidden"}">
-        <div class="settings-hint ap-other-hint">${t("settings.appearance_other_hint")}</div>
         <div ${tl()}>
           <div class="settings-row ap-row-block">
             <span class="settings-label">${t("settings.appearance_other_overlay")}</span>
@@ -966,21 +957,14 @@ async function buildSearchPane(): Promise<string> {
     { id: "baidu",      name: "Baidu",        url: "https://www.baidu.com/s?wd={{query}}" },
   ];
 
-  const renderCustomSelect = (id: string, options: { value: string; label: string; selected: boolean; tag?: string }[], allowDelete = false): string => {
-    const optsHtml = options.map(o => {
-      const del = allowDelete && o.value !== "__custom__" ? `<span class="cs-del" title="×">×</span>` : "";
-      return `<div class="custom-select-option${o.selected ? ' selected' : ''}" data-value="${esc(o.value)}" data-tag="${o.tag || 'builtin'}">${esc(o.label)}${del}</div>`;
-    }).join("");
-    const sel = options.find(o => o.selected);
-    return `
-      <div class="custom-select" id="${id}">
-        <button class="custom-select-trigger" type="button">
-          <span class="custom-select-label">${esc(sel?.label || options[0]?.label || "")}</span>
-          <svg class="custom-select-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-        </button>
-        <div class="custom-select-dropdown">${optsHtml}</div>
-      </div>`;
-  };
+  const renderCustomSelect = (id: string, options: { value: string; label: string; selected: boolean; tag?: string }[], allowDelete = false): string =>
+    customSelectHtml(id, options.map<CustomSelectOption>(o => ({
+      value: o.value,
+      label: o.label,
+      selected: o.selected,
+      tag: o.tag || "builtin",
+      deletable: allowDelete && o.value !== "__custom__",
+    })));
 
   const engSelectHtml = renderCustomSelect("settings-search-engine", engines.map(e => ({
     value: e.id,
@@ -1078,6 +1062,66 @@ function belongsToOtherProvider(model: string, provider: string): boolean {
   return false;
 }
 
+/** 一段 curl 解析出来的供应商配置（容错：能解析多少算多少）。 */
+interface CurlParsed {
+  /** 供应商名候选（URL 主机名，去掉 www.；仅作输入框默认值）。 */
+  provider: string;
+  /** 只取 origin（scheme + host）当作 base_url —— 语义见 parseCurlConfig 注释。 */
+  baseUrl: string;
+  /** curl 里那段的路径（可能为空）。原样带出来是为了**如实提示**用户它未被采用。 */
+  path: string;
+  apiKey: string;
+  /** Authorization 用的是形如 $ENV 的环境变量引用时，这里存那个引用（否则空）。 */
+  envKey: string;
+  model: string;
+  /** 命令里到底有没有 Authorization 头（用来区分「没写」与「写了但取不到值」）。 */
+  hasKey: boolean;
+}
+
+/** 从一段 curl 命令里**尽力**抠出供应商三要素。
+ *
+ *  解析口径：
+ *   · base_url —— 文本里第一个 http(s) 链接（通常就是 --location 后面那个）的
+ *                **origin**（scheme + host）。为什么不整条照抄：现有预设的 base_url
+ *                一律不带 /v1 与业务路径（见本文件顶部注释），agent 会在它上面派生
+ *                端点；而 curl 给的常是**完整 endpoint**，直接当 base_url 存进去会
+ *                多出一段路径。被丢掉的路径随接口一起返回，由调用方**如实提示**。
+ *   · api_key  —— Authorization: Bearer 后面的 token。若是 $ENV 形态（值不在命令里，
+ *                是环境变量引用），留空并回一个提示，让用户去密钥框手填。
+ *   · model    —— --data / -d 那段 JSON 里顶层的 "model" 字段。
+ *   · provider —— 默认取主机名（去掉 www.），仅作输入框默认值。
+ *
+ *  一点 URL 都找不到就抛错（没有端点地址就建不出供应商）；其余缺项只体现在返回值里。 */
+function parseCurlConfig(raw: string): CurlParsed {
+  const text = (raw || "").trim();
+  const urlMatch = text.match(/https?:\/\/[^\s]+/i);
+  if (!urlMatch) throw new Error("no-url");
+  const url = urlMatch[0].replace(/^['"]+/, "").replace(/['"\\]+$/, "");
+  let baseUrl = url;
+  let path = "";
+  let provider = "";
+  try {
+    const u = new URL(url);
+    baseUrl = u.origin;
+    path = (u.pathname || "") + (u.search || "");
+    provider = u.hostname.replace(/^www\./i, "");
+  } catch {}
+  let apiKey = "";
+  let envKey = "";
+  let hasKey = false;
+  const authMatch = text.match(/Authorization\s*:\s*Bearer\s+([^\s'"\\]+)/i);
+  if (authMatch) {
+    hasKey = true;
+    const tok = authMatch[1];
+    if (tok.startsWith("$")) envKey = tok;
+    else apiKey = tok;
+  }
+  let model = "";
+  const modelMatch = text.match(/"model"\s*:\s*"([^"]+)"/);
+  if (modelMatch) model = modelMatch[1];
+  return { provider, baseUrl, path, apiKey, envKey, model, hasKey };
+}
+
 /** AI 模型分块（2026-10-05 精简）。**只剩**：供应商 / 模型 / Base URL / API Key + 保存。
  *
  *  用户口径「对 AI 零基础用户做减法」，砍掉：搜索服务商 + 搜索 API 密钥（进阶，WebSearch
@@ -1096,21 +1140,14 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
   try { hiddenProvs = JSON.parse(localStorage.getItem("lunac-hidden-providers") || "[]"); } catch {}
   const provKeys = Object.keys(PROVIDER_PRESETS).filter(p => !hiddenProvs.includes(p) || p === provider);
   // Custom dropdown HTML helper
-  const renderCustomSelect = (id: string, options: { value: string; label: string; selected: boolean; tag?: string }[], allowDelete = false): string => {
-    const optsHtml = options.map(o => {
-      const del = allowDelete && o.value !== "__custom__" ? `<span class="cs-del" title="×">×</span>` : "";
-      return `<div class="custom-select-option${o.selected ? ' selected' : ''}" data-value="${esc(o.value)}" data-tag="${o.tag || 'builtin'}">${esc(o.label)}${del}</div>`;
-    }).join("");
-    const selectedLabel = options.find(o => o.selected)?.label || options[0]?.label || "";
-    return `
-      <div class="custom-select" id="${id}">
-        <button class="custom-select-trigger" type="button">
-          <span class="custom-select-label">${esc(selectedLabel)}</span>
-          <svg class="custom-select-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-        </button>
-        <div class="custom-select-dropdown">${optsHtml}</div>
-      </div>`;
-  };
+  const renderCustomSelect = (id: string, options: { value: string; label: string; selected: boolean; tag?: string }[], allowDelete = false): string =>
+    customSelectHtml(id, options.map<CustomSelectOption>(o => ({
+      value: o.value,
+      label: o.label,
+      selected: o.selected,
+      tag: o.tag || "builtin",
+      deletable: allowDelete && o.value !== "__custom__",
+    })));
   const provOpts: { value: string; label: string; selected: boolean; tag?: string }[] = provKeys.map(p => ({
     value: p,
     label: PROVIDER_PRESETS[p].name,
@@ -1181,6 +1218,25 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         <input type="password" id="settings-apikey" class="settings-input" autocomplete="off" value="${esc(apiKey)}" placeholder="${masked || 'sk-...'}">
       </div>
       <div class="settings-row" style="justify-content: flex-end;">
+        <button type="button" id="settings-add-curl-btn" class="settings-install-btn">${t("settings.curl_btn")}</button>
+      </div>
+      <!-- 一键添加配置（粘贴 curl）：默认隐藏，点上面那枚按钮展开。
+           本段在模板字符串里，注释里不能出现反引号。 -->
+      <div class="settings-curl hidden" id="settings-curl-box">
+        <div class="settings-curl-title">${t("settings.curl_title")}</div>
+        <textarea id="settings-curl-input" spellcheck="false" autocomplete="off" placeholder="${esc(t("settings.curl_ph"))}"></textarea>
+        <div class="settings-curl-row">
+          <span class="settings-label">${t("settings.curl_name")}</span>
+          <input type="text" id="settings-curl-name" class="settings-input" autocomplete="off" placeholder="${esc(t("settings.curl_name_ph"))}">
+        </div>
+        <div class="settings-curl-actions">
+          <button type="button" id="settings-curl-cancel" class="settings-install-btn">${t("settings.cancel")}</button>
+          <button type="button" id="settings-curl-add" class="settings-save-btn">${t("settings.curl_confirm")}</button>
+        </div>
+        <div class="settings-curl-msg" id="settings-curl-msg"></div>
+      </div>
+      <div class="settings-row" style="justify-content: flex-end;">
+        <button id="settings-test-ai-btn" class="settings-install-btn">${t("settings.test_conn")}</button>
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
         <span id="settings-save-msg" class="settings-save-msg"></span>
       </div>`;
@@ -1192,13 +1248,48 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
  *  两个分块 —— 它们是给进阶用户看的入口，对 AI 零基础用户只会造成「这个该怎么用」的
  *  困扰。skill / 工具改为**由 AI 在运行时按需查找或生成**（动手前提醒用户），不再在设置里
  *  暴露入口。人格（L2）2026-09-21 已搬出本面板 → 输入栏「更多设置」的 ⋯ 菜单（见 main.ts）。 */
+/** 「本地模型决策」开关（2026-10-09）。
+ *
+ *  本地决策模型（插件 `local-model`）不再是可搜索 / 可打开的工具插件 —— 它的开关归到这里：
+ *  开 = 宿主拉起 `llama-server` 子进程并把端点下发给 agent（`LUNAC_LOCAL_MODEL_URL`），
+ *  由本地小模型判断「桌宠消息 / 对话输入」要不要发给云模型（省钱）；关 = 收进程、不下发端点。
+ *  插件本身仍留在「插件」市场可下载 / 卸载（见 kinds.ts 的 `isHeadlessPlugin`）。 */
+function buildLocalModelSection(enabled: boolean, installed: boolean): string {
+  const hint = installed ? t("settings.local_model_hint") : t("settings.local_model_missing");
+  return `
+      <div class="settings-row">
+        <span class="settings-label">${t("settings.local_model")}</span>
+        <label class="settings-toggle">
+          <input type="checkbox" id="settings-local-model"${enabled ? " checked" : ""}${installed ? "" : " disabled"}>
+          <span class="settings-toggle-slider"></span>
+        </label>
+      </div>
+      <div class="settings-hint" id="settings-local-model-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${hint}</div>
+      <!-- 开启前的内联警告（**不用信任卡**：那卡片渲染在 #results-list 里会被设置布局裁掉 / 吞掉，
+           2026-10-09 用户要求改为面板内可见的警告 + 确认）-->
+      <div class="settings-hint hidden" id="settings-local-model-warn" style="font-size:0.72rem;color:var(--yellow);margin:2px 0 6px;line-height:1.6;">
+        ${t("settings.local_model_warn")}
+        <div style="display:flex;gap:8px;margin-top:6px;">
+          <button class="settings-install-btn" id="settings-local-model-ok">${t("settings.local_model_confirm")}</button>
+          <button class="settings-skill-del-installed" id="settings-local-model-cancel">${t("settings.local_model_cancel")}</button>
+        </div>
+      </div>`;
+}
+
 async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string): Promise<string> {
   const costHtml = await buildUsageCostSection();
+  // 本地模型决策：开关状态来自宿主（config\local_model.json）；「装了没」按本机事实判
+  //（`hasDiskPlugin` = 盘上有且清单可用），未装就禁用开关并提示去市场下。
+  let lmEnabled = false;
+  try { lmEnabled = await invoke<boolean>("local_model_config_get"); } catch { /* 读不到按关处理 */ }
+  const lmInstalled = hasDiskPlugin("local-model");
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
       ${buildAIModelSection(provider, baseUrl, model, apiKey)}
+      <div class="settings-group-title">${t("settings.local_model_group")}</div>
+      ${buildLocalModelSection(lmEnabled, lmInstalled)}
       <div class="settings-group-title">${t("settings.cost_title")}</div>
       ${costHtml}
     </div>`;
@@ -1575,11 +1666,15 @@ function marketRowHtml(r: MarketRow): string {
     : "";
   const meta = r.broken
     ? `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: r.broken }))}</span>`
-    : `<span class="settings-plugin-desc">${esc(r.description)}${deps}${perms}</span>`;
+    : `<span class="settings-plugin-desc">${esc(r.description)}${deps}${perms}${
+        // 基础设施插件（无用户入口）留一句「去哪开关」，否则用户会奇怪市场里的插件点不开
+        isHeadlessPlugin(r.id) ? `<span class="settings-market-deps">${esc(t("settings.local_model_managed"))}</span>` : ""
+      }</span>`;
   // 基础插件随安装包走，**用户既不能装也不能卸**（2026-09-29 用户定）⇒ 只留「打开」。
   // 拓展插件才按「盘上事实」出下载 / 更新 / 卸载。
   const base = isBasePlugin(r.id);
-  const open = r.installed && !r.broken
+  // 基础设施插件**不给「打开」**（它没有面板）—— 开关在「设置 → AI」，但下载 / 卸载照留
+  const open = r.installed && !r.broken && !isHeadlessPlugin(r.id)
     ? `<button class="settings-install-btn" data-open-plugin="${esc(r.id)}">${t("settings.skill_open")}</button>`
     : "";
   const download = !base && r.url
@@ -1986,9 +2081,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
         border-radius: 6px;
         color: var(--text);
         outline: none;
-        caret-color: var(--accent);
+        caret-color: rgb(var(--other-overlay-rgb));
       }
-      .settings-input:focus { border-color: var(--accent-border); }
+      .settings-input:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
       /* ── 插件市场（L1，2026-09-21；二次改版见 buildPluginsPane 头注释）─────────
          一张表一行一个插件：图标 + 名称/描述 + 该状态下的一到两个按钮
          （打开 / 下载 / 卸载）。刻意与 .settings-plugin-item 分成两个类：
@@ -2055,9 +2150,9 @@ export async function attachSettingsListeners(container: HTMLElement) {
       .cost-pending {
         margin: 4px 0 10px;
         padding: 8px 10px;
-        border: 1px solid var(--accent-border);
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
         border-radius: 8px;
-        background: var(--accent-bg);
+        background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
       }
       .cost-pending-title {
         font-size: 0.75rem;
@@ -2071,7 +2166,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         opacity: 0.75;
         word-break: break-all;
       }
-      .cost-new { color: var(--accent); font-size: 0.62rem; }
+      .cost-new { color: rgb(var(--other-overlay-rgb)); font-size: 0.62rem; }
       .cost-warn { color: var(--yellow); }
       .settings-select {
         flex: 1;
@@ -2080,7 +2175,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         box-sizing: border-box;
         padding: 5px 8px;
         font-size: 0.73rem;
-        background: rgba(0, 0, 0, calc(0.25 * var(--shade-scale)));
+        background: rgba(var(--shade-rgb), calc(0.25 * var(--shade-scale)));
         border: 1px solid var(--border-glass);
         border-radius: 6px;
         color: var(--text);
@@ -2090,15 +2185,15 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 5px 12px;
         font-size: 0.73rem;
         border-radius: 6px;
-        border: 1px solid var(--accent-border);
-        background: var(--accent-bg);
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+        background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
         color: var(--text);
         cursor: pointer;
         min-width: 90px;
         text-align: center;
         transition: background 0.1s;
       }
-      .settings-hotkey:hover { background: rgba(var(--accent-rgb), 0.2); }
+      .settings-hotkey:hover { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06)); }
       .settings-hotkey.recording {
         border-color: var(--yellow);
         background: rgba(201,184,150,0.15);
@@ -2144,7 +2239,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       .settings-toggle input:checked + .settings-toggle-slider::before {
         transform: translateX(16px);
-        background: var(--accent);
+        background: rgb(var(--btn-line-rgb));
       }
       .settings-plugin-list {
         max-height: 200px;
@@ -2182,13 +2277,13 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 5px 12px;
         font-size: 0.72rem;
         border-radius: 6px;
-        border: 1px solid var(--accent-border);
-        background: var(--accent-bg);
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+        background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
         color: var(--text);
         cursor: pointer;
         transition: background 0.1s;
       }
-      .settings-tool-btn:hover { background: rgba(var(--accent-rgb), 0.2); }
+      .settings-tool-btn:hover { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06)); }
       .settings-marketplace-section { margin-bottom: 14px; }
       .settings-marketplace-title {
         font-size: 0.7rem;
@@ -2219,19 +2314,28 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 3px 10px;
         font-size: 0.68rem;
         border-radius: 4px;
-        border: 1px solid var(--accent-border);
-        background: rgba(var(--accent-rgb), 0.1);
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+        background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
         color: var(--text);
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.1s;
       }
-      .settings-install-btn:hover { background: rgba(var(--accent-rgb), 0.2); }
+      .settings-install-btn:hover { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06)); }
       .settings-install-btn.installed {
         border-color: var(--text-muted);
         background: rgba(var(--ink-rgb), 0.05);
         color: var(--text-dim);
         cursor: default;
+      }
+      /* 需求 6（2026-10-09）：AI 供应商那行里「测试连通」（类 settings-install-btn）
+         与「保存」（类 settings-save-btn）两枚按钮**必须同高** —— 以保存按钮的盒模型
+         为准。**不改 .settings-install-btn 本体**：它还被市场安装 / 本地模型确认等好几处
+         复用，那些地方没有要跟谁对齐。 */
+      #settings-test-ai-btn {
+        padding: 6px 18px;
+        font-size: 0.74rem;
+        border-radius: 6px;
       }
       /* 保存按钮：**动作按钮一律跟随主题色**（accent 三态 + 半透明档），
          不跟随主题色的是「语义状态色」—— --green(成功) / --red(危险) /
@@ -2243,14 +2347,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 6px 18px;
         font-size: 0.74rem;
         border-radius: 6px;
-        border: 1px solid var(--accent-border);
-        background: rgba(var(--accent-rgb), 0.12);
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+        background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
         color: var(--text);
         cursor: pointer;
         transition: background 0.15s, color 0.15s;
       }
-      .settings-save-btn:hover { background: rgba(var(--accent-rgb), 0.25); }
-      .settings-save-btn:active { background: rgba(var(--accent-rgb), 0.35); }
+      .settings-save-btn:hover { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.11)); }
+      .settings-save-btn:active { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.21)); }
       /* 保存结果提示**保留语义绿**：它表达的是「操作成功」这一状态，不是动作按钮。 */
       .settings-save-msg {
         font-size: 0.72rem;
@@ -2261,91 +2365,55 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       .settings-save-msg.show { opacity: 1; }
 
-      /* Custom dropdown (replaces native <select> — broken in transparent WebView2 windows) */
-      .custom-select {
-        position: relative;
-        flex: 1;
-        max-width: 220px;
-        height: 26px;
-        box-sizing: border-box;
+      /* 一键添加配置（粘贴 curl）：内联展开的小框。默认隐藏（配 .hidden 用）。
+         注意本文件整段样式是模板字符串，注释里**不许出现反引号**。 */
+      .settings-curl {
         display: flex;
-        align-items: center;
-        user-select: none;
+        flex-direction: column;
+        gap: 8px;
+        margin: 4px 0 8px;
+        padding: 10px;
+        border: 1px solid var(--border-glass);
+        border-radius: 8px;
+        background: rgba(var(--ink-rgb), 0.04);
       }
-      .custom-select-trigger {
+      .settings-curl-title { font-size: 0.74rem; color: var(--text); }
+      .settings-curl textarea {
         width: 100%;
-        height: 26px;
+        min-height: 84px;
         box-sizing: border-box;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 6px;
-        padding: 5px 8px;
-        font-size: 0.73rem;
-        font-family: inherit;
-        /* ② 文本框（下拉的收合面）—— 与 .settings-input 同一条凹陷层口径 */
-        background: rgba(var(--ctx-shade-rgb), calc(0.25 * var(--ctx-shade-scale)));
-        border: 1px solid var(--ctx-border-glass);
-        border-radius: 6px;
+        resize: vertical;
+        padding: 6px 8px;
+        font-size: 0.68rem;
+        line-height: 1.5;
+        font-family: 'Consolas', 'Cascadia Mono', monospace;
         color: var(--text);
-        cursor: pointer;
-        outline: none;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .custom-select-trigger:hover { border-color: var(--accent-border); }
-      .custom-select-arrow {
-        flex-shrink: 0;
-        width: 10px;
-        height: 10px;
-        transition: transform 0.15s;
-      }
-      .custom-select.open .custom-select-arrow { transform: rotate(180deg); }
-      .custom-select-dropdown {
-        position: absolute;
-        top: 100%;
-        left: 0;
-        right: 0;
-        max-height: 240px;
-        overflow-y: auto;
-        overscroll-behavior: contain; /* 滚轮不穿透到外层列表 */
-        background: var(--surface-glass);
-        backdrop-filter: blur(20px);
-        -webkit-backdrop-filter: blur(20px);
+        background: rgba(var(--ink-rgb), 0.06);
         border: 1px solid var(--border-glass);
         border-radius: 6px;
-        z-index: 999;
-        display: none;
-        margin-top: 0;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, calc(0.4 * var(--shade-scale)));
-        /* 滚动条外观走全局统一细条（styles.css 的「统一细滚动条」一节）。
-           这里**不要**再写 scrollbar-width / scrollbar-color —— 在 Chromium
-           (WebView2) 里它们会让 ::-webkit-scrollbar 整段失效、退回系统默认样式。 */
+        outline: none;
       }
-      .custom-select.open .custom-select-dropdown { display: block; }
-      .custom-select-option {
-        padding: 6px 10px;
-        font-size: 0.73rem;
-        color: var(--text-dim);
-        cursor: pointer;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .custom-select-option:hover { background: var(--accent-bg); color: var(--text); }
-      .custom-select-option.selected { color: var(--text); font-weight: 600; }
+      .settings-curl textarea:focus { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
+      .settings-curl-row { display: flex; align-items: center; gap: 10px; }
+      .settings-curl-row input { flex: 1; min-width: 0; }
+      .settings-curl-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .settings-curl-msg { font-size: 0.7rem; line-height: 1.5; color: var(--green); }
+
+      /* 自绘下拉框 .custom-select 的样式已提到**共享的 styles.css**（2026-10-11）：
+         插件悬浮窗也加载那份，故任何插件都能拿到同一副外观。见
+         docs/ui-style.md §界面 12 与 app/src/plugins/builtin/custom-select.ts。
+         这里保留设置独有的「自定义模型 / 供应商」内联输入行。 */
       .custom-model-input {
         width: 100%;
         box-sizing: border-box;
         padding: 6px 10px;
         font-size: 0.73rem;
         color: var(--text);
-        background: rgba(0, 0, 0, calc(0.35 * var(--shade-scale)));
-        border: 1px solid var(--accent-border);
+        background: rgba(var(--shade-rgb), calc(0.35 * var(--shade-scale)));
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
         border-radius: 4px;
         outline: none;
-        caret-color: var(--accent);
+        caret-color: rgb(var(--other-overlay-rgb));
       }
       .custom-model-edit {
         display: flex;
@@ -2361,24 +2429,12 @@ export async function attachSettingsListeners(container: HTMLElement) {
         font-size: 0.85rem;
         line-height: 1;
         color: var(--text);
-        background: rgba(var(--accent-rgb), 0.18);
-        border: 1px solid var(--accent-border);
+        background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.04));
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
         border-radius: 4px;
         cursor: pointer;
       }
-      .custom-model-ok:hover { background: rgba(var(--accent-rgb), 0.35); }
-      .cs-del {
-        display: inline-block;
-        margin-left: 6px;
-        padding: 0 3px;
-        font-size: 0.7rem;
-        color: var(--text-dim);
-        border-radius: 3px;
-        cursor: pointer;
-        opacity: 0.6;
-      }
-      .custom-select-option:hover .cs-del { opacity: 1; color: var(--red, #c08a8a); }
-      .cs-del:hover { background: rgba(192,138,138,0.2); }
+      .custom-model-ok:hover { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.21)); }
       /* Detached (expanded) mode: let settings fill the whole window so no
          blank translucent area remains below the content. */
       #app.detached .plugin-result {
@@ -2397,14 +2453,14 @@ export async function attachSettingsListeners(container: HTMLElement) {
         padding: 3px 10px;
         font-size: 0.68rem;
         border-radius: 4px;
-        border: 1px solid var(--accent-border);
-        background: var(--accent-bg);
+        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+        background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));
         color: var(--text);
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.1s;
       }
-      .settings-skill-open:hover, .settings-skill-edit:hover { background: rgba(var(--accent-rgb), 0.2); }
+      .settings-skill-open:hover, .settings-skill-edit:hover { background: rgba(var(--btn-bg-rgb), calc(var(--btn-bg-alpha) + 0.06)); }
       /* 中性/危险按钮（移除）：无底色，hover 转 --red。 */
       .settings-skill-del, .settings-skill-del-installed {
         padding: 3px 10px;
@@ -2449,7 +2505,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         color: var(--text);
         /* 2026-09-21：「其他颜色」的统一浮层（默认 α 0.1 × 1.4 = 0.14）。 */
         background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha));
-        border-left: 3px solid rgb(var(--ctx-rgb));
+        border-left: 3px solid rgb(var(--other-overlay-rgb));
         border-radius: 4px;
       }
       .settings-group-title:first-of-type { margin-top: 6px; }
@@ -2522,7 +2578,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         background: none; border: 1px solid var(--ctx-border-glass);
         border-radius: 8px; color: var(--text-dim);
       }
-      .ap-picker-toggle:hover { border-color: var(--accent-border); color: var(--accent); }
+      .ap-picker-toggle:hover { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); color: rgb(var(--other-overlay-rgb)); }
       .ap-pick-panel {
         display: flex; flex-direction: column; gap: 4px; padding: 6px;
         border: 1px solid var(--ctx-border-glass); border-radius: 8px;
@@ -2575,7 +2631,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
         /* 一圈极淡的描边：主色接近底色时圆点才不会「消失」 */
         box-shadow: inset 0 0 0 1px rgba(var(--ink-rgb), 0.25);
       }
-      .ap-theme.active { border-color: var(--accent-border); background: var(--accent-bg); color: var(--text); }
+      .ap-theme.active { border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); background: rgba(var(--btn-bg-rgb), var(--btn-bg-alpha)); color: var(--text); }
       .ap-badge { font-size: 0.62rem; opacity: 0.75; }
     `;
     document.head.appendChild(style);
@@ -2783,6 +2839,77 @@ export async function attachSettingsListeners(container: HTMLElement) {
   const updateProgressRing = container.querySelector("#settings-update-progress-ring") as HTMLElement | null;
   const updateProgressSpeed = container.querySelector("#settings-update-progress-speed") as HTMLElement | null;
   const updateAuto = container.querySelector("#settings-update-auto") as HTMLInputElement | null;
+
+  // ── 本地模型决策开关（2026-10-09）─────────────────────────────
+  // 编排：开 ⇒ 起 sidecar（首次弹信任卡）+ 写开关 + 重载 agent（让 `LUNAC_LOCAL_MODEL_URL` 生效）；
+  //       关 ⇒ 写开关 + 收 sidecar + 重载 agent。任一步失败即回滚开关并提示。
+  // 为什么在前端编排而不是让宿主自己起：sidecar 的**信任门**只在 webview 里能弹（默认拒绝），
+  // 宿主闷头起只会拿到 `needs_trust` 而什么都不发生。
+  const lmToggle = container.querySelector("#settings-local-model") as HTMLInputElement | null;
+  const lmHint = container.querySelector("#settings-local-model-hint") as HTMLElement | null;
+  const lmWarn = container.querySelector("#settings-local-model-warn") as HTMLElement | null;
+  if (lmToggle && !lmToggle.disabled) {
+    const lmHintDefault = lmHint?.textContent ?? "";
+    // 状态 / 错误**直接写进那行提示**（不再单开一个提示元素）：空元素不占位，也不会再出现
+    // 「有文字但 opacity:0 ⇒ 看着是一块空白」（2026-10-09 修：原来挂在 `.settings-save-msg` 上）
+    const setLmMsg = (s: string, isErr = false) => {
+      if (!lmHint) return;
+      lmHint.textContent = s || lmHintDefault;
+      lmHint.style.color = isErr ? "var(--red)" : "var(--text-dim)";
+    };
+    const turnOn = async () => {
+      lmToggle.disabled = true;
+      setLmMsg(t("settings.local_model_working"));
+      try {
+        if (!hasDiskPlugin("local-model")) throw new Error(t("settings.local_model_missing"));
+        // 不经信任卡：直接落盘信任再起进程（原因见 sidecar.ts 的 startPluginSidecarTrusted）
+        await startPluginSidecarTrusted("local-model");
+        await invoke("local_model_config_set", { enabled: true });
+        lmToggle.checked = true;
+        setLmMsg("");
+        // 端点靠 spawn 时的环境变量下发 ⇒ 必须重启 agent 才生效（沿用全局桥）
+        await (window as any).__lunac_reload_agent?.();
+      } catch (e) {
+        lmToggle.checked = false; // 回滚：界面状态与落盘状态保持一致
+        setLmMsg(String(e instanceof Error ? e.message : e), true);
+      } finally {
+        lmToggle.disabled = false;
+      }
+    };
+    const turnOff = async () => {
+      lmToggle.disabled = true;
+      setLmMsg(t("settings.local_model_working"));
+      try {
+        await invoke("local_model_config_set", { enabled: false });
+        await stopPluginSidecar("local-model");
+        setLmMsg("");
+        await (window as any).__lunac_reload_agent?.();
+      } catch (e) {
+        lmToggle.checked = true;
+        setLmMsg(String(e instanceof Error ? e.message : e), true);
+      } finally {
+        lmToggle.disabled = false;
+      }
+    };
+    lmToggle.addEventListener("change", () => {
+      lmWarn?.classList.add("hidden");
+      if (lmToggle.checked) {
+        // 开：先回退勾选，弹**内联警告**；确认后才真信任 + 起进程（不用会被布局吞掉的信任卡）
+        lmToggle.checked = false;
+        lmWarn?.classList.remove("hidden");
+      } else {
+        void turnOff();
+      }
+    });
+    const lmOk = container.querySelector("#settings-local-model-ok") as HTMLButtonElement | null;
+    const lmCancel = container.querySelector("#settings-local-model-cancel") as HTMLButtonElement | null;
+    lmOk?.addEventListener("click", () => {
+      lmWarn?.classList.add("hidden");
+      void turnOn();
+    });
+    lmCancel?.addEventListener("click", () => lmWarn?.classList.add("hidden"));
+  }
+
   if (updateCheckBtn && updateStatusEl) {
     updateUi = {
       row: updateProgressRow,
@@ -2868,99 +2995,23 @@ export async function attachSettingsListeners(container: HTMLElement) {
   const baseUrlInput = container.querySelector("#settings-baseurl") as HTMLInputElement | null;
   const apiKeyInput = container.querySelector("#settings-apikey") as HTMLInputElement | null;
 
-  // ── Custom dropdown setup ────────────────────────────────────
+  // ── Custom dropdown setup（2026-10-11：改为调用**共享组件** ./custom-select）──
+  // 开合 / 选择 / 外点关闭 / 长列表滚轮 / 边界翻转限高都在共享组件里（单一真相源）；
+  // 这里只补设置独有的三件：× 删除、__custom__ 内联输入、「打开时放宽面板裁剪」。
   function setupCustomDropdown(dd: HTMLElement, onChange: (value: string) => void) {
-    const trigger = dd.querySelector(".custom-select-trigger") as HTMLElement | null;
     const dropdown = dd.querySelector(".custom-select-dropdown") as HTMLElement | null;
     const label = dd.querySelector(".custom-select-label") as HTMLElement | null;
-    if (!trigger || !dropdown || !label) return;
+    if (!dropdown || !label) return;
 
-    // Helper: allow dropdown to overflow parent containers
-    const setOverflowVisible = (v: boolean) => setDropdownOverflow(container, v);
+    // 任一 dd 开着就放宽所属面板的裁剪（关到没有打开的 dd 时还原）。见 setDropdownOverflow 注释。
+    const syncOverflow = () => setDropdownOverflow(container, !!container.querySelector(".custom-select.open"));
 
-    /**
-     * Position the dropdown absolutely within .custom-select (position:relative)
-     * so it sits flush below the trigger. IMPORTANT: position:fixed is broken
-     * here — #results-container has `backdrop-filter`, which per spec makes it
-     * the containing block for fixed descendants, so a viewport-coordinate top
-     * lands ~searchbar-height BELOW the trigger (需求2 复测: 52px gap). Absolute
-     * is immune to that offset.
-     *
-     * 可用空间按**滚动容器（`#results-list`）的可视区**计算，不再按窗口算：
-     * 裁剪下拉框的是那一层（它 `overflow-y: auto`），按窗口算会在容器底部
-     * 明明放不下时仍然朝下展开 → 被裁掉半截；而放宽它的 overflow 会让整页
-     * 跳回顶部（见 setDropdownOverflow 的注释），所以只能在可视区内翻转 + 限高。
-     */
-    function positionDropdown() {
-      const dropEl = dd.querySelector(".custom-select-dropdown") as HTMLElement | null;
-      const trigEl = dd.querySelector(".custom-select-trigger") as HTMLElement | null;
-      if (!dropEl || !trigEl) return;
-      const trigRect = trigEl.getBoundingClientRect();
-      const MARGIN = 8;
-      // 目标高度：约 4 行可见（紧凑，不把面板撑满窗口），
-      // 更多项（如自定义模型）通过列表内部滚动条拉动查看。
-      const TARGET_H = 120;
-      // 边界 = 滚动容器的可视区（找不到时退回窗口）
-      const scroller = dd.closest("#results-list") as HTMLElement | null;
-      const box = scroller?.getBoundingClientRect();
-      const boundTop = Math.max(box ? box.top : 0, 0);
-      const boundBottom = Math.min(box ? box.bottom : window.innerHeight, window.innerHeight);
-      const spaceBelow = boundBottom - trigRect.bottom - MARGIN;
-      const spaceAbove = trigRect.top - boundTop - MARGIN;
-      // 下方放得下就朝下展开；下方不够（如面板底部）则翻到上方；
-      // 高度固定 TARGET_H，极小窗口下保底 60px，始终可内部滚动。
-      const openUp = spaceBelow < TARGET_H && spaceAbove > spaceBelow;
-      const sideSpace = openUp ? spaceAbove : spaceBelow;
-      const maxH = Math.max(60, Math.min(TARGET_H, sideSpace));
-      dropEl.style.overflowY = "auto";
-      dropEl.style.overscrollBehavior = "contain"; // 滚轮只滚本列表，不穿透外层
-      dropEl.style.position = "absolute";
-      dropEl.style.left = "0";
-      dropEl.style.width = "100%";
-      dropEl.style.maxHeight = maxH + "px";
-      if (openUp) {
-        dropEl.style.top = "auto";
-        dropEl.style.bottom = "calc(100% + 4px)";
-        dropEl.style.marginTop = "0";
-        dropEl.style.marginBottom = "0";
-      } else {
-        dropEl.style.top = "calc(100% + 4px)";
-        dropEl.style.bottom = "auto";
-        dropEl.style.marginTop = "0";
-        dropEl.style.marginBottom = "0";
-      }
-    }
-
-    // Toggle open/close
-    trigger.addEventListener("click", (e: Event) => {
-      e.preventDefault(); e.stopPropagation();
-      const wasOpen = dd.classList.contains("open");
-      // Close all other custom selects first
-      container.querySelectorAll(".custom-select.open").forEach(el => {
-        if (el !== dd) el.classList.remove("open");
-      });
-      if (wasOpen) {
-        dd.classList.remove("open");
-        setOverflowVisible(false);
-      } else {
-        dd.classList.add("open");
-        setOverflowVisible(true);
-        // position:fixed + dynamic height — never split/clipped on small windows
-        positionDropdown();
-        // Re-position if the window is resized while open
-        window.addEventListener("resize", positionDropdown, { once: true });
-      }
-    });
-
-    // Select option (and handle per-option delete buttons)
-    dropdown.addEventListener("click", (e: Event) => {
-      const target = e.target as HTMLElement;
-      // ── Delete button (×): remove the option (custom → also persisted) ──
-      const delBtn = target.closest(".cs-del") as HTMLElement | null;
-      if (delBtn) {
-        e.preventDefault(); e.stopPropagation();
-        const opt = delBtn.closest(".custom-select-option") as HTMLElement | null;
-        if (!opt) return;
+    attachCustomSelect(dd, {
+      scope: container,
+      onOpenChange: () => syncOverflow(),
+      onPick: (value) => onChange(value),
+      // ── × 删除：自定义项同时从 localStorage 摘掉；内置项记进 hidden 表 ──
+      onDelete: (opt) => {
         const value = opt.getAttribute("data-value") || "";
         const tag = opt.getAttribute("data-tag") || "builtin";
         const isProvider = dd.id === "settings-provider";
@@ -3007,55 +3058,16 @@ export async function attachSettingsListeners(container: HTMLElement) {
           }
         }
         opt.remove();
-        return;
-      }
-      const opt = target.closest(".custom-select-option") as HTMLElement | null;
-      if (!opt) return;
-      e.preventDefault(); e.stopPropagation();
-      const value = opt.getAttribute("data-value") || "";
-      if (value === "__custom__") {
-        // WebView2 does NOT support window.prompt() — use an inline input
-        promptCustomModelInput(dd, label, (val) => {
-          commitCustomOption(dd, val, label);
+      },
+      // ── __custom__ 入口：WebView2 不支持 window.prompt() ⇒ 下拉内联输入行 ──
+      onCustomEntry: (labelEl) => {
+        promptCustomModelInput(dd, labelEl, (val) => {
+          commitCustomOption(dd, val, labelEl);
           onChange(val);
-        }, "", setOverflowVisible);
-        return;
-      }
-      // Update visual selection
-      dropdown.querySelectorAll(".custom-select-option").forEach(o => o.classList.remove("selected"));
-      opt.classList.add("selected");
-      label.textContent = opt.textContent?.replace(/\s*×$/, "").trim() || "";
-      dd.classList.remove("open");
-      setOverflowVisible(false);
-      onChange(value);
+        }, "", (v) => setDropdownOverflow(container, v));
+      },
     });
-
-    // 长列表（如模型多、含自定义项时）强制内部滚动：
-    // 项超出可视区后滚轮在 WebView2 下可能被外层 #results-list 吞掉，
-    // 这里手动滚自己，保证永远能滚到列表底部的自定义项/新增项。
-    dropdown.addEventListener("wheel", (e: WheelEvent) => {
-      const canUp = dropdown.scrollTop > 0;
-      const canDown = dropdown.scrollTop + dropdown.clientHeight < dropdown.scrollHeight - 1;
-      if ((e.deltaY < 0 && canUp) || (e.deltaY > 0 && canDown)) {
-        e.preventDefault();
-        dropdown.scrollTop += e.deltaY;
-      }
-    }, { passive: false });
   }
-
-  // Close dropdowns on outside click
-  document.addEventListener("click", (e: Event) => {
-    const target = e.target as HTMLElement;
-    let anyOpen = false;
-    container.querySelectorAll(".custom-select.open").forEach(dd => {
-      if (dd.contains(target)) {
-        anyOpen = true;
-      } else {
-        dd.classList.remove("open");
-      }
-    });
-    if (!anyOpen) setDropdownOverflow(container, false);
-  });
 
   // Provider dropdown
   if (providerDD) {
@@ -3117,6 +3129,147 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       saveAiBtn.disabled = false;
       saveAiBtn.textContent = t("settings.save");
+    });
+  }
+
+  // ── 测试连通（2026-10-09）：用**表单当前值**打一次最小请求，不必先保存 ──
+  // 取值口径与 `saveAIConfig()` 完全一致（下拉的 `.selected` + 两个输入框），
+  // 这样「测的就是你眼前这套」，不会出现「测通了但保存的是另一套」。
+  const testAiBtn = container.querySelector("#settings-test-ai-btn") as HTMLButtonElement | null;
+  if (testAiBtn) {
+    testAiBtn.addEventListener("click", async () => {
+      const provider = container.querySelector("#settings-provider .custom-select-option.selected")?.getAttribute("data-value") || "openai";
+      const model = container.querySelector("#settings-model .custom-select-option.selected")?.getAttribute("data-value") || "";
+      const baseUrl = (container.querySelector("#settings-baseurl") as HTMLInputElement)?.value || "";
+      const apiKey = (container.querySelector("#settings-apikey") as HTMLInputElement)?.value || "";
+      testAiBtn.disabled = true;
+      const oldLabel = testAiBtn.textContent;
+      testAiBtn.textContent = t("settings.testing");
+      if (saveMsg) {
+        saveMsg.style.color = "";
+        saveMsg.textContent = t("settings.testing");
+        saveMsg.classList.add("show");
+      }
+      try {
+        await invoke("test_ai_connection", { provider, baseUrl, model, apiKey });
+        if (saveMsg) {
+          saveMsg.textContent = t("settings.test_ok");
+          saveMsg.style.color = "var(--green)";
+        }
+      } catch (e) {
+        // 宿主给的就是「哪一步没成 + 用户能做什么」（原始 body 只进日志），原样显示
+        if (saveMsg) {
+          saveMsg.textContent = String(e instanceof Error ? e.message : e);
+          saveMsg.style.color = "var(--red)";
+        }
+      } finally {
+        testAiBtn.disabled = false;
+        testAiBtn.textContent = oldLabel;
+      }
+    });
+  }
+
+  // ── 一键添加配置（粘贴 curl，2026-10-09）────────────────────────
+  // 用户粘一段 curl → 解析出 base_url / key / model → 写成一个**自定义供应商栏位**并
+  // 落盘。复用既有的「自定义供应商」持久化（lunac-custom-providers）与 set_ai_config
+  // 保存路径，所以重开设置窗仍在。改完只**原地更新**下拉 / 输入框（不整块重绘）：
+  // 这样本次解析的提示（缺 key / 未采用路径）还看得见。
+  const curlBox = container.querySelector("#settings-curl-box") as HTMLElement | null;
+  const curlInput = container.querySelector("#settings-curl-input") as HTMLTextAreaElement | null;
+  const curlName = container.querySelector("#settings-curl-name") as HTMLInputElement | null;
+  const curlMsg = container.querySelector("#settings-curl-msg") as HTMLElement | null;
+  const curlBtn = container.querySelector("#settings-add-curl-btn") as HTMLButtonElement | null;
+
+  /** 落盘：与 `saveAIConfig()` 同一条路径（agent_url / search 原样透传，vision 恒 true，
+   *  出图字段由供应商预设推导 —— 自定义供应商不在预设表里 ⇒ 空 = 不出图）。 */
+  async function saveCurlConfig(name: string, p: CurlParsed) {
+    let agentUrl = "";
+    let searchProvider = "";
+    let searchKey = "";
+    try {
+      const cur = await invoke<{ agent_url?: string; search_provider?: string; search_key?: string }>("get_ai_config");
+      agentUrl = cur.agent_url || "";
+      searchProvider = cur.search_provider || "";
+      searchKey = cur.search_key || "";
+    } catch {}
+    const preset = PROVIDER_PRESETS[name];
+    await invoke("set_ai_config", {
+      provider: name,
+      url: p.baseUrl,
+      key: p.apiKey,
+      model: p.model,
+      agent_url: agentUrl,
+      search_provider: searchProvider,
+      search_key: searchKey,
+      vision: true,
+      image_model: preset?.image_model || "",
+      image_url: preset?.image_url || "",
+    });
+    // 兜底记一次「自定义供应商」列表（commitCustomOption 通常会写；这里防它没跑到）。
+    try {
+      const arr: string[] = JSON.parse(localStorage.getItem("lunac-custom-providers") || "[]");
+      if (!arr.includes(name)) { arr.push(name); localStorage.setItem("lunac-custom-providers", JSON.stringify(arr)); }
+    } catch {}
+  }
+
+  if (curlBox && curlInput && curlName && curlBtn) {
+    const showCurl = (on: boolean) => {
+      curlBox.classList.toggle("hidden", !on);
+      if (on) {
+        curlInput.focus();
+      } else {
+        curlInput.value = "";
+        curlName.value = "";
+        if (curlMsg) { curlMsg.textContent = ""; curlMsg.style.color = ""; }
+      }
+    };
+    // 粘贴后按主机名自动补供应商名（用户已手填就不覆盖）。用 input 而非 paste 事件：
+    // WebView2 下 paste 事件里读 value 拿不到刚粘进去的内容。
+    curlInput.addEventListener("input", () => {
+      if (curlName.value.trim()) return;
+      try { curlName.value = parseCurlConfig(curlInput.value).provider; } catch { /* 还没粘全 */ }
+    });
+    curlBtn.addEventListener("click", () => {
+      const willShow = curlBox.classList.contains("hidden");
+      if (curlMsg) { curlMsg.textContent = ""; curlMsg.style.color = ""; }
+      showCurl(willShow);
+    });
+    container.querySelector("#settings-curl-cancel")?.addEventListener("click", () => showCurl(false));
+    container.querySelector("#settings-curl-add")?.addEventListener("click", async () => {
+      let parsed: CurlParsed;
+      try {
+        parsed = parseCurlConfig(curlInput.value);
+      } catch {
+        if (curlMsg) { curlMsg.textContent = t("settings.curl_err_url"); curlMsg.style.color = "var(--red)"; }
+        return;
+      }
+      const name = curlName.value.trim() || parsed.provider || "";
+      if (!name) {
+        if (curlMsg) { curlMsg.textContent = t("settings.curl_err_name"); curlMsg.style.color = "var(--red)"; }
+        return;
+      }
+      if (!parsed.model) {
+        if (curlMsg) { curlMsg.textContent = t("settings.curl_need_model"); curlMsg.style.color = "var(--yellow)"; }
+        return;
+      }
+      // 原地写进表单与下拉（复用既有能力，不另起一套）
+      const providerLabel = providerDD?.querySelector(".custom-select-label") as HTMLElement | null;
+      if (providerDD && providerLabel) commitCustomOption(providerDD, name, providerLabel);
+      if (baseUrlInput) baseUrlInput.value = parsed.baseUrl;
+      if (apiKeyInput) apiKeyInput.value = parsed.apiKey;
+      reloadModelSelector(name, parsed.model);
+      try {
+        await saveCurlConfig(name, parsed);
+      } catch (e) {
+        if (curlMsg) { curlMsg.textContent = String(e instanceof Error ? e.message : e); curlMsg.style.color = "var(--red)"; }
+        return;
+      }
+      // 成功提示 + 「如实告知」的短提示（解析不到的东西绝不静默吞掉）
+      const notes: string[] = [t("settings.curl_ok", { name })];
+      if (!parsed.hasKey) notes.push(t("settings.curl_noauth"));
+      else if (parsed.envKey) notes.push(t("settings.curl_envkey", { env: parsed.envKey }));
+      if (parsed.path && parsed.path !== "/") notes.push(t("settings.curl_path", { path: parsed.path }));
+      if (curlMsg) { curlMsg.textContent = notes.join("  ·  "); curlMsg.style.color = "var(--green)"; }
     });
   }
 

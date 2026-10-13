@@ -245,22 +245,42 @@ export function hasDiskPlugin(id: string): boolean {
  *  成功返回 true —— 调用方（`attach.ts`）据此判定「这个插件自己会挂载，不用宿主那份硬编码表」。
  *  没导出钩子 / 模块加载失败都返回 false（与「内置表未命中」同义：没有监听要挂）。
  *  失败**只记控制台**：插件坏了不该让结果区整个渲染不出来。 */
+/** 挂载链路失败**必须上报宿主日志**（2026-10-09）：`console.warn` 在 release 里没人看得到，
+ *  而「插件面板在、按钮全没反应」最常见的原因就是这里返回了 `false`（模块加载失败 / `attach`
+ *  抛错 / 认不出钩子）。上报到 `log_frontend` ⇒ `lunac-*.log` 里能直接读到插件 id 与原因，
+ *  不必再靠猜。 */
+function reportAttachFailure(id: string, stage: string, e?: unknown): void {
+  const detail = e === undefined ? "" : `：${e instanceof Error ? e.message : String(e)}`;
+  void invoke("log_frontend", {
+    level: "error",
+    message: `[lunac] 插件 ${id} ${stage}，面板监听未挂上${detail}`,
+  }).catch(() => {});
+}
+
 export async function externalAttach(id: string, root: HTMLElement): Promise<boolean> {
   const info = infoOf(id);
-  if (!info) return false;
+  if (!info) {
+    reportAttachFailure(id, "不在最近一次插件扫描结果里");
+    return false;
+  }
   let mod: unknown;
   try {
     mod = await loadModule(info);
   } catch (e) {
     console.warn("[lunac] 插件模块加载失败，跳过挂载：", id, e);
+    reportAttachFailure(id, "模块加载失败", e);
     return false;
   }
   const hook = pickAttach(mod);
-  if (!hook) return false;
+  if (!hook) {
+    reportAttachFailure(id, "模块里没有可用的 attach 钩子");
+    return false;
+  }
   try {
     await hook.attach(root);
   } catch (e) {
     console.warn("[lunac] 插件 attach 失败：", id, e);
+    reportAttachFailure(id, "attach 抛错", e);
     return false;
   }
   hooks.set(id, hook.detach ? { detach: hook.detach } : {});

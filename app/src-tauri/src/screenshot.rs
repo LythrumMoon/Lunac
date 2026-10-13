@@ -270,13 +270,164 @@ pub fn virtual_rect() -> Result<(i32, i32, u32, u32), String> {
     }
 }
 
+/// 抓屏幕上一块矩形（物理像素）→ RGBA。
+pub fn capture_rgba_rect(x: i32, y: i32, w: u32, h: u32) -> Result<image::RgbaImage, String> {
+    #[cfg(target_os = "windows")]
+    {
+        imp::capture_rgba_rect(x, y, w, h)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (x, y, w, h);
+        Err("截屏目前只在 Windows 上实现".into())
+    }
+}
+
+/// 目标显示器的矩形（物理像素）。`label = Some(窗口 label)` 且该窗口存在时取
+/// **那扇窗所在的显示器**（桌宠 `plugin-pet` 用的就是这个），否则回退到主显示器。
+///
+/// 为什么用 `MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)` 而不是自己枚举
+/// 显示器：系统会按窗口/坐标**就近**判定归属，多显示器、DPI 缩放、窗口跨屏这些
+/// 情况都不必自己处理（本仓也没有任何显示器枚举代码）。句柄为 `None` 时传
+/// `HWND::default()`（NULL），`MONITOR_DEFAULTTONEAREST` 对 NULL 给的就是主显示器。
+fn monitor_rect(
+    app: &tauri::AppHandle,
+    label: Option<&str>,
+) -> Result<(i32, i32, u32, u32), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use tauri::Manager;
+        // 窗口存在 → 取其 HWND 并换成**本 crate `windows` 版本**的 HWND：
+        // Tauri 依赖的是另一版 `windows`（0.61），两者的 HWND 只是同一个
+        // `*mut c_void` 的 newtype，`h.0` 直接搬过来即可（同 `hotkey.rs` 的写法）。
+        let hwnd = label
+            .and_then(|l| app.get_webview_window(l))
+            .and_then(|w| w.hwnd().ok())
+            .map(|h| windows::Win32::Foundation::HWND(h.0));
+        imp::monitor_rect(hwnd)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, label);
+        Err("截屏目前只在 Windows 上实现".into())
+    }
+}
+
+/// 编码成 PNG 写进**临时目录**，返回文件绝对路径。
+///
+/// **为什么返回路径而不是 data URL**：4K 整屏的 PNG data URL 有十几 MB，
+/// 过 IPC 既慢又占内存（ai-spec §4.5「几 MB 的图不过 IPC」）。调用方（桌宠插件）
+/// 直接读这个本地文件即可。
+fn write_png_temp(img: &image::RgbaImage) -> Result<String, String> {
+    use image::ImageEncoder as _;
+    let mut png: Vec<u8> = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("PNG 编码失败：{e}"))?;
+    let path = crate::commands::temp_image_path("shot", "png");
+    std::fs::write(&path, &png).map_err(|e| format!("写临时文件失败：{e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 抓「当前显示器」整屏存成临时 PNG 的返回：**文件路径** + 像素尺寸（桌宠插件用）。
+#[derive(serde::Serialize)]
+pub struct ShotFile {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 抓「当前显示器」整屏 → 存临时 PNG → 返回文件路径。
+///
+/// 目标显示器：`label` 给了且窗口存在 → 该窗口所在的显示器；否则主显示器。
+///
+/// **⚠️ 隐私（硬约束，预检 #72 ①，2026-10-10 修订）**：抓屏**只在用户显式触发**时发生 ——
+/// 用户手势（桌宠右键「看一眼屏幕」）或用户**主动开启**的「主动反应」子选项（自动抓屏 /
+/// 屏幕变化触发）。后者是显式 opt-in + 默认关 + 有间隔与每日上限 + 桌宠不可见即停，
+/// 且界面上有可见提示。**除这两条外**，任何后台 / 周期性抓屏都不许接进来。
+#[tauri::command]
+pub async fn screenshot_monitor(
+    app: tauri::AppHandle,
+    label: Option<String>,
+) -> Result<ShotFile, String> {
+    // 抓帧 + PNG 编码是纯 CPU/IO 重活（4K 整屏），必须离开主线程（预检 #72 ③）
+    crate::commands::run_blocking(move || {
+        let (x, y, w, h) = monitor_rect(&app, label.as_deref())?;
+        let img = capture_rgba_rect(x, y, w, h)?;
+        let path = write_png_temp(&img)?;
+        Ok(ShotFile {
+            path,
+            width: img.width(),
+            height: img.height(),
+        })
+    })
+    .await
+}
+
+/// 降采样后的指纹尺寸（`SIG_COLS × SIG_ROWS` 灰度字节）。
+const SIG_COLS: u32 = 16;
+const SIG_ROWS: u32 = 9;
+
+/// 抓「当前显示器」整屏 → **降采样成 16×9 灰度**（144 字节）返回，**不落盘**。
+///
+/// 「屏幕变化触发」（2026-10-10，主动反应的一个**显式 opt-in** 子开关）要周期性地比对
+/// 画面，不能每次都往临时目录落一个几 MB 的 PNG。这里只回一个极小的指纹：宿主做完
+/// BitBlt + 降采样，前端拿前后两组指纹算「平均绝对差」，超过阈值就当画面变了。
+///
+/// **隐私**：与 `screenshot_monitor` 同一条口径（见那里的注释）—— 只由用户显式开启的
+/// 主动反应子选项触发，默认关、有频次上限、桌宠不可见时一律不抓。
+#[tauri::command]
+pub async fn screenshot_signature(
+    app: tauri::AppHandle,
+    label: Option<String>,
+) -> Result<Vec<u8>, String> {
+    crate::commands::run_blocking(move || {
+        let (x, y, w, h) = monitor_rect(&app, label.as_deref())?;
+        let img = capture_rgba_rect(x, y, w, h)?;
+        Ok(downsample_gray(&img, SIG_COLS, SIG_ROWS))
+    })
+    .await
+}
+
+/// 把 RGBA 图降采样成 `cols×rows` 灰度（每格取平均亮度，Rec.601 权重）。
+/// 只用于「画面变没变」的粗判，不需要精度。
+fn downsample_gray(img: &image::RgbaImage, cols: u32, rows: u32) -> Vec<u8> {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let mut out = vec![0u8; (cols * rows) as usize];
+    for gy in 0..rows {
+        for gx in 0..cols {
+            let x0 = (gx * w) / cols;
+            let x1 = (((gx + 1) * w) / cols).max(x0 + 1).min(w);
+            let y0 = (gy * h) / rows;
+            let y1 = (((gy + 1) * h) / rows).max(y0 + 1).min(h);
+            let (mut sum, mut n) = (0u64, 0u64);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = img.get_pixel(x, y).0;
+                    sum += (299 * p[0] as u64 + 587 * p[1] as u64 + 114 * p[2] as u64) / 1000;
+                    n += 1;
+                }
+            }
+            out[(gy * cols + gx) as usize] = if n > 0 { (sum / n) as u8 } else { 0 };
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW, DeleteDC, DeleteObject,
-        GetDIBits, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
-        HGDIOBJ, ROP_CODE, SRCCOPY,
+        GetDIBits, GetMonitorInfoW, MonitorFromWindow, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        ROP_CODE, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -297,7 +448,17 @@ mod imp {
 
     pub fn capture_rgba() -> Result<image::RgbaImage, String> {
         let (x, y, w, h) = virtual_rect()?;
+        capture_rgba_rect(x, y, w, h)
+    }
+
+    /// 抓屏幕上一块矩形（物理像素）→ RGBA。`x` / `y` 是**屏幕坐标**左上角，
+    /// `w` / `h` 是截取范围。整屏抓帧只是「矩形 = 整块虚拟桌面」的特例，
+    /// 共用同一套 BitBlt 内核 —— 参数化后按显示器抓帧不必再写第二份。
+    pub fn capture_rgba_rect(x: i32, y: i32, w: u32, h: u32) -> Result<image::RgbaImage, String> {
         let (wi, hi) = (w as i32, h as i32);
+        if wi <= 0 || hi <= 0 {
+            return Err("抓帧区域尺寸非法".into());
+        }
 
         unsafe {
             let screen_dc = CreateDCW(w!("DISPLAY"), PCWSTR::null(), PCWSTR::null(), None);
@@ -332,6 +493,31 @@ mod imp {
             let _ = DeleteDC(mem_dc);
             let _ = DeleteDC(screen_dc);
             out
+        }
+    }
+
+    /// 目标显示器的矩形（物理像素）。`hwnd = Some(窗口)` 取该窗口所在的那台，
+    /// `None`（或句柄无效）取主显示器 —— 两者都靠 `MONITOR_DEFAULTTONEAREST`
+    /// 由系统就近判定，不自己枚举显示器。
+    pub fn monitor_rect(hwnd: Option<HWND>) -> Result<(i32, i32, u32, u32), String> {
+        unsafe {
+            let monitor = MonitorFromWindow(hwnd.unwrap_or_default(), MONITOR_DEFAULTTONEAREST);
+            if monitor.is_invalid() {
+                return Err("MonitorFromWindow 失败".into());
+            }
+            let mut mi = MONITORINFO::default();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                return Err("GetMonitorInfoW 失败".into());
+            }
+            // rcMonitor 是物理像素的屏幕坐标；转成 (left, top, width, height)
+            let r = mi.rcMonitor;
+            Ok((
+                r.left,
+                r.top,
+                (r.right - r.left) as u32,
+                (r.bottom - r.top) as u32,
+            ))
         }
     }
 

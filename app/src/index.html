@@ -413,6 +413,16 @@
                   <span id="chat-persona-msg" class="chat-persona-msg"></span>
                 </div>
               </div>
+              <!-- 阶段状态栏（L4 调试，默认关）：开启后窗口右上角浮出一条「agent 当前阶段」。
+                   与上面几行同构（label + 两档分段）；浮标颜色走四类自定义变量，
+                   定位 fixed + pointer-events:none（不占布局、不挡输入框）。见 main.ts setDebugPhase。 -->
+              <div class="chat-more-row">
+                <span class="chat-more-label" id="chat-debugphase-label"></span>
+                <div class="chat-more-seg" id="chat-debugphase-seg">
+                  <button type="button" data-mode="on"></button>
+                  <button type="button" data-mode="off"></button>
+                </div>
+              </div>
             </div>
           </div>
           <button id="chat-history-btn" title="Chat History" aria-label="History">
@@ -448,6 +458,9 @@
             </svg>
           </button>
         </div>
+        <!-- 斜杠命令候选菜单（输入 `/` 时随输入过滤；形态复用「更多」菜单 / .custom-select
+             的浮层语言，定位贴输入行上方、不占布局。见 main.ts 的 updateSlashMenu。 -->
+        <div id="chat-slash-menu" class="hidden"></div>
       </div>
     </div>
     <!-- Status bar (always visible, bottom rounded) -->

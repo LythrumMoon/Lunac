@@ -5,6 +5,8 @@
 #![allow(rust_2024_compatibility)]
 
 mod hotkey;
+// 全局低级鼠标钩子（WH_MOUSE_LL）：桌宠鼠标穿透态下 Alt+右键 唤出菜单（按需懒启停）。
+mod mouse_hook;
 mod commands;
 mod child_job;
 mod app_indexer;
@@ -39,21 +41,39 @@ mod translate;
 mod plugin_window;
 mod plugin_sidecar;
 mod screenshot;
+// 桌宠回复的本机离线**语音朗读**（2026-10-10，`tts.rs`）：WinRT 语音合成 + rodio 出声。
+// 与 `windows_ocr.rs` 同源（都是 WinRT），但失败一律静默跳过，不 panic。
+mod tts;
+mod tts_zipvoice;
 mod cli_bridge;
 mod agent_server;
 mod log;
+// Win32 裸 FFI 小工具（进程表枚举 / 后台线程降级）。**必须只有一处声明** —— 同一个
+// Win32 符号在本 crate 里出现两种签名会触发 `clashing_extern_declarations`。
+mod win_proc;
 mod single_instance;
 mod updater;
 mod snapshots;
 
 use commands::{
     start_cli, stop_cli, send_message, get_status,
+    // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
+    get_memory, clear_memory,
     set_security_profile, list_start_menu_apps,
     set_query_state, set_recording_state, set_ui_mode, set_chips_empty,
-    set_ai_mode, set_thinking_mode, set_detached, get_ai_config, set_ai_config,
+    set_ai_mode, set_thinking_mode, set_detached, get_ai_config, set_ai_config, test_ai_connection,
     get_hooks_config, set_hooks_enabled, hooks_file_path,
     get_pricing_state, pricing_file_path, commit_pricing_pending, discard_pricing_pending,
     get_persona, set_persona,
+    get_pet_persona, set_pet_persona,
+    read_pet_hotkeys, write_pet_hotkeys,
+    read_pet_chains, write_pet_chains,
+    read_pet_params, write_pet_params,
+    write_motion_file, delete_motion_file, rename_motion_file,
+    list_exp3_files, list_motion_files, scan_model_folder,
+    // 脚本（Cmd / PowerShell）生成 / 改写文件的**事后登记**探测：按 mtime 扫 agent 工作目录
+    // （见 commands.rs 的 scan_agent_writes）。前端登记成 `unknown` 帧，只列、不回退。
+    scan_agent_writes,
     get_mcp_config, open_mcp_config,
     set_workspace, get_workspace, set_tool_blacklist,
     search_apps, launch_app, add_custom_app, remove_custom_app, list_custom_apps,
@@ -66,12 +86,15 @@ use commands::{
     set_hotkey_combo, get_hotkey_combo,
     set_auto_start, get_auto_start_info,
     check_file_exists,
+    // 桌宠表情按钮：列出模型文件同层目录里实际存在的 *.exp3.json（见 commands.rs）
+    list_expression_files,
     list_tool_files, read_tool_file, save_tool_file, delete_tool_file,
     download_tool_from_url,
     list_installed_skills, read_skill_file, save_skill_file, delete_skill,
     import_skill_content, install_skill_from_url,
     open_path,
     list_installed_plugins, install_plugin_from_url, uninstall_plugin, plugins_dir_path,
+    local_model_config_get, local_model_config_set,
     install_plugin_dependencies,
     fetch_plugin_index,
     run_ocr,
@@ -396,6 +419,12 @@ fn main() {
             // 永不扫盘（见 docs/ai-spec.md §2.1.2 与 file_indexer.rs 头注释）。
             crate::file_indexer::init();
 
+            // 2026-10-09：删掉了「后台活动自检」（原 `activity.rs`，每秒采一次整族 CPU/IO）。
+            // 它 2026-10-08 为排查「玩游戏时周期性卡顿」而生，10-08/10-09 的 `activity:` 日志
+            // 已把病根点名清楚（top_cpu 一直是游戏本体 launcher/yysls、代理 hongmo、IDE Trae，
+            // Lunac 自身从未上榜）⇒ 结论「与 Lunac 无关」，诊断工具随之撤下，省掉每秒一次的
+            // 全系统进程枚举。若日后又要查同类问题，从 Git 历史取回 `activity.rs` 即可。
+
             // 2026-10-05：删掉了「每 3s 轮询进程 + Spotify 一启动就自动弹音乐插件窗」
             // 那套检测机制（用户口径：只保留抓取正在播放 + 控制即可，不要后台常驻探测）。
             // `music_autoconfigure` 仍会在用户主动打开面板时做一次性「桌面端是否在跑」判定。
@@ -442,6 +471,9 @@ fn main() {
                         return;
                     }
                     if is_plugin_window {
+                        // 桌宠窗被销毁 ⇒ 它不可能再处于穿透态，全局鼠标钩子必须卸掉
+                        // （非桌宠窗是空操作）；否则会留下一个指向已关闭窗口的钩子。
+                        mouse_hook::on_plugin_window_destroyed(window.label());
                         plugin_window::note_destroyed(window.label());
                         // **音乐插件窗关了 ⇒ 本机播放（librespot）一起收掉**（2026-09-30，
                         // 用户定）。界面没了却还有一个进程在出声 / 占着「Lunac」那台设备，
@@ -455,6 +487,9 @@ fn main() {
                         return;
                     }
                     log::info("window destroyed → app exit");
+                    // **全局鼠标钩子必须跟着卸载**：钩子回调是本进程内的静态函数，
+                    // 进程退出时若仍挂着，系统回调会打到已失效的代码页（见 mouse_hook.rs 头）。
+                    mouse_hook::stop();
                     // **系统代理必须在退出前还原**（2026-10-01，代理插件）：我们改的是
                     // 整台机器的代理设置，程序走了却把它留在「指向一个已经关掉的本地端口」
                     // 的状态，等于用户关掉 Lunac 之后整个浏览器都上不了网 —— 那比没有这个
@@ -505,6 +540,9 @@ fn main() {
             start_cli,
             stop_cli,
             send_message,
+            // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
+            get_memory,
+            clear_memory,
             get_status,
             set_security_profile,
             list_start_menu_apps,
@@ -517,6 +555,7 @@ fn main() {
             set_detached,
             get_ai_config,
             set_ai_config,
+            test_ai_connection,
             get_hooks_config,
             set_hooks_enabled,
             hooks_file_path,
@@ -526,6 +565,20 @@ fn main() {
             discard_pricing_pending,
             get_persona,
             set_persona,
+            get_pet_persona,
+            set_pet_persona,
+            read_pet_hotkeys,
+            write_pet_hotkeys,
+            read_pet_chains,
+            write_pet_chains,
+            read_pet_params,
+            write_pet_params,
+            write_motion_file,
+            delete_motion_file,
+            rename_motion_file,
+            list_exp3_files,
+            list_motion_files,
+            scan_model_folder,
             get_mcp_config,
             open_mcp_config,
             set_workspace,
@@ -572,6 +625,7 @@ fn main() {
             snapshots::snapshot_restore_text,
             snapshots::snapshots_save,
             snapshots::snapshots_load,
+            scan_agent_writes,
             storage::save_chat_sessions,
             storage::load_chat_sessions,
             storage::save_clipboard_history,
@@ -589,6 +643,9 @@ fn main() {
             set_auto_start,
             get_auto_start_info,
             check_file_exists,
+            // 桌宠表情按钮（2026-10-09）：以模型文件**同层目录**里实际存在的 *.exp3.json
+            // 为准，而非只看 model3.json 声明过的项（见 commands.rs 的 list_expression_files）。
+            list_expression_files,
             list_tool_files,
             read_tool_file,
             save_tool_file,
@@ -606,6 +663,9 @@ fn main() {
             install_plugin_dependencies,
             uninstall_plugin,
             plugins_dir_path,
+            // 本地模型决策开关（2026-10-09）：与插件列表同段，读 / 写该开关。
+            local_model_config_get,
+            local_model_config_set,
             fetch_plugin_index,
             run_ocr,
             save_temp_image,
@@ -672,6 +732,9 @@ fn main() {
         media_lib::media_roots,
         media_lib::media_add_root,
         media_lib::media_remove_root,
+        // 删**单个文件**（2026-10-11）：从库里删一条曲目 = 删磁盘文件 + 库中那行 + 它的封面缓存。
+        // 安全边界：只认库里已有的路径、只删文件不删目录、目标不存在仍清索引（见 media_lib.rs）。
+        media_lib::media_delete_file,
         media_lib::media_scan_start,
         media_lib::media_scan_status,
         media_lib::media_tracks,
@@ -721,6 +784,7 @@ fn main() {
             translate::translate_ai,
             // 插件悬浮窗（多窗口基础设施）—— 见 src/plugin_window.rs
             plugin_window::open_plugin_window,
+            plugin_window::open_plugin_ids,
             plugin_window::plugin_window_init,
             plugin_window::plugin_window_close,
             plugin_window::close_plugin_window,
@@ -730,6 +794,8 @@ fn main() {
             plugin_window::plugin_window_set_resizable,
             plugin_window::plugin_window_pin_state,
             plugin_window::plugin_window_resize,
+            // 桌宠鼠标穿透态下 Alt+右键 唤出（全局 WH_MOUSE_LL，懒启停）—— 见 src/mouse_hook.rs
+            mouse_hook::pet_alt_rclick_watch,
             // 插件 sidecar（L12 档 1，2026-10-06）—— 见 src/plugin_sidecar.rs
             plugin_sidecar::plugin_sidecar_start,
             plugin_sidecar::plugin_sidecar_request,
@@ -744,6 +810,16 @@ fn main() {
             screenshot::screenshot_overlay_image,
             screenshot::screenshot_overlay_finish,
             screenshot::screenshot_overlay_cancel,
+            // 抓「当前显示器」整屏存临时 PNG、返回路径（桌宠插件用；只由用户手势触发）
+            screenshot::screenshot_monitor,
+            screenshot::screenshot_signature,
+            // 桌宠回复的本机离线语音朗读（2026-10-10）—— 合成 + 出声整段在宿主，
+            // 命令只做 enabled 判断 + 起后台线程，立即返回（见 src/tts.rs）。
+            tts::tts_speak,
+            tts_zipvoice::get_pet_voice,
+            tts_zipvoice::set_pet_voice,
+            // 参考音色导入（2026-10-12）：选中的音频 → 校验 + 规整成 PCM16 WAV 缓存 → 返回缓存路径。
+            tts_zipvoice::import_pet_voice_audio,
             hide_lunac,
             appearance::get_system_theme,
             appearance::list_themes,
