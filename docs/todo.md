@@ -89,6 +89,14 @@
 - **待裁定 / 需知晓**：① **LICENSE 冲突**：仓库根 `LICENSE` 为 **MIT**，但随插件分发 **CC-BY-NC** 权重（ZipVoice）与 **GPL-3.0** 数据（espeak-ng-data）—— 二者**不被 MIT 覆盖**；本轮**未擅改 LICENSE**，建议在 `LICENSE` / README 显式声明「随分发的第三方组件各自适用其自身许可，MIT 仅覆盖本项目原创代码」。② **Vocos 授权**：按上游模型卡 MIT 处理，但模型卡原话针对「代码」，严格商用建议复核（已标注）。③ **`espeak-ng-data` 体积 17,991,651 B（约 17 MB）**：本轮**保留全语言**；若需裁剪须另行评估「修改版」义务。④ 本轮**未 +1** `pet` 的 `version`（`build-plugins.ps1:168`，仍 0.9.53）：加依赖属插件变更，若要市场判为「有更新」需用户拍板是否 +1 并 `publish-plugins.ps1`。
 - **涉及文件**：`scripts/build-plugins.ps1`、`README.md`、`licenses\zipvoice\`（新增 7 个纯文本）；产物（gitignore、不入库）：`release\deps\zipvoice\_stage\zipvoice\`、`release\deps\zipvoice\zipvoice-1.13.8.7z`。
 
+#### §待办 1-4 补 中文 TTS 授权口径再标一笔：ZipVoice 权重 = CC-BY-NC-4.0 ⇒ **仅限非商用**（2026-10-13）
+
+- **当前中文 TTS 通路（已定）**：**继续用 ZipVoice，不换引擎**（supertonic 已下架；`audio.cpp` / CosyVoice 仅作将来备选）。**授权口径**：**ZipVoice 预训练权重** —— 即上游包 `zipvoice-distill-int8-zh-en-emilia`、对应随 `licenses\zipvoice\` 分发的 `model\encoder.int8.onnx` / `model\decoder.int8.onnx` 等 —— = **CC-BY-NC-4.0（署名—非商业性使用）⇒ 仅限非商用**；**`vocos_24khz.onnx`（声码器）= MIT（可商用）**；同目录 **DLL / 运行时各按自身许可**（`sherpa-onnx-c-api.dll` = Apache-2.0、`onnxruntime.dll` = MIT、`espeak-ng-data` = GPL-3.0）。逐组件见 `licenses\zipvoice\THIRD_PARTY_NOTICES.md`（仓库已如实声明，本条只是**再标一笔**防忘）。
+- **⚠️ 商用前必须换引擎**：ZipVoice 权重**不得用于任何商业目的**（售卖 / SaaS / 商业产品内嵌均属）；本项目当前口径 = **个人项目、明确非商用、仅在 GitHub 公开分发**（据此再分发该权重）。**Lunac 的 MIT 许可不覆盖该权重**。一旦涉及商用 ⇒ **必须先换掉中文 TTS 引擎 / 权重**（不能沿用当前 ZipVoice 权重）。
+- **已评估的商用友好备选（将来要捡起来时从这条入手）**：**`audio.cpp`**（授权 = **Apache-2.0**，可商用）—— 含 **Qwen3-TTS Base / VoxCPM2**，支持**中文 + 参考音频克隆**，**RTF 0.39 @ RTX 5090**、**空载实测 ~10 MB**（轻量）。接入点 = **替换 / 扩充 `app/src-tauri/src/tts_zipvoice.rs` 那一处**（**不建多引擎注册表**）。另：CosyVoice 属同方向备选，仅作将来考虑。
+- **依据来源（与日期）**：HF 模型卡 `k2-fsa/ZipVoice` 的 License 节原话「Our code is released under the Apache 2.0 License. The pre-trained model is licensed under the CC-BY-NC due to constraints from its training data (Emilia).」—— 即**权重 NC 的成因 = 训练数据 Emilia 的 CC-BY-NC 口径**；`licenses\zipvoice\THIRD_PARTY_NOTICES.md` §二 已逐字记录。本条日期 **2026-10-13**。
+- **用途**：**避免以后忘记** —— 将来若要做商用或改变分发口径，**先回到本条**，核对「当前中文 TTS 权重是否已换成可商用引擎」。
+
 #### §待办 1-4 补 桌宠 TTS 并存切换：Supertonic 通路 —— **已下架（2026-10-13，用户裁决）**
 
 - **裁决 / 来源**：**用户 2026-10-13 亲耳确认**后裁决 —— **干净下架**上一阶段「阶段 1」的 Supertonic 通路**全部改动**（资产依赖 / 后端 `engine` 分支 / 前端引擎与音色控件 / i18n key / `licenses\supertonic\`）。
