@@ -1527,12 +1527,13 @@ function settingsHtml(cfg: PetConfig): string {
   <div class="pet-file" id="pet-file"></div>
   <div class="pet-note">该插件只提供 Live2D 模型入口。</div>
   <div class="pet-note">${t("pet.hint_interactions")}</div>
-  ${proactiveBlock(cfg)}
-  ${ttsBlock(cfg)}
   <div class="pet-tabs" id="pet-tabs">
     <button type="button" class="pet-tab on" data-pet-tab="debug">${esc(t("pet.debug_title"))}</button>
     <button type="button" class="pet-tab" data-pet-tab="hotkey">${esc(t("pet.hotkey_title"))}</button>
     <button type="button" class="pet-tab" data-pet-tab="motion">${esc(t("pet.motions_title"))}</button>
+    <button type="button" class="pet-tab" data-pet-tab="proactive">${esc(t("pet.proactive_title"))}</button>
+    <button type="button" class="pet-tab" data-pet-tab="voice">${esc(t("pet.tts_title"))}</button>
+    <button type="button" class="pet-tab" data-pet-tab="persona">${esc(t("pet.persona_title"))}</button>
   </div>
   <div class="pet-tabpage" data-pet-page="debug">
     <div class="pet-row pet-reset-row">
@@ -1555,16 +1556,57 @@ function settingsHtml(cfg: PetConfig): string {
     </div>
     ${motionBlock()}
   </div>
-  <div class="pet-persona" id="pet-persona">
-    <div class="pet-debug-title">${t("pet.persona_title")}</div>
-    <div class="pet-note">${t("pet.persona_hint")}</div>
-    <textarea id="pet-persona-text" class="pet-persona-text" rows="6" spellcheck="false" maxlength="8000" placeholder=""></textarea>
-    <div class="pet-row pet-persona-actions">
-      <button type="button" id="pet-persona-save" class="pet-btn pet-btn-primary">${t("settings.persona_save")}</button>
-      <button type="button" id="pet-persona-clear" class="pet-btn">${t("pet.persona_clear")}</button>
-      <button type="button" id="pet-persona-restart" class="pet-btn">${t("settings.persona_restart")}</button>
+  <!-- 三个新分页（2026-10-13）：把原先散在页签之外的三块控件搬进来。
+       迁移只挪节点、接线（事件委托 / 落盘）原样复用，语义不分叉。 -->
+  <div class="pet-tabpage" data-pet-page="proactive" hidden>
+    ${proactiveBlock(cfg)}
+  </div>
+  <div class="pet-tabpage" data-pet-page="voice" hidden>
+    ${ttsBlock(cfg)}
+  </div>
+  <div class="pet-tabpage" data-pet-page="persona" hidden>
+    <div class="pet-persona" id="pet-persona">
+      <div class="pet-debug-title">${t("pet.persona_core_title")}</div>
+      <div class="pet-note">${t("pet.persona_hint")}</div>
+      <textarea id="pet-persona-text" class="pet-persona-text" rows="6" spellcheck="false" maxlength="8000" placeholder=""></textarea>
+      <div class="pet-row pet-persona-actions">
+        <button type="button" id="pet-persona-save" class="pet-btn pet-btn-primary">${t("settings.persona_save")}</button>
+        <button type="button" id="pet-persona-clear" class="pet-btn">${t("pet.persona_clear")}</button>
+        <button type="button" id="pet-persona-restart" class="pet-btn">${t("settings.persona_restart")}</button>
+      </div>
+      <div class="pet-note" id="pet-persona-msg"></div>
     </div>
-    <div class="pet-note" id="pet-persona-msg"></div>
+    <!-- 事实记忆 = ModuleData\memory\pet\MEMORY.md（AI 经 Remember 写） -->
+    <div class="pet-list" id="pet-memory">
+      <div class="pet-debug-title">${t("pet.memory_title")}</div>
+      <div class="pet-note">${t("pet.memory_desc")}</div>
+      <div class="pet-list-items" id="pet-memory-items"></div>
+      <div class="pet-row">
+        <button type="button" id="pet-memory-clear" class="pet-btn pet-list-clear" data-pet-clear="memory" data-armed-text="${esc(t("pet.list_clear_armed"))}">${esc(t("pet.list_clear"))}</button>
+      </div>
+      <div class="pet-note" id="pet-memory-msg"></div>
+    </div>
+    <!-- 成长笔记 = ModuleData\memory\pet\GROWTH.md（AI 经 PetGrowth 写）—— 与上面那份**不是一个文件** -->
+    <div class="pet-list" id="pet-growth">
+      <div class="pet-debug-title">${t("pet.growth_title")}</div>
+      <div class="pet-note">${t("pet.growth_desc")}</div>
+      <div class="pet-list-items" id="pet-growth-items"></div>
+      <div class="pet-row">
+        <button type="button" id="pet-growth-clear" class="pet-btn pet-list-clear" data-pet-clear="growth" data-armed-text="${esc(t("pet.list_clear_armed"))}">${esc(t("pet.list_clear"))}</button>
+      </div>
+      <div class="pet-note" id="pet-growth-msg"></div>
+    </div>
+    <!-- 人格建议 = ModuleData\memory\pet\PERSONA_SUGGESTIONS.md；「接受」= 事前确认后并入核心
+         人格，「清空」= 只丢弃建议（不写核心人格）-->
+    <div class="pet-list" id="pet-suggest">
+      <div class="pet-debug-title">${t("pet.suggest_title")}</div>
+      <div class="pet-note">${t("pet.suggest_desc")}</div>
+      <div class="pet-list-items" id="pet-suggest-items"></div>
+      <div class="pet-row">
+        <button type="button" id="pet-suggest-clear" class="pet-btn pet-list-clear" data-pet-clear="suggest" data-armed-text="${esc(t("pet.suggest_clear_armed"))}">${esc(t("pet.list_clear"))}</button>
+      </div>
+      <div class="pet-note" id="pet-suggest-msg"></div>
+    </div>
   </div>
 </div>`;
 }
@@ -1908,6 +1950,156 @@ async function attachSettings(root: HTMLElement): Promise<void> {
       setPersonaMsg(okMsg + t("pet.persona_effective"));
     } catch (e) {
       setPersonaMsg(t("settings.persona_failed", { err: String(e) }));
+    }
+  };
+
+  // ── 人格页三张列表：事实记忆 / 成长笔记 / 人格建议（2026-10-13）──────────
+  // 全部只调**既有**宿主命令，不新增落盘路径、不改命令语义：
+  //   · 事实记忆 → `pet\MEMORY.md`（get_pet_memory / delete_pet_memory_note / clear_pet_memory）
+  //   · 成长笔记 → `pet\GROWTH.md`（get_pet_growth / delete_pet_growth_note / clear_pet_growth）
+  //   · 人格建议 → `pet\PERSONA_SUGGESTIONS.md`（get_persona_suggestions / delete_persona_suggestion
+  //     / clear_persona_suggestions / merge_persona_suggestion）
+  // 逐条删按**内容**匹配（与宿主 `delete_*_entry` 同口径）；「接受」= **事前**二次确认后并入核心
+  // 人格（§8），「清空」= 只是丢弃建议（不写核心人格）—— 两者都走两段式确认。
+  type PetListKind = "memory" | "growth" | "suggest";
+  /** 三张列表的命令与容器 id（唯一映射，别处不再抄第二份）。三张都有「清空」（`clear` 非空）。
+   *  `cleared` = 清空成功后的轻提示 i18n key（三张各自区分；建议那句写明「不改核心人格」）。 */
+  const PET_LIST: Record<PetListKind, { get: string; del: string; clear: string | null; cleared: string; merge: boolean; items: string; msg: string }> = {
+    memory: { get: "get_pet_memory", del: "delete_pet_memory_note", clear: "clear_pet_memory", cleared: "pet.memory_cleared", merge: false, items: "pet-memory-items", msg: "pet-memory-msg" },
+    growth: { get: "get_pet_growth", del: "delete_pet_growth_note", clear: "clear_pet_growth", cleared: "pet.growth_cleared", merge: false, items: "pet-growth-items", msg: "pet-growth-msg" },
+    suggest: { get: "get_persona_suggestions", del: "delete_persona_suggestion", clear: "clear_persona_suggestions", cleared: "pet.suggest_cleared", merge: true, items: "pet-suggest-items", msg: "pet-suggest-msg" },
+  };
+
+  const petListMsg = (k: PetListKind, text: string, bad = false) => {
+    const m = el(PET_LIST[k].msg);
+    if (!m) return;
+    m.className = bad ? "pet-note pet-bad" : "pet-note";
+    m.textContent = text;
+  };
+
+  /** 两段式确认（同 `main.ts` 回退按钮口径）：第一次点置 `data-armed="1"` 并把文案换成
+   *  `data-armed-text`（写明将要发生什么），4 秒内再点才真执行；超时自动解除。
+   *  **不用原生 `confirm`**（全仓一贯禁用）。 */
+  const armedRun = (btn: HTMLElement, run: () => void) => {
+    if (btn.dataset.armed === "1") {
+      delete btn.dataset.armed;
+      btn.textContent = btn.dataset.armedRestore ?? btn.textContent;
+      delete btn.dataset.armedRestore;
+      run();
+      return;
+    }
+    btn.dataset.armedRestore = btn.textContent ?? "";
+    btn.dataset.armed = "1";
+    const armed = btn.dataset.armedText;
+    if (armed) btn.textContent = armed;
+    window.setTimeout(() => {
+      if (btn.dataset.armed !== "1") return;
+      delete btn.dataset.armed;
+      btn.textContent = btn.dataset.armedRestore ?? btn.textContent;
+      delete btn.dataset.armedRestore;
+    }, 4000);
+  };
+
+  /** 把一个条目文本画进列表（`textContent` 赋值 ⇒ 不解析 HTML；`dataset` 存原文供删除 / 合并用）。 */
+  const renderPetList = (k: PetListKind, entries: string[]) => {
+    const box = el(PET_LIST[k].items);
+    if (!box) return;
+    const frag = document.createDocumentFragment();
+    if (!entries.length) {
+      const empty = document.createElement("div");
+      empty.className = "pet-list-empty";
+      empty.textContent = t(`pet.${k}_empty`);
+      frag.appendChild(empty);
+      box.replaceChildren(frag);
+      return;
+    }
+    for (const text of entries) {
+      const row = document.createElement("div");
+      row.className = "pet-list-row";
+      const txt = document.createElement("div");
+      txt.className = "pet-list-text";
+      txt.textContent = text;
+      row.appendChild(txt);
+      const acts = document.createElement("div");
+      acts.className = "pet-list-acts";
+      if (PET_LIST[k].merge) {
+        const acc = document.createElement("button");
+        acc.type = "button";
+        acc.className = "pet-btn pet-suggest-accept";
+        acc.dataset.petMerge = text;
+        acc.dataset.armedText = t("pet.suggest_accept_armed");
+        acc.textContent = t("pet.suggest_accept");
+        acts.appendChild(acc);
+      }
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "pet-btn pet-list-del";
+      del.dataset.petDel = text;
+      del.dataset.petList = k;
+      del.dataset.armedText = t("pet.item_del_armed");
+      del.textContent = t("pet.item_del");
+      acts.appendChild(del);
+      row.appendChild(acts);
+      frag.appendChild(row);
+    }
+    box.replaceChildren(frag);
+  };
+
+  /** 读取一张列表；**失败也要在列表位置给出明确提示**（不白屏）。 */
+  const refreshPetList = async (k: PetListKind): Promise<void> => {
+    try {
+      const p = await invoke<{ entries?: string[] }>(PET_LIST[k].get);
+      renderPetList(k, p.entries ?? []);
+    } catch (e) {
+      report(`读取列表失败（${k}）`, e);
+      const box = el(PET_LIST[k].items);
+      if (box) {
+        const fail = document.createElement("div");
+        fail.className = "pet-list-empty pet-bad";
+        fail.textContent = t("pet.list_load_fail");
+        box.replaceChildren(fail);
+      }
+    }
+  };
+
+  /** 逐条删除（按内容匹配）；条目消失即最好反馈 ⇒ 成功不弹提示，失败才写一行。 */
+  const deletePetListEntry = async (k: PetListKind, text: string): Promise<void> => {
+    try {
+      await invoke(PET_LIST[k].del, { text });
+      petListMsg(k, "");
+      await refreshPetList(k);
+    } catch (e) {
+      report(`删除列表条目失败（${k}）`, e);
+      petListMsg(k, t("pet.list_fail"), true);
+    }
+  };
+
+  /** 清空一张列表（仅对宿主提供 `clear_*` 的列表可用）。成功后刷新列表并给一句轻提示
+   *  （文案取自 `PET_LIST[k].cleared`，三张表各自区分；人格建议那句写明「不改核心人格」）。 */
+  const clearPetList = async (k: PetListKind): Promise<void> => {
+    const cmd = PET_LIST[k].clear;
+    if (!cmd) return;
+    try {
+      await invoke(cmd);
+      petListMsg(k, t(PET_LIST[k].cleared));
+      await refreshPetList(k);
+    } catch (e) {
+      report(`清空列表失败（${k}）`, e);
+      petListMsg(k, t("pet.list_fail"), true);
+    }
+  };
+
+  /** 「接受」一条人格建议 = **事前二次确认后**把它并入核心人格（`merge_persona_suggestion`）。
+   *  合并成功 ⇒ 核心人格文本域刷新 + 建议列表刷新。 */
+  const mergePetSuggestion = async (text: string): Promise<void> => {
+    try {
+      await invoke("merge_persona_suggestion", { text });
+      await loadPetPersona();
+      await refreshPetList("suggest");
+      petListMsg("suggest", t("pet.suggest_accepted"));
+    } catch (e) {
+      report("合并人格建议失败", e);
+      petListMsg("suggest", t("pet.merge_fail"), true);
     }
   };
 
@@ -2329,6 +2521,33 @@ async function attachSettings(root: HTMLElement): Promise<void> {
         // 「重启 AI」按钮：桌宠窗没有 `__lunac_reload_agent` 桥 ⇒ 广播给主窗执行（见 main.ts）。
         setPersonaMsg(MSG_PERSONA_RESTARTING);
         void emit(AGENT_RESTART_EVENT).catch(e => report("重启 AI 请求失败", e));
+      } else if (t.closest("[data-pet-merge]")) {
+        // 「接受」人格建议：**先二次确认**（`armedRun` 换文案「将把这条并入核心人格」），再动核心人格。
+        const btn = t.closest<HTMLElement>("[data-pet-merge]");
+        if (!btn) return;
+        const text = btn.dataset.petMerge ?? "";
+        armedRun(btn, () => {
+          if (text) void mergePetSuggestion(text).catch(e => report("合并人格建议失败", e));
+        });
+      } else if (t.closest("[data-pet-del]")) {
+        // 逐条删：同样两段式确认（列表条目不少，误点一下不该直接删掉）。
+        const btn = t.closest<HTMLElement>("[data-pet-del]");
+        if (!btn) return;
+        const kind = btn.dataset.petList as PetListKind | undefined;
+        const text = btn.dataset.petDel ?? "";
+        if (!kind || !PET_LIST[kind]) return;
+        armedRun(btn, () => {
+          if (text) void deletePetListEntry(kind, text).catch(e => report("删除列表条目失败", e));
+        });
+      } else if (t.closest("[data-pet-clear]")) {
+        // 三张列表（事实记忆 / 成长笔记 / 人格建议）统一走这一支：读 `data-pet-clear` 得到列表类别，
+        // 复用 `armedRun` **两段式确认**（4s 超时自动解除）。「清空」= 只丢弃该列表内容；各表成功后
+        // 的轻提示取自 `PET_LIST[k].cleared`，其中人格建议那句写明「不改核心人格」（与「接受」区分）。
+        const btn = t.closest<HTMLElement>("[data-pet-clear]");
+        if (!btn) return;
+        const kind = btn.dataset.petClear as PetListKind | undefined;
+        if (!kind || !PET_LIST[kind]) return;
+        armedRun(btn, () => void clearPetList(kind).catch(e => report(`清空列表失败（${kind}）`, e)));
       } else if (t.closest("#pet-reset-debug")) {
         void resetDebugParams();
       } else if (t.closest("#pet-reset-hotkeys")) {
@@ -2699,11 +2918,24 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     }
   }
 
-  /** 「试听」：用 `tts_speak` 读一句固定示例（复用同一条朗读链路）。配置不齐时**静默无反应**。 */
+  /** 「试听」：用 `tts_speak` 读一句固定示例（复用同一条朗读链路）。
+   *  ⚠️ **不可用时宿主现在会返回原因 key**（与 `get_pet_voice` 的 `reason` **同一套**，见
+   *  `tts_zipvoice::unavailable_reason`）⇒ 这里翻成文案显示在按钮下方（**不再「点了没反应」**）；
+   *  桌宠**自动朗读**那条路径仍 `.catch(()=>{})` 吞掉 ⇒ 静默不读（用户 2026-10-12 裁决不变）。 */
   function previewPetVoice(): void {
     const msg = el("pet-tts-msg");
     if (msg) msg.textContent = "";
-    void invoke("tts_speak", { text: t("pet.tts_preview_text"), enabled: true }).catch(e => report("试听失败", e));
+    void invoke("tts_speak", { text: t("pet.tts_preview_text"), enabled: true }).catch(e => {
+      const key = e instanceof Error ? e.message : String(e);
+      // 已知原因 key 走 i18n（复用状态行那组 pet.tts_reason_*）；其余（不该出现）原样显示，绝不吞掉。
+      const known = ["disabled", "no_ref_audio", "no_ref_text", "ref_missing", "assets_missing"];
+      const shown = known.includes(key) ? t("pet.tts_reason_" + key) : key;
+      if (msg) {
+        msg.textContent = shown;
+        msg.className = "pet-note";
+      }
+      report("试听失败", e);
+    });
   }
 
   void refreshPetVoiceStatus();
@@ -3111,6 +3343,10 @@ async function attachSettings(root: HTMLElement): Promise<void> {
   refreshToggle();
   void refreshHotkeys();
   void refreshMotions();
+  // 人格页三张列表（事实记忆 / 成长笔记 / 人格建议）：面板打开时各拉一次。
+  void refreshPetList("memory");
+  void refreshPetList("growth");
+  void refreshPetList("suggest");
   // **每次打开插件自动拉起模型**（用户 2026-10-10 口径）：配了 Live2D 模型而桌宠窗没开时，
   // 直接把它开起来 —— 桌宠窗装载时会自行应用**持久化**的参数，于是「上次的参数」自动维持。
   // 放最后：先让本窗渲染完再拉形象，且失败也不影响设置窗可用。
@@ -3273,8 +3509,9 @@ const PET_CSS = `
 .pet-tab{appearance:none;font:inherit;font-size:.72rem;color:var(--text-dim);background:transparent;border:1px solid var(--border-glass);border-radius:999px;padding:4px 14px;cursor:pointer;}
 .pet-tab:hover{color:var(--text);border-color:rgba(var(--btn-line-rgb), var(--btn-line-alpha));}
 .pet-tab.on{color:var(--text);background:rgba(var(--btn-bg-rgb), var(--btn-bg-alpha));border-color:rgba(var(--btn-line-rgb), var(--btn-line-alpha));}
-/* 页内的块不再各画一条上分隔线（那一排页签已经承担了分隔）。 */
-.pet-tabpage>.pet-hotkeys,.pet-tabpage>.pet-debug{margin-top:0;border-top:0;padding-top:0;}
+/* 页内的块不再各画一条上分隔线（那一排页签已经承担了分隔）。
+   2026-10-13：主动反应 / 语音朗读 / 人格三页把原先在页签之外的三块搬了进来，同样去掉上分隔。 */
+.pet-tabpage>.pet-hotkeys,.pet-tabpage>.pet-debug,.pet-tabpage>.pet-proactive,.pet-tabpage>.pet-tts,.pet-tabpage>.pet-persona{margin-top:0;border-top:0;padding-top:0;}
 /* 「恢复默认」按钮行：三个分页各一颗，**贴在页顶**（2026-10-10 用户口径：从页底移上来）。 */
 .pet-reset-row{margin-bottom:10px;}
 .pet-phys-tag{margin-left:6px;font-size:.62rem;color:var(--text-dim);border:1px solid var(--border-glass);border-radius:999px;padding:0 6px;opacity:.85;}
@@ -3292,6 +3529,17 @@ const PET_CSS = `
 .pet-persona-text{width:100%;box-sizing:border-box;resize:vertical;min-height:96px;font:inherit;font-size:.72rem;line-height:1.7;color:var(--text);background:rgba(var(--shade-rgb),calc(0.3 * var(--shade-scale)));border:1px solid var(--border-glass);border-radius:8px;padding:8px 10px;outline:none;caret-color:rgb(var(--other-overlay-rgb));}
 .pet-persona-text:focus{border-color:rgb(var(--other-overlay-rgb));}
 .pet-persona-actions{gap:8px;flex-wrap:wrap;}
+/* 人格页的三张列表（事实记忆 / 成长笔记 / 人格建议，2026-10-13）—— 与核心人格块同款分隔线；
+   行是 JS 渲染，样式按结构类写（行数 / 文本都来自宿主，样式不绑 id）。 */
+.pet-list{margin-top:14px;border-top:1px solid var(--border-glass);padding-top:12px;}
+.pet-list .pet-note{border-top:0;padding-top:0;margin-top:8px;}
+.pet-list-items{display:flex;flex-direction:column;gap:8px;margin:10px 0;}
+.pet-list-row{display:flex;flex-direction:column;gap:8px;padding:8px 10px;border:1px solid var(--border-glass);border-radius:8px;}
+.pet-list-text{color:var(--text);font-size:.72rem;line-height:1.7;white-space:pre-wrap;word-break:break-word;}
+.pet-list-acts{display:flex;flex-wrap:wrap;gap:6px;}
+.pet-list-empty{color:var(--text-muted);font-size:.7rem;line-height:1.7;}
+/* 两段式确认态（删除 / 清空 / 接受合并）：红色确认，见 docs/ui-style.md §界面 2 / §界面 11 白名单。 */
+.pet-list-del[data-armed="1"],.pet-list-clear[data-armed="1"],.pet-suggest-accept[data-armed="1"]{color:var(--red);background:rgba(192,138,138,0.14);border-color:var(--red);}
 .pet-debug{margin-top:12px;border-top:1px solid var(--border-glass);padding-top:11px;}
 .pet-debug-title{font-weight:600;color:var(--text);margin-bottom:8px;}
 .pet-debug-note{color:var(--text-dim);font-size:.68rem;line-height:1.7;margin-bottom:8px;}

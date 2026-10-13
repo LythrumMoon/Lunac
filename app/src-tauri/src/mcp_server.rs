@@ -889,6 +889,14 @@ pub fn persona_suggestion_append(content: &str) -> Result<String, String> {
     write_memory_at(&persona_suggestions_path(), content, false)
 }
 
+/// 清空全部人格修订建议（把 `PERSONA_SUGGESTIONS.md` 截断为空；文件不存在 ⇒ 幂等空操作）。
+/// **只动建议区** —— 核心人格（`config\pet-persona.md`）与另两张列表（`MEMORY.md` / `GROWTH.md`）
+/// 都不碰。破坏性操作，调用方（前端）负责二次确认；复用 `clear_memory_at` 与固定路径真相源
+/// （`persona_suggestions_path()`），**不新增第二份常量 / 第二处路径拼接**。
+pub fn persona_suggestions_clear() -> Result<(), String> {
+    clear_memory_at(&persona_suggestions_path())
+}
+
 /// 建议区的设置窗载荷：条目列表 + 上限。
 pub fn persona_suggestions_payload() -> Result<Value, String> {
     Ok(serde_json::json!({
@@ -2289,6 +2297,50 @@ mod tests {
         assert!(err.contains("上限") || err.contains("过长"), "应报长度上限：{err}");
         assert_eq!(read_memory_at(&persona).unwrap(), before, "校验不过不得写人格");
         assert_eq!(list_memory_entries_at(&sug).unwrap().len(), 1, "校验不过不得摘建议");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ⑧ 清空建议区：**只截断 `PERSONA_SUGGESTIONS.md`** —— 核心人格 `pet-persona.md` 与另两张
+    /// 列表（`MEMORY.md` / `GROWTH.md`）一个字节都不动；文件不存在 ⇒ 幂等空操作（不报错、不新建）。
+    ///
+    /// 清空命令 `clear_persona_suggestions` 走的正是 `clear_memory_at(&persona_suggestions_path())`
+    /// （与 `pet_growth_clear` 同款复用）⇒ 这里用临时文件直接钉住「只动这一份」这条硬行为；
+    /// 固定落点由 `pet_self_paths_are_fixed_siblings_outside_config` 单独钉。
+    #[test]
+    fn persona_suggestions_clear_only_truncates_its_own_file() {
+        let dir = tmp_memory_dir("petsuggestclear");
+        let persona = dir.join("pet-persona.md");
+        let mem = dir.join("MEMORY.md");
+        let growth = dir.join("GROWTH.md");
+        let sug = dir.join("PERSONA_SUGGESTIONS.md");
+
+        // 四份都先有内容
+        assert!(write_memory_at(&persona, "你是桌面宠物。", true).is_ok());
+        assert!(write_memory_at(&mem, "用户喜欢简洁", false).is_ok());
+        assert!(write_memory_at(&growth, "说话可以更简短一点", false).is_ok());
+        assert!(write_memory_at(&sug, "可以偶尔用点俏皮话", false).is_ok());
+        assert!(write_memory_at(&sug, "被夸时轻轻晃一下", false).is_ok());
+        assert_eq!(list_memory_entries_at(&sug).unwrap().len(), 2);
+
+        let persona_before = read_memory_at(&persona).unwrap();
+        let mem_before = read_memory_at(&mem).unwrap();
+        let growth_before = read_memory_at(&growth).unwrap();
+
+        // 清空建议区（与宿主命令同一实现）：条目清空、读为空串
+        assert!(clear_memory_at(&sug).is_ok());
+        assert_eq!(read_memory_at(&sug).unwrap(), "");
+        assert!(list_memory_entries_at(&sug).unwrap().is_empty(), "清空后建议列表必须为空");
+
+        // 另三份原样不动
+        assert_eq!(read_memory_at(&persona).unwrap(), persona_before, "核心人格不得被清空波及");
+        assert_eq!(read_memory_at(&mem).unwrap(), mem_before, "事实记忆不得被清空波及");
+        assert_eq!(read_memory_at(&growth).unwrap(), growth_before, "成长笔记不得被清空波及");
+
+        // 幂等：文件不存在时清空不报错，且不凭空新建文件
+        let missing = dir.join("NOT_THERE.md");
+        assert!(clear_memory_at(&missing).is_ok(), "文件不存在 ⇒ 幂等空操作，不报错");
+        assert!(!missing.exists(), "清空不得凭空新建文件");
 
         let _ = fs::remove_dir_all(&dir);
     }

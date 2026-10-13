@@ -961,6 +961,14 @@ pub fn merge_persona_suggestion(text: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 清空全部人格修订建议（把 `PERSONA_SUGGESTIONS.md` 截断为空）。**只是丢弃建议** ——
+/// 不写 `config\pet-persona.md`（往核心人格写只走上面的 `merge_persona_suggestion`）。
+/// 破坏性操作，调用方负责二次确认。
+#[tauri::command]
+pub fn clear_persona_suggestions() -> Result<(), String> {
+    crate::mcp_server::persona_suggestions_clear()
+}
+
 #[tauri::command]
 pub async fn get_status(_state: State<'_, AppState>) -> Result<StatusPayload, String> {
     let cli_running = cli_bridge::is_running();

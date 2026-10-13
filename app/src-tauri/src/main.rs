@@ -64,6 +64,7 @@ use commands::{
     // 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）
     get_pet_growth, delete_pet_growth_note, clear_pet_growth,
     get_persona_suggestions, delete_persona_suggestion, merge_persona_suggestion,
+    clear_persona_suggestions,
     set_security_profile, list_start_menu_apps,
     set_query_state, set_recording_state, set_ui_mode, set_chips_empty,
     set_ai_mode, set_thinking_mode, set_detached, get_ai_config, set_ai_config, test_ai_connection,
@@ -561,6 +562,7 @@ fn main() {
             get_persona_suggestions,
             delete_persona_suggestion,
             merge_persona_suggestion,
+            clear_persona_suggestions,
             get_status,
             set_security_profile,
             list_start_menu_apps,

@@ -165,7 +165,7 @@ $Plugins = @{
   # **控制台**面板，桌宠窗由控制台里的「显示桌宠」按钮开（理由见 pet.ts 文件头：
   # 穿透开着时桌宠窗收不到鼠标事件，开关必须落在另一个窗口里）。
   pet = @{
-    version      = "0.9.58"
+    version      = "0.9.62"
     name         = "桌宠"
     description  = "桌宠 —— 独立透明置顶的桌面形象窗（图片或 Live2D 模型，由你自己导入）"
     keywords     = @("桌宠", "宠物", "桌面宠物", "pet", "desktop pet", "live2d", "看板娘", "吉祥物")
@@ -210,21 +210,27 @@ $Plugins = @{
       #   （sherpa-onnx 的 dll + onnxruntime + ZipVoice 权重 + espeak-ng 数据 + Vocos 声码器），
       #   所以走 `archive`（与 ocr 的 PaddleOCR / local-model 的 llama-server 同款）。
       # `dest = "zipvoice"` ⇒ 解到 `<插件目录>\zipvoice\`（宿主 tts_zipvoice.rs 的 zipvoice_dir()
-      #   认这条路径；`assets_ready()` 要求同级存在 sherpa-onnx-c-api.dll / vocos_24khz.onnx /
-      #   model\encoder.int8.onnx / model\decoder.int8.onnx）。压缩包内是**单层 `zipvoice\`**，
-      #   安装器会把它摊平（plugin_market 的 flatten_single_top_dir）。
+      #   认这条路径；`assets_ready()` 要求 sherpa-onnx-c-api.dll / onnxruntime.dll /
+      #   model\encoder.int8.onnx / model\decoder.int8.onnx / vocos_24khz.onnx 齐备且**头字节合法**）。
+      #   压缩包内是**单层 `zipvoice\`**，安装器会把它摊平（plugin_market 的 flatten_single_top_dir）。
       # **授权**：ZipVoice 权重为 CC-BY-NC（仅非商用），espeak-ng 数据为 GPL-3.0 —— 授权全文与
       #   声明随包放 `zipvoice\LICENSES\` + `zipvoice\THIRD_PARTY_NOTICES.md`（见下面的 notices）；
       #   两份原文在仓库 `licenses\zipvoice\`（取上游原文，勿转述）。
       # `sha256` 是**压缩包本身**的校验和（不是解压产物）；换版本时用
       #   `Get-FileHash <7z> -Algorithm SHA256` 重取，并同步更新 url 标签与本行。
-      # `local` = 打包机上**已解开的目录**（只用于给安装包 / dev 暂存，写清单时摘掉）。
+      # ⚠️ **本依赖**没有** `local`（2026-10-13 用户要求）**：`local` 会让 Stage-PluginDir 把整棵树
+      #   拷进 `release\ext-plugins\`（进而被 `lunac-installer.nsi` 的 `File /r "ext-plugins\pet\*"`
+      #   打进安装包）与 dev 的 `Modules\` —— 解压后约 216 MiB，安装包体积会从 ~19 MB 涨到 ~176 MB。
+      #   用户口径「release 不内嵌、跟以前的依赖一样在**下载桌宠插件时同步拉取**」⇒ 与 ocr 的
+      #   PaddleOCR **同一条路**：只在清单里声明，宿主装 `pet` 时按 `dependencies[]` 下载 + 校验
+      #   sha256（见 plugin_market.rs 的 install_archive_dependency），与本文件无关。
+      #   dev 已铺好的 `Modules\pet\zipvoice\` 是**开发运行时资产**，本脚本既不重铺也不删除
+      #   （dev 暂存走 `-NoClean`，只覆盖构建产物）。**别给它加回 `local`**。
       @{
         type   = "archive"
         url    = "https://github.com/LythrumMoon/lunac-plugins/releases/download/zipvoice-1.13.8/zipvoice-1.13.8.7z"
         dest   = "zipvoice"
         sha256 = "DE25D3192B9C6C34DF642F1FB58852ED4991E604AFA95754499627D8C03FFEE2"
-        local  = "deps\zipvoice\_stage\zipvoice"
         # **第三方授权随附义务**（2026-10-12，照 Live2D 的 notices 先例）：CC-BY-NC 要求署名 +
         #   附许可全文，GPL-3.0 要求附许可证全文，MIT / Apache-2.0 要求保留声明。这些文件与
         #   archive 内的 LICENSES/ 内容一致；**缺一份就打包失败**（见第 ② 步）—— 宁可不打包，
@@ -488,15 +494,17 @@ foreach ($id in $Ids) {
 #     `release\ext-plugins\` 那份只服务安装包，它新鲜**不代表** dev 新鲜，两者不能互相顶替。
 # ── 依赖内容「下载污染」前置校验（2026-10-12，见 docs/todo.md §待办 1-4 补）──
 # 拦什么：gh-proxy 之类的 GitHub 加速镜像会用 HTML 落地页顶替原件，**总尺寸可与上游完全相同**
-#   ⇒ 只比大小 / 只比「文件在不在」都漏。ONNX Runtime 解析到 HTML 头会抛 `Protobuf parsing
-#   failed`（MSVC 下是未捕获的 0xe06d7363），宿主被直接杀掉 —— 桌宠「试听」闪退的真因。
-# 怎么拦（只看头，不整读大文件）：
-#   ① 通用 HTML 污染：读每个文件**前 512 字节**，以 <!DOCTYPE / <html 开头（大小写不敏感、
-#      容忍 BOM 与前导空白）⇒ 当场 throw，错误信息给出**文件路径 + 首 40 字节 + 诊断**；
-#   ② ZipVoice 必需文件存在且非空（只针对 pet 的 archive 依赖，直白断言，不做通用框架）；
-#   ③ 已知合法 vocos_24khz.onnx 的 sha256 钉死校验。
+#   ⇒ 只比大小 / 只比「文件在不在」都漏。
+# 怎么拦（只看头，不整读大文件）：读每个文件**前 512 字节**，以 <!DOCTYPE / <html 开头
+#   （大小写不敏感、容忍 BOM 与前导空白）⇒ 当场 throw，错误信息给出**文件路径 + 首 40 字节 + 诊断**。
 # 为什么放在这里：Stage-PluginDir 是**唯一**把 `local` 拷进插件目录（ext-plugins / dev）的入口，
 #   在拷贝**之前**校验，污染文件就进不了产物。
+# ⚠️（2026-10-13）ZipVoice 的 archive 依赖**已去掉 `local`**（不再进这两条暂存路，见 pet 的
+#   dependencies 注释）⇒ 本闸门**不再覆盖它**；它的完整性改由两处保证：① 市场下载时的 **sha256**
+#   （plugin_market.rs）；② 宿主 `tts_zipvoice::assets_ready()` 的**头字节校验** —— 坏文件当场判
+#   「未就绪」并返回可读错误，**不再**喂给 ONNX Runtime（它抛的 MSVC C++ 异常 0xe06d7363 跨 FFI
+#   边界没有捕获点，会直接把宿主进程带走 —— 那正是 2026-10-12「试听闪退」的真因）。
+#   本闸门对**仍带 `local`** 的依赖（如 Live2D Core）照旧生效。
 function Read-FileHeadText([string]$path, [int]$maxBytes) {
   $fs = [IO.File]::OpenRead($path)
   try {
@@ -541,22 +549,6 @@ function Assert-DepInputClean([string]$id, $dep, [string]$localPath) {
              "  该文件首 40 字节（不可打印字符以 . 代）：" + (Get-FileHeadPreview $f.FullName 40))
     }
   }
-  # ZipVoice：仅针对 pet 的 archive 依赖，直白断言（不做多引擎注册表式的通用框架）
-  if ($id -eq "pet" -and $dep.type -eq "archive" -and $dep.dest -eq "zipvoice") {
-    $required = @("sherpa-onnx-c-api.dll", "model\encoder.int8.onnx", "model\decoder.int8.onnx", "vocos_24khz.onnx")
-    foreach ($rel in $required) {
-      $p = Join-Path $localPath $rel
-      if (-not (Test-Path -LiteralPath $p -PathType Leaf) -or (Get-Item -LiteralPath $p).Length -le 0) {
-        throw "ZipVoice 资产缺必需文件或为空：$p（$id 的 archive 依赖 local 应为运行期布局）"
-      }
-    }
-    # 已知合法 vocos_24khz.onnx 的 sha256 —— ⚠️ 换模型/换版本时必须同步更新此常量
-    $vocosSha256 = "BCB3B970E384161C4D634F0BB9E999FF1C471B34C9BC0B1049A5014065ED3CC0"
-    $got = (Get-FileHash (Join-Path $localPath "vocos_24khz.onnx") -Algorithm SHA256).Hash
-    if ($got -ne $vocosSha256) {
-      throw "vocos_24khz.onnx 的 sha256 与钉死值不一致（期望 $vocosSha256 / 实得 $got）—— 疑似下载污染，或换了模型/版本而没同步更新本脚本内的常量"
-    }
-  }
 }
 function Stage-PluginDir([string]$id, [string]$dst, [switch]$NoClean) {
   $meta = $Plugins[$id]
@@ -571,12 +563,13 @@ function Stage-PluginDir([string]$id, [string]$dst, [switch]$NoClean) {
   Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force
   # `dependencies` 只对**市场安装**生效（宿主下载 + 校验 sha256）—— 这两条暂存路都**不会**下载。
   # 所以凡是有本机副本（`local`）的依赖，必须在这里预先进目标目录；否则
-  # 「安装器里勾了桌宠」的用户、以及 dev 实例，一开 Live2D / 语音会看到「引擎文件加载失败」。
+  # 「安装器里勾了桌宠」的用户、以及 dev 实例，一开 Live2D 会看到「引擎文件加载失败」。
   #   · `file` 的 `local` = 单个文件，**逐字节校验**（同一份文件好几条分发路，暂存的那份必须
   #     与清单钉死的 sha256 一致）；
-  #   · `archive` 的 `local` = 打包机上**已解开的目录**（如 `deps\zipvoice\_stage\zipvoice`）——
-  #     archive 的 sha256 校验的是**压缩包本身**（那是市场安装器的事），这里只把整棵树拷进
-  #     dest，让 dev / 安装包的插件目录与「市场装完」的形状一致。
+  #   · `archive` 的 `local` = 打包机上**已解开的目录** —— archive 的 sha256 校验的是**压缩包
+  #     本身**（那是市场安装器的事），这里只把整棵树拷进 dest，让 dev / 安装包的插件目录与
+  #     「市场装完」的形状一致。（当前**没有** archive 依赖带 `local`：ZipVoice 已改成纯市场
+  #     下载，见 pet 的 dependencies 注释。）
   foreach ($dep in $meta.dependencies) {
     if (-not $dep.local) { continue }
     $src = Join-Path "$Root\release" $dep.local

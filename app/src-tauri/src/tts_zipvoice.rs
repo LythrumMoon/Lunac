@@ -296,13 +296,63 @@ fn zipvoice_dir() -> PathBuf {
     crate::plugin_market::plugins_dir().join("pet").join("zipvoice")
 }
 
-/// 资产是否齐备（DLL + 模型 + vocoder）。任一缺 = 这条通路不可用。
+/// 读文件**前 `n` 字节**（不整读大文件 —— decoder 有 124 MB）。读不满 / 打不开返回 `None`。
+fn read_head(p: &Path, n: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut buf = vec![0u8; n];
+    let mut got = 0usize;
+    while got < n {
+        match f.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(got);
+    Some(buf)
+}
+
+/// 下限体积：**只**用来拦「空 / 近空的残file」（如只落了 2 字节 `MZ`），**不设业务下限**
+/// （真实件：`sherpa-onnx-c-api.dll` 4.6 MB / `onnxruntime.dll` 17.8 MB / 三个 onnx 均 > 5 MB）。
+const ASSET_MIN_BYTES: u64 = 1024;
+
+/// 是不是可加载的 **PE**（DLL）：以 `MZ`（`4D 5A`）开头且体积过下限。
+fn is_pe(p: &Path) -> bool {
+    if std::fs::metadata(p).map(|m| m.len() < ASSET_MIN_BYTES).unwrap_or(true) {
+        return false;
+    }
+    matches!(read_head(p, 2), Some(b) if b.as_slice() == b"MZ")
+}
+
+/// 是不是 **ONNX** 模型：`ModelProto` 首字段是 `ir_version`（field 1, varint）⇒ 首字节恒为 **0x08**；
+/// 再要体积过下限，排除空 / 截断残file。
+fn is_onnx(p: &Path) -> bool {
+    if std::fs::metadata(p).map(|m| m.len() < ASSET_MIN_BYTES).unwrap_or(true) {
+        return false;
+    }
+    matches!(read_head(p, 1), Some(b) if b.first() == Some(&0x08u8))
+}
+
+/// 指定目录下的 ZipVoice 资产是否**可用**（两个 DLL 是 PE、三个 onnx 是 ONNX，且都非近空）。
+///
+/// ⚠️ **为什么查头字节、而不是只查「文件在不在」**（2026-10-13）：只判存在会把**被污染 / 截断**
+/// 的资产当成可用 —— 例：gh-proxy 之类的 GitHub 加速镜像用 HTML 落地页把 `vocos_24khz.onnx` 顶掉，
+/// **总尺寸还与上游完全一致**（2026-10-12 实测事故）。这种坏文件喂进 ONNX Runtime ⇒ 它抛的 MSVC
+/// C++ 异常（`0xe06d7363`）**跨 FFI 边界没有 Rust 侧的捕获点**（`catch_unwind` 只接 Rust panic）
+/// ⇒ **宿主进程被直接带走**（用户报的「点试听就闪退」）。这里当场判「未就绪」，把崩溃换成一条
+/// 可读的「资产缺失或损坏」（`reason_for` → `assets_missing`）。
+fn dir_assets_ready(dir: &Path) -> bool {
+    is_pe(&dir.join("sherpa-onnx-c-api.dll"))
+        && is_pe(&dir.join("onnxruntime.dll"))
+        && is_onnx(&dir.join("model").join("encoder.int8.onnx"))
+        && is_onnx(&dir.join("model").join("decoder.int8.onnx"))
+        && is_onnx(&dir.join("vocos_24khz.onnx"))
+}
+
+/// 资产是否齐备（运行库 + 模型 + vocoder，且**头字节合法**）。任一不合格 = 这条通路不可用。
 pub fn assets_ready() -> bool {
-    let d = zipvoice_dir();
-    d.join("sherpa-onnx-c-api.dll").is_file()
-        && d.join("model").join("encoder.int8.onnx").is_file()
-        && d.join("model").join("decoder.int8.onnx").is_file()
-        && d.join("vocos_24khz.onnx").is_file()
+    dir_assets_ready(&zipvoice_dir())
 }
 
 /// 音色库缓存目录：`config\pet-voices\`（与 `pet-voice.json` 同层，走既有 `lunac_root_dir()`）。
@@ -343,6 +393,20 @@ fn reason_for(cfg: &PetVoiceConfig, assets_ready: bool) -> String {
 /// 这条通路此刻**能不能用**（给命令 / 前端看的完整判据）。
 pub fn available() -> bool {
     reason_for(&load_config(), assets_ready()).is_empty()
+}
+
+/// 语音**此刻不可用**的原因 key（与 `get_pet_voice` 的 `PetVoiceStatus.reason` **同一套**：
+/// `disabled` / `no_ref_audio` / `no_ref_text` / `ref_missing` / `assets_missing`）；可用时返回 `None`。
+///
+/// 供**用户主动触发**的调用方（设置窗「试听」按钮，见 `tts.rs::tts_speak`）当场据此提示；
+/// 桌宠**自动朗读**那条路径不看它 —— 仍是**静默不读**（用户 2026-10-12 裁决）。
+pub fn unavailable_reason() -> Option<String> {
+    let r = reason_for(&load_config(), assets_ready());
+    if r.is_empty() {
+        None
+    } else {
+        Some(r)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -429,7 +493,9 @@ fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
     let c_vocoder = p(dir.join("vocos_24khz.onnx"))?;
     let c_data = p(model.join("espeak-ng-data"))?;
     let c_lexicon = p(model.join("lexicon.txt"))?;
-    let c_provider = CString::new("cpu").unwrap();
+    // 不用 `unwrap()`：这是**试听路径**上的 panic 点（`"cpu"` 恒无 NUL、实际不会触发，但不留
+    // panic）—— 本模块纪律是「失败给可读错误，不 panic、不 abort」。
+    let c_provider = CString::new("cpu").map_err(|_| "provider 名非法".to_string())?;
 
     let conf = OfflineTtsConfig {
         model: OfflineTtsModelConfig {
@@ -484,6 +550,12 @@ pub fn speak(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
     let cfg = load_config();
     if !cfg.enabled {
         return Err("ZipVoice 未启用".into());
+    }
+    // **资产前置守卫**（2026-10-13）：缺 / 坏资产 ⇒ 当场返回可读错误，**绝不**把它们喂进
+    // ONNX Runtime（那会以未捕获的 C++ 异常把宿主进程带走，见 `dir_assets_ready`）。
+    // `available()`（调用方的前置校验）已经拦过一道；这里是**直接调用 `speak`** 时的第二道保险。
+    if !assets_ready() {
+        return Err("语音组件未就绪（资产缺失或损坏）".into());
     }
     let ref_path = cfg.reference_audio.trim();
     if ref_path.is_empty() {
@@ -822,6 +894,43 @@ mod tests {
         assert_eq!(reason_for(&cfg, true), "ref_missing");
         cfg.reference_audio = p;
         assert_eq!(reason_for(&cfg, false), "assets_missing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 资产头字节校验（`dir_assets_ready`）：空目录 / 缺件 / 被污染（HTML 顶替）/ 近空残file
+    /// ⇒ 一律判**未就绪**（⇒ 命令返回可读错误，而**不是**把坏文件喂给 ONNX Runtime 崩掉进程）；
+    /// 形状（PE / ONNX 魔数 + 体积）正确 ⇒ 就绪。
+    ///
+    /// 复刻 2026-10-12 的真实事故：`vocos_24khz.onnx` 被 GitHub 加速镜像的 HTML 落地页顶掉，
+    /// 头几字节是 `<!DOCTYPE html>`（**总尺寸还与上游一致**）。
+    #[test]
+    fn dir_assets_ready_rejects_missing_and_corrupt_assets() {
+        let dir = temp_root("assets");
+        // ① 空目录：缺件 ⇒ 未就绪
+        assert!(!dir_assets_ready(&dir), "空目录必须判未就绪");
+
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, bytes).unwrap();
+        };
+        let mut pe = b"MZ".to_vec();
+        pe.extend_from_slice(&[0u8; 4096]);
+        let mut onnx = vec![0x08u8];
+        onnx.extend_from_slice(&[0u8; 4096]);
+        write("sherpa-onnx-c-api.dll", &pe);
+        write("onnxruntime.dll", &pe);
+        write("model/encoder.int8.onnx", &onnx);
+        write("model/decoder.int8.onnx", &onnx);
+        // ② vocos 被 HTML 落地页污染（真实事故形状）⇒ 必须判未就绪
+        write("vocos_24khz.onnx", b"<!DOCTYPE html><html lang=\"en\"><head>...");
+        assert!(!dir_assets_ready(&dir), "被 HTML 污染的 onnx 必须判未就绪");
+        // ③ 换成头字节合法的 vocos ⇒ 就绪（证明②拦的是内容、不是文件名）
+        write("vocos_24khz.onnx", &onnx);
+        assert!(dir_assets_ready(&dir), "形状正确应判就绪");
+        // ④ 只落了个空壳（不足下限）⇒ 未就绪
+        write("vocos_24khz.onnx", &[0x08u8]);
+        assert!(!dir_assets_ready(&dir), "近空残file必须判未就绪");
         std::fs::remove_dir_all(&dir).ok();
     }
 

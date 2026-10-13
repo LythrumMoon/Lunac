@@ -240,6 +240,50 @@
 - **涉及文件（本轮改动）**：`app/src/plugins/builtin/pet-window-size.ts`、`app/src/plugins/builtin/pet.ts`、`scripts/pet-window-size-selftest.mjs`、`scripts/build-plugins.ps1`（pet `minHeight` 250 + `version` 0.9.58）。**未改宿主 Rust**（宿主 clamp 读清单 `minHeight`，随清单同源生效）。
 - **待裁定 / 需知晓**：① **清单 `minHeight` 与前端 / 宿主确为同源**：前端用 `pet-window-size.ts` 的 `WIN_H_MIN`，宿主读**同一份清单**的 `minHeight`（值由本模块推导、`build-plugins.ps1:264` 手工镜像）；单测已断言「清单 minHeight === WIN_H_MIN」，但**镜像仍需人工保持**（TS 常量无法被 ps1 直接 import）。② 动态上限取**基准高**（非当前窗高）是为避免正反馈 —— 已在 `outCap` 注释与单测钉死。
 
+#### §待办 1-4 补 桌宠设置窗新增三页（主动反应 / 语音朗读 / 人格）+ 人格页四项接线（2026-10-13，上一轮补记）
+
+- **用户口径**：设置窗按功能分页；主动反应、语音朗读各自独立成页；新增「人格」页，集中显示核心人格 + 事实记忆 + 成长笔记 + 人格建议四块。
+- **A 新增三页（复用既有 tab 机制，未新造交互）**：页签按钮 `pet.ts:1534-1536`（`data-pet-tab` = `proactive` / `voice` / `persona`），对应页容器 `pet.ts:1561-1606`（`data-pet-page`，`hidden` 控制）；分页切换沿用既有委托 `pet.ts:2389-2398`（读 `data-pet-tab` → 切 `.pet-tab` 的 `on` + `.pet-tabpage` 的 `hidden` 互斥），**未新增第二套分页逻辑**。
+- **B 主动反应 / 语音朗读控件「同文件搬迁」**：两块由内联改到独立的渲染函数 `proactiveBlock(cfg)`（`pet.ts:560`）/ `ttsBlock(cfg)`（`pet.ts:633`），分别注入各自页 —— **原处移除、控件 id 全不变**（`pet-proactive-enabled` / `pet-proactive-interval` / `pet-proactive-cap` / `pet-tts-enabled` …）、**落盘路径未动**（`PetConfig`（localStorage）与 `pet-voice.json` 照旧）。
+- **C 人格页四项接线（只调既有宿主命令）**：① 核心人格 `get_pet_persona` / `set_pet_persona`（`loadPetPersona` `pet.ts:1935`、`savePetPersona` `pet.ts:1948`，点击委托 `pet.ts:2506-2513`）；② 事实记忆 / ③ 成长笔记 / ④ 人格建议三张列表走唯一映射 `PET_LIST`（`pet.ts:1961-1971`）+ `renderPetList` / `refreshPetList` / `deletePetListEntry` / `clearPetList` 一族（`pet.ts:1998-2089`），打开面板各拉一次（`pet.ts:3324-3326`）。**「接受」一条人格建议 = §8 事前二次确认后并入核心人格**（文案 `pet.suggest_accept_armed` + `armedRun` 两段式，`mergePetSuggestion` `pet.ts:2085`，委托 `pet.ts:2517-2524`）—— 与「清空」（只丢弃）语义区分。
+- **为什么**：设置窗原先只有「模型调试 / 热键 / 动作」三页，主动反应与语音的设置散在页内、人格相关无统一入口；分页 + 同文件搬迁在**不改任何落盘路径与控件 id** 的前提下把功能归位。
+- **验证结论（本轮复核，逐条退出码；`### §待办 1-5` 上方为同一工作树）**：`npx tsc --noEmit`（app）**exit 0**；`npm run build`（app）**exit 0**；`npm run verify`（根）**exit 0**（`[8/8]` BOM 18 份）；`cargo test --bins`（app\src-tauri）**exit 0 / 231 passed / 0 failed / 2 ignored**；`cargo build --release` **exit 0**（18 warning 均既有 `proxy_server.rs` 死代码）。开发产物 `app\src-tauri\target\debug\Modules\pet\lunac-plugin.json` 版本 **0.9.60**（本轮又 +1）。**注：本页对应上一轮，当时未单独记录**，以上为本轮同工作树的复核值。
+- **待真机验收**：① 设置窗出现「主动反应 / 语音朗读 / 人格」三个页签，点切换互斥、选中态可见；② 主动反应、语音两条拉条 / 开关行为与搬迁前一致（值落盘、重启后保持）；③ 人格页四块齐全：保存 / 清空核心人格、逐条删 / 清空记忆与成长笔记均生效，「接受」建议前有二次确认、确认后并入核心人格。
+- **涉及文件**：`app/src/plugins/builtin/pet.ts`（三页 + 两块搬迁 + 四项接线）、`app/src/i18n.ts`（相关文案）。
+
+#### §待办 1-4 补 桌宠人格建议「清空」命令与接线（2026-10-13，本轮）
+
+- **要补的缺口**：另两张列表（事实记忆 / 成长笔记）已有「清空」命令 + 前端「清空 + 二次确认」；**人格建议当时缺清空命令，故没给入口**。本轮只补这一条。
+- **A 宿主命令 `clear_persona_suggestions`**：
+  - `mcp_server.rs:896` 新增 `persona_suggestions_clear()` = `clear_memory_at(&persona_suggestions_path())`（截断 `ModuleData\memory\pet\PERSONA_SUGGESTIONS.md`；文件不存在 ⇒ 幂等空操作）—— **复用既有路径真相源 `persona_suggestions_path()` 与既有 `clear_memory_at`**，**未新增第二份常量 / 第二处路径拼接**（§62）。
+  - `commands.rs:968` 新增 `#[tauri::command] pub fn clear_persona_suggestions()`；`main.rs` 导入（`:67`）+ `invoke_handler` 注册（`:565`），照同族命令体例。
+- **B 接到人格页（与另两张表同款交互）**：建议区加「清空」按钮（`pet.ts:1606`，`class="pet-btn pet-list-clear"` + `data-pet-clear="suggest"` + `data-armed-text`），复用 `PET_LIST.suggest.clear = "clear_persona_suggestions"`（`pet.ts:1970`）与既有 `clearPetList`（`pet.ts:2077-2089`，本轮仅给它加一个**可选** `done` 轻提示参数；记忆 / 成长缺省 `""` ⇒ **行为不变**）；点击委托 `pet.ts:2548-2552` 走既有 `armedRun` **两段式确认**（4s 超时自动解除，全仓禁用原生 `confirm`）。清空成功刷新列表并给轻提示 `pet.suggest_cleared`。**「接受（合并）」= §8 事前确认后并入核心人格；「清空」= 只是丢弃建议、不写核心人格** —— 按钮与两段式确认文案均写明区别（`pet.suggest_clear_armed`）。
+- **为什么**：三张列表的「清空」体验要一致；建议区补上唯一的清空入口，且必须与「接受」的写入语义明确区分。
+- **验证结论（逐条退出码）**：`cargo test --bins`（app\src-tauri）**exit 0 / 231 passed**（新增 `mcp_server::tests::persona_suggestions_clear_only_truncates_its_own_file`：清空后列表为空 / 核心人格与 `MEMORY.md`、`GROWTH.md` 不动 / 文件不存在幂等——不报错、不新建）；`cargo build --release` **exit 0**（18 warning 均既有）；`npx tsc --noEmit` **exit 0**；`npm run build` **exit 0**；`npm run verify` **exit 0**（`[8/8]` BOM 18 份）；`build-plugins.ps1`（根）**exit 0**（pet **0.9.60**；dev `Modules\pet\index.js` 命中 `clear_persona_suggestions`×1 / `pet.suggest_clear_armed`×1 / `pet.suggest_cleared`×1 / `pet-suggest-clear`×1）。i18n 新 key `pet.suggest_clear_armed` / `pet.suggest_cleared` 各 **5/5 语言**。
+- **待真机验收**：① 建议区有「清空」按钮，点一次变「再点一次清空建议…」、4s 内再点才清空（超时自动还原）；② 清空后建议列表变空、显示「已清空建议（核心人格未改动）」；③ 清空**不改**核心人格 / 事实记忆 / 成长笔记，与「接受」结果明显不同。
+- **涉及文件**：`app/src-tauri/src/mcp_server.rs`、`app/src-tauri/src/commands.rs`、`app/src-tauri/src/main.rs`、`app/src/plugins/builtin/pet.ts`、`app/src/i18n.ts`、`scripts/build-plugins.ps1`（pet 版本 +1）。
+
+#### §待办 1-4 补 桌宠人格页三张列表「清空」逻辑与提示归一（2026-10-13，本轮）
+
+- **用户口径**：三张列表（事实记忆 / 成长笔记 / 人格建议）的清空点击与成功提示要归一 —— 消除两套点击匹配方式；三张表都显示轻提示且文案各自区分。
+- **A 点击归一（消除两套匹配）**：原先记忆 / 成长走**硬编码 `#pet-memory-clear` / `#pet-growth-clear` 分支**、建议走 `data-pet-clear` 泛化分支 —— 两种匹配方式并存。本轮**删掉**那两段硬编码分支（`pet.ts` 旧 `:2542-2547`），三张表的「清空」按钮统一带 `data-pet-clear`（`memory` / `growth` / `suggest`，`pet.ts:1585` / `:1595` / `:1606`），点击全部由**唯一一支**委托（`pet.ts:2542-2550`）读 `data-pet-clear` → `clearPetList(kind)` 驱动，复用既有 `armedRun` **两段式确认**（4s 超时自动解除，行为不变）。**未改任何命令映射**（`clear_pet_memory` / `clear_pet_growth` / `clear_persona_suggestions` 照旧）、逐条删不受影响；同时删掉仅供旧建议分支使用的 `MSG_SUGGEST_CLEARED` 常量（不留死代码）。
+- **B 三表统一轻提示（文案各自区分）**：`clearPetList` 去掉缺省 `done = ""` 参数，改为从唯一映射 `PET_LIST[k].cleared` 取文案（`pet.ts:1967-1971` + `:2079-2090`）。记忆 / 成长此前「只刷新、无提示」，本轮补上各自文案；建议沿用既有那句，保留「不改核心人格」专项说明：
+  - 事实记忆 → 新增 `pet.memory_cleared`（「已清空事实记忆」）
+  - 成长笔记 → 新增 `pet.growth_cleared`（「已清空成长笔记」）
+  - 人格建议 → **复用** `pet.suggest_cleared`（「已清空建议（核心人格未改动）」）
+  - 确认态文案：记忆 / 成长沿用 `pet.list_clear_armed`（「再点一次清空（不可恢复）」），建议沿用 `pet.suggest_clear_armed`；**未给记忆 / 成长照抄「核心人格未改动」那句**（它们没有该问题，照抄是误导）。
+- **为什么**：三张表同款「清空 + 两段式确认」却有两套点击识别方式（硬编码 id vs `data-pet-clear`）+ 两套提示（一张有、两张无）—— 归一后单一匹配方式、单一映射表、一致的反馈；不变量（命令映射 / 超时行为 / 逐条删）保持不变。
+- **验证结论（逐条退出码）**：`npx tsc --noEmit`（app）**exit 0**；`npm run build`（app）**exit 0**；`npm run verify`（根）**exit 0**（`[8/8]`）；`build-plugins.ps1`（根）**exit 0**（pet **0.9.61**）。dev `Modules\pet\index.js`：`data-pet-clear` 命中 **3** 处（`"memory"` / `"growth"` / `"suggest"` 各 1）、硬编码 `#pet-memory-clear` / `#pet-growth-clear` 分支**已不存在**（按钮 id 各仅 1 处，只作 DOM 标识）；新 key `pet.memory_cleared` / `pet.growth_cleared` 各 **5/5 语言**，`pet.suggest_cleared` 复用。
+- **待真机验收**：① 人格页三张列表各有「清空」按钮，点一次变「再点一次清空…」（建议区为专用文案）、4s 内再点才清空、超时自动还原；② 清空后三张表**都**出现各自轻提示（记忆 / 成长 / 建议文案不同），建议那句含「核心人格未改动」；③ 清空命令映射与逐条删行为与改动前一致；④ 清空人格建议**不改**核心人格 / 事实记忆 / 成长笔记。
+- **涉及文件**：`app/src/plugins/builtin/pet.ts`、`app/src/i18n.ts`、`scripts/build-plugins.ps1`（pet 版本 +1）。
+
+#### §待办 1-4 补 顺带：`publish-plugins.ps1` 开头两份 BOM 归一成一份（2026-10-13）
+
+- **改动点**：`scripts/publish-plugins.ps1` 开头由 `EF BB BF EF BB BF`（两份 BOM）归一为 `EF BB BF`（**恰一份**），**只改前 3 字节、无任何逻辑改动**（现首六字节 = `EF BB BF 23 20 E6`）。
+- **为什么**：多一份 BOM 时首行变成命令、`param` 不再绑定参数（PowerShell 5.1 报「无法将 `#` 项识别为 cmdlet」），且**会让 `npm run verify` 的 `[8/8]` 脚本编码自检 FAIL**（判据：前 3 字节 = `EF BB BF` 且第 4 字节 ≠ `EF`，见 [`testing.md`](./testing.md) §测试 3）。
+- **验证结论**：`npm run verify`（根）**exit 0**（`[8/8]` BOM 自检 18 份通过）。
+- **待真机验收**：无（编码卫生，不影响运行）。
+
 ### §待办 1-5 L5 自研调音 / 音乐插件：剩余与未发布
 - **目标**：调音「全局生效」与在线音乐发布收尾。
 - **已查清**：引擎（`tuning-engine/`，手写 FFT）+ 宿主接线 + 音乐插件调音页（可编辑链 / 预设 / 声道槽 / 卷积 / 延迟 / A-B 盲测）均已落地并实测；在线音乐已并入同一条链（`librespot` `-B pipe -f F32` + `live_audio.rs`）。
