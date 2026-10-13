@@ -89,6 +89,20 @@
 - **待裁定 / 需知晓**：① **LICENSE 冲突**：仓库根 `LICENSE` 为 **MIT**，但随插件分发 **CC-BY-NC** 权重（ZipVoice）与 **GPL-3.0** 数据（espeak-ng-data）—— 二者**不被 MIT 覆盖**；本轮**未擅改 LICENSE**，建议在 `LICENSE` / README 显式声明「随分发的第三方组件各自适用其自身许可，MIT 仅覆盖本项目原创代码」。② **Vocos 授权**：按上游模型卡 MIT 处理，但模型卡原话针对「代码」，严格商用建议复核（已标注）。③ **`espeak-ng-data` 体积 17,991,651 B（约 17 MB）**：本轮**保留全语言**；若需裁剪须另行评估「修改版」义务。④ 本轮**未 +1** `pet` 的 `version`（`build-plugins.ps1:168`，仍 0.9.53）：加依赖属插件变更，若要市场判为「有更新」需用户拍板是否 +1 并 `publish-plugins.ps1`。
 - **涉及文件**：`scripts/build-plugins.ps1`、`README.md`、`licenses\zipvoice\`（新增 7 个纯文本）；产物（gitignore、不入库）：`release\deps\zipvoice\_stage\zipvoice\`、`release\deps\zipvoice\zipvoice-1.13.8.7z`。
 
+#### §待办 1-4 补 桌宠 TTS 并存切换：Supertonic 通路 —— **已下架（2026-10-13，用户裁决）**
+
+- **裁决 / 来源**：**用户 2026-10-13 亲耳确认**后裁决 —— **干净下架**上一阶段「阶段 1」的 Supertonic 通路**全部改动**（资产依赖 / 后端 `engine` 分支 / 前端引擎与音色控件 / i18n key / `licenses\supertonic\`）。
+- **⚠️ 下架原因（保留结论）**：**Supertonic 官方 31 语言表不含中文（`zh`）** —— `lang="zh"` 会被 sherpa-onnx 直接拒绝（打印 `Invalid language: zh` 并返回空音频）；汉字文本虽能在 `lang="en"`（不传 `lang` 时内部缺省 `en`）下**出声**，但模型 `tts.json` 的 `n_langs=0` / `lang_emb_dim=0`（**无语言条件**）、文本被 `<en>…</en>` 包裹后按**裸字符 id** 送入 ⇒ **汉字走兜底发音，中文听感「按日文读」**（用户已亲耳确认）⇒ **中文场景直接弃用**。（原实测的「时长随字数近似线性、常用汉字均被 `unicode_indexer.bin` 索引、非静音」等数据仍为真，但**听感不达标是决定性的**。）
+- **保留（与引擎无关、且已被实证必要）**：① **确定性 DLL 加载** —— `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`；理由：ZipVoice 同样依赖 `onnxruntime.dll`，走标准搜索序会命中 System32 的 1.17.1（低于 sherpa 1.13.8 要求的 1.26）⇒ `0xC0000005`。② 常驻诊断日志（`zipvoice: onnxruntime path=… version=…`）。
+- **保留（外部）**：公开插件仓库的 Release 资产 **`supertonic-3-tts-int8-2026-05-11` 未删除**（无害，便于将来复活）。
+- **ZipVoice 未受影响**：参考音频链路与用户新增的 **4 个参考音频单测**（`import_accepts_at_max_rejects_just_over` / `import_resamples_to_target_rate_preserving_duration` / `scale_guard_flags_oversized_reference` / `old_oversized_cache_is_blocked_before_engine`）**逐字保留**；参考音频**时长上限保持现状**（`REF_MAX_SECS = 10.0`，未改）。
+- **版本处理**：`scripts/build-plugins.ps1` 的 pet 版本**保持 0.9.63**（0.9.63 从未发布，不回退以免与可能已构建的产物混淆）。
+- **本轮回退涉及文件**：`app/src-tauri/src/tts_zipvoice.rs`、`app/src-tauri/src/main.rs`（命令注册）、`app/src/plugins/builtin/pet.ts`、`app/src/i18n.ts`、`scripts/build-plugins.ps1`（pet 依赖表 + 发布提示）；**删除** `licenses\supertonic\`（3 个纯文本）。
+- **历史存档（原「阶段 1」要点，均已移除）**：Supertonic 3 **合成期不吃参考音频**（预置音色 `sid` 0–4=F1..F5 / 5–9=M1..M5 + 自建音色 `custom_voice`），语言经 `GenerationConfig.extra={"lang":…}` 传入 —— 本可**整类消除** ZipVoice 那条「192 kHz × 29.2 s 旧缓存触发 `0xc0000005`」的崩溃类；另含「音色 JSON → `voice.bin`」纯函数打包器 `pack_voice_bin` / 落盘 `write_supertonic_voice` 与新命令 `import_supertonic_voice`；`PetVoiceConfig` 的新字段 `engine` / `sid` / `lang` / `custom_voice` 亦一并移除（回到阶段 1 之前的结构；serde 默认忽略未知字段，老 `pet-voice.json` 仍可解析、无兼容问题）。
+- **注**：`tts_zipvoice.rs` 里**仍保留** FFI 结构 `OfflineTtsSupertonicModelConfig` 及 `OfflineTtsModelConfig.supertonic` 字段（置零）—— 那是 sherpa-onnx 1.13.8 的 **ABI 布局要求**（少字段 ⇒ 结构偏移错位、`SherpaOnnxCreateOfflineTts` 崩溃），**非功能残留**。
+
+
+
 #### §待办 1-4 补 桌宠「试听」闪退根因 + 打包「下载污染」闸门（2026-10-12）
 
 - **用户报障**：桌宠设置里点「试听」→ 应用直接闪退。

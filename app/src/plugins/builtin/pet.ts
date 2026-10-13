@@ -623,10 +623,14 @@ function clampVoiceVolume(v: number): number {
   return Math.min(VOICE_VOLUME_MAX, Math.max(VOICE_VOLUME_MIN, Math.round(v * 100) / 100));
 }
 
+/** 宿主 `reason_for` 会返回的**全部**机器可读 key（见 `tts_zipvoice::reason_for`）。
+ *  前端只把这些翻成文案（`pet.tts_reason_<key>`）；其余（不该出现）原样显示，绝不吞掉。 */
+const PET_VOICE_REASONS = ["disabled", "no_ref_audio", "no_ref_text", "ref_missing", "ref_out_of_spec", "assets_missing"];
+
 /** 「语音朗读」开关区块（设置窗，2026-10-10；2026-10-12 加参考音色导入入口）。
  *  **默认开** —— 用户要「读出其输出」；关掉后桌宠窗收到最终回复也不再朗读。
- *  合成与出声都在宿主（WebView 放不出声音，见 archive ai-spec §4.6），用的是 **ZipVoice 参考音色**：
- *  参考音频 + 那句参考文本都写进 `config\pet-voice.json`（`set_pet_voice`，**共用同一份配置**）。
+ *  合成与出声都在宿主（WebView 放不出声音，见 archive ai-spec §4.6），**引擎是 ZipVoice 零样本克隆**：
+ *   · 用**你导入的参考音色**朗读（参考音频 + 那句参考文本写进 `config\pet-voice.json`）。
  *  **静默语义**：配置不齐 / 资产缺失 / 合成失败时**不朗读、不弹错**（见 src/tts.rs 文件头）。
  *  **三条拉条相互独立**（用户 2026-10-12 口径）：打字速度（本插件 `PetConfig.speechRate`，只驱动
  *  逐字动画）/ 语音语速（宿主 `PetVoiceConfig.speed`）/ 语音音量（宿主 `PetVoiceConfig.volume`）。 */
@@ -652,16 +656,18 @@ function ttsBlock(cfg: PetConfig): string {
       <input type="range" id="pet-tts-volume" class="pet-range" min="${VOICE_VOLUME_MIN}" max="${VOICE_VOLUME_MAX}" step="0.05" value="${VOICE_VOLUME_DEFAULT}" aria-label="${esc(t("pet.tts_volume_label"))}">
       <span class="pet-val" id="pet-tts-volume-val">${Math.round(VOICE_VOLUME_DEFAULT * 100)}%</span>
     </div>
-    <div class="pet-tts-voice">
+    <div class="pet-tts-voice" id="pet-tts-voice">
       <span class="pet-label">${esc(t("pet.tts_voice_label"))}</span>
       <input type="text" id="pet-tts-reftext" class="pet-tts-text" autocomplete="off" spellcheck="false" placeholder="${esc(t("pet.tts_ref_text_ph"))}" aria-label="${esc(t("pet.tts_voice_label"))}">
       <div class="pet-row">
         <button type="button" id="pet-tts-addfile" class="pet-btn pet-btn-primary">${esc(t("pet.tts_add_audio"))}</button>
-        <button type="button" id="pet-tts-preview" class="pet-btn">${esc(t("pet.tts_preview"))}</button>
       </div>
-      <div class="pet-note" id="pet-tts-status"></div>
-      <div class="pet-note" id="pet-tts-msg"></div>
     </div>
+    <div class="pet-row pet-tts-actions">
+      <button type="button" id="pet-tts-preview" class="pet-btn">${esc(t("pet.tts_preview"))}</button>
+    </div>
+    <div class="pet-note" id="pet-tts-status"></div>
+    <div class="pet-note" id="pet-tts-msg"></div>
   </div>`;
 }
 
@@ -2790,9 +2796,9 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     };
   }
 
-  // ── 语音「参考音色」导入 / 状态回显（2026-10-12）──────────────────────
-  // 状态来自宿主 `get_pet_voice`（配置 + 是否可用 + 不可用原因）；参考文本与音色路径都经
-  // `set_pet_voice` 写 `config\pet-voice.json`（**共用同一份 PetVoiceConfig，不新增第二套**）。
+  // ── 语音「参考音色」导入 / 状态回显（2026-10-12）──────────────────────────────
+  // 状态来自宿主 `get_pet_voice`（配置 + 是否可用 + 不可用原因）；参考文本 / 音色路径
+  // 都经 `set_pet_voice` 写 `config\pet-voice.json`（**共用同一份 PetVoiceConfig，不新增第二套**）。
   // 「不可用原因」是宿主给的**机器可读 key**，这里翻成文案（见 i18n 的 pet.tts_reason_*）。
   interface PetVoiceCfg {
     enabled: boolean;
@@ -2928,8 +2934,7 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     void invoke("tts_speak", { text: t("pet.tts_preview_text"), enabled: true }).catch(e => {
       const key = e instanceof Error ? e.message : String(e);
       // 已知原因 key 走 i18n（复用状态行那组 pet.tts_reason_*）；其余（不该出现）原样显示，绝不吞掉。
-      const known = ["disabled", "no_ref_audio", "no_ref_text", "ref_missing", "assets_missing"];
-      const shown = known.includes(key) ? t("pet.tts_reason_" + key) : key;
+      const shown = PET_VOICE_REASONS.includes(key) ? t("pet.tts_reason_" + key) : key;
       if (msg) {
         msg.textContent = shown;
         msg.className = "pet-note";
@@ -3568,6 +3573,7 @@ const PET_CSS = `
 .pet-tts-voice{margin-top:10px;padding-top:10px;border-top:1px solid var(--border-glass);}
 .pet-tts-voice .pet-label{display:block;margin-bottom:6px;}
 .pet-tts-voice .pet-row{margin-top:8px;}
+.pet-tts-actions{margin-top:8px;}
 .pet-tts-text{display:block;width:100%;box-sizing:border-box;font:inherit;font-size:.72rem;color:var(--text);background:rgba(var(--shade-rgb),calc(0.3 * var(--shade-scale)));border:1px solid var(--border-glass);border-radius:5px;padding:6px 8px;outline:none;caret-color:rgb(var(--other-overlay-rgb));}
 .pet-tts-text:focus{border-color:rgba(var(--btn-line-rgb), var(--btn-line-alpha));}
 .pet-tts-ok{color:var(--green);}

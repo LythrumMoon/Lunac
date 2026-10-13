@@ -1,7 +1,9 @@
-// ── tts_zipvoice.rs — 桌宠语音的 **ZipVoice 零样本克隆** 通路（2026-10-10）────────
+// ── tts_zipvoice.rs — 桌宠语音的**合成通路**（2026-10-10）────────────────────
 //
-// **它解决什么**：本文件是桌宠语音**唯一的合成通路**（2026-10-12 起去掉了 WinRT 系统音色兜底，
-// 见 `tts.rs` 文件头）。给一段 **3~30 秒**参考音频 + 那句参考文本，ZipVoice 就能用该音色朗读任意文本。
+// **引擎：ZipVoice 零样本克隆** —— 给一段 **3~10 秒**参考音频 + 那句参考文本，就能用该音色朗读任意
+// 文本（上限 10 秒见 `REF_MAX_SECS`；参考音频导入时**重采样 24 kHz 单声道**，见 `REF_TARGET_SR`）。
+// **合成期吃参考音频** ⇒ 参考音频规格越界会触发 sherpa 内部 AV（见规模守卫）。（2026-10-12 起去掉了
+// WinRT 系统音色兜底，见 `tts.rs` 文件头。）
 //
 // **为什么是「运行期加载 DLL」而不是 `cargo add sherpa-onnx`**：
 // 本项目用 `x86_64-pc-windows-gnu`（MinGW）工具链，而 sherpa-onnx 的 Rust crate 下的是
@@ -22,17 +24,24 @@
 // **常驻**：模型只加载一次（`TTS` 里的 `OnceLock`），之后每次朗读只花合成时间。
 // 失败一律**静默不读**（见 `tts.rs`）—— 朗读是锦上添花，不该把气泡带崩。
 //
-// **音色库缓存（2026-10-12）**：用户经设置窗导入的参考音频，会被**规整成 PCM16 WAV** 复制进
-// `config\pet-voices\`（见 `import_pet_voice_audio`）—— 原文件被移动 / 删除后朗读照常。
-// 目录卫生：只保留最近一次导入的那一份副本（见 `prune_voice_cache`）。
+// **音色库缓存（2026-10-12）**：用户经设置窗导入的参考音频，会被**规整成 24 kHz 单声道 PCM16 WAV**
+// （重采样到模型原生率，见 `REF_TARGET_SR`）复制进 `config\pet-voices\`（见 `import_pet_voice_audio`）
+// —— 原文件被移动 / 删除后朗读照常。目录卫生：只保留最近一次导入的那一份副本（见 `prune_voice_cache`）。
+//
+// **规模守卫（2026-10-13）**：参考音频**规格越界**（时长 / 样本数超限，或磁盘上残留的旧缓存如
+// 192 kHz × 29.2 s）一律在**进引擎前**挡掉 —— 超规格输入会让 sherpa 内部在崩溃性内存拷贝上
+// `0xc0000005` AV。见 `REF_MAX_SECS` / `MAX_REF_SAMPLES` 与 `ref_exceeds_scale`。
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_float, c_void, CString};
+use std::ffi::{c_char, c_float, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use libloading::os::windows::{
+    Library as WinLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+};
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +127,10 @@ struct OfflineTtsPocketModelConfig {
     voice_embedding_cache_capacity: i32,
 }
 
+// ⚠️ **ABI 保留（勿删）**：本结构是 sherpa-onnx 1.13.8 `SherpaOnnxOfflineTtsModelConfig` 的一个字段
+// （逐字段抄自官方 bindgen 产物，**内存布局必须一致**）。本宿主已不使用 Supertonic 引擎，但**仍须保留
+// 此字段**并在装配配置时置零（`mem::zeroed()`）—— 否则 `OfflineTtsModelConfig` 整体尺寸 / 偏移与 DLL
+// 期望不符，`SherpaOnnxCreateOfflineTts` 会读到错位内存而崩溃。
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct OfflineTtsSupertonicModelConfig {
@@ -188,10 +201,92 @@ type GenFn = unsafe extern "C" fn(
 ) -> *const GeneratedAudio;
 type DestroyAudioFn = unsafe extern "C" fn(*const GeneratedAudio);
 
-// `onnxruntime.dll` 等依赖必须先被找到 —— 加载前把 DLL 目录塞进搜索路径。
+// Win32 裸 FFI（kernel32）：确定性加载 DLL + 「实际加载了哪份依赖」的探针。
+// ⚠️ 同一个 Win32 符号在本 crate 里**只能有一种声明**（见 `win_proc.rs` 顶部）——
+// 以下符号全仓仅此处声明。
 #[link(name = "kernel32")]
 extern "system" {
-    fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
+    /// 取**已加载**模块的句柄（未加载返回 NULL，**不触发加载** ⇒ 探针里是安全只读操作）。
+    fn GetModuleHandleW(lpModuleName: *const u16) -> *mut c_void;
+    /// 取模块**全路径**；`nSize` 是 `lpFilename` 的 u16 个数，返回写入的字符数（不含结尾 NUL）。
+    fn GetModuleFileNameW(hModule: *mut c_void, lpFilename: *mut u16, nSize: u32) -> u32;
+    /// 取已加载模块的导出符号地址。
+    fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+}
+
+// ONNX Runtime 的 C API 基址表 —— 仅探针用来读版本。
+// C 定义：`const OrtApiBase* OrtGetApiBase(void);`，
+// `struct OrtApiBase { const OrtApi*(*GetApi)(uint32_t); const char*(*GetVersionString)(void); }`。
+// `get_api` 字段虽不用，但保留它才能让 `get_version_string` 落在正确偏移上。
+#[repr(C)]
+struct OrtApiBase {
+    get_api: unsafe extern "system" fn(u32) -> *const c_void,
+    get_version_string: unsafe extern "system" fn() -> *const c_char,
+}
+type OrtGetApiBaseFn = unsafe extern "system" fn() -> *const OrtApiBase;
+
+/// 取**已加载**模块的绝对路径（`GetModuleHandleW` + `GetModuleFileNameW`）。取不到返回 `None`。
+unsafe fn loaded_module_path(name: &str) -> Option<String> {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    let hmod = GetModuleHandleW(wide.as_ptr());
+    if hmod.is_null() {
+        return None;
+    }
+    // 32768 = 长路径上限（含 `\\?\` 前缀），足够容纳任何模块路径。
+    let mut buf = vec![0u16; 32768];
+    let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32);
+    if n == 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(String::from_utf16_lossy(&buf))
+}
+
+/// 经**已加载**的模块取 ORT 版本串（`OrtGetApiBase()->GetVersionString()`）。
+/// 任何一步拿不到（模块未加载 / 无该导出 / 返回空指针）一律 `None` —— **不 panic**。
+unsafe fn loaded_ort_version(name: &str) -> Option<String> {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    let hmod = GetModuleHandleW(wide.as_ptr());
+    if hmod.is_null() {
+        return None;
+    }
+    let proc = GetProcAddress(hmod, b"OrtGetApiBase\0".as_ptr());
+    if proc.is_null() {
+        return None;
+    }
+    // 与 `OrtGetApiBase` 的 C 签名一致：返回 `const OrtApiBase*`。
+    let get_api_base: OrtGetApiBaseFn = std::mem::transmute(proc);
+    let base = get_api_base();
+    if base.is_null() {
+        return None;
+    }
+    let ver = ((*base).get_version_string)();
+    if ver.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(ver).to_string_lossy().into_owned())
+}
+
+/// **探针 1（常驻，诊断价值高，仅一行日志）**：打印**实际**被映射进来的 `onnxruntime.dll`
+/// 全路径与版本。
+///
+/// 动机（2026-10-13）：机器上有两份 `onnxruntime.dll`（随包 ORT 1.28.2 / System32 ORT 1.17），
+/// sherpa 1.13.8 要求 **ORT ≥ 1.26**。加载已走确定性方式（见 `create_session`），但「随包
+/// 那一份到底有没有被选中」只能靠运行时证据 —— 这里把它落成日志。任何字段取不到打 `n/a`。
+fn log_loaded_onnxruntime() {
+    let (path, version) = unsafe {
+        (
+            loaded_module_path("onnxruntime.dll"),
+            loaded_ort_version("onnxruntime.dll"),
+        )
+    };
+    crate::log::info(format!(
+        "zipvoice: onnxruntime path={} version={}",
+        path.as_deref().unwrap_or("n/a"),
+        version.as_deref().unwrap_or("n/a"),
+    ));
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -317,21 +412,20 @@ fn read_head(p: &Path, n: usize) -> Option<Vec<u8>> {
 /// （真实件：`sherpa-onnx-c-api.dll` 4.6 MB / `onnxruntime.dll` 17.8 MB / 三个 onnx 均 > 5 MB）。
 const ASSET_MIN_BYTES: u64 = 1024;
 
+/// 文件体积过下限（拦空 / 近空残file）。`is_pe` / `is_onnx` 共用这一个判据。
+fn size_at_least(p: &Path, min: u64) -> bool {
+    std::fs::metadata(p).map(|m| m.len() >= min).unwrap_or(false)
+}
+
 /// 是不是可加载的 **PE**（DLL）：以 `MZ`（`4D 5A`）开头且体积过下限。
 fn is_pe(p: &Path) -> bool {
-    if std::fs::metadata(p).map(|m| m.len() < ASSET_MIN_BYTES).unwrap_or(true) {
-        return false;
-    }
-    matches!(read_head(p, 2), Some(b) if b.as_slice() == b"MZ")
+    size_at_least(p, ASSET_MIN_BYTES) && matches!(read_head(p, 2), Some(b) if b.as_slice() == b"MZ")
 }
 
 /// 是不是 **ONNX** 模型：`ModelProto` 首字段是 `ir_version`（field 1, varint）⇒ 首字节恒为 **0x08**；
 /// 再要体积过下限，排除空 / 截断残file。
 fn is_onnx(p: &Path) -> bool {
-    if std::fs::metadata(p).map(|m| m.len() < ASSET_MIN_BYTES).unwrap_or(true) {
-        return false;
-    }
-    matches!(read_head(p, 1), Some(b) if b.first() == Some(&0x08u8))
+    size_at_least(p, ASSET_MIN_BYTES) && matches!(read_head(p, 1), Some(b) if b.first() == Some(&0x08u8))
 }
 
 /// 指定目录下的 ZipVoice 资产是否**可用**（两个 DLL 是 PE、三个 onnx 是 ONNX，且都非近空）。
@@ -350,7 +444,7 @@ fn dir_assets_ready(dir: &Path) -> bool {
         && is_onnx(&dir.join("vocos_24khz.onnx"))
 }
 
-/// 资产是否齐备（运行库 + 模型 + vocoder，且**头字节合法**）。任一不合格 = 这条通路不可用。
+/// 当前资产是否齐备（供命令 / 前端看的无参入口）。
 pub fn assets_ready() -> bool {
     dir_assets_ready(&zipvoice_dir())
 }
@@ -363,14 +457,31 @@ fn voices_dir() -> PathBuf {
         .join("pet-voices")
 }
 
-/// ZipVoice 参考音频的**可用时长区间（秒）** —— 出处见本文件文件头（3~30 秒）。
+/// ZipVoice 参考音频的**可用时长区间（秒）**。
+///
+/// 上限 **10** 的出处：官方 ZipVoice 仓库（k2-fsa/ZipVoice）README「Prompt length」写明参考 prompt
+/// 应**很短**（单人 < 3 秒 / 对话 < 10 秒），「a very long prompt will slow down the inference and
+/// degenerate the speech quality」；sherpa-onnx v1.13.8 官方示例音频 `leijun-1.wav` 实测为
+/// **24 kHz / 单声道 / 16-bit / 6.06 秒**。取 10 秒作上限：既容纳官方 6 秒示例，也贴住官方「过长为界」。
+/// 下限沿用 3 秒（原业务下限，本次不动）。
 pub const REF_MIN_SECS: f64 = 3.0;
-pub const REF_MAX_SECS: f64 = 30.0;
+pub const REF_MAX_SECS: f64 = 10.0;
+
+/// ZipVoice 参考音频的**目标采样率（Hz）**：模型元数据 `sample_rate = 24000`，声码器为
+/// `vocos_24khz`（见文件头与官方 v1.13.8 `sherpa-onnx/csrc/offline-tts-zipvoice-model-meta-data.h`）。
+/// 导入时把参考音频**重采样到此率**再落缓存（见 `import_voice_file`）。
+pub const REF_TARGET_SR: i32 = 24000;
+
+/// 送进引擎的参考音频**样本数硬上限**（兜底守卫，与 `REF_MAX_SECS` 同口径）：
+/// **目标率 24 kHz × 上限 10 秒 = 240 000**。历史缓存 / 手改配置指向的超规格 wav（如用户磁盘上那条
+/// 192 kHz × 29.2 s = 5 613 276 样本的旧缓存）据此在**进引擎前**挡掉（见 `ref_exceeds_scale`）。
+pub const MAX_REF_SAMPLES: usize = 240_000;
 
 /// 不可用的原因（**机器可读 key**，供前端本地化成文案）。空串 = 可用。
 ///
-/// 取值：`disabled` / `no_ref_audio` / `no_ref_text` / `ref_missing` / `assets_missing`。
-/// `speak_blocking` 的**静默不读**判据就是它非空（见 `tts.rs`）。
+/// key 集合：`disabled` / `no_ref_audio` / `no_ref_text` / `ref_missing` / `ref_out_of_spec` /
+/// `assets_missing`。前端 i18n 的 `pet.tts_reason_*` 列表需与这里对齐（见 `pet.ts` 的
+/// `PET_VOICE_REASONS`）。`speak_blocking` 的**静默不读**判据就是它非空（见 `tts.rs`）。
 fn reason_for(cfg: &PetVoiceConfig, assets_ready: bool) -> String {
     if !cfg.enabled {
         return "disabled".into();
@@ -381,8 +492,15 @@ fn reason_for(cfg: &PetVoiceConfig, assets_ready: bool) -> String {
     if cfg.reference_text.trim().is_empty() {
         return "no_ref_text".into();
     }
-    if !Path::new(cfg.reference_audio.trim()).is_file() {
+    let ref_path = Path::new(cfg.reference_audio.trim());
+    if !ref_path.is_file() {
         return "ref_missing".into();
+    }
+    // 参考音频**规格越界**（磁盘上残留的旧缓存 / 手改配置指向的超规格 wav）：按文件体积**廉价**
+    // 判定（读元数据，不解码）。要求用户重新导入 —— **绝不**把它送进引擎（`speak` 侧还有一道按
+    // 实际样本数的硬守卫，见 `ref_exceeds_scale`）。
+    if ref_file_exceeds_scale(ref_path) {
+        return "ref_out_of_spec".into();
     }
     if !assets_ready {
         return "assets_missing".into();
@@ -390,13 +508,28 @@ fn reason_for(cfg: &PetVoiceConfig, assets_ready: bool) -> String {
     String::new()
 }
 
+/// 参考音频**解码后样本数**是否超出可送入引擎的上限（`MAX_REF_SAMPLES`）。这是 `speak` 的
+/// **运行时硬守卫**，兜住任何人绕过导入（历史缓存 / 手改配置）直接指向超规格 wav 的情况。
+fn ref_exceeds_scale(n_samples: usize) -> bool {
+    n_samples > MAX_REF_SAMPLES
+}
+
+/// 参考音频**文件体积**是否超出「规整后上限」。仅用于 `reason_for` 的**廉价**越界判据（读文件
+/// 元数据，不解码整个 wav）—— PCM16 WAV 体积 ≈ 44 字节头 + 每样本 2 字节，故上限取
+/// `MAX_REF_SAMPLES × 2 + 4096`（余量留给可能存在的额外 RIFF chunk）。体积越界 ⇒ 该文件**不可能**
+/// 是规整后的缓存（那是按导入规则生成的）⇒ 判超规格、要求重新导入。
+fn ref_file_exceeds_scale(path: &Path) -> bool {
+    const MAX_BYTES: u64 = (MAX_REF_SAMPLES as u64) * 2 + 4096;
+    std::fs::metadata(path).map(|m| m.len() > MAX_BYTES).unwrap_or(false)
+}
+
 /// 这条通路此刻**能不能用**（给命令 / 前端看的完整判据）。
 pub fn available() -> bool {
     reason_for(&load_config(), assets_ready()).is_empty()
 }
 
-/// 语音**此刻不可用**的原因 key（与 `get_pet_voice` 的 `PetVoiceStatus.reason` **同一套**：
-/// `disabled` / `no_ref_audio` / `no_ref_text` / `ref_missing` / `assets_missing`）；可用时返回 `None`。
+/// 语音**此刻不可用**的原因 key（与 `get_pet_voice` 的 `PetVoiceStatus.reason` **同一套**，
+/// 见 `reason_for`）；可用时返回 `None`。
 ///
 /// 供**用户主动触发**的调用方（设置窗「试听」按钮，见 `tts.rs::tts_speak`）当场据此提示；
 /// 桌宠**自动朗读**那条路径不看它 —— 仍是**静默不读**（用户 2026-10-12 裁决）。
@@ -431,20 +564,20 @@ fn tts_slot() -> &'static Mutex<Option<TtsSession>> {
     TTS.get_or_init(|| Mutex::new(None))
 }
 
-/// 句柄变动（换了线程数 / 模型目录）⇒ 作废重来。这里只按线程数记一个简单指纹。
-static TTS_FINGERPRINT: OnceLock<Mutex<i64>> = OnceLock::new();
+/// 会话指纹（换了**线程数**）⇒ 作废重来。参考音频是**每次生成**的参数、不进指纹。
+static TTS_FINGERPRINT: OnceLock<Mutex<String>> = OnceLock::new();
 
-fn fingerprint_of(cfg: &PetVoiceConfig) -> i64 {
-    cfg.num_threads as i64
+fn fingerprint_of(cfg: &PetVoiceConfig) -> String {
+    format!("zipvoice:{}", cfg.num_threads)
 }
 
 /// 取（必要时**建**）常驻会话。失败不缓存 —— 用户补上文件后应当能再试。
 fn ensure_session(cfg: &PetVoiceConfig) -> Result<(), String> {
     let fp = fingerprint_of(cfg);
-    let fp_slot = TTS_FINGERPRINT.get_or_init(|| Mutex::new(i64::MIN));
+    let fp_slot = TTS_FINGERPRINT.get_or_init(|| Mutex::new(String::new()));
     {
         let guard = tts_slot().lock().map_err(|_| "TTS 锁中毒".to_string())?;
-        let cur = *fp_slot.lock().map_err(|_| "TTS 锁中毒".to_string())?;
+        let cur = fp_slot.lock().map_err(|_| "TTS 锁中毒".to_string())?.clone();
         if guard.is_some() && cur == fp {
             return Ok(());
         }
@@ -459,18 +592,34 @@ fn ensure_session(cfg: &PetVoiceConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
-    let dir = zipvoice_dir();
-    let model = dir.join("model");
-    let dll_path = dir.join("sherpa-onnx-c-api.dll");
+/// 路径 → UTF-8 `CString`（含 NUL 的路径给可读错误）。**在 create 调用期间必须存活**。
+fn path_cstring(x: PathBuf) -> Result<CString, String> {
+    CString::new(x.to_string_lossy().as_bytes()).map_err(|e| format!("路径含 NUL：{e}"))
+}
 
-    // 先把 DLL 目录塞进搜索路径，`onnxruntime.dll` 才找得到。
-    let mut wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(dir.as_os_str()).collect();
-    wide.push(0);
-    unsafe { SetDllDirectoryW(wide.as_ptr()) };
+/// 加载一次 sherpa-onnx 运行库并取齐 4 个函数指针（`<pet>\zipvoice\sherpa-onnx-c-api.dll`）。
+fn load_sherpa() -> Result<(Library, CreateFn, DestroyFn, GenFn, DestroyAudioFn), String> {
+    let dll_path = zipvoice_dir().join("sherpa-onnx-c-api.dll");
 
-    let lib = unsafe { Library::new(&dll_path) }
+    // **确定性加载**（2026-10-13）：走 `LoadLibraryExW(file, NULL, flags)`（经 libloading 的
+    // `os::windows::Library::load_with_flags`），flags =
+    // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`。
+    // 前者把 **sherpa 所在目录**（= zipvoice 目录）置于**依赖搜索最前** ⇒ 保证 sherpa 链接的
+    // `onnxruntime.dll` 从 zipvoice 目录取，而不是被 System32 里 Windows 自带的旧版（1.17，低于
+    // sherpa 1.13.8 要求的 1.26）抢走；后者保留「应用目录 / System32 / 用户目录」作兜底。
+    //
+    // **不再用 `SetDllDirectoryW`**：它改的是**进程级**默认搜索路径（对全进程后续所有加载生效），
+    // 而上面的 flags 是**单次加载**级、语义更窄更准；两套并存属语义重复，且前者带全局副作用，故移除。
+    // **不调 `SetDefaultDllDirectories`**：`LOAD_LIBRARY_SEARCH_*` 在 Windows 8+（含本目标的
+    // Windows 10/11）原生支持、无需前置调用；而 `SetDefaultDllDirectories` 会把**当前目录 / PATH**
+    // 从全进程默认搜索路径里剔掉 —— 那会改变宿主其它组件的加载行为，超出本次范围，故不采用。
+    let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    let win_lib = unsafe { WinLibrary::load_with_flags(&dll_path, flags) }
         .map_err(|e| format!("加载 sherpa-onnx-c-api.dll 失败：{e}"))?;
+    let lib: Library = win_lib.into();
+
+    // 探针 1（常驻）：sherpa 已加载 ⇒ 其依赖 `onnxruntime.dll` 已解析，打印**实际**命中的那一份。
+    log_loaded_onnxruntime();
 
     let create: Symbol<CreateFn> = unsafe { lib.get(b"SherpaOnnxCreateOfflineTts\0") }
         .map_err(|e| format!("找不到 SherpaOnnxCreateOfflineTts：{e}"))?;
@@ -482,25 +631,34 @@ fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
     let destroy_audio: Symbol<DestroyAudioFn> =
         unsafe { lib.get(b"SherpaOnnxDestroyOfflineTtsGeneratedAudio\0") }
             .map_err(|e| format!("找不到 SherpaOnnxDestroyOfflineTtsGeneratedAudio：{e}"))?;
+    // 先把 4 个函数指针**拷出来**、再显式释放 `Symbol`（它们借用 `lib`）—— 否则下面把 `lib`
+    // 移进返回值时会撞 `E0505`（`Symbol` 的借用尚未结束）。函数指针的有效期由 `lib` 决定。
+    let fns = (*create, *destroy, *generate, *destroy_audio);
+    drop((create, destroy, generate, destroy_audio));
+    Ok((lib, fns.0, fns.1, fns.2, fns.3))
+}
 
-    // 路径全部转 UTF-8 CString；**在 create 调用期间必须存活**。
-    let p = |x: PathBuf| -> Result<CString, String> {
-        CString::new(x.to_string_lossy().as_bytes()).map_err(|e| format!("路径含 NUL：{e}"))
-    };
-    let c_tokens = p(model.join("tokens.txt"))?;
-    let c_encoder = p(model.join("encoder.int8.onnx"))?;
-    let c_decoder = p(model.join("decoder.int8.onnx"))?;
-    let c_vocoder = p(dir.join("vocos_24khz.onnx"))?;
-    let c_data = p(model.join("espeak-ng-data"))?;
-    let c_lexicon = p(model.join("lexicon.txt"))?;
+/// 建一份常驻会话 —— 装配 ZipVoice 模型配置。失败给可读错误、**不 panic**（本模块纪律）。
+fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
+    let (lib, create, destroy, gen, destroy_audio) = load_sherpa()?;
     // 不用 `unwrap()`：这是**试听路径**上的 panic 点（`"cpu"` 恒无 NUL、实际不会触发，但不留
     // panic）—— 本模块纪律是「失败给可读错误，不 panic、不 abort」。
     let c_provider = CString::new("cpu").map_err(|_| "provider 名非法".to_string())?;
+    let num_threads = cfg.num_threads.clamp(1, 32);
 
+    // 各路径 CString **在 create 调用期间必须存活** ⇒ 绑在此作用域内直到 `create(&conf)` 返回。
+    let dir = zipvoice_dir();
+    let model = dir.join("model");
+    let c_tokens = path_cstring(model.join("tokens.txt"))?;
+    let c_encoder = path_cstring(model.join("encoder.int8.onnx"))?;
+    let c_decoder = path_cstring(model.join("decoder.int8.onnx"))?;
+    let c_vocoder = path_cstring(dir.join("vocos_24khz.onnx"))?;
+    let c_data = path_cstring(model.join("espeak-ng-data"))?;
+    let c_lexicon = path_cstring(model.join("lexicon.txt"))?;
     let conf = OfflineTtsConfig {
         model: OfflineTtsModelConfig {
             vits: unsafe { std::mem::zeroed() },
-            num_threads: cfg.num_threads.clamp(1, 32),
+            num_threads,
             debug: 0,
             provider: c_provider.as_ptr(),
             matcha: unsafe { std::mem::zeroed() },
@@ -518,6 +676,8 @@ fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
                 target_rms: 0.1,
                 guidance_scale: 1.0,
             },
+            // `pocket` / `supertonic` 是本仓库不用的引擎字段，但**必须保留**（ABI：布局不能少字段，
+            // 见 `OfflineTtsSupertonicModelConfig` 上的注释）—— 置零即可。
             pocket: unsafe { std::mem::zeroed() },
             supertonic: unsafe { std::mem::zeroed() },
         },
@@ -526,16 +686,16 @@ fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
         rule_fars: std::ptr::null(),
         silence_scale: 0.0,
     };
-
     let handle = unsafe { create(&conf) };
+
     if handle.is_null() {
-        return Err("创建 ZipVoice 会话失败（模型文件或参数有问题）".into());
+        return Err("创建语音会话失败（模型文件或参数有问题）".into());
     }
     Ok(TtsSession {
         handle,
-        gen: *generate,
-        destroy: *destroy,
-        destroy_audio: *destroy_audio,
+        gen,
+        destroy,
+        destroy_audio,
         _lib: lib,
     })
 }
@@ -544,29 +704,38 @@ fn create_session(cfg: &PetVoiceConfig) -> Result<TtsSession, String> {
 //  朗读
 // ══════════════════════════════════════════════════════════════════
 
-/// 用 ZipVoice 合成 `text` 并播放。**阻塞**（在后台线程里跑）。
+/// 合成 `text` 并播放。**阻塞**（在后台线程里跑）。吃参考音频（规格越界当场挡下）。
 /// `app` 只用来把**口型包络**下发给桌宠窗（见 `tts::play_wav_bytes`）。
 pub fn speak(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
     let cfg = load_config();
     if !cfg.enabled {
-        return Err("ZipVoice 未启用".into());
+        return Err("语音朗读未启用".into());
     }
     // **资产前置守卫**（2026-10-13）：缺 / 坏资产 ⇒ 当场返回可读错误，**绝不**把它们喂进
     // ONNX Runtime（那会以未捕获的 C++ 异常把宿主进程带走，见 `dir_assets_ready`）。
     // `available()`（调用方的前置校验）已经拦过一道；这里是**直接调用 `speak`** 时的第二道保险。
-    if !assets_ready() {
+    if !dir_assets_ready(&zipvoice_dir()) {
         return Err("语音组件未就绪（资产缺失或损坏）".into());
     }
+
     let ref_path = cfg.reference_audio.trim();
     if ref_path.is_empty() {
         return Err("未配置参考音频".into());
     }
     let (ref_samples, ref_sr) = read_wav_mono(Path::new(ref_path))?;
+    // **规模守卫（兜底，治本）**：参考音频规模超出上限 ⇒ 当场返回可读原因 key，**绝不**送进引擎
+    // —— 超规格输入会让 sherpa 内部在崩溃性内存拷贝上 AV（见文件头 2026-10-13 记录）。这道闸兜住
+    // 「绕过导入的历史缓存 / 手改配置」；`reason_for` 侧还有一道按文件体积的廉价前置闸。
+    if ref_sr <= 0 || ref_exceeds_scale(ref_samples.len()) {
+        return Err("ref_out_of_spec".into());
+    }
+    let ref_text_c = Some(
+        CString::new(cfg.reference_text.as_bytes())
+            .map_err(|e| format!("参考文本含 NUL：{e}"))?,
+    );
     ensure_session(&cfg)?;
 
     let text_c = CString::new(text.as_bytes()).map_err(|e| format!("文本含 NUL：{e}"))?;
-    let ref_text_c =
-        CString::new(cfg.reference_text.as_bytes()).map_err(|e| format!("参考文本含 NUL：{e}"))?;
     let gen_cfg = GenerationConfig {
         silence_scale: 0.0,
         speed: cfg.clamped_speed(),
@@ -574,7 +743,7 @@ pub fn speak(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
         reference_audio: ref_samples.as_ptr(),
         reference_audio_len: ref_samples.len() as i32,
         reference_sample_rate: ref_sr,
-        reference_text: ref_text_c.as_ptr(),
+        reference_text: ref_text_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
         num_steps: cfg.num_steps.clamp(1, 64),
         extra: std::ptr::null(),
     };
@@ -603,6 +772,7 @@ pub fn speak(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
     unsafe { (session.destroy_audio)(audio) };
 
     // 与 WinRT 那条复用同一个「WAV 落盘 → rodio 播放」的收尾（见 tts.rs）。
+    // 采样率由引擎返回 —— 写进 WAV 头，播放端照读。
     let wav = encode_wav_pcm16(&samples, sr);
     crate::tts::play_wav_bytes(app, &wav)
 }
@@ -681,7 +851,7 @@ fn encode_wav_pcm16(samples: &[f32], sr: i32) -> Vec<u8> {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  音色库导入（任意常见音频 → 规整成 PCM16 WAV 存进缓存目录）
+//  音色库导入（任意常见音频 → 规整成 24 kHz 单声道 PCM16 WAV 存进缓存目录）
 // ══════════════════════════════════════════════════════════════════
 
 /// 按声道数把交错样本**混成单声道**（多声道取平均；单声道原样返回）。
@@ -693,6 +863,38 @@ fn to_mono(interleaved: Vec<f32>, channels: usize) -> Vec<f32> {
         .chunks_exact(channels)
         .map(|fr| fr.iter().copied().sum::<f32>() / channels as f32)
         .collect()
+}
+
+/// 把**单声道** f32 样本从 `src_sr` 重采样到 `dst_sr`（**线性插值**）。
+///
+/// 取舍：这是**导入期、一次性**的规整，线性插值实现最小、零依赖、结果确定且无重采样器状态；
+/// 目标是 24 kHz 的语音（带宽 < 12 kHz），常见源（44.1k / 48k）多为整数或近似 2 倍下采样，线性
+/// 插值的混叠在听感上可接受 —— 且参考音频**只用来提取说话人音色**、不决定合成音质本身。此仓库
+/// 没有现成的音频重采样实现可复用（另有 `screenshot.rs` 的 `downsample_gray`，那是图像、不适用）。
+/// （sherpa 内部对非目标率也走 `LinearResample`，但那是**运行期**开销；在导入期先做既省内存，
+/// 也让落缓存的数据贴合模型原生率。）
+///
+/// `src_sr == dst_sr` / 任一采样率非法 / 空输入 ⇒ 原样返回（避免无谓拷贝与累计误差）。
+fn resample_linear_mono(samples: &[f32], src_sr: i32, dst_sr: i32) -> Vec<f32> {
+    if src_sr <= 0 || dst_sr <= 0 || samples.is_empty() || src_sr == dst_sr {
+        return samples.to_vec();
+    }
+    let ratio = dst_sr as f64 / src_sr as f64;
+    let out_len = (samples.len() as f64 * ratio).round() as usize;
+    let last = samples.len() - 1;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        // 目标第 i 点映射回源域的位置；落在末点及其后一律取末样本（防越界）。
+        let src_pos = i as f64 / ratio;
+        let i0 = src_pos.floor() as usize;
+        if i0 >= last {
+            out.push(samples[last]);
+            continue;
+        }
+        let frac = (src_pos - i0 as f64) as f32;
+        out.push(samples[i0] + (samples[i0 + 1] - samples[i0]) * frac);
+    }
+    out
 }
 
 /// 用 **rodio**（内含 symphonia）解码任意常见音频（wav / mp3 / flac / ogg / m4a）成
@@ -710,16 +912,21 @@ fn decode_audio_mono(path: &Path) -> Result<(Vec<f32>, i32), String> {
     Ok((to_mono(interleaved, channels), sr))
 }
 
-/// 缓存副本的文件名 = **内容哈希**（规整后 WAV 的 SHA-256）⇒ 同一段音频重复导入必落同一文件、
-/// 不同音频必不互相覆盖，且天然免路径注入（文件名只含 `voice-` + 十六进制 + `.wav`）。
-fn content_name(wav: &[u8]) -> String {
+/// 字节流的 **SHA-256 十六进制小写**串（`content_name` 与自建音色落点共用）。
+fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(wav);
+    let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
     for b in digest {
         hex.push_str(&format!("{b:02x}"));
     }
-    format!("voice-{hex}.wav")
+    hex
+}
+
+/// 缓存副本的文件名 = **内容哈希**（规整后 WAV 的 SHA-256）⇒ 同一段音频重复导入必落同一文件、
+/// 不同音频必不互相覆盖，且天然免路径注入（文件名只含 `voice-` + 十六进制 + `.wav`）。
+fn content_name(wav: &[u8]) -> String {
+    format!("voice-{}.wav", sha256_hex(wav))
 }
 
 /// 音色库**目录卫生**：缓存目录只保留 `keep` 这一份 `*.wav`，其余删掉。
@@ -742,9 +949,9 @@ fn prune_voice_cache(dir: &Path, keep: &Path) {
 }
 
 /// 导入核心（**可单测**：`dir` 由调用方给，生产传 `voices_dir()`、测试传系统 temp 子目录）：
-/// 校验 → 规整成 PCM16 WAV → 写进 `dir` → 清理旧副本 → 返回缓存副本路径。
+/// 校验 → 规整成 24 kHz 单声道 PCM16 WAV → 写进 `dir` → 清理旧副本 → 返回缓存副本路径。
 ///
-/// 校验（失败各给一句可读错误）：文件不存在 / 解不出音频 / 解出来是空的 / 时长越界（3~30 秒）。
+/// 校验（失败各给一句可读错误）：文件不存在 / 解不出音频 / 解出来是空的 / 时长越界（3~10 秒）。
 fn import_voice_file(src: &Path, dir: &Path) -> Result<PathBuf, String> {
     if !src.is_file() {
         return Err("找不到这个音频文件（可能已被移动或删除）".into());
@@ -760,7 +967,12 @@ fn import_voice_file(src: &Path, dir: &Path) -> Result<PathBuf, String> {
             REF_MIN_SECS, REF_MAX_SECS, secs
         ));
     }
-    let wav = encode_wav_pcm16(&samples, sr);
+    // **规整**：重采样到模型原生率（24 kHz）—— `decode_audio_mono` 已把多声道混成单声道。
+    // 既贴合模型元数据 `sample_rate` / 声码器 `vocos_24khz`，也避免把 44.1k / 48k / 192k 的大样本
+    // 数组送进引擎（sherpa 内部虽会 `LinearResample`，但那是**运行期**开销，样本量越大越贴近它的
+    // 规模红线，见 `MAX_REF_SAMPLES`）。
+    let normalized = resample_linear_mono(&samples, sr, REF_TARGET_SR);
+    let wav = encode_wav_pcm16(&normalized, REF_TARGET_SR);
     std::fs::create_dir_all(dir).map_err(|_| "创建音色库目录失败".to_string())?;
     let dst = dir.join(content_name(&wav));
     if !dst.is_file() {
@@ -809,7 +1021,7 @@ pub fn set_pet_voice(config: PetVoiceConfig) -> Result<(), String> {
 }
 
 /// 导入一个「参考音色」音频（设置窗「添加音频文件」按钮走它）：
-/// 校验（可读 / 可解码 / 时长 3~30 秒）→ **规整成 PCM16 WAV** 复制进音色库缓存目录 →
+/// 校验（可读 / 可解码 / 时长 3~10 秒）→ **规整成 24 kHz 单声道 PCM16 WAV** 复制进音色库缓存目录 →
 /// **返回缓存副本的绝对路径**。前端据此调 `set_pet_voice({ reference_audio: 缓存路径, reference_text })`
 /// （**共用同一份 `PetVoiceConfig`，不新增第二套配置**）。
 ///
@@ -863,6 +1075,26 @@ mod tests {
             let s: i16 = if i % 2 == 0 { 8000 } else { -8000 };
             b.extend_from_slice(&s.to_le_bytes());
         }
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// 写一段 **PCM16 单声道** WAV，样本全 0（样本量很大时比 `write_wav` 逐样本快得多）。
+    fn write_wav_zeros(path: &Path, sr: u32, n: usize) {
+        let data_len = (n * 2) as u32;
+        let mut b = Vec::with_capacity(44 + n * 2);
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+        b.extend_from_slice(&sr.to_le_bytes());
+        b.extend_from_slice(&(sr * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.resize(44 + n * 2, 0);
         std::fs::write(path, b).unwrap();
     }
 
@@ -956,21 +1188,106 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 失败分支③：时长越界（< 3s 与 > 30s）—— 都不落文件。
+    /// 失败分支③：时长越界（< 下限 3s、> 上限 10s）—— 都不落文件。40s、12s 都应越界。
     #[test]
     fn import_rejects_out_of_range_duration() {
         let root = temp_root("dur");
         let cache = root.join("cache");
         let short = root.join("short.wav");
         let long = root.join("long.wav");
-        write_wav(&short, 8000, 1.0); // 1s
-        write_wav(&long, 8000, 40.0); // 40s
+        let too_long = root.join("too_long.wav");
+        write_wav(&short, 8000, 1.0); // 1s（< 下限 3s）
+        write_wav(&long, 8000, 40.0); // 40s（>> 上限）
+        write_wav(&too_long, 8000, 12.0); // 12s（> 新上限 10s）
         let e1 = import_voice_file(&short, &cache).unwrap_err();
         assert!(e1.contains("时长需在"), "err={e1}");
         let e2 = import_voice_file(&long, &cache).unwrap_err();
         assert!(e2.contains("时长需在"), "err={e2}");
+        let e3 = import_voice_file(&too_long, &cache).unwrap_err();
+        assert!(e3.contains("时长需在"), "err={e3}");
         assert!(!cache.exists(), "越界不应落文件");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **新上限边界**：刚好在上限（10.0s）⇒ 接受并落文件；刚超上限（10.1s）⇒ 拒绝且**不落文件**。
+    #[test]
+    fn import_accepts_at_max_rejects_just_over() {
+        let root = temp_root("bound");
+        let cache = root.join("cache");
+        let at_max = root.join("at_max.wav");
+        let over = root.join("over.wav");
+        write_wav(&at_max, 8000, REF_MAX_SECS); // 10.0s，正好在限上
+        write_wav(&over, 8000, REF_MAX_SECS + 0.1); // 10.1s，刚超限
+        let ok = import_voice_file(&at_max, &cache).expect("刚好在上限应被接受");
+        assert!(ok.is_file());
+        // 规整后应为 24 kHz、约 10s，且样本数不超硬上限（不会触发规模守卫）
+        let (s, sr) = read_wav_mono(&ok).unwrap();
+        assert_eq!(sr, REF_TARGET_SR);
+        assert!(!ref_exceeds_scale(s.len()), "上限内的样本不应判超规格");
+        let before = std::fs::read_dir(&cache).unwrap().flatten().count();
+        let e = import_voice_file(&over, &cache).unwrap_err();
+        assert!(e.contains("时长需在"), "err={e}");
+        let after = std::fs::read_dir(&cache).unwrap().flatten().count();
+        assert_eq!(before, after, "越界不应落文件、不改动缓存目录");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **重采样正确性**（`resample_linear_mono` + 导入规整）：48 kHz 源 → 24 kHz 输出，
+    /// 时长保持 ±1%、样本数 ≈ 目标率 × 秒数、不出现整段静音 / 长度错位。
+    #[test]
+    fn import_resamples_to_target_rate_preserving_duration() {
+        let root = temp_root("resample");
+        let cache = root.join("cache");
+        let src = root.join("src48.wav");
+        write_wav(&src, 48000, 4.0);
+        let cached = import_voice_file(&src, &cache).unwrap();
+        let (s, sr) = read_wav_mono(&cached).unwrap();
+        assert_eq!(sr, REF_TARGET_SR, "落缓存应为模型原生率 24 kHz");
+        let secs = s.len() as f64 / sr as f64;
+        assert!((secs - 4.0).abs() / 4.0 < 0.01, "时长应保持 ±1%：secs={secs}");
+        let expect = REF_TARGET_SR as i64 * 4;
+        assert!((s.len() as i64 - expect).abs() <= 2, "样本数应≈目标率×秒数：{}", s.len());
+        assert!(s.iter().any(|&v| v.abs() > 0.1), "不应出现整段静音");
+        // 纯函数直测：48k→24k 为 2:1 整数下采样，样本数应精确半减、无长度错位
+        let ramp: Vec<f32> = (0..48000).map(|i| (i % 2) as f32).collect();
+        let out = resample_linear_mono(&ramp, 48000, 24000);
+        assert_eq!(out.len(), 24000);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **规模守卫的核心回归断言**：`ref_exceeds_scale` 是 `speak` 在**进引擎前**的拦阻判据 ——
+    /// 旧缓存形状（192 kHz × 29.2 s = 5 613 276 样本）必须判真；规整后上限（24 kHz × 10s =
+    /// 240 000）必须判假。并校验 `MAX_REF_SAMPLES` 与「目标率 × 上限秒数」口径一致。
+    #[test]
+    fn scale_guard_flags_oversized_reference() {
+        assert_eq!(
+            MAX_REF_SAMPLES,
+            REF_TARGET_SR as usize * REF_MAX_SECS as usize,
+            "MAX_REF_SAMPLES 应与 目标率 × 上限秒数 一致"
+        );
+        assert!(ref_exceeds_scale(5_613_276), "旧缓存样本数（192kHz×29.2s）应判超规格");
+        assert!(!ref_exceeds_scale(MAX_REF_SAMPLES), "上限样本本身不超");
+        assert!(ref_exceeds_scale(MAX_REF_SAMPLES + 1), "刚超上限即判超规格");
+    }
+
+    /// **老数据兜底**：复刻用户磁盘上那条 192 kHz × 29.2 s 的旧缓存形状，证明 `reason_for` 判
+    /// 超规格（`ref_out_of_spec`）⇒ `available()` 为假 ⇒ `tts.rs::speak_blocking` **不会**把它送进
+    /// 引擎（静默跳过），设置窗则显示「请重新导入」文案。仅按文件体积（≈11.2 MB）即判，不必解码。
+    #[test]
+    fn old_oversized_cache_is_blocked_before_engine() {
+        let dir = temp_root("oldcache");
+        let old = dir.join("voice-192k-29s.wav");
+        write_wav_zeros(&old, 192000, 5_613_276); // 192 kHz × 29.2 s
+        let cfg = PetVoiceConfig {
+            enabled: true,
+            reference_audio: old.to_string_lossy().to_string(),
+            reference_text: "旧缓存".into(),
+            ..Default::default()
+        };
+        assert_eq!(reason_for(&cfg, true), "ref_out_of_spec");
+        // 兜底闸同样判真（即便有人绕过体积闸直读样本，也进不了引擎）
+        assert!(ref_exceeds_scale(5_613_276));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 成功路径：缓存副本落点 / 命名（内容哈希）/ PCM16 可读回 / 旧副本被清理。
@@ -990,9 +1307,9 @@ mod tests {
         assert!(da.starts_with(&cache), "副本应落缓存目录：{}", da.display());
         let name = da.file_name().unwrap().to_string_lossy().to_string();
         assert!(name.starts_with("voice-") && name.ends_with(".wav"), "name={name}");
-        // 缓存的是**可读回的 PCM16 WAV**，时长≈4s
+        // 缓存的是**可读回的 PCM16 WAV**，已被规整到 24 kHz，时长≈4s
         let (s, sr) = read_wav_mono(&da).unwrap();
-        assert_eq!(sr, 8000);
+        assert_eq!(sr, REF_TARGET_SR);
         assert!((s.len() as f64 / sr as f64 - 4.0).abs() < 0.05, "len={}", s.len());
         // 同一段再导 ⇒ 内容哈希同 ⇒ 落同一文件（幂等、不新增长）
         let da2 = import_voice_file(&a, &cache).unwrap();
@@ -1032,3 +1349,4 @@ mod tests {
         assert_eq!(s(9.0), SPEED_MAX);
     }
 }
+

@@ -2559,6 +2559,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "음성 모델 자산이 준비되지 않았습니다 (먼저 음성 구성 요소를 설치하세요)",
     "en": "Voice model assets are not ready (install the voice component first)",
   },
+  "pet.tts_reason_ref_out_of_spec": {
+    "zh-CN": "参考音色规格不符，请重新导入一段 3~10 秒的音频",
+    "zh-TW": "參考音色規格不符，請重新匯入一段 3~10 秒的音訊",
+    "ja": "参照音声の仕様が合いません（3〜10 秒の音声を取り込み直してください）",
+    "ko": "참조 음색 규격이 맞지 않습니다 (3~10초 오디오를 다시 가져오세요)",
+    "en": "Reference voice has an unsupported format (import a 3-10 second clip again)",
+  },
   "pet.tts_import_ok": {
     "zh-CN": "参考音色已导入",
     "zh-TW": "參考音色已匯入",
