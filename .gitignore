@@ -68,3 +68,6 @@ testapi.txt
 *.swp
 Thumbs.db
 Desktop.ini
+
+# scratch/debug residue at repo root
+temp/

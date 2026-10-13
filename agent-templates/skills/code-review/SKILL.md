@@ -2,7 +2,7 @@
 name: code-review
 description: 对当前改动做一次系统性代码审查：读 diff 与相关上下文，按正确性 / 安全 / 可维护性出结构化问题清单。用户说「审查一下这次改动」「review 这段代码」时用它。
 context: fork
-allowed-tools: Read, Glob, Grep, Bash
+allowed-tools: Read, Glob, Grep, Cmd, PowerShell
 ---
 
 # 代码审查
