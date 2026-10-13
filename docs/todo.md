@@ -198,6 +198,48 @@
   - **未做（按用户裁决 / 约束）**：`.vtube.json` 的 `InputRange/OutputRange` **未引入**；cdi3 分组标题 **未做**；**未新增**第二套参数 / 预设存储；**未碰**语音三条拉条与 `tts*.rs`；物理开关**未新增**按钮（已有热键入口）。
   - **顺带发现（只报告，未改）**：`readCdi3Names` 现在多返回一个 `physicsDriven` 字段（原只收 Id→Name）；引擎产物经压缩后**标识符被改名**，故「按函数名在产物里查证据」不适用于引擎那一份（改用纯逻辑单测 + 源码核对）。
 
+#### §待办 1-4 补 桌宠输出框「上下空白」真因：模板缩进 × pre-wrap 幽灵空行（2026-10-13）
+
+- **用户报障**：桌宠气泡里文字**上方 / 下方各多出一段空白**（不是回复文本里的换行造成的，而是固定多出来的）。
+- **真因（文件:行号 + 无头实测）**：气泡模板（`app/src/plugins/builtin/pet.ts:3138-3139`）在 `.pet-chat-output` 与 `.pet-chat-text` 两行之间**夹着换行 + 缩进**（HTML 排版的空白文本节点），而 `.pet-chat-output` 带 `white-space:pre-wrap`（`pet.ts:3225`）、又是**块级**容器 ⇒ 按 CSS 规范把这段**纯空白子文本节点**当成真内容渲染成空行 ⇒ 文字顶部 / 底部各多约两行。（上一轮的 `normalizeReplyText` 只归一**回复文本本身**，管不到模板自带的这段空白。）无头 Chrome 实测：文字距盒顶 **42.84px**，而 `padding-top` 只有 6px；盒内容高 **104** > 下限 75，单行文本也平白多出一条滚动条。
+- **修法（`app/src/plugins/builtin/pet.ts`）**：`.pet-chat-output` 由块级改 **flex 列**（`display:flex;flex-direction:column`，`:3226`）—— flex 容器**不渲染**纯空白子文本节点（规范按 `display:none` 处理）⇒ 与模板缩进无关地保证文字贴顶；`.pet-chat-text` 声明 `flex:0 0 auto`（`:3229` 附近）不许被压，超出走盒内滚。无正文时靠 `:has(> .pet-chat-text:empty){visibility:hidden}`（`:3230`）**不可见但仍占位** ⇒ 输出带回到下限 75px、开合对话时模型不位移。**没有**用 `display:none` 藏内容充数。
+- **验证结论**：`npx tsc --noEmit`（app）exit 0；`npm run build`（app）exit 0；`npm run verify`（根）exit 0。**无头实测对照**：文字距盒顶 **42.84px → 6px**（= padding-top）、内容高 **104 → 75**（= 下限）、**单行不再出滚动条**。（模板两行 3138-3139 **未改**，只改 CSS 3225-3230。）
+- **待真机验收**：① 一段**单行**中文回复 ⇒ 气泡内文字**贴顶**、上下无空行、**无滚动条**；② 对照改前（文字被顶到盒中偏下）。
+- **涉及文件**：`app/src/plugins/builtin/pet.ts`（CSS 3225-3230）。
+
+#### §待办 1-4 补 桌宠输出框随内容封顶 + 窗口可缩放（记忆 / 向上生长）+ 语音播完再隐（2026-10-13）
+
+- **用户口径**：① 输出框**随内容变高但封顶**（超上限才盒内滚），短 / 中回复不再出滚动条；② 窗口**可拖拽缩放**、尺寸要**记住**；③ 变高时窗口**向上生长**（模型不位移）；④ 语音**播完再自动隐**。
+- **A 输出框随内容封顶（纯逻辑 `app/src/plugins/builtin/pet-window-size.ts`）**：下限 `OUT_MIN_H = 75`（`pet-window-size.ts:21`）、上限 `OUT_CAP_H = 255`（`:43`）、20px 档位 `OUT_STEP = 20`（`:65`）。纯函数 `clampOutTop`（`:83`，内容→带高、夹 `[75,255]`、向上取整）、`quantizeTopH`（`:91`，逐字增长时**只在跨档才 resize**，把一次动画的 resize 次数从「每字一次」压到 ≤9 次）、`targetWindowHeight`（`:100`，= 基准高 + (带高 − 75)）、`baseHeightFromWindow`（`:125`）、`resizePlan`（`:133`）。落点在 `pet.ts` 的 `applyOutHeight`（`:3951`）与 `setChatText`（`:3979`）—— 逐字动画每拍调 `applyOutHeight(false)`（跨档节流），收尾 / 换内容调 `(true)`。
+- **B 窗口可缩放 + 记忆 + 向上生长**：清单 pet `window` 段 `resizable = $true`（`scripts/build-plugins.ps1:265`）；前端「窗上缩放手柄」`.pet-resize-handle`（CSS `pet.ts:3256`、DOM `:3170`、mousedown → `startResizeDragging("SouthEast")` `:3818`）；权限 `core:window:allow-start-resize-dragging`（`app/src-tauri/capabilities/default.json`）；尺寸记忆落本插件 localStorage（`CFG_KEY = "lunac.pet.v1"` 的 `winW`/`winH`），`onResized` 去抖 250ms 记账（`pet.ts:5043`），开窗读回并 `clampWindowSize`（`:5031` 附近）；右键「恢复默认窗口大小」`data-act="win-reset"`（`:3162` / `:4611`）。**向上生长** = 宿主新命令 `plugin_window_resize_anchored`（`app/src-tauri/src/plugin_window.rs:736`，下沿锚定换算 `anchored_top` `:675`；命令注册在 `main.rs:815` 附近）：`set_size` 后把上沿按高度差反向搬一次 ⇒ 下沿（屏幕 y）不动，多出的高度全落在输出框上、模型区与输入带**不位移**。
+- **C 语音播完再隐（`app/src-tauri/src/tts.rs` + `pet.ts`）**：宿主在**一次朗读结束之后**（播完 / 未就绪静默跳过 / 合成失败**都算**）定向发 `TTS_DONE_EVENT = "pet-tts-done"`（`tts.rs:33`，发送点 `tts.rs:242` 的 `tts_speak` 线程尾；前端同名常量 `pet.ts:136`）。前端 `beginTtsWait`（`:4403`）在收到最终回复且 `tts` 开时置位 + 起 **3 分钟看门狗**（`TTS_WAIT_MAX_MS = 180000`，`:4112`）；`endTtsWait`（`:4414`）由该事件或用户中断解除；`maybeScheduleAutoHide`（`:4425`）是**自动收起唯一判据**（本轮自动展开 + 可见 + 动画已停 + 语音已播完）⇒ 起算 `PROACTIVE_BOX_MS = 6000`（`:149`）。`tts` 关着时不置位 ⇒ 仍是「动画跑完即起算 ≈6s」的兜底。
+- **验证结论**：`build-plugins.ps1`（根）exit 0（pet **0.9.58**）；`npx tsc --noEmit` exit 0；`npm run build` exit 0；`cargo test --bins`（app\src-tauri）exit 0（含 `anchored_top_keeps_the_bottom_edge_fixed`、`clamp_size_bounds_bad_and_out_of_range_values`）；`cargo build --release` exit 0。
+- **待真机验收**：① 长回复 ⇒ 盒到 255 后**盒内滚动**、窗口随之变高（上沿上移、下沿不动、模型不位移）；② 拖边缘 / 角 / 手柄改尺寸 ⇒ 重启后**记住**；右键「恢复默认窗口大小」⇒ 回 320×510 基准；③ 开朗读时气泡**等语音播完**再隐（对照：关朗读 ⇒ 动画跑完 ≈6s 收）。
+- **涉及文件**：`app/src/plugins/builtin/pet-window-size.ts`、`app/src/plugins/builtin/pet.ts`、`app/src-tauri/src/plugin_window.rs`、`app/src-tauri/src/tts.rs`、`app/src-tauri/src/main.rs`（注册新命令）、`app/src-tauri/capabilities/default.json`、`scripts/build-plugins.ps1`。
+
+#### §待办 1-4 补 桌宠画布随窗 + 模型「不变只多空间」贴底（2026-10-13）
+
+- **用户口径**：窗口变大时**模型不放大**、只是周围多出空间；画布（模型区）**跟随窗口**剩余空间、模型**贴底**。
+- **A 「参考尺寸」语义变更**：`STAGE_H`（`pet-window-size.ts:25`）由「定尺 400」改为**参考模型区高**（缺省窗口下的 400），`STAGE_W`（`:28`）同理为参考宽 300。它们只作参考：模型基准缩放（只缩不放）与基准窗高换算。
+- **B 画布跟随窗口（CSS）**：`.pet-stage` 改 `flex:1 1 auto`（`pet.ts:3191`）⇒ 吃掉「输出带 + 输入带」之外的全部高度（= 窗高 − 输出带 − 输入带），宽度 = 窗宽 − 左右留白（`--pet-stage-gap`）。`.pet-img` 改**定尺参考**（`width/height = var(--pet-stage-ref-w/h)`，缺省 300×400，`:3197`）+ `max-width/height:100%` + `object-position:bottom center` ⇒ 图片分支与模型分支行为一致（画布变大不放大、变小按需收、贴底）。参考值由 `attachPetWindow` 从常量注入 CSS 变量（`:3436-3438`）。
+- **C 「只缩不放」缩放**：纯函数 `modelBaseScale`（`pet-window-size.ts:154`）= `min(参考基准, 画布基准)` ⇒ 画布比参考大 ⇒ 结果 = 参考基准（**不放大**）、比参考小 ⇒ 按画布收（**不裁切**）；由该式恒有「模型不溢出画布」。引擎侧消费见 `live2d-engine` 的 fit 与 `refStageW/refStageH` 传入（`pet.ts:3549`）。
+- **验证结论**：纯逻辑单测 `scripts/pet-window-size-selftest.mjs` 覆盖「画布更大不放大 / 更小按画布收 / 纵横比不同取较小者 / 不溢出 / 宽度钳制」（本轮扩到 38 项，见下条）；`tsc` / `npm run build` / `npm run verify` exit 0。
+- **待真机验收**：① 拖大窗口 ⇒ 模型**尺寸不变**、周围多出空间（且**贴底**）；② 拖小窗口 ⇒ 模型按画布收、不被裁切；③ 图片形象与 Live2D 表现一致。
+- **涉及文件**：`app/src/plugins/builtin/pet.ts`、`app/src/plugins/builtin/pet-window-size.ts`、`app/src/plugins/builtin/live2d-engine.ts`（fit 参考口径）、`app/src/plugins/builtin/live2d.ts`（`refStageW/H`）。
+
+#### §待办 1-4 补 桌宠「最小模型区」保护：动态输出上限 + 三处同源最小窗高（2026-10-13，本轮）
+
+- **要消除的病态**：长回复（盒到 255）时把窗手动拖到最小高 ⇒ `255 + 35 > 窗高` ⇒ `.pet-stage` 被压到 **0**、模型不可见。
+- **A 动态输出上限（`app/src/plugins/builtin/pet-window-size.ts`）**：新增 `outCap(winH) = clamp(winH − IN_H − STAGE_MIN_H, OUT_MIN_H, OUT_CAP_H)`（`:75-77`）；`clampOutTop` / `quantizeTopH` 增加 `cap` 参数（缺省 `OUT_CAP_H` ⇒ 旧行为逐字不变，`:83` / `:91`）；`resizePlan` 内部按 `outCap(baseH)` 取上限（`:133`）。`pet.ts` 的 `applyOutHeight` 用 `outCap(winBaseH)`（`:3955-3956`）。**为什么用「窗口基准高」而非「当前窗高」**：内容驱动生长满足 `窗高 = 基准高 + (带高 − 75)` ⇒ 模型区高 = 基准高 − 75 − 35 **与带高无关**，故以基准高推上限是**稳定**的；若用当前窗高，带越高窗越高、上限又越大，会自我放大成正反馈。窗矮 ⇒ 上限降到下限（不挤压模型区）；基准 510 ⇒ `510 − 175 = 335 ≥ 255` ⇒ 取 `OUT_CAP_H`（**正常路径完全不变**）。
+- **B 抬高最小窗高（三处同源）**：新增 `STAGE_MIN_H = 140`（`pet-window-size.ts:35`），**唯一真相源**推导 `WIN_H_MIN = OUT_MIN_H + IN_H + STAGE_MIN_H = 75 + 35 + 140 = 250`（`:58`，原 200）。三处消费同一口径：① 前端 `clampWindowSize`（`:105`，用本模块常量）；② 清单 `window.minHeight = 250`（`scripts/build-plugins.ps1:264`，值 = 本式，注释声明勿写第二份）；③ 宿主 `plugin_window_resize` / `plugin_window_resize_anchored` 的 clamp（`plugin_window.rs:664` 的 `clamp_size` → `min_size` **读清单** `minHeight` ⇒ 天然同源）。⇒「窗高 < `OUT_MIN_H + IN_H + STAGE_MIN_H`」**根本不可达**。
+- **C 手拖时先收窄盒高（`pet.ts` 的 `onResized`，`:5043-5051`）**：把窗拖矮 ⇒ `outCap(实际窗高)` 随之降低 ⇒ **先**把盒高收到新上限（**只收不放**：内容变短不在这里放大），再据「实际窗高 + 收窄后的盒高」反推基准高。否则盒停在旧高、`.pet-stage` 仍被压到 0。程序化下发恒满足 `盒高 ≤ outCap(窗高)`，故**不触发**、不影响既有记账（`baseHeightFromWindow` 恒等）。
+- **D 尺寸记忆读回纠偏**：`loadConfig` / 开窗都过 `clampWindowSize`（`pet.ts:5031` 附近）⇒ 老用户存的过小高度（如 200）被抬到 250。
+- **定值理由（`STAGE_MIN_H = 140`）**：① = 参考模型区高 `STAGE_H`(400) 的 **35%**；② = 最小窗口宽下的画布宽（`WIN_W_MIN − STAGE_GAP` = 160 − 20 = **140**）⇒ 最小合法窗口下模型区仍是一个「不低于其宽度」的竖向可辨认区域；③ 把最小窗高抬到 250（原 200），仍远低于 `WIN_BASE_H`(510) ⇒ 短回复 / 开合对话不改变窗口高。
+- **验证结论**：纯逻辑单测 `node --experimental-strip-types scripts/pet-window-size-selftest.mjs` **exit 0 / 38 项全过**（本轮新增 12 项：动态上限边界「= 最小窗 ⇒ 75」「= 下限高 ⇒ 75」「大窗 ⇒ 255」「窗矮单调降且 ∈[75,255]」「非有限兜底」「clamp/quantize 按 cap 收窄」；最小窗高「推导式」「清单 minHeight/minWidth 逐字一致（读 `build-plugins.ps1` 断言）」「clamp 兜住老尺寸」；不变量「任意合法窗高下 `窗高 − 盒高 − IN_H ≥ STAGE_MIN_H`」「内容驱动路径同理」「`H = WIN_H_MIN` 时模型区恰为 `STAGE_MIN_H`」）。`npx tsc --noEmit`（app）exit 0；`npm run build`（app）exit 0；`npm run verify`（根）exit 0（`[8/8]` BOM 18 份）；`build-plugins.ps1`（根）exit 0（pet **0.9.58**、dev 产物 `Modules\pet\index.js` 含 `STAGE_MIN_H`×2）；`cargo test --bins`（app\src-tauri）exit 0（**230 passed / 0 failed / 2 ignored**）；`cargo build --release` exit 0（18 warning 均既有 `proxy_server.rs` 死代码，与本轮无关）。
+- **待真机验收**：① 长回复把窗拖到**最小**（≥250）⇒ 输出框自动收到 75、**模型区仍在（≈140px）可见**、不塌成 0；② 拖回大窗 ⇒ 盒能重新长起来（内容仍长时到上限）；③ 正常窗（未手动改）下短 / 中回复行为与上一轮**完全一致**（窗口高不变）；④ 老 `winH=200` 的配置打开后窗口高 = 250。
+- **涉及文件（本轮改动）**：`app/src/plugins/builtin/pet-window-size.ts`、`app/src/plugins/builtin/pet.ts`、`scripts/pet-window-size-selftest.mjs`、`scripts/build-plugins.ps1`（pet `minHeight` 250 + `version` 0.9.58）。**未改宿主 Rust**（宿主 clamp 读清单 `minHeight`，随清单同源生效）。
+- **待裁定 / 需知晓**：① **清单 `minHeight` 与前端 / 宿主确为同源**：前端用 `pet-window-size.ts` 的 `WIN_H_MIN`，宿主读**同一份清单**的 `minHeight`（值由本模块推导、`build-plugins.ps1:264` 手工镜像）；单测已断言「清单 minHeight === WIN_H_MIN」，但**镜像仍需人工保持**（TS 常量无法被 ps1 直接 import）。② 动态上限取**基准高**（非当前窗高）是为避免正反馈 —— 已在 `outCap` 注释与单测钉死。
+
 ### §待办 1-5 L5 自研调音 / 音乐插件：剩余与未发布
 - **目标**：调音「全局生效」与在线音乐发布收尾。
 - **已查清**：引擎（`tuning-engine/`，手写 FFT）+ 宿主接线 + 音乐插件调音页（可编辑链 / 预设 / 声道槽 / 卷积 / 延迟 / A-B 盲测）均已落地并实测；在线音乐已并入同一条链（`librespot` `-B pipe -f F32` + `live_audio.rs`）。

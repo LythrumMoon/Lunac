@@ -2108,6 +2108,29 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "(이번 턴이 중단되었습니다)",
     "en": "(this turn was interrupted)",
   },
+  // ── 桌宠「窗口尺寸」（pet.win_* / pet.resize_handle，2026-10-13）────────
+  // 右键菜单的「恢复默认窗口大小」+ 窗上缩放手柄的提示（五语言齐全）。
+  "pet.win_reset": {
+    "zh-CN": "恢复默认窗口大小",
+    "zh-TW": "恢復預設視窗大小",
+    "ja": "ウィンドウサイズを既定に戻す",
+    "ko": "창 크기 기본값으로 복원",
+    "en": "Reset window size",
+  },
+  "pet.win_reset_done": {
+    "zh-CN": "已恢复默认窗口大小",
+    "zh-TW": "已恢復預設視窗大小",
+    "ja": "ウィンドウサイズを既定に戻しました",
+    "ko": "창 크기를 기본값으로 복원했습니다",
+    "en": "Window size reset",
+  },
+  "pet.resize_handle": {
+    "zh-CN": "拖动调整窗口大小",
+    "zh-TW": "拖曳調整視窗大小",
+    "ja": "ドラッグでウィンドウサイズを変更",
+    "ko": "드래그하여 창 크기 조절",
+    "en": "Drag to resize the window",
+  },
   // ── 桌宠「模型调试区」（pet.debug_* / pet.param_*，2026-10-09）────────
   // 设置窗里的横向拉条 + 表情状态按钮；参数名一律走 i18n，界面里不硬编码中文。
   "pet.debug_title": {

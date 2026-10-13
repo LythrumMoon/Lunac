@@ -812,6 +812,9 @@ fn main() {
             plugin_window::plugin_window_set_resizable,
             plugin_window::plugin_window_pin_state,
             plugin_window::plugin_window_resize,
+            // 下沿锚定的尺寸下发（2026-10-13，桌宠输出框随内容变高）：与上面同源 clamp / 回读，
+            // 但保持窗口下沿不动（模型区在屏幕上不位移）。见 plugin_window.rs。
+            plugin_window::plugin_window_resize_anchored,
             // 桌宠鼠标穿透态下 Alt+右键 唤出（全局 WH_MOUSE_LL，懒启停）—— 见 src/mouse_hook.rs
             mouse_hook::pet_alt_rclick_watch,
             // 插件 sidecar（L12 档 1，2026-10-06）—— 见 src/plugin_sidecar.rs

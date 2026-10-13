@@ -300,6 +300,12 @@ export interface MountOptions {
   offsetY?: number;
   /** **整体旋转**（角度制）。绕模型自身的中心（`model.anchor` 那一点）转。缺省 0。 */
   rotation?: number;
+  /** **参考模型区尺寸**（px）：模型**基准缩放**按它算（见 `./pet-window-size` 的
+   *  `modelBaseScale`）—— 画布比它大时模型**不放大**（只多空间），画布比它小时按画布收（不裁切）。
+   *  **唯一真相源** = `pet-window-size` 的 `STAGE_W` / `STAGE_H`（缺省 300×400），别在这里再写一份。
+   *  不传时回落到当前画布（= 只按画布 contain 的旧行为）。 */
+  refStageW?: number;
+  refStageH?: number;
   /** **额外表情**：引擎自己扫不到的 `.exp3.json`（导入到子目录 / 别处、模型文件同层里没有的）。
    *  桌宠窗在挂载前从 `lunac.hotkeys.json` 收集、按绝对路径去重后交进来。库的
    *  `model.expression(Name)` 只认 `settings.FileReferences.Expressions` 里登记过的项 ——

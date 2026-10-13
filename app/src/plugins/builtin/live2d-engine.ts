@@ -39,6 +39,8 @@ import {
   type Live2DHandle,
   type MountOptions,
 } from "./live2d";
+// 模型基准缩放的**纯逻辑**（与桌宠窗共用同一份，见 pet-window-size 的 modelBaseScale）。
+import { modelBaseScale } from "./pet-window-size";
 
 /** 建画布 + 载模型，返回一个可停可毁的句柄。失败时抛错，调用方负责把消息显示出来。 */
 export async function mountLive2D(host: HTMLElement, opts: MountOptions): Promise<Live2DHandle> {
@@ -602,13 +604,25 @@ export async function mountLive2D(host: HTMLElement, opts: MountOptions): Promis
   // **整体旋转**（角度制）：绕 `model.anchor`（底边中心）转。与 scale / offset 各改各的。
   let rotDeg = opts.rotation ?? 0;
 
+  // 「参考尺寸」（= 参考模型区大小，缺省 300×400）—— 模型**基准缩放**按它算 ⇒ 画布比它大时不放大。
+  // 未提供（≤0 / 非法）时回落到当前画布 ⇒ 等价旧行为（只按画布 contain）。唯一真相源见 pet-window-size。
+  const refW = opts.refStageW && opts.refStageW > 0 ? opts.refStageW : 0;
+  const refH = opts.refStageH && opts.refStageH > 0 ? opts.refStageH : 0;
+  /** 当前画布 (w,h) 下的基准缩放 = min(参考基准, 画布基准)（只缩不放，见 modelBaseScale）。 */
+  const computeBase = (w: number, h: number): number =>
+    modelBaseScale(w, h, srcW, srcH, refW > 0 ? refW : w, refH > 0 ? refH : h);
+
   const fit = () => {
     const w = Math.max(1, host.clientWidth);
     const h = Math.max(1, host.clientHeight);
     app.renderer.resize(w, h);
-    const base = Math.min(w / srcW, h / srcH);
+    // base = min(参考尺寸基准, 当前画布基准)：画布变大模型不放大、画布变小按画布收（不裁切）。
+    // **fit 每次都把用户视图（scale / offX / offY / rotDeg）重新应用** —— 这四个只在闭包里被
+    // 用户改动（setScale / setOffset / setRotation / zoomAtPointer），fit 自己从不写它们 ⇒
+    // ResizeObserver 触发的重算**不会**冲掉用户调好的缩放 / 位移 / 旋转（见文件头那段说明）。
+    const base = computeBase(w, h);
     model.scale.set(base * scale);
-    model.anchor.set(0.5, 1); // 底边中心对齐 —— 桌宠站在窗口下沿
+    model.anchor.set(0.5, 1); // 底边中心对齐 —— 桌宠站在窗口下沿（画布变高 ⇒ 只在上方多出空间）
     model.position.set(w / 2 + offX, h + offY);
     model.rotation = (rotDeg * Math.PI) / 180;
   };
@@ -641,7 +655,7 @@ export async function mountLive2D(host: HTMLElement, opts: MountOptions): Promis
     zoomAtPointer(factor: number, px: number, py: number) {
       const w = Math.max(1, host.clientWidth);
       const h = Math.max(1, host.clientHeight);
-      const base = Math.min(w / srcW, h / srcH);
+      const base = computeBase(w, h); // 与 fit 同一套基准（含「参考尺寸」兜底，别再各算一份）
       // 夹在配置认可的区间：越界的值下次 loadConfig 会被判非法、静默跳回 1。
       const next = Math.min(PET_SCALE_MAX, Math.max(PET_SCALE_MIN, scale * factor));
       const s0 = base * scale;

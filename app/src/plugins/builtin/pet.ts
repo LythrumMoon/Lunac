@@ -84,6 +84,22 @@ import {
   shouldAnimateDirectly,
   splitUnits,
 } from "./pet-typewriter";
+import {
+  OUT_MIN_H,
+  OUT_STEP,
+  STAGE_GAP,
+  STAGE_H,
+  STAGE_W,
+  WIN_BASE_H,
+  WIN_W_DEFAULT,
+  baseHeightFromWindow,
+  clampOutTop,
+  clampWindowSize,
+  outCap,
+  quantizeTopH,
+  shouldResize,
+  targetWindowHeight,
+} from "./pet-window-size";
 
 /** 桌宠「看一眼屏幕」的暂存载荷落点。与 `main.ts`（聊天窗那侧）**必须同值**：
  *  桌宠窗没有 `__lunac_*` 桥、也调不到聊天窗的 `startAIChat`，所以「那句话 + 图片路径」
@@ -112,6 +128,13 @@ const CHAT_STOP_EVENT = "pet-chat-stop";
  *  桌宠窗按同一条时间线写 `setMouthOpen`。**必须与 Rust 侧同名**。 */
 const MOUTH_EVENT = "pet-tts-mouth";
 
+/** **「语音播完」信号**（2026-10-13）。契约另一端在宿主的 `src/tts.rs`（`TTS_DONE_EVENT`，
+ *  **定向** `emit_to("plugin-pet")`）：宿主在**这条 WAV 播完（或判定无需出声 / 合成失败）之后**
+ *  发一条。桌宠窗据此把气泡自动收起的起算推迟到「语音播完」—— 见 `scheduleOutputAutoHide`。
+ *  `tts` 关着时宿主根本不会被调用，桌宠窗自己按原 ≈6s 起算（见 CHAT_REPLY_EVENT 处理处）。
+ *  **必须与 Rust 侧同名**。 */
+const TTS_DONE_EVENT = "pet-tts-done";
+
 /** 「主动反应」（2026-10-09）：桌宠**定时主动**对用户说一句话（复用 `sendToAI`）。
  *  **成本红线（用户口径）**：这条链路**持续烧 token** ⇒ 默认**关**，且「最小间隔 + 每日上限」
  *  两道闸；桌宠窗隐藏 / 最小化时必须停（别在看不见时偷偷烧 token）。
@@ -138,17 +161,18 @@ const WATCH_SEC_MAX = 600;
 const WATCH_DIFF_MIN = 1;
 const WATCH_DIFF_MAX = 120;
 
-/** 桌宠窗的三段高度（逻辑像素）—— 与 PET_CSS 的 `.pet-top` / `.pet-stage` / `.pet-bottom` 一致：
- *  输出带 75 + 模型区 400 + 输入带 35 = **510**，三条**紧贴、无空隙**（用户 2026-10-10 口径）。 */
-const PET_OUT_H = 75; // 输出框高
-const PET_STAGE_H = 400; // 模型区高
-const PET_IN_H = 35; // 输入框高
-/** 桌宠窗的**整体尺寸**（逻辑像素），与清单 `window` 段的 `320×510` 配套：
- *  **整体窗口放大、模型不变**，且上下两条**紧贴模型**（无空隙）。
- *  为什么代码里也留一份：清单**只在建窗那一刻**生效 —— dev 里这扇窗往往是清单更新之前建的，
- *  于是它会一直是旧尺寸；开窗时按这组常量再对齐一次。 */
-const PET_WIN_W = 320;
-const PET_WIN_H = PET_OUT_H + PET_STAGE_H + PET_IN_H; // = 510
+/** 桌宠窗的三段布局（逻辑像素）与整体尺寸的**唯一真相源在 `./pet-window-size`**：
+ *  缺省下 输出带（下限）75 + 模型区（参考）400 + 输入带 35 = **510**，三条**紧贴、无空隙**。
+ *  ⚠️ 2026-10-13 第二轮起：模型区**不再定尺 400**，而是用 flex **跟随窗口剩余空间**
+ *  （= 窗高 − 输出带 − 输入带）；`STAGE_W` / `STAGE_H` 改为**参考尺寸**（缺省窗口下的 300×400），
+ *  供模型基准缩放（只缩不放，见 live2d-engine 的 fit）与基准窗高换算使用。
+ *  `.pet-top` 的 `flex-basis` / `.pet-chat-output` 的高度由 CSS 变量 `--pet-top-h` 驱动（见 PET_CSS），
+ *  数值初值取 `OUT_MIN_H`（75）；输出框随内容封顶后由 JS 改写它（见 applyOutHeight）。
+ *  ⚠️ 2026-10-13 第三轮：输出带的上限**动态**取 `outCap(窗口基准高)`（窗矮则上限降，**绝不把模型区
+ *  压到 0**），且最小窗高抬到 `WIN_H_MIN = OUT_MIN_H + IN_H + STAGE_MIN_H`（= 250）—— 三处口径同源。
+ *  模型区的左右留白与图片定尺走 `--pet-stage-gap` / `--pet-stage-ref-w` / `--pet-stage-ref-h`
+ *  （由 `attachPetWindow` 从上面这些常量注入，避免在 CSS 里再写一份）。
+ *  ⚠️ 数值与 PET_CSS 里 `.pet-top` / `.pet-bottom` / `.pet-stage` **必须一致**，改一处要同步。 */
 
 /** 配置落点。用 localStorage 而不是宿主命令：宿主**没有**通用的文本读写命令
  *  （只有 `read_tool_file` / `read_skill_file` 那几条面向工具与技能的），
@@ -182,7 +206,8 @@ interface PetConfig {
   image: string;
   /** Live2D 模型的 `*.model3.json` **绝对路径**（用户经文件对话框选的）。**非空时优先于图片**。 */
   model: string;
-  /** 形象占窗口宽度的比例。窗口是定尺的，所以「大小」调的是形象本身。 */
+  /** 形象的**整体缩放系数**（1 = 按参考模型区尺寸贴合，>1 放大 / <1 缩小）。它乘在「基准缩放」
+   *  （按参考尺寸 contain）上，故与模型区当前大小无关 —— 模型区变大只是多出空间、不改形象大小。 */
   scale: number;
   /** 形象相对**基准位置**（窗口底边中心）的像素偏移。模型与图片两种模式都用它：
    *  Alt+拖动与滚轮锚点缩放都会改它，随 `scale` 一起持久化。 */
@@ -227,6 +252,13 @@ interface PetConfig {
    *  `PetVoiceConfig.speed` / `volume`，不再由本字段折算。
    *  旧配置缺这个字段时回落默认（见 `loadConfig`）。 */
   speechRate: number;
+  /** **窗口宽**（逻辑像素，2026-10-13）。用户在桌宠窗里拖边缘 / 拖窗上缩放手柄改过就记这里，
+   *  重启后按它开窗（再 clamp 到合法区间，见 `clampWindowSize`）。缺字段回落 `WIN_W_DEFAULT`。 */
+  winW: number;
+  /** **窗口基准高**（逻辑像素，2026-10-13）：**无内容**（输出带回到预留下限 75）时窗口的高度。
+   *  输出框变高时窗口高 = 基准高 + (输出带高 − 75)（模型区 / 输入带不参与、故模型不位移）。
+   *  缺字段回落 `WIN_BASE_H`（= 510）。 */
+  winH: number;
 }
 
 /** 「主动反应」配置。计数字段（`date` / `used`）也落在这里 —— **与配置共用同一个 localStorage
@@ -262,6 +294,8 @@ const DEFAULT_CFG: PetConfig = {
   proactive: { enabled: false, intervalMin: 30, dailyCap: 20, date: "", used: 0, autoShot: false, autoShotMin: 5, screenWatch: false, screenWatchSec: 20, screenDiff: 12 },
   tts: true,
   speechRate: RATE_DEFAULT,
+  winW: WIN_W_DEFAULT,
+  winH: WIN_BASE_H,
 };
 
 function loadConfig(): PetConfig {
@@ -355,6 +389,11 @@ function loadConfig(): PetConfig {
                 : pd.screenDiff,
           }
         : { ...pd };
+    // 窗口尺寸记忆：宽 / 高一起过一次 clamp（越界 / 非法都夹到合法区间）。
+    const win = clampWindowSize(
+      typeof o.winW === "number" ? o.winW : WIN_W_DEFAULT,
+      typeof o.winH === "number" ? o.winH : WIN_BASE_H,
+    );
     return {
       image: typeof o.image === "string" ? o.image : "",
       model: typeof o.model === "string" ? o.model : "",
@@ -376,6 +415,9 @@ function loadConfig(): PetConfig {
       tts: typeof o.tts === "boolean" ? o.tts : true,
       // 速率：越界 / 非法回落默认（`clampRate` 同一套夹取口径）。
       speechRate: clampRate(typeof o.speechRate === "number" ? o.speechRate : RATE_DEFAULT),
+      // 窗口尺寸记忆：越界 / 非法在 `clampWindowSize` 里夹到合法区间（打开时还会再 clamp 一次）。
+      winW: win.w,
+      winH: win.h,
     };
   } catch {
     // 配置坏了不该让桌宠开不出来 —— 回到默认值，并把坏值覆盖掉
@@ -1070,6 +1112,13 @@ const STOP_SVG =
   `<g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6"><rect x="5" y="5" width="14" height="14" rx="2.5"/></g>` +
   `<rect x="5" y="5" width="14" height="14" rx="2.5"/>` +
   `<circle cx="8.6" cy="8.6" r="0.9" fill="currentColor" stroke="none"/></svg>`;
+
+/** 窗上「缩放手柄」的图标（右下角斜向抓握；严格线性 SVG）。`currentColor` 跟随 `--text-dim`
+ *  （hover 变 `--text`），不写死色值。 */
+const RESIZE_SVG =
+  `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" ` +
+  `stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">` +
+  `<path d="M22 6 6 22"/><path d="M22 12 12 22"/><path d="M22 18 18 22"/></svg>`;
 
 /** 一步的**折叠态摘要**（文件名词干 · 循环 · 硬停）。整条链的摘要 = 各步摘要拼接。 */
 function chainStepSummary(s: ChainStep): string {
@@ -3080,10 +3129,11 @@ async function attachSettings(root: HTMLElement): Promise<void> {
 function petHtml(): string {
   return `
 <div class="pet-root" id="pet-root">
-  <!-- 对话改渲染（2026-10-10 用户口径）：窗口整体变大但模型大小不变，**输出贴上沿、输入贴下沿**，
-       且两条**紧贴模型**（无空隙）—— 上 75 / 模型 300×400 / 下 35，合计 510。两条**始终占位**
-       （对话收起时只隐藏内容），所以模型不会因开合对话而跳动。整块的显隐由 .pet-root 上的
-       chat-on / chat-input-on 两个类控制（见 setChatOpen）。 -->
+  <!-- 对话改渲染（2026-10-10 用户口径；2026-10-13 第二轮补画布跟随窗口）：
+       输出贴窗口上沿、输入贴下沿，两条**紧贴模型区**（无空隙）—— 缺省 上 75 / 模型区（参考）300×400 / 下 35。
+       模型区高度**不再定尺**：用 flex 跟随窗口剩余空间（画布变高模型不变大、贴底、上方多出空间）。
+       两条**始终占位**（对话收起时只隐藏内容），所以模型不会因开合对话而跳动。整块的显隐由 .pet-root
+       上的 chat-on / chat-input-on 两个类控制（见 setChatOpen）。 -->
   <div class="pet-top">
     <div class="pet-chat-output" id="pet-chat-bubble">
       <div class="pet-chat-text" id="pet-chat-text"></div>
@@ -3109,9 +3159,15 @@ function petHtml(): string {
     <button data-act="look-screen">${t("pet.look_screen")}</button>
     <button data-act="change">更换模型…</button>
     <button data-act="reset">恢复</button>
+    <button data-act="win-reset">${t("pet.win_reset")}</button>
     <button data-act="through" id="pet-menu-through">${esc(throughLabel(loadConfig().clickThrough))}</button>
     <button data-act="close" class="danger">关闭桌宠</button>
   </div>
+  <!-- 窗上缩放手柄（2026-10-13）：无边框窗没有系统边框可抓，靠它给一个**看得见**的缩放入口
+       （拖边缘 / 角的能力由宿主 resizable 提供，见 plugin_window.rs 的 .resizable(...)）。
+       只在**输入区未展开**时显示 —— 输入区右下角是「关闭 ×」按钮，两者会重叠。
+       图标是严格线性 SVG（无 emoji），颜色走 --text-dim → hover --text。 -->
+  <div class="pet-resize-handle" id="pet-resize-handle" title="${esc(t("pet.resize_handle"))}" aria-label="${esc(t("pet.resize_handle"))}">${RESIZE_SVG}</div>
 </div>`;
 }
 
@@ -3119,15 +3175,26 @@ function petHtml(): string {
  *  …）照用，这样换主题时两个窗口观感一致（规范见 Modules 的插件开发规范 §4.3）。 */
 const PET_CSS = `
 .pet-root{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;overflow:hidden;}
-/* 上：输出带 固定 75；下：输入带 固定 35 —— **始终占位**（对话收起只隐藏内容、模型不跳动）；
-   两条都紧贴模型（无空隙）。数值与 PET_OUT_H / PET_IN_H 一致。 */
-.pet-top{flex:0 0 75px;width:100%;display:flex;align-items:flex-start;justify-content:center;overflow:hidden;}
+/* 上：输出带（**预留下限 75**，可随内容变大 —— 由 JS 改写 --pet-top-h，见 applyOutHeight）；
+   下：输入带 固定 35 —— **始终占位**（对话收起只隐藏内容、模型不跳动）；
+   两条都紧贴模型（无空隙）。数值与 pet-window-size 的 IN_H / OUT_MIN_H 一致。 */
+.pet-top{flex:0 0 var(--pet-top-h,75px);width:100%;display:flex;align-items:flex-start;justify-content:center;overflow:hidden;}
 .pet-bottom{flex:0 0 35px;width:100%;display:flex;align-items:flex-end;justify-content:center;overflow:hidden;}
-/* 模型区**定尺 300×400**（= 窗口变大之前整窗的大小）—— 用户 2026-10-10 口径：
-   窗口整体放大，但**模型本身的大小不变**，上下两条紧贴它（左 10 / 右 10 的留白照旧）。 */
-.pet-stage{position:relative;width:300px;height:400px;flex:0 0 auto;display:flex;align-items:flex-end;justify-content:center;cursor:grab;touch-action:none;}
+/* 模型区（画布）**跟随窗口剩余空间**（2026-10-13 第二轮）：
+   flex:1 1 auto ⇒ 吃掉「输出带 + 输入带」之外的全部高度（= 窗高 − 输出带 − 输入带）；
+   宽度 = 窗宽 − 左右留白（--pet-stage-gap，缺省 20 = 左右各 10，与 STAGE_W 一致）。
+   画布变大时模型**不放大**（只是周围多出空间）、且**贴底**（模型逻辑见 live2d-engine 的 fit 与
+   pet-window-size 的 modelBaseScale「只缩不放」）。min-height:0 让它在窗口很矮时能收到底。
+   ⚠️ 2026-10-13 第三轮：模型区**不会低于 STAGE_MIN_H（140）** —— 这个下限由 JS 保证（输出带上限
+   动态取 outCap、窗矮则上限降；最小窗高抬到 WIN_H_MIN = 75 + 35 + 140 = 250），CSS 的 min-height:0
+   只负责不被内容顶开、不再承担下限。见 pet-window-size 的 STAGE_MIN_H / WIN_H_MIN / outCap。 */
+.pet-stage{position:relative;width:calc(100% - var(--pet-stage-gap,20px));flex:1 1 auto;min-height:0;display:flex;align-items:flex-end;justify-content:center;cursor:grab;touch-action:none;}
 .pet-stage:active{cursor:grabbing;}
-.pet-img{width:100%;height:100%;object-fit:contain;object-position:bottom center;transform-origin:50% 100%;pointer-events:none;-webkit-user-drag:none;filter:drop-shadow(0 6px 14px rgba(var(--shade-rgb),.35));}
+/* 图片分支与模型分支**行为一致**（2026-10-13）：盒子定尺 = **参考模型区**（--pet-stage-ref-w/h，
+   缺省 300×400），不随画布放大 ⇒ 画布变大时图片同样不放大、只多空间；画布小于参考时由
+   max-width/max-height 收到画布内（object-fit:contain 不裁切）。底对齐 ⇒ object-position:bottom
+   center 让它贴底、上方留白（与 Live2D 的 anchor=底边中心对齐）。 */
+.pet-img{flex:0 0 auto;width:var(--pet-stage-ref-w,300px);height:var(--pet-stage-ref-h,400px);max-width:100%;max-height:100%;object-fit:contain;object-position:bottom center;transform-origin:50% 100%;pointer-events:none;-webkit-user-drag:none;filter:drop-shadow(0 6px 14px rgba(var(--shade-rgb),.35));}
 .pet-l2d{position:absolute;inset:0;display:none;}
 .pet-l2d.on{display:block;}
 .pet-l2d canvas{display:block;}
@@ -3135,20 +3202,32 @@ const PET_CSS = `
 .pet-err.on{display:block;}
 .pet-toast{position:absolute;left:50%;top:84px;transform:translateX(-50%);display:none;max-width:92%;font-size:.72rem;line-height:1.6;color:var(--text);background:var(--surface-glass);border:1px solid var(--border-glass);border-radius:var(--radius);padding:8px 12px;text-align:center;word-break:break-all;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:0 6px 18px rgba(var(--shade-rgb),.28);}
 .pet-toast.on{display:block;}
-/* 输出框：宽 320、**固定占满预留的 75px 输出带**（用户 2026-10-12 口径：输出框 / 输入框是**提前预留**
-   的区域，文字应渲染在这个区域内、**靠顶**，而不是按内容收缩后飘在带里）。
-   做法：用 align-self:stretch 覆盖 .pet-top 的 flex-start（= 撑满 75px）；文字靠顶（块级 + 顶部对齐，
-   **不做垂直居中**）。长回复满 75px 后在盒内滚动（overflow-y:auto，max-height 兜底）。
-   无正文时靠 .pet-chat-output:empty{visibility:hidden} 让它**不可见但仍占位** ⇒ .pet-top 始终 75px、
+/* 输出框：**随内容封顶**（用户 2026-10-13 口径）—— 宽度**跟随窗口宽**（width:100% = 整窗宽，
+   缺省即 320；比参考窄时靠 box-sizing:border-box + min-width:0 + max-width:100% + word-break
+   收住，不产生横向溢出）；高度**跟随输出带** --pet-top-h（下限 75 = 预留带，上限 OUT_CAP_H）。
+   做法：align-self:stretch 覆盖 .pet-top 的 flex-start（= 撑满输出带）；height / max-height 都取
+   --pet-top-h ⇒ 盒高恒等于输出带高（下限 75 时即原「固定占满预留 75px」的行为）；文字靠顶
+   （顶部对齐，**不做垂直居中**）。内容**超过上限**（= 输出带已被封在 OUT_CAP_H）时在盒内滚动
+   （overflow-y:auto）。短 / 中回复盒高贴合内容 ⇒ **不再出现滚动条**。
+   ⚠️ 盒子是 **flex 列**而不是 block（2026-10-13 修）：本模板里 .pet-chat-output 与 .pet-chat-text
+   之间夹着换行 + 缩进（HTML 排版的空白文本节点），而本盒带 white-space:pre-wrap、**块级**容器会把
+   这种纯空白文本节点当成真内容渲染成空行 —— 于是文字**上方 / 下方各多出约两行空白**（用户 2026-10-13
+   报的「文字前面 / 上下都有空白」；无头 Chrome 实测：文字距盒顶 42.84px，而 padding-top 只有 6px，
+   盒内容高 104 > 75 还平白多出一条滚动条）。flex 容器**不渲染**纯空白子文本节点（规范把整串空白
+   子文本节点按 display:none 处理）⇒ 与模板缩进无关地保证文字贴顶。
+   无正文时靠 :has(> .pet-chat-text:empty) 让它**不可见但仍占位** ⇒ 输出带回到下限 75px、
    开合对话时模型不位移。
    ⚠️ white-space:pre-wrap 会把回复里的换行 / 连续空行渲染成盒子内的**真实空白块**（用户报的段间空白）；
    故正文写进 DOM 前一律先过 JS 的 normalizeReplyText（换行归一 + 连续空白折叠 + 首尾空行丢弃，
    见 pet-typewriter.ts）—— 这里保留 pre-wrap 只为兜底单个空格。
    ⚠️ 滚动条只走全局那一条（ui-style.md 界面 6）：不得写 scrollbar-width / scrollbar-color、
    不得按容器另写、不得藏。 */
-.pet-chat-output{display:none;width:320px;align-self:stretch;max-height:75px;box-sizing:border-box;overflow-y:auto;padding:6px 10px;font-size:.72rem;line-height:1.6;color:var(--text);text-align:left;background:var(--surface-glass);border:1px solid var(--border-glass);border-radius:var(--radius);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);word-break:break-word;white-space:pre-wrap;}
-.pet-root.chat-on .pet-chat-output{display:block;}
-.pet-chat-output:empty{visibility:hidden;}
+.pet-chat-output{display:none;width:100%;max-width:100%;min-width:0;align-self:stretch;height:var(--pet-top-h,75px);max-height:var(--pet-top-h,75px);min-height:0;box-sizing:border-box;overflow-y:auto;padding:6px 10px;font-size:.72rem;line-height:1.6;color:var(--text);text-align:left;background:var(--surface-glass);border:1px solid var(--border-glass);border-radius:var(--radius);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);word-break:break-word;white-space:pre-wrap;}
+.pet-root.chat-on .pet-chat-output{display:flex;flex-direction:column;}
+/* 正文**不许被 flex 收缩**（flex-shrink:0）：否则盒子定尺时正文会被压到盒高、内容溢出到
+   盒外 —— 那样既量不到正文的真实高度（本来要按它算盒高），滚动也会看不见。撑开 + 盒内滚。 */
+.pet-chat-text{flex:0 0 auto;min-width:0;}
+.pet-chat-output:has(> .pet-chat-text:empty){visibility:hidden;}
 .pet-chat-output.thinking .pet-chat-text{opacity:.55;}
 /* 输入行：高 35（贴窗口下沿）；只在 .pet-root.chat-input-on 时显示。
    「桌宠发起」的三种情况（语音输入 / 主动询问 / 抓屏）**不显示输入区** —— 见 setChatOpen 的 showInput。 */
@@ -3170,6 +3249,13 @@ const PET_CSS = `
 .pet-menu button{appearance:none;background:none;border:0;text-align:left;font:inherit;font-size:.72rem;color:var(--text);padding:6px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;}
 .pet-menu button:hover{background:var(--border-glass);}
 .pet-menu button.danger:hover{color:var(--red);}
+/* 窗上缩放手柄（2026-10-13）：右下角。**起点是斜向抓握图标**（严格线性 SVG + currentColor），
+   色走 --text-dim → hover --text（§界面 2「文字 / 图标走四类派生」）。
+   只在**输入区未展开**时显示（.pet-root 无 chat-input-on）—— 输入区右下角是「关闭 ×」按钮，会重叠。
+   pointer-events 必须 auto（桌宠窗空白区是穿透 / 拖窗的，手柄要能点）。 */
+.pet-resize-handle{position:absolute;right:2px;bottom:2px;width:16px;height:16px;display:none;align-items:center;justify-content:center;color:var(--text-dim);cursor:nwse-resize;z-index:6;pointer-events:auto;touch-action:none;-webkit-user-select:none;user-select:none;}
+.pet-root:not(.chat-input-on) .pet-resize-handle{display:flex;}
+.pet-resize-handle:hover{color:var(--text);}
 .pet-console{padding:10px 12px 14px;font-size:.76rem;color:var(--text);}
 .pet-row{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;}
 /* 开头那排按钮（显示桌宠 / 更换模型 / 取消配置 / 穿透）**必须同一行**（用户 2026-10-10 口径）：
@@ -3342,6 +3428,14 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   const chatClose = el("pet-chat-close");
   const chatStop = el("pet-chat-stop");
   const chatInput = el<HTMLTextAreaElement>("pet-chat-input");
+  const resizeHandle = el("pet-resize-handle");
+
+  // 画布（模型区）尺寸**参考值**注入 CSS 变量：唯一真相源 = pet-window-size 的常量（别在 CSS 里
+  // 再写一份 300/400）。--pet-stage-gap 供 .pet-stage 的左右留白；--pet-stage-ref-w/h 供 .pet-img
+  // 定尺（图片分支不随画布放大）。Live2D 的基准缩放另经 mountLive2D 的 refStageW/H 传入。
+  petRoot?.style.setProperty("--pet-stage-gap", `${STAGE_GAP}px`);
+  petRoot?.style.setProperty("--pet-stage-ref-w", `${STAGE_W}px`);
+  petRoot?.style.setProperty("--pet-stage-ref-h", `${STAGE_H}px`);
 
   let raf = 0;
   let cfg = loadConfig();
@@ -3449,6 +3543,10 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
           offsetX: cfg.offsetX,
           offsetY: cfg.offsetY,
           rotation: cfg.rotation,
+          // 参考模型区尺寸（缺省窗口下的 300×400）：模型基准缩放按它算 ⇒ 画布比它大时不放大、
+          // 比它小时按画布收（见 live2d-engine 的 fit 与 pet-window-size 的 modelBaseScale）。
+          refStageW: STAGE_W,
+          refStageH: STAGE_H,
           extraExpressions,
           extraMotions,
           idleMotions,
@@ -3706,6 +3804,21 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     if (menu?.classList.contains("open") && !menu.contains(ev.target as Node)) closeMenu();
   });
 
+  // ── 窗上「缩放手柄」（2026-10-13）────────────────────────────────
+  // 无边框窗没有系统边框可抓 ⇒ 右下角给一个**看得见**的缩放入口：按下即发起宿主的
+  // 「拖拽缩放」原生循环（`startResizeDragging`，方向 = 右下角 `SouthEast`）—— 与拖窗口边缘
+  // （宿主 `resizable` 提供）是**同一套**原生行为，只是这一条有可视抓手。用户松手后由
+  // `onResized` 记进配置（见窗口尺寸那一段）。鼠标穿透开着时收不到事件（符合穿透语义）。
+  resizeHandle?.addEventListener("mousedown", ev => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    closeMenu();
+    void getCurrentWindow()
+      .startResizeDragging("SouthEast")
+      .catch(() => {});
+  });
+
   // 滚轮：以**指针所在位置**为锚点缩放（锚点下的像素保持不动）。
   // `{passive:false}` 才能 `preventDefault` 拦住页面级滚动。
   stage?.addEventListener(
@@ -3805,11 +3918,63 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     petRoot?.classList.toggle("chat-on", on);
     petRoot?.classList.toggle("chat-input-on", on && showInput);
     if (on && showInput && focusInput) chatInput?.focus();
+    applyOutHeight(true); // 开合对话 ⇒ 输出带高随之变化（关闭时回到下限 75、窗口缩回基准高）
+  }
+
+  // ── 窗口尺寸（随内容封顶 + 可调宽高 + 记忆，2026-10-13）────────────────
+  // **纯换算在 `./pet-window-size`**（可 node 单测）；这里只管 CSS 变量、量测与下发。
+  // 记忆落点 = 本插件自己的 localStorage 配置（`CFG_KEY` 的 winW / winH）：宿主**没有**按插件
+  // id 存窗口尺寸的机制（`plugin_window.rs` 的尺寸只来自清单 + 内存里的 clamp，**不落盘**）。
+  let winW = cfg.winW; // 窗口宽（用户拖边缘 / 角 / 手柄改过就记这里）
+  let winBaseH = cfg.winH; // **无内容**时窗口的基准高（= 510 缺省；用户改过则是他拖出来的高度）
+  let outTopH = OUT_MIN_H; // 当前生效的输出带高（= CSS 变量 `--pet-top-h`）
+  let lastSentH = -1; // 上次**成功下发**的目标窗口高（跨档节流的比较基准）
+  let failedH = -1; // 上次**下发失败**的目标高：同一个值不再重试（clamp / 回读失败不空转重试）
+  let resizeSaveTimer: ReturnType<typeof setTimeout> | null = null; // 拖拽记账去抖
+
+  /** 量测输出框正文的真实高度（+ 盒 padding 12 / border 2 = 14）。**必须在文本已写入后量** ——
+   *  量的是**正文元素本身**（不受盒 overflow 裁剪影响，拿不到滚动容器的中间态）。 */
+  function measureOutContentH(): number {
+    if (!chatText) return 0;
+    const r = chatText.getBoundingClientRect().height;
+    return Number.isFinite(r) ? Math.ceil(r + 14) : 0;
+  }
+
+  /** 把输出带高写进 CSS 变量（`.pet-top` 的 flex-basis 与 `.pet-chat-output` 的 height 都取它）。 */
+  function setOutTopVar(topH: number) {
+    petRoot?.style.setProperty("--pet-top-h", `${topH}px`);
+  }
+
+  /** 按当前内容算出目标输出带高，并（必要时）下发窗口尺寸。
+   *  `force` = 忽略跨档节流（收尾 / 清空 / 开合对话时用）；逐字增长走 `false`。
+   *  ⚠️ **下发失败（clamp / 回读对不上）只记下目标、不重试同一个值** —— 免得陷入死循环重试。 */
+  function applyOutHeight(force: boolean) {
+    // **最小模型区保护**（2026-10-13 第三轮）：上限**动态**取 `outCap(窗口基准高)` —— 窗矮则上限
+    // 自动降低，输出带绝不侵占模型区（见 pet-window-size 的 outCap / STAGE_MIN_H）。
+    // 基准高（而非「当前窗高」）是**稳定**的：模型区高 = 基准高 − OUT_MIN_H − IN_H 与带高无关。
+    const cap = outCap(winBaseH);
+    const wanted = chatOpen && visible ? quantizeTopH(clampOutTop(measureOutContentH(), cap), OUT_STEP, cap) : OUT_MIN_H;
+    outTopH = wanted;
+    setOutTopVar(wanted);
+    if (!visible) return; // 隐藏 / 最小化时不下发（唤出时 applyShown 会重新对齐）
+    const targetH = targetWindowHeight(winBaseH, wanted);
+    if (!force && !shouldResize(lastSentH, targetH)) return; // 没跨档 ⇒ 不下发（逐字增长不逐帧 resize）
+    if (force) failedH = -1; // 收尾 / 清空是权威目标：允许对上次失败的值重试一次
+    if (targetH === failedH) return; // 上次同一个目标失败过：不重试
+    const h = targetH;
+    void invoke("plugin_window_resize_anchored", { width: Math.round(winW), height: Math.round(h) })
+      .then(() => {
+        lastSentH = h;
+      })
+      .catch(() => {
+        failedH = h; // 失败：记下这个目标，后续同一目标不再重发（防死循环）
+      });
   }
 
   /** 更新气泡正文（**立即**显示，不走逐字动画）。用于「思考中」占位、中断占位等要瞬时可见的文本。
    *  正文先过 `normalizeReplyText`（换行归一 / 连续空白折叠 / 首尾空行丢弃，见 `./pet-typewriter`），
-   *  这样 `white-space:pre-wrap` 不会再渲染出**上方 / 下方空白框**（成因见文件末本轮注释）。
+   *  这样 `white-space:pre-wrap` 不会再渲染出**上方 / 下方空白框**（成因见 PET_CSS 里 `.pet-chat-output`
+   *  那段注释：pre-wrap 会把换行 / 纯空白文本节点渲染成真实空行）。
    *  每次更新都会**中止**正在跑的逐字动画（不得留悬挂 interval）。 */
   function setChatText(text: string, thinking = false) {
     stopTypewriter(false); // 换内容 ⇒ 先清上一轮动画（新内容马上覆盖它，不必补显全文）
@@ -3818,6 +3983,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     chatOut?.classList.toggle("thinking", !!thinking);
     followBottom = true;
     if (chatText?.parentElement) chatText.parentElement.scrollTop = 0;
+    applyOutHeight(true); // 正文整体换掉 ⇒ 输出带高按新内容重算（立即，不走跨档节流）
   }
 
   /** 输出框滚到底（让刚揭示的字符保持在视野内）。 */
@@ -3836,6 +4002,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     typeUnits = [];
     typeIdx = 0;
     typeRevealed = "";
+    applyOutHeight(true); // 动画收尾 ⇒ 按全文对齐一次（补齐最后一段档位）
     if (done) done();
   }
 
@@ -3879,6 +4046,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     if (!visible || shouldAnimateDirectly(units.length, rate, ANIM_MAX_MS)) {
       chatText.textContent = full;
       if (chatOut) chatOut.scrollTop = 0;
+      applyOutHeight(true); // 整体显示 ⇒ 按全文对齐一次
       onDone?.();
       return;
     }
@@ -3891,6 +4059,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
       typeIdx++;
       if (chatText) chatText.textContent = typeRevealed;
       if (followBottom) scrollChatToBottom();
+      applyOutHeight(false); // 逐字增长：跨档才下发（节流，见 applyOutHeight）
       if (typeIdx >= typeUnits.length) finishTyping();
     }, 1000 / rate);
   }
@@ -3934,6 +4103,13 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   let proactiveBusy = false; // 上一轮未收尾（还在「思考中」）⇒ 不叠发
   let outputBoxTimer: ReturnType<typeof setTimeout> | null = null; // 自动弹输出的自动收起
   let outputBoxAuto = false; // 输出区是不是「本轮自动展开」的（用户自己开着的不自动收）
+  /** **语音是否还在播**（2026-10-13）：为真时**不起算**自动收起 —— 等宿主 `TTS_DONE_EVENT`
+   *  （播完 / 未配好 / 合成失败都会发）把气泡多留一会儿。`tts` 关着时它恒为 false，
+   *  于是行为与加这条之前一致（逐字动画跑完即起算原 ≈6s）。 */
+  let ttsPlaying = false;
+  /** 语音的**兜底看门狗**：万一那次 `TTS_DONE_EVENT` 丢了，3 分钟后强制放行自动收起（绝不永久不隐）。 */
+  let ttsWatchdog: ReturnType<typeof setTimeout> | null = null;
+  const TTS_WAIT_MAX_MS = 180_000;
 
   function clearProactiveTimer() {
     if (proactiveTimer) {
@@ -4205,11 +4381,12 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     scheduleProactive();
     scheduleAutoShot();
     scheduleScreenWatch();
+    applyOutHeight(true); // 唤出 ⇒ 按当前正文重新对齐输出带高（隐藏期间没下发过）
   }
 
   /** 只弹**输出**、**不显示输入区** —— 用于「桌宠发起」的轮次（主动反应 / 抓取屏幕图像；语音输入同理），
-   *  **本身不排自动收起**。自动收起由 `scheduleOutputAutoHide` 单独负责 —— 逐字动画**跑完**后才起算
-   *  `PROACTIVE_BOX_MS`，避免长回复在动画中途被收起（见 `CHAT_REPLY_EVENT` 处理处）。
+   *  **本身不排自动收起**。自动收起由 `maybeScheduleAutoHide` 单独负责 —— 逐字动画**跑完**、
+   *  且**语音播完**（若在朗读）之后才起算 `PROACTIVE_BOX_MS`，避免长回复在动画 / 朗读中途被收起。
    *  用户本来就开着输入对话（chatOpen 为真）⇒ 视为「他正在看」：不弹输入、也不自动收。 */
   function showOutputBox() {
     if (outputBoxTimer) {
@@ -4222,9 +4399,39 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     }
   }
 
+  /** 开始朗读（把 `ttsPlaying` 置真并起看门狗）。由 `CHAT_REPLY_EVENT` 处理处调用。 */
+  function beginTtsWait() {
+    ttsPlaying = true;
+    if (ttsWatchdog) clearTimeout(ttsWatchdog);
+    ttsWatchdog = setTimeout(() => {
+      ttsWatchdog = null;
+      ttsPlaying = false; // 兜底：等太久（信号丢了）⇒ 放行自动收起
+      maybeScheduleAutoHide();
+    }, TTS_WAIT_MAX_MS);
+  }
+
+  /** 语音播完（或那次朗读根本没法发声）⇒ 解除等待并（若其余条件也满足）起算自动收起。 */
+  function endTtsWait() {
+    if (ttsWatchdog) {
+      clearTimeout(ttsWatchdog);
+      ttsWatchdog = null;
+    }
+    ttsPlaying = false;
+    maybeScheduleAutoHide();
+  }
+
+  /** **自动收起的唯一判据**：`outputBoxAuto`（本轮自动展开，用户自己开着的不收）+ 现在没在隐藏
+   *  + 逐字动画已停 + 语音已播完。任一不满足就不起算（由对应的完成点再来调一次）。 */
+  function maybeScheduleAutoHide() {
+    if (!visible) return;
+    if (typeTimer !== null) return; // 逐字动画还在跑
+    if (ttsPlaying) return; // 语音还在播（TTS 未启用时恒 false，行为同加这条之前）
+    scheduleOutputAutoHide();
+  }
+
   /** 起算气泡自动收起（只在「本轮自动展开」`outputBoxAuto` 时生效；用户自己开着的不收）。
-   *  由逐字动画结束 / 直接整体显示后调用 ⇒ **动画有多长，气泡就至少多留 `PROACTIVE_BOX_MS`**。
-   *  这就是与既有自动收起口径的关系：动画没跑完**不会**到收起时间（计时被推迟到动画之后）。 */
+   *  唯一调用者是 `maybeScheduleAutoHide`（逐字动画停 + 语音播完之后）⇒ **动画 / 朗读有多长，
+   *  气泡就至少多留 `PROACTIVE_BOX_MS`**。 */
   function scheduleOutputAutoHide() {
     if (outputBoxTimer) {
       clearTimeout(outputBoxTimer);
@@ -4251,6 +4458,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   // 按钮先按下即收起、气泡先切成「已中断」占位（真正的收尾回复随后由 `pet-chat-reply` 覆盖）。
   const onChatStopClick = () => {
     setPetGenerating(false);
+    endTtsWait(); // 用户中断 ⇒ 停止语音等待并起算自动收起（沿用「用户中断即刻处理」语义）
     setChatText(t("pet.chat_reply_interrupted"), true);
     void emit(CHAT_STOP_EVENT).catch(e => reportPet("中止 AI 消息失败", e));
   };
@@ -4305,16 +4513,27 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     // 失败必须 catch 掉，绝不能影响气泡显示（宿主那侧合成失败也会静默跳过，见 src/tts.rs）。
     // 与逐字动画相互独立（2026-10-12 拆分）：动画节拍取本插件 `speechRate`（打字速度），
     // 语音语速 / 音量各自独立（宿主 `PetVoiceConfig.speed` / `volume`）—— 两者不再绑定。
+    // **自动收起改为「语音播完再隐」（2026-10-13）**：开朗读时先置 `ttsPlaying`，等宿主
+    // `TTS_DONE_EVENT`（播完 / 未配好 / 合成失败都会发）再放行 ⇓ 的起算；`tts` 关着不置位，
+    // 于是仍是「动画跑完即起算原 ≈6s」的兜底行为。
     if (text && loadConfig().tts) {
-      void invoke("tts_speak", { text, enabled: true }).catch(() => {});
+      beginTtsWait();
+      void invoke("tts_speak", { text, enabled: true }).catch(() => {
+        // 连命令都没发出去（异常）⇒ 解除等待，回落原 ≈6s，别把气泡永久钉住。
+        endTtsWait();
+      });
     }
     // 让用户看到回复：**自动弹输出**（输入区不显示）。轮次开头已由 `sendToAI` 弹过一次（显示「思考中」）；
-    // 这里逐字揭示正文，**动画跑完后再起算自动收起**（避免长回复在动画中途被 `PROACTIVE_BOX_MS` 收起）。
+    // 这里逐字揭示正文，**动画跑完 + 语音播完后再起算自动收起**（见 maybeScheduleAutoHide）。
     if (visible) showOutputBox();
-    startTypewriter(text, () => {
-      if (visible) scheduleOutputAutoHide();
-    });
+    startTypewriter(text, () => maybeScheduleAutoHide());
     onProactiveReply(); // 若本轮是主动反应发起的 ⇒ 结束本轮 + 排下一轮（非主动轮是空操作）
+  });
+
+  // **「语音播完」信号**（**定向**事件 ⇒ 按纪律用带 label 的 `listen`，同 MOUTH_EVENT / CHAT_REPLY_EVENT）。
+  const offTtsDone = await getCurrentWindow().listen(TTS_DONE_EVENT, () => {
+    if (!inPetWindow()) return;
+    endTtsWait();
   });
 
   menu?.addEventListener("click", ev => {
@@ -4387,6 +4606,17 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
         void emit(CTL_EVENT, { type: "scale-changed", value: 1 }); // 设置窗的拉条跟着对齐
         void emit(CTL_EVENT, { type: "rotation-changed", value: 0 });
         showToast("已恢复默认大小、位置与角度", 2000);
+        return;
+      }
+      if (act === "win-reset") {
+        // 恢复**默认窗口尺寸**（2026-10-13）：宽回 320、基准高回 510，并按当前输出带高重新对齐。
+        winW = WIN_W_DEFAULT;
+        winBaseH = WIN_BASE_H;
+        cfg = { ...cfg, winW: WIN_W_DEFAULT, winH: WIN_BASE_H };
+        saveConfig(cfg);
+        failedH = -1; // 恢复默认是权威动作：允许对上次失败的目标重试
+        applyOutHeight(true);
+        showToast(t("pet.win_reset_done"), 2000);
         return;
       }
       if (act === "through") {
@@ -4792,9 +5022,49 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   );
 
   injectPetStyle();
-  // 窗口尺寸对齐（幂等）：清单 `window` 段只在**建窗那一刻**生效，dev 里若是清单更新前建的窗
-  // 就会一直停在旧尺寸 ⇒ 这里按同一组常量再对齐一次（见 PET_WIN_W / PET_WIN_H 的注释）。
-  void invoke("plugin_window_resize", { width: PET_WIN_W, height: PET_WIN_H }).catch(() => {});
+  // 窗口尺寸（2026-10-13）：
+  //  · **可调宽高** —— 无边框窗也能拖边缘 / 角缩放，前提是宿主侧 `resizable` 为真（清单 `window`
+  //    段的 resizable，见 build-plugins.ps1 的 pet 块）；dev 里若这扇窗是旧清单建的，这里再确保一次。
+  //  · **记忆尺寸** —— 用本插件 localStorage 里的 winW / winH（宿主**不**按插件 id 存窗口尺寸），
+  //    先 clamp 到合法区间再对齐（清单只在建窗那一刻生效，记忆 + clamp 才是权威）。
+  //    ⚠️ clamp 的**下限由 pet-window-size 推导**（`WIN_H_MIN = 75 + 35 + STAGE_MIN_H`，2026-10-13
+  //    第三轮把它抬到 250）—— 老用户存的过小尺寸（如 200）在这里被纠正，模型区不会再被压到 0。
+  void invoke("plugin_window_set_resizable", { resizable: true }).catch(() => {});
+  {
+    const init = clampWindowSize(cfg.winW, cfg.winH);
+    winW = init.w;
+    winBaseH = init.h;
+  }
+  applyOutHeight(true); // 无内容 ⇒ 输出带回到下限 75、窗口 = 基准高（= 记忆值 / 缺省 510）
+
+  // 用户拖边缘 / 角 / 手柄改尺寸后**记住**（去抖 250ms；拖拽期间 resize 事件很密）。
+  // 程序化下发满足 `窗高 = 基准高 + (输出带高 − 75)`，故反推基准高对程序化改动恒等、不会漂移。
+  // **最小模型区保护**（2026-10-13 第三轮）：手拖把窗变矮时**先收窄盒高**再反推基准高。
+  const offResized = await getCurrentWindow().onResized(ev => {
+    if (!visible) return;
+    const size = ev.payload; // PhysicalSize（物理像素）
+    const dpr = window.devicePixelRatio || 1;
+    const winH = size.height / dpr;
+    // 窗矮 ⇒ 上限（outCap）随之降低 ⇒ 把盒高收到新上限（**只收不放**：内容变短不在这里放大，
+    // 那由 applyOutHeight 负责）。否则盒仍停在旧高、`.pet-stage` 会被压到 0（长回复 + 手拖到
+    // 最小窗的病态，见 outCap / STAGE_MIN_H）。程序化下发恒满足 `盒高 ≤ outCap(窗高)`，故不触发。
+    const cap = outCap(winH);
+    if (outTopH > cap) {
+      outTopH = cap;
+      setOutTopVar(cap);
+    }
+    const topH = outTopH; // 反推基准高要用**收窄后**的盒高（否则记账会漂），别用 250ms 后的新值
+    if (resizeSaveTimer) clearTimeout(resizeSaveTimer);
+    resizeSaveTimer = setTimeout(() => {
+      resizeSaveTimer = null;
+      const next = clampWindowSize(size.width / dpr, baseHeightFromWindow(winH, topH));
+      if (next.w === winW && next.h === winBaseH) return; // 与已记的一致 ⇒ 不写盘（收敛）
+      winW = next.w;
+      winBaseH = next.h;
+      cfg = { ...cfg, winW: next.w, winH: next.h };
+      saveConfig(cfg);
+    }, 250);
+  });
   void paint();
   // 配置里就写着要穿透（上次在控制台开的）⇒ 开窗即生效。
   // **动画不在这里起**：`paint()` 会按当前来源决定 —— 模型自己走 pixi 的 ticker，
@@ -4826,6 +5096,8 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     clearScreenWatchTimer();
     if (proactiveWatchdog) clearTimeout(proactiveWatchdog);
     if (outputBoxTimer) clearTimeout(outputBoxTimer);
+    if (ttsWatchdog) clearTimeout(ttsWatchdog); // 语音等待的兜底看门狗
+    if (resizeSaveTimer) clearTimeout(resizeSaveTimer); // 拖拽记账去抖
     if (mouthTimer) {
       clearInterval(mouthTimer); // 口型驱动：别在窗关掉后还在跑
       mouthTimer = null;
@@ -4834,7 +5106,9 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     offVis();
     offAltRclick();
     offChatReply();
+    offTtsDone();
     offMouth();
+    offResized();
     l2dHandle?.setMouthOpen(null);
     chatInput?.removeEventListener("keydown", onChatKeydown);
     chatClose?.removeEventListener("click", onChatCloseClick);

@@ -165,7 +165,7 @@ $Plugins = @{
   # **控制台**面板，桌宠窗由控制台里的「显示桌宠」按钮开（理由见 pet.ts 文件头：
   # 穿透开着时桌宠窗收不到鼠标事件，开关必须落在另一个窗口里）。
   pet = @{
-    version      = "0.9.54"
+    version      = "0.9.58"
     name         = "桌宠"
     description  = "桌宠 —— 独立透明置顶的桌面形象窗（图片或 Live2D 模型，由你自己导入）"
     keywords     = @("桌宠", "宠物", "桌面宠物", "pet", "desktop pet", "live2d", "看板娘", "吉祥物")
@@ -247,14 +247,22 @@ $Plugins = @{
     extraEntries = [ordered]@{ "engine/live2d-engine.js" = "src/plugins/builtin/live2d-engine.ts" }
     # `chrome = $false` ⇒ 前端收起标题栏、结果区去玻璃底（styles.css 的 `html.no-chrome`）；
     # `skipTaskbar = $true` ⇒ 不进任务栏（桌宠在任务栏里出现一个条目是纯噪音）；
-    # `resizable = $false` ⇒ 禁手动缩放（尺寸由形象与控制台决定）。
+    # `resizable = $true`（2026-10-13 改）⇒ 允许拖边缘 / 角缩放。**无边框窗（decorations:false）
+    #   也能拖边缘缩放**（tao 对 undecorated + resizable 的窗实现了 WM_NCHITTEST 的边框命中区），
+    #   再加前端那个「窗口缩放手柄」（pet.ts 的 .pet-resize-handle → startResizeDragging）。尺寸由
+    #   前端记得（localStorage 的 winW/winH）+ 输出框随内容封顶后再对齐，见 pet.ts 的窗口尺寸段。
     # 三个缺省值反过来的写法（不写这一段）就是历史上所有插件的样子 —— 别把这一段复制给它们。
     window       = @{
       width       = 320
       height      = 510
       minWidth    = 160
-      minHeight   = 200
-      resizable   = $false
+      # **最小窗高 = pet-window-size 的 `WIN_H_MIN`（唯一真相源，勿在此硬编码第二份）**：
+      # = OUT_MIN_H(75) + IN_H(35) + STAGE_MIN_H(140) = **250**（2026-10-13 第三轮由 200 抬高）。
+      # 宿主的 `plugin_window_resize` / `plugin_window_resize_anchored` 的 clamp 就**读这里**
+      # （`min_size` → `shape.min_height`），前端 `clampWindowSize` 用 pet-window-size 的同名常量
+      # ⇒ 三处口径同源。它排除「输出带封顶 + 输入带把模型区压到 0」那个病态（见 pet.ts 的 outCap）。
+      minHeight   = 250
+      resizable   = $true
       skipTaskbar = $true
       chrome      = $false
     }

@@ -27,6 +27,10 @@ use tauri::Emitter;
 /// 由宿主在**开始播放之前**定向发给桌宠窗（WebView 放不出声音，见文件头），
 /// 于是「音频在宿主放」+「口型在 WebView 演」共用同一条时间线。
 pub const MOUTH_EVENT: &str = "pet-tts-mouth";
+/// **「语音播完」信号**的下发事件（2026-10-13）：桌宠窗收到就把气泡自动收起的起算推迟到这一刻
+/// （`pet.ts` 的 `TTS_DONE_EVENT`，**必须与前端同名**）。宿主在**一次朗读结束之后**（播完 /
+/// 未就绪静默跳过 / 合成失败**都算**）定向发一条 —— 前端的逻辑因此只有一条：等它就对了。
+pub const TTS_DONE_EVENT: &str = "pet-tts-done";
 /// 桌宠窗的 label（宿主按 `plugin-<id>` 命名）。定向发，不给别的插件窗广播。
 const PET_LABEL: &str = "plugin-pet";
 
@@ -219,6 +223,10 @@ fn play_wav(path: &Path, app: &tauri::AppHandle, fps: u32, env: &[u8], volume: f
 ///
 /// **命令本身立即返回**：合成 + 播放（ZipVoice 合成会阻塞）整段丢到后台线程；
 /// 失败只记日志、不 panic、也不回给调用方 —— 朗读失败不该影响气泡显示。
+///
+/// **「播完」信号**（2026-10-13）：线程跑完 `speak_blocking`（无论播完 / 静默跳过 / 合成失败）
+/// 都定向发一条 `TTS_DONE_EVENT` 给桌宠窗 —— 桌宠据此把气泡自动收起的起算推迟到这一刻。
+/// 定向（`emit_to`）而非广播：同时开着音乐 / 聊天等插件窗是常态，广播会让别的窗也收到。
 #[tauri::command]
 pub fn tts_speak(app: tauri::AppHandle, text: String, enabled: Option<bool>) -> Result<(), String> {
     if enabled == Some(false) {
@@ -228,7 +236,11 @@ pub fn tts_speak(app: tauri::AppHandle, text: String, enabled: Option<bool>) -> 
     if t.is_empty() {
         return Ok(());
     }
-    std::thread::spawn(move || speak_blocking(&app, &t));
+    std::thread::spawn(move || {
+        speak_blocking(&app, &t);
+        // 发不出去（桌宠窗没开）也无所谓：`let _` 吞掉，朗读 / 气泡一律不受影响。
+        let _ = app.emit_to(PET_LABEL, TTS_DONE_EVENT, ());
+    });
     Ok(())
 }
 

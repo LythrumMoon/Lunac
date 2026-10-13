@@ -658,6 +658,24 @@ pub fn plugin_window_set_resizable(window: WebviewWindow, resizable: bool) -> Re
         .map_err(|e| format!("切换窗口缩放失败：{e}"))
 }
 
+/// 尺寸收窄：按插件 id 的**下限**夹取、上限 `2000`（与 `plugin_window_resize` 同源口径）。
+/// 抽成纯函数是为了能单测「坏值 / 越界不落出去」这件事（`plugin_window_resize` 与
+/// `plugin_window_resize_anchored` 共用它，两处的 clamp 不得漂移）。
+fn clamp_size(plugin_id: &str, shape: Option<&PluginWindowShape>, width: f64, height: f64) -> (f64, f64) {
+    let (min_w, min_h) = min_size(plugin_id, shape);
+    (width.clamp(min_w, 2000.0), height.clamp(min_h, 2000.0))
+}
+
+/// **下沿锚定**的新上沿：窗高从 `cur_h` 变到 `new_h`、下沿（屏幕 y）不动 ⇒ 上沿位移
+/// `(cur_h - new_h) * scale`（物理像素）。`scale` = 逻辑→物理的 DPI 比例。
+///
+/// 为什么要这一步（2026-10-13）：桌宠的输出框变高时窗口要跟着变高，但**模型区与输入带在屏幕上
+/// 不能位移**（用户裁决「模型既不缩也不移」）。`set_size` 只会向下生长（上沿不动、下沿下移），
+/// 那样会把模型整体推下去；把上沿按高度差反向搬一次，下沿就锚住了，多出来的高度全部落在输出框上。
+fn anchored_top(cur_top: i32, cur_h: f64, new_h: f64, scale: f64) -> i32 {
+    cur_top + ((cur_h - new_h) * scale).round() as i32
+}
+
 /// 前端实测内容尺寸后下发窗口尺寸。
 ///
 /// **为什么由前端决定**：音乐插件的播放态与默认态高度差近一倍，而内容里的是
@@ -688,15 +706,62 @@ pub fn plugin_window_resize(window: WebviewWindow, width: f64, height: f64) -> R
     let id = plugin_id_of(window.label());
     // 下限也要按**清单声明的**那一份取：桌宠禁缩放、且定尺比通用下限小的话，
     // 用通用下限会让它每轮 resize 都报 `ERR_SIZE_STUCK`（同一个坑，见上面注释）。
-    let (min_w, min_h) = min_size(id, declared_shape(id).as_ref());
-    let w = width.clamp(min_w, 2000.0);
-    let h = height.clamp(min_h, 2000.0);
+    let (w, h) = clamp_size(id, declared_shape(id).as_ref(), width, height);
     window
         .set_size(tauri::LogicalSize::new(w, h))
         .map_err(|e| format!("调整插件窗口尺寸失败：{e}"))?;
     // 容差 2px：LogicalSize → PhysicalSize 那一趟会按 DPI 比例取整
     // （1.25 缩放下 550 → 688 → 550.4），严格相等会把自己误判成失败。
     let scale = window.scale_factor().unwrap_or(1.0);
+    let got = window
+        .inner_size()
+        .map(|s| (f64::from(s.width) / scale, f64::from(s.height) / scale))
+        .map_err(|e| format!("读窗口尺寸失败：{e}"))?;
+    if (got.0 - w).abs() > 2.0 || (got.1 - h).abs() > 2.0 {
+        return Err(format!("ERR_SIZE_STUCK({:.0}x{:.0}≠{w}x{h})", got.0, got.1));
+    }
+    Ok(())
+}
+
+/// 与 `plugin_window_resize` 同源的 clamp 与回读，但**保持窗口下沿不动**（桌宠输出框随内容变高用）。
+///
+/// 桌宠窗是 `decorations(false)` 的透明窗（无边框 / 无阴影 ⇒ 外框尺寸 == 内容尺寸），
+/// 所以「下沿锚定」= 先按目标尺寸 `set_size`（上沿不动、向下生长），再把上沿按高度差**搬回**，
+/// 使下沿停在原处。表现：输出框向上生长，模型区与输入带**在屏幕上不位移**。
+///
+/// 回读判定 / 容差 / clamp 口径与 `plugin_window_resize` **逐字一致**（共用 `clamp_size`）——
+/// 前端据此同款记账；失败（含被最小化顶回）照常返回 `ERR_SIZE_STUCK`，前端**不重试同一个值**
+/// （见 pet.ts 的 failedH），故不会死循环。
+#[tauri::command]
+pub fn plugin_window_resize_anchored(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+    if !width.is_finite() || !height.is_finite() {
+        return Err("ERR_BAD_SIZE".into());
+    }
+    let id = plugin_id_of(window.label());
+    let (w, h) = clamp_size(id, declared_shape(id).as_ref(), width, height);
+    let scale = window.scale_factor().unwrap_or(1.0);
+    // 先量当前几何：inner 高度（逻辑）+ 外框左上角（物理）。取外框而不是内容位置——
+    // 下沿锚定关心的是整扇窗在屏幕上的位置。
+    let (cur_h, cur_top) = {
+        let sz = window.inner_size().map_err(|e| format!("读窗口尺寸失败：{e}"))?;
+        let pos = window.outer_position().map_err(|e| format!("读窗口位置失败：{e}"))?;
+        (f64::from(sz.height) / scale, pos.y)
+    };
+    let new_top = anchored_top(cur_top, cur_h, h, scale);
+    window
+        .set_size(tauri::LogicalSize::new(w, h))
+        .map_err(|e| format!("调整插件窗口尺寸失败：{e}"))?;
+    if new_top != cur_top {
+        // 外框左上角的 x 保持不动（`set_size` 后它仍是旧的 x），只挪 y。
+        let x = window
+            .outer_position()
+            .map(|p| p.x)
+            .unwrap_or(0);
+        window
+            .set_position(tauri::PhysicalPosition::new(x, new_top))
+            .map_err(|e| format!("移动插件窗口失败：{e}"))?;
+    }
+    // 回读：只有**尺寸**参与判定（位置由系统按 clamp 微调，且平移本身不影响贴合）。
     let got = window
         .inner_size()
         .map(|s| (f64::from(s.width) / scale, f64::from(s.height) / scale))
@@ -890,5 +955,47 @@ mod tests {
         assert!(!is_safe_plugin_id("A-B")); // 大写不收（label 一律小写，避免大小写不匹配）
         assert!(!is_safe_plugin_id(".hidden"));
         assert!(!is_safe_plugin_id(&"x".repeat(41)));
+    }
+
+    /// 尺寸 clamp（2026-10-13）：两个 resize 命令共用 `clamp_size`，坏值 / 越界不得落出去。
+    #[test]
+    fn clamp_size_bounds_bad_and_out_of_range_values() {
+        // 通用下限 300×200；上限 2000
+        assert_eq!(clamp_size("memo", None, 500.0, 400.0), (500.0, 400.0));
+        assert_eq!(clamp_size("memo", None, 10.0, 10.0), (MIN_W, MIN_H), "下限必须兜住");
+        assert_eq!(clamp_size("memo", None, 9_999.0, 9_999.0), (2000.0, 2000.0), "上限必须兜住");
+        // 桌宠按清单那一份下限取（minWidth 160 / minHeight 200）；越小越要按它、不能套通用 300
+        let pet = pet_shape();
+        let (w, h) = clamp_size("pet", Some(&pet), 100.0, 100.0);
+        assert_eq!((w, h), (120.0, 160.0), "要按清单的 minWidth/minHeight 夹，而不是通用档");
+        // 只声明 minHeight（minHeight 300 ≤ 初始 380）⇒ 高度按 300 兜住，宽度走清单 120
+        let only_min_h = PluginWindowShape { min_height: 300.0, ..pet_shape() };
+        let (w2, h2) = clamp_size("pet", Some(&only_min_h), 100.0, 100.0);
+        assert_eq!((w2, h2), (120.0, 300.0));
+    }
+
+    /// 下沿锚定的上沿换算（2026-10-13）：窗口变高 ⇒ 上沿上移（y 变小）、下沿不动。
+    #[test]
+    fn anchored_top_keeps_the_bottom_edge_fixed() {
+        // 1x：高度 +180 ⇒ 上沿上移 180
+        assert_eq!(anchored_top(500, 510.0, 690.0, 1.0), 320);
+        // 高度 -180 ⇒ 上沿下移 180（缩回）
+        assert_eq!(anchored_top(320, 690.0, 510.0, 1.0), 500);
+        // 不变 ⇒ 不动
+        assert_eq!(anchored_top(500, 510.0, 510.0, 1.0), 500);
+        // 1.25 缩放：逻辑差 180 ⇒ 物理差 225
+        assert_eq!(anchored_top(1000, 510.0, 690.0, 1.25), 775);
+        // 校验「下沿不动」这条不变量本身：top + h*scale 恒定
+        for (top, cur, new, s) in [
+            (500, 510.0, 690.0, 1.0),
+            (320, 690.0, 510.0, 1.0),
+            (1000, 510.0, 690.0, 1.25),
+            (0, 200.0, 255.0, 1.5),
+        ] {
+            let moved = anchored_top(top, cur, new, s);
+            let bottom_before = f64::from(top) + cur * s;
+            let bottom_after = f64::from(moved) + new * s;
+            assert!((bottom_before - bottom_after).abs() < 1.0, "下沿必须不动：{bottom_before} vs {bottom_after}");
+        }
     }
 }
