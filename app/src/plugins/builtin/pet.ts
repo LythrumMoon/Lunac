@@ -643,7 +643,7 @@ const KIND_ICON =
   `<path d="M8 1.6 11.2 5.2H4.8Z" fill="currentColor"/>` +
   `<path d="M8 14.4 4.8 10.8h6.4Z" fill="currentColor"/></svg>`;
 
-/** **热键区**（2026-10-10）：定义存**与模型同目录**的 `lunac.hotkeys.json`（用户口径：
+/** **热键区**（2026-10-10）：定义存模型目录下 `lunac-live2d\lunac.hotkeys.json`（用户口径：
  *  热键 / 表情 / 模型放同一个文件夹）。这里只出骨架 —— 行由 JS 按数据渲染
  *  （热键是动态列表，写死在模板里改不动，见 `attachSettingsWindow` 的 `refreshHotkeys`）。 */
 function hotkeyBlock(): string {
@@ -694,11 +694,22 @@ interface CoreIdTable {
   parts: string[];
   /** 参数取值范围（Cubism Core 的 min/max/default）；旧数据没有这个字段时为空对象。 */
   parameterRanges: Record<string, { min: number; max: number; def: number }>;
+  /** **物理输入**参数 id（`.physics3.json`）；旧数据没有这个字段时为空数组。 */
+  physicsInputs: string[];
+  /** **物理输出**参数 id（被物理每帧写值的那些）；旧数据没有这个字段时为空数组。 */
+  physicsOutputs: string[];
 }
 
 /** 读某模型的运行时 id 表（**只读 localStorage 那一份**）。没开过桌宠时返回空表。 */
 function readCoreIdsLocal(modelPath: string): CoreIdTable {
-  const empty: CoreIdTable = { parameters: [], drawables: [], parts: [], parameterRanges: {} };
+  const empty: CoreIdTable = {
+    parameters: [],
+    drawables: [],
+    parts: [],
+    parameterRanges: {},
+    physicsInputs: [],
+    physicsOutputs: [],
+  };
   try {
     const raw = localStorage.getItem(CORE_IDS_KEY + modelPath.toLowerCase());
     if (!raw) return empty;
@@ -709,6 +720,8 @@ function readCoreIdsLocal(modelPath: string): CoreIdTable {
       parts: Array.isArray(o.parts) ? o.parts : [],
       parameterRanges:
         o.parameterRanges && typeof o.parameterRanges === "object" ? o.parameterRanges : {},
+      physicsInputs: Array.isArray(o.physicsInputs) ? o.physicsInputs : [],
+      physicsOutputs: Array.isArray(o.physicsOutputs) ? o.physicsOutputs : [],
     };
   } catch {
     return empty; // 坏数据当没有
@@ -948,7 +961,7 @@ async function importHotkeysFromFolder(dirAbs: string, modelPath: string, vtubeP
 let moFiles: MotionFileRef[] = [];
 
 /** **动作链**（2026-10-10，backlog ㉝②）：状态放模块级（与 `moFiles` 同一纪律 —— 委托只注册
- *  一次，重渲染后不能用旧闭包）。存 `<模型目录>\lunac.chains.json`，由 `refreshChains` 从宿主读。 */
+ *  一次，重渲染后不能用旧闭包）。存 `<模型目录>\lunac-live2d\lunac.chains.json`，由 `refreshChains` 从宿主读。 */
 let chains: MotionChain[] = [];
 
 /** 本插件**生成**的动作文件名前缀 —— 「恢复默认」只删这一批，绝不动作者/用户自己的动作。 */
@@ -1027,7 +1040,7 @@ async function refreshMotions(): Promise<void> {
 
 // ── 动作链（2026-10-10，backlog ㉝②）────────────────────────────────
 // 把多个动作排在一条时间线上：每步 `loopSec`（循环播放时长）+ `stopSec`（硬停秒上限）。
-// 存 `<模型目录>\lunac.chains.json`（宿主读写，见 pet-chains.ts）。**在动作页最上面**。
+// 存 `<模型目录>\lunac-live2d\lunac.chains.json`（宿主读写，见 pet-chains.ts）。**在动作页最上面**。
 
 function chainMsg(text: string): void {
   const n = document.getElementById("pet-chain-msg");
@@ -1419,7 +1432,7 @@ async function refreshHotkeys(): Promise<void> {
     hkMsg("先选一个 Live2D 模型 —— 热键要跟它存在同一个文件夹里。");
     return;
   }
-  // 运行时 id 表（参数 / ArtMesh / Part）优先读模型同目录的 `lunac.params.json`，回退桌宠窗
+  // 运行时 id 表（参数 / ArtMesh / Part）优先读 `lunac-live2d\lunac.params.json`，回退桌宠窗
   // 挂载模型时写进 localStorage 的那份；都没开过 ⇒ 只剩动作 / 表情 / 物理三类可选（提示用户开一次桌宠）。
   const core = await readCoreIdsAsync(model);
   hkTargets = await enumerateTargets(model, core);
@@ -1674,7 +1687,7 @@ async function attachSettings(root: HTMLElement): Promise<void> {
   };
 
   /** 把某模型某个参数的当前值写回持久化（与 expressions 同一口径：按模型路径分键）。
-   *  **同时更新模型同目录的 `lunac.params.json`**（防抖，见 `scheduleParamFile`）。 */
+   *  **同时更新模型目录下 `lunac-live2d\lunac.params.json`**（防抖，见 `scheduleParamFile`）。 */
   const persistParam = (modelPath: string, id: string, value: number) => {
     const c = loadConfig();
     const all = { ...c.params };
@@ -3457,9 +3470,11 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
         l2dHandle = h;
         // 装载期间用户可能又拖了大小滑块 / Alt 移动了形象 ⇒ 用最新配置对齐一次
         const latest = loadConfig();
-        // **运行时 id 表 + 调试参数**一并落**模型同目录**的 `lunac.params.json`（2026-10-10，backlog ㉝③）：
+        // **运行时 id 表 + 调试参数**一并落模型目录下的 `lunac-live2d\lunac.params.json`（2026-10-10，backlog ㉝③）：
         //   · `coreIds` 用引擎刚给的运行时表覆盖 ⇒ 设置窗**进插件读取之前**就能拿到它列目标
         //     （以前只有 localStorage 那份，没开过桌宠时是空的 —— 调试区 / 热键页一片空）；
+        //   · 附带 `enumerateTargets` 的**物理输入 / 输出分类** ⇒ 桌宠轮把它注进给 AI 的参数词表，
+        //     让 AI 知道哪些参数会被物理每帧覆盖（见 main.ts 的 buildPetActionHint）；
         //   · `params` 优先用**文件里的**（AI 可能刚改过，别覆盖它），文件为空再回退 config 播种；
         //   · 失败只 warn：一份坏缓存不该把桌宠窗搞崩。
         let fileParams: Record<string, number> | null = null;
@@ -3467,9 +3482,15 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
           const ids = h.listCoreIds();
           const cache = (await loadPetParams(modelPath)) ?? emptyPetParamCache(modelPath);
           if (ids.parameters.length || ids.drawables.length || ids.parts.length) {
-            cache.coreIds = ids;
-            // localStorage 那份仍写：文件尚未生成时的老路径继续可用。
-            localStorage.setItem(CORE_IDS_KEY + modelPath.toLowerCase(), JSON.stringify(ids));
+            const tg = await enumerateTargets(modelPath, ids);
+            const coreIds: CoreIdTable = {
+              ...ids,
+              physicsInputs: tg.physicsInputs,
+              physicsOutputs: tg.physicsOutputs,
+            };
+            cache.coreIds = coreIds;
+            // localStorage 那份仍写：文件尚未生成时的老路径继续可用（桌宠轮读的就是它）。
+            localStorage.setItem(CORE_IDS_KEY + modelPath.toLowerCase(), JSON.stringify(coreIds));
           }
           const cfgParams = latest.params[modelPath];
           if ((!cache.params || !Object.keys(cache.params).length) && cfgParams && typeof cfgParams === "object") {

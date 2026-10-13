@@ -8,7 +8,7 @@
 //     无论动作播到哪都**强制**切下一步。它是 `loopSec` 的**上限保护**（通常 ≥ `loopSec`，
 //     用于兜住「某个动作永远不结束」）。⇒ 本步实际时长 = `min(loopSec, stopSec || loopSec)`。
 //
-// **存哪**：与模型**同目录**的 `lunac.chains.json`（沿用热键的同一条口径：热键 / 动作 /
+// **存哪**：模型目录下 `lunac-live2d\lunac.chains.json`（沿用热键的同一条口径：热键 / 动作 /
 // 模型放同一个文件夹，拷走整个文件夹即完整）。写盘由宿主命令 `write_pet_chains` 做
 //（WebView 不能写盘）；读同理由宿主。
 //

@@ -11075,6 +11075,10 @@ type PetActionVocab = {
   expressions: string[];
   params: string[];
   drawables: string[];
+  /** **物理输入**参数 id 集合（`.physics3.json`；桌宠窗挂载时算好存进运行时 id 表）。 */
+  physicsInputs: Set<string>;
+  /** **物理输出**参数 id 集合（被物理每帧重算覆盖的那些）。 */
+  physicsOutputs: Set<string>;
 };
 
 /** 读一遍本机现成的东西拼出词表：热键键串、动作文件名、同层表情名、运行时参数 / ArtMesh id。
@@ -11088,7 +11092,16 @@ async function collectPetActionVocab(): Promise<PetActionVocab | null> {
     /* 坏配置当没有 */
   }
   if (!modelPath) return null;
-  const v: PetActionVocab = { hotkeys: [], motions: [], chains: [], expressions: [], params: [], drawables: [] };
+  const v: PetActionVocab = {
+    hotkeys: [],
+    motions: [],
+    chains: [],
+    expressions: [],
+    params: [],
+    drawables: [],
+    physicsInputs: new Set<string>(),
+    physicsOutputs: new Set<string>(),
+  };
   // 热键：AI 按**键串**（`keys`）触发
   try {
     const raw = await invoke<string | null>("read_pet_hotkeys", { modelPath });
@@ -11142,13 +11155,24 @@ async function collectPetActionVocab(): Promise<PetActionVocab | null> {
   }
   // 参数 / ArtMesh：同一份运行时 id 表（localStorage，桌宠窗挂载模型时写的）——
   // 参数给 `param` 用，ArtMesh 给 `artmeshColor`（染色）用。两条都可能很多 ⇒ 注入时截断。
+  // 同一份表里还带**物理输入 / 输出分类**（桌宠窗挂载时由 `enumerateTargets` 算出）——
+  // 注入时给参数打短标，让 AI 知道哪些会被物理每帧覆盖。
   try {
     const raw = localStorage.getItem(PET_CORE_IDS_KEY + modelPath.toLowerCase());
-    const o = raw ? (JSON.parse(raw) as { parameters?: unknown; drawables?: unknown }) : null;
+    const o = raw
+      ? (JSON.parse(raw) as {
+          parameters?: unknown;
+          drawables?: unknown;
+          physicsInputs?: unknown;
+          physicsOutputs?: unknown;
+        })
+      : null;
     const onlyStr = (x: unknown): string[] =>
       Array.isArray(x) ? x.filter((s): s is string => typeof s === "string") : [];
     v.params = onlyStr(o?.parameters);
     v.drawables = onlyStr(o?.drawables);
+    v.physicsInputs = new Set(onlyStr(o?.physicsInputs));
+    v.physicsOutputs = new Set(onlyStr(o?.physicsOutputs));
   } catch {
     /* 同上 */
   }
@@ -11182,7 +11206,17 @@ async function buildPetActionHint(): Promise<PetTurnActions> {
   if (v.params.length) {
     const names = v.params.slice(0, 120);
     const more = v.params.length > names.length ? ` …(+${v.params.length - names.length} more)` : "";
-    lines.push(`- parameters (action="param", name = id, value = number): ${names.join(", ")}${more}`);
+    // 物理分类**只在被注入的这一小撮 id 上打短标**（AI 只会用注入过的名字 ⇒ 只需标它们）：
+    //   · `[out]` = 物理输出 —— 该参数每帧被物理重算覆盖，写进去只在「保持」期间压得住、且会钉住摆动；
+    //   · `[in]` = 物理输入。
+    // 这样体积只随被列出的物理参数线性增加（6/5 字符/个），不额外单列 129+24 个 id。
+    const tag = (id: string): string =>
+      v.physicsOutputs.has(id) ? `${id}[out]` : v.physicsInputs.has(id) ? `${id}[in]` : id;
+    lines.push(
+      `- parameters (action="param", name = id, value = number; suffix [out] = physics recomputes it ` +
+        `every frame — your value only sticks while held and holding pins the sway; [in] = physics input): ` +
+        `${names.map(tag).join(", ")}${more}`,
+    );
   }
   if (v.drawables.length) {
     const names = v.drawables.slice(0, 120);

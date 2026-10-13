@@ -5,16 +5,17 @@
 //      它列参数 / ArtMesh / Part 全靠桌宠窗挂载模型时写进 localStorage 的「运行时 id 表」
 //      （`pet.ts` 的 `CORE_IDS_KEY`）—— 没开过桌宠时那份是空的 ⇒ 调试区 / 热键页一片空。
 //   ② **AI 可直接改这个文件**，用户重开设置窗时**反向同步**进设置面板。
-// 于是把「运行时 id 表 + 调试参数」一并落到**模型同目录**的文件里。
+// 于是把「运行时 id 表 + 调试参数」一并落到模型目录下 `lunac-live2d\` 里的文件里。
 //
-// **存哪**：与模型**同目录**的 `lunac.params.json`（沿用 `lunac.hotkeys.json` /
-// `lunac.chains.json` 的同一条最小口子纪律：宿主命令只认模型同层 + 固定文件名，不接受
+// **存哪**：与模型**同目录**下的 `lunac-live2d\lunac.params.json`（沿用 `lunac.hotkeys.json` /
+// `lunac.chains.json` 的同一条最小口子纪律：宿主命令只认模型目录 + 固定文件名，不接受
 // 任意路径）。写盘由宿主命令 `write_pet_params` 做（WebView 不能写盘）；读同理由宿主
 // `read_pet_params`。热键 / 动作链各有自己那一份，本文件只管「调试参数」这一份。
 //
 // **两半各管什么、谁读谁写**：
-//   · `coreIds` —— 运行时 id 表（parameters / drawables / parts / parameterRanges）。
-//     **桌宠窗**挂载模型时用引擎给的 `listCoreIds()` 覆盖写入；**设置窗只读**它列目标。
+//   · `coreIds` —— 运行时 id 表（parameters / drawables / parts / parameterRanges /
+//     physicsInputs / physicsOutputs）。**桌宠窗**挂载模型时用引擎给的 `listCoreIds()` +
+//     `enumerateTargets()` 的物理分类覆盖写入；**设置窗只读**它列目标，桌宠轮读它给 AI 注词表。
 //   · `params`  —— 调试区每个参数的**保持值**（`PetConfig.params[模型路径]` 的镜像）。
 //     **设置窗**在拖动 / 提交时写（防抖），**桌宠窗**挂载时读并应用（文件优先、config 兜底）。
 //
@@ -30,6 +31,10 @@ export interface PetParamCoreIds {
   parts: string[];
   /** 参数取值范围（Cubism Core 的 min/max/default）；旧数据没有这个字段时为空对象。 */
   parameterRanges: Record<string, { min: number; max: number; def: number }>;
+  /** **物理输入**参数 id（`.physics3.json`）；旧数据没有这个字段时为空数组。 */
+  physicsInputs: string[];
+  /** **物理输出**参数 id（被物理每帧写值的那些）；旧数据没有这个字段时为空数组。 */
+  physicsOutputs: string[];
 }
 
 /** `lunac.params.json` 的完整结构（AI 会直接读写它，见文件头）。 */
@@ -51,7 +56,14 @@ export function emptyPetParamCache(modelPath: string): PetParamCache {
   return {
     version: 1,
     model: baseName(modelPath),
-    coreIds: { parameters: [], drawables: [], parts: [], parameterRanges: {} },
+    coreIds: {
+      parameters: [],
+      drawables: [],
+      parts: [],
+      parameterRanges: {},
+      physicsInputs: [],
+      physicsOutputs: [],
+    },
     params: {},
   };
 }
@@ -108,6 +120,8 @@ export async function loadPetParams(modelPath: string): Promise<PetParamCache | 
         drawables: strArray(ci.drawables),
         parts: strArray(ci.parts),
         parameterRanges: rangeMap(ci.parameterRanges),
+        physicsInputs: strArray(ci.physicsInputs),
+        physicsOutputs: strArray(ci.physicsOutputs),
       },
       params: numMap(o.params),
     };

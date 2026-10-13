@@ -11,7 +11,7 @@
 //   “Expression on/off” 这一种对应表情 ⇒ 所有 `.exp3.json` 归到 `expression` 是对的，
 //   不是识别不准。两条语义：① 多次叠加**互不冲掉**（VTS：变化的值会保留）、② 再触发一次 = 关。
 //
-// **存哪**：与模型**同目录**的 `lunac.hotkeys.json`（用户口径：热键 / 表情 / 模型放同一个
+// **存哪**：模型目录下 `lunac-live2d\lunac.hotkeys.json`（用户口径：热键 / 表情 / 模型放同一个
 // 文件夹）。写盘由宿主命令 `write_pet_hotkeys` 做（WebView 不能写盘）；读同理由宿主。
 //
 // **「适配所有模型」的关键**：本文件里**不出现任何模型名**。所有可选目标都从
@@ -89,7 +89,7 @@ export interface HotkeyTargets {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  读写（与模型同目录）
+//  读写（模型目录下 `lunac-live2d\`）
 // ══════════════════════════════════════════════════════════════════
 
 function baseName(p: string): string {
@@ -447,7 +447,8 @@ export function hotkeyFromVts(h: VtsHotkey, dir: string): Hotkey | null {
 // **一条动作 = 一个文件**（2026-10-10 用户口径，替代原先的 `lunac.motions.json` 预设表）：
 // 「预设动作」页直接列模型文件夹里扫到的 `*.motion3.json`（见 [`listMotionFiles`]），播放走
 // 引擎的 `playMotion(合成组, 下标)`；「新建动作」由桌宠窗/设置窗拼模板、宿主 `write_motion_file`
-// 落盘（覆盖全参数的常数曲线，交给 AI 编）。宿主另有 `delete_motion_file` / `rename_motion_file`。
+// 落盘（覆盖全参数的常数曲线，交给 AI 编）—— lunac **新建的**落到 `lunac-live2d\motions\`，
+// 用户 / 作者自带的动作留在原地。宿主另有 `delete_motion_file` / `rename_motion_file`。
 
 /** 一个动作文件（`*.motion3.json`）。预设动作页与桌宠窗注入**共用同一份**（下标即组内序号）。 */
 export interface MotionFileRef {

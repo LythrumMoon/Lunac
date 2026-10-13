@@ -1641,33 +1641,109 @@ pub fn set_pet_persona(text: String) -> Result<(), String> {
 // **为什么必须有宿主命令**：WebView（插件窗）**不能写盘**。读其实可以走 asset 协议
 // （`readModelJson` 那条），但写只能由宿主做 ⇒ 这里成对提供读写。
 //
-// 口子收到最小（同 `list_expression_files` 的纪律）：只认**模型文件所在那一层**的
-// 固定文件名（`lunac.hotkeys.json` / `lunac.motions.json`），不接受任意路径 / 任意文件名。
-fn pet_hotkeys_path(model_path: &str) -> Result<std::path::PathBuf, String> {
-    pet_side_file_path(model_path, "lunac.hotkeys.json")
+// 口子收到最小（同 `list_expression_files` 的纪律）：只认**模型文件所在目录下**的
+// 固定文件名（`lunac.hotkeys.json` / `lunac.chains.json` / `lunac.params.json`），
+// 不接受任意路径 / 任意文件名。
+//
+// **布局（2026-10-13）**：这些 lunac side 文件不再散在模型目录根，统一归到
+// `<模型目录>\lunac-live2d\<name>`；lunac **新建的动作文件**再下一层到
+// `<模型目录>\lunac-live2d\motions\`。模型根目录只留用户 / 作者自己的资产
+// （`.model3.json` / `.moc3` / `.physics3.json` / 自带动作 / 表情…），位置一律不动。
+// 旧位置（模型根）的文件由 `resolve_pet_side_file` 做**一次性迁移**（移动，非复制）。
+
+/// lunac 旁挂文件（热键 / 动作链 / 参数缓存 / 新建动作）在模型目录下的**子目录名**（固定小写）。
+const PET_SIDE_DIR: &str = "lunac-live2d";
+/// lunac **新建的动作文件**在 `<PET_SIDE_DIR>` 下再下一层的**子目录名**（固定小写）。
+const PET_MOTIONS_SUBDIR: &str = "motions";
+
+/// 模型文件（`*.model3.json` 等）所在目录。
+fn pet_model_dir(model_path: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(model_path);
+    if !p.is_file() {
+        return Err("模型文件不存在".into());
+    }
+    p.parent()
+        .map(|d| d.to_path_buf())
+        .ok_or_else(|| "模型路径没有父目录".to_string())
 }
 
-/// 模型同目录下某个**固定文件名**的旁挂配置。口子收到最小：只认文件名，不接受任意路径
-/// （同 `list_expression_files` 的纪律）。
+/// side 文件的**新位置**：`<模型目录>/lunac-live2d/<name>`。口子收到最小：只认文件名。
 fn pet_side_file_path(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
-    let p = std::path::Path::new(model_path);
-    if !p.is_file() {
-        return Err("模型文件不存在".into());
-    }
-    let dir = p.parent().ok_or_else(|| "模型路径没有父目录".to_string())?;
-    Ok(dir.join(name))
+    Ok(pet_model_dir(model_path)?.join(PET_SIDE_DIR).join(name))
 }
 
-/// 模型同目录下一个 `*.motion3.json` 的绝对路径。
-///
-/// **口子收最小**（同 `pet_side_file_path`）：`name` 只允许**纯文件名**（不含路径分隔符 /
-/// `..`），后缀必须是 `.motion3.json` —— 用这个名字既越不出去、也覆盖不到模型目录里别的东西。
-fn motion_file_path(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
-    let p = std::path::Path::new(model_path);
-    if !p.is_file() {
-        return Err("模型文件不存在".into());
+/// side 文件的**旧位置**（历史版本直接落在模型目录根）：`<模型目录>/<name>`。仅用于一次性迁移。
+fn pet_side_file_legacy_path(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    Ok(pet_model_dir(model_path)?.join(name))
+}
+
+/// 一次性迁移 + 解析**读取**路径：**新位置优先**。
+/// 新位置不存在而旧位置有 ⇒ 把旧文件**移动**到新位置（同一卷 `rename`）；移动失败
+/// （只读 / 被占用）⇒ **退回旧位置** —— 迁移绝不致命，绝不能因它让桌宠不可用。
+/// 幂等：新位置已存在 ⇒ 以新位置为准（不覆盖、不报错）。
+fn resolve_pet_side_file(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    let new_p = pet_side_file_path(model_path, name)?;
+    if new_p.is_file() {
+        return Ok(new_p);
     }
-    let dir = p.parent().ok_or_else(|| "模型路径没有父目录".to_string())?;
+    let old_p = pet_side_file_legacy_path(model_path, name)?;
+    if old_p.is_file() {
+        if let Some(parent) = new_p.parent() {
+            if std::fs::create_dir_all(parent).is_ok() && std::fs::rename(&old_p, &new_p).is_ok() {
+                return Ok(new_p);
+            }
+        }
+        return Ok(old_p); // 迁移失败：退回旧位置
+    }
+    Ok(new_p) // 两边都没有：返回新位置（写入时在此落地）
+}
+
+/// 写盘前的落点：**恒为新位置**（`<模型目录>/lunac-live2d/<name>`），并保证父目录存在。
+/// 旧位置若还留着同一份（迁移尚未发生）⇒ 尽力先搬过去，避免留下陈旧副本；搬不动就照写新位置。
+fn prepare_pet_side_write(model_path: &str, name: &str) -> Result<std::path::PathBuf, String> {
+    let new_p = pet_side_file_path(model_path, name)?;
+    if let Some(parent) = new_p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 lunac-live2d 目录失败：{e}"))?;
+    }
+    if !new_p.is_file() {
+        if let Ok(old_p) = pet_side_file_legacy_path(model_path, name) {
+            if old_p.is_file() {
+                let _ = std::fs::rename(&old_p, &new_p); // 失败无妨：新位置照写
+            }
+        }
+    }
+    Ok(new_p)
+}
+
+/// 读一个 side 文件（走 `resolve_pet_side_file` 的迁移 + 回退口径）。不存在 ⇒ `None`。
+fn read_side_file(model_path: &str, name: &str, what: &str) -> Result<Option<String>, String> {
+    let p = resolve_pet_side_file(model_path, name)?;
+    if !p.is_file() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&p)
+        .map(Some)
+        .map_err(|e| format!("读{what}失败：{e}"))
+}
+
+/// 写一个 side 文件（走 `prepare_pet_side_write` 的新位置），返回落点绝对路径。
+fn write_side_file(model_path: &str, name: &str, json: &str, what: &str) -> Result<String, String> {
+    let p = prepare_pet_side_write(model_path, name)?;
+    std::fs::write(&p, json).map_err(|e| format!("写{what}失败：{e}"))?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+/// lunac **新建动作文件**的目录：`<模型目录>/lunac-live2d/motions`。用户 / 作者自带的
+/// `*.motion3.json` 不住这里（它们留在模型目录里原来的位置，位置不能动）。
+fn motion_file_dir(model_path: &str) -> Result<std::path::PathBuf, String> {
+    Ok(pet_model_dir(model_path)?.join(PET_SIDE_DIR).join(PET_MOTIONS_SUBDIR))
+}
+
+/// 校验一个动作文件名，返回**纯文件名**。
+///
+/// **口子收最小**（同 `pet_side_file_path`）：只允许**纯文件名**（不含路径分隔符 / `..`），
+/// 后缀必须是 `.motion3.json` —— 用这个名字既越不出去、也覆盖不到模型目录里别的东西。
+fn motion_file_name(name: &str) -> Result<String, String> {
     let n = name.trim();
     if n.is_empty() {
         return Err("文件名不能为空".into());
@@ -1678,123 +1754,112 @@ fn motion_file_path(model_path: &str, name: &str) -> Result<std::path::PathBuf, 
     if !n.to_ascii_lowercase().ends_with(".motion3.json") {
         return Err("文件必须叫 *.motion3.json".into());
     }
-    Ok(dir.join(n))
+    Ok(n.to_string())
+}
+
+/// 按文件名查现有动作文件：**先新目录**（`lunac-live2d/motions/`）**再旧位置**（模型目录，用户 / 作者自带）。
+fn find_motion_file(model_path: &str, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let n = motion_file_name(name)?;
+    let dir = pet_model_dir(model_path)?;
+    let new_p = dir.join(PET_SIDE_DIR).join(PET_MOTIONS_SUBDIR).join(&n);
+    if new_p.is_file() {
+        return Ok(Some(new_p));
+    }
+    let old_p = dir.join(&n);
+    if old_p.is_file() {
+        return Ok(Some(old_p));
+    }
+    Ok(None)
 }
 
 /// 读热键定义。文件不存在 ⇒ `None`（不是错误：还没配过）。
 #[tauri::command]
 pub fn read_pet_hotkeys(model_path: String) -> Result<Option<String>, String> {
-    let p = pet_hotkeys_path(&model_path)?;
-    if !p.is_file() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(&p)
-        .map(Some)
-        .map_err(|e| format!("读热键文件失败：{e}"))
+    read_side_file(&model_path, "lunac.hotkeys.json", "热键文件")
 }
 
 /// 写热键定义，返回落点绝对路径（前端可展示「存到哪了」）。
 #[tauri::command]
 pub fn write_pet_hotkeys(model_path: String, json: String) -> Result<String, String> {
-    let p = pet_hotkeys_path(&model_path)?;
-    std::fs::write(&p, json).map_err(|e| format!("写热键文件失败：{e}"))?;
-    Ok(p.to_string_lossy().to_string())
+    write_side_file(&model_path, "lunac.hotkeys.json", &json, "热键文件")
 }
 
-// ── 桌宠「动作链」缓存（与模型同目录，2026-10-10）────────────────────
-// 用户口径（backlog ㉝②/③）：动作链跟模型走、存在**模型文件夹里**的 lunac 配置里。
-// 与热键同一条最小口子纪律：**只认模型文件所在那一层的固定文件名**（经 `pet_side_file_path`），
-// 不接受任意路径 / 任意文件名。热键已有 `lunac.hotkeys.json`，动作链是 `lunac.chains.json`。
-fn pet_chains_path(model_path: &str) -> Result<std::path::PathBuf, String> {
-    pet_side_file_path(model_path, "lunac.chains.json")
-}
+// ── 桌宠「动作链」缓存（与模型目录，2026-10-10）────────────────────
+// 用户口径（backlog ㉝②/③）：动作链跟模型走、存在**模型文件夹里的 lunac 配置**里。
+// 与热键同一条最小口子纪律：**只认模型文件所在目录下的固定文件名**
+// （经 `read_side_file` / `write_side_file`，落 `<模型目录>\lunac-live2d\lunac.chains.json`）。
 
 /// 读动作链定义。文件不存在 ⇒ `None`（不是错误：还没配过）。
 #[tauri::command]
 pub fn read_pet_chains(model_path: String) -> Result<Option<String>, String> {
-    let p = pet_chains_path(&model_path)?;
-    if !p.is_file() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(&p)
-        .map(Some)
-        .map_err(|e| format!("读动作链文件失败：{e}"))
+    read_side_file(&model_path, "lunac.chains.json", "动作链文件")
 }
 
 /// 写动作链定义，返回落点绝对路径。
 #[tauri::command]
 pub fn write_pet_chains(model_path: String, json: String) -> Result<String, String> {
-    let p = pet_chains_path(&model_path)?;
-    std::fs::write(&p, json).map_err(|e| format!("写动作链文件失败：{e}"))?;
-    Ok(p.to_string_lossy().to_string())
+    write_side_file(&model_path, "lunac.chains.json", &json, "动作链文件")
 }
 
-// ── 桌宠「调试参数 + 运行时 id 表」缓存（与模型同目录，2026-10-10）────────
-// 用户口径（backlog ㉝③）：把「运行时 id 表 + 调试参数」一并落进**模型文件夹里**的 lunac
-// 缓存，解决两件事 —— ①进入插件**读取之前**就能拿到上次的数据（不用先开一次桌宠）；
+// ── 桌宠「调试参数 + 运行时 id 表」缓存（与模型目录，2026-10-10）────────
+// 用户口径（backlog ㉝③）：把「运行时 id 表 + 调试参数」一并落进**模型文件夹里的 lunac
+// 缓存**，解决两件事 —— ①进入插件**读取之前**就能拿到上次的数据（不用先开一次桌宠）；
 // ②AI 可直接改这个文件、再反向同步进设置面板。与热键 / 动作链同一条最小口子纪律：
-// **只认模型文件所在那一层的固定文件名**（经 `pet_side_file_path`），不接受任意路径。
-fn pet_params_path(model_path: &str) -> Result<std::path::PathBuf, String> {
-    pet_side_file_path(model_path, "lunac.params.json")
-}
+// **只认模型文件所在目录下的固定文件名**（落 `<模型目录>\lunac-live2d\lunac.params.json`）。
 
 /// 读调试参数缓存。文件不存在 ⇒ `None`（不是错误：还没配过）。
 #[tauri::command]
 pub fn read_pet_params(model_path: String) -> Result<Option<String>, String> {
-    let p = pet_params_path(&model_path)?;
-    if !p.is_file() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(&p)
-        .map(Some)
-        .map_err(|e| format!("读参数缓存失败：{e}"))
+    read_side_file(&model_path, "lunac.params.json", "参数缓存")
 }
 
 /// 写调试参数缓存，返回落点绝对路径（前端可展示「存到哪了」）。
 #[tauri::command]
 pub fn write_pet_params(model_path: String, json: String) -> Result<String, String> {
-    let p = pet_params_path(&model_path)?;
-    std::fs::write(&p, json).map_err(|e| format!("写参数缓存失败：{e}"))?;
-    Ok(p.to_string_lossy().to_string())
+    write_side_file(&model_path, "lunac.params.json", &json, "参数缓存")
 }
 
 // ── 动作文件本身（`*.motion3.json`，2026-10-10）────────────────────
 // 「预设动作」页改成**按文件**列出（用户口径：行 = 文件），并且「新建动作」要在模型文件夹里
 // **生成一个覆盖全参数的 motion3 模板**给 AI 去编。于是需要三个最小的文件操作命令 ——
-// 三者都经 `motion_file_path` 收口：只认模型同目录 + 纯文件名 + `.motion3.json` 后缀。
+// 三者都经 `motion_file_name` 收口：只认纯文件名 + `.motion3.json` 后缀。
+// **只搬 lunac 自己新建的**：新建落在 `<模型目录>\lunac-live2d\motions\`；改名 / 删除按
+// 「先新目录再模型根」查现有文件，用户 / 作者自带的动作原地不动。
 // （原先的 `lunac.motions.json` 预设表与其 `read_pet_motions` / `write_pet_motions` 已撤掉。）
 
 /// 写一个 `*.motion3.json`（「新建动作」落模板用）。**已存在则拒绝**（不覆盖用户/作者的动作）。
 #[tauri::command]
 pub fn write_motion_file(model_path: String, name: String, json: String) -> Result<String, String> {
-    let p = motion_file_path(&model_path, &name)?;
+    let n = motion_file_name(&name)?;
+    let dir = motion_file_dir(&model_path)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建动作目录失败：{e}"))?;
+    let p = dir.join(&n);
     if p.exists() {
-        return Err(format!("{name} 已存在"));
+        return Err(format!("{n} 已存在"));
     }
     std::fs::write(&p, json).map_err(|e| format!("写动作文件失败：{e}"))?;
     Ok(p.to_string_lossy().to_string())
 }
 
-/// 删一个 `*.motion3.json`（按名字，限模型同目录）。
+/// 删一个 `*.motion3.json`（按名字；新目录优先，回退模型目录根）。
 #[tauri::command]
 pub fn delete_motion_file(model_path: String, name: String) -> Result<(), String> {
-    let p = motion_file_path(&model_path, &name)?;
-    if !p.is_file() {
-        return Err("文件不存在".into());
-    }
+    let p = find_motion_file(&model_path, &name)?.ok_or_else(|| "文件不存在".to_string())?;
     std::fs::remove_file(&p).map_err(|e| format!("删除动作文件失败：{e}"))
 }
 
-/// 重命名一个 `*.motion3.json`（新旧名都限模型同目录）。返回新路径。
+/// 重命名一个 `*.motion3.json`（按名字；新名落在**原文件所在目录**）。返回新路径。
 #[tauri::command]
 pub fn rename_motion_file(model_path: String, from: String, to: String) -> Result<String, String> {
-    let a = motion_file_path(&model_path, &from)?;
-    let b = motion_file_path(&model_path, &to)?;
-    if !a.is_file() {
-        return Err("原文件不存在".into());
-    }
+    let a = find_motion_file(&model_path, &from)?.ok_or_else(|| "原文件不存在".to_string())?;
+    let n = motion_file_name(&to)?;
+    // 新名留在原目录：lunac 生成的动作待在 `motions/`，用户自带的留在它原来的位置。
+    let b = a
+        .parent()
+        .ok_or_else(|| "原文件没有父目录".to_string())?
+        .join(&n);
     if b.exists() {
-        return Err(format!("{to} 已存在"));
+        return Err(format!("{n} 已存在"));
     }
     std::fs::rename(&a, &b).map_err(|e| format!("重命名动作文件失败：{e}"))?;
     Ok(b.to_string_lossy().to_string())
@@ -3640,5 +3705,141 @@ fn lang_id_to_tag(lang_id: u16) -> String {
         0x041e => "th".into(),      // Thai
         0x042a => "vi".into(),      // Vietnamese
         _ => "en".into(),           // Fallback to English
+    }
+}
+
+#[cfg(test)]
+mod pet_side_file_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// 造一个干净的假模型目录：目录里放一个空 `m.model3.json`，返回 (目录, 模型文件绝对路径)。
+    fn fake_model(tag: &str) -> (PathBuf, String) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-pet-side-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.model3.json");
+        std::fs::write(&model, "{}").unwrap();
+        (dir, model.to_string_lossy().to_string())
+    }
+
+    /// 新路径拼接：`<模型目录>/lunac-live2d/<name>`（固定小写）。
+    #[test]
+    fn side_file_path_is_under_lunac_live2d() {
+        let (dir, model) = fake_model("path");
+        let p = pet_side_file_path(&model, "lunac.params.json").unwrap();
+        assert_eq!(p, dir.join("lunac-live2d").join("lunac.params.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移：旧位置有、新位置无 ⇒ **移动**到新位置，内容不变，旧位置不再有该文件。
+    #[test]
+    fn migrates_legacy_file_to_new_location() {
+        let (dir, model) = fake_model("mig");
+        let old = dir.join("lunac.hotkeys.json");
+        std::fs::write(&old, "{\"v\":1}").unwrap();
+        let p = resolve_pet_side_file(&model, "lunac.hotkeys.json").unwrap();
+        assert_eq!(p, dir.join("lunac-live2d").join("lunac.hotkeys.json"));
+        assert!(p.is_file());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"v\":1}");
+        assert!(!old.exists(), "旧位置的同一份应已搬走（移动而非复制）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 幂等：两边都有 ⇒ 以**新位置**为准，旧文件**留着不动**（不覆盖、不删）。
+    #[test]
+    fn keeps_new_when_both_exist() {
+        let (dir, model) = fake_model("both");
+        let new_dir = dir.join("lunac-live2d");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let new_p = new_dir.join("lunac.params.json");
+        std::fs::write(&new_p, "{\"src\":\"new\"}").unwrap();
+        let old = dir.join("lunac.params.json");
+        std::fs::write(&old, "{\"src\":\"old\"}").unwrap();
+        let p = resolve_pet_side_file(&model, "lunac.params.json").unwrap();
+        assert_eq!(p, new_p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"src\":\"new\"}");
+        assert!(old.is_file(), "旧文件不得被删 / 覆盖");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "{\"src\":\"old\"}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移失败（新位置建不出来：用一个占位文件挡住 `lunac-live2d`）⇒ 不崩、退回旧路径读。
+    #[test]
+    fn falls_back_to_legacy_on_migration_failure() {
+        let (dir, model) = fake_model("fail");
+        std::fs::write(dir.join("lunac-live2d"), "x").unwrap(); // 目录名被文件占住 ⇒ create_dir_all 失败
+        let old = dir.join("lunac.chains.json");
+        std::fs::write(&old, "{\"c\":1}").unwrap();
+        let p = resolve_pet_side_file(&model, "lunac.chains.json").unwrap();
+        assert_eq!(p, old);
+        assert!(old.is_file());
+        assert_eq!(read_side_file(&model, "lunac.chains.json", "动作链文件").unwrap().unwrap(), "{\"c\":1}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写盘落在新位置，且自动建出 `lunac-live2d/` 目录（旧位置的残留副本一并搬走）。
+    #[test]
+    fn write_lands_in_new_location() {
+        let (dir, model) = fake_model("write");
+        let old = dir.join("lunac.params.json");
+        std::fs::write(&old, "{\"stale\":1}").unwrap();
+        let ret = write_side_file(&model, "lunac.params.json", "{\"fresh\":2}", "参数缓存").unwrap();
+        let want = dir.join("lunac-live2d").join("lunac.params.json");
+        assert_eq!(Path::new(&ret), want);
+        assert_eq!(std::fs::read_to_string(&want).unwrap(), "{\"fresh\":2}");
+        assert!(!old.exists(), "旧位置残留副本应在写入前被搬走");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新动作落 `lunac-live2d/motions/`；模型根里用户自带的动作原地不动（改名留在原地）。
+    #[test]
+    fn new_motion_lands_in_motions_subdir() {
+        let (dir, model) = fake_model("motion");
+        let ret =
+            write_motion_file(model.clone(), "lunac-gen.motion3.json".into(), "{}".into()).unwrap();
+        let want = dir
+            .join("lunac-live2d")
+            .join("motions")
+            .join("lunac-gen.motion3.json");
+        assert_eq!(Path::new(&ret), want);
+        assert!(want.is_file());
+
+        // 用户 / 作者自带的动作留在模型根：查得到、改名后仍在原地。
+        let authored = dir.join("author.motion3.json");
+        std::fs::write(&authored, "{}").unwrap();
+        assert_eq!(
+            find_motion_file(&model, "author.motion3.json").unwrap().unwrap(),
+            authored
+        );
+        let renamed = rename_motion_file(
+            model.clone(),
+            "author.motion3.json".into(),
+            "author2.motion3.json".into(),
+        )
+        .unwrap();
+        assert_eq!(Path::new(&renamed), dir.join("author2.motion3.json"));
+        assert!(!authored.exists());
+
+        // lunac 新建的那条改名后仍留在 motions/ 里。
+        let renamed2 = rename_motion_file(
+            model.clone(),
+            "lunac-gen.motion3.json".into(),
+            "lunac-gen2.motion3.json".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&renamed2),
+            dir.join("lunac-live2d")
+                .join("motions")
+                .join("lunac-gen2.motion3.json")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
