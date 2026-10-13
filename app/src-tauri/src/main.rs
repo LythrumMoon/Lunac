@@ -82,6 +82,7 @@ use commands::{
     scan_agent_writes,
     get_mcp_config, open_mcp_config,
     set_workspace, get_workspace, set_tool_blacklist,
+    set_pet_model_dir,
     search_apps, launch_app, add_custom_app, remove_custom_app, list_custom_apps,
     get_app_icon,
     get_file_thumbnail,
@@ -132,6 +133,9 @@ pub struct AppState {
     pub thinking_mode: Mutex<String>, // 思考开关: "on" | "off"
     pub workspace: Mutex<String>, // AI agent workspace dir; empty = user home dir (whole system)
     pub tool_blacklist: Mutex<Vec<String>>, // user-custom tool blacklist; merged with defaults on agent.exe start
+    /// 桌宠当前模型目录（绝对路径；空 = 未设 / 已清除）。桌宠插件在模型目录确定 / 变化时上报，
+    /// spawn agent 时作为 `LUNAC_DENY_READ_DIRS` 注入（**只拦读**，见 commands.rs 的 start_cli_process）。
+    pub pet_model_dir: Mutex<String>,
 }
 
 fn kill_port(port: u16) {
@@ -448,6 +452,7 @@ fn main() {
                 thinking_mode: Mutex::new("on".into()),
                 workspace: Mutex::new(String::new()),
                 tool_blacklist: Mutex::new(Vec::new()),
+                pet_model_dir: Mutex::new(String::new()),
             });
             Ok(())
         })
@@ -604,6 +609,8 @@ fn main() {
             set_workspace,
             get_workspace,
             set_tool_blacklist,
+            // 桌宠模型目录 → 宿主（②1，2026-10-13）：决定 agent 的读禁目录（只拦读）。
+            set_pet_model_dir,
             search_apps,
             launch_app,
             add_custom_app,

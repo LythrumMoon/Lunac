@@ -289,10 +289,12 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── 后台复盘 fork（A4：长期记忆的**触发点**）──────────────────────
 //
-// 触发条件（2026-10-11 方案 B：由「进程内每 N 轮」改为「按会话 + 按时间」）：
+// 触发条件（2026-10-11 方案 B：由「进程内每 N 轮」改为「按会话 + 按时间」；
+//           2026-10-13 折中：每会话配额**按作用域各一份**，时间闸仍共享）：
 //   ① 本轮确实完成了一次用户提问（判定点就在 user 分支、run_query 返回之后）；
-//   ② 距上次复盘 ≥ REVIEW_MIN_GAP_SECS（30 分钟）；
-//   ③ 本次会话（= 本 agent 进程）尚未复盘过（每会话 ≤ 1 次）。
+//   ② 距上次复盘 ≥ REVIEW_MIN_GAP_SECS（30 分钟）—— **两侧共享**同一个「上次时间」，
+//      任一作用域刚复盘过，另一侧 30 分钟内也不跑；
+//   ③ **本轮 scope** 在本次会话（= 本 agent 进程）尚未复盘过（每会话每 scope ≤ 1 次）。
 // 三条全满足才派一个后台 fork 去复盘这段对话，把值得留的结论用 Remember 写进长期记忆。
 //
 // 为什么放弃「进程内每 N 轮」：旧的 questions 是**进程内局部变量**，而 agent 频繁重启
@@ -300,9 +302,9 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 // 永远够不着，写入侧事实上从未触发过（2026-10-11 运行时证据）。改成「按会话 + 按时间」后，
 // 门槛不再依赖单进程活多久。
 //
-// 频次硬上限（用户成本敏感）：**每会话 ≤ 1 次**（会话 = 本进程）+ **距上次复盘 ≥ 30 分钟**
-// （时间戳落盘、跨进程重启有效）⇒ 单次触发只 spawn 一个后台线程、无循环重试 ⇒ 单次 ≤ 1 次
-// 云调用。
+// 频次硬上限（用户成本敏感）：**每会话每作用域 ≤ 1 次**（会话 = 本进程）+ **距上次复盘
+// ≥ 30 分钟**（时间戳落盘、跨进程重启有效、两侧共享）⇒ 一次触发只 spawn 一个后台线程、
+// 无循环重试 ⇒ 单次 ≤ 1 次云调用。
 //
 // **不引定时器**（backlog 硬约束）：定时器会在用户什么都没干的时候空转（每次都真花钱）。
 //
@@ -2186,10 +2188,22 @@ fn memory_block_text(remember_tool_on: bool, body: &str, scope: tools::MemorySco
         tools::MemoryScope::Global => "# Long-term memory",
         tools::MemoryScope::Pet => "# Long-term memory (desktop pet — private notes)",
     };
+    // 来源 / 时间说明行（B2，2026-10-13）：**固定前缀的一部分**（逐字节稳定、随 scope 不同），
+    // 措辞按作用域点明记忆归属，并交代「未标注日期者视为背景」。**不逐条塞日期**（那是 B1，
+    // 会牵动去重语义，本轮不做）；也不动正文与 bullet 格式。
+    let provenance = match scope {
+        tools::MemoryScope::Global => "- Source: the main assistant saved these in earlier \
+            sessions with this user. They are not dated, so treat an undated entry as background \
+            you already know, never as the current request.",
+        tools::MemoryScope::Pet => "- Source: this is the desktop pet's own private memory, saved \
+            in its earlier pet sessions. It is not dated, so treat an undated entry as background \
+            you already know, never as the current request.",
+    };
     format!(
         "\n\n{header}\n\
          Durable facts saved in earlier sessions. Treat them as background you already know; \
          they are not part of the current request.\n\
+         {provenance}\n\
          {tail}\n\n{body}",
     )
 }
@@ -4080,6 +4094,12 @@ fn main() {
         read_only: cli.permission_mode == "plan",
         locked: std::env::var("LUNAC_WORKSPACE_LOCKED").ok().as_deref() == Some("1")
             && !cli.skip_permissions,
+        // 读禁目录（2026-10-13，桌宠模型目录保护）：宿主注入 `LUNAC_DENY_READ_DIRS`
+        //（多路径 `;` 分隔、绝对路径；空则不注入）。启动时解析一次、进程内恒定 ——
+        // 与 `locked` 同为「启动时定死」的策略边界。**只拦 Read / Glob / Grep**（见 tools::guard_read）。
+        deny_read_dirs: tools::parse_deny_read_dirs(
+            &std::env::var("LUNAC_DENY_READ_DIRS").unwrap_or_default(),
+        ),
         // 有效工作目录的覆盖层（`EnterWorktree` / `ExitWorktree`，2026-10-11）：起手不在
         // 任何 worktree 里 ⇒ `None`（有效工作目录 = `cwd`）。见 `tools::Ctx::worktree`。
         worktree: Arc::new(Mutex::new(None)),
@@ -4513,12 +4533,13 @@ fn main() {
     // ── 后台复盘（A4）的装配状态 ────────────────────────────────────
     // `pending_review` = 上一次复盘还没收回来。**收的时机是「处理下一条消息之前」，且只收
     // 已经跑完的**（见 `collect_review`）—— 复盘是后台事务，不许它决定前台时延。
-    // `reviewed_this_session` = 本次会话（= 本进程）是否已复盘过（每会话 ≤ 1 次，方案 B）。
-    // `last_review_ts` = 上次复盘时间（epoch 秒），**启动时从 temp\review-last 读一次** ——
+    // `reviewed_this_session` = 本次会话（= 本进程）是否已复盘过，**按作用域各一份**
+    // （global / pet；即「每会话每 scope ≤ 1 次」，2026-10-13 配额折中）。`last_review_ts` =
+    // 上次复盘时间（epoch 秒），**两侧共享同一个值**，启动时从 temp\review-last 读一次 ——
     // 跨进程重启有效，这正是「按时间」那一半不再被重启清零的关键。
     let mut review_seq: u64 = 0;
     let mut pending_review: Option<thread::JoinHandle<Result<String, String>>> = None;
-    let mut reviewed_this_session = false;
+    let mut reviewed_this_session = [false, false];
     let mut last_review_ts: Option<i64> = load_last_review_ts();
     // 项目 MCP 的信任门**只过一次**（首次真实提问前）：接上后工具表就是固定前缀的一部分，
     // 之后不再变（见 `connect_project_servers`）。
@@ -4647,12 +4668,13 @@ fn main() {
                     turn_block.as_ref(),
                     thinking_override,
                 );
-                // 复盘的四个前置（方案 B，2026-10-11）：① 本轮确实完成了一次用户提问
-                // （本代码位置即保证 —— 它在 run_query 返回之后，不在工具轮中途）；
-                // ② 不是只读（plan）档、也不在计划相位（复盘的唯一产品就是一条 `Remember`
-                // 写入，那两档下 `write_blocked` 会直接拒 ⇒ 派出去也是白烧一次 API）；
-                // ③ 写侧可用 + 距上次复盘 ≥ 30 分钟 + 本会话还没复盘过（见 should_review）；
-                // ④ 上一轮那次已经收干净（pending 非空就不再派，防两条复盘并发）。
+                // 复盘的四个前置（方案 B，2026-10-11；2026-10-13 折中把每会话配额按 scope 拆）：
+                // ① 本轮确实完成了一次用户提问（本代码位置即保证 —— 它在 run_query 返回之后，
+                // 不在工具轮中途）；② 不是只读（plan）档、也不在计划相位（复盘的唯一产品就是
+                // 一条 `Remember` 写入，那两档下 `write_blocked` 会直接拒 ⇒ 派出去也是白烧一次
+                // API）；③ 写侧可用 + 距上次复盘 ≥ 30 分钟（时间闸两侧共享）+ **本轮 scope 这一份**
+                // 的「每会话 ≤ 1 次」还没消耗（见 should_review）；④ 上一轮那次已经收干净
+                // （pending 非空就不再派，防两条复盘并发）。
                 // 「当前记忆」在主线程读（那条桥归主线程）—— 复盘靠它避免重复写。
                 // 单发模式不派复盘：进程马上就要退出，后台线程会被直接杀掉，
                 // 那次云调用纯属白烧（单发的语义就是「跑一轮、拿结果、退出」）。
@@ -4665,6 +4687,7 @@ fn main() {
                         reviewed_this_session,
                         last_review_ts,
                         now_epoch_secs(),
+                        turn_scope,
                     )
                 {
                     // 「当前记忆」按**本轮作用域**读（桌宠轮读桌宠私有那份）：复盘据此避免
@@ -4672,11 +4695,11 @@ fn main() {
                     // 复盘线程拿的是它的克隆 ⇒ 自动同作用域）。
                     let memory = fetch_memory(mcp_bridge.as_mut(), turn_scope).unwrap_or_default();
                     review_seq += 1;
-                    // spawn 前先吃掉本会话配额（无论派没派成，本会话都不再重试）——「每会话
-                    // ≤ 1 次」是硬上限。只有**真派出去**了才记「上次复盘时间」（写侧发生了
-                    // 一次云调用，下一次要隔 30 分钟）；派不出去（配置副本建不出 / 快照为空）
-                    // 不记时间，于是下个会话仍可再来一次。
-                    reviewed_this_session = true;
+                    // spawn 前先吃掉**本轮 scope** 的会话配额（无论派没派成，本 scope 本会话都
+                    // 不再重试）——「每会话每 scope ≤ 1 次」是硬上限。只有**真派出去**了才记
+                    // 「上次复盘时间」（写侧发生了一次云调用，下一次要隔 30 分钟）；派不出去
+                    // （配置副本建不出 / 快照为空）不记时间，于是下个会话仍可再来一次。
+                    reviewed_this_session[turn_scope.index()] = true;
                     if let Some(handle) =
                         review_setup.spawn(&cfg, &tools_ctx, &history, &memory, review_seq)
                     {
@@ -5640,8 +5663,10 @@ fn save_last_review_ts(ts: i64) {
 ///
 ///   · `enabled` —— 写侧可用（没桥 / 记忆关 / Remember 被黑名单裁掉时为假：复盘写不进
 ///     任何东西，只会白烧一次 API）；
-///   · `fired_this_session` —— 本会话是否已复盘过（每会话 ≤ 1 次）；
-///   · `last_ts` —— 上次复盘时间（epoch 秒；None = 从未）；
+///   · `fired_per_scope` —— 「每会话 ≤ 1 次」的配额，**按作用域各一份**（数组下标见
+///     `MemoryScope::index`）。本函数只看**本轮 `scope` 那一份**；
+///   · `last_ts` —— 上次复盘时间（epoch 秒；None = 从未）。**两侧共享同一个值**（30 分钟
+///     时间闸不按作用域拆）：任一作用域刚复盘过，另一侧 30 分钟内也不跑，防总成本翻倍；
 ///   · `now_ts` —— 当前时间（epoch 秒）。
 ///
 /// 第 4 个条件（「本轮确实完成了一次用户提问」）由**调用点**保证 —— 本函数只在 user 分支、
@@ -5650,12 +5675,13 @@ fn save_last_review_ts(ts: i64) {
 /// 走安全侧（宁可少复盘，不要时钟一乱就狂调模型）。
 fn should_review(
     enabled: bool,
-    fired_this_session: bool,
+    fired_per_scope: [bool; 2],
     last_ts: Option<i64>,
     now_ts: i64,
+    scope: tools::MemoryScope,
 ) -> bool {
     enabled
-        && !fired_this_session
+        && !fired_per_scope[scope.index()]
         && last_ts.map_or(true, |t| now_ts.saturating_sub(t) >= REVIEW_MIN_GAP_SECS)
 }
 
@@ -7810,6 +7836,7 @@ mod tests {
             add_dirs: Vec::new(),
             read_only: false,
             locked: false,
+            deny_read_dirs: Vec::new(),
             worktree: Arc::new(Mutex::new(None)),
             plan_phase: Arc::new(AtomicBool::new(false)),
             tool_output: None,
@@ -8265,6 +8292,210 @@ mod tests {
         assert!(three.contains(&deep) && three.contains(&deeper), "更深的应保留");
     }
 
+    // ── 子目录记忆懒加载：注入层单测（2026-10-13，§待办 3-1a 子目录级）──────────
+    //
+    // 判据层（`touched_dir` / `eligible_subdir`）已在 `tools.rs` 单测覆盖；这里测**注入层**
+    // ——`subdir_memory_block` / `subdir_memory_injected` / `subdir_memory_count` /
+    // `append_text_to_tool_result` / `inject_subdir_memory` 的落点与去重。全部用临时目录夹具。
+
+    /// 造一个「Read 一条子目录里的文件」调用（触达目录 = 该文件的父目录）。
+    fn read_call(file: &Path) -> (String, String, Value) {
+        (
+            "t1".to_string(),
+            "Read".to_string(),
+            json!({ "file_path": file.display().to_string() }),
+        )
+    }
+
+    /// 单一子目录命中 ⇒ 注入进**对应那条** `tool_result`，带表头与来源行 `### <绝对路径>`；
+    /// 原结果文本保留在前、未新增消息 / 块（固定前缀纪律）。
+    #[test]
+    fn subdir_memory_hit_is_injected_into_its_tool_result() {
+        let root = std::env::temp_dir().join(format!("lunac-subdir-hit-{}", std::process::id()));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(AGENTS_MD_FILE), "SUB-RULE").unwrap();
+
+        let calls = vec![read_call(&sub.join("a.txt"))];
+        let run_inputs = vec![calls[0].2.clone()];
+        let denieds = vec![None];
+        let mut results = vec![tool_result_block("t1", "ORIGINAL".into(), false)];
+
+        inject_subdir_memory(&root, &[], &calls, &run_inputs, &denieds, &mut results);
+
+        let content = results[0].get("content").and_then(Value::as_str).unwrap();
+        assert!(content.starts_with("ORIGINAL"), "原结果文本必须保留在前：{content}");
+        assert!(content.contains(SUBDIR_MEMORY_HEADER), "要带子目录记忆表头：{content}");
+        let marker = format!("### {}", sub.join(AGENTS_MD_FILE).display());
+        assert!(content.contains(&marker), "要带来源行 {marker}：{content}");
+        assert!(content.contains("SUB-RULE"), "要带上该目录的 AGENTS.md 正文");
+        assert!(
+            content.find(SUBDIR_MEMORY_HEADER).unwrap() < content.find(&marker).unwrap(),
+            "表头应在来源行之前"
+        );
+        // 未新增消息 / 块，content 仍是字符串（图块数组那种才不拼）。
+        assert_eq!(results.len(), 1);
+        assert!(results[0].get("content").unwrap().is_string());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 同一目录每会话只注一次；且 `set_history` 回退（history 换成不含来源行的版本）后能补回
+    /// ——与 `context_block_message` 同一条纪律（去重判据活在 history 里，回退即随之消失）。
+    #[test]
+    fn subdir_memory_is_injected_once_per_session_and_restored_after_set_history() {
+        let root = std::env::temp_dir().join(format!("lunac-subdir-dedup-{}", std::process::id()));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(AGENTS_MD_FILE), "SUB-RULE").unwrap();
+
+        let calls = vec![read_call(&sub.join("a.txt"))];
+        let run_inputs = vec![calls[0].2.clone()];
+        let denieds = vec![None];
+
+        // 第一次：注入，并把这条带来源行的结果当作「已留在 history 里」。
+        let mut first = vec![tool_result_block("t1", "ORIGINAL".into(), false)];
+        inject_subdir_memory(&root, &[], &calls, &run_inputs, &denieds, &mut first);
+        assert!(first[0]["content"].as_str().unwrap().contains("SUB-RULE"));
+        let history = vec![json!({ "role": "user", "content": [ first[0].clone() ] })];
+
+        // 第二次（同会话）：history 已含该目录来源行 ⇒ 不再注入。
+        let mut again = vec![tool_result_block("t2", "ORIGINAL2".into(), false)];
+        inject_subdir_memory(&root, &history, &calls, &run_inputs, &denieds, &mut again);
+        assert!(
+            !again[0]["content"].as_str().unwrap().contains("SUB-RULE"),
+            "同目录每会话只注一次"
+        );
+
+        // set_history 回退：history 换成不含该来源行的版本 ⇒ 下次触碰能补回。
+        let rolled_back = vec![json!({ "role": "user", "content": [
+            { "type": "text", "text": "hi" }
+        ] })];
+        let mut restored = vec![tool_result_block("t3", "ORIGINAL3".into(), false)];
+        inject_subdir_memory(&root, &rolled_back, &calls, &run_inputs, &denieds, &mut restored);
+        assert!(
+            restored[0]["content"].as_str().unwrap().contains("SUB-RULE"),
+            "回退后应能补回"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 已达每会话目录数上限 ⇒ 停注（`inject_subdir_memory` 同时落一行 warn；本用例只管
+    /// 「不注入」这个可断言的结果，warn 是日志副作用、不在单测断言范围）。
+    #[test]
+    fn subdir_memory_stops_at_session_dir_cap() {
+        let root = std::env::temp_dir().join(format!("lunac-subdir-cap-{}", std::process::id()));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(AGENTS_MD_FILE), "SUB-RULE").unwrap();
+
+        let calls = vec![read_call(&sub.join("a.txt"))];
+        let run_inputs = vec![calls[0].2.clone()];
+        let denieds = vec![None];
+
+        // 造 `MAX_SUBDIR_MEMORY_DIRS` 个「已注入过」的历史块（计数判据 = 表头出现次数）。
+        let history: Vec<Value> = (0..MAX_SUBDIR_MEMORY_DIRS)
+            .map(|i| {
+                json!({ "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": format!("old{i}"),
+                      "content": format!("{SUBDIR_MEMORY_HEADER}\n### fake/{i}") },
+                ]})
+            })
+            .collect();
+        assert_eq!(subdir_memory_count(&history), MAX_SUBDIR_MEMORY_DIRS);
+
+        let mut results = vec![tool_result_block("t1", "ORIGINAL".into(), false)];
+        inject_subdir_memory(&root, &history, &calls, &run_inputs, &denieds, &mut results);
+        assert_eq!(
+            results[0]["content"].as_str().unwrap(),
+            "ORIGINAL",
+            "达每会话上限后不得再注入"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 不合格目录（超深度 / 在 `SKIP_DIRS` / 等于 cwd）一律不注 —— 注入层必须过
+    /// `tools::eligible_subdir` 这道筛。每例都真放了 AGENTS.md，确保「没注入」是筛掉了、
+    /// 不是「文件不存在」。
+    #[test]
+    fn subdir_memory_skips_ineligible_dirs() {
+        let root = std::env::temp_dir().join(format!("lunac-subdir-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 超深度：cwd 下 9 层（> MAX_SUBDIR_MEMORY_DEPTH = 8）
+        let mut deep = root.clone();
+        for i in 0..9 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(AGENTS_MD_FILE), "DEEP-RULE").unwrap();
+
+        // 在忽略名单里（`node_modules` 之下的子目录也一并跳过）
+        let skipped = root.join("node_modules").join("pkg");
+        std::fs::create_dir_all(&skipped).unwrap();
+        std::fs::write(skipped.join(AGENTS_MD_FILE), "SKIP-RULE").unwrap();
+
+        // 等于 cwd 本身（那是固定前缀那一层，不归懒加载管）
+        std::fs::write(root.join(AGENTS_MD_FILE), "CWD-RULE").unwrap();
+
+        let cases = [
+            ("超深度", deep.join("a.txt"), "DEEP-RULE"),
+            ("SKIP_DIRS", skipped.join("a.txt"), "SKIP-RULE"),
+            ("等于 cwd", root.join("a.txt"), "CWD-RULE"),
+        ];
+        for (label, file, marker) in cases {
+            let calls = vec![read_call(&file)];
+            let run_inputs = vec![calls[0].2.clone()];
+            let denieds = vec![None];
+            let mut results = vec![tool_result_block("t1", "ORIGINAL".into(), false)];
+            inject_subdir_memory(&root, &[], &calls, &run_inputs, &denieds, &mut results);
+            assert_eq!(results[0]["content"].as_str().unwrap(), "ORIGINAL", "{label} 不应注入");
+            assert!(
+                !results[0]["content"].as_str().unwrap().contains(marker),
+                "{label} 不应注入"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 子目录注入与后台结果回流**共存在同一块** `tool_result` 文本里：现顺序是子目录先
+    /// （`inject_subdir_memory`）、后台结果后（`run_query` 里 `results.last_mut()` 三行内联追加）。
+    /// 后台那段落点是内联在 `run_query` 里的、不是可单测的纯函数 ⇒ 这里复刻它那三行追加，
+    /// 验证「同一块字符串上两次追加互不覆盖、顺序不串」（能测的最小子集，未改生产代码）。
+    #[test]
+    fn subdir_memory_and_background_result_share_one_tool_result() {
+        let root = std::env::temp_dir().join(format!("lunac-subdir-bg-{}", std::process::id()));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(AGENTS_MD_FILE), "SUB-RULE").unwrap();
+
+        let calls = vec![read_call(&sub.join("a.txt"))];
+        let run_inputs = vec![calls[0].2.clone()];
+        let denieds = vec![None];
+        let mut results = vec![tool_result_block("t1", "ORIGINAL".into(), false)];
+
+        inject_subdir_memory(&root, &[], &calls, &run_inputs, &denieds, &mut results);
+        // 复刻 run_query 的后台回流落点（拼进最后一条 tool_result 的文本内部）。
+        let bg = "[background] BUILD DONE";
+        let last = results.last_mut().expect("非空");
+        let prev = last.get("content").and_then(Value::as_str).unwrap().to_string();
+        last["content"] = json!(format!("{prev}\n\n{bg}"));
+
+        let content = results[0]["content"].as_str().unwrap();
+        assert!(content.contains("SUB-RULE"), "子目录块仍在：{content}");
+        assert!(content.contains(bg), "后台结果也在同一块：{content}");
+        assert!(
+            content.find("SUB-RULE").unwrap() < content.find(bg).unwrap(),
+            "顺序须是子目录先、后台结果后"
+        );
+        assert_eq!(results.len(), 1, "仍是同一块，未新增消息 / 块");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// 子代理工具集的守门测试（2026-09-20 复查补，A7 扩了一类）。
     ///
     /// 原实现只剔了 `Agent`，把 `mcp__*` 与 `SessionSearch` 一起发给了子代理 —— 而子代理
@@ -8422,31 +8653,79 @@ mod tests {
     /// 时钟回拨（last_ts 在未来）按「还没到时间」处理。
     #[test]
     fn review_gate_is_per_session_and_time_capped() {
+        use tools::MemoryScope;
         let gap = REVIEW_MIN_GAP_SECS;
         let now = 1_700_000_000i64;
+        let none = [false, false];
         // 正常触发：写侧可用、本会话没复盘过、从未复盘 or 已过间隔。
-        assert!(should_review(true, false, None, now), "从未复盘 + 本会话未复盘 ⇒ 触发");
         assert!(
-            should_review(true, false, Some(now - gap), now),
+            should_review(true, none, None, now, MemoryScope::Global),
+            "从未复盘 + 本会话未复盘 ⇒ 触发"
+        );
+        assert!(
+            should_review(true, none, Some(now - gap), now, MemoryScope::Global),
             "恰好满 30 分钟 ⇒ 触发"
         );
         // 不到间隔 ⇒ 不触发（差 1 秒也不行）。
         assert!(
-            !should_review(true, false, Some(now - gap + 1), now),
+            !should_review(true, none, Some(now - gap + 1), now, MemoryScope::Global),
             "差 1 秒不满间隔 ⇒ 不触发"
         );
         // 每会话 ≤ 1 次 ⇒ 本会话已复盘过一律不触发（即便过了很久）。
         assert!(
-            !should_review(true, true, Some(now - gap * 10), now),
+            !should_review(true, [true, false], Some(now - gap * 10), now, MemoryScope::Global),
             "本会话已复盘过 ⇒ 不再触发"
         );
         // 写侧不可用（没桥 / 记忆关 / Remember 被裁）⇒ 永不触发。
-        assert!(!should_review(false, false, None, now), "写侧不可用 ⇒ 不触发");
+        assert!(
+            !should_review(false, none, None, now, MemoryScope::Global),
+            "写侧不可用 ⇒ 不触发"
+        );
         // 时钟回拨（last_ts 在未来）按「没到时间」处理，不狂调模型。
         assert!(
-            !should_review(true, false, Some(now + 3600), now),
+            !should_review(true, none, Some(now + 3600), now, MemoryScope::Global),
             "时钟回拨 ⇒ 当作没到时间"
         );
+    }
+
+    /// 复盘配额按作用域拆（2026-10-13 折中）：**每会话每 scope ≤ 1 次**、**30 分钟时间闸共享**。
+    /// 关键差异：一个作用域复盘过，不再压制另一个作用域的「会话配额」——但它仍受共享时间闸约束。
+    #[test]
+    fn review_gate_splits_session_quota_by_scope_and_shares_time_gate() {
+        use tools::MemoryScope;
+        let gap = REVIEW_MIN_GAP_SECS;
+        let now = 1_700_000_000i64;
+
+        // 时间闸已放行（None = 从未复盘）时，两侧配额独立：
+        // · 全新会话 ⇒ global / pet 各自都能触发一次
+        assert!(should_review(true, [false, false], None, now, MemoryScope::Global));
+        assert!(should_review(true, [false, false], None, now, MemoryScope::Pet));
+        // · global 已复盘 ⇒ global 不再触发，pet 首启**仍可**触发（旧实现会一起压制）
+        assert!(
+            !should_review(true, [true, false], None, now, MemoryScope::Global),
+            "global 已复盘 ⇒ global 本会话不再触发"
+        );
+        assert!(
+            should_review(true, [true, false], None, now, MemoryScope::Pet),
+            "global 已复盘不得压制 pet 的会话配额"
+        );
+        // · 反向亦然
+        assert!(
+            !should_review(true, [false, true], None, now, MemoryScope::Pet),
+            "pet 已复盘 ⇒ pet 本会话不再触发"
+        );
+        assert!(
+            should_review(true, [false, true], None, now, MemoryScope::Global),
+            "pet 已复盘不得压制 global 的会话配额"
+        );
+
+        // 30 分钟时间闸**两侧共享**：任一作用域刚复盘过（last_ts = now），另一侧即便会话配额
+        // 未消耗，也在 30 分钟内不跑（防总成本翻倍）。
+        assert!(!should_review(true, [true, false], Some(now), now, MemoryScope::Pet));
+        assert!(!should_review(true, [false, true], Some(now), now, MemoryScope::Global));
+        // 满 30 分钟后恢复：pet 那一份未消耗 ⇒ 可触发；差 1 秒仍被共享闸挡住。
+        assert!(should_review(true, [true, false], Some(now - gap), now, MemoryScope::Pet));
+        assert!(!should_review(true, [true, false], Some(now - gap + 1), now, MemoryScope::Pet));
     }
 
     /// 长期记忆的冷启动死锁回归（方案 D，2026-10-11）：记忆为空但写侧可用时**仍要注入
@@ -8511,6 +8790,29 @@ mod tests {
             MemoryScope::Global,
             "无法识别 ⇒ 退回全局（绝不误判成桌宠轮）"
         );
+    }
+
+    /// 记忆块的「来源 / 时间」说明行（B2，2026-10-13）：属**固定前缀**（同 scope 逐字节稳定）、
+    /// 位于正文之前（正文仍拼在其后）、按 scope 措辞点明归属（桌宠段点明「桌宠私有」）。
+    #[test]
+    fn memory_block_provenance_line_is_byte_stable_and_precedes_body() {
+        use tools::MemoryScope;
+        // 同 scope 两次调用完全相等（固定前缀不变量：不随轮次 / 内容变化）。
+        let a = memory_block_text(true, "- prefers tabs", MemoryScope::Global);
+        let b = memory_block_text(true, "- prefers tabs", MemoryScope::Global);
+        assert_eq!(a, b, "同 scope 两次调用必须逐字节相同（前缀缓存不变量）");
+        // 说明行在正文之前：空记忆块是有记忆块的前缀（正文不混进前缀）。
+        let empty = memory_block_text(true, "", MemoryScope::Global);
+        assert!(a.starts_with(&empty), "正文必须拼在说明行之后");
+        assert!(a.ends_with("- prefers tabs"), "正文仍在最末，bullet 格式未变");
+        // 全局段点明「主 AI 保存」；桌宠段点明「桌宠私有」；两段说明行不同。
+        assert!(a.contains("main assistant saved"), "全局段要说明来源：{a}");
+        assert!(!a.contains("desktop pet"), "全局段不得混入桌宠措辞");
+        let p = memory_block_text(true, "- prefers tabs", MemoryScope::Pet);
+        assert!(p.contains("desktop pet's own private memory"), "桌宠段要点明私有：{p}");
+        assert_ne!(a, p, "两侧说明行不同");
+        // 说明行交代「未标注日期者视为背景」。
+        assert!(a.contains("undated"), "要交代未标注日期者视为背景");
     }
 
     /// 复盘快照（A4）：只认三类块、工具结果有上限、超预算时**从最早处**丢。

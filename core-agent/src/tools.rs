@@ -135,6 +135,16 @@ impl MemoryScope {
             MemoryScope::Pet => "pet",
         }
     }
+
+    /// 按作用域计数的数组下标（`[bool; 2]` 之类，如复盘「每会话 ≤ 1 次」的 per-scope 标志）。
+    ///
+    /// 与 `as_str` 同源列出变体：加第三个作用域时两处一起改，别在别处再抄一份映射。
+    pub fn index(self) -> usize {
+        match self {
+            MemoryScope::Global => 0,
+            MemoryScope::Pet => 1,
+        }
+    }
 }
 
 /// 工具执行上下文（由 main.rs 依据启动参数构建）。
@@ -152,6 +162,15 @@ pub struct Ctx {
     pub read_only: bool,
     /// 越界拦截开关（工作区已配置时为真）
     pub locked: bool,
+    /// **读禁目录**（2026-10-13，桌宠模型目录保护）：落在这些目录之内的**读类**工具
+    /// （`Read` / `Glob` / `Grep`）一律拒，**且独立于工作区锁**（未配工作区也拦）；**写类不受影响**。
+    ///
+    /// 来源 = 宿主注入的 `LUNAC_DENY_READ_DIRS`（多路径 `;` 分隔、绝对路径；空则不注入），
+    /// 启动时经 [`parse_deny_read_dirs`] 解析一次、进程内恒定。判据见 [`guard_read`]。
+    ///
+    /// ⚠️ **这是策略级路径闸，不是沙箱**（见 `forbidden.md` §禁用 1.1）：拦不住 `Cmd` /
+    /// `PowerShell`（刻意不解析 shell 命令行），符号链接 / junction 也能绕过（词法比较不解析链接）。
+    pub deny_read_dirs: Vec<PathBuf>,
     /// **有效工作目录的覆盖层**（2026-10-11，`EnterWorktree` / `ExitWorktree`）。
     ///
     /// `cwd` 是**进程级常量**（工作区根，也是系统提示词里那条），
@@ -1389,11 +1408,53 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     !root.as_os_str().is_empty() && path.starts_with(&root)
 }
 
+// ── 读禁目录（2026-10-13，桌宠模型目录保护）─────────────────────────
+
+/// 路径是否落在任一**读禁目录**之内（命中返回该目录的归一化路径，供错误信息用）。
+///
+/// 与 [`path_is_within`] **同源**（两边都过 [`normalize`]）—— **不新造第二套路径归一**
+/// （见 `forbidden.md` §禁用 62）。空目录项一律跳过。
+fn in_deny_read_dirs(dirs: &[PathBuf], path: &Path) -> Option<PathBuf> {
+    dirs.iter().find_map(|root| {
+        let root = normalize(root);
+        (!root.as_os_str().is_empty() && path.starts_with(&root)).then_some(root)
+    })
+}
+
+/// `LUNAC_DENY_READ_DIRS` 的解析口径：`;` 分隔、忽略空白项、**只收绝对路径**
+/// （相对路径的含义取决于 agent 的 cwd，宿主已约定传绝对路径 ⇒ 相对项静默丢弃）。
+/// 空串 / 全空白 ⇒ 空列表（= 不设闸）。
+pub fn parse_deny_read_dirs(raw: &str) -> Vec<PathBuf> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
+/// **读类**工具的路径闸：先判读禁目录（**deny 优先，且独立于工作区锁** —— 未配工作区也拦），
+/// 再走 [`guard`] 的工作区锁。**写类沿用 [`guard`]**，不受读禁目录影响。
+///
+/// ⚠️ **策略级路径闸，不是沙箱**：只拦 `Read` / `Glob` / `Grep`；`Cmd` / `PowerShell` 仍能读到
+/// （刻意不解析 shell 命令行，见 [`path_arg_kind`] 的注释）、符号链接 / junction 也能绕过
+/// （词法比较不解析链接）。见 `forbidden.md` §禁用 1.1。
+fn guard_read(ctx: &Ctx, path: &Path) -> Result<(), String> {
+    if let Some(root) = in_deny_read_dirs(&ctx.deny_read_dirs, path) {
+        return Err(format!(
+            "Access denied: {} is inside a read-blocked directory ({})",
+            path.display(),
+            root.display()
+        ));
+    }
+    guard(ctx, path)
+}
+
 // ── Read ─────────────────────────────────────────────────────────
 
 fn read(ctx: &Ctx, input: &Value) -> Result<String, String> {
     let path = resolve(ctx, &str_arg(input, "file_path")?);
-    guard(ctx, &path)?;
+    guard_read(ctx, &path)?;
 
     let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
@@ -2192,7 +2253,7 @@ fn glob(ctx: &Ctx, input: &Value) -> Result<String, String> {
         Some(p) if !p.trim().is_empty() => resolve(ctx, p),
         _ => effective_cwd(ctx),
     };
-    guard(ctx, &base)?;
+    guard_read(ctx, &base)?;
 
     // glob crate 以 `/` 为分隔符、`\` 是转义符 —— 必须转成正斜杠
     let joined = if Path::new(&pattern).is_absolute() {
@@ -2235,7 +2296,7 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
         Some(p) if !p.trim().is_empty() => resolve(ctx, p),
         _ => effective_cwd(ctx),
     };
-    guard(ctx, &base)?;
+    guard_read(ctx, &base)?;
 
     let ignore_case = input
         .get("ignore_case")
@@ -3805,6 +3866,7 @@ mod tests {
             add_dirs: Vec::new(),
             read_only: false,
             locked: false,
+            deny_read_dirs: Vec::new(),
             // 单测默认不在 worktree 里（有效工作目录 = cwd）：`effective_cwd` 返回 `.`。
             worktree: Arc::new(Mutex::new(None)),
             plan_phase: Arc::new(AtomicBool::new(false)),
@@ -4492,6 +4554,59 @@ mod tests {
         assert!(
             !path_is_within(Path::new(r"D:\lunac\skills\x.md"), Path::new("")),
             "没配技能目录 ⇒ 不开这道口子"
+        );
+    }
+
+    /// 读禁目录（2026-10-13，桌宠模型目录保护）：**只拦读、独立于工作区锁**。
+    /// ① 未配工作区（`locked=false`）+ deny 命中 ⇒ 读类被拒；
+    /// ② deny 只影响读类（写类仍走 `guard`，放行）；
+    /// ③ 不相干目录 / 同前缀非子目录（`petmodels-evil`）不误伤；空列表恒放行。
+    #[test]
+    fn guard_denies_read_in_deny_list_even_when_unlocked() {
+        let mut ctx = test_ctx();
+        ctx.deny_read_dirs = vec![PathBuf::from(r"D:\ws\petmodels")];
+        assert!(!ctx.locked, "本用例刻意不配工作区锁");
+        assert!(
+            guard_read(&ctx, Path::new(r"D:\ws\petmodels\a\m.model3.json")).is_err(),
+            "读禁目录内的文件必须拒读"
+        );
+        assert!(guard_read(&ctx, Path::new(r"D:\ws\petmodels")).is_err(), "目录本身也拒");
+    }
+
+    #[test]
+    fn guard_does_not_deny_writes_for_read_only_deny() {
+        let mut ctx = test_ctx();
+        ctx.deny_read_dirs = vec![PathBuf::from(r"D:\ws\petmodels")];
+        // 写类走 `guard`，不受读禁目录影响
+        assert!(
+            guard(&ctx, Path::new(r"D:\ws\petmodels\a.model3.json")).is_ok(),
+            "读禁目录不该拦写类"
+        );
+    }
+
+    #[test]
+    fn guard_allow_when_dir_not_denied() {
+        let mut ctx = test_ctx();
+        ctx.deny_read_dirs = vec![PathBuf::from(r"D:\ws\petmodels")];
+        assert!(guard_read(&ctx, Path::new(r"D:\ws\other\x.txt")).is_ok());
+        assert!(
+            guard_read(&ctx, Path::new(r"D:\ws\petmodels-evil\x.txt")).is_ok(),
+            "同前缀但不是子目录 ⇒ 不误伤（按组件比）"
+        );
+        let empty = test_ctx();
+        assert!(guard_read(&empty, Path::new(r"D:\ws\petmodels\x")).is_ok(), "空列表恒放行");
+    }
+
+    /// `LUNAC_DENY_READ_DIRS` 解析口径：`;` 分隔、忽略空白项、只收绝对路径。
+    #[test]
+    fn parse_deny_read_dirs_ignores_empty_and_relative() {
+        assert!(parse_deny_read_dirs("").is_empty());
+        assert!(parse_deny_read_dirs("   ").is_empty());
+        assert!(parse_deny_read_dirs(" ; ; ").is_empty());
+        assert_eq!(
+            parse_deny_read_dirs(r"D:\a; D:\b ;; .\rel; rel\x"),
+            vec![PathBuf::from(r"D:\a"), PathBuf::from(r"D:\b")],
+            "相对路径（.\\rel / rel\\x）应被丢弃，绝对路径保留"
         );
     }
 

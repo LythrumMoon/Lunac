@@ -433,6 +433,17 @@ function saveConfig(cfg: PetConfig): void {
   }
 }
 
+/** 把**当前模型目录**（`PetConfig.model` 的 dirname）报给宿主，供「桌宠模型目录禁止 AI 读取」
+ *  的**策略级路径闸**用（2026-10-13）。空串 = 清除（没配模型 / 取消配置）。
+ *
+ *  ⚠️ 宿主把它作为 `LUNAC_DENY_READ_DIRS` 注入 agent，**改后需重启 agent 才生效**；
+ *  这只是**策略级路径闸**（只拦 Read / Glob / Grep，写不管），**不是沙箱** —— shell（Cmd /
+ *  PowerShell）仍能读到、符号链接 / junction 也可绕过。 */
+function reportModelDir(model: string): void {
+  const dir = model ? model.replace(/[\\/][^\\/]*$/, "") : "";
+  void invoke("set_pet_model_dir", { path: dir }).catch(() => {});
+}
+
 /** 本地「自然日」字符串（`YYYY-MM-DD`）。主动反应的每日计数按它归零。 */
 function todayStr(): string {
   const d = new Date();
@@ -2432,6 +2443,7 @@ async function attachSettings(root: HTMLElement): Promise<void> {
         void pickShape().catch(e => report("更换形象失败", e));
       } else if (t.closest("#pet-clear")) {
         saveConfig({ ...loadConfig(), model: "", image: "" });
+        reportModelDir(""); // ②1：取消配置 ⇒ 清除宿主的读禁目录
         renderFile();
         void emit(CTL_EVENT, { type: "reload" });
         void refreshHotkeys(); // 清空形象 ⇒ 热键页也清空（没有模型就没有可绑的目标）
@@ -2985,6 +2997,7 @@ async function attachSettings(root: HTMLElement): Promise<void> {
       return "";
     }
     saveConfig({ ...loadConfig(), model, image: "" });
+    reportModelDir(model); // ②1：把模型目录报给宿主（读禁闸）
     // 「一并读取」：作者热键（vtube.json，没有就回落扫 exp3）+ cdi3（参数可读名字）。
     const extra: string[] = [];
     try {
@@ -4842,6 +4855,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
           return;
         }
         saveConfig({ ...loadConfig(), model, image: "" });
+        reportModelDir(model); // ②1：把模型目录报给宿主（读禁闸）
         try {
           await importHotkeysFromFolder(dir, model, vtube); // 作者热键一并读（同控制台）
         } catch (e) {
@@ -5404,6 +5418,9 @@ const petPlugin: Plugin = {
   },
 
   async attach(root: HTMLElement) {
+    // 桌宠窗 / 设置窗都先同步一次「模型目录」给宿主（②1）：宿主的读禁目录只在 spawn agent 时
+    // 注入，故这里补上「上次没报过 / 应用重启后 AppState 已清空」的那一次。
+    reportModelDir(loadConfig().model);
     if (inPetWindow()) {
       await attachPetWindow(root);
       return;

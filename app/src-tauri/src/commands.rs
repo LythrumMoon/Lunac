@@ -430,6 +430,22 @@ fn start_cli_process(
     if workspace_locked {
         envs.push(("LUNAC_WORKSPACE_LOCKED", "1".into()));
     }
+    // 桌宠模型目录读禁（②1，2026-10-13）：把桌宠**当前模型目录**作为 agent 的读禁目录注入，
+    // 让 Read / Glob / Grep 拒读该目录。**只拦读、写不管**，且**独立于工作区锁**
+    //（未配工作区也拦）。空则不注入（= 不设闸）。⚠️ 策略级路径闸，**不是沙箱**：
+    // shell（Cmd / PowerShell）仍能读到、符号链接 / junction 也可绕过（前端/agent 注释同此口径）。
+    // **改后需重启 agent 才生效**（env 只在 spawn 时注入）。
+    {
+        let dir = state
+            .pet_model_dir
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            envs.push(("LUNAC_DENY_READ_DIRS", dir.to_string()));
+        }
+    }
     // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
     // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
     envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
@@ -2192,6 +2208,18 @@ pub fn set_workspace(path: String, state: State<'_, AppState>) -> Result<String,
 #[tauri::command]
 pub fn get_workspace(state: State<'_, AppState>) -> String {
     state.workspace.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// 桌宠当前**模型目录** → 宿主（2026-10-13，②1「桌宠模型目录禁止 AI 读取」）。
+///
+/// 桌宠插件在模型目录确定 / 变化时调用（选模型 / 换模型 / 取消配置），传**绝对路径**；
+/// 传空串 = 清除。存进 `AppState`（**同一份真相源**，不另造第二套存储），下次 spawn agent 时
+/// 由 `start_cli_process` 注入 `LUNAC_DENY_READ_DIRS`。**改后需重启 agent 才生效**。
+#[tauri::command]
+pub fn set_pet_model_dir(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    let mut g = state.pet_model_dir.lock().map_err(|e| e.to_string())?;
+    *g = path.trim().to_string();
+    Ok("Pet model dir updated".into())
 }
 
 /// Set the user-custom tool blacklist (第 19 点缓存优化)。

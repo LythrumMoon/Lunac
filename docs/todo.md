@@ -33,8 +33,23 @@
 ### §待办 1-4 L10 桌宠 × AI：剩余三条
 - **目标**：桌宠的屏幕获取自动化 + AI 触发工具 + 目录保护。
 - **已查清**：①②③ 的主干均落地（手动抓屏 `screenshot_monitor` + 「看一眼屏幕」；对话框 + 主动反应（默认关 + 间隔 + 每日上限 + 不可见即停）；用量来源 `source="pet"` + 成本面板来源下拉）。契约 = `pet-chat-send` / `pet-chat-reply`（take 语义、复用 `startAIChat`、不新开 API 通道）。
-- **待办点**：① **自动 / 定时抓屏**（需「默认关 + 频次上限」）；② 屏幕变化触发；③ **当前配置的模型目录禁止 AI 读取**（需新增「宿主 → agent」路径黑名单通道）；④ 桌宠轮「不调工具 / skills」（需收窄工具集或人格约束）；⑤ 语音输入（入口已就绪）。
+- **待办点**：① **自动 / 定时抓屏** —— **已实现（默认关 + 频次上限），待真机验收**；② **屏幕变化触发** —— **已实现（默认关 + 频次上限），待真机验收**；③ **当前配置的模型目录禁止 AI 读取** —— **已实现（2026-10-13，只拦读；见下 §待办 1-4 补「模型目录读禁」）**；④ 桌宠轮「不调工具 / skills」 —— **已取消（2026-10-13，用户裁决）**（原拟「桌宠轮工具闸」）；⑤ 语音输入（入口已就绪）。
 - **涉及文件**：`app/src/plugins/builtin/pet.ts`、`app/src-tauri/src/screenshot.rs`、`core-agent/src/main.rs`。
+
+#### §待办 1-4 补 桌宠模型目录「禁止 AI 读取」+ `mask_secrets` 扩展（2026-10-13，本轮）
+
+- **②1 桌宠模型目录：只拦读的「策略级路径闸」（端到端已实现，待真机验收）**
+  - **链路四段**：① **前端** `app/src/plugins/builtin/pet.ts` 新增 `reportModelDir()`（把 `PetConfig.model` 的 **dirname** 上报宿主；空串 = 清除），在插件 `attach()`（启动同步一次）与「选模型 `pickShape`」「换模型（桌宠窗 `change`）」「取消配置 `#pet-clear`」处调用；② **宿主** `app/src-tauri/src/commands.rs` 新增命令 **`set_pet_model_dir`**（存进 `AppState.pet_model_dir`，**同一份真相源**，不造第二套存储），在 `start_cli_process` 注入 `LUNAC_DENY_READ_DIRS`（多路径 `;` 分隔、绝对路径、**空不注入**；`main.rs` 注册命令）；③ **agent** `core-agent/src/tools.rs` 的 `Ctx` 新增 `deny_read_dirs`（启动时经 `parse_deny_read_dirs` 解析一次，与既有 `LUNAC_WORKSPACE_LOCKED` 读取处同风格）；④ **读类闸** `guard_read()`：**先判 deny、deny 优先于 allow、独立于 `locked`**（未配工作区也拦），只用于 `read` / `glob` / `grep`。
+  - **只拦读**：`Read` / `Glob` / `Grep` 命中读禁目录即拒；**写类不动**（`Write` / `Edit` / `NotebookEdit` / `SendUserFile` 仍走 `guard`，`Cmd` / `PowerShell` 本就不过闸）。
+  - ⚠️ **诚实边界（不得称沙箱，见 `forbidden.md` §禁用 1.1）**：**拦不住 `Cmd` / `PowerShell`**（`tools.rs:1272-1273` 刻意不解析 shell 命令行）⇒ **shell 仍能读到**；**符号链接 / junction 可绕过**（词法比较不解析链接）。本闸定性 = **策略级路径闸**。
+  - ⚠️ **改后需重启 agent 才生效**（env 只在 spawn 时注入），沿用「重启才生效」的既有纪律。
+  - **路径归一与既有 `guard` 一致**：deny 命中走 `normalize()` + 组件前缀比较，与 `guard` / `path_is_within` **同源**（**不新造第二套路径归一**，见 `forbidden.md` §禁用 62）。
+  - **单测（4 条，`core-agent/src/tools.rs`）**：`guard_denies_read_in_deny_list_even_when_unlocked`（未配工作区 + deny 命中 ⇒ 拒）、`guard_does_not_deny_writes_for_read_only_deny`（deny 只影响读类）、`guard_allow_when_dir_not_denied`、`parse_deny_read_dirs_ignores_empty_and_relative`（env 解析：空 / 多路径 / 相对路径丢弃）。
+- **① `mask_secrets` 扩展（`app/src-tauri/src/log.rs`）**：在原三类（键值对 / `Bearer <token>` / 裸 `sk-`）之外补四类 —— **PEM 私钥多行块**（保留 `BEGIN`/`END` 两行、**中段每行内容换成 `***`**，**换行数与缩进形状不变**，含 RSA/EC/OPENSSH/ENCRYPTED 各种词形）、**裸 JWT**（`eyJ…` 三段 base64url 点分，不依赖前置键名）、**前缀型 token**（`ghp_`/`gho_`/`ghs_`/`ghu_`、`xoxb-`/`xoxp-`/`xoxa-`、`AIza`、`AKIA`/`ASIA`）、**裸连接串** `scheme://user:password@host`（只抹口令、保留 scheme/user/host 形状）；`SECRET_KEYS` 补 `passphrase` / `secret_key` / `client_secret` / `private_key` / `access_key` / `refresh_token` / `session_token`。
+  - **为什么锚定形态**：该函数被**日志 / API 报文 / 记忆落盘**多处共用，误伤会把普通文本打成码 ⇒ 新模式一律**锚定可辨认形态**（前缀 / `://…@` 结构 / `eyJ` 头 / 行首 PEM 标记），并保留前缀便于辨认；普通词 `token`（后面不是取值符）一律不动。
+  - **仍是纯字符串变换**（返回 `String`、**无 `Result`**、不新增失败路径）；**老三类逐字节不变**。
+  - **单测（6 条，`log.rs` tests）**：`mask_hides_pem_private_key_body_keeps_begin_end` / `mask_hides_bare_jwt` / `mask_hides_prefixed_tokens` / `mask_hides_bare_connection_string` / `mask_keeps_multiline_bullet_shape` / `mask_keeps_plain_words_untouched`（反向：普通文本不误伤）。
+- **涉及文件**：`app/src/plugins/builtin/pet.ts`、`app/src-tauri/src/commands.rs`、`app/src-tauri/src/main.rs`、`app/src-tauri/src/log.rs`、`core-agent/src/tools.rs`、`core-agent/src/main.rs`、`scripts/build-plugins.ps1`（pet **0.9.63 → 0.9.64**）。
 
 #### §待办 1-4 补 桌宠轮「关掉 AI 插件后永久不达」修复（2026-10-11）
 
@@ -329,10 +344,14 @@
   - **`read_only` / plan_phase 的短路语义原样保留**（那两档下 `write_blocked` 会拒写，派出去只白烧一次 API）。
 - **待真机验收口径（2026-10-11 起）**：
   1. **D**：全新（或删掉 `ModuleData\memory\MEMORY.md` 后）启动 agent，agent 日志应出现 `长期记忆为空，已注入 Remember 引导（冷启动）`；模型在一轮里**主动调 `Remember`** 时，`MEMORY.md` 应被创建且含该条 bullet。
-  2. **B**：同一个 agent 进程里连问多次，agent 日志里 `后台复盘 {} 启动` 至多出现 **1 次**（每会话 ≤ 1 次）；关掉 App 重开（重启 agent）后，距上次复盘 < 30 分钟应**不再**触发、≥ 30 分钟才触发；`<exe 根>\temp\review-last` 应记着上次 epoch 秒。
+  2. **B / ①A**：同一个 agent 进程里连问多次，agent 日志里 `后台复盘 {} 启动` **每 scope 至多 1 次**（global / pet 各 ≤ 1，合计至多 2；2026-10-13 折中）；关掉 App 重开（重启 agent）后，距上次复盘 < 30 分钟应**不再**触发（时间闸两侧共享）、≥ 30 分钟才触发；`<exe 根>\temp\review-last` 应记着上次 epoch 秒。
   3. 复盘真跑成时，`MEMORY.md` 应多出条目（或回 `NOTHING_TO_REMEMBER` 不写）；复盘的模型调用经 `run_subagent` 的 `usage_delta` 通道上报（与子代理同形，`main.rs` 的 `UsageAcc::record`），故成本面板 / `usage-*.jsonl` 应新增对应调用记录。
   - **S0 自动抽取（2026-10-11，方案甲）**：已把复盘 fork 提示词升级为**结构化抽取**（四类该抽 + 显式不抽 + **禁写凭据**），并加**落盘前 `mask_secrets()` 兜底**；触发 / 频次 / 开关一行未改。详见下方「S0 记忆自动抽取」小节的「已实现」。
 - **涉及文件**：`core-agent/src/main.rs`（`memory_block` / `memory_block_text` / `should_review` / `review_state_path` / `ReviewSetup` / `run_review_fork`）、`core-agent/src/tools.rs`（`remember_tool` / `BRIDGE_TOOLS` / `write_blocked`）、`app/src-tauri/src/mcp_server.rs`（`lunac/memory_read` / `_write`）、`app/src-tauri/src/commands.rs`（`tool_blacklist_args`、spawn env）。
+- **已实现（2026-10-13，P1 折中 + B2）**：
+  - **①A 复盘配额折中** —— **选型 (a)**：保留**单一** `temp\review-last` 承载**共享时间闸**，把「每会话 ≤ 1 次」的 `reviewed_this_session` 由单个 bool 拆成**按 scope 的 `[bool; 2]`**（`tools::MemoryScope::index` 取下标，global / pet 各一份）。⇒ `Global` 与 `Pet` 在同一 agent 进程内**各能触发一次**；`last_review_ts` 仍**两侧共享**（任一作用域刚复盘过，另一侧 30 分钟内也不跑，防总成本翻倍）。落点：`should_review` 改签名收 `fired_per_scope: [bool; 2]` + `scope`（**仍纯函数**）；调用点按本轮 `turn_scope` 置对应下标（`main.rs` 提问循环）；`ReviewSetup::spawn` 经 `tctx` 克隆已随本轮作用域，**无需改签名**。触发语义其余不动（每会话每 scope 上限、30 分钟、输入 6000 字、输出 ≤ 3 条、预算 12 万 token、`enabled` 开关链）。
+  - **①B 复盘来源 / 时间标注** —— **本轮只做 B2（块头一行）**：`memory_block_text` 的引导段加**一行固定来源 / 时间说明**（英文，属固定前缀、逐字节稳定、按 scope 措辞：全局段点明「主 AI 保存」、桌宠段点明「桌宠私有」；并交代「未标注日期者视为背景」）。**B1（逐条日期 / 来源）仍待做**，且**需同步改去重语义**（现状去重 = 整条 bullet 完全相等）。
+  - **本轮新增单测**：`review_gate_splits_session_quota_by_scope_and_shares_time_gate`（per-scope 配额 + 共享时间闸）、`memory_block_provenance_line_is_byte_stable_and_precedes_body`（说明行逐字节稳定 + 与正文分离）。
 
 ### S0 记忆自动抽取（云侧先行）· 可实施方案（2026-10-11 设计）
 
@@ -381,7 +400,7 @@
 - **丙（每 N 轮细粒度）**：这正是 §4.1.6 给 **S1 本地决策旁路**排的位（「每 K 轮 / 压缩事件，不做每轮」，`archive/agent-feature-backlog.md:1316`）——在**云侧先行**阶段每 N 轮调云模型，频次随会话长度线性增长，直接撞用户成本红线。⇒ **推迟到 S1**（换本地小模型 ⇒ 零 API 成本）再做。
 
 **验收口径（方案已落地，待真机验收）**
-1. **触发**：同一 agent 进程内 `后台复盘 … 启动` 至多 1 次；`temp\review-last` 记 epoch 秒（沿用 D+B 口径）。
+1. **触发**：同一 agent 进程内 `后台复盘 … 启动` **每 scope 至多 1 次**（global / pet 各 ≤ 1；2026-10-13 折中，时间闸两侧共享）；`temp\review-last` 记 epoch 秒（沿用 D+B 口径）。
 2. **口径（甲）**：构造含「用户偏好 / 项目约定 / 一次性任务细节 / 一条 API key」的对话，抽取后 `MEMORY.md` **只应含前两类**、**不含**任务细节与凭据。
 3. **凭据兜底（B，与提示词独立）**：即便是提示词漏掉 / 模型不听那一轮，凡经 `write_memory_at` 落盘的内容都要**在文件里被脱敏**——`MEMORY.md` 里不应出现完整 `sk-...` 明文，且**多行 bullet 的缩进形状不被破坏**（`- ` 起头、续行缩进仍在）。
 4. **去重 / 冲突**：重复事实不再追加第二条；与已有记忆冲突时走 `replace` 合并（或至少不产生自相矛盾的两条并存）。
@@ -410,10 +429,10 @@
 
 ### §待办 3-1 A13 Agent 能力缺口剩余项
 - **已查清**：MCP 的 Streamable HTTP / OAuth 2.1 / prompts / roots / elicitation / `.mcp.json`（项目级）+ 信任门 + 配置改动检测自动重启**均已落地**；内置技能 / 工具模板、`AGENTS.md` 项目记忆**多层 / 向上递归已落地（2026-10-11，见下 3-1a）**。
-- **待办点**（按需）：`sampling`（服务端反向调用模型）；**记忆目录的「子目录级」按需加载**（代价已评估，本轮不做，见下 3-1a）；斜杠命令（只挑与能力相关子集：`/compact`、`/rewind`、memory 类）—— **`/rewind` + memory 类 + `/compact` 均已实现，见下 3-1b**；**`NotebookEdit` 已实现，见下 3-1c**；**`EnterWorktree` / `ExitWorktree` 已实现，见下 3-1e**；**`CronCreate/Delete/List` 本轮未做（代价 / 可测性已评估，见下 3-1d）**；`WebBrowser` / `LSP`；**`SendUserFile` / `PushNotification` 均已实现（agent → 用户呈递：文件卡 / 桌面通知，见下 3-1g）**；**已废弃的 HTTP+SSE 双端点传输不做**。
+- **待办点**（按需）：`sampling`（服务端反向调用模型）；**记忆目录的「子目录级」按需加载**（**已实现（2026-10-12）**，见下 3-1a）；斜杠命令（只挑与能力相关子集：`/compact`、`/rewind`、memory 类）—— **`/rewind` + memory 类 + `/compact` 均已实现，见下 3-1b**；**`NotebookEdit` 已实现，见下 3-1c**；**`EnterWorktree` / `ExitWorktree` 已实现，见下 3-1e**；**`CronCreate/Delete/List` 本轮未做（代价 / 可测性已评估，见下 3-1d）**；`WebBrowser` / `LSP`；**`SendUserFile` / `PushNotification` 均已实现（agent → 用户呈递：文件卡 / 桌面通知，见下 3-1g）**；**已废弃的 HTTP+SSE 双端点传输不做**。
 - **涉及文件**：`core-agent/src/tools.rs`（`NotebookEdit`、`EnterWorktree` / `ExitWorktree`）、`core-agent/src/main.rs`、`app/src/main.ts`、`core-agent/src/mcp.rs`、`skills.rs`。
 
-#### §待办 3-1a 记忆目录：多层 / 向上递归（固定前缀层**已实现**）+ 子目录级（**未做**）
+#### §待办 3-1a 记忆目录：多层 / 向上递归（固定前缀层**已实现**）+ 子目录级（**已实现（2026-10-12）**，注入层单测**已补（2026-10-13）**）
 
 - **目标**：把项目记忆从「只读工作目录下那一份 `AGENTS.md`」扩成「多层 / 向上递归」。
 - **已查清（现状，2026-10-11，逐条可复核）**：
@@ -424,11 +443,12 @@
 - **「哪一级算数」的裁定（本设计的核心交付）**：
   - **扫描范围**：从 cwd **逐级向上到盘根**，每一级只要有**非空 `AGENTS.md`** 就收（`collect_agents_md`，`:1558`；层级上限 12 防御）；「项目级 / 父级」= cwd 之上的那些级，「本级」= cwd 自己那一份。
   - **优先级 / 覆盖**：**都注入、后来者优先** —— 顺序**浅→深**（父级在前、cwd 那一份在最后），越深越具体 ⇒ 冲突时**深层赢**；多份时每份前加一行来源路径便于判读。
-  - **加载时机**：**启动时扫一次**（`project_block` 在启动装配处调一次，`:3491`）⇒ 进**固定前缀**；cwd 恒定 + 文件集合读一次即定 ⇒ **进程内逐字节稳定、不废缓存**。**子目录级**那层只能**懒加载**（进消息、绝不动固定前缀）——本轮**不做**（见下）。
+  - **加载时机**：**启动时扫一次**（`project_block` 在启动装配处调一次，`:3491`）⇒ 进**固定前缀**；cwd 恒定 + 文件集合读一次即定 ⇒ **进程内逐字节稳定、不废缓存**。**子目录级**那层只能**懒加载**（进消息、绝不动固定前缀）——**已实现（2026-10-12）**（见下；注入层单测**已补（2026-10-13）**）。
   - **体量与截断**：单份 ≤ 8000 字符（截断 + 日志 warn）；**总上限 16000 字符**（`MAX_AGENTS_TOTAL_CHARS`，`:1537`），超时**丢最浅的**（保留更贴近工作目录的）、日志 warn。
   - **可观测**：启动一条 INFO 日志列出**这次用了哪几层**（份数 + 逐份绝对路径，`project_block`）；报文级证据用 `-DumpApi` 看请求体 `system`。
 - **已实现（2026-10-11，只做能稳进固定前缀的确定集合）**：`core-agent/src/main.rs` 的 `collect_agents_md`（浅→深收集）/ `project_block_from_chain`（单份时输出与单层**逐字节相同**；多份带来源标签；总量超限丢最浅）/ `project_block`（读盘 + 拼装 + 记日志）；**沿用既有 `AGENTS.md` → `env_section` 通道，未新造第二套记忆 / 指令机制**。单测 5 条（多层顺序、前缀稳定、单份截断、空文件零字节、总量丢最浅）。
-- **未做（如实记，本轮不做）· 子目录级「按需加载」**：需要 ① agent 侧在**每个读写类工具入口**新增「工具路径 → 所属目录」判定点；② 注入到**可变层**（拼进已有 `tool_result` 文本内部，或一条 `user` 消息），**绝不动固定前缀**；③ 去重（每个目录的 `AGENTS.md` 每会话只注一次）与体量预算。代价 = 跨工具入口的钩子 + 与 ai-spec 那条「动 history **尾部**块结构会打乱缓存单元」的实测红线对齐，属**独立设计**。
+- **已实现（2026-10-12）· 子目录级「按需加载」（注入层单测**已补（2026-10-13）**）**：需要 ① agent 侧在**每个读写类工具入口**新增「工具路径 → 所属目录」判定点（`tools.rs` 的 `path_arg_kind` / `path_arg_key` / `touched_dir` / `eligible_subdir`，2026-10-12 落地）；② 注入到**可变层**（拼进已有 `tool_result` 文本内部，或一条 `user` 消息），**绝不动固定前缀**；③ 去重（每个目录的 `AGENTS.md` 每会话只注一次）与体量预算。代价 = 跨工具入口的钩子 + 与 ai-spec 那条「动 history **尾部**块结构会打乱缓存单元」的实测红线对齐，属**独立设计**。
+- **注入层单测（2026-10-13 补，`core-agent/src/main.rs` 的 tests，临时目录夹具、未改生产代码）**：`subdir_memory_hit_is_injected_into_its_tool_result`（单一命中 ⇒ 拼进对应 `tool_result`、带 `SUBDIR_MEMORY_HEADER` 与 `### <绝对路径>`、原文本保留在前、未新增消息 / 块）；`subdir_memory_is_injected_once_per_session_and_restored_after_set_history`（同目录每会话只注一次 + `set_history` 回退后能补回）；`subdir_memory_stops_at_session_dir_cap`（达 `MAX_SUBDIR_MEMORY_DIRS=16` 停注；`warn` 是日志副作用、未在单测断言）；`subdir_memory_skips_ineligible_dirs`（超深度 / 在 `SKIP_DIRS` / 等于 cwd 均不注）；`subdir_memory_and_background_result_share_one_tool_result`（子目录注入与后台结果回流共存于同一块，顺序子目录先、后台结果后——后台落点是内联在 `run_query` 里的、非纯函数，故复刻其最小追加逻辑验证）。
 - **脚本与真机验收口径**：
   - **脚本（已跑，exit 0）**：`scripts\agent-e2e.ps1`（本次新增 `-WorkspaceDir` 夹具开关，见 `docs/testing.md` §测试 10；**脚本默认瞄准 release 产物**，2026-10-11 已在 release 上重跑通过）——夹具 `F\AGENTS.md` + `F\sub\AGENTS.md`、cwd = `F\sub`；`-DumpApi` 后 `api-dump.jsonl` 的请求体：`system` 含**两份标记且浅在深前**、`messages` **不含**（⇒ 进固定前缀不进消息）；同一进程两次请求的 `system` **sha256 逐字节相同**（前缀不抖）；默认工作目录（无 `AGENTS.md`）`system` **不含**该段（与「没这个功能」等价）。
   - **真机**：`<exe 根>\temp\logs\agent-*.log` 应出现 `项目记忆已注入系统提示词固定段：N 份、… [路径…]`；改 `AGENTS.md` 后需**重启 agent** 才生效（与 persona 同一条纪律）。
@@ -771,7 +791,7 @@
 ## §待办 5 环境变量与数据根（核对基线）
 
 - **数据根 = `<exe 根>`（便携式，无独立 HOME）**：`skills\` / `tools\` / `ModuleData\`（`history\chat.db`、`memory\MEMORY.md`、`usage\usage-*.jsonl`）/ `temp\`（`logs`、`tool-outputs`、`transStorage`、`webview-data`、`review-last`）/ `config\`。
-- **`core-agent` 读取的 18 个 `LUNAC_*`**（均**只在 spawn 时注入**；切换其中任何一项 = `kill_and_cleanup()` 重启 agent）：端点 / 凭据 / 模型、`LUNAC_MAX_CONTEXT_TOKENS`、`LUNAC_SUMMARY_COMPACT`、`LUNAC_MEMORY`、`LUNAC_SKILLS_DIR`、`LUNAC_THINKING`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_HOOKS_FILE`（按 mtime 热重载）、`LUNAC_PERSONA_FILE`（启动读一次）、`LUNAC_MCP_FILE`、`LUNAC_SEARCH_PROVIDER` / `_KEY`、`LUNAC_LOG_DIR` / `LUNAC_LOG` / `LUNAC_LOG_LEVEL`。**（`LUNAC_NUDGE_INTERVAL` 已于 2026-10-11 随复盘触发改造删除，见 §待办 1-6。）**
+- **`core-agent` 读取的 19 个 `LUNAC_*`**（均**只在 spawn 时注入**；切换其中任何一项 = `kill_and_cleanup()` 重启 agent）：端点 / 凭据 / 模型、`LUNAC_MAX_CONTEXT_TOKENS`、`LUNAC_SUMMARY_COMPACT`、`LUNAC_MEMORY`、`LUNAC_SKILLS_DIR`、`LUNAC_THINKING`、`LUNAC_WORKSPACE_LOCKED`、`LUNAC_DENY_READ_DIRS`（**读禁目录**，2026-10-13 新增，见 §待办 1-4 补「模型目录读禁」）、`LUNAC_HOOKS_FILE`（按 mtime 热重载）、`LUNAC_PERSONA_FILE`（启动读一次）、`LUNAC_MCP_FILE`、`LUNAC_SEARCH_PROVIDER` / `_KEY`、`LUNAC_LOG_DIR` / `LUNAC_LOG` / `LUNAC_LOG_LEVEL`。**（`LUNAC_NUDGE_INTERVAL` 已于 2026-10-11 随复盘触发改造删除，见 §待办 1-6。）**
 - 另有 3 个由 agent 自己解析 / 兜底（`LUNAC_MODULES_DIR`、`LUNAC_CACHE_TTL_SECS`、`LUNAC_TURN_BUDGET_TOKENS`）与 2 个只传给 hook 子进程（`LUNAC_HOOK_EVENT`、`LUNAC_TOOL_NAME`）。
 - **「什么时候生效」要如实说**：工具与注入块是「重启 agent 才生效」；只有 `hooks.json` 是 mtime 热重载；技能 = 重启 agent，插件 = 立即。
 
