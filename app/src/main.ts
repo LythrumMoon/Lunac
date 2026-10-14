@@ -6,6 +6,9 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen, emit, emitTo } from "@tauri-apps/api/event";
 import { invoke as tauriInvoke, convertFileSrc } from "@tauri-apps/api/core";
+// 正文里的裸 URL 走**既有外部打开通路**：WebView2 里直接导航会把应用本身顶掉，
+// 所以拦截点击后交给 `plugin-shell` 的 `open()`（本地路径才走宿主 `open_path`，见 §规范 4）。
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { type Plugin, pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { attachPluginListeners } from "./plugins/attach";
@@ -2070,7 +2073,8 @@ function historyStepHtml(s: SessionStep): string {
     );
   }
   if (s.kind === "text") {
-    return `<div class="agent-text">${esc(s.detail || "")}</div>`;
+    // 过程步骤里的正文与助手气泡是同一段内容 ⇒ 裸 URL 同样可点
+    return `<div class="agent-text">${linkifyBareUrls(s.detail || "")}</div>`;
   }
   const firstLine = (s.result || "").split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 60);
   const state = s.isError
@@ -2082,7 +2086,8 @@ function historyStepHtml(s: SessionStep): string {
     `<span class="tool-name">${esc(s.name || t("chat.badge_tool"))}</span>` +
     `<span class="tool-cmd">${esc(s.detail || "")}</span>` +
     `<span class="tool-state">${esc(state)}</span></summary>` +
-    (s.result ? `<div class="tool-body"><pre class="tool-out">${esc(s.result)}</pre></div>` : "") +
+    // WebSearch 的历史卡片同样把来源链接化（与实时卡走同一出口，不覆盖回纯文本）；其余工具卡照旧 esc。
+    (s.result ? `<div class="tool-body"><pre class="tool-out">${s.name === "WebSearch" ? linkifyBareUrls(s.result) : esc(s.result)}</pre></div>` : "") +
     `</details>`
   );
 }
@@ -3363,6 +3368,11 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   // 弹一条桌面通知。两件都**不碰本机**（读元信息 / 发一条本机通知），列出来只是给用户开关。
   { name: "SendUserFile" },
   { name: "PushNotification" },
+  // 代码库骨架（2026-10-14）：`RepoMap` 只读、本地、免审批 —— 按需扫工作区里的源文件，
+  // 回一张「文件 → 顶层符号」的结构骨架（纯正则抽取 + 引用计数近似排序，不含 tree-sitter /
+  // PageRank 这类重型分析）。它只在调用时才进请求体、不进固定前缀。列在这里是给用户一个
+  // 关掉它的入口（`--disallowedTools RepoMap`），禁掉后就拿不到这份骨架了。
+  { name: "RepoMap" },
 ];
 
 function loadCustomBlacklist(): string[] {
@@ -7193,7 +7203,12 @@ function fillToolCard(
   const outEl = el.querySelector<HTMLElement>(".tool-out");
   if (outEl) {
     if (txt) {
-      outEl.textContent = txt.length > 600 ? txt.slice(0, 600) : txt;
+      const shown = txt.length > 600 ? txt.slice(0, 600) : txt;
+      // 只对 WebSearch：把来源 URL 做成可点。复用 linkifyBareUrls（先转义、后链接化，只放行
+      // http/https）—— 结果文本来自网络，绝不给它未转义的 HTML 解析面。
+      // 其余工具卡一律走 textContent（内容是文件内容 / 命令输出，不得当 HTML 解析）。
+      if (card.name === "WebSearch") outEl.innerHTML = linkifyBareUrls(shown);
+      else outEl.textContent = shown;
       outEl.dataset.full = txt;
     } else {
       outEl.remove();
@@ -7261,7 +7276,12 @@ function fillToolCard(
         e.preventDefault();
         e.stopPropagation();
         const box = el.querySelector<HTMLElement>(".tool-out");
-        if (box) box.textContent = box.dataset.full || box.textContent;
+        if (box) {
+          const full = box.dataset.full || box.textContent || "";
+          // 展开全文与截断态同一口径：WebSearch 重新链接化（别覆盖回纯文本），其余照旧纯文本
+          if (card.name === "WebSearch") box.innerHTML = linkifyBareUrls(full);
+          else box.textContent = full;
+        }
         all.remove();
       });
       actions.appendChild(all);
@@ -11584,6 +11604,63 @@ const IMAGE_VIEW_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="no
   <circle cx="18" cy="18" r="0.4" fill="currentColor" stroke="none" opacity="0.45"/>
 </svg>`;
 
+/** 只识别裸 URL 的正则（`http://` / `https://` 开头）。
+ *
+ *  字符类排除：空白、`<` `>`、`"` `'`、反引号，以及**绝不会出现在 URL 里**的中日韩全角
+ *  标点（`，。、；：！？（）【】《》「」『』“”‘’`）—— 它们紧贴在 URL 后（如「…）。」）时
+ *  必须留在正文里，不能被吞进链接。*/
+const BARE_URL_RE = /https?:\/\/[^\s<>"'`，。、；：！？（）【】《》「」『』“”‘’]+/gi;
+
+/** 剥掉一处裸 URL 末尾的**句子标点**。
+ *
+ *  全角标点已由正则排除；这里只处理 ASCII 句末标点，以及**不成对**的右括号：
+ *  `(` / `[` / `{` 配平 ⇒ `https://…/Foo_(bar)` 的右括号保留，句尾多出来的 `)`
+ *  却能被剥掉（`。` / `，` 这类已在正则端拦下）。*/
+function trimUrlTail(url: string): string {
+  const SENT = /[.,;:!?*]+$/;
+  const PAIRS: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  let s = url;
+  for (;;) {
+    const before = s;
+    s = s.replace(SENT, "");
+    const closer = s.slice(-1);
+    const opener = PAIRS[closer];
+    if (opener) {
+      const opens = s.split(opener).length - 1;
+      const closes = s.split(closer).length - 1;
+      if (closes > opens) s = s.slice(0, -1);
+    }
+    if (s === before) return s;
+  }
+}
+
+/** 把一段**纯文本**里的裸 http(s) URL 渲染成可点 `<a class="agent-link">`，其余原样保留。
+ *  这是「正文里裸 URL 可点」的唯一出口（助手正文 / 历史气泡 / 过程步骤正文共用）。
+ *
+ *  **XSS 防护（首要红线，正文来自模型）**——一律先当纯文本处理：
+ *    ① 只认 `http://` / `https://`：`javascript:` / `data:` 等伪协议匹配不上 URL 分支，
+ *       只会落到 `esc()` 当纯文本显示；
+ *    ② **每一段进 HTML 前都过一次 `esc()`**（非 URL 段、URL 的 href 与可见文本各转一次）
+ *       —— 引号被转成 `&quot;`，无法从属性里逃逸；每字符只转一次，不双转义；
+ *    ③ 不给链接任何 HTML 解析面：不认 markdown、不 decode 实体。*/
+function linkifyBareUrls(raw: string): string {
+  if (!raw) return "";
+  BARE_URL_RE.lastIndex = 0;
+  let html = "";
+  let last = 0;
+  for (let m = BARE_URL_RE.exec(raw); m; m = BARE_URL_RE.exec(raw)) {
+    const url = trimUrlTail(m[0]);
+    if (!url) continue;                       // 理论上不可达（必以 http 开头）；仅为防死循环
+    const start = m.index;
+    html += esc(raw.slice(last, start));
+    html += `<a class="agent-link" href="${esc(url)}" rel="noopener noreferrer">${esc(url)}</a>`;
+    last = start + url.length;
+    BARE_URL_RE.lastIndex = last;             // 尾随标点留给下一段正文（别吞进链接）
+  }
+  html += esc(raw.slice(last));
+  return html;
+}
+
 /** Escape text but render markdown `![alt](path)` images as "查看图片" buttons
  *  (需求5: 不再内联渲染 <img>，改为按钮 + 独立全窗查看界面)。本地路径经
  *  convertFileSrc (asset protocol)，因 WebView2 的 CSP img-src 无 file: scheme。
@@ -11601,7 +11678,8 @@ function mdImagesToHtml(raw: string): string {
       const label = alt || t("chat.view_image");
       html += `<button class="agent-md-view" data-src="${esc(url)}" title="${esc(label)}">${IMAGE_VIEW_SVG}<span>${esc(label)}</span></button>`;
     } else {
-      html += esc(seg[i]);
+      // 非图片段：正文里的裸 URL 在这里链接化（内部已完成转义，勿再 esc 一次）
+      html += linkifyBareUrls(seg[i]);
     }
   }
   return html;
@@ -11631,6 +11709,16 @@ document.addEventListener("click", (e) => {
   const viewBtn = tgt.closest<HTMLElement>(".agent-md-view");
   if (viewBtn?.dataset.src) {
     openImageViewer(viewBtn.dataset.src);
+    return;
+  }
+  // 正文里的裸 URL：**拦下默认导航**（WebView2 直接导航会把应用本身顶掉），
+  // 改走既有外部打开通路 `plugin-shell` 的 `open()`（URL 仍走 open，见 §规范 4）。
+  // 打开前再校验一次 scheme（纵深防御，只放行 http/https），不符就当普通文本不处理。
+  const link = tgt.closest<HTMLAnchorElement>("a.agent-link");
+  if (link) {
+    e.preventDefault();
+    const href = link.getAttribute("href") || "";
+    if (/^https?:\/\//i.test(href)) void openExternal(href).catch(() => {});
     return;
   }
   const viewer = document.getElementById("image-viewer");

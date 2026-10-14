@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / NotebookEdit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite
+// 内置工具：Read / Write / Edit / NotebookEdit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite / RepoMap
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Cmd" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -18,6 +18,7 @@
 //
 // 本文件为 Lunac 自研实现，不派生自任何第三方源码。
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -338,7 +339,7 @@ pub fn write_blocked(ctx: &Ctx, what: &str) -> Option<String> {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 二十一个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 二十四个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -786,6 +787,23 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": ["title", "body"]
             }
         }),
+        json!({
+            "name": "RepoMap",
+            "description": "Build a compact structural map of the workspace: every source file \
+                with its top-level symbols (functions, classes, structs, traits, interfaces, ...), \
+                ranked so the most-referenced files and symbols come first and trimmed to a token \
+                budget. Use it before reading files one by one, to see what exists and which files \
+                are central to the code. Symbol extraction is a regex approximation — it may miss \
+                or over-report a few names, so treat the map as a guide, not a contract. Read-only \
+                and local: it never runs code, writes anything, or touches the network.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Base directory to map (defaults to the working directory)" }
+                },
+                "required": []
+            }
+        }),
     ];
 
     all.into_iter()
@@ -1186,6 +1204,9 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         // 事件（`tools.rs` 拿不到 `emit`）。两件都免审批（见 `needs_approval`）。
         "SendUserFile" => send_user_file(ctx, input).map(|(text, _)| text),
         "PushNotification" => push_notification(input).map(|(text, _)| text),
+        // RepoMap（2026-10-14）：**只读、本地、免审批** —— 它只读工作区里的源文件、回一张
+        // 符号骨架；不写盘、不发请求。按需调用 ⇒ 不进固定前缀（见下方实现段注释）。
+        "RepoMap" => repo_map(ctx, input),
         // ImageGen（A13，2026-10-03）：**写类** —— 它往 `temp\images\` 落图。
         // 只读档 / 计划相位的拦法与 Write 同源（`write_blocked`），但**不**进
         // `gated_in_read_only`：只读档下它该被**拒绝**，而不是「问了再做」。
@@ -3676,6 +3697,356 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|&b| b == 0)
 }
 
+// ── RepoMap（零依赖正则符号表，2026-10-14）──────────────────────────
+//
+// 先验证「Repo Map 是否有价值」：用已有依赖（regex）做**纯正则符号表**，不引 tree-sitter /
+// 任何新依赖。文档口径（archive/agent-feature-backlog.md 的 Repo Map 段）的最终形态是
+// tree-sitter AST + PageRank + token 预算裁剪；本轮只做**零依赖近似**：
+//   · 符号抽取 = 正则（误捞已尽量抑制，但做不到零误报 —— 精度边界见 `extract_symbols`）；
+//   · 排序 = **引用计数的近似**（统计符号名在语料里的出现次数），**不是 PageRank**；
+//   · 按字符预算截断。
+//
+// 骨架随文件变化而变 ⇒ **绝不能进 system 固定前缀**（否则每轮 cache miss，违反
+// forbidden.md §禁用 45 / code-standards.md §规范 6）。所以做成**按需调用的只读工具**：
+// 结果进 tool_result（可变层），不参与固定前缀构造。工具定义本身属固定前缀，新增一次会让
+// 前缀变一次、之后稳定。
+//
+// 扫描**必须跳过 `deny_read_dirs`**（安全项）。⚠️ 这是**策略级过滤、不是沙箱**：`Cmd` /
+// `PowerShell` 仍能读到这些目录、符号链接也能绕过（词法比较不解析链接）；RepoMap 只保证
+// 【不把 deny 目录里的符号名返回给模型】。见 forbidden.md §禁用 1.1。
+
+/// RepoMap 单次扫描的文件数上限（超限早退，防大仓库卡死）。
+const REPO_MAP_MAX_FILES: usize = 600;
+/// 单次扫描累计读取的字节上限（超限早退，并如实告知结果可能不全）。
+const REPO_MAP_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+/// 单文件**读取上限**（超过只读前缀这么多字节 —— **不整文件跳过**：最大的那个文件往往
+/// 正是最核心的，直接跳过会丢掉它）。
+const REPO_MAP_MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// 目录递归深度上限。
+const REPO_MAP_MAX_DEPTH: usize = 12;
+/// 每个文件最多列出的符号数（按引用计数取前 N）。
+const REPO_MAP_MAX_SYMBOLS_PER_FILE: usize = 40;
+/// 输出字符预算（约 2750 token）。超预算按文件分从低到高截断。
+/// **刻意低于 `tools::SPILL_THRESHOLD`（12000）**：给截断 / 上限提示留出余量，
+/// 免得自身再触发外层「落盘 + 头尾预览」（那就等于「没压到预算」）。
+const REPO_MAP_MAX_CHARS: usize = 11_000;
+
+/// 语言族位（符号规则按它过滤；一个扩展名映射到一族，0 = 不抽）。
+const L_RUST: u8 = 1;
+const L_TSJS: u8 = 2;
+const L_PY: u8 = 4;
+const L_GO: u8 = 8;
+const L_JAVA: u8 = 16;
+const L_C: u8 = 32;
+
+/// 一条符号抽取规则：`langs` = 语言族位掩码；正则**行首锚定**，捕获组 1 = 符号名。
+struct SymbolRule {
+    langs: u8,
+    re: regex::Regex,
+}
+
+/// 全量符号规则表（进程内只编译一次）。规则刻意**行首锚定** —— 这是抑制「从字符串里误捞」
+/// 的主要手段（`let s = "fn foo"` 里的 fn 不在行首，不会被抽到）。
+fn symbol_rules() -> &'static [SymbolRule] {
+    static RULES: OnceLock<Vec<SymbolRule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let raw: &[(&str, u8)] = &[
+            // Rust
+            (r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)*(?:async\s+|unsafe\s+|const\s+)*fn\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            (r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)*struct\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            (r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)*enum\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            (r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)*trait\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            (r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)*mod\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            (r"^\s*impl(?:<[^>]*>)?\s+([A-Za-z_][A-Za-z0-9_:]*)", L_RUST),
+            (r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)*type\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            (r"^\s*macro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)", L_RUST),
+            // JS / TS
+            (r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)", L_TSJS),
+            (r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)", L_TSJS),
+            (r"^\s*(?:export\s+)?interface\s+([A-Za-z_$][A-Za-z0-9_$]*)", L_TSJS),
+            (r"^\s*(?:export\s+)?type\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*[=<]", L_TSJS),
+            (r"^\s*(?:export\s+)?enum\s+([A-Za-z_$][A-Za-z0-9_$]*)", L_TSJS),
+            (r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|\()", L_TSJS),
+            // Python
+            (r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)", L_PY),
+            (r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)", L_PY),
+            // Go
+            (r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)", L_GO),
+            (r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)", L_GO),
+            // Java / Kotlin / C#
+            (r"^\s*(?:(?:public|private|protected|static|final|abstract|sealed|open|data|internal|override|partial)\s+)*(?:class|interface|enum|record|object)\s+([A-Za-z_][A-Za-z0-9_]*)", L_JAVA),
+            (r"^\s*(?:(?:public|private|protected|internal|override|open|suspend|inline|operator|infix|tailrec|abstract)\s+)*fun\s+(?:<[^>]*>\s*)?(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*)", L_JAVA),
+            // C / C++
+            (r"^\s*(?:typedef\s+)?(?:struct|enum|union|class)\s+([A-Za-z_][A-Za-z0-9_]*)", L_C),
+        ];
+        raw.iter()
+            .filter_map(|(p, l)| regex::Regex::new(p).ok().map(|re| SymbolRule { langs: *l, re }))
+            .collect()
+    })
+}
+
+/// 扩展名 → 语言族位（0 = 不是我们抽取的源文件类型）。
+fn lang_bit(ext: &str) -> u8 {
+    match ext {
+        "rs" => L_RUST,
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "vue" | "svelte" => L_TSJS,
+        "py" => L_PY,
+        "go" => L_GO,
+        "java" | "kt" | "kts" | "cs" | "scala" => L_JAVA,
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => L_C,
+        _ => 0,
+    }
+}
+
+/// 语料分词（引用计数用）：`[A-Za-z_][A-Za-z0-9_]*`。
+fn word_regex() -> &'static regex::Regex {
+    static WORD: OnceLock<regex::Regex> = OnceLock::new();
+    WORD.get_or_init(|| regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("static word regex"))
+}
+
+/// 纯函数：从源文件文本抽符号名（按规则表、行首锚定、前向去重）。
+///
+/// **精度边界（如实说明 —— 正则近似做不到零误报）**：能抑制最常见的两类误捞 ——
+/// ① 行首注释（`//` / `/*` / `*` / `#`）整行跳过；② 行中字符串里的声明样式文本
+///（规则行首锚定，故 `let s = "fn foo"` 抽不到）。仍存在的边界：**块注释内部独立成行的
+/// 声明样式文本**、**多行字符串 / 模板串里的独立行**可能被误捞；反之少数异形声明
+///（宏生成的、跨行的）会漏。故输出只能当「导引」，不是契约。
+fn extract_symbols(text: &str, ext: &str) -> Vec<String> {
+    let bit = lang_bit(ext);
+    if bit == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        let first = t.as_bytes()[0];
+        if first == b'/' || first == b'*' || first == b'#' {
+            continue; // 行首注释整行跳过
+        }
+        for rule in symbol_rules() {
+            if rule.langs & bit == 0 {
+                continue;
+            }
+            if let Some(m) = rule.re.captures(t).and_then(|c| c.get(1)) {
+                let raw = m.as_str();
+                let name = raw.rsplit("::").next().unwrap_or(raw).to_string();
+                if !name.is_empty() && seen.insert(name.clone()) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 递归收集源文件：跳过 `SKIP_DIRS`、跳过 `deny_read_dirs` 命中的目录（整棵子树）、
+/// 不追符号链接；文件数 / 深度封顶。
+fn collect_source_files(ctx: &Ctx, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > REPO_MAP_MAX_DEPTH || out.len() >= REPO_MAP_MAX_FILES {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue; // 不追链接：既防目录环，也防拿链接绕过 deny（词法比较不解析链接）
+        }
+        if ft.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if SKIP_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d)) {
+                continue;
+            }
+            if in_deny_read_dirs(&ctx.deny_read_dirs, &path).is_some() {
+                continue; // deny 目录整棵子树跳过（安全项）
+            }
+            subdirs.push(path);
+        } else if ft.is_file() {
+            if in_deny_read_dirs(&ctx.deny_read_dirs, &path).is_some() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if lang_bit(&ext) != 0 {
+                out.push(path);
+                if out.len() >= REPO_MAP_MAX_FILES {
+                    return;
+                }
+            }
+        }
+    }
+    subdirs.sort();
+    for d in subdirs {
+        if out.len() >= REPO_MAP_MAX_FILES {
+            return;
+        }
+        collect_source_files(ctx, &d, depth + 1, out);
+    }
+}
+
+/// 渲染用的单文件条目（已在排序阶段定序）。
+struct RepoEntry {
+    rel: String,
+    symbols: Vec<String>,
+}
+
+/// 纯函数：把已排序的条目渲染成骨架，按 `budget` 字符截断。
+/// 返回 (文本, 实际写入的文件行数) —— 行数 < 条目数即表示被预算截断。
+fn render_repo_map(entries: &[RepoEntry], header: &str, budget: usize) -> (String, usize) {
+    let mut out = String::from(header);
+    out.push('\n');
+    let mut shown = 0usize;
+    for e in entries {
+        let line = format!("{}: {}\n", e.rel, e.symbols.join(", "));
+        if out.chars().count() + line.chars().count() > budget {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    (out, shown)
+}
+
+/// `RepoMap`（2026-10-14，见本段开头注释）：只读扫描工作区，回一张按引用计数排序、
+/// 按预算裁剪的「文件 → 顶层符号」骨架。
+fn repo_map(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    let base = match input.get("path").and_then(Value::as_str) {
+        Some(p) if !p.trim().is_empty() => resolve(ctx, p),
+        _ => effective_cwd(ctx),
+    };
+    guard_read(ctx, &base)?;
+    if !base.is_dir() {
+        return Err(format!("{} is not a directory", base.display()));
+    }
+
+    let started = Instant::now();
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_source_files(ctx, &base, 0, &mut files);
+    files.sort();
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut entries: Vec<RepoEntry> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut cap_hit = false;
+    for file in &files {
+        let Ok(meta) = fs::metadata(file) else { continue };
+        let read_cap = REPO_MAP_MAX_FILE_BYTES.min(meta.len()) as usize;
+        if total_bytes + read_cap > REPO_MAP_MAX_TOTAL_BYTES {
+            cap_hit = true;
+            break;
+        }
+        let Ok(f) = fs::File::open(file) else { continue };
+        // 只读前缀：文件可能极大（生成的 / 压缩的），一次性读全会把内存吃光
+        let mut bytes = Vec::new();
+        if f.take(REPO_MAP_MAX_FILE_BYTES).read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        if is_binary(&bytes) {
+            continue;
+        }
+        if (meta.len() as usize) > bytes.len() {
+            cap_hit = true; // 单文件超上限 ⇒ 只抽了它的前缀
+        }
+        total_bytes += bytes.len();
+        let text = String::from_utf8_lossy(&bytes);
+        let ext = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let syms = extract_symbols(&text, &ext);
+        if syms.is_empty() {
+            continue;
+        }
+        for m in word_regex().find_iter(&text) {
+            match counts.get_mut(m.as_str()) {
+                Some(n) => *n += 1,
+                None => {
+                    counts.insert(m.as_str().to_string(), 1);
+                }
+            }
+        }
+        let rel = file
+            .strip_prefix(&base)
+            .unwrap_or(file.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        entries.push(RepoEntry { rel, symbols: syms });
+    }
+
+    // 符号按引用计数降序（并列按字典序，保证确定性）；文件分 = 其符号计数之和。
+    let mut scored: Vec<(usize, RepoEntry)> = entries
+        .into_iter()
+        .map(|e| {
+            let mut with_score: Vec<(usize, String)> = e
+                .symbols
+                .into_iter()
+                .map(|s| (counts.get(&s).copied().unwrap_or(0), s))
+                .collect();
+            with_score.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            with_score.truncate(REPO_MAP_MAX_SYMBOLS_PER_FILE);
+            let file_score: usize = with_score.iter().map(|(n, _)| *n).sum();
+            let symbols: Vec<String> = with_score.into_iter().map(|(_, s)| s).collect();
+            (file_score, RepoEntry { rel: e.rel, symbols })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.rel.cmp(&b.1.rel)));
+
+    let file_count = scored.len();
+    let sym_total: usize = scored.iter().map(|(_, e)| e.symbols.len()).sum();
+    crate::log::info(format!(
+        "RepoMap：扫描 {} 个源文件（{} KB）{}，{} 个符号，用时 {} ms",
+        file_count,
+        total_bytes / 1024,
+        if cap_hit { "（命中体积上限，结果可能不全）" } else { "" },
+        sym_total,
+        started.elapsed().as_millis()
+    ));
+
+    if file_count == 0 {
+        return Ok(format!(
+            "[repo-map] No recognized source files under {} (looked for common source \
+             extensions; skipped .git / node_modules / target and read-blocked directories).",
+            base.display()
+        ));
+    }
+
+    let entries: Vec<RepoEntry> = scored.into_iter().map(|(_, e)| e).collect();
+    let header = format!(
+        "[repo-map] {} source files, {} symbols ({} KB read); ranked by identifier reference \
+         count (approximate, NOT PageRank), most-referenced first, trimmed to a {} char budget.",
+        file_count,
+        sym_total,
+        total_bytes / 1024,
+        REPO_MAP_MAX_CHARS
+    );
+    let (mut body, shown) = render_repo_map(&entries, &header, REPO_MAP_MAX_CHARS);
+    if shown < entries.len() {
+        body.push_str(&format!(
+            "[... map truncated at the {} char budget — {} of {} files shown; narrow the base \
+             path or use Grep for a specific symbol.]\n",
+            REPO_MAP_MAX_CHARS,
+            shown,
+            entries.len()
+        ));
+    }
+    if cap_hit {
+        body.push_str(
+            "[... scan stopped at a size cap (max 600 files / 1 MB per file / 4 MB total); \
+             the map may be incomplete.]\n",
+        );
+    }
+    Ok(body)
+}
+
 /// 单条工具结果的**预算出口**（唯一出口，由 main.rs `run_tool` 调用 —— 只有那里
 /// 同时知道工具名与完整输出）。
 ///
@@ -3980,8 +4351,8 @@ mod tests {
             "SendUserFile / PushNotification（agent→用户呈递，2026-10-11）必须在内置工具表里"
         );
         assert_eq!(
-            total, 23,
-            "内置工具应为 23 件（21 件 + SendUserFile + PushNotification，2026-10-11）"
+            total, 24,
+            "内置工具应为 24 件（23 件 + RepoMap，2026-10-14）"
         );
 
         let cut = defs(&["Agent".to_string()]);
@@ -4608,6 +4979,100 @@ mod tests {
             vec![PathBuf::from(r"D:\a"), PathBuf::from(r"D:\b")],
             "相对路径（.\\rel / rel\\x）应被丢弃，绝对路径保留"
         );
+    }
+
+    /// `RepoMap`（2026-10-14）的注册 / 分档口径：在 `defs()` 里、**免审批**、只读档放行、
+    /// 可被 `--disallowedTools` 裁掉；同时钉住「只读、不写盘」这一条 —— 不进写类。
+    #[test]
+    fn repo_map_tool_is_registered_and_ungated() {
+        let all = defs(&[]);
+        assert!(names(&all).contains(&"RepoMap".to_string()), "RepoMap 必须在内置工具表里");
+        assert!(!needs_approval("RepoMap"), "只读本地文件，与 Read / Grep 同级 ⇒ 免审批");
+        assert!(!gated_in_read_only("RepoMap"), "只读档放行");
+        assert!(!needs_bridge("RepoMap"), "不走桥");
+        let cut = defs(&["RepoMap".to_string()]);
+        assert!(!names(&cut).contains(&"RepoMap".to_string()), "disallowed 必须能裁掉 RepoMap");
+        assert_eq!(cut.len(), all.len() - 1);
+    }
+
+    /// `RepoMap` 的正则符号抽取：覆盖常见形态（Rust / TS / Python），且**行首注释与
+    /// 行中字符串里的声明样式文本不被误捞**（精度边界的下限保证）。
+    #[test]
+    fn repo_map_extracts_common_symbols_and_suppresses_false_positives() {
+        let rust = "pub fn alpha() {}\nstruct Beta;\nenum Gamma {}\ntrait Delta {}\nimpl Beta {}\nmod eps {}\n";
+        let got = extract_symbols(rust, "rs");
+        for n in ["alpha", "Beta", "Gamma", "Delta", "eps"] {
+            assert!(got.contains(&n.to_string()), "Rust 应抽到 {n}：{got:?}");
+        }
+
+        let ts = "export function gamma() {}\nclass Delta {}\ninterface Epsilon {}\n\
+                  const zeta = () => {};\nconst eta = (a) => a;\nconst theta = () => a;\n";
+        let got = extract_symbols(ts, "ts");
+        for n in ["gamma", "Delta", "Epsilon", "zeta", "eta", "theta"] {
+            assert!(got.contains(&n.to_string()), "TS 应抽到 {n}：{got:?}");
+        }
+
+        let py = "def theta():\n    pass\nclass Iota:\n    pass\n";
+        let got = extract_symbols(py, "py");
+        assert!(got.contains(&"theta".to_string()) && got.contains(&"Iota".to_string()), "{got:?}");
+
+        // 抑制误捞：注释行 / 字符串里的声明样式文本都不抽
+        let noisy = "// fn commented_out\n/* fn also_commented\n * fn block_comment\n */\n\
+                     let s = \"fn inside_string\";\nfn real_one() {}\n";
+        let got = extract_symbols(noisy, "rs");
+        assert!(got.contains(&"real_one".to_string()), "真实声明必须抽到：{got:?}");
+        for bad in ["commented_out", "also_commented", "block_comment", "inside_string"] {
+            assert!(!got.contains(&bad.to_string()), "{bad} 是误捞，不该出现：{got:?}");
+        }
+    }
+
+    /// `RepoMap` 的**预算裁剪**：超预算必须截断，且输出绝不超预算；预算充足时全量输出。
+    #[test]
+    fn repo_map_render_trims_to_budget() {
+        let entries: Vec<RepoEntry> = (0..50)
+            .map(|i| RepoEntry {
+                rel: format!("dir{}/file_{i}.rs", i),
+                symbols: vec![format!("sym_{i}")],
+            })
+            .collect();
+        let (text, shown) = render_repo_map(&entries, "[repo-map] header", 200);
+        assert!(shown < entries.len(), "超预算必须截断：shown={shown}");
+        assert!(
+            text.chars().count() <= 200,
+            "输出不得超预算：{}",
+            text.chars().count()
+        );
+
+        let (full, all) = render_repo_map(&entries, "h", 100_000);
+        assert_eq!(all, entries.len(), "预算充足时应全量输出");
+        assert!(full.contains("dir0/file_0.rs"));
+    }
+
+    /// **安全项：deny 不被绕过** —— 在 `deny_read_dirs` 内造一个目录 + 源文件，
+    /// 断言骨架里**不出现**该目录的文件 / 符号，而正常目录的照常出现。
+    /// 这是「RepoMap 不得成为读禁目录后门」的验收点（策略级过滤，见 forbidden.md §禁用 1.1）。
+    #[test]
+    fn repo_map_skips_deny_read_dirs() {
+        let root = std::env::temp_dir().join(format!("lunac-repomap-deny-{}", std::process::id()));
+        let ok_dir = root.join("src");
+        let deny_dir = root.join("secret");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&ok_dir).unwrap();
+        fs::create_dir_all(&deny_dir).unwrap();
+        fs::write(ok_dir.join("good.rs"), "pub fn visible_symbol() {}\n").unwrap();
+        fs::write(deny_dir.join("hidden.rs"), "pub fn hidden_symbol() {}\n").unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.cwd = root.clone();
+        ctx.deny_read_dirs = vec![deny_dir.clone()];
+        let out = repo_map(&ctx, &json!({})).expect("扫描应成功");
+
+        assert!(out.contains("visible_symbol"), "正常目录的符号应在骨架里：{out}");
+        assert!(out.contains("good.rs"), "正常文件应出现：{out}");
+        assert!(!out.contains("hidden_symbol"), "deny 目录里的符号绝不能出现：{out}");
+        assert!(!out.contains("hidden.rs"), "deny 目录里的文件绝不能出现：{out}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// `Agent` 的审批 / 并行 / 只读三条口径（A1 约束③；**A14 起「并行」一条已改**）：

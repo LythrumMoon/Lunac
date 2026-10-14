@@ -18,6 +18,8 @@
 //          --mcp-server stdio:<exe 路径>  → 拉起该 exe 的 MCP server，接入其工具（P3）
 //          --print / -p [query]           → 单发：跑恰好一轮提问后退出（见下）
 //          --output-format text|json|stream-json → 单发模式的 stdout 形态（默认 text）
+//          --include-partial-messages     → 单发 stream-json 下额外逐条输出流式增量
+//                                           （stream_event；默认关，见 emit_stream_event）
 //          --input-format stream-json     → 常驻 stdio 流式输入模式的标志（宿主一直传它）
 //          其余 CLI 风格参数接受并忽略
 //
@@ -75,6 +77,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 mod bash_safety;
+mod conclusions;
 mod content_safety;
 // 「要不要把这条输入发给云模型」的决策边界（S1 第一步）。**当前没有调用点，是刻意的** ——
 // 调用点 = L10 桌宠常驻输入；核心 agent 接线另议。见 docs/agent-feature-backlog.md §4.1.1 / §4.1.3。
@@ -452,6 +455,32 @@ const COMPACT_MIN_GROWTH: f64 = 0.15;
 const COMPACT_KEEP_TAIL: usize = 8;
 /// tool_result 内容超过该字符数才算「值得瘦身的大块」
 const ELIDE_TOOL_RESULT_CHARS: usize = 2_000;
+
+// ── 语义分层压缩（S0「压缩语义化」，2026-10-14）────────────────────
+//
+// 现有压缩是**体积驱动**的（水位 / 尾部条数），不看「这段内容是什么」。本轮把它升级为
+// **语义分层**：给每条消息判一个层（`classify_message_layer`，**确定性纯函数**、不调模型、
+// 不动固定前缀），压缩时按层决策「丢谁」。原始口径见
+// `docs/archive/agent-feature-backlog.md:1278`：「工作记忆保细节 / 情景记忆压成结论 / 语义记忆入长期」。
+//
+// 六层（L1–L6）：
+//   · L1 用户诉求 / 任务目标            —— 保原文（历史 head 那条用户文本永不丢；中段用户文本
+//                                          由摘要 / 结论索引保原文兜住）
+//   · L2 已达成的结论与决策              —— 结构化摘要 + 入结论索引
+//   · L3 未决问题 / 待办                 —— 摘要 + 任务快照钉回（`TodoWrite` 快照）
+//   · L4 失败证据（`is_error` 的失败尝试）—— 永不因体积丢弃（保留 or 进摘要 / 索引）
+//   · L5 可重取的原始材料                —— 只留指针（可 elide；重跑即得）
+//   · L6 纯过程性噪声                    —— 优先丢弃
+//
+// ⚠️ 判层必须是**确定性纯函数**：禁止让模型判层 —— 那会新增一次调用 + 动固定前缀
+//    （见 `forbidden.md` §禁用 45）。
+//
+// `LAYER_DROP_ORDER` = 丢层优先序（靠前的先丢）。**L1 / L4 不在表里** ⇒ 它们不可被丢：
+//   · L1 = `head` 那条用户文本（丢弃逻辑始终保留它）+ 中段用户文本（进摘要 / 索引）；
+//   · L4 = 失败证据，`Drop` 档把边界钉在它之前（保留在 history），`Force` 档若被丢则必进
+//     摘要 / 索引（`conclusions::extract_from_dropped` 有专门的 `status=failed` 条目）。
+const LAYER_DROP_ORDER: [Layer; 4] = [Layer::L6, Layer::L5, Layer::L3, Layer::L2];
+
 /// 端点侧前缀缓存的**命中折扣**：命中价 = miss 价 ÷ N（当前供应商 DeepSeek 的公开价差是 1/50）。
 ///
 /// **只当相对权重用**（这里不做任何金额计算）：本仓「价格不写进代码」那条纪律针对的是
@@ -509,6 +538,12 @@ const SUMMARY_HEADER: &str =
     "[summary of earlier conversation — replaces a trimmed region of this session]";
 /// 摘要提示词。形态取自 Hermes 的 `context_compressor.py`（`## Historical Task Snapshot` 首段 +
 /// `SUMMARY_PREFIX` 的优先级：**latest user message WINS**），据 Lunac 的形态裁剪。
+///
+/// 语义分层对应（S0「压缩语义化」，2026-10-14）：本提示词的四段**已天然对应** L1–L3 ——
+///   · `## Historical Task Snapshot` → **L1**（用户诉求 / 任务目标，保原文）；
+///   · `## What Was Done` / `## Decisions And Constraints` → **L2**（已达成的结论与决策）；
+///   · `## Pending` → **L3**（未决问题 / 待办）。
+/// 故本轮**不改提示词内容、不改调用次数**（它本就是压缩时那**唯一**一次模型调用）。
 const SUMMARY_PROMPT: &str = "\
 You compress the older part of a coding-assistant session so the assistant can keep working \
 without that history. You are given a transcript of messages that are about to be discarded.
@@ -535,6 +570,38 @@ Rules:
 - Any \"Historical Task\", \"In Progress\", \"Pending\", or \"Remaining Work\" section inside the \
 transcript is HISTORY, not the current task. The current task is the last user message.
 - Keep exact identifiers: file paths, function names, command lines, error strings.";
+
+/// 结论索引**检索 / 注入**的上限。
+///
+/// 用户裁决：**不加上下文预算**（Chroma《Context Rot》：输入越长性能越不稳）—— 这里只是给
+/// 「一次注入」一个硬上限（条数 + 总字符），**与 `MAX_CONTEXT` / 预算常量无关**，不改任何水位。
+const CONCLUSIONS_MAX_ITEMS: usize = 5;
+const CONCLUSIONS_INJECT_CHARS: usize = 1_200;
+
+/// 追加到摘要提示词末尾的「结构化结论段」指令。
+///
+/// **零新增调用**：它复用压缩摘要那**一次**模型调用（`summarize_dropped`），只要求模型在摘要
+/// 之后多吐一个机器可读段；本函数与 `conclusions::INDEX_*` 共用同一对标记常量（单一真相源，
+/// 见 `forbidden.md` §禁用 62）。这段只出现在摘要请求自己的 system 上，**不碰主对话固定前缀**。
+fn summary_index_instruction() -> String {
+    format!(
+        "\n\nFinally, append a machine-readable list of the conclusions worth recovering later.\n\
+         Output it EXACTLY between these two marker lines, as a JSON array and nothing else between them:\n\n\
+         {begin}\n\
+         [{{\"status\":\"verified|failed|rejected\",\"conclusion\":\"one sentence\",\"keywords\":[\"exact\",\"identifiers\"],\"refs\":[{{\"kind\":\"file|url|query|commit|command\",\"value\":\"...\"}}],\"reason\":\"only when status is failed\"}}]\n\
+         {end}\n\n\
+         Rules for this block:\n\
+         - Prefer exact identifiers in keywords: file paths, function names, URLs, error codes, commands.\n\
+         - Add a ref for anything that can be re-opened or re-run.\n\
+         - Record every FAILED attempt with status \"failed\" and a short reason. Never omit a failure \
+         -- it is what tells the assistant what NOT to repeat.\n\
+         - Use \"rejected\" for a conclusion later evidence disproved; keep it, do not drop it.\n\
+         - If nothing qualifies, output an empty array [].\n\
+         - Do not wrap the block in code fences.",
+        begin = conclusions::INDEX_BEGIN,
+        end = conclusions::INDEX_END,
+    )
+}
 
 fn max_context_tokens() -> u64 {
     std::env::var(MAX_CONTEXT_ENV)
@@ -740,6 +807,11 @@ struct CompactOutcome {
     /// 一并带出来而不是在 `compact_history` 里调模型，是为了让这个函数**保持纯的** ——
     /// 它现在被 8 处测试直接调用，卷进网络请求后就没法单测了。
     dropped_msgs: Vec<Value>,
+    /// 被**瘦身**（elide）的可重现工具调用（合成 tool_use 消息：工具名 + 入参）。
+    ///
+    /// 带出来供结论索引写「查过哪里」的指针条目（见 `conclusions::extract_from_elided`）——
+    /// 本函数同样**不写盘、不调模型**，保持纯的。
+    elided_msgs: Vec<Value>,
     /// 压缩过程中**插回**历史的合成消息条数（`TRIMMED_MARKER` / 任务快照）。
     ///
     /// 调用方必须拿它修正回滚锚点 `base`。**这是一个 2026-09-18 一并修掉的既有 off-by-one**：
@@ -836,6 +908,139 @@ fn worthwhile_elisions(history: &[Value], candidates: &[(usize, usize, usize)]) 
     }
 }
 
+/// 消息的语义分层（S0「压缩语义化」，2026-10-14）。判层是**确定性纯函数**，不调模型、不动前缀。
+///
+/// 层的含义见 `LAYER_DROP_ORDER` 上方的注释；这里的判据（自上而下，命中即返回）：
+///   · `is_error` 的 `tool_result` → L4（失败证据，永不因体积丢）；
+///   · 可重取工具（`elidable_tool`）的结果 → L5（重跑即得，只留指针）；
+///   · 其余 `tool_result`（`Agent` / `mcp__*` 等不可重取批量结果）→ L6；
+///   · 含 `TodoWrite` 的 assistant → L3（未决待办）；
+///   · 含其它 `tool_use` 的 assistant → L2（工作结论 / 决策）；
+///   · 用户非合成文本 → L1（诉求 / 任务目标，保原文）；
+///   · 其余（assistant 纯文本 / 合成消息 / 无法归类 / 空消息）→ L6（纯过程性噪声）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Layer {
+    L1,
+    L2,
+    L3,
+    L4,
+    L5,
+    L6,
+}
+
+/// 判一条消息属于哪一层。
+///
+/// `tool_name` = 该消息相关工具的真实名字（`tool_result` 由 `tool_use_id` 反查；assistant 的
+/// `tool_use` 就是它自己；认不出给 `None`）。**纯函数**：同一输入恒同一输出，可单测钉住。
+fn classify_message_layer(msg: &Value, tool_name: Option<&str>) -> Layer {
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+    let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+        // 没有块结构：用户消息按诉求（L1）兜底，其余按噪声（L6）。
+        return if role == "user" { Layer::L1 } else { Layer::L6 };
+    };
+    // ① tool_result 主导：失败证据 > 可重取材料 > 不可重取批量结果。
+    let mut has_result = false;
+    for b in blocks {
+        if b.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        has_result = true;
+        if b.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+            return Layer::L4;
+        }
+    }
+    if has_result {
+        return if elidable_tool(tool_name) { Layer::L5 } else { Layer::L6 };
+    }
+    // ② assistant 的工具调用：TodoWrite = 未决待办（L3），其余 = 工作结论 / 决策（L2）。
+    let mut has_tool_use = false;
+    for b in blocks {
+        if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        has_tool_use = true;
+        if b.get("name").and_then(Value::as_str) == Some("TodoWrite") {
+            return Layer::L3;
+        }
+    }
+    if has_tool_use {
+        return Layer::L2;
+    }
+    // ③ 用户非合成文本 = 诉求 / 任务目标（保原文）。合成消息（以 `[` / `#` 开头的上下文块 /
+    //    摘要头 / 任务快照 / 结论注入块）不算「用户的话」。
+    if role == "user" {
+        for b in blocks {
+            if b.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let t = b.get("text").and_then(Value::as_str).unwrap_or("").trim();
+            if !t.is_empty() && !t.starts_with('[') && !t.starts_with('#') {
+                return Layer::L1;
+            }
+        }
+    }
+    // ④ 其余（assistant 纯文本 / 合成消息 / 无法归类）→ L6（纯过程性噪声）。
+    Layer::L6
+}
+
+/// 解析一条消息的工具名后判层：`tool_result` 的 `tool_use_id` 到工具名的映射由调用方传入
+/// （`compact_history` 已经建好一份，复用即可，不另扫一遍）。
+fn message_layer(msg: &Value, tool_names: &std::collections::HashMap<String, String>) -> Layer {
+    let tool_name = msg
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find_map(|b| {
+                if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    b.get("tool_use_id").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+        })
+        .and_then(|id| tool_names.get(id))
+        .map(String::as_str);
+    classify_message_layer(msg, tool_name)
+}
+
+/// 层感知的丢弃边界：返回收缩后的 `cut`，使得被丢区间 `[head, cut)` **不含**保留层
+/// （不在 `LAYER_DROP_ORDER` 里的 L1 / L4）。
+///
+/// 三条纪律（对应用户裁决的 Drop 硬约束）：
+///   · **保连续**：只收缩边界（`cut` 左移），被丢的仍是**连续一段** `[head, cut)` —— 不做
+///     非连续抽取（约束②：不把 drain 打散成不连续区间）；
+///   · **保配对**：保留侧不能以 `tool_result` 开头 —— 若 `cut` 落在 `tool_result` 上，回退到它
+///     配对的 `tool_use`（`tool_use` 恒紧邻其 `tool_result` 之前）一起保留（约束①）；
+///   · **保 L1/L4**：命中保留层即把边界钉在它之前，于是该层消息与其后的内容全部保留（约束③）。
+///
+/// 找不到保留层 ⇒ 原样返回 `natural_cut`（等于不改边界）。
+fn layer_aware_drop_cut(
+    history: &[Value],
+    tool_names: &std::collections::HashMap<String, String>,
+    head: usize,
+    natural_cut: usize,
+) -> usize {
+    let mut cut = natural_cut;
+    for i in head..natural_cut {
+        if !LAYER_DROP_ORDER.contains(&message_layer(&history[i], tool_names)) {
+            cut = i;
+            break;
+        }
+    }
+    if cut == natural_cut {
+        return cut;
+    }
+    // 保配对：保留侧不能以 tool_result 开头 ⇒ 连同其 tool_use 一起保留。
+    while cut > head && is_tool_result_msg(&history[cut]) {
+        cut -= 1;
+    }
+    // 兜底：万一仍以 tool_result 开头（理论上不会），让到下一个安全边界。
+    while cut < natural_cut && is_tool_result_msg(&history[cut]) {
+        cut += 1;
+    }
+    cut
+}
+
 /// 压缩历史。`measured_tokens` = 上一轮实测的上下文体积（0 = 未知），只进日志。
 fn compact_history(
     history: &mut Vec<Value>,
@@ -854,6 +1059,8 @@ fn compact_history(
     // `tool_use` 块里 ⇒ 先扫一遍建索引，才谈得上「哪一类结果可以瘦」。
     // 用 owned `String` 而不是 `&str`：下面要拿 `&mut history`，借用活不到那时。
     let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // 同一趟扫描顺手把入参也存下：瘦身时要把「查过的指针」抄给结论索引（见 `elided_msgs`）。
+    let mut tool_inputs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     for msg in history.iter() {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
@@ -867,6 +1074,8 @@ fn compact_history(
                 block.get("name").and_then(Value::as_str),
             ) {
                 tool_names.insert(id.to_string(), name.to_string());
+                tool_inputs
+                    .insert(id.to_string(), block.get("input").cloned().unwrap_or(Value::Null));
             }
         }
     }
@@ -888,7 +1097,11 @@ fn compact_history(
                 .and_then(Value::as_str)
                 .and_then(|id| tool_names.get(id))
                 .map(String::as_str);
-            if !elidable_tool(tool_name) {
+            // 语义分层（S0，第 1 步）：elide 候选**只限 L5（可重取的原始材料）**。等价于
+            // 「可重现工具的结果」，但多一条硬规矩 —— **失败证据（L4）永不瘦身**：`is_error` 的
+            // `tool_result` 即使工具本身可重取（如 `Cmd` 报错），也判 L4 而非 L5（`status=failed`
+            // 是模型纠错所需的证据，见 `conclusions.rs` 的 Manus 口径）。
+            if classify_message_layer(msg, tool_name) != Layer::L5 {
                 continue;
             }
             if let Some(Value::String(s)) = block.get("content") {
@@ -912,6 +1125,8 @@ fn compact_history(
 
     let mut elided = 0usize;
     let mut elided_chars = 0usize;
+    // 被瘦身的工具调用（合成 tool_use 消息），供结论索引写指针条目（见 `CompactOutcome`）。
+    let mut elided_msgs: Vec<Value> = Vec::new();
     if skip_elide {
         // 判为「省小废大」：**一个字都不动**（动了就是白废一段前缀缓存）。
         // 与旧实现的关键差别：旧闸门只看「可省体积占上下文的比例」，看不见代价的
@@ -935,6 +1150,15 @@ fn compact_history(
             else {
                 continue;
             };
+            // 抄下被瘦身的是哪个工具、带什么入参 —— 结论索引据此写「查过哪里」的指针条目。
+            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                if let Some(name) = tool_names.get(id) {
+                    let input = tool_inputs.get(id).cloned().unwrap_or(Value::Null);
+                    elided_msgs.push(json!({"role": "assistant", "content": [
+                        {"type": "tool_use", "id": id, "name": name, "input": input}
+                    ]}));
+                }
+            }
             block["content"] = json!(format!("[elided: {n} chars dropped to save context]"));
             elided += 1;
             elided_chars += n;
@@ -992,6 +1216,13 @@ fn compact_history(
         // 不能以 tool_result 开头（它必须紧跟对应的 tool_use）
         while cut < history.len() && is_tool_result_msg(&history[cut]) {
             cut += 1;
+        }
+        // 语义分层（S0，第 2 步）：`Drop` 档改「按层丢」—— 把保留层（L1 / L4）钉在保留侧。
+        // **只收缩连续段的右边界**（`head..cut` 仍是一段连续区间），不把 drain 打散。
+        // `Force`（400 兜底）**不走层感知**：它是「不压就撞上限」的安全刚需，必须能压下去；
+        // 其被丢的 L4 仍进摘要 / 索引（`restore_after_compaction`），证据不消失。
+        if mode == Compact::Drop {
+            cut = layer_aware_drop_cut(history.as_slice(), &tool_names, head, cut);
         }
         if cut > head {
             if history[head..cut].iter().any(has_todo_write) {
@@ -1052,6 +1283,7 @@ fn compact_history(
         elided,
         dropped,
         dropped_msgs,
+        elided_msgs,
         pinned,
     }
 }
@@ -1096,7 +1328,12 @@ fn stdin_kind(msg: &Value) -> StdinKind<'_> {
 ///
 /// 返回需要**补发**的回执事件；None = compact_history 已经发过，别重复发。
 /// 抽成函数便于单测：空历史 / 压不动两条路径都不联网、不发 stdout。
-fn manual_compact(cfg: &Cfg, history: &mut Vec<Value>, cwd: &Path) -> Option<Value> {
+fn manual_compact(
+    cfg: &Cfg,
+    history: &mut Vec<Value>,
+    cwd: &Path,
+    scope: tools::MemoryScope,
+) -> Option<Value> {
     if history.is_empty() {
         log::info("手动压缩：历史为空，无可压缩内容");
         return Some(json!({
@@ -1109,9 +1346,17 @@ fn manual_compact(cfg: &Cfg, history: &mut Vec<Value>, cwd: &Path) -> Option<Val
     fire_plain_hook("PreCompact", cwd, json!({ "trigger": "manual" }));
     let measured = cfg.last_input.get();
     let out = compact_history(history, Compact::Force, measured);
-    // 摘要压缩：与自动路径同款（Force 档丢弃量最大，摘要最值钱）。返回值只用来修正调用方的
-    // 回滚锚点，本路径没有回滚锚点 ⇒ 忽略。
-    let _ = pin_summary_of_dropped(cfg, history, &out.dropped_msgs);
+    // 摘要压缩 + 结论索引写入 + 检索重注入：与自动路径同款（Force 档丢弃量最大，最值钱）。
+    // 返回值只用来修正调用方的回滚锚点，本路径没有回滚锚点 ⇒ 忽略。
+    let _ = restore_after_compaction(
+        cfg,
+        history,
+        &out.dropped_msgs,
+        &out.elided_msgs,
+        scope,
+        0,
+        &conclusions::default_dir(),
+    );
     // last_input 清零（与自动路径一致）：下一次请求重新按实测水位判断。
     cfg.last_input.set(0);
     if out.elided + out.dropped > 0 {
@@ -1242,7 +1487,11 @@ fn render_dropped_for_summary(dropped: &[Value]) -> String {
 ///
 /// **失败一律返回 `None`，绝不把错误往上抛** —— 摘要压缩是「锦上添花」，它失败时必须
 /// 让调用方照旧走纯机械压缩，而不是让整轮对话挂掉（对照规则 25 的瞬时失败处理思路）。
-fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
+fn summarize_dropped(
+    cfg: &Cfg,
+    dropped: &[Value],
+    meta: &conclusions::Meta,
+) -> Option<(String, Vec<conclusions::Conclusion>)> {
     let transcript = render_dropped_for_summary(dropped);
     // 不值得为一点点内容花一次调用
     if transcript.chars().count() < SUMMARY_MIN_INPUT_CHARS {
@@ -1252,12 +1501,14 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
         );
         return None;
     }
+    // 摘要提示词 = 原摘要指令 + 结构化结论段指令（**同一次调用产出两者**，零新增请求）。
+    let system_prompt = format!("{SUMMARY_PROMPT}{}", summary_index_instruction());
     let body = json!({
         "model": cfg.model,
         "max_tokens": SUMMARY_MAX_OUTPUT_TOKENS,
         // **非流式**：摘要是内部产物，不必往前端流 —— 也不该占用 stream_event 通道
         "stream": false,
-        "system": SUMMARY_PROMPT,
+        "system": system_prompt,
         "messages": [{ "role": "user", "content": [{ "type": "text", "text": transcript }] }],
     });
     let started = Instant::now();
@@ -1351,62 +1602,230 @@ fn summarize_dropped(cfg: &Cfg, dropped: &[Value]) -> Option<String> {
         log::warn("摘要压缩失败：模型返回空摘要");
         return None;
     }
+    // 切出结构化结论段：摘要正文里**不留**它（钉回历史的只有摘要）。拿不到段 ⇒ 结论为空，
+    // 调用方退到确定性抽取（见 `restore_after_compaction`）。
+    let (summary, entries) = conclusions::parse_model_block(text, meta);
+    if summary.is_empty() {
+        log::warn("摘要压缩失败：模型返回空摘要（去掉结构化段后为空）");
+        return None;
+    }
     let out_tokens = v
         .get("usage")
         .and_then(|u| u.get("output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     log::info(format!(
-        "摘要压缩：{} 条旧消息 / {} 字 → 摘要 {} 字（输出 {out_tokens} tokens，耗时 {}ms）",
+        "摘要压缩：{} 条旧消息 / {} 字 → 摘要 {} 字 / 结构化结论 {} 条（输出 {out_tokens} tokens，耗时 {}ms）",
         dropped.len(),
         transcript.chars().count(),
-        text.chars().count(),
+        summary.chars().count(),
+        entries.len(),
         started.elapsed().as_millis()
     ));
-    Some(format!("{SUMMARY_HEADER}\n{text}"))
+    Some((format!("{SUMMARY_HEADER}\n{summary}"), entries))
 }
 
-/// 摘要压缩的落点：把摘要（或兜底清单）钉回历史开头（`compact_history` 之后调用）。
+/// 压缩后的收尾：摘要钉回 + **可恢复结论索引**写入 + 检索并重注入。
 ///
-/// 与任务快照同一个位置策略 —— **插在第一条之后**，不抢「开头那条用户提问」的位置。
-/// 两者同时存在时的顺序是 [摘要][任务快照]：摘要是「过去发生了什么」，任务快照是「现在要做什么」，
-/// 读起来正好由远及近。
+/// 与任务快照同一个位置策略 —— 合成消息**插在第一条之后**，不抢「开头那条用户提问」的位置。
+/// 三者同时存在时的顺序是 [摘要][结论索引][任务快照]：摘要 = 「过去发生了什么」，结论索引 =
+/// 「可复用的结论」，任务快照 = 「现在要做什么」，读起来正好由远及近。
+/// **全部落在可变层（history），绝不进 system / 固定前缀**（见 `forbidden.md` §禁用 45）。
 ///
-/// **2026-10-10 改：拿不到模型摘要时必须退到确定性兜底**。`compact_history` 是**先 drain 再让
-/// 模型写摘要**，原先模型摘要失败（或输入太短被跳过、或该档被关掉）就 `return false` ——
-/// 被丢的那几十条**永久没有顶替物**，模型手里只剩「开头那条最早的用户提问」+ 尾部，于是把
-/// **最早的那个诉求**当成当前任务往下做。用户报障原话：「只要压缩上下文直接回到了上一次人格修改」
-/// ——现场对得上：那段会话第一条是「为桌宠设置一个人格」，而当天 agent 日志 7 次压缩里 5 次是
-/// 「摘要压缩失败：模型返回空摘要」，所以每次压缩后助手都回头重写人格。
-fn pin_summary_of_dropped(cfg: &Cfg, history: &mut Vec<Value>, dropped: &[Value]) -> bool {
-    if dropped.is_empty() {
-        return false;
+/// 三件事都只在这里做（**单一入口**，被 Drop / Force 四个调用点复用，见 §禁用 62）：
+///   ① 摘要（或确定性兜底清单）。**2026-10-10 起拿不到模型摘要也必须退到
+///      `fallback_digest_of_dropped`**：`compact_history` 是先 drain 再让模型写摘要，原先模型
+///      摘要失败就 `return false` ⇒ 被丢的几十条永久没有顶替物，模型手里只剩「开头那条最早的
+///      提问」+ 尾部，于是把**最早那个诉求**当成当前任务往下做（用户报障原话：「只要压缩上下文
+///      直接回到了上一次人格修改」）。
+///   ② 结论索引写入：优先用摘要那**一次**调用产出的结构化段（**零新增调用**）；拿不到就确定性
+///      抽取。被瘦身（elide）的可重现结果也写指针条目。**失败条目不删**（Manus「Keep the Wrong
+///      Stuff In」：删掉失败会移除模型纠错所需的证据）—— 用 `status=failed` + `reason` 标注。
+///   ③ 检索 + 重注入：按「最近诉求 + 任务快照关键词 + 被丢区间标识符」查询，重排后取 top-N，
+///      拼成一段注入到**紧随压缩摘要之后**（可变层，避开 lost-in-the-middle）。
+///
+/// 返回**插入的合成消息条数**（摘要 0/1 + 结论块 0/1）—— 调用方拿它修正回滚锚点 `base`。
+fn restore_after_compaction(
+    cfg: &Cfg,
+    history: &mut Vec<Value>,
+    dropped: &[Value],
+    elided: &[Value],
+    scope: tools::MemoryScope,
+    turn: u64,
+    dir: &Path,
+) -> usize {
+    let meta = conclusions::Meta {
+        ts: now_epoch_secs(),
+        scope,
+        turn,
+        session_id: session_id(),
+    };
+    let mut entries: Vec<conclusions::Conclusion> = Vec::new();
+    let mut summary_text: Option<String> = None;
+    if !dropped.is_empty() {
+        let (text, model_entries) = if summary_compact_enabled() {
+            match summarize_dropped(cfg, dropped, &meta) {
+                Some((s, e)) => (s, Some(e)),
+                None => {
+                    let d = fallback_digest_of_dropped(dropped);
+                    log::warn(format!(
+                        "摘要压缩不可用（模型摘要失败 / 输入过短）⇒ 退到确定性兜底清单（{} 字），\
+                         保证被丢弃的 {} 条有顶替物",
+                        d.chars().count(),
+                        dropped.len()
+                    ));
+                    (d, None)
+                }
+            }
+        } else {
+            (fallback_digest_of_dropped(dropped), None)
+        };
+        if !text.trim().is_empty() {
+            summary_text = Some(text);
+        }
+        // 优先用模型结构化段；拿不到（或段为空）⇒ 确定性抽取（**兜底路径也写索引**）。
+        entries = match model_entries {
+            Some(e) if !e.is_empty() => e,
+            _ => conclusions::extract_from_dropped(dropped, &meta),
+        };
     }
-    let text = if summary_compact_enabled() {
-        match summarize_dropped(cfg, dropped) {
-            Some(s) => s,
-            None => {
-                let d = fallback_digest_of_dropped(dropped);
-                log::warn(format!(
-                    "摘要压缩不可用（模型摘要失败 / 输入过短）⇒ 退到确定性兜底清单（{} 字），\
-                     保证被丢弃的 {} 条有顶替物",
-                    d.chars().count(),
-                    dropped.len()
-                ));
-                d
+    entries.extend(conclusions::extract_from_elided(elided, &meta));
+    conclusions::append(dir, scope, &entries);
+
+    let mut added = 0usize;
+    if let Some(text) = summary_text {
+        history.insert(
+            1.min(history.len()),
+            json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
+        );
+        added += 1;
+    }
+    // 检索 + 重注入：只在**真的丢了内容**（Drop / Force）时做 —— Elide / ElideCold 不丢整条，
+    // 无「结论被丢」可言，也就没有重注入的必要（用户裁决：检索时机 = 压缩完成后 Drop/Force）。
+    if !dropped.is_empty() {
+        let query = build_conclusion_query(history, dropped, elided);
+        let picked = conclusions::retrieve(
+            dir,
+            scope,
+            &query,
+            meta.ts,
+            CONCLUSIONS_MAX_ITEMS,
+            CONCLUSIONS_INJECT_CHARS,
+        );
+        let block = conclusions::render_injection(&picked);
+        if !block.is_empty() {
+            // 紧随摘要之后（没有摘要时紧随 head 之后）。
+            let at = (if added > 0 { 2usize } else { 1usize }).min(history.len());
+            history.insert(
+                at,
+                json!({ "role": "user", "content": [{ "type": "text", "text": block }] }),
+            );
+            log::info(format!(
+                "结论索引注入：{} 条 / {} 字，落在可变层（紧随压缩摘要之后）",
+                picked.len(),
+                block.chars().count()
+            ));
+            added += 1;
+        }
+    }
+    added
+}
+
+/// 构造检索查询串：**最近的用户诉求 + 任务快照关键词 + 被丢弃 / 被瘦身区间的标识符**。
+///
+/// 设计说明（为什么这么拼）：
+///   · 最近的用户诉求 = 「现在要做什么」，是检索的相关性锚点（取尾部最近 2 条用户文本）；
+///   · 任务快照 = 当前清单（`TodoWrite`），补上「用户没再重复、但仍在做」的目标；
+///   · 被丢区间的标识符 = 让「文件名 / 函数名 / 命令」这类精确标识符能把对应结论拉回来。
+fn build_conclusion_query(history: &[Value], dropped: &[Value], elided: &[Value]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut recent = 0usize;
+    for msg in history.iter().rev() {
+        if recent >= 2 {
+            break;
+        }
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for b in blocks {
+            if b.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let t = b.get("text").and_then(Value::as_str).unwrap_or("").trim();
+            // 合成消息（上下文块 / TRIMMED_MARKER / 摘要 / 结论注入块）以 [ 或 # 开头，跳过。
+            if t.is_empty() || t.starts_with('[') || t.starts_with('#') {
+                continue;
+            }
+            parts.push(t.chars().take(300).collect());
+            recent += 1;
+            break;
+        }
+    }
+    if let Some(snap) = latest_todo_snapshot(history) {
+        parts.push(snap);
+    }
+    let mut ids: Vec<String> = Vec::new();
+    // 除标识符外也带上被丢区间的**原文片段**：BM25 是词面匹配，标识符未必覆盖普通词
+    // （如错误文本里的 cannot / find / macro），带上原文才能把相关结论拉回来。
+    let mut raw: Vec<String> = Vec::new();
+    for msg in dropped.iter().chain(elided.iter()) {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for b in blocks {
+            match b.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = b.get("text").and_then(Value::as_str) {
+                        ids.extend(conclusions::extract_identifiers(t));
+                        raw.push(t.chars().take(200).collect());
+                    }
+                }
+                Some("tool_use") => {
+                    if let Some(i) = b.get("input") {
+                        let args = tools::summarize_args(i);
+                        ids.extend(conclusions::extract_identifiers(&args));
+                        raw.push(args.chars().take(200).collect());
+                    }
+                }
+                _ => {}
             }
         }
-    } else {
-        fallback_digest_of_dropped(dropped)
-    };
-    if text.trim().is_empty() {
-        return false;
     }
-    history.insert(
-        1.min(history.len()),
-        json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
-    );
-    true
+    ids.sort();
+    ids.dedup();
+    ids.truncate(40);
+    raw.truncate(40);
+    parts.extend(ids);
+    parts.extend(raw);
+    parts.join(" ")
+}
+
+/// 里程碑写入（结论索引的**第二个写入点**，用户裁决「里程碑 / 压缩边界」里的里程碑）：
+/// 一轮提问收尾（`run_query` 返回）后，从最近的对话窗口里**确定性**抽取结论写进索引。
+///
+/// 为什么选「轮末」而不是「每次工具调用 / 每轮」：轮末是**里程碑**（一轮诉求完成）；工具调用
+/// 级别会频繁变动前缀、制造噪音、打爆 prompt cache（用户裁决红线）。本写入**不调模型**，且
+/// `append` 去重 ⇒ 反复抽到同一结论不会让索引膨胀。
+///
+/// 与压缩边界那次写入的分工：里程碑把结论**提前**落盘（在它们可能被丢弃之前）；压缩边界那次
+/// 负责补上「里程碑之后又被丢掉的那一段」（见 `restore_after_compaction`）。
+fn flush_turn_conclusions(scope: tools::MemoryScope, history: &[Value], turn: u64) {
+    if history.is_empty() {
+        return;
+    }
+    // 只看最近一个窗口（去重保证不重复写）；不扫全历史，避免每次轮末都做重活。
+    let start = history.len().saturating_sub(COMPACT_KEEP_TAIL * 2);
+    let meta = conclusions::Meta {
+        ts: now_epoch_secs(),
+        scope,
+        turn,
+        session_id: session_id(),
+    };
+    let entries = conclusions::extract_from_dropped(&history[start..], &meta);
+    conclusions::append(&conclusions::default_dir(), scope, &entries);
 }
 
 /// 摘要压缩的**确定性兜底清单**（不调模型、不会失败）。
@@ -2614,6 +3033,14 @@ static APPROVAL_POLICY: AtomicU8 = AtomicU8::new(0);
 /// 因单发策略被拒的审批都会置它。常驻模式只写不读，对外不可见。
 static SINGLE_SHOT_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// `--include-partial-messages`（CLI 输出面）：`stream_event` 增量行是否落 stdout。
+///
+/// **初始值 = true 是「常驻现行为」**：宿主 / 前端一直靠这些增量做打字机效果
+/// （`app/src/main.ts` 的 `cliSawStreamDelta` 是它的双渲染守卫），本任务**绝不改宿主协议**
+/// —— 常驻模式不碰这个量，于是逐字节不变。只有单发（--print）会在 `main()` 里按 CLI 开关
+/// 把它置成传入值；该开关**默认关** ⇒ 单发默认不出增量，只出最终完整消息。
+static INCLUDE_PARTIAL_MESSAGES: AtomicBool = AtomicBool::new(true);
+
 fn set_output_mode(m: OutputMode) {
     OUTPUT_MODE.store(m as u8, Ordering::Relaxed);
 }
@@ -2636,6 +3063,14 @@ fn approval_policy() -> ApprovalPolicy {
         2 => ApprovalPolicy::UnattendedAllow,
         _ => ApprovalPolicy::Stdio,
     }
+}
+
+fn set_include_partial_messages(on: bool) {
+    INCLUDE_PARTIAL_MESSAGES.store(on, Ordering::Relaxed);
+}
+
+fn include_partial_messages() -> bool {
+    INCLUDE_PARTIAL_MESSAGES.load(Ordering::Relaxed)
 }
 
 fn emit(line: Value) {
@@ -2714,8 +3149,25 @@ fn mcp_config_changed_event(watch: &mut Option<mcp::ConfigWatch>, idle: bool) ->
     }))
 }
 
+/// 组装一条 `stream_event` 增量行；`--include-partial-messages` 关闭时返回 `None`
+/// （单发默认关 ⇒ 不出增量，只出最终完整消息；常驻恒开 ⇒ 逐字节不变）。
+///
+/// 抽成纯函数是为了单测能直接钉住「开关 gating + 行的形状」，不必去捕获进程 stdout。
+/// 形状沿用既有 stream-json 形态（`{"type":"stream_event","event":{…}}`）—— 既有消费者
+/// （前端 `cli-output` 的 `data.type === "stream_event"`）按此解析，**字段一个不改**。
+fn stream_event_line(event: Value) -> Option<Value> {
+    if !include_partial_messages() {
+        return None;
+    }
+    Some(json!({ "type": "stream_event", "event": event }))
+}
+
 fn emit_stream_event(event: Value) {
-    emit(json!({ "type": "stream_event", "event": event }));
+    // 每行 flush 由 write_stdout_line 保证（emit → write_stdout_line）：无头管道下增量必须
+    // 当场可见，不能被行缓冲吞掉 —— 否则「流式」名不副实。
+    if let Some(line) = stream_event_line(event) {
+        emit(line);
+    }
 }
 
 /// 命令类工具的**实时输出**回传（2026-09-30）：把一次工具调用的 stdout / stderr 分片
@@ -3894,8 +4346,9 @@ fn fire_plain_hook(event: &str, cwd: &Path, payload: Value) -> hooks::Run {
 //   --disallowedTools <name…>      variadic：这些工具不进请求体
 //   --print / -p [query]           单发：跑恰好一轮提问后退出（见 single_shot）
 //   --output-format <fmt>          单发模式的 stdout 形态（text / json / stream-json）
+//   --include-partial-messages     单发 stream-json 下额外逐条输出流式增量（默认关）
 //   --input-format stream-json     常驻 stdio 流式输入模式标志（宿主一直传它）
-// 其余（--verbose / --include-partial-messages …）一律接受并忽略。
+// 其余（--verbose …）一律接受并忽略。
 #[derive(Default)]
 struct CliArgs {
     add_dirs: Vec<PathBuf>,
@@ -3912,6 +4365,9 @@ struct CliArgs {
     print_query: Option<String>,
     /// `--output-format`（`text` / `json` / `stream-json`），默认 `text`。只在单发模式生效。
     output_format: String,
+    /// `--include-partial-messages`：单发 stream-json 下额外逐条输出流式增量事件
+    /// （`stream_event`）。默认 **关**；常驻模式不受它影响（见 `emit_stream_event`）。
+    include_partial_messages: bool,
     /// `--input-format stream-json` —— 常驻 stdio 流式输入模式的标志（宿主 / e2e 脚本都传它）。
     input_stream_json: bool,
 }
@@ -3960,6 +4416,7 @@ impl CliArgs {
                         i += 1;
                     }
                 }
+                "--include-partial-messages" => out.include_partial_messages = true,
                 "--input-format" => {
                     if let Some(v) = args.get(i + 1) {
                         out.input_stream_json = v == "stream-json";
@@ -4044,6 +4501,10 @@ fn main() {
                 OutputMode::Text
             }
         });
+        // 单发才按 CLI 开关决定是否出 `stream_event` 增量行（默认关）；常驻不碰这个量
+        // ⇒ 常驻恒 true、逐字节不变（宿主协议不动）。text / json 形态本就把非 result 行
+        // 挡在 emit() 里，故「仅 stream-json 才看得到增量」这层由既有过滤自然满足。
+        set_include_partial_messages(cli.include_partial_messages);
         set_approval_policy(if cli.skip_permissions {
             ApprovalPolicy::UnattendedAllow
         } else {
@@ -4668,6 +5129,9 @@ fn main() {
                     turn_block.as_ref(),
                     thinking_override,
                 );
+                // 里程碑写入（结论索引）：一轮提问收尾后把最近窗口的结论确定性落盘（**不调模型**），
+                // 在它们可能被压缩丢掉之前先保住。见 `flush_turn_conclusions`。
+                flush_turn_conclusions(turn_scope, &history, question_seq);
                 // 复盘的四个前置（方案 B，2026-10-11；2026-10-13 折中把每会话配额按 scope 拆）：
                 // ① 本轮确实完成了一次用户提问（本代码位置即保证 —— 它在 run_query 返回之后，
                 // 不在工具轮中途）；② 不是只读（plan）档、也不在计划相位（复盘的唯一产品就是
@@ -4737,7 +5201,9 @@ fn main() {
             // 手动压缩一次（2026-10-11，stdin 输入 {"type":"compact"}）：复用自动压缩的
             // Force 路径，压动与否都保证回一条 system/context_compacted（前端已有该事件渲染）。
             StdinKind::Compact => {
-                if let Some(ev) = manual_compact(&cfg, &mut history, &tools_ctx.cwd) {
+                if let Some(ev) =
+                    manual_compact(&cfg, &mut history, &tools_ctx.cwd, tools_ctx.memory_scope)
+                {
                     emit(ev);
                 }
             }
@@ -6658,12 +7124,18 @@ fn run_query(
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "drop" }));
                 let out = compact_history(history, Compact::Drop, measured);
                 base = base.saturating_sub(out.dropped) + out.pinned;
-                // 摘要压缩（backlog §8.2）：丢弃档是它**唯一**的常规触发点 ——
-                // 这一档本来就必然会 drain 并废掉缓存，多留一段摘要是净赚。
-                // 它又插了一条合成消息 ⇒ 回滚锚点再 +1（见 CompactOutcome::pinned）。
-                if pin_summary_of_dropped(cfg, history, &out.dropped_msgs) {
-                    base += 1;
-                }
+                // 摘要压缩（backlog §8.2）+ 结论索引写入 + 检索重注入：丢弃档是「结论被丢」的
+                // 主战场，三者都在 `restore_after_compaction` 里做（单一入口）。
+                // 返回值 = 插回历史的合成消息条数（摘要 / 结论块）⇒ 回滚锚点要加回来。
+                base += restore_after_compaction(
+                    cfg,
+                    history,
+                    &out.dropped_msgs,
+                    &out.elided_msgs,
+                    tctx.memory_scope,
+                    question_seq,
+                    &conclusions::default_dir(),
+                );
                 cfg.last_input.set(0);
                 cfg.last_compact.set(measured);
                 compacted_this_round = out.elided + out.dropped > 0;
@@ -6678,6 +7150,16 @@ fn run_query(
                 // `ELIDE_TOOL_RESULT_CHARS` 的大块。所以它是**渐进**的，不是一次清空。
                 let out = compact_history(history, Compact::ElideCold, measured);
                 base = base.saturating_sub(out.dropped) + out.pinned;
+                // 瘦身档不丢整条 ⇒ 无摘要、无重注入（返回 0）；只把「查过哪里」的指针写进结论索引。
+                base += restore_after_compaction(
+                    cfg,
+                    history,
+                    &out.dropped_msgs,
+                    &out.elided_msgs,
+                    tctx.memory_scope,
+                    question_seq,
+                    &conclusions::default_dir(),
+                );
                 cfg.last_input.set(0);
                 compacted_this_round = out.elided + out.dropped > 0;
                 if out.elided > 0 {
@@ -6686,6 +7168,16 @@ fn run_query(
             } else if ratio > ELIDE_RATIO && grew_enough {
                 let out = compact_history(history, Compact::Elide, measured);
                 base = base.saturating_sub(out.dropped) + out.pinned;
+                // 同冷档：瘦身不丢整条 ⇒ 无摘要、无重注入（返回 0）；只写「查过哪里」的指针条目。
+                base += restore_after_compaction(
+                    cfg,
+                    history,
+                    &out.dropped_msgs,
+                    &out.elided_msgs,
+                    tctx.memory_scope,
+                    question_seq,
+                    &conclusions::default_dir(),
+                );
                 cfg.last_input.set(0);
                 // 闸门判定「不值得」时什么都没改 —— 那时**不推进滞回时钟**，
                 // 否则会白等一个 15% 增长窗口才重新评估（压缩次数统计也不会被污染）。
@@ -6718,9 +7210,15 @@ fn run_query(
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "budget" }));
                 let out = compact_history(history, Compact::Force, measured_now);
                 base = base.saturating_sub(out.dropped) + out.pinned;
-                if pin_summary_of_dropped(cfg, history, &out.dropped_msgs) {
-                    base += 1;
-                }
+                base += restore_after_compaction(
+                    cfg,
+                    history,
+                    &out.dropped_msgs,
+                    &out.elided_msgs,
+                    tctx.memory_scope,
+                    question_seq,
+                    &conclusions::default_dir(),
+                );
                 cfg.last_input.set(0);
                 cfg.last_compact.set(measured_now);
                 out.elided + out.dropped > 0
@@ -6941,10 +7439,17 @@ fn run_query(
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "force" }));
                 let out = compact_history(history, Compact::Force, cfg.last_input.get());
                 base = base.saturating_sub(out.dropped) + out.pinned;
-                // 兜底档也做摘要 —— 这一档丢弃量最大（连尾部都瘦），摘要在此时最值钱
-                if pin_summary_of_dropped(cfg, history, &out.dropped_msgs) {
-                    base += 1;
-                }
+                // 兜底档也做「摘要 + 结论索引 + 重注入」—— 这一档丢弃量最大（连尾部都瘦），
+                // 结论在此时最值钱。
+                base += restore_after_compaction(
+                    cfg,
+                    history,
+                    &out.dropped_msgs,
+                    &out.elided_msgs,
+                    tctx.memory_scope,
+                    question_seq,
+                    &conclusions::default_dir(),
+                );
                 cfg.last_compact.set(cfg.last_input.get());
                 cfg.last_input.set(0);
                 eprintln!("[agent] 端点回报上下文超限 → 压缩 {} 条后重试", out.dropped);
@@ -7826,6 +8331,61 @@ mod tests {
         assert!(c.print && c.input_stream_json);
         assert!(!c.single_shot());
         assert_eq!(c.print_query, None);
+    }
+
+    /// `--include-partial-messages` 的解析与默认值（2026-10-14）。
+    /// 钉住三件事：① 默认关（不传 ⇒ false）；② 传了即 true；③ 与 `--output-format stream-json`
+    /// 并存不互斥，且不吞 query / output-format。
+    #[test]
+    fn cli_include_partial_messages_defaults_off_and_parses() {
+        let parse = |v: &[&str]| CliArgs::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        // 默认关：不给开关 ⇒ false（单发默认不出增量行）
+        let off = parse(&["--print", "--output-format", "stream-json", "hi"]);
+        assert!(off.single_shot());
+        assert!(!off.include_partial_messages);
+
+        // 给了开关 ⇒ true，query / output-format 均不受影响
+        let on = parse(&[
+            "--print",
+            "hi",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ]);
+        assert!(on.single_shot());
+        assert!(on.include_partial_messages);
+        assert_eq!(on.output_format, "stream-json");
+        assert_eq!(on.print_query.as_deref(), Some("hi"));
+    }
+
+    /// `--include-partial-messages` 对 `stream_event` 增量的 gating + 行形状（2026-10-14）。
+    /// 关 = 不出（默认，绝不新增噪音）；开 = 出一行 `{"type":"stream_event","event":{…}}`
+    /// （既有 stream-json 形态，字段不动）。用纯函数断言，避免捕获进程 stdout。
+    #[test]
+    fn include_partial_messages_gates_stream_event_and_keeps_shape() {
+        let delta = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "hi" },
+        });
+
+        // 开：出增量行，形状 = 既有 {"type":"stream_event","event":{…}}
+        set_include_partial_messages(true);
+        let line = stream_event_line(delta.clone()).expect("开启时应当出增量行");
+        assert_eq!(line["type"], json!("stream_event"));
+        assert_eq!(line["event"]["type"], json!("content_block_delta"));
+        assert_eq!(line["event"]["delta"]["text"], json!("hi"));
+
+        // 关：不出（None）
+        set_include_partial_messages(false);
+        assert!(
+            stream_event_line(delta).is_none(),
+            "关闭时不得出增量行（默认关）"
+        );
+
+        // 复位成常驻默认（true），避免影响同进程其它用例
+        set_include_partial_messages(true);
     }
 
     /// 计划相位 / 档位判据的单测用最小上下文（与 `tools.rs` 里那份同形）：
@@ -9069,20 +9629,159 @@ mod tests {
         assert_ne!(history[2]["content"][0]["content"], big);
     }
 
-    /// ⚠️ **已知权衡，如实钉住**（2026-10-01）：`Drop` 档是 0.95 水位的**安全刚需** ——
-    /// 「挤不出来（瘦不动）就丢整条消息」。所以**分级拦不住丢弃**：不可瘦的结果在
-    /// `Drop` 档下仍然会被整条丢掉。
+    /// ⚠️ **已知权衡，如实钉住**（2026-10-01；2026-10-14 补注）：`Drop` 档是 0.95 水位的
+    /// **安全刚需** —— 「挤不出来（瘦不动）就丢整条消息」。所以**工具分级（elidable 那一层）
+    /// 拦不住丢弃**：不可瘦的结果在 `Drop` 档下仍然可能被整条丢掉。
     ///
-    /// 这个取舍是有意的：不压就可能撞 400，而 400 会让**整轮**失败、回滚重来，
-    /// 比丢掉一份报告更糟。要改成「Drop 时优先丢可重现的那些」，得给丢弃也加一层
-    /// 分级排序 —— 目前不值得那个复杂度。**写在这里是为了防止以后误以为
-    /// 「子代理报告永不丢」**（分级只在瘦身那一层生效）。
+    /// 2026-10-14 的语义分层（S0）给 Drop **加了一层按层排序**，但它只保护 **L1 / L4**
+    /// （用户诉求 / 失败证据）；`Agent` 报告这类**不可重取批量结果 = L6**，仍属「优先丢弃」
+    /// 的层 ⇒ 本用例的结论不变。**写在这里是为了防止以后误以为「子代理报告永不丢」**。
     #[test]
     fn drop_still_evicts_what_the_grade_refuses_to_slim() {
         let (mut history, _) = history_for_elide_tool("Agent", 30_000, 1_000);
         let out = compact_history(&mut history, Compact::Drop, 100_000);
         assert_eq!(out.elided, 0, "分级不许瘦它");
         assert!(out.dropped > 0, "瘦不动 ⇒ Drop 档转而丢整条消息（安全刚需）");
+    }
+
+    /// 语义分层（S0，第 2 步）：`Drop` **优先丢 L6 噪声、保 L4 失败证据**。
+    ///
+    /// 造法：head 用户诉求 → 两条噪声 → 一次 `is_error` 的失败尝试 → 尾部。
+    /// 若不按层丢，`natural_cut` 会把失败证据一起丢掉；按层丢则边界收缩到失败证据之前。
+    #[test]
+    fn drop_prefers_noise_over_failed_evidence() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"帮我改脚本"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"n1"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"n2"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"b1","name":"Cmd","input":{"command":"cargo test"}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"error: boom"}
+            ]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"继续"}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("t{i}")}]}));
+        }
+        // len = 14；natural_cut = 14 - 8 = 6（> 失败证据所在的下标 4）
+        let out = compact_history(&mut history, Compact::Drop, 100_000);
+        assert!(out.dropped > 0, "前面的噪声应当被丢掉：{}", out.dropped);
+        assert!(
+            history.iter().any(|m| m["content"][0]["is_error"].as_bool() == Some(true)),
+            "失败证据（L4）必须留在 history 里，不因体积丢弃"
+        );
+        assert!(
+            !history.iter().any(|m| m["content"][0]["text"].as_str() == Some("n1"))
+                && !history.iter().any(|m| m["content"][0]["text"].as_str() == Some("n2")),
+            "前面的噪声（L6）应当已被丢掉"
+        );
+    }
+
+    /// 语义分层（S0）：**L4 不因体积消失** —— 失败证据躺在深处、`natural_cut` 越过它时，
+    /// `Drop` 档必须把边界收缩到它之前（保留在 history）。
+    #[test]
+    fn failed_evidence_survives_compaction() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"把 parse_args 改对"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"先看看"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"b1","name":"Cmd","input":{"command":"cargo test --bins"}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"b1","is_error":true,
+                 "content":"error: cannot find macro parse_args_panics"}
+            ]}),
+        ];
+        // 后面垫足够多的噪声，使 natural_cut 落在失败证据之后（下标 3）。
+        for i in 0..(COMPACT_KEEP_TAIL + 4) {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("m{i}")}]}));
+        }
+        // len = 16；natural_cut = 8（越过失败证据）
+        let out = compact_history(&mut history, Compact::Drop, 100_000);
+        assert!(
+            history.iter().any(|m| m["content"][0]["is_error"].as_bool() == Some(true)),
+            "L4 不因体积消失：必须保留在 history（或进摘要 / 索引）"
+        );
+        assert!(out.dropped > 0, "其余噪声仍应被丢弃：{}", out.dropped);
+    }
+
+    /// 语义分层（S0）：**用户诉求（L1）不被丢** —— head 那条 + 中段那条都要活过 `Drop`。
+    #[test]
+    fn pinned_user_request_survives() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"原始诉求：修渲染层"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"n1"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"n2"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"n3"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"第二个诉求：别动 docs"}]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("t{i}")}]}));
+        }
+        // len = 13；natural_cut = 5（包含中段用户诉求）
+        let out = compact_history(&mut history, Compact::Drop, 100_000);
+        assert!(out.dropped > 0, "前面的噪声应当被丢");
+        assert_eq!(
+            history[0]["content"][0]["text"].as_str(),
+            Some("原始诉求：修渲染层"),
+            "head 用户诉求必须保留在 0 号位"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m["content"][0]["text"].as_str() == Some("第二个诉求：别动 docs")),
+            "中段用户诉求（L1）也不因体积丢弃"
+        );
+    }
+
+    /// 语义分层（S0）：**配对完整** —— 边界恰好落在 `tool_result` 上时必须退到安全的配对边界，
+    /// 被丢段不会产生「`tool_result` 无对应 `tool_use`」的孤儿。
+    #[test]
+    fn drop_does_not_orphan_tool_results() {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"a1","name":"Read","input":{"file_path":"a"}}
+            ]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":"A"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"a2","name":"Read","input":{"file_path":"b"}}
+            ]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a2","content":"B"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"a3","name":"Read","input":{"file_path":"c"}}
+            ]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a3","content":"C"}]}),
+        ];
+        for i in 0..(COMPACT_KEEP_TAIL - 3) {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("t{i}")}]}));
+        }
+        // len = 12；natural_cut = 12 - 8 = 4，正好指向 a2 的 tool_result（配对边界用例）
+        let mut h = history.clone();
+        let out = compact_history(&mut h, Compact::Drop, 100_000);
+        assert!(out.dropped > 0, "这个用例必须真的丢过东西，否则没测到配对");
+        // 配对完整：history 里任何 tool_result 都必须有对应的 tool_use。
+        let uses: std::collections::HashSet<String> = h
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        for m in &h {
+            let Some(blocks) = m.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for b in blocks {
+                if b.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                let id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                assert!(uses.contains(id), "tool_result {id} 成了孤儿（无配对 tool_use）");
+            }
+        }
     }
 
     /// 白名单是**闭集**：认不出名字的（`None`）一律不瘦 —— 分不清就按「不可重现」处理。
@@ -9095,6 +9794,47 @@ mod tests {
             assert!(!elidable_tool(Some(no)), "{no} 不可重现，绝不许瘦");
         }
         assert!(!elidable_tool(None), "认不出工具名 ⇒ 保守不瘦");
+    }
+
+    /// 语义分层（S0）：`classify_message_layer` 是**确定性纯函数**，六层各一例。
+    #[test]
+    fn layer_classification_covers_every_layer() {
+        // L1：用户非合成文本 = 诉求 / 任务目标（保原文）
+        let l1 = json!({"role":"user","content":[{"type":"text","text":"帮我把 parse_args 改对"}]});
+        assert_eq!(classify_message_layer(&l1, None), Layer::L1);
+        // 合成消息（以 `[` 开头）不算「用户的话」⇒ 落 L6
+        let synthetic = json!({"role":"user","content":[{"type":"text","text":"[summary of earlier]"}]});
+        assert_eq!(classify_message_layer(&synthetic, None), Layer::L6);
+
+        // L2：assistant 的工具调用（工作结论 / 决策）
+        let l2 = json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"a","name":"Read","input":{"file_path":"x"}}
+        ]});
+        assert_eq!(classify_message_layer(&l2, Some("Read")), Layer::L2);
+
+        // L3：TodoWrite 的未决待办
+        let l3 = json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"t","name":"TodoWrite","input":{"todos":[]}}
+        ]});
+        assert_eq!(classify_message_layer(&l3, Some("TodoWrite")), Layer::L3);
+
+        // L4：`is_error` 的失败证据 —— 即使工具本身可重取（Cmd）也判 L4，**不是** L5
+        let l4 = json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"b","is_error":true,"content":"error: boom"}
+        ]});
+        assert_eq!(classify_message_layer(&l4, Some("Cmd")), Layer::L4);
+
+        // L5：可重取工具的结果（重跑即得）
+        let l5 = json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"r","content":"file body"}
+        ]});
+        assert_eq!(classify_message_layer(&l5, Some("Read")), Layer::L5);
+        // 不可重取（Agent / MCP）的结果**不是** L5（照旧不可瘦身）
+        assert_eq!(classify_message_layer(&l5, Some("Agent")), Layer::L6);
+
+        // L6：assistant 纯文本 = 纯过程性噪声
+        let l6 = json!({"role":"assistant","content":[{"type":"text","text":"好的，我来处理"}]});
+        assert_eq!(classify_message_layer(&l6, None), Layer::L6);
     }
 
     /// 冷缓存档（2026-10-01）：缓存已过期 ⇒ **不走成本模型**，净亏也照瘦；
@@ -9332,6 +10072,16 @@ mod tests {
         }
     }
 
+    /// 结论索引用例的最小 `Meta`（不碰磁盘 / 网络）。
+    fn test_meta() -> conclusions::Meta<'static> {
+        conclusions::Meta {
+            ts: 1_000,
+            scope: tools::MemoryScope::Global,
+            turn: 1,
+            session_id: "sess-test",
+        }
+    }
+
     /// 起一个**只服务一次请求**的本地 HTTP stub，返回 (端点 URL, 收到的请求体)。
     ///
     /// 为什么值得写：摘要压缩唯一真正没被单测覆盖的东西就是**它发出去的 HTTP 形状**
@@ -9406,22 +10156,26 @@ mod tests {
             })
             .collect();
 
-        let out = summarize_dropped(&cfg, &dropped).expect("stub 返回正常时应当拿到摘要");
+        let (out, entries) =
+            summarize_dropped(&cfg, &dropped, &test_meta()).expect("stub 返回正常时应当拿到摘要");
         assert!(out.starts_with(SUMMARY_HEADER), "摘要必须带固定表头：{out}");
         assert!(
             out.contains("继续验证 §8.2"),
             "必须用响应的 content[].text：{out}"
         );
+        assert!(entries.is_empty(), "响应里没有结构化段 ⇒ 结论为空，调用方退到确定性抽取");
 
         let sent: Value =
             serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).expect("应当收到请求"))
                 .expect("请求体是 JSON");
         assert_eq!(sent["stream"], json!(false), "摘要请求必须是非流式");
         assert_eq!(sent["max_tokens"], json!(SUMMARY_MAX_OUTPUT_TOKENS));
-        assert_eq!(
-            sent["system"].as_str(),
-            Some(SUMMARY_PROMPT),
-            "system 必须是摘要提示词"
+        let system = sent["system"].as_str().expect("system 必须是字符串");
+        assert!(system.starts_with(SUMMARY_PROMPT), "system 必须以摘要提示词开头");
+        assert!(
+            system.contains(conclusions::INDEX_BEGIN)
+                && system.contains(conclusions::INDEX_END),
+            "摘要提示词末尾必须追加结构化结论段指令（否则索引没有模型侧来源）"
         );
         assert!(sent.get("tools").is_none(), "摘要请求不该带 tools");
         assert_eq!(sent["messages"].as_array().map(Vec::len), Some(1));
@@ -9437,24 +10191,25 @@ mod tests {
     /// 端点返回非 2xx / 非 JSON / 空摘要时，一律降级为 `None`（不能让整轮对话失败）。
     #[test]
     fn summary_failures_degrade_instead_of_erroring() {
+        let meta = test_meta();
         // 非 JSON 的 200
         let (endpoint, _rx) = start_stub_server("not json at all".to_string());
-        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped()).is_none());
+        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped(), &meta).is_none());
 
         // 200 但 content 为空
         let (endpoint, _rx) = start_stub_server(
             json!({"content": [], "usage": {"output_tokens": 0}}).to_string(),
         );
-        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped()).is_none());
+        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped(), &meta).is_none());
 
         // 200 但文本全空白
         let (endpoint, _rx) = start_stub_server(
             json!({"content": [{"type": "text", "text": "   \n  "}]}).to_string(),
         );
-        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped()).is_none());
+        assert!(summarize_dropped(&cfg_pointing_at(&endpoint), &long_dropped(), &meta).is_none());
 
         // 连不上（端口 1）
-        assert!(summarize_dropped(&cfg_for_tests(), &long_dropped()).is_none());
+        assert!(summarize_dropped(&cfg_for_tests(), &long_dropped(), &meta).is_none());
     }
 
     fn long_dropped() -> Vec<Value> {
@@ -9525,10 +10280,12 @@ mod tests {
             "用例自身的输入太短（{transcript_len} 字），改长一点才有意义"
         );
 
-        let summary = summarize_dropped(&cfg, &dropped).expect("真端点应当接受非流式摘要请求");
+        let (summary, index_entries) =
+            summarize_dropped(&cfg, &dropped, &test_meta()).expect("真端点应当接受非流式摘要请求");
         println!(
-            "[summary-live] 原文 {transcript_len} 字 → 摘要 {} 字：\n{summary}",
-            summary.chars().count()
+            "[summary-live] 原文 {transcript_len} 字 → 摘要 {} 字 / 结构化结论 {} 条：\n{summary}",
+            summary.chars().count(),
+            index_entries.len()
         );
 
         assert!(summary.starts_with(SUMMARY_HEADER), "必须带固定表头：{summary}");
@@ -9649,16 +10406,25 @@ mod tests {
         assert_eq!(render_one_message_for_summary(&json!({"role":"user"})), "");
     }
 
-    /// 没有可丢的内容时，摘要压缩**一条网络请求都不该发**。
+    /// 没有可丢 / 可瘦的内容时，`restore_after_compaction` 一条网络请求都不发、一条合成消息都不插。
     #[test]
-    fn nothing_is_summarised_when_nothing_was_dropped() {
+    fn restore_does_nothing_when_nothing_was_dropped_or_elided() {
         let cfg = cfg_for_tests();
+        let dir = std::env::temp_dir().join(format!("lunac-concl-nop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let mut history = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
-        assert!(
-            !pin_summary_of_dropped(&cfg, &mut history, &[]),
-            "dropped 为空必须直接返回 false（不发请求）"
+        let added = restore_after_compaction(
+            &cfg,
+            &mut history,
+            &[],
+            &[],
+            tools::MemoryScope::Global,
+            1,
+            &dir,
         );
+        assert_eq!(added, 0, "无丢无瘦 ⇒ 不插合成消息、不发请求");
         assert_eq!(history.len(), 1, "不该改动历史");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 内容太短时跳过 —— 不值得为一点点东西花一次调用（单轮成本上限的一道闸）。
@@ -9667,9 +10433,217 @@ mod tests {
         let cfg = cfg_for_tests();
         let small = vec![json!({"role":"assistant","content":[{"type":"text","text":"很短"}]})];
         assert!(
-            summarize_dropped(&cfg, &small).is_none(),
+            summarize_dropped(&cfg, &small, &test_meta()).is_none(),
             "低于 SUMMARY_MIN_INPUT_CHARS 时不该调模型"
         );
+    }
+
+    /// 造一段「Force 档必然 drain 掉中段的结论 / 失败尝试 / 文件指针」的历史。
+    fn history_with_droppable_conclusions() -> Vec<Value> {
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"把 core-agent 的 parse_args 改对，文件在 src/main.rs"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"b1","name":"Cmd","input":{"command":"cargo test --bins"}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"error: cannot find macro parse_args_panics"}
+            ]}),
+        ];
+        for i in 0..COMPACT_KEEP_TAIL * 2 {
+            history.push(json!({"role":"assistant","content":[{"type":"text","text":format!("tail{i}")}]}));
+        }
+        history
+    }
+
+    /// **端到端（写入 + 检索 + 注入）**：触发一次真实压缩 ⇒ 索引出现条目（**失败那条带 `reason`**、
+    /// 指针字段正确），压缩后检索命中并把结论块注入到可变层。
+    ///
+    /// 走**确定性路径**（dropped 不足 `SUMMARY_MIN_INPUT_CHARS` ⇒ 摘要调用被跳过、不联网）。
+    #[test]
+    fn compaction_writes_index_and_reinjects_conclusions() {
+        let cfg = cfg_for_tests();
+        let dir = std::env::temp_dir().join(format!("lunac-concl-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut history = history_with_droppable_conclusions();
+        let out = compact_history(&mut history, Compact::Force, 0);
+        assert!(out.dropped > 0, "Force 档必须真的丢了中段");
+
+        let added = restore_after_compaction(
+            &cfg,
+            &mut history,
+            &out.dropped_msgs,
+            &out.elided_msgs,
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+        assert!(added >= 1, "至少要把摘要 / 兜底清单钉回");
+
+        let entries = conclusions::load(&dir, tools::MemoryScope::Global);
+        let failed = entries
+            .iter()
+            .find(|e| e.status == conclusions::STATUS_FAILED)
+            .expect("失败尝试必须进索引（不得删 —— Manus：保留纠错证据）");
+        assert!(!failed.reason.is_empty(), "失败条目必须带 reason");
+        assert!(
+            failed.reason.contains("parse_args_panics"),
+            "reason 应当是错误文本：{}",
+            failed.reason
+        );
+        assert!(
+            entries.iter().any(|e| e
+                .refs
+                .iter()
+                .any(|r| r.kind == "command" && r.value.contains("cargo test"))),
+            "失败的 Cmd 要留 command 指针"
+        );
+
+        // 检索 + 注入：历史里出现结论块（可变层，紧随摘要之后，不在 0 号位）。
+        let injected = history
+            .iter()
+            .position(|m| {
+                m["content"][0]["text"]
+                    .as_str()
+                    .map(|t| t.starts_with(conclusions::INJECT_HEADER))
+                    .unwrap_or(false)
+            })
+            .expect("压缩后必须检索并注入结论块");
+        assert!(injected >= 1, "注入块不能在 0 号位（那是 head / 固定上下文块）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **前缀不变量**：压缩 + 结论注入**只动可变层（history）** —— `system` 提示词（固定前缀）与
+    /// 历史开头的固定上下文块逐字节不变（`code-standards.md` §规范 6 / `forbidden.md` §禁用 45）。
+    #[test]
+    fn compaction_and_injection_leave_the_fixed_prefix_untouched() {
+        let cfg = cfg_for_tests();
+        let dir = std::env::temp_dir().join(format!("lunac-concl-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 历史开头放一条固定上下文块（模拟 `context_block_message` 注入的那条）。
+        let ctx = context_block_message(
+            "# Background context (fixed for this session)\n- prefers tabs",
+        )
+        .unwrap();
+        let mut history = vec![ctx.clone()];
+        history.extend(history_with_droppable_conclusions());
+        let system_before = SYSTEM_PROMPT.to_string();
+
+        let out = compact_history(&mut history, Compact::Force, 0);
+        let _ = restore_after_compaction(
+            &cfg,
+            &mut history,
+            &out.dropped_msgs,
+            &out.elided_msgs,
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+
+        // ① `system` 提示词（真的固定前缀）逐字节不变 —— 本函数根本不接收它，这里把意图钉住。
+        assert_eq!(SYSTEM_PROMPT, system_before);
+        // ② 历史开头那条固定上下文块逐字节不变（压缩保留 head；注入块不占 0 号位）。
+        assert_eq!(history[0], ctx, "history[0] 必须是原样的固定上下文块");
+        // ③ 结论块是可变层里的**独立 user 消息**（带固定表头）。
+        let injected = history
+            .iter()
+            .find(|m| {
+                m["content"][0]["text"]
+                    .as_str()
+                    .map(|t| t.starts_with(conclusions::INJECT_HEADER))
+                    .unwrap_or(false)
+            })
+            .expect("结论块必须注入");
+        assert_eq!(injected["role"].as_str(), Some("user"), "注入块是可变层的 user 文本消息");
+
+        // ④ 语义分层（S0）的 `Drop` 档也走一遍：前缀不变量必须一样成立。
+        //    造一段「噪声 ×3 → 用户诉求(L1) → 失败证据(L4) → 尾部」的历史，Drop 只丢噪声。
+        let mut h2 = vec![ctx.clone()];
+        for i in 0..3 {
+            h2.push(json!({"role":"assistant","content":[{"type":"text","text":format!("noise{i}")}]}));
+        }
+        h2.push(json!({"role":"user","content":[{"type":"text","text":"继续修 parse_args"}]}));
+        h2.push(json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"b9","name":"Cmd","input":{"command":"cargo test"}}
+        ]}));
+        h2.push(json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"b9","is_error":true,"content":"error: boom"}
+        ]}));
+        for i in 0..COMPACT_KEEP_TAIL {
+            h2.push(json!({"role":"assistant","content":[{"type":"text","text":format!("t{i}")}]}));
+        }
+        let drop_out = compact_history(&mut h2, Compact::Drop, 0);
+        assert!(drop_out.dropped > 0, "Drop 档应当丢掉了噪声");
+        assert_eq!(SYSTEM_PROMPT, system_before);
+        assert_eq!(h2[0], ctx, "Drop 档下 history[0] 仍必须是原样的固定上下文块");
+        assert!(
+            h2.iter().any(|m| m["content"][0]["is_error"].as_bool() == Some(true)),
+            "Drop 档下失败证据（L4）仍在（前缀不变量与保证据同时成立）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **零新增调用**：压缩时结构化的结论提取**复用摘要那一次调用** —— 同一份模型响应既产出钉回
+    /// 历史的摘要，又产出进索引的结论；全程**只有一次** API 请求。
+    #[test]
+    fn structured_conclusions_reuse_the_single_summary_call() {
+        let body = format!(
+            "## Historical Task Snapshot\n继续改 parse_args\n\n{}\n\
+             [{{\"status\":\"failed\",\"conclusion\":\"试了 cargo test 不行\",\"reason\":\"cannot find macro\",\"keywords\":[\"parse_args\"],\"refs\":[{{\"kind\":\"file\",\"value\":\"src/main.rs\"}}]}}]\n{}",
+            conclusions::INDEX_BEGIN,
+            conclusions::INDEX_END
+        );
+        let canned =
+            json!({"content":[{"type":"text","text":body}],"usage":{"output_tokens":10}}).to_string();
+        let (endpoint, rx) = start_stub_server(canned);
+        let cfg = cfg_pointing_at(&endpoint);
+        let dir = std::env::temp_dir().join(format!("lunac-concl-call-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // dropped 要够长（>= `SUMMARY_MIN_INPUT_CHARS`）才触发那一次调用。
+        let dropped: Vec<Value> = (0..6)
+            .map(|i| {
+                json!({"role":"assistant","content":[{
+                    "type":"text","text":format!("m{i}:{}", "x".repeat(1_000))
+                }]})
+            })
+            .collect();
+        let mut history = vec![json!({"role":"user","content":[{"type":"text","text":"继续"}]})];
+
+        let _ = restore_after_compaction(
+            &cfg,
+            &mut history,
+            &dropped,
+            &[],
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+
+        // ① 摘要钉回（来自这次调用）
+        assert!(
+            history
+                .iter()
+                .any(|m| m["content"][0]["text"]
+                    .as_str()
+                    .map(|t| t.starts_with(SUMMARY_HEADER))
+                    .unwrap_or(false)),
+            "摘要必须钉回"
+        );
+        // ② 结构化结论落进索引 —— **同一份响应既产摘要又产结论 = 复用那一次调用**
+        let entries = conclusions::load(&dir, tools::MemoryScope::Global);
+        assert!(
+            entries.iter().any(|e| e.status == conclusions::STATUS_FAILED
+                && e.refs.iter().any(|r| r.value == "src/main.rs")),
+            "结构化段必须进索引（否则模型侧结论提取没接上）"
+        );
+        // ③ 那一次请求确实发生（stub 只服务一次 ⇒ 它就是全部模型调用）
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "必须发出且只发一次摘要请求");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9782,7 +10756,7 @@ mod tests {
     fn manual_compact_on_empty_history_receipts_zero_without_pollution() {
         let cfg = cfg_for_tests();
         let mut history: Vec<Value> = Vec::new();
-        let ev = manual_compact(&cfg, &mut history, &std::env::temp_dir())
+        let ev = manual_compact(&cfg, &mut history, &std::env::temp_dir(), tools::MemoryScope::Global)
             .expect("空历史也必须补发一条回执");
         assert_eq!(ev["type"], "system");
         assert_eq!(ev["subtype"], "context_compacted");
@@ -9801,7 +10775,7 @@ mod tests {
             json!({"role":"assistant","content":[{"type":"text","text":"hello"}]}),
         ];
         let before = history.clone();
-        let ev = manual_compact(&cfg, &mut history, &std::env::temp_dir())
+        let ev = manual_compact(&cfg, &mut history, &std::env::temp_dir(), tools::MemoryScope::Global)
             .expect("压不动也要补发回执");
         assert_eq!(ev["type"], "system");
         assert_eq!(ev["subtype"], "context_compacted");

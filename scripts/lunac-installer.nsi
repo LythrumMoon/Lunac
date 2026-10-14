@@ -19,7 +19,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "0.9.36"
+!define PRODUCT_VERSION "0.9.38"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
 ; 升级 / 重装时自动定位**上一版的安装目录**（2026-09-30）：从卸载注册表的
@@ -221,8 +221,14 @@ Section /o "Music & lyrics (librespot)" SecExtMusic
   !endif
 SectionEnd
 
-; 桌宠（2026-09-30 补）：无依赖（形象由用户自己在控制台里导入，见 ai-spec §4.8），
-; 所以这一段就是纯拷贝。窗口形态由插件清单的 `window` 段声明，安装器不必知道。
+; 桌宠（2026-09-30 补）：形象由用户自己在控制台里导入（见 ai-spec §4.8），窗口形态由插件清单的
+; `window` 段声明、安装器不必知道 ⇒ 这一段就是**纯拷贝插件目录**。
+; **语音资产不内嵌（2026-10-13 用户要求）**：ZipVoice 运行库 + 模型（解压约 216 MiB）**不进安装包**
+; —— `build-plugins.ps1` 的 pet 依赖去掉了 `local`，于是 `ext-plugins\pet\` 里没有 `zipvoice\`，
+; 下面的 `File /r` 自然不带它。装完由宿主在**从市场安装 pet 插件**时按清单的 `dependencies[]`
+; 下载 + 校验 sha256（见 plugin_market.rs 的 install_archive_dependency）。Live2D Core 仍照旧由
+; `local` 随包带（体积小、离线要能用）。**别为了让安装包离线可用就把 zipvoice 塞回来** —— 那会把
+; 安装包从 ~19 MB 顶到 ~176 MB。
 Section /o "Desktop pet" SecExtPet
   !if /FileExists "ext-plugins\pet\lunac-plugin.json"
     SetOutPath "$INSTDIR\Modules\pet"

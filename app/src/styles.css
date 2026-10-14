@@ -2026,6 +2026,20 @@ body.plan-open #todo-drawer {
   white-space: nowrap;
 }
 
+/* 正文里的裸 URL（linkifyBareUrls 生成）——可点，走既有外部打开通路。
+   颜色用既有语义色 `--blue`（信息 / 链接），不新造配色；
+   `overflow-wrap: anywhere` 让超长 URL 在正文里换行，避免横向溢出（不引入滚动条）。 */
+.agent-link {
+  color: var(--blue);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.agent-link:hover {
+  color: var(--text);
+}
+
 /* 独立图片查看界面（全窗遮罩层） */
 #image-viewer {
   position: fixed;
