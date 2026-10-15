@@ -69,7 +69,7 @@ function ensureUpdateProgressListener(): void {
 
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
-import { refreshMarketPlugins, fetchPluginIndex, hasDiskPlugin, type MarketPluginInfo, type MarketIndexEntry } from "../market";
+import { refreshMarketPlugins, fetchPluginIndex, hasDiskPlugin, diskPluginReady, type MarketPluginInfo, type MarketIndexEntry } from "../market";
 import { isBasePlugin, showsInMarket, basePluginOrder, isHeadlessPlugin } from "../kinds";
 import { detachPluginListeners } from "../attach";
 import { startPluginSidecarTrusted, stopPluginSidecar } from "../sidecar";
@@ -1253,9 +1253,25 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
  *  本地决策模型（插件 `local-model`）不再是可搜索 / 可打开的工具插件 —— 它的开关归到这里：
  *  开 = 宿主拉起 `llama-server` 子进程并把端点下发给 agent（`LUNAC_LOCAL_MODEL_URL`），
  *  由本地小模型判断「桌宠消息 / 对话输入」要不要发给云模型（省钱）；关 = 收进程、不下发端点。
- *  插件本身仍留在「插件」市场可下载 / 卸载（见 kinds.ts 的 `isHeadlessPlugin`）。 */
-function buildLocalModelSection(enabled: boolean, installed: boolean): string {
-  const hint = installed ? t("settings.local_model_hint") : t("settings.local_model_missing");
+ *  插件本身仍留在「插件」市场可下载 / 卸载（见 kinds.ts 的 `isHeadlessPlugin`）。
+ *
+ *  `ready`（2026-10-15）：依赖是否就位。**装的是不含依赖的插件包时 `ready=false`** ——
+ *  界面这时要显示「未就绪 / 待下载」并给一个下载入口，而不是放行后让底层报「可执行文件不存在」。 */
+function buildLocalModelSection(enabled: boolean, installed: boolean, ready: boolean): string {
+  const hint = !installed
+    ? t("settings.local_model_missing")
+    : !ready
+      ? t("settings.local_model_deps_missing")
+      : t("settings.local_model_hint");
+  // 「未就绪」时的显式下载入口（同时就是失败后的重试入口）：点了走既有的依赖安装，
+  // 带进度、可取消（见 attachSettingsListeners 里的 installDeps）。
+  const depsRow = installed && !ready
+    ? `
+      <div class="settings-hint" id="settings-local-model-deps" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">
+        <div class="dl-inline hidden" id="settings-local-model-progress"></div>
+        <button class="settings-install-btn" id="settings-local-model-download">${t("settings.local_model_download_deps")}</button>
+      </div>`
+    : "";
   return `
       <div class="settings-row">
         <span class="settings-label">${t("settings.local_model")}</span>
@@ -1265,6 +1281,7 @@ function buildLocalModelSection(enabled: boolean, installed: boolean): string {
         </label>
       </div>
       <div class="settings-hint" id="settings-local-model-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${hint}</div>
+      ${depsRow}
       <!-- 开启前的内联警告（**不用信任卡**：那卡片渲染在 #results-list 里会被设置布局裁掉 / 吞掉，
            2026-10-09 用户要求改为面板内可见的警告 + 确认）-->
       <div class="settings-hint hidden" id="settings-local-model-warn" style="font-size:0.72rem;color:var(--yellow);margin:2px 0 6px;line-height:1.6;">
@@ -1283,13 +1300,14 @@ async function buildAIPane(provider: string, baseUrl: string, model: string, api
   let lmEnabled = false;
   try { lmEnabled = await invoke<boolean>("local_model_config_get"); } catch { /* 读不到按关处理 */ }
   const lmInstalled = hasDiskPlugin("local-model");
+  const lmReady = diskPluginReady("local-model");
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
       ${buildAIModelSection(provider, baseUrl, model, apiKey)}
       <div class="settings-group-title">${t("settings.local_model_group")}</div>
-      ${buildLocalModelSection(lmEnabled, lmInstalled)}
+      ${buildLocalModelSection(lmEnabled, lmInstalled, lmReady)}
       <div class="settings-group-title">${t("settings.cost_title")}</div>
       ${costHtml}
     </div>`;
@@ -2840,29 +2858,136 @@ export async function attachSettingsListeners(container: HTMLElement) {
   const updateProgressSpeed = container.querySelector("#settings-update-progress-speed") as HTMLElement | null;
   const updateAuto = container.querySelector("#settings-update-auto") as HTMLInputElement | null;
 
-  // ── 本地模型决策开关（2026-10-09）─────────────────────────────
-  // 编排：开 ⇒ 起 sidecar（首次弹信任卡）+ 写开关 + 重载 agent（让 `LUNAC_LOCAL_MODEL_URL` 生效）；
-  //       关 ⇒ 写开关 + 收 sidecar + 重载 agent。任一步失败即回滚开关并提示。
+  // ── 本地模型决策开关（2026-10-09；2026-10-15 起「开启前先补依赖」）──────────
+  // 编排：开 ⇒（若依赖未就位，**先**按清单下载依赖，带进度、可取消）→ 起 sidecar（首次落盘信任）
+  //       + 写开关 + 重载 agent（让 `LUNAC_LOCAL_MODEL_URL` 生效）；关 ⇒ 写开关 + 收 sidecar + 重载。
   // 为什么在前端编排而不是让宿主自己起：sidecar 的**信任门**只在 webview 里能弹（默认拒绝），
   // 宿主闷头起只会拿到 `needs_trust` 而什么都不发生。
   const lmToggle = container.querySelector("#settings-local-model") as HTMLInputElement | null;
   const lmHint = container.querySelector("#settings-local-model-hint") as HTMLElement | null;
   const lmWarn = container.querySelector("#settings-local-model-warn") as HTMLElement | null;
+  const lmDeps = container.querySelector("#settings-local-model-deps") as HTMLElement | null;
+  const lmDepsBtn = container.querySelector("#settings-local-model-download") as HTMLButtonElement | null;
+  const lmProgress = container.querySelector("#settings-local-model-progress") as HTMLElement | null;
   if (lmToggle && !lmToggle.disabled) {
-    const lmHintDefault = lmHint?.textContent ?? "";
     // 状态 / 错误**直接写进那行提示**（不再单开一个提示元素）：空元素不占位，也不会再出现
     // 「有文字但 opacity:0 ⇒ 看着是一块空白」（2026-10-09 修：原来挂在 `.settings-save-msg` 上）
-    const setLmMsg = (s: string, isErr = false) => {
+    // 提示行按**当前就绪状态**现算默认文案 —— 依赖装好后不能再留着「未就绪」那句。
+    const resetLmHint = () => {
       if (!lmHint) return;
-      lmHint.textContent = s || lmHintDefault;
+      lmHint.textContent = !hasDiskPlugin("local-model")
+        ? t("settings.local_model_missing")
+        : !diskPluginReady("local-model")
+          ? t("settings.local_model_deps_missing")
+          : t("settings.local_model_hint");
+      lmHint.style.color = "var(--text-dim)";
+    };
+    const setLmMsg = (s: string, isErr = false) => {
+      if (!s) return resetLmHint();
+      if (!lmHint) return;
+      lmHint.textContent = s;
       lmHint.style.color = isErr ? "var(--red)" : "var(--text-dim)";
+    };
+    // ── 依赖安装（**复用宿主 `install_plugin_dependencies`** —— 与 ocr-engine.ts:55 同一条路，
+    //    不新造第二套下载器）：进度经全局事件 `plugin-install-progress` 回传（按 id 过滤），
+    //    下载中按钮变「取消」（宿主下载循环据 `cancel_plugin_dependency_install` 中止）。
+    //    2.33 GiB ⇒ 必须有进度、能取消、失败可重试、有时间预期（预期写在 `local_model_deps_missing` 里）。──
+    let depBusy = false;
+    let depCancelled = false;
+    let depUnlisten: (() => void) | undefined;
+    const showDeps = (on: boolean) => lmDeps?.classList.toggle("hidden", !on);
+    const setDepsBtn = (label: string, disabled = false) => {
+      if (!lmDepsBtn) return;
+      lmDepsBtn.textContent = label;
+      lmDepsBtn.disabled = disabled;
+    };
+    const installDeps = async (): Promise<"ok" | "cancelled" | "failed"> => {
+      if (depBusy) return "failed";
+      depBusy = true;
+      depCancelled = false;
+      showDeps(true);
+      setDepsBtn(t("settings.local_model_deps_cancel"));
+      setLmMsg(t("settings.local_model_deps_downloading"));
+      if (lmProgress) {
+        lmProgress.classList.remove("hidden");
+        lmProgress.innerHTML =
+          ringHtml(-1) +
+          `<span class="dl-meta"><span class="dl-phase">${t("settings.local_model_deps_downloading")}</span>` +
+          `<span class="dl-speed">—</span></span>`;
+      }
+      const meter = new DownloadMeter();
+      // 阶段键：`download#1`（第 1 条依赖）→ `extract#1` → `download#2` …；变了就重置速度基线
+      //（不同文件之间的字节数不连续，不重置会算出一个荒唐的速度，见 download-progress.ts）。
+      let segKey = "";
+      try {
+        depUnlisten = await listen("plugin-install-progress", (ev) => {
+          const p = ev.payload as {
+            id: string;
+            phase: string;
+            downloaded: number;
+            total: number;
+            index: number;
+          };
+          if (p.id !== "local-model") return;
+          const key = `${p.phase}#${p.index}`;
+          if (key !== segKey) {
+            segKey = key;
+            meter.reset();
+          }
+          const extracting = p.phase === "extract";
+          const s = meter.push(p.downloaded, p.total);
+          if (lmProgress) {
+            updateRing(lmProgress, extracting ? -1 : s.percent);
+            const ph = lmProgress.querySelector<HTMLElement>(".dl-phase");
+            const sp = lmProgress.querySelector<HTMLElement>(".dl-speed");
+            if (ph) ph.textContent = extracting
+              ? t("settings.plugins_market_extracting")
+              : t("settings.local_model_deps_downloading");
+            if (sp) sp.textContent = extracting ? "—" : formatSpeed(s.speed);
+          }
+        });
+      } catch { /* 挂不上监听不该拦住安装本身 */ }
+      let result: "ok" | "cancelled" | "failed" = "failed";
+      try {
+        await invoke("install_plugin_dependencies", { id: "local-model" });
+        result = "ok";
+      } catch {
+        // 是「用户点了取消」还是「真失败」，前端自己分得清（宿主中止消息不必拿来做判据）
+        result = depCancelled ? "cancelled" : "failed";
+      } finally {
+        try { depUnlisten?.(); } catch { /* ignore */ }
+        depUnlisten = undefined;
+        depBusy = false;
+      }
+      lmProgress?.classList.add("hidden");
+      // 重扫一次：让 `hasDiskPlugin` / `diskPluginReady` 看到刚落盘的依赖
+      await refreshMarketPlugins().catch(() => {});
+      showDeps(!diskPluginReady("local-model"));
+      if (result === "ok") {
+        setLmMsg(t("settings.local_model_deps_done"));
+        if (lmToggle) lmToggle.disabled = false; // 依赖到位 ⇒ 开关可用
+      } else if (result === "cancelled") {
+        setLmMsg(t("settings.local_model_deps_cancelled"));
+      } else {
+        setLmMsg(t("settings.local_model_deps_failed"), true);
+      }
+      setDepsBtn(result === "failed"
+        ? t("settings.local_model_deps_retry")
+        : t("settings.local_model_download_deps"));
+      return result;
     };
     const turnOn = async () => {
       lmToggle.disabled = true;
       setLmMsg(t("settings.local_model_working"));
       try {
         if (!hasDiskPlugin("local-model")) throw new Error(t("settings.local_model_missing"));
-        // 不经信任卡：直接落盘信任再起进程（原因见 sidecar.ts 的 startPluginSidecarTrusted）
+        // ① 开启前**先补依赖**：缺 `sidecar.command` 时先下 2.33 GiB 依赖（带进度、可取消）
+        if (!diskPluginReady("local-model")) {
+          const r = await installDeps();
+          if (r === "cancelled") return; // 用户取消：不继续、也不改落盘状态（勾选本就没勾上）
+          if (r !== "ok") throw new Error(t("settings.local_model_deps_failed"));
+        }
+        // ② 不经信任卡：直接落盘信任再起进程（原因见 sidecar.ts 的 startPluginSidecarTrusted）
         await startPluginSidecarTrusted("local-model");
         await invoke("local_model_config_set", { enabled: true });
         lmToggle.checked = true;
@@ -2900,6 +3025,16 @@ export async function attachSettingsListeners(container: HTMLElement) {
       } else {
         void turnOff();
       }
+    });
+    // 「下载依赖」按钮：闲时下载 / 失败后重试；**下载中变「取消」**（点了就中止本次下载）
+    lmDepsBtn?.addEventListener("click", () => {
+      if (depBusy) {
+        depCancelled = true;
+        setDepsBtn(t("settings.local_model_deps_cancel"), true);
+        void invoke("cancel_plugin_dependency_install").catch(() => {});
+        return;
+      }
+      void installDeps();
     });
     const lmOk = container.querySelector("#settings-local-model-ok") as HTMLButtonElement | null;
     const lmCancel = container.querySelector("#settings-local-model-cancel") as HTMLButtonElement | null;

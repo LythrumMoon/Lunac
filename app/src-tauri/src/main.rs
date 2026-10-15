@@ -103,6 +103,7 @@ use commands::{
     list_installed_plugins, install_plugin_from_url, uninstall_plugin, plugins_dir_path,
     local_model_config_get, local_model_config_set,
     install_plugin_dependencies,
+    cancel_plugin_dependency_install,
     fetch_plugin_index,
     run_ocr,
     save_temp_image,
@@ -688,6 +689,7 @@ fn main() {
             list_installed_plugins,
             install_plugin_from_url,
             install_plugin_dependencies,
+            cancel_plugin_dependency_install,
             uninstall_plugin,
             plugins_dir_path,
             // 本地模型决策开关（2026-10-09）：与插件列表同段，读 / 写该开关。

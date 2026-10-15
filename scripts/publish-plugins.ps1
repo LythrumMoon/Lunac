@@ -33,6 +33,26 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# ── BOM 自愈守卫（2026-10-04，见 ai-spec §11 规则 82）──────────────────
+# 开头多一份 BOM 时 PS 5.1 只剥第一份，剩下的 U+FEFF 把首行 `# 注释` 顶成一条命令
+# ⇒ `param()` 不再是脚本首语句 ⇒ **参数静默不绑定**（`-Repo` / `-WorkDir` / `-NoPush`
+# 全读成空值，表现是「只想看预览、结果直接推了」或是把包发去默认仓库）。
+# 这种文件**仍能跑到这里**（首行那个错误是非终止的），所以守卫跑得到：
+# 就地把自己修回一份 BOM，然后中止 —— 参数绑定只有**重跑**才能恢复。
+$selfPath = $PSCommandPath
+$selfBytes = [IO.File]::ReadAllBytes($selfPath)
+$bomN = 0
+while ($bomN * 3 + 2 -lt $selfBytes.Length -and
+       $selfBytes[$bomN * 3] -eq 0xEF -and $selfBytes[$bomN * 3 + 1] -eq 0xBB -and $selfBytes[$bomN * 3 + 2] -eq 0xBF) { $bomN++ }
+if ($bomN -gt 1) {
+  $fixed = New-Object byte[] ($selfBytes.Length - $bomN * 3 + 3)
+  [Array]::Copy([byte[]](0xEF, 0xBB, 0xBF), 0, $fixed, 0, 3)
+  [Array]::Copy($selfBytes, $bomN * 3, $fixed, 3, $selfBytes.Length - $bomN * 3)
+  [IO.File]::WriteAllBytes($selfPath, $fixed)
+  throw "publish-plugins.ps1 开头有 $bomN 份 BOM（正确是 1 份）—— 已自动修正，请**重新运行**一次（命令行参数要靠重跑才恢复绑定）。"
+}
+
 $Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $PkgDir = "$Root\release\plugin-packages"
 $DistDir = "$Root\app\plugin-dist"

@@ -283,8 +283,9 @@ $Plugins = @{
   #    `plugin_market::validate_sidecar` 是 **fail-closed** 的 —— 声明了 sidecar 却缺这条权限
   #    ⇒ **整包拒装**（不是「起了但没权限」）。此前 `permissions = @()` 是空的，走市场/zip 安装
   #    管线**根本装不上**，只因本地是手工铺进 `Modules\` 才没暴露。
-  # **模型进 dependencies（2026-10-09 用户定，v0.9.1）**：GGUF 有 468MB，做成 `type:"file"` 硬依赖
-  #    = 「装这个插件就自动下 468MB 并校验 sha256」——用户明确选了**强制随装下载**（而非面板按需下）。
+  # **模型进 dependencies（2026-10-09 用户定，v0.9.1）**：GGUF 有 2381.6 MB（约 2.33 GiB；模型是 4B，
+  #    Qwen3-4B-Instruct-2507），做成 `type:"file"` 硬依赖
+  #    = 「装这个插件就自动下 2381.6 MB 并校验 sha256」——用户明确选了**强制随装下载**（而非面板按需下）。
   #    `dest` 的相对路径与 `sidecar.args` 的 `--model` **必须逐字一致**；`sha256` 是本地实算的
   #    （`Get-FileHash`），对不上时宿主**整包拒绝**。llama-server 本体很小（18.6MB），走 archive
   #    依赖随装随下 —— zip 里是「exe + 一堆 DLL」，所以用 `archive` 而不是 `file`（与 ocr 的 PaddleOCR 同款）。

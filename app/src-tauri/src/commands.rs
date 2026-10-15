@@ -3041,6 +3041,16 @@ pub async fn install_plugin_dependencies(app: AppHandle, id: String) -> Result<(
     .await
 }
 
+/// 中止**当前这次**依赖下载（2026-10-15）。
+///
+/// 只置一个全局中止标志（见 `plugin_market::cancel_dependency_install`），下载循环每读一块检查一次 ——
+/// **没有第二条下载链路**，只是给既有那条加了一个可停的出口（本地决策模型的依赖有 2.33 GiB，
+/// 用户必须能中途叫停）。幂等：没有正在进行的安装时调用它是无操作。
+#[tauri::command]
+pub fn cancel_plugin_dependency_install() {
+    crate::plugin_market::cancel_dependency_install();
+}
+
 /// 卸载插件（递归删 <exe 根>\plugins\<id>）。id 必须安全、目录必须在插件根内 —— 见 `plugin_market::uninstall`。
 #[tauri::command]
 pub fn uninstall_plugin(id: String) -> Result<String, String> {

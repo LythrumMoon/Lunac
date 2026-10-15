@@ -38,6 +38,7 @@ use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -538,6 +539,13 @@ pub struct InstalledPlugin {
     pub entry_path: String,
     /// 清单与入口都通过校验
     pub valid: bool,
+    /// **依赖就位**（2026-10-15）：清单 + 入口通过校验，且声明的 `sidecar.command`
+    /// （本机依赖，如 `bin/llama-server.exe`）**真的存在**。见 `plugin_ready`。
+    ///
+    /// 与 `valid` 分开是为了如实区分两种「不能用」：`valid=false` = 包本身坏了；
+    /// `valid=true` 但 `ready=false` = 包没问题、**只是依赖还没下来**（界面显示「未就绪 / 待下载」
+    /// 并提供下载入口，而不是放行后让底层报「可执行文件不存在」）。
+    pub ready: bool,
     /// `valid = false` 时的原因（原样显示在面板上，不猜）
     pub error: String,
     /// 这个插件声明的依赖（2026-09-28）。界面上只是「它要拉什么」的提示，
@@ -983,6 +991,22 @@ pub fn install_from_bytes_with_progress(
     Ok(manifest.id.clone())
 }
 
+/// 依赖下载的中止标志（2026-10-15）。
+///
+/// 为什么用一个全局 `AtomicBool`：**同一时刻只该有一次依赖安装**（前端按插件串行发起），
+/// 所以就一个开关够了 —— 再按 id 维护一张表只是多一份要同步的状态（本地模型那次是 2.33 GiB，
+/// 用户必须能中途叫停，不能干等）。
+static CANCEL_DEP_INSTALL: AtomicBool = AtomicBool::new(false);
+
+/// 请求中止当前这次依赖安装。下载循环每读一块检查一次；幂等。
+pub fn cancel_dependency_install() {
+    CANCEL_DEP_INSTALL.store(true, Ordering::Relaxed);
+}
+
+fn dep_install_cancelled() -> bool {
+    CANCEL_DEP_INSTALL.load(Ordering::Relaxed)
+}
+
 /// 逐条安装清单里的依赖（`dependencies[]`）。**任意一条失败即中止**，由调用方决定是否回滚。
 ///
 /// 顺序执行、不并发：依赖条数是个位数，并发带来的收益抵不过「并发失败时哪一半落了盘」的复杂度。
@@ -997,6 +1021,8 @@ pub fn install_dependencies_with_progress(
     if deps.is_empty() {
         return Ok(());
     }
+    // 每次安装开始时清掉中止标志：否则上一次的「取消」会立刻把这次也掐掉
+    CANCEL_DEP_INSTALL.store(false, Ordering::Relaxed);
     if deps.len() > MAX_DEP_ENTRIES {
         return Err(format!("依赖条目过多（{} 条）", deps.len()));
     }
@@ -1358,6 +1384,9 @@ fn download_bytes_with_progress(
         if n == 0 {
             break;
         }
+        if dep_install_cancelled() {
+            return Err("已取消依赖下载".into());
+        }
         if bytes.len() as u64 + n as u64 > limit {
             return Err(over());
         }
@@ -1403,6 +1432,10 @@ fn download_to_file_with_progress(
         };
         if n == 0 {
             break;
+        }
+        if dep_install_cancelled() {
+            let _ = fs::remove_file(dest);
+            return Err("已取消依赖下载".into());
         }
         written += n as u64;
         if written > limit {
@@ -1456,6 +1489,30 @@ fn hex_digest(bytes: &[u8]) -> String {
     s
 }
 
+/// 依赖就位判定（2026-10-15）：声明了 `sidecar` 的插件，其 `sidecar.command`
+/// （通常是 `dependencies[]` 下下来的本机依赖，如 `bin/llama-server.exe`）**必须真的存在**。
+///
+/// **只对声明了 sidecar 的插件收紧**：没有 sidecar 的插件（含自带「引擎缺失 → 下载」提示的
+/// OCR）恒为就绪 —— 免得把「依赖缺失但界面上另有出口」的插件也一并标成未就绪。
+///
+/// 纯函数（只看 `dir` 与 `spec`）：判据可单测，不必真的起进程。
+pub fn sidecar_command_ready(dir: &Path, spec: &SidecarSpec) -> bool {
+    let cmd = spec.command.trim();
+    if cmd.is_empty() {
+        // 空 command 不会通过 `validate_sidecar`；这里按「无约束」处理，不因它误判未就绪
+        return true;
+    }
+    matches!(safe_join(dir, cmd), Some(p) if p.is_file())
+}
+
+/// 已装插件是否**就绪**（清单 + 入口 + 声明的 `sidecar.command` 都就位）。判据同 `sidecar_command_ready`。
+fn plugin_ready(dir: &Path, sidecar: Option<&SidecarSpec>) -> bool {
+    match sidecar {
+        Some(s) => sidecar_command_ready(dir, s),
+        None => true,
+    }
+}
+
 /// 扫插件目录，列出全部已安装插件（含「坏包」——它们也要在面板上可见，否则用户只会看到插件莫名其妙消失）。
 pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
     let mut out: Vec<InstalledPlugin> = Vec::new();
@@ -1480,6 +1537,7 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
             dir: dir.to_string_lossy().to_string(),
             entry_path: String::new(),
             valid: false,
+            ready: false,
             error: String::new(),
             dependencies: Vec::new(),
             permissions: Vec::new(),
@@ -1509,6 +1567,8 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
                         Some(p) if p.is_file() => {
                             item.entry_path = p.to_string_lossy().to_string();
                             item.valid = true;
+                            // 依赖就位判定（2026-10-15）：见 `plugin_ready`
+                            item.ready = plugin_ready(&dir, m.sidecar.as_ref());
                         }
                         _ => item.error = format!("入口文件不存在：{}", m.entry),
                     }
@@ -1580,6 +1640,43 @@ mod tests {
     /// 装一份包（不关心依赖进度）—— 生产路径由 commands.rs 传真回调，测试里一律吞掉。
     fn install(bytes: &[u8], root: &Path) -> Result<String, String> {
         install_from_bytes_with_progress(bytes, root, &mut |_| {})
+    }
+
+    /// 依赖就位判定（2026-10-15）：**声明了 sidecar 的插件**，其 `sidecar.command` 文件真的在
+    /// 才算就绪；没有 sidecar 的插件恒就绪（不误伤那批依赖缺失但界面另有出口的插件）。
+    #[test]
+    fn sidecar_command_ready_drives_plugin_readiness() {
+        let root = tmp_root("ready");
+        let dir = root.join("demo");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+
+        let spec = |cmd: &str| SidecarSpec {
+            command: cmd.to_string(),
+            ..Default::default()
+        };
+        // 声明了 sidecar、可执行文件还没下来 ⇒ 未就绪
+        assert!(!sidecar_command_ready(&dir, &spec("bin/llama-server.exe")));
+        // 依赖就位 ⇒ 就绪
+        fs::write(dir.join("bin").join("llama-server.exe"), b"MZ").unwrap();
+        assert!(sidecar_command_ready(&dir, &spec("bin/llama-server.exe")));
+        // 越界的 command 一律不就绪（safe_join 拦下）
+        assert!(!sidecar_command_ready(&dir, &spec("../evil.exe")));
+
+        // 没有 sidecar 的插件恒就绪 —— 它们不因这条判据被标成未就绪
+        let no_side = parse_manifest(&good_manifest("plain")).unwrap();
+        assert!(plugin_ready(&dir, no_side.sidecar.as_ref()));
+
+        // 有 sidecar：command 就位 ⇒ 就绪；删掉 ⇒ 立刻未就绪（id/入口都没变）
+        let m = parse_manifest(
+            r#"{"id":"lm","entry":"index.js","permissions":["process.spawn"],
+                "sidecar":{"command":"bin/llama-server.exe"}}"#,
+        )
+        .unwrap();
+        assert!(plugin_ready(&dir, m.sidecar.as_ref()));
+        fs::remove_file(dir.join("bin").join("llama-server.exe")).unwrap();
+        assert!(!plugin_ready(&dir, m.sidecar.as_ref()));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// sidecar（2026-10-06，L12 档 1）：**必须与 `process.spawn` 同时出现**，

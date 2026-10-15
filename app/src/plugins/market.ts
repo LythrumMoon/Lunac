@@ -41,6 +41,11 @@ export interface MarketPluginInfo {
   entryPath: string;
   /** 清单与入口都通过校验 */
   valid: boolean;
+  /** 依赖是否就位（2026-10-15）。
+   *  与 `valid` 分开：`valid=true` 但 `ready=false` = 包没问题、**只是依赖还没下来**
+   *  （声明了 `sidecar` 的插件要求它的 `sidecar.command` 文件真的存在，见 Rust `plugin_ready`）。
+   *  无 sidecar 的插件恒为 `true`。 */
+  ready: boolean;
   /** `valid === false` 时的原因（原样显示，不猜） */
   error: string;
   /** 这个插件声明的依赖（2026-09-28）。宿主在装插件时已顺带拉好；
@@ -238,6 +243,16 @@ function infoOf(id: string): MarketPluginInfo | undefined {
 export function hasDiskPlugin(id: string): boolean {
   const info = infoOf(id);
   return !!info && info.valid;
+}
+
+/** 盘上那份插件是否**就绪**（已装 + 依赖就位）。
+ *
+ *  与 `hasDiskPlugin` 同源（都读最近一次扫描结果），只多一道「依赖就位」：
+ *  声明了 sidecar 的插件若 `sidecar.command`（本机依赖，如 `bin/llama-server.exe`）还没下来，
+ *  这里给 `false` —— 调用方据此显示「未就绪 / 待下载」并提供下载入口，而不是放行后让底层报错。 */
+export function diskPluginReady(id: string): boolean {
+  const info = infoOf(id);
+  return !!info && info.valid && info.ready;
 }
 
 /** 用**磁盘插件模块自带的 `attach(root)`** 挂载（2026-09-28）。

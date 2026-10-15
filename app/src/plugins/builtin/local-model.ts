@@ -9,8 +9,8 @@
 // 它服务两处「要不要把这条输入发给云模型」的决策（判定在 `core-agent/src/decide.rs`）：
 //   ① 桌宠插件的消息发送决策；② agent 对话流的输入门。
 //
-// **模型与二进制都走清单 `dependencies` 随装下载**（llama-server archive + 468MB GGUF，
-// sha256 校验）；`permissions:["process.spawn"]` 必须与清单 `sidecar` 段同时出现，否则整包拒装。
+// **模型与二进制都走清单 `dependencies` 随装下载**（llama-server archive + 2381.6 MB / 约 2.33 GiB
+// 的 GGUF；模型是 4B，Qwen3-4B-Instruct-2507，sha256 校验）；`permissions:["process.spawn"]` 必须与清单 `sidecar` 段同时出现，否则整包拒装。
 //
 // **本文件刻意没有任何 UI 逻辑**：面板已删除，`execute` 只留一句兜底说明（见下）。
 

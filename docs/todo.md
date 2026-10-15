@@ -767,7 +767,16 @@
 ### §待办 3-6 L11 本地「只参与决策」模型：结论存档
 - **已查清**（结论，落点已实现为 headless 插件 `local-model`）：本地决策模型已是独立品类（TypeSafe Jev + firelex Jeff、Ollama `/v1/systemone` 的 `nimble`/`tev1`、Cactus Needle 2、distil labs 的 `defer_to_larger_model`）。**可靠线**：7B 以下通用模型会吐畸形工具调用，要 7B 以下必须选**专训**的（decision model / Needle）。
 - **待办点**：agent 侧「重要节点审查 / 策展」功能本身**尚未实现**（阶段 0/1 都没做）；本地引擎已换 **Qwen3-4B-Instruct-2507-Q4_K_M**，需先实测 CPU 单次判定延迟再定节点频率。
-- **涉及文件**：`core-agent/src/decide.rs`、`app/src/plugins/builtin/local-model.ts`、`app/src-tauri/src/plugin_sidecar.rs`。
+- **本轮进展（2026-10-15）：判定输出加 GBNF 约束（S1 的真正前置）**。选型 = **请求体 `grammar` 字段**（GBNF 文本），实测 `llama-server` build **b11524**（win-cpu-x64）**支持且生效**；`response_format={"type":"json_schema",…}` **也支持**（回 `{"send":false}`）但因输出更长（16 token）未选；**未用启动参数** `--grammar-file` / `--grammar` ⇒ **插件与 `build-plugins.ps1` 均未改、插件版本不动**。落点 = `core-agent/src/decide.rs` 的 `VERDICT_GRAMMAR` 常量 + 判定请求体的 `"grammar"` 字段（内联字符串、零新依赖）。
+  - **约束确被服务端应用（非静默忽略）的对照证据**：给「你是诗人，只能写诗、绝不给单个词」的系统提示，**不带**约束时回整段诗（`finish_reason:"length"`、出满 max_tokens）；**带上**约束后被**强制**回枚举（`SKIP`）。
+  - **实测数字**（纯 CPU，`-c 8192 -np 1`，3 类输入 = 真需求 / 闲聊 / 明确触发词 × 各 20+ 次）：
+    - **合法枚举率：改造前 75/75、改造后 75/75** —— ⚠️ 本机基线**未复现**任务描述的「对真需求开始作答（出满 8 token 散文）」漂移，模型稳定输出 `SEND`（1 token）；约束的**咬合力**以对照实验为准（见上）。
+    - **延迟：p50 158→146ms、p95 187→165ms**（约束下仍 1 token 枚举，无「作答 8 token」的尾部）。
+  - **仍未接线**：`decide.rs` 依旧模块级 `#![allow(dead_code)]`、`main.rs` 无调用方（`mod decide;` 而已）—— 本轮只把「判定可靠性」做对，不动主循环、不加判定到生产路径。
+- **本轮进展（2026-10-15）：修复「安装版本地模型从未真正可用」（方案 B）**。**根因**：`local-model` 的两个依赖（`bin/llama-server.exe` + `models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf`，实测 **2.33 GiB**）**唯一来源 = 运行期从插件市场安装时按 `dependencies[]` 下载**（`plugin_market.rs:887` → `install_dependencies_with_progress` → `install_archive_dependency`(bin) / `install_file_dependency`(GGUF)）。**安装器不内嵌**（NSIS 无该段，见 `forbidden.md` §禁用 5 第 56 条），设置里的开关也**不下载依赖** —— 安装机上只铺了「不含依赖的 1.4KB 插件包」，依赖下载从未触发；而「已装可用」判据只查「清单可解析 + 入口存在」，于是那句「未安装…请到插件下载」永远不显示，用户一开就撞 `sidecar 可执行文件不存在：…\bin\llama-server.exe`。
+- **方案 B 三件事（已实现）**：① **开启前先补依赖** —— 开启开关时若依赖未就位，**先**调**既有** `install_plugin_dependencies`（与 `ocr-engine.ts` 同一条路，**未造第二套下载器**）按清单补齐，带 `plugin-install-progress` 进度 / 可取消（宿主 `cancel_plugin_dependency_install` 置中止标志）/ 失败可重试；② **判据扩展到「依赖就位」** —— `plugin_market::list_installed` 新增 `ready`（`sidecar_command_ready`：声明了 `sidecar` 的插件要求其 `sidecar.command` 文件真的存在；**无 sidecar 的插件恒就绪，不误伤**），前端据此显示「未就绪 / 待下载」而不是放行后报底层错误；③ **失败文案可操作**（人话 + 「重试」入口）。
+- **仍**未内嵌依赖、也**不做**开机自动下载（2.33 GiB 体积太大，违背既有口径）⇒ **首次开启需下 ~2.33 GiB**（视网速数分钟到数十分钟，界面已给时间预期提示）。**未动** `build-plugins.ps1`（local-model 的 468MB/0.5B 旧注释口径订正不在此范围）。
+- **涉及文件**：`core-agent/src/decide.rs`、`app/src/plugins/builtin/local-model.ts`、`app/src-tauri/src/plugin_sidecar.rs`（本轮**另加**：`app/src-tauri/src/plugin_market.rs`、`app/src-tauri/src/commands.rs`、`app/src-tauri/src/main.rs`、`app/src/plugins/market.ts`、`app/src/plugins/builtin/settings.ts`、`app/src/i18n.ts`）。
 
 ### §待办 3-7 M1 两个待实测项
 | # | 项 | 待办点 |

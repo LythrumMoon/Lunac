@@ -557,8 +557,15 @@ if (-not (Test-Path $NsiFile)) {
   throw "NSI script not found: $NsiFile"
 }
 
-# Read + replace version using UTF8 (no BOM) — NSIS compiler requires correct encoding
-$NsiContent = [System.IO.File]::ReadAllText($NsiFile, [System.Text.Encoding]::UTF8)
+# 读原始字节 → 跳过开头**所有** BOM → UTF-8 解码 → 写回时**恰好一份** BOM。
+# 幂等：源文件有几份 BOM 都无所谓，跑完一定只剩一份（自愈）。
+# ⚠️ 不能只 `ReadAllText` + `WriteAllText`（下文改写）——`ReadAllText` 只剥**一份** BOM，
+# 多出来的 U+FEFF 会当普通字符留在串首，写回时再叠一份 ⇒ 双 BOM 永远治不好（见 testing.md §测试 3）。
+$nsiBytes = [IO.File]::ReadAllBytes($NsiFile)
+$nsiBom = 0
+while ($nsiBom * 3 + 2 -lt $nsiBytes.Length -and
+       $nsiBytes[$nsiBom * 3] -eq 0xEF -and $nsiBytes[$nsiBom * 3 + 1] -eq 0xBB -and $nsiBytes[$nsiBom * 3 + 2] -eq 0xBF) { $nsiBom++ }
+$NsiContent = [System.Text.Encoding]::UTF8.GetString($nsiBytes, $nsiBom * 3, $nsiBytes.Length - $nsiBom * 3)
 
 # Replace PRODUCT_VERSION define (OutFile/DisplayVersion use ${PRODUCT_VERSION})
 $NewDefine = "!define PRODUCT_VERSION `"$Version`""
@@ -569,6 +576,7 @@ if ($NsiContent -notmatch [regex]::Escape($NewDefine)) {
   throw "Failed to update PRODUCT_VERSION in NSI script"
 }
 
+# 以**恰好一份** UTF-8 BOM 重写（NSIS 编译器对含中文的 .nsi 要求正确编码）
 [System.IO.File]::WriteAllText($NsiFile, $NsiContent, [System.Text.UTF8Encoding]::new($true))
 Write-Host "  Version in NSI: $Version" -ForegroundColor DarkGray
 

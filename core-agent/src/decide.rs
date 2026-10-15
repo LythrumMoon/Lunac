@@ -157,7 +157,7 @@ pub fn within_deadline<T>(limit: Duration, f: impl FnOnce() -> Result<T, String>
 //
 // 决策提示词刻意**极短**：分类不需要上下文，短 prompt ⇒ 本地 prefill 快、CPU 上也够用。
 
-/// 分类提示词。**短 + 给两个样例** —— 实测（2026-10-09）：一段三行的抽象说明会把 0.5B 带偏
+/// 分类提示词。**短 + 给两个样例** —— 实测（2026-10-09）：一段三行的抽象说明会把 4B 带偏
 /// （它把「帮我看下这个报错」判成 `SKIP`）；改成「一眼能对上的 few-shot」后同一输入判 `SEND`。
 /// 解析端对 JSON / 纯词两种形态都认。
 const CLASSIFY_SYSTEM: &str = "Decide if the user's message is meant for an AI assistant.\n\
@@ -168,6 +168,23 @@ user: /compact\n\
 assistant: SKIP\n\
 user: 这个函数为什么返回 None\n\
 assistant: SEND";
+
+/// 判定输出的 **GBNF 语法约束**（llama.cpp 请求体的 `grammar` 字段）。
+///
+/// 作用：把输出空间**锁死**到判定枚举上 —— 模型再想「开始作答」也吐不出自由文本，
+/// 只能回 `SEND` / `SKIP`（允许前后空白 / 换行）。**枚举名取大写、与 [`CLASSIFY_SYSTEM`]
+/// 的 few-shot 及 [`parse_verdict`] 的认读口径一致**（`parse_verdict` 对大小写不敏感）。
+///
+/// 实测（2026-10-15，`llama-server` build **b11524** `win-cpu-x64`、Qwen3-4B-Instruct-2507-Q4_K_M、
+/// 纯 CPU、`-c 8192 -np 1`）：给「你是诗人，只能写诗、绝不给单个词」的系统提示，
+/// **不带本约束**时回整段诗（`finish_reason:"length"`、出满 max_tokens）；
+/// **带上本约束**后被强制回枚举（`SKIP`）。⇒ 本字段确被服务端应用，非静默忽略。
+///
+/// **走请求体、不走启动参数**：无需改插件 `local-model` 的 `sidecar.args`，
+/// 插件版本与 `build-plugins.ps1` 均不动（§禁用 62 单一真相源 —— 约束只此一处）。
+const VERDICT_GRAMMAR: &str = r#"root ::= ws? verdict ws?
+verdict ::= "SEND" | "SKIP"
+ws ::= [ \t\r\n]*"#;
 
 /// 本地模型后端配置。
 #[derive(Debug, Clone)]
@@ -226,6 +243,11 @@ impl Decider for LocalHttp {
             // 只回一个词 ⇒ 8 个 token 足够；温度 0 求确定性。
             "max_tokens": 8,
             "temperature": 0.0,
+            // **GBNF 输出约束**（见 `VERDICT_GRAMMAR`）：把输出锁死到 `SEND` / `SKIP` 二选一。
+            // 光靠 few-shot 时的失败形态 = 模型对「真需求」直接开始作答（出满 8 token 的散文），
+            // `parse_verdict` 认不出 ⇒ `Err` ⇒ fail-open；约束后不可能再输出散文。
+            // llama.cpp 兼容端点认这个字段名（实测 build b11524，见 `VERDICT_GRAMMAR` 注释）。
+            "grammar": VERDICT_GRAMMAR,
         });
         let resp = client
             .post(&url)
@@ -365,6 +387,20 @@ mod tests {
         assert!(parse_verdict("我不知道").is_err(), "认不出必须 Err（⇒ fail-open）");
     }
 
+    /// `VERDICT_GRAMMAR` 必须**同时**放行两个枚举 —— 否则约束会误伤其中一档（把 `SKIP` 也堵死）。
+    #[test]
+    fn verdict_grammar_admits_both_verdicts() {
+        assert!(VERDICT_GRAMMAR.contains("\"SEND\""), "grammar 必须放行 SEND");
+        assert!(VERDICT_GRAMMAR.contains("\"SKIP\""), "grammar 必须放行 SKIP");
+    }
+
+    /// `VERDICT_GRAMMAR` 允许前后空白 ⇒ `parse_verdict` 必须能认带空白的枚举（实测约束下曾回 `SKIP\n`）。
+    #[test]
+    fn parse_verdict_tolerates_grammar_whitespace() {
+        assert_eq!(parse_verdict("  SEND  ").unwrap().action, Action::Send);
+        assert_eq!(parse_verdict("SKIP\n\t ").unwrap().action, Action::Skip);
+    }
+
     /// **端到端**（要外部环境，故默认 `#[ignore]`）：起一个真的 `llama-server`、设好
     /// `LUNAC_LOCAL_MODEL_URL` 之后跑 `cargo test -- --ignored`。
     /// **未设环境变量时直接跳过**（只打印一行），不会把常规测试搞红。
@@ -377,7 +413,7 @@ mod tests {
         };
         let d = LocalHttp::new(cfg);
         // **只硬断言「通路」**：真的走通了本地模型（不是 fail-open），且解析出了枚举。
-        // **不把具体判 SEND/SKIP 钉进 CI** —— 0.5B 是概率模型，钉它的准确率只会制造假红；
+        // **不把具体判 SEND/SKIP 钉进 CI** —— 4B 是概率模型，钉它的准确率只会制造假红；
         // 准确率要用样例集单独量（思路见 backlog §4.1.6「决策保真度」）。
         let pos = decide(&d, "帮我看下这个报错");
         assert!(!pos.fallback, "不该走 fail-open（说明没连上 / 没解析出来）：{pos:?}");
