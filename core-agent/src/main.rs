@@ -90,6 +90,10 @@ mod image;
 mod log;
 mod mcp;
 mod mcp_oauth;
+// 记忆候选抽取（S1 第二切片，2026-10-15）：从回合里抽「值得记住的事实」，**只落账本**
+// （绝不写 MEMORY.md / 绝不改任何注入）。见 `memory_candidates.rs` 头注释；开关复用
+// `LUNAC_LOCAL_DECIDE`（默认关），摊销口径 = 每 K 轮 + 压缩事件（与 S1 首切片同源）。
+mod memory_candidates;
 mod peers;
 mod skills;
 mod tools;
@@ -1350,6 +1354,8 @@ fn manual_compact(
     let measured = cfg.last_input.get();
     // 本地只读预筛（S1）：压缩事件点上**只记账，绝不改压缩行为**（手动压缩无提问号 ⇒ turn=0）。
     prescreen_compact("manual", &format!("measured={measured}"), scope, 0);
+    // 记忆候选抽取（S1 第二切片）：压缩事件同样触发一次；**只落账本**、不改压缩行为、不改注入。
+    extract_candidates(history, scope, 0);
     let out = compact_history(history, Compact::Force, measured);
     // 摘要压缩 + 结论索引写入 + 检索重注入：与自动路径同款（Force 档丢弃量最大，最值钱）。
     // 返回值只用来修正调用方的回滚锚点，本路径没有回滚锚点 ⇒ 忽略。
@@ -5142,6 +5148,13 @@ fn main() {
                 // 里程碑写入（结论索引）：一轮提问收尾后把最近窗口的结论确定性落盘（**不调模型**），
                 // 在它们可能被压缩丢掉之前先保住。见 `flush_turn_conclusions`。
                 flush_turn_conclusions(turn_scope, &history, question_seq);
+                // 记忆候选抽取（S1 第二切片，2026-10-15）：**每 K 轮**触发一次 —— 复用 S1 的
+                // 摊销口径（`prescreen_due` + `decide::amortize_k`），**不新造计时器**。
+                // **只落账本**：绝不写 MEMORY.md / 绝不改任何注入（见 `extract_candidates`）。
+                // 单发不抽（进程马上退出、白等一次本地调用）；开关关 / 未配端点 ⇒ 零请求零账本行。
+                if !single_shot && prescreen_due(question_seq, decide::amortize_k()) {
+                    extract_candidates(&history, turn_scope, question_seq);
+                }
                 // 复盘的四个前置（方案 B，2026-10-11；2026-10-13 折中把每会话配额按 scope 拆）：
                 // ① 本轮确实完成了一次用户提问（本代码位置即保证 —— 它在 run_query 返回之后，
                 // 不在工具轮中途）；② 不是只读（plan）档、也不在计划相位（复盘的唯一产品就是
@@ -6458,6 +6471,8 @@ fn run_prescreen(
         scope: scope.as_str().to_string(),
         turn,
         session_id: session_id().to_string(),
+        candidate_count: None,
+        candidates: None,
     };
     decisions::append(dir, scope, &rec);
     decision.action
@@ -6516,6 +6531,98 @@ fn spawn_local_decide_warmup() {
         let d = decide::LocalHttp::new(cfg);
         decide::warmup_with(&d);
     });
+}
+
+// ── 记忆候选抽取的接线（S1 第二切片，2026-10-15）──────────────────────
+//
+// 语义见 `memory_candidates.rs` 头注释。三条铁律（与 S1 首切片同源）：
+//   · **只落账本**：候选只写决策账本，**绝不**写 `MEMORY.md` / **绝不**改 history / `system` /
+//     上下文块 / **不做任何注入** ⇒ **开关开与关，可见行为逐字节不变**（只有账本多一种 `kind`）；
+//   · **默认关 / 未配端点 / 故障 ⇒ 与不接线逐字节一致**（fail-open 落在 `memory_candidates::extract`）；
+//   · **摊销 = 每 K 轮 + 压缩事件**：复用 `decide::amortize_k()` / `prescreen_due` 与既有接线点，
+//     **不新造计时器、不新开账本**（docs/forbidden.md §禁用 62）。
+
+/// 喂给本地抽取的回合快照上限（字符）。**硬上限**：本地 4B 的 prefill / 上下文都吃紧，
+/// 比复盘快照（`REVIEW_TRANSCRIPT_CHARS` = 6000）更短；history→文本复用 `review_transcript`
+/// （**同一套机制**，不另写一份 history 序列化）。
+const CANDIDATE_TRANSCRIPT_CHARS: usize = 4_000;
+
+/// 一次记忆候选抽取：跑抽取 + 记账，**永远返回结果**（可注入 extractor，便于单测）。
+///
+/// **只落账本、不落原文**：每候选只换算成 `hash` + `len`（见 `decisions::CandidateRef`）；
+/// 输入只留 `hash`（`log::hash64`）。账本再过一遍 `decisions::append` 的脱敏。
+fn run_memory_extraction(
+    e: &dyn memory_candidates::Extractor,
+    model: &str,
+    input: &str,
+    scope: tools::MemoryScope,
+    turn: u64,
+    dir: &Path,
+) -> memory_candidates::Extraction {
+    let t0 = Instant::now();
+    let out = memory_candidates::extract(e, input);
+    let latency_ms = t0.elapsed().as_millis() as u64;
+    let verdict = if out.fallback {
+        "fallback"
+    } else if out.facts.is_empty() {
+        "empty"
+    } else {
+        "ok"
+    };
+    let candidates: Vec<decisions::CandidateRef> = out
+        .facts
+        .iter()
+        .map(|f| decisions::CandidateRef {
+            hash: format!("{:016x}", log::hash64(f)),
+            len: f.chars().count() as u32,
+        })
+        .collect();
+    let rec = decisions::DecideRecord {
+        ts: now_epoch_secs(),
+        kind: "memory-candidates".to_string(),
+        input_hash: format!("{:016x}", log::hash64(input)),
+        verdict: verdict.to_string(),
+        latency_ms,
+        model: model.to_string(),
+        reason: out.reason.to_string(),
+        fallback: out.fallback,
+        scope: scope.as_str().to_string(),
+        turn,
+        session_id: session_id().to_string(),
+        candidate_count: Some(candidates.len() as u32),
+        candidates: Some(candidates),
+    };
+    decisions::append(dir, scope, &rec);
+    out
+}
+
+/// 生产入口：**开关关 / 未配端点 ⇒ 不做任何事**（零请求、零账本行）。
+///
+/// 单发（`--print`）不在调用点触发：进程马上退出、白等一次本地调用（同理见复盘）。
+/// 本函数自身**同步**执行（与 S1 预筛同款）—— 单次消耗由 [`memory_candidates::LOCAL_EXTRACT_TIMEOUT`]
+/// 兜底（抽取比判定慢一个量级，用的是**更宽但仍硬**的独立上限，理由见该常量）。
+fn extract_candidates(history: &[Value], scope: tools::MemoryScope, turn: u64) {
+    extract_candidates_into(&decisions::default_dir(), history, scope, turn);
+}
+
+/// [`extract_candidates`] 的可测内核（账本目录**显式传入**，便于单测断言「默认关 ⇒ 零账本行」）。
+fn extract_candidates_into(dir: &Path, history: &[Value], scope: tools::MemoryScope, turn: u64) {
+    if !decide::enabled() {
+        return;
+    }
+    let Some(cfg) = decide::LocalHttpConfig::from_env() else {
+        return;
+    };
+    let model = cfg.model.clone();
+    let input = review_transcript(history, CANDIDATE_TRANSCRIPT_CHARS);
+    let _ = run_memory_extraction(
+        &memory_candidates::LocalExtract::new(cfg),
+        &model,
+        &input,
+        scope,
+        turn,
+        dir,
+    );
 }
 
 // ── 计划相位（A7）：两件工具的**回执**（给模型看）──────────────────
@@ -7257,6 +7364,8 @@ fn run_query(
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "drop" }));
                 // 本地只读预筛（S1）：压缩事件点上**只记账，绝不改压缩行为**。
                 prescreen_compact("drop", &format!("measured={measured}"), tctx.memory_scope, question_seq);
+                // 记忆候选抽取（S1 第二切片）：压缩事件同样触发一次；**只落账本**、不改压缩行为。
+                extract_candidates(history, tctx.memory_scope, question_seq);
                 let out = compact_history(history, Compact::Drop, measured);
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 // 摘要压缩（backlog §8.2）+ 结论索引写入 + 检索重注入：丢弃档是「结论被丢」的
@@ -7344,6 +7453,8 @@ fn run_query(
                 let measured_now = cfg.last_input.get();
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "budget" }));
                 prescreen_compact("budget", &format!("measured={measured_now}"), tctx.memory_scope, question_seq);
+                // 记忆候选抽取（S1 第二切片）：压缩事件同样触发一次；**只落账本**、不改压缩行为。
+                extract_candidates(history, tctx.memory_scope, question_seq);
                 let out = compact_history(history, Compact::Force, measured_now);
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 base += restore_after_compaction(
@@ -7574,6 +7685,8 @@ fn run_query(
                 compacted_for_retry = true;
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "force" }));
                 prescreen_compact("force", &format!("measured={}", cfg.last_input.get()), tctx.memory_scope, question_seq);
+                // 记忆候选抽取（S1 第二切片）：压缩事件同样触发一次；**只落账本**、不改压缩行为。
+                extract_candidates(history, tctx.memory_scope, question_seq);
                 let out = compact_history(history, Compact::Force, cfg.last_input.get());
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 // 兜底档也做「摘要 + 结论索引 + 重注入」—— 这一档丢弃量最大（连尾部都瘦），
@@ -8624,6 +8737,170 @@ mod tests {
         let (spawns, _) = simulate(&Counting(n.clone()), 1, 7, &dir); // K=1 ⇒ 7 轮判 7 次
         assert_eq!(n.load(Ordering::SeqCst), 7, "预筛恰好问 7 次，无预热请求混入");
         assert_eq!(spawns, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── S1 第二切片：记忆候选抽取的接线行为证据（2026-10-15）────────────────
+    //
+    // 与上面 S1 首切片同构：可注入的假 `Extractor` **精确计数**、账本只落 hash + 长度、
+    // 开关关 / 故障 ⇒ 主流程零差异、**绝不落用户原文**。
+
+    /// 固定回一条候选 / 恒失败 / 回显输入的三种桩。
+    struct OneFact;
+    impl memory_candidates::Extractor for OneFact {
+        fn extract(&self, _i: &str) -> Result<Vec<String>, String> {
+            Ok(vec!["用户偏好 4 空格缩进".into()])
+        }
+    }
+    struct CandBoom;
+    impl memory_candidates::Extractor for CandBoom {
+        fn extract(&self, _i: &str) -> Result<Vec<String>, String> {
+            Err("endpoint down".into())
+        }
+    }
+    /// 故意把**输入原文**当候选返回（用于证明账本绝不落原文）。
+    struct EchoInput;
+    impl memory_candidates::Extractor for EchoInput {
+        fn extract(&self, i: &str) -> Result<Vec<String>, String> {
+            Ok(vec![i.to_string()])
+        }
+    }
+
+    /// 模型化「每 K 轮 + 每个压缩事件各触发一次」的接线，返回账本条数。
+    fn simulate_memory(d: &dyn memory_candidates::Extractor, k: u64, n: u64, compactions: usize, dir: &Path) -> usize {
+        for turn in 1..=n {
+            if prescreen_due(turn, k) {
+                run_memory_extraction(d, "test-model", &format!("turn-{turn}"), tools::MemoryScope::Global, turn, dir);
+            }
+        }
+        for c in 0..compactions {
+            run_memory_extraction(d, "test-model", &format!("compact-{c}"), tools::MemoryScope::Global, 0, dir);
+        }
+        decisions::count(dir, tools::MemoryScope::Global)
+    }
+
+    /// ① 摊销**精确计数**：N=23、K=5 ⇒ 恰好 5 条（轮 1/6/11/16/21，与 S1 首切片同口径）；
+    /// 再叠 3 个压缩事件 ⇒ 5 + 3 = 8 条（压缩事件各触发一次）。
+    #[test]
+    fn memory_extraction_is_amortized_every_k_turns_and_per_compaction() {
+        let dir = tmp_dir("cand-k5");
+        assert_eq!(simulate_memory(&OneFact, 5, 23, 0, &dir), 5, "N=23,K=5 必须恰好抽 5 次");
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir2 = tmp_dir("cand-k5c");
+        assert_eq!(simulate_memory(&OneFact, 5, 23, 3, &dir2), 8, "每压缩事件各 +1");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// ② 账本内容正确：`kind=memory-candidates`、`candidate_count` 与 `candidates` 长度一致、
+    /// 每候选带 hash + 长度。
+    #[test]
+    fn memory_extraction_records_kind_and_candidate_refs() {
+        let dir = tmp_dir("cand-kind");
+        run_memory_extraction(&OneFact, "test-model", "user: 记住 4 空格", tools::MemoryScope::Global, 7, &dir);
+        let recs = decisions::load(&dir, tools::MemoryScope::Global);
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!(r.kind, "memory-candidates");
+        assert_eq!(r.verdict, "ok");
+        assert_eq!(r.turn, 7);
+        assert_eq!(r.candidate_count, Some(1));
+        let c = &r.candidates.as_ref().unwrap()[0];
+        assert_eq!(c.hash, format!("{:016x}", log::hash64("用户偏好 4 空格缩进")));
+        assert_eq!(c.len, "用户偏好 4 空格缩进".chars().count() as u32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ③ **绝不落原文**：即便模型把**输入原文**当候选返回，账本里也搜不到那个独特字符串
+    /// （只落 hash 与长度）。
+    #[test]
+    fn memory_extraction_ledger_never_holds_plaintext() {
+        let dir = tmp_dir("cand-mask");
+        let unique = "独特字符串-ZZZUNIQUE-12345";
+        run_memory_extraction(
+            &EchoInput,
+            "test-model",
+            &format!("user: 请记住 {unique} 这件事"),
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+        let blob = std::fs::read_to_string(decisions::path_for(&dir, tools::MemoryScope::Global)).unwrap();
+        assert!(!blob.contains(unique), "账本绝不能含用户原文：{blob}");
+        assert!(!blob.contains("ZZZUNIQUE"), "账本绝不能含用户原文：{blob}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ④ **故障 / 不合 schema = 主流程零差异**：假 `Extractor` 恒 `Err` ⇒ 记账走 `fallback=true`
+    /// 且候选为空，**history / system / tool_defs 指纹逐字节不变**、无 panic。
+    #[test]
+    fn memory_extraction_backend_error_keeps_main_flow_identical() {
+        let dir = tmp_dir("cand-err");
+        let history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"帮我把 parse_args 改对"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"好"}]}),
+        ];
+        let system = "SYS-FIXED-PREFIX";
+        let tool_defs = vec![json!({"name":"Read"}), json!({"name":"Edit"})];
+        let fingerprint = |h: &[Value]| {
+            log::hash64(&format!(
+                "{system}\u{1}{}",
+                serde_json::to_string(&(h, &tool_defs)).unwrap()
+            ))
+        };
+        let before = fingerprint(&history);
+        let out = run_memory_extraction(&CandBoom, "test-model", "user: hi", tools::MemoryScope::Global, 1, &dir);
+        assert!(out.facts.is_empty(), "故障必须丢弃候选");
+        assert!(out.fallback, "必须标 fallback");
+        assert_eq!(fingerprint(&history), before, "固定前缀指纹必须逐字节不变");
+        assert_eq!(history.len(), 2, "history 不被抽取改写");
+        let recs = decisions::load(&dir, tools::MemoryScope::Global);
+        assert_eq!(recs.len(), 1, "故障也留一条 fallback 账本行（与 S1 同口径）");
+        assert!(recs[0].fallback);
+        assert_eq!(recs[0].candidate_count, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑤ **默认关 ⇒ 零请求、零账本行**：未设开关 / 未配端点时 `extract_candidates` 直接返回。
+    #[test]
+    fn memory_extraction_transparent_when_disabled() {
+        if decide::enabled() || decide::LocalHttpConfig::from_env().is_some() {
+            eprintln!("环境已设 LUNAC_LOCAL_DECIDE / LUNAC_LOCAL_MODEL_URL ⇒ 跳过本断言");
+            return;
+        }
+        let dir = tmp_dir("cand-off");
+        let history = vec![json!({"role":"user","content":[{"type":"text","text":"帮我记住 4 空格缩进"}]})];
+        // 走**显式目录**的可测内核：默认关 ⇒ 提前返回，**零账本行**（不碰真实数据根）。
+        extract_candidates_into(&dir, &history, tools::MemoryScope::Global, 1);
+        assert_eq!(decisions::count(&dir, tools::MemoryScope::Global), 0, "默认关 ⇒ 不得写任何候选账本行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **端到端**（要外部环境，默认 `#[ignore]`）：起真的 `llama-server`、设 `LUNAC_LOCAL_MODEL_URL`
+    /// 后跑 `cargo test -- --ignored --nocapture`。真的走一次「记忆候选抽取 + 记账」并打印账本样例行。
+    /// **未设环境变量时直接跳过**（只打印一行），不会把常规测试搞红。
+    #[test]
+    #[ignore = "需要本地 llama-server：设 LUNAC_LOCAL_MODEL_URL 后跑 cargo test -- --ignored"]
+    fn memory_extraction_end_to_end_writes_a_candidate_line() {
+        let Some(cfg) = decide::LocalHttpConfig::from_env() else {
+            eprintln!("跳过：未设 LUNAC_LOCAL_MODEL_URL");
+            return;
+        };
+        let model = cfg.model.clone();
+        let dir = std::env::temp_dir().join(format!("lunac-cand-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let input = "user: 我们项目里的 Rust 代码一律用 cargo clippy 必须 0 warning，提交前必须跑 npm run verify。\nassistant: 明白，以后改 Rust 都先跑 clippy。";
+        let out = run_memory_extraction(
+            &memory_candidates::LocalExtract::new(cfg),
+            &model,
+            input,
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+        let line = std::fs::read_to_string(decisions::path_for(&dir, tools::MemoryScope::Global)).unwrap();
+        eprintln!("真机候选条数 = {}", out.facts.len());
+        eprintln!("账本样例 = {}", line.trim());
+        assert!(!line.trim().is_empty(), "必须写出账本样例行");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

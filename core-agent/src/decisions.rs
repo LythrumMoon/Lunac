@@ -49,6 +49,29 @@ pub struct DecideRecord {
     pub turn: u64,
     /// 会话标识（复用 agent 既有的 `session_id()`）。
     pub session_id: String,
+    /// **记忆候选抽取**（`kind = "memory-candidates"`）的候选**条数**；其余 kind 为 `None`。
+    ///
+    /// `skip_serializing_if` ⇒ 其余 kind 的账本行**逐字节不变**（向后兼容）；`serde(default)`
+    /// ⇒ 老行（没有本字段）仍能被 [`load`] 读出（语义不变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<u32>,
+    /// 各候选的**可追溯引用**（**只存 hash 与长度，绝不含原文**）。见 [`CandidateRef`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<CandidateRef>>,
+}
+
+/// 单条记忆候选在账本里的**可追溯引用**：只有**指纹与长度**，**没有原文**。
+///
+/// 为什么这样存（见 `docs/forbidden.md` §禁用 61 与 `memory_candidates.rs` 的隐私边界）：
+/// 候选是**对用户内容的抽取**，原文不该进账本（账本是旁路留痕，不是对话真相源）。留 hash 供
+/// 去重 / 关联，留 `len` 供体量核对；事实原文仍在 `chat.db` / history 里，靠账本行的
+/// `turn` / `session_id` / `input_hash` **回查**。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateRef {
+    /// 候选事实文本的 FNV-1a 64 位哈希（16 位十六进制）。
+    pub hash: String,
+    /// 候选事实的字符长度。
+    pub len: u32,
 }
 
 // ── 落点与 I/O ───────────────────────────────────────────────────
@@ -145,7 +168,27 @@ mod tests {
             scope: MemoryScope::Global.as_str().into(),
             turn: 5,
             session_id: "sess-1".into(),
+            candidate_count: None,
+            candidates: None,
         }
+    }
+
+    /// 一条**记忆候选抽取**留痕（`kind = memory-candidates`）。
+    fn cand_rec(ts: i64, facts: &[&str]) -> DecideRecord {
+        let mut r = rec(ts, "ok");
+        r.kind = "memory-candidates".into();
+        r.reason = "ok".into();
+        r.candidate_count = Some(facts.len() as u32);
+        r.candidates = Some(
+            facts
+                .iter()
+                .map(|f| CandidateRef {
+                    hash: format!("{:016x}", log::hash64(f)),
+                    len: f.chars().count() as u32,
+                })
+                .collect(),
+        );
+        r
     }
 
     /// 追加 + 读取 + 精确计数：三条写进去，`count` 必须是 3（验收靠它精确断言）。
@@ -206,5 +249,50 @@ mod tests {
         append(&file, MemoryScope::Global, &rec(1, "run"));
         assert_eq!(count(&file, MemoryScope::Global), 0);
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// **向后兼容 ①**：老格式行（**没有** `candidate_count` / `candidates` 两个新字段）仍能 `load`。
+    #[test]
+    fn legacy_lines_without_new_fields_still_load() {
+        let dir = std::env::temp_dir().join(format!("lunac-dec-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 手写一条「改造前」的行（字段名与顺序同旧版，无新字段）。
+        let legacy = r#"{"ts":42,"kind":"prescreen-review","input_hash":"0000000000000001","verdict":"run","latency_ms":9,"model":"local","reason":"model-run","fallback":false,"scope":"global","turn":3,"session_id":"sess-old"}"#;
+        std::fs::write(path_for(&dir, MemoryScope::Global), format!("{legacy}\n")).unwrap();
+        let loaded = load(&dir, MemoryScope::Global);
+        assert_eq!(loaded.len(), 1, "老行必须仍可读出");
+        assert_eq!(loaded[0].ts, 42);
+        assert_eq!(loaded[0].verdict, "run");
+        assert_eq!(loaded[0].candidate_count, None, "老行新字段缺省为 None");
+        assert_eq!(loaded[0].candidates, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **向后兼容 ②**：非「记忆候选」kind 的行**逐字节不变**（新字段为 `None` 时被跳过、不落盘）。
+    #[test]
+    fn legacy_kind_serialization_is_byte_identical() {
+        let line = serde_json::to_string(&rec(7, "skip")).unwrap();
+        assert!(!line.contains("candidate_count"), "新字段不得出现在老 kind 的行里：{line}");
+        assert!(!line.contains("candidates"), "新字段不得出现在老 kind 的行里：{line}");
+    }
+
+    /// 记忆候选行：条数与各候选的 hash + 长度往返一致；**原文不进账本**（只落 hash）。
+    #[test]
+    fn candidate_line_round_trips_without_plaintext() {
+        let dir = std::env::temp_dir().join(format!("lunac-dec-cand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let secret_ish = "用户偏好 4 空格缩进不用 Tab";
+        let r = cand_rec(3, &[secret_ish]);
+        append(&dir, MemoryScope::Global, &r);
+        let blob = std::fs::read_to_string(path_for(&dir, MemoryScope::Global)).unwrap();
+        assert!(blob.contains("candidate_count"), "候选行应含条数");
+        assert!(!blob.contains("Tab"), "候选**原文绝不能**落进账本：{blob}");
+        assert!(blob.contains(&format!("{:016x}", log::hash64(secret_ish))), "候选 hash 应在");
+        let loaded = load(&dir, MemoryScope::Global);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].candidate_count, Some(1));
+        assert_eq!(loaded[0].candidates.as_ref().unwrap()[0].len, secret_ish.chars().count() as u32);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
