@@ -37,10 +37,15 @@ try {
   if ($LASTEXITCODE -ne 0) { Fail "不是 git 仓库: $Root" }
 
   # ── 0.5 BOM 归一（2026-10-04，见 ai-spec §11 规则 82）─────────────
-  # 入库前把 scripts\*.ps1 / *.nsi 的 BOM 修成**恰好一份**：编辑工具（含 AI 的
-  # SearchReplace / Write）会反复往上叠 BOM，而多一份就让 `param()` 不再是脚本首语句
-  # ⇒ 参数静默不绑定（build-plugins / build-release / publish-release 三个脚本都这么
-  # 坏过）。这里是整条链路里**唯一**能自动愈合的点 —— 修完照常提交，坏文件不进库。
+  # 入库前把 scripts\*.ps1 / *.nsi 的 BOM 修成**恰好一份**：多一份就让 `param()` 不再是
+  # 脚本首语句 ⇒ 参数静默不绑定（build-plugins / build-release / publish-release 三个脚本
+  # 都这么坏过）；少一份同样致命（PS 5.1 按 ANSI(GBK) 解码中文 ⇒ 直接解析失败）。
+  # ⚠️ 2026-10-15 实验证伪旧说法「本仓编辑工具（SearchReplace / Write）会往上叠 BOM」：
+  #    它们**只剥不加**（实测 1→0、2→1、3→2）。累加的真正来源是**外部编辑器 / 批量文本
+  #    替换工具**（前置一个 BOM 却不先剥掉原文自带的那份，每跑一次 +1）。取证见
+  #    testing.md §测试 3「BOM 累积取证结论」。
+  # 本脚本是**入库前**的一道归一；`verify-git.ps1` 的 [8/8] 自 2026-10-15 起也做幂等自动
+  # 归一（两者口径一致）。绕过本脚本的直接 `git add`/`git commit` 不受本道保护。
   $bomFixed = @()
   foreach ($f in @(Get-ChildItem (Join-Path $Root "scripts") -File -ErrorAction SilentlyContinue |
                    Where-Object { $_.Extension -in ".ps1", ".nsi" })) {
