@@ -79,9 +79,12 @@ use serde_json::{json, Value};
 mod bash_safety;
 mod conclusions;
 mod content_safety;
-// 「要不要把这条输入发给云模型」的决策边界（S1 第一步）。**当前没有调用点，是刻意的** ——
-// 调用点 = L10 桌宠常驻输入；核心 agent 接线另议。见 docs/agent-feature-backlog.md §4.1.1 / §4.1.3。
+// 本地「只读预筛」决策层（S1 首个切片，2026-10-15）：消费点 = 主循环里「是否派后台复盘 fork」
+// （另在四个压缩触发点只记账）。见 `decide.rs` 头注释；开关 `LUNAC_LOCAL_DECIDE` 默认关，
+// 未配 `LUNAC_LOCAL_MODEL_URL` 时整层透明关闭（行为与不接线逐字节一致）。
 mod decide;
+// 本地决策账本：独立追加式 JSONL，**不进 chat.db**（docs/forbidden.md §禁用 61）。
+mod decisions;
 mod hooks;
 mod image;
 mod log;
@@ -1345,6 +1348,8 @@ fn manual_compact(
     }
     fire_plain_hook("PreCompact", cwd, json!({ "trigger": "manual" }));
     let measured = cfg.last_input.get();
+    // 本地只读预筛（S1）：压缩事件点上**只记账，绝不改压缩行为**（手动压缩无提问号 ⇒ turn=0）。
+    prescreen_compact("manual", &format!("measured={measured}"), scope, 0);
     let out = compact_history(history, Compact::Force, measured);
     // 摘要压缩 + 结论索引写入 + 检索重注入：与自动路径同款（Force 档丢弃量最大，最值钱）。
     // 返回值只用来修正调用方的回滚锚点，本路径没有回滚锚点 ⇒ 忽略。
@@ -5010,6 +5015,11 @@ fn main() {
     // 那时工具表已定死，只能白答一轮再重启（实测踩到，见 ai-spec §20.1）。
     // 超时分支不处理任何消息，只做一次 watcher 比对（报过后 `Option` 已置 `None`，零成本）；
     // 断开与原「迭代器结束」语义相同。
+    //
+    // 冷启动预热（S1，2026-10-15）：进主循环**之前**丢一个后台线程预热本地判定端点 ——
+    // 趁用户还没提问，把 `llama-server` 的冷启开销吃掉，让「启动后第一次真实判定」落在
+    // `LOCAL_DECIDE_TIMEOUT`（1500ms）内。**绝不阻塞启动 / 主循环**；默认关 ⇒ 零请求。
+    spawn_local_decide_warmup();
     loop {
         let msg = match rx.recv_timeout(MCP_WATCH_TICK) {
             Ok(m) => m,
@@ -5163,14 +5173,34 @@ fn main() {
                     // 不再重试）——「每会话每 scope ≤ 1 次」是硬上限。只有**真派出去**了才记
                     // 「上次复盘时间」（写侧发生了一次云调用，下一次要隔 30 分钟）；派不出去
                     // （配置副本建不出 / 快照为空）不记时间，于是下个会话仍可再来一次。
+                    // ⚠️ 本地只读预筛判 SKIP 时**照样**吃配额（就在这一行）——保持幂等语义，
+                    // 别让「跳过」变成「下次还能再派」。
                     reviewed_this_session[turn_scope.index()] = true;
-                    if let Some(handle) =
-                        review_setup.spawn(&cfg, &tools_ctx, &history, &memory, review_seq)
+                    // ── 本地只读预筛（S1 首个切片，2026-10-15）──
+                    // 只在「每 K 轮」到点时判定（K = LUNAC_LOCAL_DECIDE_K，默认 5）。
+                    // SKIP ⇒ 本轮**不派**复盘（省一次云调用）；None（整层关闭 / 未配端点 /
+                    // 未到点）/ RUN / 任何故障 ⇒ **照旧派**（fail-open）。判定只影响控制流与
+                    // 账本，**绝不改 history / 固定前缀**（见 `prescreen`）。
+                    let verdict = if decide::enabled()
+                        && prescreen_due(question_seq, decide::amortize_k())
                     {
-                        pending_review = Some(handle);
-                        let now = now_epoch_secs();
-                        last_review_ts = Some(now);
-                        save_last_review_ts(now);
+                        prescreen(&prompt, "prescreen-review", turn_scope, question_seq)
+                    } else {
+                        None
+                    };
+                    if allow_review_spawn(verdict) {
+                        if let Some(handle) =
+                            review_setup.spawn(&cfg, &tools_ctx, &history, &memory, review_seq)
+                        {
+                            pending_review = Some(handle);
+                            let now = now_epoch_secs();
+                            last_review_ts = Some(now);
+                            save_last_review_ts(now);
+                        }
+                    } else {
+                        log::info(format!(
+                            "本地只读预筛判 SKIP：本轮（q{question_seq}）不派后台复盘（配额已吃）"
+                        ));
                     }
                 }
             }
@@ -6385,6 +6415,109 @@ fn collect_review(
     true
 }
 
+// ── 本地只读预筛的接线（S1 首个切片，2026-10-15）──────────────────────
+//
+// 语义与摊销口径见 `decide.rs` 头注释。三条铁律（**首切片**）：
+//   · **只读**：判定只影响**控制流与账本**，**绝不**改 history / `system` / `tool_defs` /
+//     上下文块 ⇒ **不动主请求固定前缀**、不废缓存（docs/code-standards.md §规范 6）；
+//   · **默认关 / 未配端点 / 故障 ⇒ 与不接线逐字节一致**（fail-open 落在 `decide::decide`）；
+//   · **压缩事件只记账**：四个触发点上只写账本，**绝不改压缩行为**。
+
+/// 是否本轮该做「每 K 轮」预筛：**第 1 轮** + 之后每 K 轮一次。
+///
+/// 口径 `(turn - 1) % K == 0`（`turn` 从 1 起，即 `question_seq`）。K=1 ⇒ 退化为每轮；
+/// K ≥ 轮数 ⇒ 只在首轮判一次（第 2..K 轮的 `(turn-1) < K` 恒不整除）。
+fn prescreen_due(turn: u64, k: u64) -> bool {
+    k > 0 && turn >= 1 && (turn - 1) % k == 0
+}
+
+/// 一次只读预筛：跑判定 + 记账，**永远返回判定**（可注入 decider，便于单测）。
+///
+/// 输入只用于留**哈希**（`log::hash64`），账本里没有原文（`decisions::append` 再过一遍脱敏）。
+fn run_prescreen(
+    d: &dyn decide::Decider,
+    model: &str,
+    input: &str,
+    kind: &str,
+    scope: tools::MemoryScope,
+    turn: u64,
+    dir: &Path,
+) -> decide::Action {
+    let t0 = Instant::now();
+    let decision = decide::decide(d, input);
+    let latency_ms = t0.elapsed().as_millis() as u64;
+    let rec = decisions::DecideRecord {
+        ts: now_epoch_secs(),
+        kind: kind.to_string(),
+        input_hash: format!("{:016x}", log::hash64(input)),
+        verdict: decision.action.as_str().to_string(),
+        latency_ms,
+        model: model.to_string(),
+        reason: decision.reason.to_string(),
+        fallback: decision.fallback,
+        scope: scope.as_str().to_string(),
+        turn,
+        session_id: session_id().to_string(),
+    };
+    decisions::append(dir, scope, &rec);
+    decision.action
+}
+
+/// 生产入口：**整层关闭 / 未配端点 ⇒ `None`**（调用方据此走现状路径，逐字节不变）。
+fn prescreen(input: &str, kind: &str, scope: tools::MemoryScope, turn: u64) -> Option<decide::Action> {
+    if !decide::enabled() {
+        return None;
+    }
+    // 未配 `LUNAC_LOCAL_MODEL_URL` ⇒ 整层透明关闭（既有行为，别破坏）。
+    let cfg = decide::LocalHttpConfig::from_env()?;
+    let dir = decisions::default_dir();
+    // 形态 A（零依赖确定性快判）：明显不值得复盘的回合（斜杠命令 / 无实质内容）直接 Skip，
+    // 连本地模型都不必问（省一次模型调用）。这也是 `Heuristic` 在生产里的唯一用途，判据同源。
+    if decide::obviously_not_reviewable(input) {
+        return Some(run_prescreen(&decide::Heuristic, "heuristic", input, kind, scope, turn, &dir));
+    }
+    // 形态 B：本地模型。任何故障 ⇒ fail-open（照旧派），落在 `decide::decide`。
+    let model = cfg.model.clone();
+    let d = decide::LocalHttp::new(cfg);
+    Some(run_prescreen(&d, &model, input, kind, scope, turn, &dir))
+}
+
+/// 压缩事件的只读预筛：**只记账，绝不改压缩行为**（四个压缩触发点各调一次）。
+fn prescreen_compact(trigger: &str, detail: &str, scope: tools::MemoryScope, turn: u64) {
+    if !decide::enabled() {
+        return;
+    }
+    let input = format!("compact-trigger={trigger} {detail}");
+    let _ = prescreen(&input, "compact-prescreen", scope, turn);
+}
+
+/// 预筛结果是否允许派后台复盘：**只有明确 `Skip` 才拦**（`None` / `Run` / 故障 ⇒ 照旧派）。
+fn allow_review_spawn(verdict: Option<decide::Action>) -> bool {
+    !matches!(verdict, Some(decide::Action::Skip))
+}
+
+/// 冷启动预热（S1，2026-10-15）：**agent 启动时**后台对本地端点发**一次**极短请求。
+///
+/// 为什么需要：`llama-server` 冷启后**第一次**判定耗时 **>1500ms**（撞 [`decide::LOCAL_DECIDE_TIMEOUT`]）
+/// ⇒ 启动后首次预筛静默 fail-open（行为安全，但等于没生效）；热机后正常。预热把模型加载 /
+/// 首次 KV / 连接吃进缓存，使首次真实判定落在超时内。**超时值 1500ms 不动**。
+///
+/// 三条硬约束：① **后台线程，绝不阻塞启动 / 主循环**（本函数立刻返回）；
+/// ② 只在「开关开 + 端点已配」时预热（[`decide::warmup_config`]），**默认关 ⇒ 零预热、零请求**；
+/// ③ 失败静默（[`decide::warmup_with`] 内部只记 info，绝不上抛）。**只打本地端点**，绝不碰云端点。
+/// 预热**不进决策账本**、**不影响预筛语义与消费点**、**不动固定前缀**。
+/// ⚠️ 预热用自己的更宽上限（[`decide::WARMUP_TIMEOUT`]）而非判定的 1500ms —— 冷启第一次推理
+/// 本就更慢，沿用 1500ms 会把预热自身提前掐掉（理由见该常量注释）。
+fn spawn_local_decide_warmup() {
+    let Some(cfg) = decide::warmup_config() else {
+        return; // 默认关 / 未配端点 ⇒ 不预热（零请求）
+    };
+    thread::spawn(move || {
+        let d = decide::LocalHttp::new(cfg);
+        decide::warmup_with(&d);
+    });
+}
+
 // ── 计划相位（A7）：两件工具的**回执**（给模型看）──────────────────
 //
 // 为什么这两件工具的状态机写在 `main.rs` 而不是 `tools.rs`：状态本身在 `tools::Ctx`
@@ -7122,6 +7255,8 @@ fn run_query(
                 // 那是**按端点实际报错**触发，比「按我们猜的水位反复压」可靠得多。
                 // PreCompact hook（A9）：压缩**之前**发，让用户脚本能记录「这次压了什么水位」
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "drop" }));
+                // 本地只读预筛（S1）：压缩事件点上**只记账，绝不改压缩行为**。
+                prescreen_compact("drop", &format!("measured={measured}"), tctx.memory_scope, question_seq);
                 let out = compact_history(history, Compact::Drop, measured);
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 // 摘要压缩（backlog §8.2）+ 结论索引写入 + 检索重注入：丢弃档是「结论被丢」的
@@ -7208,6 +7343,7 @@ fn run_query(
             } else {
                 let measured_now = cfg.last_input.get();
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "budget" }));
+                prescreen_compact("budget", &format!("measured={measured_now}"), tctx.memory_scope, question_seq);
                 let out = compact_history(history, Compact::Force, measured_now);
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 base += restore_after_compaction(
@@ -7437,6 +7573,7 @@ fn run_query(
             if status == 400 && !compacted_for_retry && context_related_error(&detail) {
                 compacted_for_retry = true;
                 fire_plain_hook("PreCompact", &tctx.cwd, json!({ "trigger": "force" }));
+                prescreen_compact("force", &format!("measured={}", cfg.last_input.get()), tctx.memory_scope, question_seq);
                 let out = compact_history(history, Compact::Force, cfg.last_input.get());
                 base = base.saturating_sub(out.dropped) + out.pinned;
                 // 兜底档也做「摘要 + 结论索引 + 重注入」—— 这一档丢弃量最大（连尾部都瘦），
@@ -8298,6 +8435,228 @@ fn finish_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S1 首个切片：本地只读预筛的接线行为证据（2026-10-15）────────────────
+    //
+    // 用可注入的假 `Decider` **精确计数**（不许「看起来对」）。控制流与 `main()` 里那段同构：
+    // 只有「每 K 轮」到点才判，`allow_review_spawn` 决定派不派。基线 = 「不接线」（每轮都派）。
+
+    struct FixedSkip;
+    impl decide::Decider for FixedSkip {
+        fn decide(&self, _i: &str) -> Result<decide::Decision, String> {
+            Ok(decide::Decision::skip("stub-skip"))
+        }
+    }
+    struct FixedRun;
+    impl decide::Decider for FixedRun {
+        fn decide(&self, _i: &str) -> Result<decide::Decision, String> {
+            Ok(decide::Decision::run("stub-run"))
+        }
+    }
+    struct FixedErr;
+    impl decide::Decider for FixedErr {
+        fn decide(&self, _i: &str) -> Result<decide::Decision, String> {
+            Err("endpoint down".into())
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("lunac-pre-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// 模型化「每 K 轮 gate 复盘 spawn」的控制流，返回 (派发次数, 账本条数)。
+    fn simulate(d: &dyn decide::Decider, k: u64, n: u64, dir: &Path) -> (usize, usize) {
+        let mut spawns = 0usize;
+        for turn in 1..=n {
+            let verdict = if prescreen_due(turn, k) {
+                Some(run_prescreen(
+                    d,
+                    "test-model",
+                    &format!("turn-{turn}"),
+                    "prescreen-review",
+                    tools::MemoryScope::Global,
+                    turn,
+                    dir,
+                ))
+            } else {
+                None
+            };
+            if allow_review_spawn(verdict) {
+                spawns += 1;
+            }
+        }
+        (spawns, decisions::count(dir, tools::MemoryScope::Global))
+    }
+
+    /// ① 调用次数精确：N=23、K=5 ⇒ 账本**恰好 5 条**（轮 1/6/11/16/21）。
+    #[test]
+    fn prescreen_is_amortized_every_k_turns_exactly() {
+        let dir = tmp_dir("k5");
+        let (_, count) = simulate(&FixedRun, 5, 23, &dir);
+        assert_eq!(count, 5, "N=23,K=5 必须恰好判 5 次");
+        let due: Vec<u64> = (1..=23).filter(|t| prescreen_due(*t, 5)).collect();
+        assert_eq!(due, vec![1, 6, 11, 16, 21]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ② SKIP 真的改变行为：固定回 SKIP（每轮都判，K=1）⇒ 派发**零次**；固定回 RUN ⇒ 与不接线一致。
+    #[test]
+    fn skip_suppresses_spawn_and_run_matches_baseline() {
+        let d_skip = tmp_dir("skip");
+        let (spawn_skip, n_skip) = simulate(&FixedSkip, 1, 23, &d_skip);
+        assert_eq!(spawn_skip, 0, "SKIP ⇒ 后台复盘派发零次");
+        assert_eq!(n_skip, 23, "K=1 ⇒ 每轮都记账");
+
+        let d_run = tmp_dir("run");
+        let (spawn_run, _) = simulate(&FixedRun, 1, 23, &d_run);
+        assert_eq!(spawn_run, 23, "RUN ⇒ 派发次数与不接线（每轮都派）一致");
+        let _ = std::fs::remove_dir_all(&d_skip);
+        let _ = std::fs::remove_dir_all(&d_run);
+    }
+
+    /// ③ 失败 = 零差异：假 `Decider` 回 `Err` ⇒ 派发次数、history、固定前缀指纹与不接线**全等**。
+    #[test]
+    fn backend_error_is_identical_to_unwired() {
+        let dir = tmp_dir("err");
+        let history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"帮我把 parse_args 改对"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"好"}]}),
+        ];
+        let system = "SYS-FIXED-PREFIX";
+        let tool_defs = vec![json!({"name":"Read"}), json!({"name":"Edit"})];
+        let fingerprint = |h: &[Value]| {
+            log::hash64(&format!(
+                "{system}\u{1}{}",
+                serde_json::to_string(&(h, &tool_defs)).unwrap()
+            ))
+        };
+        let before = fingerprint(&history);
+        let (spawn_err, _) = simulate(&FixedErr, 5, 23, &dir);
+        assert_eq!(spawn_err, 23, "Err ⇒ fail-open ⇒ 与不接线（每轮都派）一致");
+        assert_eq!(fingerprint(&history), before, "固定前缀指纹必须逐字节不变");
+        assert_eq!(history.len(), 2, "history 不被判定改写");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ④ 账本脱敏：喂含 sk-... 的输入 ⇒ 账本文件不含明文（只留哈希）。
+    #[test]
+    fn ledger_never_holds_plaintext_secret() {
+        let dir = tmp_dir("mask");
+        run_prescreen(
+            &FixedRun,
+            "test-model",
+            "用 sk-live-99887766 试一下",
+            "prescreen-review",
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+        let blob =
+            std::fs::read_to_string(decisions::path_for(&dir, tools::MemoryScope::Global)).unwrap();
+        assert!(!blob.contains("99887766"), "凭据不得落进账本：{blob}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑤ 写账本失败不影响主流程：目录不可写（指到一个文件）⇒ 只 warn、判定照常返回、不 panic。
+    #[test]
+    fn ledger_write_failure_does_not_break_prescreen() {
+        let file = std::env::temp_dir().join(format!("lunac-pre-file-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let action = run_prescreen(
+            &FixedSkip,
+            "test-model",
+            "hi",
+            "prescreen-review",
+            tools::MemoryScope::Global,
+            1,
+            &file,
+        );
+        assert_eq!(action, decide::Action::Skip, "记账失败也必须正常返回判定");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// ⑥ K 边界：K=1 退化为每轮；K ≥ N 只在首轮判一次。
+    #[test]
+    fn amortize_k_boundaries() {
+        assert!((1..=23).all(|t| prescreen_due(t, 1)), "K=1 ⇒ 每轮都触发");
+        let due: Vec<u64> = (1..=23).filter(|t| prescreen_due(*t, 100)).collect();
+        assert_eq!(due, vec![1], "K≥N ⇒ 只判首轮");
+        let d1 = tmp_dir("k1");
+        let (_, c1) = simulate(&FixedRun, 1, 5, &d1);
+        assert_eq!(c1, 5, "K=1 ⇒ 5 轮判 5 次");
+        let d2 = tmp_dir("kbig");
+        let (_, c2) = simulate(&FixedRun, 100, 23, &d2);
+        assert_eq!(c2, 1, "K≥N ⇒ 只有 1 条账本");
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// ⑦ 默认关等同不接线：未设开关 / 未配端点 ⇒ `prescreen` 返回 `None`、照旧派。
+    #[test]
+    fn prescreen_transparent_when_disabled() {
+        if decide::enabled() || decide::LocalHttpConfig::from_env().is_some() {
+            eprintln!("环境已设 LUNAC_LOCAL_DECIDE / LUNAC_LOCAL_MODEL_URL ⇒ 跳过本断言");
+            return;
+        }
+        let v = prescreen("随便一句", "prescreen-review", tools::MemoryScope::Global, 1);
+        assert!(v.is_none(), "默认关 / 未配端点时整层不介入");
+        assert!(allow_review_spawn(v), "None ⇒ 照旧派（与不接线逐字节一致）");
+    }
+
+    /// ⑧ 预热**不在预筛路径上**：N 次预筛 ⇒ 计数桩恰好被问 N 次（没有额外的预热请求混进来）。
+    /// 「恰好预热一次」由 `spawn_local_decide_warmup` 的**唯一启动调用点** + `decide.rs` 的
+    /// `warmup_asks_the_backend_exactly_once` 共同保证。
+    #[test]
+    fn prescreen_path_never_triggers_a_warmup_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Counting(Arc<AtomicUsize>);
+        impl decide::Decider for Counting {
+            fn decide(&self, _i: &str) -> Result<decide::Decision, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(decide::Decision::run("counted"))
+            }
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        let dir = tmp_dir("nowarm");
+        let (spawns, _) = simulate(&Counting(n.clone()), 1, 7, &dir); // K=1 ⇒ 7 轮判 7 次
+        assert_eq!(n.load(Ordering::SeqCst), 7, "预筛恰好问 7 次，无预热请求混入");
+        assert_eq!(spawns, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **端到端**（要外部环境，默认 `#[ignore]`）：起真的 `llama-server`、设 `LUNAC_LOCAL_MODEL_URL`
+    /// 后跑 `cargo test -- --ignored --nocapture`。真的走一次「本地只读预筛 + 记账」，打印账本样例行。
+    /// **未设环境变量时直接跳过**（只打印一行），不会把常规测试搞红。
+    #[test]
+    #[ignore = "需要本地 llama-server：设 LUNAC_LOCAL_MODEL_URL 后跑 cargo test -- --ignored"]
+    fn prescreen_end_to_end_writes_a_ledger_line() {
+        let Some(cfg) = decide::LocalHttpConfig::from_env() else {
+            eprintln!("跳过：未设 LUNAC_LOCAL_MODEL_URL");
+            return;
+        };
+        let model = cfg.model.clone();
+        let d = decide::LocalHttp::new(cfg);
+        let dir = std::env::temp_dir().join(format!("lunac-pre-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let action = run_prescreen(
+            &d,
+            &model,
+            "帮我看下 src/main.rs 这个解析报错",
+            "prescreen-review",
+            tools::MemoryScope::Global,
+            1,
+            &dir,
+        );
+        let line =
+            std::fs::read_to_string(decisions::path_for(&dir, tools::MemoryScope::Global)).unwrap();
+        eprintln!("真机判定 = {action:?}");
+        eprintln!("账本样例 = {}", line.trim());
+        assert!(!line.trim().is_empty(), "必须写出账本样例行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 单发模式（--print）的参数判定（2026-10-11）。
     /// 钉住四件事：① 带值形态把紧跟的非 flag 当 query；② 不带值形态（后面是别的 flag）

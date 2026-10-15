@@ -472,7 +472,8 @@ pub fn dump_api_enabled() -> bool {
 }
 
 /// env 布尔风格：1 / true / on / yes（忽略大小写与首尾空白）为真。
-fn is_truthy(v: &str) -> bool {
+/// `pub(crate)`：`decide.rs` 的 `LUNAC_LOCAL_DECIDE` 开关复用同一口径（单一真相源）。
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "on" | "yes"
