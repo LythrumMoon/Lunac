@@ -123,7 +123,7 @@ Write-Host "[7/8] 数据目录（便携模式）" -ForegroundColor Cyan
 Ok "根目录 = exe 所在目录；dev 落在 app\src-tauri\target\debug\ 旁，release 落在安装根"
 Note "子目录: temp\（缓存）ModuleData\（历史/备忘录/自定义启动项）skills\ tools\ Modules\（插件）config\ paddle-ocr\"
 
-# ── 8. 脚本编码（.ps1 / .nsi 的 UTF-8 BOM）──────────────────────
+# ── 8. 脚本编码（.ps1 / .nsi 的 UTF-8 BOM）—— 检测并**就地归一**──────
 # 这条不是洁癖：含中文的 .ps1 / .nsi 一旦丢了 BOM，PS 5.1 与 makensis 会按 ANSI(GBK)
 # 解码，中文字符会把紧随其后的引号/换行吞进双字节 —— 表现是「字符串缺少终止符」或
 # makensis 的 `Bad text encoding`（行号还指向首个非 ASCII 行，极易误判）。
@@ -131,10 +131,20 @@ Note "子目录: temp\（缓存）ModuleData\（历史/备忘录/自定义启动
 # ⇒ 第 18 行的 param() 不再是首语句 ⇒ 脚本参数**全部不绑定**，而报错信息是
 # 「无法将"?#"项识别为 cmdlet」+「无法将"param"项识别为 cmdlet」这种看不懂的东西
 # （实测 build-release.ps1 就是这么坏掉的：版本号最后变成字符串 "False"）。
+#
+# 2026-10-15 由「只报 FAIL、要人工修」改成「检测并**就地归一**」：多份 BOM 是**编辑 /
+# 写文件时**叠出来的（不是脚本运行时加的），而 `commit.ps1` §0.5 的 BOM 归一**只在走
+# 它提交时**生效 —— 直接 `git add` / `git commit`（agent 任务常见）会绕过它，于是 2 份
+# BOM 的文件进过库（历史确有这一笔）。并入本自检链后，跑一次 `npm run verify` 就把任何
+# 「开头多份 / 含中文却缺 BOM」的脚本修成恰好一份（幂等；全对时**零改动**）。
+# 取证结论：本仓工具链里**没有任何写入者会加 BOM** —— 本环境编辑工具（SearchReplace /
+# Write）实测写文件只会**剥掉一份** BOM（1→0 / 2→1 / 3→2），从不累加；累加源自外部
+# 编辑器 / 文本替换工具（与 archive `ai-spec.md` §11 规则 82 的记录同源）。
 Write-Host "[8/8] 脚本编码（UTF-8 with BOM，且只有一份）" -ForegroundColor Cyan
 $encFiles = Get-ChildItem -Path $root -Recurse -File -Include *.ps1, *.nsi -ErrorAction SilentlyContinue |
   Where-Object { $_.FullName -notmatch '\\(node_modules|target|release|dist|\.git|core|mingw64)\\' }
 $encBad = 0
+$encFixed = @()
 foreach ($f in $encFiles) {
   $b = [IO.File]::ReadAllBytes($f.FullName)
   # 数**全部**开头连着的 BOM，不是只判「有没有两份」（2026-09-29 实测踩到 4 份：
@@ -148,17 +158,29 @@ foreach ($f in $encFiles) {
   $nonAscii = $false
   foreach ($x in $b) { if ($x -gt 0x7F) { $nonAscii = $true; break } }
   $rel = $f.FullName.Replace("$root\", "")
-  if ($bomCount -gt 1) {
-    Bad "$rel 开头有**$bomCount 份** BOM（正确是 1 份）"
-    Note "修复: 以 UTF-8 with BOM 重存（首三字节 EF BB BF，第四字节不能又是 EF）"
-    $encBad++
-  } elseif ($nonAscii -and $bomCount -eq 0) {
-    Bad "$rel 含中文但没有 BOM"
-    Note "修复: 以 UTF-8 with BOM 重存"
-    $encBad++
+  # 需要修：① 开头有多份 BOM；② 含非 ASCII 却没有 BOM（纯 ASCII 无 BOM 合法，不动）。
+  if ($bomCount -gt 1 -or ($nonAscii -and $bomCount -eq 0)) {
+    # 就地归一（幂等）：跳过开头**所有** BOM → 以恰好一份写回。口径与 `commit.ps1`
+    # §0.5、`build-*.ps1` / `publish-*.ps1` 的自愈守卫**完全一致**（单一写法）。
+    $rest = New-Object byte[] ($b.Length - $bomCount * 3)
+    [Array]::Copy($b, $bomCount * 3, $rest, 0, $rest.Length)
+    $fixedBytes = New-Object byte[] ($rest.Length + 3)
+    [Array]::Copy([byte[]](0xEF, 0xBB, 0xBF), 0, $fixedBytes, 0, 3)
+    [Array]::Copy($rest, 0, $fixedBytes, 3, $rest.Length)
+    try {
+      [IO.File]::WriteAllBytes($f.FullName, $fixedBytes)
+      $encFixed += ("{0}（{1} 份 → 1 份）" -f $rel, $bomCount)
+    } catch {
+      Bad "$rel BOM 归一失败：$($_.Exception.Message)"
+      $encBad++
+    }
   }
 }
-if ($encBad -eq 0) { Ok "$($encFiles.Count) 个 .ps1 / .nsi 编码正确" }
+if ($encBad -eq 0 -and $encFixed.Count -eq 0) { Ok "$($encFiles.Count) 个 .ps1 / .nsi 编码正确" }
+if ($encFixed.Count -gt 0) {
+  Warn "已自动归一 $($encFixed.Count) 个 .ps1 / .nsi 的 BOM（原为多份或缺 BOM，见 testing.md §测试 3）"
+  $encFixed | ForEach-Object { Note "  $_" }
+}
 
 # ── 汇总 ────────────────────────────────────────────────────────
 Write-Host ""

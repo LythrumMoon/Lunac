@@ -80,7 +80,8 @@ powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1
   # 期望 EF BB BF 23 ...（恰好一个 BOM + 首字符）
   ```
 - **修法**（归一成恰好一份）：读出全部字节 → 跳过开头所有 `EF BB BF` → 用 `UTF8Encoding($true)` 重写。**不要用编辑器加/去 BOM。**
-- **持久化防护**：`commit.ps1` 在 `git add` 前归一 BOM；`build-plugins.ps1` / `build-release.ps1` 在写操作前自愈守卫。改完 `.ps1` / `.nsi` 一律跑 `npm run verify`。
+- **持久化防护**：`commit.ps1` 在 `git add` 前归一 BOM；`build-plugins.ps1` / `build-release.ps1` / `publish-plugins.ps1` 在写操作前自愈守卫；`verify-git.ps1` 第 ⑧ 节**检测并就地归一**（幂等；2026-10-15 由「只报 FAIL」改——全对时零改动）。改完 `.ps1` / `.nsi` 一律跑 `npm run verify`。
+- **「BOM 反复变多」的取证结论（2026-10-15）**：累加发生在**编辑 / 写文件时**（不是脚本运行时）——但**本仓工具链里没有任何写入者会加 BOM**：本环境编辑工具（`SearchReplace` / `Write`）实测每次写只会**剥掉一份** BOM（1→0 / 2→1 / 3→2），**从不累加**；累加源自**外部编辑器 / 文本替换工具**（「`ReadAllBytes` → 前置 `EF BB BF` 但不先剥原有 BOM」这一类写法，与 archive `ai-spec.md` §11 规则 82 同源）。⇒ `commit.ps1` 的自愈**只覆盖走它提交**的路径，直接 `git add` / `git commit`（agent 任务常见）会绕过它（历史确有 2 份 BOM 的提交 `7ee492c`）；这正是把归一**并入 `verify` 第 ⑧ 节**的原因。
 - 其余文件（`.ts` / `.rs` / `.css` / `.md`）**一律不带 BOM**。
 
 ## §测试 4 预检清单（每次修改必查）
