@@ -272,17 +272,38 @@ mod tests {
     /// 用各家官方文档里的**示例**值：形状对、但都不是真 key。
     #[test]
     fn prefixed_credentials_are_detected() {
+        // ⚠️ 夹具一律**拆段拼接**：运行时字符串与官方文档示例逐字一致（规则照样命中），
+        // 但源码里不再存在**连续的凭据 token** ⇒ GitHub secret scanning / push protection 不误报。
+        // 拆点只保证「任一片段自身不成形」（前缀 + 长度不足），拼接结果不受影响。
         for (want, sample) in [
-            ("AWS access key", "aws_access_key_id = AKIAIOSFODNN7EXAMPLE"),
-            ("GitHub token", "gh = ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+            (
+                "AWS access key",
+                concat!("aws_access_key_id = AKIAIOSFODNN", "7EXAMPLE"),
+            ),
+            (
+                "GitHub token",
+                concat!("gh = ghp_ABCDEFGHIJKLM", "NOPQRSTUVWXYZ0123456789"),
+            ),
             (
                 "OpenAI key",
-                "openai = sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd",
+                concat!("openai = sk-ABCDEFGHIJKLMNOP", "QRSTUVWXYZ0123456789abcd"),
             ),
-            ("Anthropic key", "anthropic = sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX"),
-            ("Google API key", "google = AIzaSyA1234567890abcdefghijklmnopqrstuv"),
-            ("Slack token", "slack = xoxb-123456789012-abcdefghijklmnop"),
-            ("Stripe key", "stripe = sk_live_ABCDEFGHIJKLMNOPQRSTUVWX"),
+            (
+                "Anthropic key",
+                concat!("anthropic = sk-ant-api03-", "ABCDEFGHIJKLMNOPQRSTUVWX"),
+            ),
+            (
+                "Google API key",
+                concat!("google = AIzaSyA1234567890", "abcdefghijklmnopqrstuv"),
+            ),
+            (
+                "Slack token",
+                concat!("slack = xoxb-12345", "6789012-abcdefghijklmnop"),
+            ),
+            (
+                "Stripe key",
+                concat!("stripe = sk_live_", "ABCDEFGHIJKLMNOPQRSTUVWX"),
+            ),
         ] {
             let hit = rules_hit(sample);
             assert!(hit.contains(&want), "{want} 没被认出来：{sample:?} → {hit:?}");
@@ -293,9 +314,13 @@ mod tests {
     #[test]
     fn structured_credentials_are_detected() {
         let text = concat!(
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n",
-            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop\n",
-            "DB=postgres://appuser:s3cr3t-p4ss@db.internal:5432/app\n",
+            // 私钥头 / JWT / 连接串口令同样拆段：拼接后与真实示例逐字一致，源码里则不成形。
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n",
+            "Authorization: Bearer eyJhbGciOiJIUzI1",
+            "NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop\n",
+            "DB=postgres://appuser:s3cr",
+            "3t-p4ss@db.internal:5432/app\n",
         );
         let hit = rules_hit(text);
         assert!(hit.contains(&"private key block"), "{hit:?}");
@@ -369,7 +394,7 @@ mod tests {
     /// 行号要准（审批卡上用户按它回去定位）
     #[test]
     fn line_numbers_are_one_based_and_accurate() {
-        let text = "line one\nline two\nGITHUB=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n";
+        let text = concat!("line one\nline two\nGITHUB=ghp_ABCDEFGHIJKLM", "NOPQRSTUVWXYZ0123456789\n");
         let r = analyze(text);
         assert_eq!(r.hits.len(), 1, "{}", r.summary());
         assert_eq!(r.hits[0].line, 3);
@@ -391,7 +416,7 @@ mod tests {
     #[test]
     fn oversize_input_is_truncated_and_flagged() {
         let mut text = "x".repeat(MAX_SCAN_BYTES + 10);
-        text.push_str("AKIAIOSFODNN7EXAMPLE\n");
+        text.push_str(concat!("AKIAIOSFODNN", "7EXAMPLE\n"));
         let r = analyze(&text);
         assert!(r.truncated);
         assert!(r.is_clean(), "尾巴上的密钥不该被扫到");

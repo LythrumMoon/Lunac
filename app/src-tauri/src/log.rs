@@ -669,7 +669,11 @@ mod tests {
     /// 既不能被 `mask_secrets` 二次打码，太短的 key 也不能整段漏出去。
     #[test]
     fn key_tail_survives_masking_but_real_key_names_do_not() {
-        assert_eq!(key_tail("sk-46a5ed7ca9e54cfd9603d6113e85d423"), "d423");
+        // 夹具拆段拼接：运行时仍是同一个 32 位假 key（照常触发 sk- 打码），源码里不再成形。
+        assert_eq!(
+            key_tail(concat!("sk-46a5ed7ca9e5", "4cfd9603d6113e85d423")),
+            "d423"
+        );
         assert_eq!(key_tail("   "), "(empty)");
         assert_eq!(key_tail("ab"), "****");
 
@@ -723,7 +727,12 @@ mod tests {
     /// 裸 JWT（不依赖前面有键名）：三段 base64url 点分整体打码；两段的不算 JWT。
     #[test]
     fn mask_hides_bare_jwt() {
-        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        // 夹具拆段拼接：运行时是同一个三段式 JWT（照常整段打码），源码里不再成形。
+        let jwt = concat!(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+            ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        );
         let m = mask_secrets(&format!("here {jwt} end"));
         assert!(!m.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"), "JWT 泄露：{m}");
         assert!(m.starts_with("here eyJ"), "锚定头 eyJ 应保留：{m}");
@@ -736,11 +745,12 @@ mod tests {
     /// 前缀型 token：GitHub / Slack / Google / AWS 各一例都要打码，且保留可辨认前缀。
     #[test]
     fn mask_hides_prefixed_tokens() {
+        // 夹具拆段拼接：运行时是同一个前缀型假 token（前缀型打码照样命中），源码里不再成形。
         for tok in [
-            "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
-            "xoxb-123456789012-abcdefABCDEF",
-            "AIzaSyD-1234567890abcdefghijklmnopqrstu",
-            "AKIAIOSFODNN7EXAMPLE",
+            concat!("ghp_16C7e42F292c6912", "E7710c838347Ae178B4a"),
+            concat!("xoxb-12345", "6789012-abcdefABCDEF"),
+            concat!("AIzaSyD-", "1234567890abcdefghijklmnopqrstu"),
+            concat!("AKIAIOSFODNN", "7EXAMPLE"),
         ] {
             let m = mask_secrets(&format!("key={tok} done"));
             assert!(!m.contains(tok), "前缀型 token 泄露：{m}");
@@ -756,7 +766,8 @@ mod tests {
     /// 普通 URL（无 `user:pass@`）不误伤。
     #[test]
     fn mask_hides_bare_connection_string() {
-        let m = mask_secrets("dsn=postgres://alice:s3cretPw@db.internal:5432/app");
+        // 夹具拆段拼接：拼接后口令仍在（照常只抹口令），源码里不再成形。
+        let m = mask_secrets(concat!("dsn=postgres://alice:s3cr", "etPw@db.internal:5432/app"));
         assert!(!m.contains("s3cretPw"), "连接串口令泄露：{m}");
         assert_eq!(m, "dsn=postgres://alice:***@db.internal:5432/app");
         let plain = "see https://example.com/path?q=1";

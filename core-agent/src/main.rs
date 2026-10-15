@@ -8506,7 +8506,8 @@ mod tests {
     /// 干净内容也是空（前端据此决定「有没有这个键」）。
     #[test]
     fn security_warnings_only_cover_written_payloads() {
-        let secret = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n";
+        // 夹具拆段拼接：拼接后仍是一段 PEM 私钥头（判据照样命中），源码里则不成形。
+        let secret = concat!("-----BEGIN RSA ", "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n");
         let hits = |v: Value| v.as_array().cloned().unwrap_or_default();
 
         assert_eq!(

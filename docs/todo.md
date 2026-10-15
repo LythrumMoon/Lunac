@@ -410,6 +410,16 @@
 1. **选甲** —— 零新增调用、频次与成本不增、直接补上口径与凭据缺口。
 2. **不加**独立的「自动抽取」开关 —— 沿用「关掉 `Remember` 工具即连带关掉复盘与自动抽取」。
 
+### §待办 1-7 清理测试夹具里的「伪凭据字面量」（GitHub secret scanning 误报）（2026-10-15，本轮）
+
+- **误报根因**：`mask_secrets` / `content_safety` 的单测为验证「能识别 / 能脱敏」，直接写了**与真实凭据格式完全一致**的合成假值。GitHub **公开**仓库 secret scanning 命中的 5 条全部如此（Google ×2 / OpenAI / Stripe / Slack），**均非真密钥**。
+- **改造口径（只改 `#[cfg(test)]` 夹具，不动任何生产逻辑）**：一律**拆段拼接**（`concat!` 或拆字符串字面量），**运行时字符串逐字不变** ⇒ 规则 / 脱敏照样命中、断言不放宽；但**源码文本里不再是一个连续 token** ⇒ 文本扫描器与 push protection 不再命中。
+  - ⚠️ **拆点判据**：每个片段自身都**不成形**（前缀 + 长度不足 / 无 `@` / 无 `://` / 非三段 `eyJ`），即**任一单独片段都匹配不上伙伴格式正则**（已用与 `content_safety::RULES` 同款正则全仓复扫验证）。
+  - **覆盖**：`AIza`(Google) / `sk-`(OpenAI) / `sk_live_`(Stripe) / `xoxb-`(Slack) / `sk-ant-`(Anthropic) / `ghp_`(GitHub) / `AKIA`(AWS) / 三段 `eyJ` JWT / PEM 私钥头 / `scheme://user:pass@host` 连接串。
+- **⚠️ 告警需在 GitHub 手动 dismiss**：本仓**不改写 git 历史**（禁 `filter-repo` / `filter-branch` / `push --force`），旧字面量仍留在历史里 ⇒ 那 5 条告警**必须在 GitHub → Security → Secret scanning 里手动 dismiss（理由：Used in tests / 合成假值）**。代码侧的 `concat!` 只负责**阻断未来新增**，清不掉历史告警。
+- **为什么没加本地自检**：一条「测试夹具不得含伙伴格式凭据字面量」的检查（扫 `src/**` 按伙伴正则、命中即 FAIL）本可低成本加，但既有校验链是 `scripts/verify-git.ps1` 的固定 `[8/8]` 段（.ps1 对 BOM 敏感，改它要重排分段与编号）⇒ 依「**别造第二套 + 保 `[8/8]`**」的约束**本轮不落地**，只在此记建议：后续如需，在既有 `[8/8]` 链里补一段**只读扫描**（`core-agent/src/**` + `app/src-tauri/src/**`，按 `content_safety::RULES` 的正则扫），命中即 `Bad` 并指路。
+- **涉及文件**：`core-agent/src/content_safety.rs`、`core-agent/src/main.rs`、`app/src-tauri/src/log.rs`（均**仅** `#[cfg(test)]`）、`docs/archive/agent-feature-backlog.md`（一条 PEM 示例改成带省略号以断形）。
+
 ## §待办 2 已实现、只差一次真机验收
 
 | # | 项 | 差哪一步 |
