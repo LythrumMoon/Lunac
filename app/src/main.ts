@@ -1520,7 +1520,7 @@ interface SessionUsage {
 
 /** 过程快照里的一步：一条思考 / 一次工具调用（含结果）。 */
 interface SessionStep {
-  kind: "thinking" | "tool" | "text" | "note";
+  kind: "thinking" | "tool" | "text" | "note" | "subtask";
   /** 工具名（kind=tool 时） */
   name?: string;
   /** 命令原文 / 参数摘要 / 文本片段（已截断） */
@@ -1532,6 +1532,9 @@ interface SessionStep {
    *  **只从 `tool_use` 入参取**（见 `WRITE_TOOLS`）—— 从工具输出正文里正则猜会把「只是读过的
    *  文件」也算成改动。恢复历史时据此重建「本次会话改动过的文件」列表。 */
   path?: string;
+  /** 子代理框格（E3，2026-10-16）：`kind="subtask"` 时承载该子代理的内部步骤（按 `task_id` 归组，
+   *  与实时框格同形）。`taskId` / `desc` 取自框格的 `dataset`（见 `tagSubtaskBox`）。 */
+  sub?: { taskId: string; desc?: string; items: SessionStep[] };
 }
 
 /** 一个回合的过程快照 —— 历史回顾时按回合渲染成可折叠的「过程」块。 */
@@ -2007,10 +2010,43 @@ function shiftRenderedMsgIdx(dropped: number) {
 const STEP_MAX = 2000;
 /** 单回合最多保留的步骤数（超长回合只留前 N 步，防文件膨胀） */
 const STEPS_PER_TURN_MAX = 60;
+/** 单回合内**子代理步骤**（框格内）最多保留的步数 —— 单独计数，**不挤占** `STEPS_PER_TURN_MAX`
+ *  的主流程预算（E3：主流程优先）。 */
+const SUBTASK_STEPS_PER_TURN_MAX = 60;
+/** 单个子代理框格最多保留的步数（防一个话多的子代理吃掉整轮配额）。 */
+const SUBTASK_STEPS_PER_GROUP_MAX = 30;
 
 function clipStep(s: string, n = STEP_MAX): string {
   const v = (s || "").trim();
   return v.length > n ? v.slice(0, n) + "…" : v;
+}
+
+/** 把一个过程块 DOM 抽成一步（主流程与子代理框格**共用同一口径**）—— 文本与路径的采集规则只此一处。 */
+function stepFromEl(el: HTMLElement): SessionStep | null {
+  // 「本回合被手动终止」的旁注（见 appendInterruptedNote）：只是一行说明，不是内容。
+  // 只认这一种 `.note-interrupted`，**不**顺带收其它 `.sys-note`（那会改变既有快照）。
+  if (el.classList.contains("note-interrupted")) {
+    return { kind: "note", detail: clipStep(el.textContent || "") };
+  }
+  if (el.classList.contains("think-block")) {
+    const text = clipStep(el.dataset.thinkText || el.textContent || "");
+    return text ? { kind: "thinking", detail: text } : null;
+  }
+  if (el.classList.contains("agent-text")) {
+    const text = clipStep(el.textContent || "");
+    return text ? { kind: "text", detail: text } : null;
+  }
+  // `Agent` 卡展开后其框格里另有内层工具卡 ⇒ 输出只取**本卡自己的**（见 `ownToolOut`）。
+  return {
+    kind: "tool",
+    name: el.querySelector(".tool-name")?.textContent?.trim() || "",
+    detail: clipStep(el.querySelector(".tool-cmd")?.textContent || ""),
+    result: clipStep(ownToolOut(el)?.textContent || ""),
+    isError: el.classList.contains("failed"),
+    // 写类工具卡上挂着 `data-file`（见 agentToolInput）—— 记进快照，恢复历史时据此
+    // 重建「本次会话改动过的文件」列表。**不从 detail 文本里解析路径**。
+    path: el.dataset.file || undefined,
+  };
 }
 
 /** 把本轮的过程块按 DOM 顺序抽成步骤（回合收尾时调用一次）。
@@ -2021,34 +2057,44 @@ function clipStep(s: string, n = STEP_MAX): string {
  *  的每一组都会整体错位一格（用户报的「输出挂到错误消息下」）。 */
 function recordTurnSteps(flowEl: HTMLElement, hasMsg: boolean) {
   const items: SessionStep[] = [];
+  // E3（2026-10-16）：子代理框格内的块**也采集**（历史回放要能看到内部过程），但按 `task_id`
+  // 归组（与实时框格一致）、单独计数上限 ⇒ 不挤占主流程的 `STEPS_PER_TURN_MAX`（主流程优先）。
+  const groups = new Map<Element, SessionStep[]>();
+  let mainCount = 0;
+  let subCount = 0;
   flowEl
     .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card, .note-interrupted")
     .forEach(el => {
-      if (items.length >= STEPS_PER_TURN_MAX) return;
-      // E2：子代理框格内的块**不进主流程过程快照**（否则历史回放会多出一层、且改变既有口径）。
-      // 待裁定：是否让历史回放展示子代理内部过程（见任务报告）。
-      if (el.closest(".subtask-box")) return;
-      // 「本回合被手动终止」的旁注（见 appendInterruptedNote）：只是一行说明，不是内容。
-      // 只认这一种 `.note-interrupted`，**不**顺带收其它 `.sys-note`（那会改变既有快照）。
-      if (el.classList.contains("note-interrupted")) {
-        items.push({ kind: "note", detail: clipStep(el.textContent || "") });
-      } else if (el.classList.contains("think-block")) {
-        const text = clipStep(el.dataset.thinkText || el.textContent || "");
-        if (text) items.push({ kind: "thinking", detail: text });
-      } else if (el.classList.contains("agent-text")) {
-        const text = clipStep(el.textContent || "");
-        if (text) items.push({ kind: "text", detail: text });
-      } else {
-        items.push({
-          kind: "tool",
-          name: el.querySelector(".tool-name")?.textContent?.trim() || "",
-          detail: clipStep(el.querySelector(".tool-cmd")?.textContent || ""),
-          result: clipStep(el.querySelector(".tool-out")?.textContent || ""),
-          isError: el.classList.contains("failed"),
-          // 写类工具卡上挂着 `data-file`（见 agentToolInput）—— 记进快照，恢复历史时据此
-          // 重建「本次会话改动过的文件」列表。**不从 detail 文本里解析路径**。
-          path: el.dataset.file || undefined,
-        });
+      const box = el.closest<HTMLElement>(".subtask-box");
+      if (box) {
+        if (subCount >= SUBTASK_STEPS_PER_TURN_MAX) return;
+        let inner = groups.get(box);
+        if (!inner) {
+          // 同一框格内的块按 DOM 顺序归一组；组本身按首次出现的位置插入 `items`，与主流程保序。
+          inner = [];
+          groups.set(box, inner);
+          items.push({
+            kind: "subtask",
+            sub: {
+              taskId: box.dataset.taskId || "",
+              desc: box.dataset.taskDesc || undefined,
+              items: inner,
+            },
+          });
+        }
+        if (inner.length >= SUBTASK_STEPS_PER_GROUP_MAX) return;
+        const s = stepFromEl(el);
+        if (s) {
+          inner.push(s);
+          subCount++;
+        }
+        return;
+      }
+      if (mainCount >= STEPS_PER_TURN_MAX) return;
+      const s = stepFromEl(el);
+      if (s) {
+        items.push(s);
+        mainCount++;
       }
     });
   if (items.length) {
@@ -2079,6 +2125,19 @@ function historyStepHtml(s: SessionStep): string {
     // 过程步骤里的正文与助手气泡是同一段内容 ⇒ 裸 URL 同样可点
     return `<div class="agent-text">${linkifyBareUrls(s.detail || "")}</div>`;
   }
+  if (s.kind === "subtask") {
+    const g = s.sub;
+    if (!g || !g.items.length) return "";
+    // E3：子代理框格 —— 复用实时框格样式（`.subtask-box`）与块渲染口径（`historyStepHtml` 递归），
+    // 观感与实时一致。标题行（id + 描述）复用 `.subtask-row-head` / `.subtask-id` / `.subtask-desc`。
+    return (
+      `<div class="subtask-box">` +
+      `<div class="subtask-row-head"><span class="subtask-id">${esc(g.taskId)}</span>` +
+      `<span class="subtask-desc">${esc(g.desc || "")}</span></div>` +
+      g.items.map(historyStepHtml).join("") +
+      `</div>`
+    );
+  }
   const firstLine = (s.result || "").split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 60);
   const state = s.isError
     ? t("agent.tool_failed", { txt: firstLine || "error" })
@@ -2093,6 +2152,11 @@ function historyStepHtml(s: SessionStep): string {
     (s.result ? `<div class="tool-body"><pre class="tool-out">${s.name === "WebSearch" ? linkifyBareUrls(s.result) : esc(s.result)}</pre></div>` : "") +
     `</details>`
   );
+}
+
+/** 一笔过程步骤的条数（含子代理框格内的内层步骤 —— 与渲染出来的块数一致）。 */
+function countSessionSteps(items: SessionStep[]): number {
+  return items.reduce((n, it) => n + (it.sub ? countSessionSteps(it.sub.items) : 1), 0);
 }
 
 /** 把每个回合的过程快照渲染成可折叠的「过程」块，插到该回合的助手气泡之后
@@ -2130,7 +2194,7 @@ function renderHistoryProcess(steps: SessionProcess[]) {
     footer.className = "turn-footer";
     const label = document.createElement("span");
     label.className = "turn-tool-count";
-    label.textContent = t("agent.process_steps", { n: String(g.items.length) });
+    label.textContent = t("agent.process_steps", { n: String(countSessionSteps(g.items)) });
     footer.appendChild(label);
     const btn = document.createElement("button");
     btn.className = "turn-fold";
@@ -5609,9 +5673,9 @@ interface AgentView {
 /** 一个并行子任务的实时状态（A14）。
  *
  *  数据来源是 `system/task_started|task_progress|task_done` 三个事件。子代理曾是非流式
- *  （不进 stdout），只有「第几轮、在跑哪个工具、跑完没」；E1（2026-10-16）起，**用户可见的
- *  `Agent` 工具调用**会把内部过程按 `system/task_event` 单独转发，由 `Agent` 卡片里的
- *  「框格」渲染（见 `agentSubtaskEventLine`）—— 面板这一行只留非 `Agent` 任务（如 fork 技能）。 */
+ *  （不进 stdout），只有「第几轮、在跑哪个工具、跑完没」；E1（2026-10-16）起，`Agent` 工具调用
+ *  **与 fork 技能**都会把内部过程按 `system/task_event` 单独转发 —— `Agent` 任务的内容进它卡片
+ *  里的「框格」，fork 技能（无 `Agent` 卡）的内容进面板行的可展开框格（见 `agentSubtaskEventLine`）。 */
 interface AgentSubtask {
   id: string;              // `task-1` / `skill-2`（进程内短计数，见 ai-spec §3.5）
   desc: string;            // `task_started` 的 description
@@ -5733,10 +5797,25 @@ function insertBoxIntoCard(card: AgentToolCard, box: HTMLElement) {
   card.subtaskBox = box;
 }
 
-/** 在 `Agent` 卡里新建一个「框格」。 */
-function attachSubtaskBox(card: AgentToolCard): HTMLElement {
+/** 造一个「框格」容器 —— `Agent` 卡与 fork 技能面板行**共用同一个工厂**（不造第二套）。 */
+function makeSubtaskBox(): HTMLElement {
   const box = doc("div");
   box.className = "subtask-box";
+  return box;
+}
+
+/** 取一张工具卡**自己的**输出节点（`.tool-out`，直属于它的 `.tool-body`）。
+ *
+ *  ⚠️ `Agent` 卡展开后，它的框格里另有**内层工具卡**，而框格插在自己的 `.tool-out` **之前**
+ *  ⇒ 裸 `querySelector(".tool-out")` 会命中框格里第一张内层卡，把报告写/读进那张卡
+ *  （内层卡自己的输出也被覆盖）。限定 `:scope` 只认本卡自己的输出 —— 主流程与子代理共用这一处。 */
+function ownToolOut(el: HTMLElement): HTMLElement | null {
+  return el.querySelector<HTMLElement>(":scope > .tool-body > .tool-out");
+}
+
+/** 在 `Agent` 卡里新建一个「框格」。 */
+function attachSubtaskBox(card: AgentToolCard): HTMLElement {
+  const box = makeSubtaskBox();
   insertBoxIntoCard(card, box);
   return box;
 }
@@ -5757,29 +5836,39 @@ function claimAgentCard(v: AgentView, desc: string): AgentToolCard | null {
 
 /** `task_started`：把子任务绑到 `Agent` 卡（建框格 + 标题栏写描述），返回子视图；
  *  卡片还没建（时序倒挂）⇒ 先建脱离 DOM 的框格暂存，卡片出现时再挂（见 `agentToolInput`）。
- *  认不到（如 fork 技能）⇒ 返回 null，仍走原来的 `.subtask-panel` 行。 */
+ *  fork 技能（`task_id` 形如 `skill-*`）**没有 `Agent` 卡**、也不会有 ⇒ 返回 null，
+ *  走保留的 `.subtask-panel` 行（该行可展开，见 `agentSubtaskEvent`）。 */
 function tryBindSubtask(v: AgentView, id: string, desc: string): AgentView | null {
+  // 判据是 id 前缀，与后端 `task-*` / `skill-*` 的取名口径同源（见 AgentSubtask.id）。
+  if (!id.startsWith("task-")) return null;
   let card = desc ? claimAgentCard(v, desc) : null;
   if (!card && !desc) {
     // 兜底：任务描述没拿到（入参未解析出来）时，若恰有一张描述同样为空的 `Agent` 卡就认领它。
-    // 只在**任务描述为空**时走这里 —— fork 技能的描述恒非空，不会被误绑。
     const cands = v.freeAgentCards.filter((c) => !c.subtaskDesc);
     if (cands.length === 1) card = v.freeAgentCards.splice(v.freeAgentCards.indexOf(cands[0]), 1)[0];
   }
   if (card) {
-    const sv = newSubtaskView(v, attachSubtaskBox(card));
+    const box = attachSubtaskBox(card);
+    tagSubtaskBox(box, id, desc);
+    const sv = newSubtaskView(v, box);
     card.subtaskView = sv;
     setAgentCardDesc(card, desc);
     v.taskViews.set(id, sv);
     return sv;
   }
   if (!desc) return null; // 无描述又认不到卡 ⇒ 无法归属，留在面板
-  const box = doc("div");
-  box.className = "subtask-box";
+  const box = makeSubtaskBox();
+  tagSubtaskBox(box, id, desc);
   const sv = newSubtaskView(v, box);
   v.taskViews.set(id, sv);
   v.orphanTasks.set(id, { desc, view: sv });
   return sv;
+}
+
+/** 给框格打上归属（`task_id` + 描述）—— `recordTurnSteps` 采集历史快照时靠它按 `task_id` 归组。 */
+function tagSubtaskBox(box: HTMLElement, id: string, desc: string) {
+  box.dataset.taskId = id;
+  if (desc) box.dataset.taskDesc = desc;
 }
 
 /** `task_event`（E1 转发通道）的唯一入口：按 `task_id` 找到子视图，把内部块按顺序渲染进框格。 */
@@ -5788,7 +5877,7 @@ function agentSubtaskEventLine(data: CliEventLine) {
   const id = typeof data.task_id === "string" ? data.task_id : "";
   if (!v || !id) return;
   const sv = v.taskViews.get(id);
-  if (!sv) return; // 未绑定（fork 技能 / 旧 agent）⇒ 不渲染，避免落进主流程
+  if (!sv) return; // 未登记（`task_started` 还没到 / 旧 agent）⇒ 不渲染，避免落进主流程
   // ① 整段超限：收到恰一条 `truncated:true` 且**无 message** ⇒ 框格末尾提示「已截断」。
   if (data.truncated === true && !data.message) {
     if (!sv.flow.querySelector(".subtask-truncated")) {
@@ -5825,7 +5914,8 @@ function renderSubtaskBlocks(
     } else if (b.type === "tool_use") {
       agentNewBlock("tool", b.name || "", b.id || "", sv);
       if (b.input !== undefined) {
-        // ⚠️ `input` 超限时后端会把它**退化成字符串**（见 E1 契约）⇒ 直接用，否则序列化。
+        // 后端保结构、只截断超长字符串叶子（见 core-agent `truncate_tool_input`）；仍兼容整包
+        // 退化成字符串的旧形态。
         const raw = typeof b.input === "string" ? b.input : JSON.stringify(b.input);
         agentToolInput(b.name || "", raw, undefined, sv);
       }
@@ -5850,7 +5940,8 @@ function renderSubtaskBlocks(
  *  （那会让用户以为剩下的子任务也结束了）。
  *
  *  E2：`Agent` 任务的这一行并入卡片（标题栏描述 + 框格内容），**不再在面板里另占一行**；
- *  非 `Agent` 任务（如 fork 技能）仍照旧走面板。 */
+ *  非 `Agent` 任务（如 fork 技能）仍走面板，且该行做成**可展开**的 `<details>`（默认收起），
+ *  展开后用与 `Agent` 卡**同一个框格**渲染内部过程。 */
 function agentSubtaskEvent(data: CliEventLine) {
   const v = agentView;
   const id = typeof data.task_id === "string" ? data.task_id : "";
@@ -5868,11 +5959,20 @@ function agentSubtaskEvent(data: CliEventLine) {
       sub = { id, desc, tool: "", round: 0, done: false, boundToCard: true };
       v.subtasks.set(id, sub);
     } else {
-      const el = doc("div");
+      // 未并入 `Agent` 卡的任务（fork 技能）走面板行。该行是**可展开**的 `<details>`（默认收起）：
+      // 展开后用与 `Agent` 卡**同一个框格**渲染内部过程（复用 `makeSubtaskBox` / `newSubtaskView`
+      // / `renderSubtaskBlocks`，不造第二套）。`task_event` 按 `task_id` 找到这个子视图。
+      const el = doc("details");
       el.className = "subtask-row running";
       el.innerHTML =
+        `<summary class="subtask-row-head">` +
         `<span class="subtask-id"></span><span class="subtask-desc"></span>` +
-        `<span class="subtask-state"></span>`;
+        `<span class="subtask-state"></span></summary>` +
+        `<div class="subtask-row-body"></div>`;
+      const box = makeSubtaskBox();
+      tagSubtaskBox(box, id, desc);
+      el.querySelector<HTMLElement>(".subtask-row-body")!.appendChild(box);
+      v.taskViews.set(id, newSubtaskView(v, box));
       agentSubtaskPanel(v).querySelector(".subtask-body")!.appendChild(el);
       sub = { id, desc: "", tool: "", round: 0, done: false, el };
       v.subtasks.set(id, sub);
@@ -6355,8 +6455,9 @@ function isCompleteJson(raw: string): boolean {
 
 /** 把入参摘要写进当前卡片：流式分片路径与整包回落路径共用。
  *  `target` 只在「整包回落要给一张早就建好的卡补写」时传（端点没发 input_json_delta 的情形）。
- *  `v`（E2）= 目标容器：缺省主视图；子代理内部过程传子视图 —— 此时**跳过**「改动文件追踪 /
- *  内容快照 / 标题栏描述」这类主流程副作用，只渲染卡片本身。 */
+ *  `v`（E2）= 目标容器：缺省主视图；子代理内部过程传子视图。此处**只跳过「`Agent` 卡标题栏
+ *  描述」这一类主流程副作用**；写类工具的「更改文件登记 + 原件快照」主流程与子代理**共用同一份
+ *  判据**（E4，2026-10-16，见下方 `WRITE_TOOLS` 分支）。 */
 function agentToolInput(name: string, rawJson: string, target?: AgentToolCard, v?: AgentView) {
   const v2 = v ?? agentView;
   const card = target ?? v2?.openCard;
@@ -6400,8 +6501,10 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard, v
   // 写类工具：把 `file_path` 摘出来渲染成**可点链接**（点击 → 资源管理器定位该文件），
   // 其余入参照旧跟在后面。同时把路径挂到卡片 dataset，`recordTurnSteps` 据此写进过程
   // 快照 ⇒ 恢复历史时能重建「改动过的文件」列表（走 `steps` 已有那一列，不改表结构）。
-  // **只对主流程做**：子代理内部的写类调用不进主流程的「改动文件 / 快照」账（见函数注释）。
-  const field = isMain ? WRITE_TOOLS[name] : undefined;
+  // **主流程与子代理同一份判据**（E4，2026-10-16）：子代理的写类调用也登记「更改文件」+ 采原件
+  // 快照 ⇒ 可回退。归属同一次提问：`captureFileSnapshot` 的 turn 口径与主流程一致（都是
+  // 「采集时已完成的助手消息条数」），去重也由同一处（turn+path）兜住，不会出两条。
+  const field = WRITE_TOOLS[name];
   const file = field ? changedFilePathFromArgs(name, rawJson) : "";
   if (file) {
     card.el.dataset.file = file;
@@ -6512,11 +6615,14 @@ function noteChangedFile(path: string) {
  *  「一点回退任务列表就没了」的直接来源。 */
 function rebuildChangedFilesFromSteps(steps: SessionProcess[]) {
   const out: string[] = [];
-  for (const g of steps) {
-    for (const it of g?.items ?? []) {
+  // 递归进子代理框格（E3/E4）：子代理写类步骤的 `path` 同样算真改动。
+  const walk = (items: SessionStep[]) => {
+    for (const it of items) {
       if (it.path && !out.includes(it.path)) out.push(it.path);
+      if (it.sub) walk(it.sub.items);
     }
-  }
+  };
+  for (const g of steps) walk(g?.items ?? []);
   sessionChangedFiles = out;
   // U1 变更审阅态跟着作废：它挂在**上一份**变更列表上（缓存了现状内容、接受标记、
   // 摊开状态）。恢复会话 / 回退到此处都会重建这份列表 ⇒ 这里清一次即可覆盖两条路径。
@@ -7389,7 +7495,7 @@ function agentToolOutput(toolUseId: string, chunk: string) {
     card.term?.write(chunk);
     return;
   }
-  const outEl = card.el.querySelector<HTMLElement>(".tool-out");
+  const outEl = ownToolOut(card.el);
   if (!outEl) return;
   let text = (outEl.textContent || "") + chunk;
   if (text.length > LIVE_OUT_MAX) text = "…\n" + text.slice(-LIVE_OUT_MAX);
@@ -7450,7 +7556,7 @@ function fillToolCard(
     }
   }
 
-  const outEl = el.querySelector<HTMLElement>(".tool-out");
+  const outEl = ownToolOut(el);
   if (outEl) {
     if (txt) {
       const shown = txt.length > 600 ? txt.slice(0, 600) : txt;
@@ -7525,7 +7631,7 @@ function fillToolCard(
       all.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        const box = el.querySelector<HTMLElement>(".tool-out");
+        const box = ownToolOut(el);
         if (box) {
           const full = box.dataset.full || box.textContent || "";
           // 展开全文与截断态同一口径：WebSearch 重新链接化（别覆盖回纯文本），其余照旧纯文本

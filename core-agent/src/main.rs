@@ -5603,12 +5603,15 @@ struct ForkSpec<'a> {
     emit_progress: bool,
     /// 是否把子代理的**内部过程**（思考 / 文本 / 工具调用与结果）按 `task_event` 事件转发到前端。
     ///
-    /// **只有「用户可见的 `Agent` 工具调用」（`run_agent_tool`）为 `true`**；后台复盘与 fork 技能
-    /// 一律 `false`。这是「静默不变量」的**唯一判据**：`false` 时 `run_subagent` 连转发器都不构造，
-    /// 一个 `task_event` 都不发（复盘是无人值守的静默 fork；fork 技能的内部过程不进入 `Agent` 卡片）。
+    /// **`Agent` 工具调用（`run_agent_tool`）与 fork 技能（`run_forked_skill`）为 `true`**，
+    /// **后台复盘（`run_review_fork`）为 `false`**。这是「静默不变量」的**唯一判据**：`false` 时
+    /// `run_subagent` 连转发器都不构造，一个 `task_event` 都不发（复盘是无人值守的静默 fork）。
+    /// 取值由调用方经具名常量给出（`AGENT_EMIT_SUBTASK` / `FORK_SKILL_EMIT_SUBTASK` /
+    /// `REVIEW_EMIT_SUBTASK`），便于单测钉住「谁转发、谁静默」。
     ///
     /// 与 `emit_progress` **不是同一个概念**，故不合并：fork 技能的 `emit_progress` 是 `true`
-    /// （进度要回前端），但它的**内部过程**不转发 —— 两个判据若合成一份就会走偏。
+    /// （进度要回前端），其内部过程现在**也**转发（进前端保留的 `.subtask-panel` 行）；后台复盘
+    /// 两者都是 `false`。两个判据若合成一份就会走偏。
     emit_subtask: bool,
     /// 多代理通信（A13，2026-10-05）：`Some(描述)` = 把这次 fork 登记进 peer 登记处
     /// （同批兄弟可 `ListPeers` 看到它、`SendMessage` 投给它）；`None` = 不登记。
@@ -5637,14 +5640,20 @@ impl Drop for PeerReg {
 //     的 `assistant` / `user` 事件**逐字对齐**（`message.content[].type` 等），前端解析可尽量复用。
 //   · **绝不进主对话**：这些事件只写给前端，`run_subagent` 自己的 history / 主循环的 history
 //     一个字都不改 ⇒ 固定前缀缓存不变量不受影响（§规范 6）。
-//   · **静默不变量**：只有「用户可见的 `Agent` 工具调用」才转发（`ForkSpec::emit_subtask`），
-//     复盘 fork 与 fork 技能保持零事件。
+//   · **静默不变量**：转发与否只由 `ForkSpec::emit_subtask` 决定（`Agent` 工具调用与 fork 技能
+//     为 `true`；后台复盘为 `false` ⇒ 零事件）。
 
 /// 子代理内部过程转发的**唯一闸门**：`emit_subtask` 为真才构造转发器，否则返回 `None`
 /// ⇒ `run_subagent` 既不构造也不发送，一个 `task_event` 都不出（静默不变量）。
 fn subtask_forwarder(emit_subtask: bool) -> Option<SubtaskForward> {
     emit_subtask.then(SubtaskForward::new)
 }
+
+/// 各调用方的 `ForkSpec::emit_subtask` 策略 —— **单一真相源**，可被单测钉住：
+/// `Agent` 工具调用与 fork 技能都转发内部过程；后台复盘保持静默（无人值守的后台过程零事件）。
+const AGENT_EMIT_SUBTASK: bool = true;
+const FORK_SKILL_EMIT_SUBTASK: bool = true;
+const REVIEW_EMIT_SUBTASK: bool = false;
 
 /// 把任意 JSON 值按字符上限收口（内部过程转发的单条上限）。字符串直接 `log::truncate_chars`
 /// （带 `…(truncated)` 标记）；对象 / 数组序列化后若超限，退化成**带标记的字符串** —— 宁可
@@ -5660,6 +5669,25 @@ fn truncate_json_value(v: Value, max: usize) -> Value {
                 Value::String(log::truncate_chars(&s, max))
             }
         }
+    }
+}
+
+/// `tool_use` 入参的收口：**保持对象 / 数组结构**，只把超长的字符串叶子截断（带标记）。
+///
+/// 与 `truncate_json_value`（会把整个对象退化成字符串）**刻意不同**：入参里的 `file_path` /
+/// `notebook_path` 之类短字段必须原样活下来，前端（`changedFilePathFromArgs` 走 `JSON.parse`）
+/// 才能解析出改动文件、采到回退用的原件快照（E4 需求：子代理改的文件也进「更改文件」且可回退）。
+/// 退化成字符串会让 `JSON.parse` 失败 ⇒ 路径丢失 ⇒ 回退不了。
+fn truncate_tool_input(v: Value, max: usize) -> Value {
+    match v {
+        Value::String(s) => Value::String(log::truncate_chars(&s, max)),
+        Value::Array(a) => {
+            Value::Array(a.into_iter().map(|x| truncate_tool_input(x, max)).collect())
+        }
+        Value::Object(m) => {
+            Value::Object(m.into_iter().map(|(k, x)| (k, truncate_tool_input(x, max))).collect())
+        }
+        other => other,
     }
 }
 
@@ -5686,7 +5714,9 @@ fn forward_content_block(blk: &Value) -> Value {
             "type": "tool_use",
             "id": blk.get("id").cloned().unwrap_or(Value::Null),
             "name": blk.get("name").cloned().unwrap_or(Value::Null),
-            "input": truncate_json_value(
+            // 入参走 `truncate_tool_input`（保结构、只截断超长字符串叶子）：`file_path` 等短字段必须
+            // 活下来，前端才能解析出改动文件、采到回退原件（见函数注释）。
+            "input": truncate_tool_input(
                 blk.get("input").cloned().unwrap_or(Value::Null),
                 SUBAGENT_EVENT_ITEM_CHARS,
             ),
@@ -6135,7 +6165,7 @@ fn run_agent_tool(
             budget_tokens: SUBAGENT_BUDGET_TOKENS,
             emit_progress: true,
             // 用户可见的 `Agent` 工具调用 ⇒ 转发内部过程（E1 数据通道，E2 前端渲染）
-            emit_subtask: true,
+            emit_subtask: AGENT_EMIT_SUBTASK,
             // 前台子代理登记进 peer 登记处（同批兄弟可互相 ListPeers / SendMessage）
             peer: Some(desc),
         },
@@ -6216,6 +6246,9 @@ fn fork_skill_tools(skill: &skills::Skill, subagent_defs: &[Value]) -> Vec<Value
 ///     与 A4 的后台复盘相反 —— 那个是无人值守，发进度会让状态栏停在错的文案上；
 ///   · `ask_permission` 随前端运行方式：技能里写 `Cmd` / `Write` 时，子代理内部**逐次**
 ///     再走 `can_use_tool`，**不是「批了技能就等于批了它要做的一切」**（同 `Agent`）。
+///
+/// `emit_subtask = true`（E1 扩展，2026-10-16）：内部过程（思考 / 工具 / 命令）同样转发 —— fork
+/// 技能没有 `Agent` 卡，前端在保留的 `.subtask-panel` 行里展开查看（复用与 `Agent` 框格同一套渲染）。
 fn run_forked_skill(
     cfg: &Cfg,
     tctx: &tools::Ctx,
@@ -6277,8 +6310,9 @@ fn run_forked_skill(
             max_rounds: MAX_SUBAGENT_ROUNDS,
             budget_tokens: SUBAGENT_BUDGET_TOKENS,
             emit_progress: true,
-            // fork 技能的**内部过程不转发**：那些内容属于技能自己的执行，不进入 `Agent` 卡片
-            emit_subtask: false,
+            // fork 技能的内部过程**也转发**（E1 扩展，2026-10-16）：它没有 `Agent` 卡，前端在保留的
+            // `.subtask-panel` 行里可展开查看（复用与 `Agent` 框格同一套块渲染）。
+            emit_subtask: FORK_SKILL_EMIT_SUBTASK,
             // fork 技能与 `Agent` 会合进同一个并发批 ⇒ 同样登记，否则会出现
             // 「Agent 看得见 fork 技能、fork 技能看不见 Agent」的不对称。
             peer: Some(skill.key.as_str()),
@@ -6531,7 +6565,7 @@ fn run_review_fork(job: ReviewJob) -> Result<String, String> {
             // 不回前端进度：复盘在提问之间跑，前端没有恢复状态栏的时机（见字段注释）
             emit_progress: false,
             // 静默不变量：复盘 fork 一个 `task_event` 都不发（无人值守的后台过程）
-            emit_subtask: false,
+            emit_subtask: REVIEW_EMIT_SUBTASK,
             // 复盘不登记为 peer：它在提问之间单独跑、没有兄弟，也不该出现在别人的列表里
             peer: None,
         },
@@ -11926,19 +11960,29 @@ mod tests {
         assert_eq!(text.chars().count(), SUBAGENT_EVENT_ITEM_CHARS + "…(truncated)".chars().count());
     }
 
-    /// 超大 tool_use 入参 ⇒ 序列化后超限时退化成**带标记的字符串**（前端可按文本渲染）。
+    /// 超大 tool_use 入参 ⇒ **保持对象结构**、只截断超长字符串叶子；短字段（如 `file_path`）
+    /// 原样存活 —— 前端据此解析改动文件、采到回退原件（E4）。
     #[test]
-    fn subtask_forward_truncates_oversized_tool_input() {
+    fn subtask_forward_keeps_tool_input_shape_and_path() {
         let mut f = SubtaskForward::new();
         let big = "z".repeat(SUBAGENT_EVENT_ITEM_CHARS * 2);
         let evs = f.events(
             "task-1",
             "assistant",
-            &[json!({"type":"tool_use","id":"t","name":"Write","input":{"content":big}})],
+            &[json!({
+                "type":"tool_use","id":"t","name":"Write",
+                "input":{"file_path":"C:\\a\\b.rs","content":big}
+            })],
         );
         let input = &evs[0]["message"]["content"][0]["input"];
-        assert!(input.is_string(), "超限入参应退化为字符串");
-        assert!(input.as_str().unwrap().ends_with("…(truncated)"));
+        assert!(input.is_object(), "入参必须保持对象，否则路径解析不出来: {input}");
+        assert_eq!(input["file_path"], "C:\\a\\b.rs", "短路径字段须原样存活");
+        let content = input["content"].as_str().unwrap();
+        assert!(content.ends_with("…(truncated)"), "超长内容须带标记: {content}");
+        assert_eq!(
+            content.chars().count(),
+            SUBAGENT_EVENT_ITEM_CHARS + "…(truncated)".chars().count()
+        );
     }
 
     /// 整段超预算 ⇒ 发**一条** `truncated:true` 标记后**不再出内容事件**（封顶 + 明确标记）。
@@ -11970,11 +12014,21 @@ mod tests {
         assert_eq!(markers, 1, "整段预算用尽只发一条标记");
     }
 
-    /// 静默不变量：闸门只认 `emit_subtask`；`false`（复盘 fork / fork 技能）时**一个转发器都不构造**
-    /// ⇒ `run_subagent` 全程零 `task_event`。`true` 仅由「用户可见的 `Agent` 工具调用」给出。
+    /// 转发策略（单一真相源）：`Agent` 工具调用与 fork 技能都开（前端都有落点）、后台复盘保持静默
+    ///（静默不变量：无人值守的后台过程零 `task_event`）。
     #[test]
-    fn subtask_forward_silent_when_gate_closed() {
-        assert!(subtask_forwarder(false).is_none(), "关闭时必须静默");
-        assert!(subtask_forwarder(true).is_some(), "仅用户可见的 Agent 工具调用才开");
+    fn subtask_forward_policy_per_path() {
+        assert!(
+            subtask_forwarder(AGENT_EMIT_SUBTASK).is_some(),
+            "用户可见的 Agent 工具调用必须转发"
+        );
+        assert!(
+            subtask_forwarder(FORK_SKILL_EMIT_SUBTASK).is_some(),
+            "fork 技能现在也转发内部过程"
+        );
+        assert!(
+            subtask_forwarder(REVIEW_EMIT_SUBTASK).is_none(),
+            "后台复盘必须保持零 task_event"
+        );
     }
 }

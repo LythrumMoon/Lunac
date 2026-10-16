@@ -3491,27 +3491,33 @@ body.plan-open #todo-drawer {
   flex-direction: column;
   gap: 3px;
 }
-.subtask-panel .subtask-row {
+/* E2（2026-10-16）：面板行是可展开的 `<details>`（fork 技能内部过程复用框格）⇒ 原来的 flex 行
+   落到 `summary.subtask-row-head` 上；`<summary>` 默认三角标记去掉（与 `.think-block` 同口径）。
+   这一组类名同时被历史回放的框格标题复用（E3），故**不再限定在 `.subtask-panel` 下**。 */
+.subtask-row-head {
   display: flex;
   align-items: baseline;
   gap: 8px;
   min-width: 0;
   font-size: 12px;
   color: var(--text-dim);
+  list-style: none;
 }
-.subtask-panel .subtask-id {
+summary.subtask-row-head { cursor: pointer; }
+.subtask-row-head::-webkit-details-marker { display: none; }
+.subtask-id {
   flex-shrink: 0;
   color: var(--blue);
   font-size: 11px;
 }
-.subtask-panel .subtask-desc {
+.subtask-desc {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-.subtask-panel .subtask-state {
+.subtask-state {
   flex-shrink: 0;
   font-size: 11px;
   opacity: 0.85;
@@ -3536,6 +3542,8 @@ body.plan-open #todo-drawer {
 }
 .subtask-box > .think-block,
 .subtask-box > .cmd-group { margin: 0; }
+/* E3：历史回放里框格的标题行（id + 描述）—— 与实时面板行同观感。 */
+.subtask-box > .subtask-row-head { margin-bottom: 4px; }
 /* 子代理没产出任何内部过程（旧 agent / 立即失败）⇒ 不显示空框格 */
 .subtask-box:empty { display: none; }
 /* 整段超限（`truncated:true`）的一行说明 —— 同「过程」暗字，不喧宾夺主。 */

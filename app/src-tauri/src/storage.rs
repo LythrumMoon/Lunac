@@ -878,6 +878,15 @@ pub struct SessionStep {
     /// （落盘走 `steps` 那一列的 JSON，**无需改表结构**）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// 子代理框格（E3，2026-10-16）：`kind == "subtask"` 时承载该子代理的内部步骤
+    /// （形状 `{taskId, desc, items:[…SessionStep]}`，按 `task_id` 归组，与实时框格同形）。
+    ///
+    /// **刻意用 `Value` 不解构**（同 `SessionTodo.todos` 的纪律）：这个嵌套形状只在前端定义
+    /// 一次，Rust 侧只负责存取 —— 若在这里再解构一份，将来往框格里加字段就得改两处。
+    /// 不留这个字段的话，落盘时会被**静默丢弃**（序列化只认结构体声明的字段），
+    /// 历史回放就再也看不到子代理内部过程。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<serde_json::Value>,
 }
 
 /// 一个回合的过程（历史回顾时按回合渲染可折叠的「过程」块）。
