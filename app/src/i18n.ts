@@ -1194,6 +1194,14 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "실행 중",
     "en": "Running",
   },
+  // E2（2026-10-16）：子代理内部过程整段超限（`task_event` 只发一条 `truncated:true`，无 message）
+  "agent.subtask_truncated": {
+    "zh-CN": "内部过程过长，已截断",
+    "zh-TW": "內部過程過長，已截斷",
+    "ja": "内部トレースが長すぎるため、切り詰めました",
+    "ko": "내부 과정이 너무 길어 잘렸습니다",
+    "en": "Subagent trace was too long and has been truncated",
+  },
   // 命令静态安全分析（agent 随 can_use_tool 上报 analysis 字段，见 ai-spec §3.5）
   "agent.static_danger": {
     "zh-CN": "危险命令（{labels}）— 不可加入白名单，请谨慎确认",

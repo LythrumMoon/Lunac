@@ -2025,6 +2025,9 @@ function recordTurnSteps(flowEl: HTMLElement, hasMsg: boolean) {
     .querySelectorAll<HTMLElement>(".think-block, .agent-text, .tool-card, .note-interrupted")
     .forEach(el => {
       if (items.length >= STEPS_PER_TURN_MAX) return;
+      // E2：子代理框格内的块**不进主流程过程快照**（否则历史回放会多出一层、且改变既有口径）。
+      // 待裁定：是否让历史回放展示子代理内部过程（见任务报告）。
+      if (el.closest(".subtask-box")) return;
       // 「本回合被手动终止」的旁注（见 appendInterruptedNote）：只是一行说明，不是内容。
       // 只认这一种 `.note-interrupted`，**不**顺带收其它 `.sys-note`（那会改变既有快照）。
       if (el.classList.contains("note-interrupted")) {
@@ -4017,15 +4020,23 @@ function parseSlashCommand(text: string): { name: string; args: string[] } | nul
   return { name, args: rest.split(/\s+/).filter(Boolean) };
 }
 
+/** `/compact` 的**占位旁注节点**（2026-10-16）：点完命令立刻插一条「已请求压缩」旁注（**避免
+ *  「零反馈」**：压缩是几十秒级的后台动作）；等 agent 回 `context_compacted` 时**原地改这一条的
+ *  文字**（不新建节点）⇒ 「请求中」与「已压缩」两处文案合并成**一条**。
+ *  仅当拿不到占位（回合内自动压缩 / 占位已离场）时才新建一条。 */
+let compactNoteEl: HTMLElement | null = null;
+
 /** 把一行系统旁注插进对话流。形态同「上下文压缩提示」（`.sys-note sys-note-line`，
- *  **独立节点、不进 textAll / chatHistory** ⇒ 不会被当成助手正文回灌给模型）。 */
-function appendSlashNote(text: string) {
+ *  **独立节点、不进 textSegs / chatHistory** ⇒ 不会被当成助手正文回灌给模型）。
+ *  返回该节点，供调用方（`/compact`）后续原地更新同一节点。 */
+function appendSlashNote(text: string): HTMLElement {
   const host = chatFlowHost();
   const note = doc("div");
   note.className = "sys-note sys-note-line";
   note.textContent = text;
   host.appendChild(note);
   resultsList.scrollTop = resultsList.scrollHeight;
+  return note;
 }
 
 /** `/memory` 的展示块：可展开的 details（记忆上限 6000 字符，直接铺开会很长）。
@@ -4096,13 +4107,14 @@ async function runSlashCommand(text: string) {
  *  `{"type":"compact"}` 写进 agent stdin（**不是**一次提问 —— 不产生回答、不写 chatHistory）；
  *  agent 压完回 `system/context_compacted`，由既有渲染落一条旁注。命令本身不进模型。 */
 async function runSlashCompact() {
-  appendSlashNote(t("chat.slash_compact_requested"));
+  compactNoteEl = appendSlashNote(t("chat.slash_compact_requested"));
   try {
     await invoke("send_message", { message: JSON.stringify({ type: "compact" }) });
     console.log("[slash] compact requested");
   } catch (e) {
     console.warn("[slash] compact request failed", e);
     appendSlashNote(t("chat.slash_compact_failed"));
+    compactNoteEl = null; // 请求没发出去 ⇒ 别让后续压缩去改那条占位
   }
 }
 
@@ -4627,7 +4639,7 @@ function finalizeInterruptedTurn(opts: { manualStop?: boolean } = {}) {
   // `chat.db` 的 messages（进 FTS 索引）并随后续 `set_history` 回灌给模型，**这是用户
   // 明确要的**：「被中断的那段输出也要成为对话历史的一部分」。
   // 桌宠轮被中断也走同一处收尾：抽情绪标签 + 去标签（见 `consumePetTags`）。
-  const finalText = consumePetTags(v.textAll.trim());
+  const finalText = consumePetTags(agentFinalText(v));
   if (finalText) chatHistory.push({ role: "assistant", content: finalText });
   // 与正常收尾同口径：先按同一上限裁剪上下文（否则每中断一次就多留一条、无界增长），
   // 再固化过程快照 —— `hasMsg` 决定历史渲染时过程块挂助手气泡还是自己的用户气泡之后。
@@ -4644,7 +4656,7 @@ function finalizeInterruptedTurn(opts: { manualStop?: boolean } = {}) {
 /** 用户按「停止」掐掉这一轮后，在过程末尾留一行明示（由 `finalizeInterruptedTurn` 调）。
  *
  *  形态照「上下文压缩提示」（`.sys-note sys-note-line`）：**必须插独立节点**、不进
- *  `textAll` —— 走了 `agentAppend("text", …)` 就会被当成助手正文存进 `chatHistory`、
+ *  `textSegs`（最终答案） —— 走了 `agentAppend("text", …)` 就会被当成助手正文存进 `chatHistory`、
  *  下次回灌给模型（同压缩提示踩过的坑，见那段注释）。`.note-interrupted` 这个类同时是
  *  `recordTurnSteps` 的采集判据，历史回看时才不会只剩半截输出。 */
 function appendInterruptedNote(flow: HTMLElement) {
@@ -5412,6 +5424,11 @@ interface CliEventLine {
   round?: number;
   ok?: boolean;
   ms?: number;
+  /** system/task_event（E1，2026-10-16）：子代理内部过程。与 `task_started` 同 `task_id`
+   *  —— 靠它把事件挂到对应的 `Agent` 卡片（见 `agentSubtaskEventLine`）。
+   *  `message.role=assistant` 是模型产出、`user` 是工具结果；块形状与主流程同名。
+   *  **整段超限时只有这一条**：`truncated:true` 且无 `message` ⇒ 框格末尾提示已截断。 */
+  truncated?: boolean;
   event?: {
     type: string;
     delta?: { type: string; text?: string; thinking?: string; partial_json?: string };
@@ -5506,9 +5523,6 @@ interface AgentTurn {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
-  /** 本轮是否跑过命令类工具（`Cmd` / `PowerShell`）—— ⑤ 脚本产出探测的开关（2026-10-10）。
-   *  只有跑过才值得在收尾时扫一遍工作目录找「脚本生成的文件」（见 `registerScriptArtifacts`）。 */
-  scriptRan?: boolean;
 }
 
 let agentTurn: AgentTurn | null = null;
@@ -5543,6 +5557,13 @@ interface AgentToolCard {
   fit?: FitAddon;
   /** 终端累积输出（终端未创建时的落点；累计上限见 `TERM_BUF_MAX`）。 */
   termBuf?: string;
+  /** `Agent` 工具卡专用（E2，2026-10-16）：内部过程的「框格」容器；子任务绑定后才建。
+   *  内部块（思考 / 工具 / 命令）由 `subtaskView` 作为目标容器渲染进它。 */
+  subtaskBox?: HTMLElement;
+  /** 该 `Agent` 卡对应的子任务视图（`flow` = 上面的框格）—— `task_event` 按 `task_id` 找到它。 */
+  subtaskView?: AgentView;
+  /** 该 `Agent` 卡对应子任务的描述（`tool_use` 入参里的 `description`）；`task_started` 据此认领卡片。 */
+  subtaskDesc?: string;
 }
 
 interface AgentView {
@@ -5555,7 +5576,10 @@ interface AgentView {
   curToolArgs: string;                  // accumulated input_json_delta
   curToolId: string;                    // tool_use id of the current card
   thinkChars: number;
-  textAll: string;                      // concatenated text blocks (history)
+  /** 本回合的**文本段**（收尾只取最后一段当最终答案，见 `agentFinalText`）——
+   *  遇到 `tool_result` 就起新段（见 `agentStartTextSeg`）：最后一次工具结果之后的 text
+   *  才是「最终输出」，它之前的 text 块是中间小输出（照旧渲染，只是不进 `chatHistory`）。 */
+  textSegs: string[];
   /** tool_use_id → 卡片；用于把 tool_result 的结果填回同一张卡 */
   toolCards: Map<string, AgentToolCard>;
   /** 最近一张未完成的卡片（端点未给 tool_use_id 时的兜底配对） */
@@ -5571,13 +5595,23 @@ interface AgentView {
    *  保证 DOM 顺序与时间顺序一致（否则第二组命令会插到中间那段正文前面）。 */
   cmdGroup: HTMLDetailsElement | null;
   cmdGroupBody: HTMLElement | null;
+  /** E2（2026-10-16）：已建、尚未被 `task_started` 认领的 `Agent` 工具卡（FIFO）。
+   *  子代理事件按 **`task_id`** 归属：描述匹配的未绑定卡被认领后移出本列表。 */
+  freeAgentCards: AgentToolCard[];
+  /** E2：`task_id` → 子任务视图（只有绑到 `Agent` 卡、需要渲染内部过程的任务才登记）。
+   *  `task_event` 靠它把内部块路由进对应框格 —— **绝不进主流程**。 */
+  taskViews: Map<string, AgentView>;
+  /** E2：时序倒挂（`task_started` 先到、`Agent` 卡后建）时的暂存，键 = `task_id`。
+   *  卡片出现（`agentToolInput` 解析出同名 description）时再挂进它的框格。 */
+  orphanTasks: Map<string, { desc: string; view: AgentView }>;
 }
 
 /** 一个并行子任务的实时状态（A14）。
  *
- *  数据来源只有 `system/task_started|task_progress|task_done` 三个事件 —— 子代理**非流式**
- *  （`run_subagent` 固定 `stream: false`），它的思考与工具过程**不进** stdout，所以这里
- *  没有正文可渲染，只有「第几轮、在跑哪个工具、跑完没」。 */
+ *  数据来源是 `system/task_started|task_progress|task_done` 三个事件。子代理曾是非流式
+ *  （不进 stdout），只有「第几轮、在跑哪个工具、跑完没」；E1（2026-10-16）起，**用户可见的
+ *  `Agent` 工具调用**会把内部过程按 `system/task_event` 单独转发，由 `Agent` 卡片里的
+ *  「框格」渲染（见 `agentSubtaskEventLine`）—— 面板这一行只留非 `Agent` 任务（如 fork 技能）。 */
 interface AgentSubtask {
   id: string;              // `task-1` / `skill-2`（进程内短计数，见 ai-spec §3.5）
   desc: string;            // `task_started` 的 description
@@ -5588,7 +5622,10 @@ interface AgentSubtask {
   ok?: boolean;
   /** `task_done` 的 `ms` */
   ms?: number;
-  el: HTMLElement;         // 面板里的那一行
+  /** 面板里的那一行；**已绑到 `Agent` 卡的任务没有这一行**（内容进卡片框格）。 */
+  el?: HTMLElement;
+  /** E2：该任务已并入某张 `Agent` 卡片 ⇒ 不再在面板里单独占一行（避免同一子代理显示两次）。 */
+  boundToCard?: boolean;
 }
 let agentView: AgentView | null = null;
 
@@ -5633,7 +5670,8 @@ function renderSubtaskHeader(v: AgentView) {
 
 /** 画一行（`task_started` / `task_progress` / `task_done` 都汇到这里，避免三处各画一遍）。 */
 function renderSubtaskRow(s: AgentSubtask) {
-  const pick = (sel: string) => s.el.querySelector<HTMLElement>(sel);
+  if (!s.el) return; // 已绑到 `Agent` 卡的任务没有面板行（内容在卡片框格里）
+  const pick = (sel: string) => s.el!.querySelector<HTMLElement>(sel);
   const idEl = pick(".subtask-id");
   if (idEl) idEl.textContent = s.id;
   const descEl = pick(".subtask-desc");
@@ -5651,11 +5689,168 @@ function renderSubtaskRow(s: AgentSubtask) {
   }
 }
 
+// ── E2 子代理内部过程：框格 + 归属（2026-10-16）───────────────────
+// 用户要求：`Agent` 工具卡标题栏显示任务描述，展开后用一个「框格」隔开、里面按顺序渲染
+// 子代理内部的思考 / 工具 / 命令，观感与主流程一致。
+// 归属判据 = **`task_id`**（`task_started` / `task_event` / `task_done` 同值）。
+// 认领方式 = 描述匹配：`Agent` 卡建好后进 `freeAgentCards`，其 `description` 由入参解析；
+// `task_started` 按同名 description 认领 —— 宁可不认领（留在面板）也不误绑（如 fork 技能）。
+
+/** 建一个子任务视图：`flow` 指向「框格」，其余状态各自独立 —— 内部块因此**全落框格内**，
+ *  与主流程的 `textSegs` / `toolCards` / 最终答案 / 复制按钮完全隔离（E1 已保证后端不污染，
+ *  这里再保证前端不污染）。 */
+function newSubtaskView(parent: AgentView, box: HTMLElement): AgentView {
+  return {
+    turn: parent.turn,
+    flow: box,
+    current: null,
+    currentKind: null,
+    curDetails: null,
+    curToolName: "",
+    curToolArgs: "",
+    curToolId: "",
+    thinkChars: 0,
+    textSegs: [],
+    toolCards: new Map<string, AgentToolCard>(),
+    openCard: null,
+    thinkText: "",
+    subtasks: new Map<string, AgentSubtask>(),
+    taskPanel: null,
+    cmdGroup: null,
+    cmdGroupBody: null,
+    freeAgentCards: [],
+    taskViews: new Map<string, AgentView>(),
+    orphanTasks: new Map<string, { desc: string; view: AgentView }>(),
+  };
+}
+
+/** 把给定的「框格」插进 `Agent` 卡（插在输出**之前**：先看过程、后看报告）。 */
+function insertBoxIntoCard(card: AgentToolCard, box: HTMLElement) {
+  const body = card.el.querySelector<HTMLElement>(".tool-body")!;
+  const out = body.querySelector(".tool-out, .tool-term");
+  if (out) body.insertBefore(box, out);
+  else body.appendChild(box);
+  card.subtaskBox = box;
+}
+
+/** 在 `Agent` 卡里新建一个「框格」。 */
+function attachSubtaskBox(card: AgentToolCard): HTMLElement {
+  const box = doc("div");
+  box.className = "subtask-box";
+  insertBoxIntoCard(card, box);
+  return box;
+}
+
+/** 把 `Agent` 卡标题栏写成任务描述（过长由 `.tool-cmd` 的单行省略兜住，见 styles.css）。 */
+function setAgentCardDesc(card: AgentToolCard, desc: string) {
+  card.subtaskDesc = desc;
+  if (!desc) return;
+  const cmdEl = card.el.querySelector<HTMLElement>(".tool-cmd");
+  if (cmdEl) cmdEl.textContent = desc;
+}
+
+/** 认领一张描述匹配的未绑定 `Agent` 卡；没有就返回 null。 */
+function claimAgentCard(v: AgentView, desc: string): AgentToolCard | null {
+  const i = v.freeAgentCards.findIndex((c) => c.subtaskDesc === desc);
+  return i < 0 ? null : v.freeAgentCards.splice(i, 1)[0];
+}
+
+/** `task_started`：把子任务绑到 `Agent` 卡（建框格 + 标题栏写描述），返回子视图；
+ *  卡片还没建（时序倒挂）⇒ 先建脱离 DOM 的框格暂存，卡片出现时再挂（见 `agentToolInput`）。
+ *  认不到（如 fork 技能）⇒ 返回 null，仍走原来的 `.subtask-panel` 行。 */
+function tryBindSubtask(v: AgentView, id: string, desc: string): AgentView | null {
+  let card = desc ? claimAgentCard(v, desc) : null;
+  if (!card && !desc) {
+    // 兜底：任务描述没拿到（入参未解析出来）时，若恰有一张描述同样为空的 `Agent` 卡就认领它。
+    // 只在**任务描述为空**时走这里 —— fork 技能的描述恒非空，不会被误绑。
+    const cands = v.freeAgentCards.filter((c) => !c.subtaskDesc);
+    if (cands.length === 1) card = v.freeAgentCards.splice(v.freeAgentCards.indexOf(cands[0]), 1)[0];
+  }
+  if (card) {
+    const sv = newSubtaskView(v, attachSubtaskBox(card));
+    card.subtaskView = sv;
+    setAgentCardDesc(card, desc);
+    v.taskViews.set(id, sv);
+    return sv;
+  }
+  if (!desc) return null; // 无描述又认不到卡 ⇒ 无法归属，留在面板
+  const box = doc("div");
+  box.className = "subtask-box";
+  const sv = newSubtaskView(v, box);
+  v.taskViews.set(id, sv);
+  v.orphanTasks.set(id, { desc, view: sv });
+  return sv;
+}
+
+/** `task_event`（E1 转发通道）的唯一入口：按 `task_id` 找到子视图，把内部块按顺序渲染进框格。 */
+function agentSubtaskEventLine(data: CliEventLine) {
+  const v = agentView;
+  const id = typeof data.task_id === "string" ? data.task_id : "";
+  if (!v || !id) return;
+  const sv = v.taskViews.get(id);
+  if (!sv) return; // 未绑定（fork 技能 / 旧 agent）⇒ 不渲染，避免落进主流程
+  // ① 整段超限：收到恰一条 `truncated:true` 且**无 message** ⇒ 框格末尾提示「已截断」。
+  if (data.truncated === true && !data.message) {
+    if (!sv.flow.querySelector(".subtask-truncated")) {
+      const note = doc("div");
+      note.className = "subtask-truncated";
+      note.textContent = t("agent.subtask_truncated");
+      sv.flow.appendChild(note);
+    }
+    agentScroll();
+    return;
+  }
+  const msg = data.message;
+  if (!msg || !Array.isArray(msg.content)) return;
+  renderSubtaskBlocks(sv, msg.content);
+  agentScroll();
+}
+
+/** 把子代理内部的一条 `message.content` 按顺序渲染进子视图的框格。
+ *  **复用主流程的块工厂**（`agentNewBlock` / `agentAppend` / `agentCloseBlock` /
+ *  `agentToolInput` / `fillToolCard`），只是把「目标容器」`v` 传成子视图 —— 不复制渲染逻辑。 */
+function renderSubtaskBlocks(
+  sv: AgentView,
+  content: NonNullable<CliEventLine["message"]>["content"],
+) {
+  for (const b of content ?? []) {
+    if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking) {
+      agentNewBlock("thinking", undefined, undefined, sv);
+      agentAppend("thinking", b.thinking, sv);
+      agentCloseBlock(sv);
+    } else if (b.type === "text" && typeof b.text === "string" && b.text) {
+      agentNewBlock("text", undefined, undefined, sv);
+      agentAppend("text", b.text, sv);
+      agentCloseBlock(sv);
+    } else if (b.type === "tool_use") {
+      agentNewBlock("tool", b.name || "", b.id || "", sv);
+      if (b.input !== undefined) {
+        // ⚠️ `input` 超限时后端会把它**退化成字符串**（见 E1 契约）⇒ 直接用，否则序列化。
+        const raw = typeof b.input === "string" ? b.input : JSON.stringify(b.input);
+        agentToolInput(b.name || "", raw, undefined, sv);
+      }
+      agentCloseBlock(sv);
+    } else if (b.type === "tool_result") {
+      const card =
+        (b.tool_use_id ? sv.toolCards.get(b.tool_use_id) : undefined) ?? sv.openCard ?? null;
+      if (card && !card.done) {
+        card.done = true;
+        if (sv.openCard === card) sv.openCard = null;
+        fillToolCard(card, extractToolResultText(b.content).trim(), !!b.is_error);
+        if (b.is_error) refreshCmdGroup(card.el.closest("details.cmd-group"));
+      }
+    }
+  }
+}
+
 /** 三个 `task_*` 事件的唯一入口。
  *
  *  `task_done` 必须回填状态行：主循环此刻还在跑（要读子代理的报告再继续），所以落到
  *  「工作中」而不是「就绪」；**还有别的子任务在跑时只更新并行数**，不能提前说「工作中」
- *  （那会让用户以为剩下的子任务也结束了）。 */
+ *  （那会让用户以为剩下的子任务也结束了）。
+ *
+ *  E2：`Agent` 任务的这一行并入卡片（标题栏描述 + 框格内容），**不再在面板里另占一行**；
+ *  非 `Agent` 任务（如 fork 技能）仍照旧走面板。 */
 function agentSubtaskEvent(data: CliEventLine) {
   const v = agentView;
   const id = typeof data.task_id === "string" ? data.task_id : "";
@@ -5665,14 +5860,23 @@ function agentSubtaskEvent(data: CliEventLine) {
   if (!sub) {
     // 没有 `task_started` 的 `task_done`（不该发生）：不凭空造一行出来
     if (subtype === "task_done") return;
-    const el = doc("div");
-    el.className = "subtask-row running";
-    el.innerHTML =
-      `<span class="subtask-id"></span><span class="subtask-desc"></span>` +
-      `<span class="subtask-state"></span>`;
-    agentSubtaskPanel(v).querySelector(".subtask-body")!.appendChild(el);
-    sub = { id, desc: "", tool: "", round: 0, done: false, el };
-    v.subtasks.set(id, sub);
+    const desc =
+      subtype === "task_started" && typeof data.description === "string" ? data.description : "";
+    const bound = subtype === "task_started" ? tryBindSubtask(v, id, desc) : null;
+    if (bound) {
+      // 已并入 `Agent` 卡 ⇒ 只登记状态（供并行数统计），不建面板行
+      sub = { id, desc, tool: "", round: 0, done: false, boundToCard: true };
+      v.subtasks.set(id, sub);
+    } else {
+      const el = doc("div");
+      el.className = "subtask-row running";
+      el.innerHTML =
+        `<span class="subtask-id"></span><span class="subtask-desc"></span>` +
+        `<span class="subtask-state"></span>`;
+      agentSubtaskPanel(v).querySelector(".subtask-body")!.appendChild(el);
+      sub = { id, desc: "", tool: "", round: 0, done: false, el };
+      v.subtasks.set(id, sub);
+    }
   }
   if (subtype === "task_started") {
     sub.desc = typeof data.description === "string" ? data.description : "";
@@ -5683,8 +5887,10 @@ function agentSubtaskEvent(data: CliEventLine) {
     sub.done = true;
     sub.ok = data.ok !== false;
     sub.ms = typeof data.ms === "number" ? data.ms : undefined;
-    sub.el.classList.remove("running");
-    sub.el.classList.add(sub.ok ? "done" : "failed");
+    if (sub.el) {
+      sub.el.classList.remove("running");
+      sub.el.classList.add(sub.ok ? "done" : "failed");
+    }
   }
   renderSubtaskRow(sub);
   renderSubtaskHeader(v);
@@ -5913,8 +6119,10 @@ window.addEventListener("resize", () => {
   }
 });
 
-/** 建一张命令执行卡片：头部（工具名 + 命令 + 状态）+ 折叠体（元信息 / 完整命令 / 输出 / 操作）。 */
-function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
+/** 建一张命令执行卡片：头部（工具名 + 命令 + 状态）+ 折叠体（元信息 / 完整命令 / 输出 / 操作）。
+ *  `interactive`（E2）= 是否给「后台运行 / 停止」实时控制 —— **子代理内部的命令卡不给**
+ *  （那条命令属于子代理，前端没有对应控制通道，按钮点了也没用）。 */
+function createToolCard(v: AgentView, name: string, id: string, interactive = true): AgentToolCard {
   const el = document.createElement("details");
   el.className = "tool-card running";
   if (id) el.dataset.toolId = id;
@@ -5941,6 +6149,9 @@ function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
     el, name, cmd: "", startAt: performance.now(), done: false, isShell,
   };
   if (id) v.toolCards.set(id, card);
+  // E2：`Agent` 卡建成即进待认领队列；`description` 由入参解析（见 `agentToolInput`），
+  // 待对应的 `task_started` 按描述认领（见 `tryBindSubtask`）。
+  if (name === "Agent") v.freeAgentCards.push(card);
 
   // 终端**惰性**：展开才建、收起即释放（内容留在 `card.termBuf`，再展开回放）。
   if (isShell) {
@@ -5959,7 +6170,7 @@ function createToolCard(v: AgentView, name: string, id: string): AgentToolCard {
   // 只给 shell 类工具 —— 别的工具没有「跑一半可以打断」这回事，agent 侧同理
   //（`run_one_tool` 里那个 `matches!(name, "Cmd" | "PowerShell")`）。
   const live = el.querySelector<HTMLElement>(".tool-live");
-  if (live && id && (name === "Cmd" || name === "PowerShell")) {
+  if (interactive && live && id && (name === "Cmd" || name === "PowerShell")) {
     live.classList.remove("hidden");
     live.innerHTML =
       `<button type="button" class="tool-live-btn" data-act="bg">${esc(t("agent.cmd_background"))}</button>` +
@@ -6005,10 +6216,16 @@ function markCardBackground(toolUseId: string | undefined) {
   live.innerHTML = `<span class="tool-live-state">${esc(t("agent.cmd_in_background"))}</span>`;
 }
 
-function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, toolId?: string) {
-  const v = agentView;
+/** 起一个新块。`v` = **目标容器**（E2）：缺省主视图；子代理内部过程传子视图（其 `flow`
+ *  是框格）⇒ 复用同一套块工厂，内容全落框格内、不进主流程。 */
+function agentNewBlock(
+  kind: "thinking" | "text" | "tool",
+  toolName?: string,
+  toolId?: string,
+  v: AgentView | null = agentView,
+) {
   if (!v) return;
-  agentCloseBlock();
+  agentCloseBlock(v);
   v.flow.querySelector(".plugin-result-loading")?.remove();
 
   if (kind === "thinking") {
@@ -6044,7 +6261,8 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, to
       v.current = null;
       v.openCard = null;
     } else {
-      const card = createToolCard(v, v.curToolName, v.curToolId);
+      // 只有主视图的卡片才给实时控制（子代理内的命令卡没有对应控制通道）
+      const card = createToolCard(v, v.curToolName, v.curToolId, v === agentView);
       v.current = card.el.querySelector(".tool-cmd");
       v.openCard = card;
     }
@@ -6059,16 +6277,46 @@ function agentNewBlock(kind: "thinking" | "text" | "tool", toolName?: string, to
   agentScroll();
 }
 
-function agentAppend(kind: "thinking" | "text", s: string) {
+/** 追加正文到**当前文本段**（段 = 相邻的 text 块；`tool_result` 起新段，见 `agentStartTextSeg`）。
+ *  只写内存的 `textSegs`，DOM 由 `agentAppend` 统一追加 —— 收尾时只取最后一段当最终答案。 */
+function agentAppendTurnText(v: AgentView, s: string) {
+  if (v.textSegs.length === 0) v.textSegs.push("");
+  v.textSegs[v.textSegs.length - 1] += s;
+}
+
+/** 本回合的**最终答案** = 最后一个文本段（最后一次 `tool_result` 之后的输出）。
+ *  没有 `tool_result` 时唯一那段就是答案（纯问答，与旧口径完全一致）；最后一次 `tool_result`
+ *  之后没有正文时返回空串 —— **不**退回上一段：过程文本不该冒充结论，且内容仍留在过程快照
+ *  （`recordTurnSteps` 照旧收 `.agent-text`）里，用户回看得到。 */
+function agentFinalText(v: AgentView | null): string {
+  if (!v || v.textSegs.length === 0) return "";
+  return (v.textSegs[v.textSegs.length - 1] || "").trim();
+}
+
+/** 遇到 `tool_result` 就起新段：此后新输出的 text 归新段（= 候选最终答案），
+ *  之前累积的那段降级为中间小输出（照旧渲染，不进最终答案）。 */
+function agentStartTextSeg() {
   const v = agentView;
+  if (!v) return;
+  v.textSegs.push("");
+  // 段边界（tool_result）⇒ 先前所有 `.agent-text` 降级为「中间小输出」：在 DOM 上打
+  // `data-mid`（样式据此转暗字 + 随回合折叠收起，见 styles.css）。此后新输出的正文块
+  // 属于新段 = 最终答案，不会再被标。**纯问答轮没有任何 tool_result** ⇒ 走不到这里
+  // ⇒ 唯一那段保持「最终答案」，绝不会被误标。
+  v.flow.querySelectorAll<HTMLElement>(".agent-text").forEach((el) => {
+    el.dataset.mid = "1";
+  });
+}
+
+function agentAppend(kind: "thinking" | "text", s: string, v: AgentView | null = agentView) {
   if (!v || !s) return;
-  if (v.currentKind !== kind || !v.current) agentNewBlock(kind);
+  if (v.currentKind !== kind || !v.current) agentNewBlock(kind, undefined, undefined, v);
   if (kind === "thinking") {
     v.thinkChars += s.length;
     v.thinkText += s;
     if (v.curDetails) setThinkLabel(v.curDetails, "running", v.thinkChars);
   } else {
-    v.textAll += s;
+    agentAppendTurnText(v, s);
   }
   v.current!.textContent = (v.current!.textContent || "") + s;
   agentScroll();
@@ -6106,10 +6354,14 @@ function isCompleteJson(raw: string): boolean {
 }
 
 /** 把入参摘要写进当前卡片：流式分片路径与整包回落路径共用。
- *  `target` 只在「整包回落要给一张早就建好的卡补写」时传（端点没发 input_json_delta 的情形）。 */
-function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
-  const card = target ?? agentView?.openCard;
+ *  `target` 只在「整包回落要给一张早就建好的卡补写」时传（端点没发 input_json_delta 的情形）。
+ *  `v`（E2）= 目标容器：缺省主视图；子代理内部过程传子视图 —— 此时**跳过**「改动文件追踪 /
+ *  内容快照 / 标题栏描述」这类主流程副作用，只渲染卡片本身。 */
+function agentToolInput(name: string, rawJson: string, target?: AgentToolCard, v?: AgentView) {
+  const v2 = v ?? agentView;
+  const card = target ?? v2?.openCard;
   if (!card) return;
+  const isMain = v === undefined;
   const display = toolArgsDisplay(name, rawJson);
   card.cmd = display;
   const el = card.el.querySelector<HTMLElement>(".tool-cmd");
@@ -6120,12 +6372,36 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
   if (fullEl && (name === "Cmd" || name === "PowerShell") && isCompleteJson(rawJson)) {
     fullEl.textContent = display;
   }
+
+  // E2：`Agent` 卡解析出 `description`（供 `task_started` 按描述认领 + 标题栏显示）。
+  // 「时序倒挂」（子任务先到、卡片后建）在此收口：解析出同名 description 后把暂存的框格挂进来。
+  if (isMain && name === "Agent" && !card.subtaskView) {
+    const desc = agentDescFromArgs(rawJson);
+    const orph = v2?.orphanTasks;
+    if (desc && orph && orph.size > 0) {
+      card.subtaskDesc = desc;
+      for (const [tid, o] of orph) {
+        if (o.desc !== desc) continue;
+        orph.delete(tid);
+        // 认领成功 ⇒ 从待认领队列里摘掉，避免之后被别的 `task_started` 再认领一次
+        const fi = v2!.freeAgentCards.indexOf(card);
+        if (fi >= 0) v2!.freeAgentCards.splice(fi, 1);
+        insertBoxIntoCard(card, o.view.flow);
+        card.subtaskView = o.view;
+        setAgentCardDesc(card, desc);
+        break;
+      }
+    } else if (desc) {
+      card.subtaskDesc = desc;
+    }
+  }
   if (!el) return;
 
   // 写类工具：把 `file_path` 摘出来渲染成**可点链接**（点击 → 资源管理器定位该文件），
   // 其余入参照旧跟在后面。同时把路径挂到卡片 dataset，`recordTurnSteps` 据此写进过程
   // 快照 ⇒ 恢复历史时能重建「改动过的文件」列表（走 `steps` 已有那一列，不改表结构）。
-  const field = WRITE_TOOLS[name];
+  // **只对主流程做**：子代理内部的写类调用不进主流程的「改动文件 / 快照」账（见函数注释）。
+  const field = isMain ? WRITE_TOOLS[name] : undefined;
   const file = field ? changedFilePathFromArgs(name, rawJson) : "";
   if (file) {
     card.el.dataset.file = file;
@@ -6134,7 +6410,7 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
     // 把文件还原到改动前。`card.snapshotTaken` 挡住入参流式的重复回调（只采第一次，
     // 也就是「这一卡动手之前」的那份）。
     void captureFileSnapshot(card, file);
-    const rest = argsWithoutPath(rawJson, field);
+    const rest = argsWithoutPath(rawJson, field!);
     el.innerHTML =
       fileLinkHtml(file) +
       (rest
@@ -6143,6 +6419,16 @@ function agentToolInput(name: string, rawJson: string, target?: AgentToolCard) {
     return;
   }
   el.textContent = display.length > 200 ? display.slice(0, 200) + "…" : display;
+}
+
+/** 从 `Agent` 工具入参取 `description`（完整 JSON 才解析得出来；分片期间返回空串）。 */
+function agentDescFromArgs(rawJson: string): string {
+  try {
+    const d = (JSON.parse(rawJson) as Record<string, unknown> | null)?.description;
+    return typeof d === "string" ? d.trim() : "";
+  } catch {
+    return "";
+  }
 }
 
 // ── 被改动文件的路径追踪（backlog §8.1）──────────────────────────
@@ -6261,10 +6547,14 @@ interface FileSnapshot {
   existed: boolean;
   /** 原内容；`existed && content === null` = 读不出来（二进制 / 超上限）⇒ 拒绝还原 */
   content: string | null;
-  /** **无改前内容**（2026-10-10，⑤）：这条不是「工具卡采到的原件」，而是**脚本（Cmd /
-   *  PowerShell）生成 / 改写**的文件的**事后登记**（见 `registerScriptArtifacts`）。它**只
-   *  用于「已改动文件」列表里看得见**，**一律不参与回退** —— 我们不知道改前是什么，硬回退
-   *  只可能误删用户原有的文件。回退 / 审阅的每一条写盘路径都必须先剔除 `unknown`。 */
+  /** **无改前内容**：这条不是「工具卡采到的原件」，而是**没有改前内容**的事后登记。它**只用于
+   *  「已改动文件」列表里看得见**，**一律不参与回退** —— 我们不知道改前是什么，硬回退只可能
+   *  误删用户原有的文件。回退 / 审阅的每一条写盘路径都必须先剔除 `unknown`。
+   *
+   *  ⚠️ **不再有新生产者**（2026-10-16）：原先「脚本（`Cmd` / `PowerShell`）产出登记」那条路径
+   *  （`registerScriptArtifacts`，按 mtime 扫工作目录）已**整体移除** —— 它会把一大批文件塞进
+   *  「更改文件」，大量出现「脚本生成 · 无改前内容」。字段保留只为**兼容已落盘的历史会话帧**
+   *  （回退 / 审阅仍须剔除它），不再由本端新写入。 */
   unknown?: boolean;
 }
 
@@ -6338,46 +6628,6 @@ async function captureFileSnapshot(card: AgentToolCard, file: string) {
     // 读不出来就不记：宁可这个文件不还原，也不要事后给用户一个假的「已回退」
     console.warn("[lunac] snapshot_read_text failed:", file, e);
   }
-}
-
-/** ⑤ 脚本产出登记（2026-10-10，用户要求「生成大的脚本所生成的文件也应该进入已改动的文件」）。
- *
- *  **要解决什么**：AI 用 `Cmd` / `PowerShell` 跑脚本**生成 / 改写**的文件不走 `Write` / `Edit`，
- *  `captureFileSnapshot`（按工具卡的 `file_path` 入参采原件）根本看不见它们 ⇒ 那些文件永远不
- *  出现在「已改动文件」列表里。
- *
- *  **怎么找**：本轮跑过命令类工具（`turn.scriptRan`）时，收尾按 mtime 扫一遍 agent 的可写工作
- *  目录（宿主命令 `scan_agent_writes`，只回路径、不读内容），把 `sinceMs` 之后被写过的文件
- *  登记成 `unknown` 帧 —— **只进列表、不参与回退**（没有改前内容，硬回退只会误删用户原有文件）。
- *
- *  ⚠️ **必须当场捕获目标线程的引用再异步写回**：这条扫描在桌宠轮收尾时才跑，而收尾紧接着
- *  `switchThread("chat")` 会把 `sessionFileSnapshots` / `sessionChangedFiles` 换成另一条线程的
- *  那份。用捕获的引用写入，落盘的 `sid` 也用捕获的 `activeSid()`，才不会被换线程串台。 */
-function registerScriptArtifacts(turn: number, sinceWallMs: number): void {
-  const frames = sessionFileSnapshots;
-  const changed = sessionChangedFiles;
-  const sid = activeSid();
-  void (async () => {
-    try {
-      const paths = await invoke<string[]>("scan_agent_writes", { sinceMs: sinceWallMs, limit: 200 });
-      if (!paths.length) return;
-      let added = 0;
-      for (const p of paths) {
-        // 已经有真快照（工具卡采过原件）就不重复登记 —— 真快照能回退，别被降级成 unknown
-        if (frames.some(s => s.turn === turn && s.path === p)) continue;
-        frames.push({ turn, path: p, existed: true, content: null, unknown: true });
-        if (!changed.includes(p)) changed.push(p);
-        added++;
-      }
-      if (!added) return;
-      framesEpoch++;
-      todoDismissed = false; // 有新登记 ⇒ 抽屉该回来（与 noteChangedFile 一致）
-      renderTodoDrawer();
-      if (sid) await saveFrames(sid, frames);
-    } catch (e) {
-      console.warn("[lunac] scan_agent_writes failed:", e);
-    }
-  })();
 }
 
 /** 把给到的快照**逐条**写回，按回合**倒序**。
@@ -6953,8 +7203,7 @@ function renderTodoPanel(todos: unknown[]) {
   renderTodoDrawer();
 }
 
-function agentCloseBlock() {
-  const v = agentView;
+function agentCloseBlock(v: AgentView | null = agentView) {
   if (!v) return;
   if (v.currentKind === "thinking" && v.curDetails) {
     // 收起的思考只留一行；正文转存到 dataset，展开时按需填回（agent-ui-spec §3.2）。
@@ -6967,7 +7216,8 @@ function agentCloseBlock() {
     v.curDetails = null;
   }
   if (v.currentKind === "text") {
-    v.textAll += "\n\n";
+    // 段间分隔照旧补空行（写在**当前段**里；最后一段因此自带尾部空行，`agentFinalText` 会 trim 掉）
+    agentAppendTurnText(v, "\n\n");
     // Render markdown images in the finished text block (点16)
     const tblock = v.current as HTMLElement;
     if (tblock) {
@@ -8884,10 +9134,6 @@ listen<{ line: string }>("cli-output", (event) => {
         } else if (cb?.type === "tool_use") {
           // Track tool call in turn (Pi: structured tool lifecycle)
           agentTurn?.toolCalls.push({ name: cb.name || "unknown", status: "running" });
-          // ⑤ 脚本产出探测（2026-10-10）：本轮跑过命令类工具 ⇒ 收尾时按 mtime 扫一遍工作目录。
-          if (cb.name === "Cmd" || cb.name === "PowerShell") {
-            if (agentTurn) agentTurn.scriptRan = true;
-          }
           // `PetControl`（桌宠动作，2026-10-10）：**不建命令卡** —— 它的效果由前端广播给
           // 桌宠窗（见 handlePetControl），而卡上那行 `action=… name=…` 正是不该给用户看的
           // 技术细节。不建块 ⇒ 后续 `input_json_delta` 因 `currentKind !== "tool"` 自然忽略；
@@ -8985,15 +9231,27 @@ listen<{ line: string }>("cli-output", (event) => {
       // 别让人只在状态行一闪而过时才发现「模型怎么忘了前面的事」。
       //
       // ⚠️ **必须插独立节点，不能用 `agentAppend("text", …)`**（2026-10-06 实测踩到）：
-      // 那条路会把文本并进 `agentView.textAll`，而收尾时 `finalText = textAll` 会被
+      // 那条路会把文本并进 `agentView.textSegs`，而收尾时 `finalText = agentFinalText(v)` 会被
       // `chatHistory.push` 存进会话库、下次还回灌给模型 —— 结果是助手回复的开头变成
       // 「上下文已压缩：省略 12 个工具结果…」，与任务完全无关、且污染历史。
-      // 形态照 `renderHookNote`（同样绕开 textAll）。
-      const host = agentView?.flow ?? resultsList;
-      const note = document.createElement("div");
-      note.className = "sys-note sys-note-line";
-      note.textContent = t("agent.compacted_note", { elided: String(elided), dropped: String(dropped) });
-      host.appendChild(note);
+      // 形态照 `renderHookNote`（同样绕开 textSegs）。
+      // 落点（修 3，2026-10-16）：回**合内**挂当前 `agentView.flow`（与过程同序）；回**合外**
+      //（手动 `/compact`，没有 `agentView`）兜底到 `chatFlowHost()`（= `ensureChatLog()`，与
+      // `appendSlashNote` / `appendSlashDetails` / `appendInterruptedNote` **同口径**）——
+      // 旧写法兜底到 `resultsList`（`#chat-log` 的**父节点**），旁注成兄弟节点被钉在最底部。
+      const compactText = t("agent.compacted_note", { elided: String(elided), dropped: String(dropped) });
+      if (compactNoteEl && compactNoteEl.isConnected) {
+        // 手里还有手动 `/compact` 的占位旁注（仍挂在对话流里）⇒ **原地改文字**（不新建节点）：
+        // 「已请求压缩」→「已压缩 …」合并成**一条**，且天然留在时间序位置（不跳到最底）。
+        compactNoteEl.textContent = compactText;
+        compactNoteEl = null; // 用掉即清：下次压缩若没有新占位就按下面那条新建
+      } else {
+        const host = agentView?.flow ?? chatFlowHost();
+        const note = document.createElement("div");
+        note.className = "sys-note sys-note-line";
+        note.textContent = compactText;
+        host.appendChild(note);
+      }
       agentScroll();
     }
     // MCP 配置改动（2026-10-06）：agent 只在**启动时**读一次 MCP 配置，而工具表是固定前缀
@@ -9147,6 +9405,12 @@ listen<{ line: string }>("cli-output", (event) => {
       // task_done 后主代理立刻继续（下次请求模型）⇒ 归回「请求模型」。
       setDebugPhase(data.subtype === "task_done" ? "requesting" : "subagent");
     }
+    // E2（2026-10-16）：子代理**内部过程**（思考 / 文本 / 工具调用与结果）—— 复用 `system`
+    // 通道（`subtype: task_event`）。按 `task_id` 路由进对应 `Agent` 卡的「框格」，
+    // **绝不进主流程**（见 `agentSubtaskEventLine`）。旧 agent 不发这个事件 ⇒ 此处自然静默。
+    else if (data.type === "system" && data.subtype === "task_event") {
+      agentSubtaskEventLine(data);
+    }
     // Whole assistant message: block fallback (only when no partial stream
     // events arrived, to avoid double rendering) + tool_use status
     else if (data.type === "assistant" && data.message?.content) {
@@ -9225,6 +9489,9 @@ listen<{ line: string }>("cli-output", (event) => {
       }
       for (const block of data.message.content) {
         if (block.type === "tool_result") {
+          // 工具结果回来 ⇒ 起一个新的正文段：模型随后（若继续说话）输出的 text 才是「最终答案」，
+          // 此前那段正文降级为中间小输出（见 `agentStartTextSeg` / `agentFinalText`）。
+          agentStartTextSeg();
           // Update turn tool call status (Pi: structured tool lifecycle)
           const tc = agentTurn?.toolCalls;
           const lastTool = tc && tc[tc.length - 1];
@@ -9388,13 +9655,6 @@ listen<string>("cli-stderr", (event) => {
 // ── 回合折叠与运行端输出（见 docs/agent-ui-spec.md §3.4 / §3.5）──────
 /** 本轮开始时间，用于回合汇总里的「耗时」。 */
 let turnStartAt = 0;
-
-/** 本轮开始的**墙钟**时间（`Date.now()`）与**本轮的回合下标**（见 `completedTurnCount`）。
- *  ⑤ 脚本产出探测用：`scan_agent_writes` 按 epoch 毫秒比 mtime，而 `turnStartAt` 是
- *  `performance.now()`（进程内相对时间）不能比；回合下标则必须与 `captureFileSnapshot`
- *  用的那一个口径一致（都是「本轮助手消息一旦入列后的下标」）。 */
-let turnStartWall = 0;
-let turnIdxAtStart = 0;
 
 const runtimeNoteBuffer: string[] = [];
 let runtimeNoteEl: HTMLDetailsElement | null = null;
@@ -10536,9 +10796,6 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
 
   cliSawStreamDelta = false; // new query — reset double-render guard
   turnStartAt = performance.now();
-  // ⑤ 脚本产出探测的起点（墙钟 + 本轮回合下标）—— 见 `registerScriptArtifacts`。
-  turnStartWall = Date.now();
-  turnIdxAtStart = completedTurnCount();
   resetRuntimeNote();
 
   agentView = {
@@ -10551,7 +10808,7 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     curToolArgs: "",
     curToolId: "",
     thinkChars: 0,
-    textAll: "",
+    textSegs: [],
     toolCards: new Map<string, AgentToolCard>(),
     openCard: null,
     thinkText: "",
@@ -10559,6 +10816,9 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     taskPanel: null,
     cmdGroup: null,
     cmdGroupBody: null,
+    freeAgentCards: [],
+    taskViews: new Map<string, AgentView>(),
+    orphanTasks: new Map<string, { desc: string; view: AgentView }>(),
   };
 
   cliDoneCallback = (info?: ChatDoneInfo) => {
@@ -10568,7 +10828,7 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     const v = agentView;
     // 桌宠轮的「情绪标签」回退：正文里的 `[名字]` 当场落成动作、并从正文里去掉
     //（见 `consumePetTags`）—— 之后的历史 / 复制 / 气泡 / 朗读都拿不到那几个标签。
-    const finalText = consumePetTags(v ? v.textAll.trim() : "");
+    const finalText = consumePetTags(agentFinalText(v));
     if (v) {
       v.flow.querySelector(".plugin-result-loading")?.remove();
       // Render LaTeX across all text blocks
@@ -10576,12 +10836,6 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     }
     agentView = null;
     agentTurn = null;
-
-    // ⑤ 脚本产出登记：本轮跑过 `Cmd` / `PowerShell`（`turn.scriptRan`）⇒ 扫一遍工作目录，
-    // 把脚本生成 / 改写的文件登记进「已改动文件」（`unknown` 帧，只列、不回退）。
-    // **必须在这里**（收尾、`switchThread` 之前）调用 —— `registerScriptArtifacts` 会当场
-    // 捕获当前线程的快照 / 列表引用，切线程之后就串台了。
-    if (turn.scriptRan) registerScriptArtifacts(turnIdxAtStart, turnStartWall);
 
     /** 本轮助手消息在 `chatHistory` 里的下标（回合页脚的回退点，A11）；没有助手消息时 -1。
      *  必须在下面的裁剪**之后**算：裁剪会把下标整体前移（见 `shiftRenderedMsgIdx`）。 */
@@ -10648,11 +10902,17 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
       // `!!finalText` = 本轮是否产出了助手气泡（决定历史渲染时挂哪里，见 recordTurnSteps）
       recordTurnSteps(flowEl, !!finalText);
 
-      // 只有这一轮真的产生了「过程」才给折叠按钮
-      const processEls = flowEl.querySelectorAll(
-        ".think-block, .tool-card, .tool-row, .subtask-panel, .sys-note",
-      );
-      if (processEls.length > 0) {
+      // 只有这一轮真的产生了「过程」才给折叠按钮。中间小输出（`data-mid`）也算过程：
+      // 折叠态下它与思考 / 工具 / 命令一起收起，只留最终答案那一段正文。
+      // E2：子代理框格内的块**不计入**主流程过程块（否则会虚抬默认折叠门槛）。
+      let processCount = 0;
+      flowEl
+        .querySelectorAll(".think-block, .tool-card, .tool-row, .subtask-panel, .sys-note")
+        .forEach((el) => {
+          if (!el.closest(".subtask-box")) processCount++;
+        });
+      const hasMid = !!flowEl.querySelector('.agent-text[data-mid="1"]');
+      if (processCount > 0 || hasMid) {
         const foldBtn = doc("button");
         foldBtn.className = "turn-fold";
         foldBtn.setAttribute("type", "button");
@@ -10660,8 +10920,10 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
           flowEl.classList.toggle("flow-folded", folded);
           // 命令组跟着回合一起开合：折叠 ⇒ 只剩「已执行 N 条命令」一行；展开 ⇒ 摊开全部命令。
           // 不这么做的话，展开回合还得再点一次每个组，等于折叠变成了两层。
+          // E2：**子代理框格内的命令组不跟**（它们由 `Agent` 卡自身的开合控制）—— 否则用户
+          // 展开 `Agent` 卡后还得再点一次嵌套的组，又成两层折叠。
           flowEl.querySelectorAll<HTMLDetailsElement>("details.cmd-group").forEach(g => {
-            g.open = !folded;
+            if (!g.closest(".subtask-box")) g.open = !folded;
           });
           foldBtn.textContent = folded ? t("agent.turn_expand") : t("agent.turn_collapse");
         };
@@ -10669,8 +10931,9 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
           setFolded(!flowEl.classList.contains("flow-folded"));
         });
         footer.appendChild(foldBtn);
-        // 默认折叠门槛（agent-ui-spec §3.5）：工具调用 ≥2 或过程块 ≥3
-        setFolded(turn.toolCalls.length >= 2 || processEls.length >= 3);
+        // 默认折叠门槛（agent-ui-spec §3.5）：工具调用 ≥2 或过程块 ≥3，或存在中间小输出
+        // （有中间小输出就一定有过程 —— 默认收起，点「展开过程」才见，用户明确要求）。
+        setFolded(turn.toolCalls.length >= 2 || processCount >= 3 || hasMid);
       }
       flowEl.appendChild(footer);
     }

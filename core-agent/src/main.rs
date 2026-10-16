@@ -277,6 +277,13 @@ const SUBAGENT_BUDGET_TOKENS: u64 = 300_000;
 /// 回灌给主对话的子代理报告字符上限。子代理的返回值**不走** `tools::apply_budget`
 /// （那条路只覆盖内置工具），不在这里收口的话，一份长报告能直接把主对话上下文顶爆。
 const SUBAGENT_REPORT_CHARS: usize = 8_000;
+/// 子代理**内部过程转发**的**单条**内容上限（字符）。转发的初衷是让用户看到「它在做什么」，
+/// 不是把每个文件原样搬进前端 —— 单块文本（thinking / text / tool 入参 / tool_result）超过它
+/// 就用 `log::truncate_chars` 截断，超限处带 `…(truncated)` 标记（绝不静默丢）。
+const SUBAGENT_EVENT_ITEM_CHARS: usize = 4_000;
+/// 子代理**内部过程转发**的**整段**上限（字符，跨所有轮累计）。一个 8 轮、每轮跑命令的子代理
+/// 能产出几十万字符；不封顶会把前端拖垮。用尽后只发一条 `truncated:true` 标记，之后不再转发。
+const SUBAGENT_EVENT_TOTAL_CHARS: usize = 40_000;
 /// 子代理的系统提示词（**角色段**）。英文的原因同 `TRIMMED_MARKER`：这是给模型看的元信息，不进 i18n。
 ///
 /// 它在 `main()` 里被拼成完整提示词时**还会接上环境块与技能清单**（见那里的 `subagent_system`）
@@ -5594,6 +5601,15 @@ struct ForkSpec<'a> {
     /// 它在提问之间跑，而前端收到这个事件只会把状态栏改成「子任务运行中」且**没有**
     /// 恢复的时机（`task_done` 前端不处理），复盘结束时状态栏就停在错的文案上。
     emit_progress: bool,
+    /// 是否把子代理的**内部过程**（思考 / 文本 / 工具调用与结果）按 `task_event` 事件转发到前端。
+    ///
+    /// **只有「用户可见的 `Agent` 工具调用」（`run_agent_tool`）为 `true`**；后台复盘与 fork 技能
+    /// 一律 `false`。这是「静默不变量」的**唯一判据**：`false` 时 `run_subagent` 连转发器都不构造，
+    /// 一个 `task_event` 都不发（复盘是无人值守的静默 fork；fork 技能的内部过程不进入 `Agent` 卡片）。
+    ///
+    /// 与 `emit_progress` **不是同一个概念**，故不合并：fork 技能的 `emit_progress` 是 `true`
+    /// （进度要回前端），但它的**内部过程**不转发 —— 两个判据若合成一份就会走偏。
+    emit_subtask: bool,
     /// 多代理通信（A13，2026-10-05）：`Some(描述)` = 把这次 fork 登记进 peer 登记处
     /// （同批兄弟可 `ListPeers` 看到它、`SendMessage` 投给它）；`None` = 不登记。
     /// 前台子代理（`Agent` / fork 技能）传 `Some`，**后台复盘传 `None`** —— 它在提问
@@ -5608,6 +5624,158 @@ struct PeerReg(String);
 impl Drop for PeerReg {
     fn drop(&mut self) {
         peers::bus().unregister(&self.0);
+    }
+}
+
+// ── 子代理内部过程转发（E1，2026-10-16）────────────────────────────
+//
+// 把子代理**内部**的思考 / 文本 / 工具调用与结果，按发生顺序转成 `task_event` 事件发给前端，
+// 让「`Agent` 工具卡」展开后能看到它在干什么（E2 负责渲染，本步只铺数据通道）。
+//
+// 三条纪律：
+//   · **复用既有 `system` 事件通道**（`subtype: "task_event"`），不另开 IPC；块内字段名与主流程
+//     的 `assistant` / `user` 事件**逐字对齐**（`message.content[].type` 等），前端解析可尽量复用。
+//   · **绝不进主对话**：这些事件只写给前端，`run_subagent` 自己的 history / 主循环的 history
+//     一个字都不改 ⇒ 固定前缀缓存不变量不受影响（§规范 6）。
+//   · **静默不变量**：只有「用户可见的 `Agent` 工具调用」才转发（`ForkSpec::emit_subtask`），
+//     复盘 fork 与 fork 技能保持零事件。
+
+/// 子代理内部过程转发的**唯一闸门**：`emit_subtask` 为真才构造转发器，否则返回 `None`
+/// ⇒ `run_subagent` 既不构造也不发送，一个 `task_event` 都不出（静默不变量）。
+fn subtask_forwarder(emit_subtask: bool) -> Option<SubtaskForward> {
+    emit_subtask.then(SubtaskForward::new)
+}
+
+/// 把任意 JSON 值按字符上限收口（内部过程转发的单条上限）。字符串直接 `log::truncate_chars`
+/// （带 `…(truncated)` 标记）；对象 / 数组序列化后若超限，退化成**带标记的字符串** —— 宁可
+/// 让前端按文本渲染，也不静默丢内容。未超限则原样返回。
+fn truncate_json_value(v: Value, max: usize) -> Value {
+    match v {
+        Value::String(s) => Value::String(log::truncate_chars(&s, max)),
+        other => {
+            let s = serde_json::to_string(&other).unwrap_or_default();
+            if s.chars().count() <= max {
+                other
+            } else {
+                Value::String(log::truncate_chars(&s, max))
+            }
+        }
+    }
+}
+
+/// 把子代理内部的一块内容块转成前端可渲染的形态。字段名与主流程同名事件**逐字对齐**：
+/// `thinking` / `text` / `tool_use`（`id` / `name` / `input`）/ `tool_result`（`tool_use_id` /
+/// `content` / `is_error`）。未知类型原样透传（前端按缺省处理）。
+fn forward_content_block(blk: &Value) -> Value {
+    match blk.get("type").and_then(Value::as_str).unwrap_or("") {
+        "thinking" => json!({
+            "type": "thinking",
+            "thinking": truncate_json_value(
+                blk.get("thinking").cloned().unwrap_or(Value::Null),
+                SUBAGENT_EVENT_ITEM_CHARS,
+            ),
+        }),
+        "text" => json!({
+            "type": "text",
+            "text": truncate_json_value(
+                blk.get("text").cloned().unwrap_or(Value::Null),
+                SUBAGENT_EVENT_ITEM_CHARS,
+            ),
+        }),
+        "tool_use" => json!({
+            "type": "tool_use",
+            "id": blk.get("id").cloned().unwrap_or(Value::Null),
+            "name": blk.get("name").cloned().unwrap_or(Value::Null),
+            "input": truncate_json_value(
+                blk.get("input").cloned().unwrap_or(Value::Null),
+                SUBAGENT_EVENT_ITEM_CHARS,
+            ),
+        }),
+        "tool_result" => {
+            let mut out = json!({
+                "type": "tool_result",
+                "tool_use_id": blk.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                "content": truncate_json_value(
+                    blk.get("content").cloned().unwrap_or(Value::Null),
+                    SUBAGENT_EVENT_ITEM_CHARS,
+                ),
+            });
+            if blk.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                out["is_error"] = json!(true);
+            }
+            out
+        }
+        _ => blk.clone(),
+    }
+}
+
+/// 子代理内部过程转发的**状态机**：单条（`forward_content_block`）+ 整段（`left`）双上限。
+///
+/// 纯逻辑：`events()` 只算出「要发什么」（不碰 stdout，单测直接钉它），`send()` 才 `emit`。
+struct SubtaskForward {
+    /// 整段剩余预算（字符）。`SUBAGENT_EVENT_TOTAL_CHARS` 起算，随每条事件的实际体积递减。
+    left: usize,
+    /// 是否已发过「整段预算用尽」标记（只发一次，避免刷屏）。
+    notified: bool,
+}
+
+impl SubtaskForward {
+    fn new() -> Self {
+        Self { left: SUBAGENT_EVENT_TOTAL_CHARS, notified: false }
+    }
+
+    /// 算出这条内部消息要 emit 的事件列表（0 / 1 / 2 条），**保序**。事件契约（E2 照此渲染）：
+    ///
+    /// ```text
+    /// {"type":"system","subtype":"task_event","task_id":"task-1",
+    ///  "message":{"role":"assistant","content":[ {type:thinking|text|tool_use,…} ]}}
+    /// {"type":"system","subtype":"task_event","task_id":"task-1",
+    ///  "message":{"role":"user","content":[ {type:tool_result,…} ]}}
+    /// ```
+    ///
+    /// 整段预算用尽后追加一条 `{"type":"system","subtype":"task_event","task_id":…,"truncated":true}`
+    /// 且**之后不再出内容事件**（明确标记，不静默丢）。
+    fn events(&mut self, task_id: &str, role: &str, content: &[Value]) -> Vec<Value> {
+        let mut out = Vec::new();
+        if content.is_empty() {
+            return out;
+        }
+        if self.left == 0 {
+            if !self.notified {
+                self.notified = true;
+                out.push(json!({
+                    "type": "system", "subtype": "task_event",
+                    "task_id": task_id, "truncated": true,
+                }));
+            }
+            return out;
+        }
+        let blocks: Vec<Value> = content.iter().map(forward_content_block).collect();
+        let size = serde_json::to_string(&blocks).map(|s| s.chars().count()).unwrap_or(0);
+        if size > self.left {
+            // 剩余预算放不下这一条 ⇒ 封顶并留标记，不再转发后续内容
+            self.left = 0;
+            self.notified = true;
+            out.push(json!({
+                "type": "system", "subtype": "task_event",
+                "task_id": task_id, "truncated": true,
+            }));
+            return out;
+        }
+        self.left -= size;
+        out.push(json!({
+            "type": "system", "subtype": "task_event",
+            "task_id": task_id,
+            "message": { "role": role, "content": blocks },
+        }));
+        out
+    }
+
+    /// 发送出口：把 `events()` 的结果逐条 `emit`（保持顺序）。
+    fn send(&mut self, task_id: &str, role: &str, content: &[Value]) {
+        for ev in self.events(task_id, role, content) {
+            emit(ev);
+        }
     }
 }
 
@@ -5657,6 +5825,9 @@ fn run_subagent(
     })];
     let mut spent: u64 = 0;
     let mut last_text = String::new();
+    // 内部过程转发器（仅「用户可见的 `Agent` 工具调用」为 `Some`；复盘 / fork 技能为 `None`
+    // ⇒ 全程一个 `task_event` 都不发，静默不变量）。
+    let mut fwd = subtask_forwarder(spec.emit_subtask);
 
     for round in 1..=max_rounds {
         // 多代理通信（A13，2026-10-05）：先把兄弟投来的消息读进本子代理的 history
@@ -5773,6 +5944,9 @@ fn run_subagent(
         // 同主循环的规矩），但文本块要 push 回 history，否则端点看不到自己说过的话。
         let mut blocks: Vec<Value> = Vec::new();
         let mut calls: Vec<(String, String, Value)> = Vec::new();
+        // 转发给前端的展示块（含 thinking —— history 不放它，但「让用户看到思考」要它）。
+        // 形状与主循环的 `display` 同构，前端可复用同一套块渲染。
+        let mut display: Vec<Value> = Vec::new();
         if let Some(arr) = parsed.get("content").and_then(Value::as_array) {
             for b in arr {
                 match b.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -5780,15 +5954,26 @@ fn run_subagent(
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
                             if !t.trim().is_empty() {
                                 last_text = t.to_string();
+                                display.push(json!({ "type": "text", "text": t }));
                             }
                         }
                         blocks.push(b.clone());
+                    }
+                    "thinking" => {
+                        if let Some(t) = b.get("thinking").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                display.push(json!({ "type": "thinking", "thinking": t }));
+                            }
+                        }
                     }
                     "tool_use" => {
                         let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                         let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                         let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
                         blocks.push(b.clone());
+                        display.push(json!({
+                            "type": "tool_use", "id": id, "name": name, "input": input.clone(),
+                        }));
                         calls.push((id, name, input));
                     }
                     _ => {}
@@ -5797,6 +5982,12 @@ fn run_subagent(
         }
         if !blocks.is_empty() {
             history.push(json!({ "role": "assistant", "content": blocks }));
+        }
+
+        // 内部过程转发：本轮的助手消息（思考 / 文本 / 工具调用）按发生顺序发出。
+        // **只 emit，不进任何 history** —— 主对话前缀缓存不变量因此不受影响。
+        if let Some(f) = fwd.as_mut() {
+            f.send(task_id, "assistant", &display);
         }
 
         if calls.is_empty() {
@@ -5879,6 +6070,11 @@ fn run_subagent(
             );
             results.push(tool_result_block(id, text, is_error));
         }
+        // 内部过程转发：本轮的工具结果按调用顺序发出（在写回子代理 history **之前**借用，
+        // 之后 `results` 被 move 进 json!）。同样只 emit、不进主对话。
+        if let Some(f) = fwd.as_mut() {
+            f.send(task_id, "user", &results);
+        }
         history.push(json!({ "role": "user", "content": results }));
     }
 
@@ -5938,6 +6134,8 @@ fn run_agent_tool(
             max_rounds: MAX_SUBAGENT_ROUNDS,
             budget_tokens: SUBAGENT_BUDGET_TOKENS,
             emit_progress: true,
+            // 用户可见的 `Agent` 工具调用 ⇒ 转发内部过程（E1 数据通道，E2 前端渲染）
+            emit_subtask: true,
             // 前台子代理登记进 peer 登记处（同批兄弟可互相 ListPeers / SendMessage）
             peer: Some(desc),
         },
@@ -6079,6 +6277,8 @@ fn run_forked_skill(
             max_rounds: MAX_SUBAGENT_ROUNDS,
             budget_tokens: SUBAGENT_BUDGET_TOKENS,
             emit_progress: true,
+            // fork 技能的**内部过程不转发**：那些内容属于技能自己的执行，不进入 `Agent` 卡片
+            emit_subtask: false,
             // fork 技能与 `Agent` 会合进同一个并发批 ⇒ 同样登记，否则会出现
             // 「Agent 看得见 fork 技能、fork 技能看不见 Agent」的不对称。
             peer: Some(skill.key.as_str()),
@@ -6330,6 +6530,8 @@ fn run_review_fork(job: ReviewJob) -> Result<String, String> {
             budget_tokens: REVIEW_BUDGET_TOKENS,
             // 不回前端进度：复盘在提问之间跑，前端没有恢复状态栏的时机（见字段注释）
             emit_progress: false,
+            // 静默不变量：复盘 fork 一个 `task_event` 都不发（无人值守的后台过程）
+            emit_subtask: false,
             // 复盘不登记为 peer：它在提问之间单独跑、没有兄弟，也不该出现在别人的列表里
             peer: None,
         },
@@ -6492,8 +6694,10 @@ fn prescreen(input: &str, kind: &str, scope: tools::MemoryScope, turn: u64) -> O
         return Some(run_prescreen(&decide::Heuristic, "heuristic", input, kind, scope, turn, &dir));
     }
     // 形态 B：本地模型。任何故障 ⇒ fail-open（照旧派），落在 `decide::decide`。
+    // 经 `ChannelGated` 包一层：本地模型通道（判定 / 抽取 / 预热**共用**）忙时**立即 busy-skip**、
+    // 绝不排队 —— `llama-server` 是 `-np 1` 单并发槽，排队只会把两个请求都拖到各自超时。
     let model = cfg.model.clone();
-    let d = decide::LocalHttp::new(cfg);
+    let d = decide::ChannelGated::new(decide::LocalHttp::new(cfg));
     Some(run_prescreen(&d, &model, input, kind, scope, turn, &dir))
 }
 
@@ -6528,7 +6732,9 @@ fn spawn_local_decide_warmup() {
         return; // 默认关 / 未配端点 ⇒ 不预热（零请求）
     };
     thread::spawn(move || {
-        let d = decide::LocalHttp::new(cfg);
+        // 预热与判定 / 抽取**共用同一把本地通道锁**（否则预热仍会和判定抢那唯一一个并发槽）：
+        // 拿不到锁 ⇒ 立即跳过（`warmup_with` 把 `Err(BUSY_SKIP)` 记成一行 info，静默无害）。
+        let d = decide::ChannelGated::new(decide::LocalHttp::new(cfg));
         decide::warmup_with(&d);
     });
 }
@@ -6615,8 +6821,10 @@ fn extract_candidates_into(dir: &Path, history: &[Value], scope: tools::MemorySc
     };
     let model = cfg.model.clone();
     let input = review_transcript(history, CANDIDATE_TRANSCRIPT_CHARS);
+    // 经 `ChannelGated` 包一层：本地模型通道（判定 / 抽取 / 预热**共用**）忙时**立即 busy-skip**、
+    // 绝不排队（抽取上限 5s 比判定 1.5s 宽，真排队时两条都等到超时 ⇒ 双双 fail-open）。
     let _ = run_memory_extraction(
-        &memory_candidates::LocalExtract::new(cfg),
+        &memory_candidates::ChannelGated::new(memory_candidates::LocalExtract::new(cfg)),
         &model,
         &input,
         scope,
@@ -7062,7 +7270,7 @@ fn plan_tool_batches(
 /// | `Agent` | 防无限递归（约束⑤）—— 子代理不能再派子代理 |
 /// | `EnterPlanMode` / `ExitPlanMode`（A7） | 计划相位是**主循环**的状态。子代理**问不了用户**（它的提示词就是这么写的），`ExitPlanMode` 在里面只会弹一张无人能负责的卡；而 `EnterPlanMode` 若被子代理调用，等于它替主代理改了全局相位 —— 一个只该由主循环做的决定 |
 /// | `EnterWorktree` / `ExitWorktree`（2026-10-11） | 有效工作目录是**主循环**的状态（`Ctx::worktree` 跨线程共享）。子代理若改它，会把主代理的相对路径解析一起带走 —— 同 `EnterPlanMode` 的判据 |
-/// | `PetControl`（2026-10-10） | 它的效果由**主进程前端**读 `tool_use` 后广播给桌宠窗执行；子代理的 tool_use 不进前端助手流 ⇒ 在里面调它是**保证的空操作** |
+/// | `PetControl`（2026-10-10） | 它的效果由**主进程前端**读**助手流**里的 `tool_use` 后广播给桌宠窗执行；子代理的 tool_use 只以 `task_event` 转发（纯展示，不触发效果处理器）⇒ 在里面调它是**保证的空操作** |
 /// | 走 MCP 桥的（`tools::needs_bridge`） | 子代理**不接 MCP 桥**（`run_one_tool(…, None, …)`：桥是 `&mut` 单线程 stdio 通道，主循环还持有它）。留在工具表里就是**保证失败**：`mcp__*` 的 `needs_approval` 恒真 ⇒ 会先弹一张注定白问的审批卡，然后回 `MCP bridge is not connected`；`SessionSearch` / resources 读侧同样无桥可用 |
 ///
 /// 桥那一类走 `tools::BRIDGE_TOOLS` 这个**唯一真相源**，不在这里另写字符串 ——
@@ -7075,9 +7283,9 @@ fn subagent_tool_defs(tool_defs: &[Value]) -> Vec<Value> {
             let name = d.get("name").and_then(Value::as_str).unwrap_or("");
             !matches!(
                 name,
-                // `PetControl`（2026-10-10）：效果由**主进程前端**读 `tool_use` 后广播给桌宠窗；
-                // 子代理的 tool_use 不进前端的助手流（只以 `task_progress` 呈现）⇒ 在里面
-                // 调它是**保证的空操作**，与走桥那一类同理，剔掉。
+                // `PetControl`（2026-10-10）：效果由**主进程前端**读**助手流**里的 `tool_use` 后
+                // 广播给桌宠窗；子代理的 tool_use 只以 `task_event` 转发（纯展示，**不触发**
+                // 前端的效果处理器）⇒ 在里面调它仍是**保证的空操作**，与走桥那一类同理，剔掉。
                 "Agent" | "EnterPlanMode" | "ExitPlanMode" | "PetControl"
                     // `EnterWorktree` / `ExitWorktree`（2026-10-11）：有效工作目录是**主循环**的
                     // 状态（`Ctx::worktree` 跨线程共享），子代理改它会把主代理的相对路径解析
@@ -7085,8 +7293,8 @@ fn subagent_tool_defs(tool_defs: &[Value]) -> Vec<Value> {
                     | "EnterWorktree" | "ExitWorktree"
                     // `SendUserFile` / `PushNotification`（2026-10-11）：效果是**主进程前端**
                     // 的卡片 / 桌面通知（由 `dispatch_tool` 发 `system` 事件驱动）；子代理的
-                    // 工具调用不进前端助手流 ⇒ 在里面调它只会**凭空冒出一张无上下文的卡**。
-                    // 同 `PetControl` 的判据，剔掉。
+                    // 工具调用只以 `task_event` 转发（纯展示）⇒ 在里面调它只会**凭空冒出一张
+                    // 无上下文的卡**。同 `PetControl` 的判据，剔掉。
                     | "SendUserFile" | "PushNotification"
             )
                 && !tools::needs_bridge(name)
@@ -11646,5 +11854,127 @@ mod tests {
         assert!(tool_result_block("t4", as_err, true)["content"].is_string());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── E1 子代理内部过程转发：数据通道契约（2026-10-16）──────────────────
+    //
+    // 纯逻辑单测：`SubtaskForward::events()` 不碰 stdout，直接钉住「标识 / 类别 / 保序 /
+    // 单条与整段上限 / 静默」五条不变量。真实发送走 `send()`（薄到只有一句 `for emit`）。
+
+    /// 一条 assistant 内部消息 → 一个 `task_event`：带 `task_id`，块类型与顺序原样保留，
+    /// 字段名与主流程 `assistant` 事件**逐字对齐**（`message.content[].type` 等）。
+    #[test]
+    fn subtask_forward_tags_identifier_and_preserves_order() {
+        let mut f = SubtaskForward::new();
+        let evs = f.events(
+            "task-7",
+            "assistant",
+            &[
+                json!({"type":"thinking","thinking":"先想一下"}),
+                json!({"type":"text","text":"说一句"}),
+                json!({"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"a.rs"}}),
+            ],
+        );
+        assert_eq!(evs.len(), 1, "一条内部消息 = 一个 task_event");
+        let ev = &evs[0];
+        assert_eq!(ev["type"], "system");
+        assert_eq!(ev["subtype"], "task_event");
+        assert_eq!(ev["task_id"], "task-7", "每条都必须带子任务标识");
+        assert_eq!(ev["message"]["role"], "assistant");
+        let c = ev["message"]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0]["type"], "thinking");
+        assert_eq!(c[0]["thinking"], "先想一下");
+        assert_eq!(c[1]["type"], "text");
+        assert_eq!(c[2]["type"], "tool_use");
+        assert_eq!(c[2]["name"], "Read");
+        assert_eq!(c[2]["input"]["file_path"], "a.rs");
+    }
+
+    /// 工具结果消息 → user 角色 `task_event`，逐块带 `tool_use_id`；`is_error` 只在为真时出现。
+    #[test]
+    fn subtask_forward_carries_tool_results() {
+        let mut f = SubtaskForward::new();
+        let evs = f.events(
+            "task-1",
+            "user",
+            &[
+                json!({"type":"tool_result","tool_use_id":"tu1","content":"ok"}),
+                json!({"type":"tool_result","tool_use_id":"tu2","content":"boom","is_error":true}),
+            ],
+        );
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["task_id"], "task-1");
+        assert_eq!(evs[0]["message"]["role"], "user");
+        let c = evs[0]["message"]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 2, "按调用顺序原样保留");
+        assert_eq!(c[0]["type"], "tool_result");
+        assert_eq!(c[0]["tool_use_id"], "tu1");
+        assert!(c[0].get("is_error").is_none(), "成功结果不带 is_error");
+        assert_eq!(c[1]["tool_use_id"], "tu2");
+        assert_eq!(c[1]["is_error"], true);
+    }
+
+    /// 单条超长文本 ⇒ 按 `SUBAGENT_EVENT_ITEM_CHARS` 截断并带 `…(truncated)` 标记（不静默丢）。
+    #[test]
+    fn subtask_forward_truncates_long_text_with_marker() {
+        let mut f = SubtaskForward::new();
+        let long = "x".repeat(SUBAGENT_EVENT_ITEM_CHARS + 500);
+        let evs = f.events("task-1", "assistant", &[json!({"type":"text","text":long})]);
+        let text = evs[0]["message"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("…(truncated)"), "超长必须带明确标记: {text}");
+        assert_eq!(text.chars().count(), SUBAGENT_EVENT_ITEM_CHARS + "…(truncated)".chars().count());
+    }
+
+    /// 超大 tool_use 入参 ⇒ 序列化后超限时退化成**带标记的字符串**（前端可按文本渲染）。
+    #[test]
+    fn subtask_forward_truncates_oversized_tool_input() {
+        let mut f = SubtaskForward::new();
+        let big = "z".repeat(SUBAGENT_EVENT_ITEM_CHARS * 2);
+        let evs = f.events(
+            "task-1",
+            "assistant",
+            &[json!({"type":"tool_use","id":"t","name":"Write","input":{"content":big}})],
+        );
+        let input = &evs[0]["message"]["content"][0]["input"];
+        assert!(input.is_string(), "超限入参应退化为字符串");
+        assert!(input.as_str().unwrap().ends_with("…(truncated)"));
+    }
+
+    /// 整段超预算 ⇒ 发**一条** `truncated:true` 标记后**不再出内容事件**（封顶 + 明确标记）。
+    #[test]
+    fn subtask_forward_total_budget_marks_then_stops() {
+        let mut f = SubtaskForward::new();
+        let chunk = "y".repeat(SUBAGENT_EVENT_ITEM_CHARS * 3);
+        let mut content_events = 0;
+        let mut markers = 0;
+        for _ in 0..20 {
+            for ev in f.events(
+                "task-1",
+                "assistant",
+                &[
+                    json!({"type":"text","text":chunk}),
+                    json!({"type":"text","text":chunk}),
+                    json!({"type":"text","text":chunk}),
+                ],
+            ) {
+                if ev.get("truncated").and_then(Value::as_bool).unwrap_or(false) {
+                    markers += 1;
+                } else {
+                    assert_eq!(markers, 0, "标记之后不得再出内容事件");
+                    content_events += 1;
+                }
+            }
+        }
+        assert!(content_events > 0, "预算内应有内容事件");
+        assert_eq!(markers, 1, "整段预算用尽只发一条标记");
+    }
+
+    /// 静默不变量：闸门只认 `emit_subtask`；`false`（复盘 fork / fork 技能）时**一个转发器都不构造**
+    /// ⇒ `run_subagent` 全程零 `task_event`。`true` 仅由「用户可见的 `Agent` 工具调用」给出。
+    #[test]
+    fn subtask_forward_silent_when_gate_closed() {
+        assert!(subtask_forwarder(false).is_none(), "关闭时必须静默");
+        assert!(subtask_forwarder(true).is_some(), "仅用户可见的 Agent 工具调用才开");
     }
 }

@@ -29,6 +29,7 @@
 // **丢弃结果、不进账本、不改预筛语义**。**超时值 1500ms 不动**；只在开关开 + 端点已配时预热
 // （[`warmup_config`]），默认关 ⇒ **零预热、零请求**。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -110,6 +111,11 @@ pub fn decide(d: &dyn Decider, input: &str) -> Decision {
                 dec.reason
             ));
             dec
+        }
+        Err(e) if e == BUSY_SKIP => {
+            // 本地通道忙（另一个本地请求在飞）⇒ **立即跳过本次**，绝不排队等待。
+            log::warn("decide: 本地通道忙，立即跳过本次（不排队）");
+            Decision::allow_fallback("busy-skip")
         }
         Err(e) => {
             // ⚠️ 这一行就是「与不接线逐字节一致」的现场：后端坏了照样照旧派。
@@ -202,6 +208,72 @@ pub fn within_deadline<T>(limit: Duration, f: impl FnOnce() -> Result<T, String>
         return Err(format!("决策超时：用了 {}ms（上限 {}ms）", used.as_millis(), limit.as_millis()));
     }
     Ok(out)
+}
+
+// ── 本地模型通道：进程级非阻塞互斥（2026-10-16）───────────────────────────────
+//
+// **要解决什么**：`llama-server` 以 `-np 1`（**单并发槽**）运行。「同一个回合」里预筛（判定，
+// 上限 1500ms）与记忆候选抽取（上限 5000ms）会**几乎同时**发往同一个本地端点 ⇒ **互相排队** ⇒
+// 两条都等到各自超时 ⇒ 双双 fail-open。真机日志铁证：抽取 `latency 5009ms`、判定 `1515ms`
+// 都在各自上限处被掐断，而**单独**一次预筛只需 1133ms。冷启动预热也会和判定抢那一个槽。
+//
+// **口径**：判定 / 抽取 / 预热都是「**摊销的尽力而为**」调用 —— **跳过无损**，排队等只会把两个
+// 请求都拖死。故三者**共用这一把进程级非阻塞锁**（`try_lock` 语义）：拿不到锁就**立即跳过本次**
+// （判定 / 抽取折成 `fallback=true` + `reason="busy-skip"`，预热只记一行 info），**绝不排队等待**。
+// 单一真相源 = 本模块的 [`try_acquire_local_channel`]（判定 / 抽取 / 预热都经它取锁）。
+//
+// ⚠️ **新增任何打本地端点的调用都要经 [`ChannelGated`] 包一层**（或自行取锁），否则仍会与
+// 判定 / 抽取抢那唯一一个并发槽。⚠️ **不改超时值、不动 `-np`、不引入「每轮多请求」**。
+
+/// 「本地模型通道忙」的**哨兵错误**：`ChannelGated` 拿不到锁时返回它，由 [`decide`]（以及
+/// `memory_candidates::extract`）折成 `busy-skip`（**立即跳过、绝不排队**）。单一真相源 = 此常量。
+pub const BUSY_SKIP: &str = "busy-skip";
+
+/// 本地模型通道是否已被占用（**进程级**：判定 / 抽取 / 预热共用一个端点，故共用这一把锁）。
+static LOCAL_CHANNEL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// 测试专用：串行化**所有**会碰本地通道锁的单测（锁是进程级静态量，而 `cargo test` 默认并行 ⇒
+/// 「持锁」测试会与「取锁」测试互相干扰）。**生产代码不使用**。
+#[cfg(test)]
+pub(crate) static TEST_CHANNEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 通道锁的持有凭证；`drop` 即释放。
+pub struct LocalChannelGuard;
+
+impl Drop for LocalChannelGuard {
+    fn drop(&mut self) {
+        LOCAL_CHANNEL_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// **非阻塞**获取本地模型通道：`Some` = 拿到了；`None` = 已有本地请求在飞 ⇒ 调用方**立即跳过
+/// 本次**（不排队）。判定 / 抽取 / 预热都从这里取锁（唯一真相源）。
+pub fn try_acquire_local_channel() -> Option<LocalChannelGuard> {
+    if LOCAL_CHANNEL_BUSY.swap(true, Ordering::AcqRel) {
+        None
+    } else {
+        Some(LocalChannelGuard)
+    }
+}
+
+/// 给「打本地端点的后端」套上通道互斥：拿不到锁 ⇒ `Err(`[`BUSY_SKIP`]`)`（由 [`decide`] 折成
+/// `busy-skip`）。生产里 `LocalHttp`（判定 / 预热）与 `LocalExtract`（抽取）都经它包一层。
+pub struct ChannelGated<D> {
+    inner: D,
+}
+
+impl<D> ChannelGated<D> {
+    pub fn new(inner: D) -> Self {
+        ChannelGated { inner }
+    }
+}
+
+impl<D: Decider> Decider for ChannelGated<D> {
+    fn decide(&self, input: &str) -> Result<Decision, String> {
+        // ⚠️ 先取锁再打端点；拿不到**立即** return Err（`ok_or_else` 不做任何等待）。
+        let _guard = try_acquire_local_channel().ok_or_else(|| BUSY_SKIP.to_string())?;
+        self.inner.decide(input)
+    }
 }
 
 // ── 本地模型后端（形态 B：子进程 `llama-server`，OpenAI 兼容端点）──────────────
@@ -682,5 +754,49 @@ mod tests {
         let used = t0.elapsed();
         assert!(!ok, "对端不回包 ⇒ 预热失败（静默）");
         assert!(used < Duration::from_secs(2), "预热必须被超时兜住、不得挂住：用了 {used:?}");
+    }
+
+    // ── 本地模型通道：进程级非阻塞互斥（2026-10-16）──────────────────────────
+
+    /// 「若被真正调用就会睡 5s」的桩 —— 用来证明第二个请求是**被跳过**而非**排队等待**。
+    struct Slow;
+    impl Decider for Slow {
+        fn decide(&self, _i: &str) -> Result<Decision, String> {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Decision::run("should-not-be-called"))
+        }
+    }
+
+    /// **两个本地请求不会同时在飞**：一个持锁时，第二个**立即** busy-skip（`Run` + `fallback` +
+    /// `reason="busy-skip"`）、**不等待**；释放后通道恢复、同一个 gate 放行到后端。
+    #[test]
+    fn gated_request_busy_skips_immediately_without_waiting() {
+        // 通道锁是进程级静态量 ⇒ 本测试「持锁」必须与其它碰锁的单测串行（见 TEST_CHANNEL_LOCK）。
+        let _serial = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = try_acquire_local_channel().expect("首个请求应拿到通道");
+        let d = ChannelGated::new(Slow);
+        let t0 = Instant::now();
+        let out = decide(&d, "帮我改一下这个文件");
+        let used = t0.elapsed();
+        assert!(used < Duration::from_secs(1), "持锁时第二个请求必须立即返回、不排队（用了 {used:?}）");
+        assert_eq!(out.action, Action::Run, "busy-skip 照旧派（fail-open）");
+        assert!(out.fallback, "busy-skip 必须标 fallback");
+        assert_eq!(out.reason, "busy-skip");
+        drop(guard);
+        // 通道释放后：同一个 gate 会真的走后端（用恒 Run 的桩证明通道已恢复）。
+        let out2 = decide(&ChannelGated::new(AlwaysRun), "hi");
+        assert_eq!(out2.action, Action::Run);
+        assert!(!out2.fallback, "通道空闲时不产生 busy-skip");
+        assert_eq!(out2.reason, "stub-run");
+    }
+
+    /// 通道锁语义：非阻塞（第二次拿不到、回 `None` 而非阻塞等待）、`drop` 即释放。
+    #[test]
+    fn channel_lock_is_exclusive_and_non_blocking() {
+        let _serial = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = try_acquire_local_channel().expect("首次应为 Some");
+        assert!(try_acquire_local_channel().is_none(), "持锁时第二次必须立即为 None（不排队）");
+        drop(g);
+        assert!(try_acquire_local_channel().is_some(), "释放后恢复可获取");
     }
 }

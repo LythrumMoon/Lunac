@@ -77,9 +77,6 @@ use commands::{
     read_pet_params, write_pet_params,
     write_motion_file, delete_motion_file, rename_motion_file,
     list_exp3_files, list_motion_files, scan_model_folder,
-    // 脚本（Cmd / PowerShell）生成 / 改写文件的**事后登记**探测：按 mtime 扫 agent 工作目录
-    // （见 commands.rs 的 scan_agent_writes）。前端登记成 `unknown` 帧，只列、不回退。
-    scan_agent_writes,
     get_mcp_config, open_mcp_config,
     set_workspace, get_workspace, set_tool_blacklist,
     set_pet_model_dir,
@@ -653,7 +650,6 @@ fn main() {
             snapshots::snapshot_restore_text,
             snapshots::snapshots_save,
             snapshots::snapshots_load,
-            scan_agent_writes,
             storage::save_chat_sessions,
             storage::load_chat_sessions,
             storage::save_clipboard_history,

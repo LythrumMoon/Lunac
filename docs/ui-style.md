@@ -580,7 +580,7 @@
 
 > 用户口径（2026-10-11）：A13「斜杠命令」子集（`/rewind` + memory 类）。代码 = `app/src/main.ts`、`app/src/i18n.ts`、`app/src-tauri/src/mcp_server.rs` / `commands.rs` / `main.rs`。**本轮不新增任何样式**，只登记「斜杠命令的界面落点复用哪几族既有形态」。
 
-- **命令旁注** = `.sys-note sys-note-line`（一行系统旁注，与「上下文压缩提示」同族；**独立节点、不进 `textAll`/`chatHistory`**）。
+- **命令旁注** = `.sys-note sys-note-line`（一行系统旁注，与「上下文压缩提示」同族；**独立节点、不进 `textSegs`/`chatHistory`**）。
 - **记忆查看** = `<details class="sys-note">` + `pre.sys-note-body`（可展开；与 hooks / 附件提示同族，避免 6000 字铺屏）。
 - **破坏性命令的二次确认条** = `.run-mode-confirm`（`msg` / `ok` / `cancel`；与「切自动档」同款，`ok` 走语义红 —— 属 §界面 11 白名单语义色）。**据此确认**：这两族既有样式已够，斜杠命令**未新增任何颜色字面量、未新增滚动条、未新增容器**。
 - **纪律**：命令文案全走 `t()`（`chat.slash_*`，五语言）；命令**不进模型**、不写会话历史（旁注节点纪律同「上下文压缩提示」）。

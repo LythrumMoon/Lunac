@@ -1996,6 +1996,14 @@ body.plan-open #todo-drawer {
   word-break: break-word;
 }
 
+/* 「中间小输出」= 最终答案之前那些正文段（`agentStartTextSeg` 在 tool_result 处打
+   `data-mid`）。它们属于**过程**：用暗字（`--text-dim`，见 ui-style.md §界面 1 的三档
+   文字），随回合折叠一起收起（见下方 `.flow-folded` 名单）。最终答案那一段不带此标记，
+   保持 `.agent-text` 的 `--text`（最亮档）⇒ 过程暗、结论亮。 */
+.agent-text[data-mid="1"] {
+  color: var(--text-dim);
+}
+
 /* Markdown images in AI responses — 不再内联渲染 <img>（WebView2 asset 协议
    内联显示不可靠），改为「查看图片」按钮，点击打开独立全窗查看界面（需求5） */
 .agent-md-view {
@@ -2254,7 +2262,10 @@ body.plan-open #todo-drawer {
 
 .tool-card .tool-name {
   flex: none;
-  color: var(--blue);
+  /* 工具名归「过程」⇒ 暗字（本轮用户要求「工具也改成暗字」）。原先用 --blue，
+     与「结论亮、过程暗」的层级冲突；改用三档文字里的 --text-dim（ui-style.md §界面 1），
+     靠 font-weight 保持可辨认，不再抢正文注意力。 */
+  color: var(--text-dim);
   font-weight: 500;
 }
 
@@ -2284,7 +2295,8 @@ body.plan-open #todo-drawer {
   font-family: ui-monospace, Consolas, monospace;
   font-size: 11px;
   line-height: 1.5;
-  color: var(--text);
+  /* 完整命令同属「过程」⇒ 暗字（原为 --text，是整张卡里最亮的一处，与「结论亮」冲突）。 */
+  color: var(--text-dim);
   white-space: pre-wrap;
   word-break: break-word;
   background: rgba(var(--shade-rgb), calc(0.24 * var(--shade-scale)));
@@ -2895,7 +2907,8 @@ body.plan-open #todo-drawer {
 .agent-flow.flow-folded .tool-row,
 .agent-flow.flow-folded .subtask-panel,
 .agent-flow.flow-folded .cmd-group,
-.agent-flow.flow-folded .sys-note {
+.agent-flow.flow-folded .sys-note,
+.agent-flow.flow-folded .agent-text[data-mid="1"] {
   display: none;
 }
 
@@ -3506,6 +3519,30 @@ body.plan-open #todo-drawer {
 .subtask-panel .subtask-row.running .subtask-id { color: var(--yellow); }
 .subtask-panel .subtask-row.done .subtask-state { color: var(--green); }
 .subtask-panel .subtask-row.failed .subtask-state { color: var(--red); }
+
+/* E2（2026-10-16）：`Agent` 卡片里「子代理内部过程」的**框格** —— 把子代理的思考 / 工具 /
+   命令与主流程视觉隔开（凹陷底更深一档 + 描边 + 更重的左边线；颜色只用既有变量，
+   见 ui-style.md §界面 11）。框格自带 `overflow` 不设、不加第二层滚动条：长内容由内部
+   `think-block` / `cmd-group` 各自的折叠承担（code-standards §规范 7）。 */
+.subtask-box {
+  margin: 4px 0 0 0;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: rgba(var(--shade-rgb), calc(0.34 * var(--shade-scale)));
+  border: 1px solid var(--border-glass);
+  border-left: 2px solid rgba(var(--ink-rgb), 0.20);
+  /* 结构容器：挡掉继承来的 `pre-wrap`，避免模板缩进被渲染成幽灵空行（§规范 7）。 */
+  white-space: normal;
+}
+.subtask-box > .think-block,
+.subtask-box > .cmd-group { margin: 0; }
+/* 子代理没产出任何内部过程（旧 agent / 立即失败）⇒ 不显示空框格 */
+.subtask-box:empty { display: none; }
+/* 整段超限（`truncated:true`）的一行说明 —— 同「过程」暗字，不喧宾夺主。 */
+.subtask-box .subtask-truncated {
+  color: var(--text-muted);
+  font-size: 11px;
+}
 
 /* 审批行上的子任务归属标（A14，纯文字 —— 页面不插装饰 emoji） */
 .approval-title .approval-task-tag {

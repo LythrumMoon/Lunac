@@ -789,6 +789,13 @@
 - **仍**未内嵌依赖、也**不做**开机自动下载（2.33 GiB 体积太大，违背既有口径）⇒ **首次开启需下 ~2.33 GiB**（视网速数分钟到数十分钟，界面已给时间预期提示）。**未动** `build-plugins.ps1`（local-model 的 468MB/0.5B 旧注释口径订正不在此范围）。
 - **涉及文件**：`core-agent/src/decide.rs`、`app/src/plugins/builtin/local-model.ts`、`app/src-tauri/src/plugin_sidecar.rs`（本轮**另加**：`app/src-tauri/src/plugin_market.rs`、`app/src-tauri/src/commands.rs`、`app/src-tauri/src/main.rs`、`app/src/plugins/market.ts`、`app/src/plugins/builtin/settings.ts`、`app/src/i18n.ts`）。
 
+#### §待办 3-6 补 本地判定 / 抽取「撞车」修法 + 记忆读写路径查证（2026-10-16，本轮）
+
+- **修 1（本地模型通道进程级非阻塞互斥）**。**根因（已查实）**：`llama-server` 以 `-np 1`（**单并发槽**）运行；开 `LUNAC_LOCAL_DECIDE=1` 时**同一个回合**里「预筛（`LOCAL_DECIDE_TIMEOUT=1500ms`）」与「记忆候选抽取（`LOCAL_EXTRACT_TIMEOUT=5000ms`）」会**几乎同时**发往同一本地端点 ⇒ **互相排队** ⇒ 两条都等到各自超时 ⇒ 双双 fail-open（真机 `app/src-tauri/target/debug/temp/logs/agent-2026-10-16.log`：抽取 `latency 5009ms`、判定 `1515ms` 都在上限处被掐断，而**单独**那次预筛仅 `1133ms`）。**修法（最小改动，首选方案）** = 判定 / 抽取 / **预热** 三者**共用一把进程级非阻塞锁**（`core-agent/src/decide.rs` 的 `try_acquire_local_channel` + `ChannelGated`，`memory_candidates.rs` 的 `ChannelGated`）—— **拿不到锁就立即跳过本次**（判定 / 抽取折成 `fallback=true` + `reason="busy-skip"`、记一条账本行；预热只记一行 info），**绝不排队等待**（这些是「摊销的尽力而为」调用，跳过无损，排队只会把两个请求都拖死）。**未动**：超时值、`-np`、「每轮多请求」；**默认关 ⇒ 逐字节不变**（开关关 / 未配端点时根本不进判断层，零请求零锁）。**单测**：`decide::tests::gated_request_busy_skips_immediately_without_waiting`（持锁时第二个「本地请求」**立即** busy-skip、`< 1s` 不等待）、`channel_lock_is_exclusive_and_non_blocking`、`memory_candidates::tests::gated_extract_busy_skips_without_waiting`。
+  - ⚠️ **卡 1 / 卡 2（预筛 × 抽取撞车）的根因 = 上面这条**（`-np 1` 单并发槽 + 同回合并发的两个本地请求）；**已由本轮修 1 消除**。
+  - ⚠️ **卡 8 需按「先开一个非聊天插件窗」重验**（本轮**未**验完；起 dev 后先开一个非聊天插件窗再看该现象）。
+- **修 5 查证结论：记忆「写了读不到」= 非 bug**。**读**（core-agent 注入用的 `memory_block`）：`fetch_memory` → 桥 `lunac/memory_read`（`core-agent/src/main.rs:2531-2533`）→ 宿主 `mcp_server::read_memory` → `memory_path_for(Global)`（`app/src-tauri/src/mcp_server.rs:549-553`）= `<exe 根>\ModuleData\memory\MEMORY.md`。**写**（`Remember`）：桥 `lunac/memory_write` → `write_memory_entry`（`mcp_server.rs:726-728`）→ **同一个** `memory_path_for` = **同一文件**。⇒ **读写同源、单一真相源，不是代码缺陷**（`mcp_server::tests::memory_scopes_are_isolated` 已钉住 `memory/MEMORY.md` 与 `memory/pet/MEMORY.md`）。观察到的 `ModuleData\MEMORY.md`（**root**，非 `memory\` 子目录）**无任何代码路径会写**（`git grep` + 全历史核对：自 A4 长期记忆引入起一直是 `memory\MEMORY.md`，从未写过 root；`module_data_dir()` 也从未与 `MEMORY_FILE` 直接拼接）；其 mtime `09:26:29Z`（= 最后一次 `Remember` 写入时刻 `agent-2026-10-16.log:168-170`）**早于**空目录 `ModuleData\memory\` 的 mtime `09:53:26Z` ⇒ 形态正是「文件被**移出** `memory\`」（外部移动保留文件 mtime、更新来源目录 mtime）。⇒ **非 bug**，root 那份是**孤儿文件**；**未改任何代码、未新增第二条路径推导**（`/memory` 与设置页读的仍是 `memory\MEMORY.md`）。
+
 ### §待办 3-7 M1 两个待实测项
 | # | 项 | 待办点 |
 |---|---|---|

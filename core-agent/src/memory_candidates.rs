@@ -87,6 +87,11 @@ impl Extraction {
     fn fail_open() -> Self {
         Extraction { facts: Vec::new(), fallback: true, reason: "fail-open" }
     }
+    /// **busy-skip 的唯一出口**：本地模型通道忙（另一个本地请求在飞）⇒ **立即跳过本次**（不排队）。
+    /// 与 `fail_open` 同形（空 + `fallback`），只把原因码换成 `busy-skip` 供事后归因。
+    pub fn busy_skip() -> Self {
+        Extraction { facts: Vec::new(), fallback: true, reason: "busy-skip" }
+    }
 }
 
 /// 抽取后端（实现者只回 `Result`）：`Ok` = 已解析出合法 schema 的候选列表（含空列表）；
@@ -98,6 +103,27 @@ pub trait Extractor {
 /// 本地模型后端（形态同 `decide::LocalHttp`：OpenAI 兼容端点、回环、显式禁代理）。
 pub struct LocalExtract {
     cfg: decide::LocalHttpConfig,
+}
+
+/// 给「打本地端点的抽取后端」套上**本地模型通道**的进程级非阻塞互斥（判定 / 抽取 / 预热共用
+/// **同一把锁**，见 `decide::try_acquire_local_channel`）：拿不到锁 ⇒ `Err(`[`decide::BUSY_SKIP`]`)`
+/// （由 [`extract`] 折成 `busy-skip`，**立即跳过、绝不排队**）。生产里包住 [`LocalExtract`]。
+pub struct ChannelGated<E> {
+    inner: E,
+}
+
+impl<E> ChannelGated<E> {
+    pub fn new(inner: E) -> Self {
+        ChannelGated { inner }
+    }
+}
+
+impl<E: Extractor> Extractor for ChannelGated<E> {
+    fn extract(&self, input: &str) -> Result<Vec<String>, String> {
+        // ⚠️ 先取锁再打端点；拿不到**立即** return Err（`ok_or_else` 不做任何等待）。
+        let _guard = decide::try_acquire_local_channel().ok_or_else(|| decide::BUSY_SKIP.to_string())?;
+        self.inner.extract(input)
+    }
 }
 
 impl LocalExtract {
@@ -163,6 +189,11 @@ pub fn extract(e: &dyn Extractor, input: &str) -> Extraction {
         Ok(facts) => {
             log::info(format!("记忆候选抽取：{} 条（只落账本，不改任何注入）", facts.len()));
             Extraction::ok(facts)
+        }
+        Err(err) if err == decide::BUSY_SKIP => {
+            // 本地通道忙（判定 / 预热在飞）⇒ **立即跳过本次抽取**，绝不排队等待。
+            log::warn("记忆候选抽取：本地通道忙，立即跳过本次（不排队）");
+            Extraction::busy_skip()
         }
         Err(err) => {
             log::warn(format!("记忆候选抽取后端故障，按 fail-open 丢弃本次候选（{err}）"));
@@ -300,5 +331,35 @@ mod tests {
         let out = extract(&e, "用户偏好 4 空格缩进");
         assert!(out.facts.is_empty());
         assert!(out.fallback);
+    }
+
+    /// 本地模型通道忙（另一个本地请求在飞）⇒ 抽取**立即** busy-skip（不排队、不 panic）。
+    #[test]
+    fn gated_extract_busy_skips_without_waiting() {
+        use std::time::Instant;
+        // 通道锁是进程级静态量 ⇒ 与其它碰锁的单测串行（见 decide::TEST_CHANNEL_LOCK）。
+        let _serial = decide::TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        /// 「若被真正调用就会睡 5s」的桩 —— 证明是**被跳过**而非**排队等待**。
+        struct SlowExtract;
+        impl Extractor for SlowExtract {
+            fn extract(&self, _i: &str) -> Result<Vec<String>, String> {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(vec!["should-not-be-called".into()])
+            }
+        }
+        let guard = decide::try_acquire_local_channel().expect("首个请求应拿到通道");
+        let e = ChannelGated::new(SlowExtract);
+        let t0 = Instant::now();
+        let out = extract(&e, "用户偏好 4 空格缩进");
+        let used = t0.elapsed();
+        assert!(used < Duration::from_secs(1), "持锁时必须立即返回、不排队（用了 {used:?}）");
+        assert!(out.facts.is_empty(), "busy-skip 丢弃候选");
+        assert!(out.fallback, "busy-skip 必须标 fallback");
+        assert_eq!(out.reason, "busy-skip");
+        drop(guard);
+        // 通道释放后：同一个 gate 放行到后端，正常抽到候选。
+        let ok = extract(&ChannelGated::new(Fixed(vec!["x"])), "y");
+        assert_eq!(ok.facts, vec!["x"]);
+        assert!(!ok.fallback, "通道空闲时不产生 busy-skip");
     }
 }
