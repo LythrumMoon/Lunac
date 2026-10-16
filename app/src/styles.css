@@ -37,11 +37,24 @@
   --accent-bg: rgba(var(--accent-rgb), 0.14);
   --accent-border: rgba(var(--accent-rgb), 0.32);
   --green: #9db4ac;
-  --red: #c08a8a;
+  /* 语义色（固定、**不随主题漂移**，见 ui-style.md §界面 16）：危险 / 失败 / 拒绝 / 告警红。
+   * **唯一数值来源 = `--danger-rgb`**，`--danger` / `--red` 是它的两个消费名 —— 这样
+   * 「rgba 带 alpha」的写法（`rgba(var(--danger-rgb), α)`）不再硬编码分量（§禁用 17），
+   * 且整族颜色只有一处定义（§禁用 62）。`--red` 沿用历史调用点（约 120 处），不改名。
+   * 值从低饱和的「尘玫瑰」#c08a8a 提到 **hsl(0,59%,64%)**：老值几乎与默认主题色
+   * #c0a0a0 同色，用户把主色换成红系时危险红会被淹没；新值饱和度更高，暗底/亮底都更
+   * 显眼、且与任何主题色都区分得开。 */
+  --danger-rgb: 222, 115, 115;
+  --danger: rgb(var(--danger-rgb));
+  --red: var(--danger);
   --yellow: #c9b896;
   --blue: #9490b4;
   --radius: 14px;
   --search-height: 52px;
+  /* 对话区栅格（2026-10-16 用户要求「右侧置顶 + 左侧留 ~1/6」）：正文列右对齐、左侧留
+     约 1/6 空档。用百分比而**不是硬编码 px** —— 聊天窗可缩放、桌宠窗更窄，百分比空档在
+     窄窗下同比收缩、不会把内容挤没。唯一消费方 = `#chat-log`（见 §界面 15）。 */
+  --chat-gutter: 16.6667%;
 
   /* ── 外观可调项（2026-09-19 新增，设置 → 风格）──────────────────
      硬要求：**每个变量都带默认值，且默认值 == 改造前的硬编码值**。不做任何
@@ -259,7 +272,7 @@ html, body {
   color: var(--red);
 }
 .context-menu-item.danger:hover {
-  background: rgba(192, 138, 138, 0.12);
+  background: rgba(var(--danger-rgb), 0.12);
 }
 .context-menu-item-active {
   color: var(--text) !important;
@@ -475,7 +488,7 @@ html, body {
   width: 16px;
   height: 16px;
   padding: 0;
-  background: rgba(192, 138, 138, 0.2);
+  background: rgba(var(--danger-rgb), 0.2);
   color: var(--red);
   border: none;
   border-radius: 50%;
@@ -488,7 +501,7 @@ html, body {
 }
 
 .file-chip-remove:hover {
-  background: rgba(192, 138, 138, 0.4);
+  background: rgba(var(--danger-rgb), 0.4);
 }
 
 /* ── 省略泡泡（分支折叠：超过阈值文件收进 ⋯，可展开 + 一键删除）── */
@@ -514,15 +527,15 @@ html, body {
 }
 .file-chip-more-clear {
   padding: 3px 10px;
-  background: rgba(192, 138, 138, 0.12);
-  border: 1px solid rgba(192, 138, 138, 0.3);
+  background: rgba(var(--danger-rgb), 0.12);
+  border: 1px solid rgba(var(--danger-rgb), 0.3);
   border-radius: 12px;
   font-size: 0.7rem;
   color: var(--red);
   cursor: pointer;
 }
 .file-chip-more-clear:hover {
-  background: rgba(192, 138, 138, 0.3);
+  background: rgba(var(--danger-rgb), 0.3);
 }
 /* 展开后的该分支文件列表（省略泡泡的分支） */
 .file-chip-more-list {
@@ -1878,9 +1891,9 @@ body.plan-open #todo-drawer {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(192, 138, 138, 0.12);
+  background: rgba(var(--danger-rgb), 0.12);
   color: var(--red);
-  border: 1px solid rgba(192, 138, 138, 0.25);
+  border: 1px solid rgba(var(--danger-rgb), 0.25);
   border-radius: 50%;
   cursor: pointer;
   font-size: 0.8rem;
@@ -1890,7 +1903,7 @@ body.plan-open #todo-drawer {
 }
 .result-item-remove:hover {
   opacity: 1;
-  background: rgba(192, 138, 138, 0.28);
+  background: rgba(var(--danger-rgb), 0.28);
 }
 
 /* ── Quick-launch panel toolbar / empty state ────────────────── */
@@ -2175,7 +2188,7 @@ body.plan-open #todo-drawer {
 
 .tool-row.tool-error {
   color: var(--red);
-  background: rgba(192, 138, 138, 0.08);
+  background: rgba(var(--danger-rgb), 0.08);
   white-space: normal;
   word-break: break-word;
 }
@@ -2315,7 +2328,7 @@ body.plan-open #todo-drawer {
 .tool-card.exit-nonzero .tool-state,
 .tool-card.timeout .tool-state { color: var(--yellow); }
 .tool-card.failed .tool-state { color: var(--red); }
-.tool-card.failed { background: rgba(192, 138, 138, 0.08); }
+.tool-card.failed { background: rgba(var(--danger-rgb), 0.08); }
 
 /* 用户点了「停止」（2026-10-01）：点下去那一刻是**乐观**置上（等 agent 收尾），
    结果回来时 `fillToolCard` 按结果文本再判一次、并写状态文字（`agent.tool_stopped`）。
@@ -2343,7 +2356,7 @@ body.plan-open #todo-drawer {
   padding: 6px 8px;
   border-left: 2px solid var(--red);
   border-radius: 0 4px 4px 0;
-  background: rgba(192, 138, 138, 0.10);
+  background: rgba(var(--danger-rgb), 0.10);
   font-size: 11px;
   line-height: 1.5;
 }
@@ -2814,11 +2827,11 @@ body.plan-open #todo-drawer {
 }
 .cr-btn.reject {
   color: var(--red);
-  border-color: rgba(192, 138, 138, 0.45);
-  background: rgba(192, 138, 138, 0.08);
+  border-color: rgba(var(--danger-rgb), 0.45);
+  background: rgba(var(--danger-rgb), 0.08);
 }
 .cr-btn.reject:hover {
-  background: rgba(192, 138, 138, 0.16);
+  background: rgba(var(--danger-rgb), 0.16);
 }
 
 /* 摊开后的主体 */
@@ -2884,7 +2897,7 @@ body.plan-open #todo-drawer {
 }
 .diff-del {
   color: var(--red);
-  background: rgba(192, 138, 138, 0.10);
+  background: rgba(var(--danger-rgb), 0.10);
 }
 .diff-eq {
   color: var(--text-muted);
@@ -2985,8 +2998,8 @@ body.plan-open #todo-drawer {
 }
 
 .approval-card.danger {
-  border-color: rgba(192, 138, 138, 0.5);
-  background: rgba(192, 138, 138, 0.08);
+  border-color: rgba(var(--danger-rgb), 0.5);
+  background: rgba(var(--danger-rgb), 0.08);
 }
 
 /* ── MCP elicitation 卡片（A13，2026-10-04）───────────────────────
@@ -3340,12 +3353,12 @@ body.plan-open #todo-drawer {
 }
 
 .approval-deny {
-  border-color: rgba(192, 138, 138, 0.35);
+  border-color: rgba(var(--danger-rgb), 0.35);
   color: var(--red);
 }
 
 .approval-deny:hover {
-  background: rgba(192, 138, 138, 0.15);
+  background: rgba(var(--danger-rgb), 0.15);
 }
 
 .approval-note {
@@ -3594,7 +3607,7 @@ summary.subtask-row-head { cursor: pointer; }
   font-weight: 600;
 }
 .approval-batch-card .approval-batch-deny-all {
-  border-color: rgba(192, 138, 138, 0.45);
+  border-color: rgba(var(--danger-rgb), 0.45);
   color: var(--red);
   font-weight: 600;
 }
@@ -3984,6 +3997,14 @@ input[type="number"]::-webkit-inner-spin-button {
   user-modify: read-only;
 }
 
+/* 对话区栅格（2026-10-16 用户要求「右侧置顶 + 左侧留 ~1/6」）：会话列**右对齐 + 左侧留
+   约 1/6 空档**，自顶部起排。`#chat-log` 是聊天独立窗（`plugin-chat`）与主窗共用的会话
+   容器；桌宠输出框是另一套 DOM（`.pet-chat-output`），不受此规则影响。空档走
+   `--chat-gutter`（百分比），窄窗下同比收缩，不硬编码 px。 */
+#chat-log {
+  margin-left: var(--chat-gutter);
+}
+
 .chat-msg-user {
   position: relative;
   background: rgba(var(--other-overlay-rgb), 0.08);
@@ -4054,7 +4075,7 @@ input[type="number"]::-webkit-inner-spin-button {
 .turn-rollback[data-armed="1"] {
   opacity: 1 !important;
   color: var(--red);
-  background: rgba(192, 138, 138, 0.18);
+  background: rgba(var(--danger-rgb), 0.18);
 }
 
 /* 复制按钮（agent-flow 结尾，实时对话助手全文）——同印象派主题 */
@@ -4195,7 +4216,7 @@ input[type="number"]::-webkit-inner-spin-button {
   opacity: 1;
 }
 .history-item-delete:hover {
-  background: rgba(192, 138, 138, 0.15);
+  background: rgba(var(--danger-rgb), 0.15);
   color: var(--red);
 }
 
@@ -4737,7 +4758,7 @@ input[type="number"]::-webkit-inner-spin-button {
 /* 「完全」放松写入边界 → 用红色提示（与运行方式自动档同一种告警色）。 */
 #chat-profile-btn[data-profile="full"] {
   color: var(--red);
-  border-color: rgba(192, 138, 138, 0.35);
+  border-color: rgba(var(--danger-rgb), 0.35);
 }
 
 /* 思考开关：两档分段（开 / 关） */
@@ -4804,7 +4825,7 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 #chat-runmode-btn.run-mode-auto {
   color: var(--red);
-  border-color: rgba(192, 138, 138, 0.35);
+  border-color: rgba(var(--danger-rgb), 0.35);
 }
 #chat-runmode-btn.run-mode-auto .rm-dots i.on {
   background: var(--red);
@@ -4824,7 +4845,7 @@ input[type="number"]::-webkit-inner-spin-button {
 /* 菜单收起时，⋯ 按钮本身也标红提醒「自动运行开着」 */
 #chat-more-btn.run-mode-auto {
   color: var(--red);
-  border-color: rgba(192, 138, 138, 0.35);
+  border-color: rgba(var(--danger-rgb), 0.35);
 }
 
 /* 切换自动档的二次确认（就地长在运行方式按钮旁，不用原生 confirm） */
@@ -4851,11 +4872,11 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 .run-mode-confirm-ok {
   color: var(--red);
-  background: rgba(192, 138, 138, 0.12);
-  border: 1px solid rgba(192, 138, 138, 0.35);
+  background: rgba(var(--danger-rgb), 0.12);
+  border: 1px solid rgba(var(--danger-rgb), 0.35);
 }
 .run-mode-confirm-ok:hover {
-  background: rgba(192, 138, 138, 0.22);
+  background: rgba(var(--danger-rgb), 0.22);
 }
 .run-mode-confirm-cancel {
   color: var(--text-dim);
@@ -4931,8 +4952,8 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 .chat-tools-item.off .chat-tools-toggle {
   color: var(--red);
-  border-color: rgba(192, 138, 138, 0.35);
-  background: rgba(192, 138, 138, 0.1);
+  border-color: rgba(var(--danger-rgb), 0.35);
+  background: rgba(var(--danger-rgb), 0.1);
 }
 .chat-tools-item.off .chat-tools-name {
   color: var(--text-muted);
@@ -5040,7 +5061,7 @@ input[type="number"]::-webkit-inner-spin-button {
   color: var(--green);
 }
 .agent-status.error {
-  background: rgba(192, 138, 138, 0.15);
+  background: rgba(var(--danger-rgb), 0.15);
   color: var(--red);
 }
 
@@ -5293,7 +5314,7 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 .memo-clear-btn:hover {
   color: var(--red);
-  border-color: rgba(192, 138, 138, 0.4);
+  border-color: rgba(var(--danger-rgb), 0.4);
 }
 
 .memo-list-title {
@@ -5372,8 +5393,8 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 .memo-item-actions .memo-del:hover {
   color: var(--red);
-  background: rgba(192, 138, 138, 0.12);
-  border-color: rgba(192, 138, 138, 0.4);
+  background: rgba(var(--danger-rgb), 0.12);
+  border-color: rgba(var(--danger-rgb), 0.4);
 }
 .memo-item-actions .memo-save-edit {
   color: var(--green);
@@ -6398,7 +6419,7 @@ input[type="number"]::-webkit-inner-spin-button {
   cursor: pointer;
 }
 /* 删除是危险操作：hover 走红系（同 `.tool-card.failed` 那一族的语义色） */
-.music-tune-del:hover { color: var(--red); border-color: rgba(192, 138, 138, 0.4); }
+.music-tune-del:hover { color: var(--red); border-color: rgba(var(--danger-rgb), 0.4); }
 .music-tune-menu { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 2px; }
 
 /* ── 调音页 2026-10-02 的四处改造 ──────────────────────────────────── */
@@ -8135,7 +8156,7 @@ body.music-resizing * { cursor: col-resize !important; }
 
 /* 危险动作（关机 / 重启）二次确认期间标红，其余与普通条目一致 */
 #detail-results .result-item.danger-armed {
-  background: rgba(192, 138, 138, 0.16);
+  background: rgba(var(--danger-rgb), 0.16);
 }
 
 .detail-danger {
@@ -8474,7 +8495,7 @@ body.music-resizing * { cursor: col-resize !important; }
 .proxy-btn:disabled { opacity: 0.5; cursor: default; }
 .proxy-btn.primary { color: var(--text); border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha)); }
 /* 删除是危险操作：hover 走红系（同 `.tool-card.failed` 那一族的语义色） */
-.proxy-btn.danger:hover:not(:disabled) { color: var(--red); border-color: rgba(192, 138, 138, 0.4); }
+.proxy-btn.danger:hover:not(:disabled) { color: var(--red); border-color: rgba(var(--danger-rgb), 0.4); }
 .proxy-empty { padding: 10px 2px; font-size: 0.72rem; color: var(--text-dim); }
 .proxy-form { display: flex; gap: 6px; flex-wrap: wrap; }
 .proxy-form input[type="text"] {
@@ -8642,6 +8663,6 @@ body.music-resizing * { cursor: col-resize !important; }
   cursor: pointer;
   opacity: 0.6;
 }
-.custom-select-option:hover .cs-del { opacity: 1; color: var(--red, #c08a8a); }
-.cs-del:hover { background: rgba(192,138,138,0.2); }
+.custom-select-option:hover .cs-del { opacity: 1; color: var(--red, #de7373); }
+.cs-del:hover { background: rgba(var(--danger-rgb),0.2); }
 

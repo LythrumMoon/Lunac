@@ -2290,7 +2290,7 @@ export async function attachSettingsListeners(container: HTMLElement) {
       .settings-plugin-empty { color: var(--text-dim); font-size: 0.75rem; padding: 8px 0; }
       .tool-badge { font-size: 0.58rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
       .tool-badge.valid { background: rgba(157,180,172,0.15); color: var(--green); }
-      .tool-badge.invalid { background: rgba(192,138,138,0.15); color: var(--red); }
+      .tool-badge.invalid { background: rgba(var(--danger-rgb),0.15); color: var(--red); }
       .settings-tool-btn {
         padding: 5px 12px;
         font-size: 0.72rem;
@@ -2491,11 +2491,11 @@ export async function attachSettingsListeners(container: HTMLElement) {
         flex-shrink: 0;
         transition: background 0.1s, color 0.1s;
       }
-      .settings-skill-del:hover, .settings-skill-del-installed:hover { color: var(--red); background: rgba(192,138,138,0.1); }
+      .settings-skill-del:hover, .settings-skill-del-installed:hover { color: var(--red); background: rgba(var(--danger-rgb),0.1); }
       /* 两段式确认的「待确认」态：语义色常亮，提示「再点一次才真删」。
          没有它的话 armed 态与常态只差文字，看不出是危险确认。 */
       .settings-skill-del[data-armed="1"],
-      .settings-skill-del-installed[data-armed="1"] { color: var(--red); background: rgba(192,138,138,0.14); }
+      .settings-skill-del-installed[data-armed="1"] { color: var(--red); background: rgba(var(--danger-rgb),0.14); }
       /* 印象派按钮背景清理（与全局 styles.css 一致：背景全透明，无扫笔/光效） */
       .settings-tool-btn, .settings-skill-open, .settings-skill-edit, .settings-install-btn,
       .settings-save-btn, .custom-model-ok, .settings-skill-del, .settings-skill-del-installed {

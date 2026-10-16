@@ -1752,6 +1752,11 @@ function saveCurrentSession() {
   const snapshotUsage: SessionUsage = { ...usageTotals };
   const snapshotSteps = sessionSteps.map(g => ({
     turn: g.turn,
+    // `hasMsg` **必须一起快照**：它决定历史回看时这一组过程挂助手气泡还是挂它自己的
+    // 用户气泡之后（见 `renderHistoryProcess`）。漏掉它 ⇒ 盘上只剩 `turn/items`，恢复时
+    // 回落成「有消息」，被截停的那一轮（无收尾正文）就会挂错位置、末回合甚至整块被丢
+    // （用户报「暂停/截停时的小思考没进历史」）。宿主 `SessionProcess` 早已声明该字段。
+    hasMsg: g.hasMsg,
     items: g.items.map(i => ({ ...i })),
   }));
   // 快照也要**当场取一份**：`newConversation()` 会在调用之后立刻清空全局
@@ -1797,6 +1802,9 @@ function restoreSession(session: ChatSession) {
   // 过程快照一并恢复，供「查看过程」
   sessionSteps = (session.steps ?? []).map(g => ({
     turn: g.turn,
+    // 同 `saveCurrentSession` 的快照：`hasMsg` 一起读回，否则被截停的回合（无收尾正文）
+    // 会被当成「有消息」而挂错助手下 / 末回合整块丢弃（见那里的注释）。
+    hasMsg: g.hasMsg,
     items: g.items.map(i => ({ ...i })),
   }));
   // 待办时间线读回来（2026-10-02）：恢复会话后任务抽屉由它重建 —— 旧记录没有该字段 → 空表。
@@ -2216,10 +2224,16 @@ function renderHistoryProcess(steps: SessionProcess[]) {
       ordinal++;
     } else {
       // 无消息的回合：优先挂到它自己的用户气泡之后 —— 该回合没有助手气泡，所以「下一条
-      // 助手气泡的前一个兄弟」正是它自己的用户消息。末回合没有下一条助手气泡时才退到
-      // 「最近放置的过程块」之后。
+      // 助手气泡的前一个兄弟」正是它自己的用户消息。**末回合**（被截停后就是最后一条）
+      // 没有下一条助手气泡 ⇒ 退回**最后一条用户气泡**（它必然属于这一个无消息的回合），
+      // 否则这一组过程会被整块丢弃（用户报「暂停/截停时的小思考没进历史」）。
       const nextBubble = assistants[ordinal - offset] ?? null;
-      host = nextBubble ? nextBubble.previousElementSibling : lastPlaced;
+      if (nextBubble) {
+        host = nextBubble.previousElementSibling;
+      } else {
+        const users = log.querySelectorAll<HTMLElement>(".chat-msg-user");
+        host = users[users.length - 1] ?? lastPlaced;
+      }
     }
     // 落不到宿主（整组在渲染窗口之外）就什么都不做 —— **绝不**退回 `appendChild` 到末尾，
     // 那正是「过程块挂到别人回答后面」的旧 bug。
@@ -5491,7 +5505,8 @@ interface CliEventLine {
   /** system/task_event（E1，2026-10-16）：子代理内部过程。与 `task_started` 同 `task_id`
    *  —— 靠它把事件挂到对应的 `Agent` 卡片（见 `agentSubtaskEventLine`）。
    *  `message.role=assistant` 是模型产出、`user` 是工具结果；块形状与主流程同名。
-   *  **整段超限时只有这一条**：`truncated:true` 且无 `message` ⇒ 框格末尾提示已截断。 */
+   *  **整段超限时只有这一条**：`truncated:true` 且无 `message` ⇒ 框格末尾提示已截断
+   *  （双上限已放大到 200k / 2M，属极端兜底，见 core-agent 的同名常量）。 */
   truncated?: boolean;
   event?: {
     type: string;
@@ -5879,6 +5894,9 @@ function agentSubtaskEventLine(data: CliEventLine) {
   const sv = v.taskViews.get(id);
   if (!sv) return; // 未登记（`task_started` 还没到 / 旧 agent）⇒ 不渲染，避免落进主流程
   // ① 整段超限：收到恰一条 `truncated:true` 且**无 message** ⇒ 框格末尾提示「已截断」。
+  // **极端兜底**（2026-10-16）：转发双上限已放大到 200k / 2M 字符（core-agent 的
+  // `SUBAGENT_EVENT_*_CHARS`），现实里够不着；此分支保留，只在病态外溢时才出现一行提示 ——
+  // 不是死代码（后端仍会在用尽时发这条标记），也绝不静默丢内容。
   if (data.truncated === true && !data.message) {
     if (!sv.flow.querySelector(".subtask-truncated")) {
       const note = doc("div");
@@ -6056,7 +6074,9 @@ function ensureCmdGroup(v: AgentView): HTMLElement {
   if (v.cmdGroupBody) return v.cmdGroupBody;
   const el = document.createElement("details");
   el.className = "cmd-group";
-  el.open = true; // 进行中摊开，让用户看到命令与实时输出
+  // 进行中摊开，让用户看到命令与实时输出 —— **仅主流程**。子代理内部保持收起（同
+  // `agentNewBlock` 的说明：③「子代理运行时不自动展开」）。
+  el.open = v === agentView;
   el.innerHTML =
     `<summary class="cmd-group-head">${TERM_SVG}` +
     `<span class="cmd-group-label"></span></summary>` +
@@ -6332,7 +6352,11 @@ function agentNewBlock(
     closeCmdGroup(v); // 正文/思考插进来 ⇒ 当前命令组到此为止，下一批工具调用另起一组
     const det = document.createElement("details");
     det.className = "think-block";
-    det.open = true; // 进行中展开，让用户看得到「在思考」
+    // 进行中展开，让用户看得到「在思考」—— **仅主流程**。子代理内部（`v` = 子视图，见
+    // `renderSubtaskBlocks`）保持收起：用户要求「子代理运行期间不要自动展开框格内容，
+    // 保持收起、自己点开才看」（见 ③）。框格整体在 `Agent` 卡（默认收起）内，这里不展开
+    // 是第二道保险（用户中途点开卡也不该看到一层层自动摊开的内部块）。
+    det.open = v === agentView;
     det.innerHTML =
       `<summary><span class="think-ic">${THINK_SVG}</span><span class="think-label"></span></summary>` +
       `<div class="think-content"></div>`;
@@ -7510,6 +7534,9 @@ function fillToolCard(
   secretHits?: ToolSecretHit[],
 ) {
   const el = card.el;
+  // 这张卡是否在**子代理框格**内（`Agent` 卡展开后内层卡）。子代理内部一律**不自动展开**
+  // （③ 用户要求「保持收起、自己点开才看」）—— 下面三处自动 `open` 由此闸住；主流程照旧。
+  const inSubtask = !!el.closest(".subtask-box");
   const { exitCode, timedOut, stopped } = parseShellOutcome(txt);
   const isShell = card.name === "Cmd" || card.name === "PowerShell";
   const firstLine = txt.split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 80);
@@ -7520,7 +7547,7 @@ function fillToolCard(
   const stateEl = el.querySelector<HTMLElement>(".tool-state");
   if (isError) {
     el.classList.add("failed");
-    el.open = true; // 失败直接摊开，别让用户再点一次
+    if (!inSubtask) el.open = true; // 失败直接摊开，别让用户再点一次（子代理内部除外，见 inSubtask）
     if (stateEl) stateEl.textContent = t("agent.tool_failed", { txt: firstLine || "unknown error" });
   } else if (stopped) {
     // 用户自己停的（2026-10-01）：既不是成功也不是失败，用黄色（同 timeout）。
@@ -7608,7 +7635,7 @@ function fillToolCard(
         wrap.appendChild(img);
       }
       box.appendChild(wrap);
-      el.open = true; // 出了图就别折叠着 —— 用户要看的就是它
+      if (!inSubtask) el.open = true; // 出了图就别折叠着 —— 用户要看的就是它（子代理内部除外）
     }
   }
 
@@ -7662,8 +7689,8 @@ function fillToolCard(
         `<span class="tool-secret-warn-note">${esc(t("agent.secret_warn_note"))}</span>`;
       box.insertBefore(warn, box.firstChild);
     }
-    // 与「失败直接摊开」同一条理由：这一条必须被看见，不许藏在折叠里
-    el.open = true;
+    // 与「失败直接摊开」同一条理由：这一条必须被看见，不许藏在折叠里（子代理内部除外，见 inSubtask）
+    if (!inSubtask) el.open = true;
   }
 
   // 越界 / 被拒：补一行用户可选的后续动作（§4.3）
@@ -12714,7 +12741,18 @@ function applyFourClassNeutrals(
     const raw = (base + textDelta) * k;
     return light ? cl(100 - Math.min(100, Math.max(0, raw))) : cl(raw);
   };
-  const textL = L(89), dimL = L(68), mutedL = L(50);
+  // ②「过程 / 次要」两档 = **在正文色（也就是用户自定义文字色）的基础上再挪一档**，
+  //    而不是各自算一个固定档位。方向按**正文在它底色上偏亮还是偏暗**定（`light` = 底色亮）：
+  //    深底（正文偏亮）⇒ 调暗；浅底（正文偏暗）⇒ 调亮 —— 保证「过程比正文暗一档」这个
+  //    **层级关系**始终成立。旧写法三档各自 `(base + textDelta) * k` 再 clamp：用户把
+  //    「文字明度」往正方向拉时三档会依次撞到 100% 而**齐平**（过程与正文同色），层级失效
+  //    （本轮修的就是它）。`cl()` 是饱和钳位 ⇒ 方向仍取 `light`（而不是比 textL>50）是为了
+  //    保住 §界面 11 的硬验收：**四类全设黑时三档文字仍恒为 0（黑）**（暗底下调暗，0 - step
+  //    钳回 0）。
+  const textL = L(89);
+  const tierStep = 21;                             // 一档间距 ≈ 改造前 89 → 68 的落差
+  const dimL = light ? cl(textL + tierStep) : cl(textL - tierStep);
+  const mutedL = light ? cl(textL + tierStep * 2) : cl(textL - tierStep * 2);
   const s = Math.min(oh.s, 30);                    // 正文饱和度收敛，避免整屏彩色字
   setVar("--text", `hsl(${oh.h}, ${s}%, ${textL}%)`);
   setVar("--text-dim", `hsl(${oh.h}, ${Math.round(s * 0.85)}%, ${dimL}%)`);

@@ -17,7 +17,7 @@
 - **基础变量**（全部只用这些，不新造颜色）：
   - 文字：`--text`（正文）/ `--text-dim`（次要，如元信息）/ `--text-muted`（极弱，如占位）；
   - 面：`--surface-glass`（卡片底）/ `--surface-glass-hover`（hover）/ `--border-glass`（描边）；
-  - 语义：`--accent` + `--accent-bg` + `--accent-border`（进行中 / 可交互）、`--green`（成功 / 放行）、`--red`（失败 / 危险）、`--yellow`（警告 / 非零退出码）、`--blue`（信息 / 链接）；
+  - 语义：`--accent` + `--accent-bg` + `--accent-border`（进行中 / 可交互）、`--green`（成功 / 放行）、`--danger-rgb`（危险 / 失败 / 拒绝 / 告警红，**唯一数值来源**；`--danger` / `--red` 是它的消费名，见 §界面 16）、`--yellow`（警告 / 非零退出码）、`--blue`（信息 / 链接）；
   - 圆角：`--radius`（默认 14）。
 - **派生 token（主题色唯一真相源）**：
   - `--accent-rgb`：凡 accent 带 alpha 必须写 `rgba(var(--accent-rgb), x)`，**不得**硬编码 `rgba(192,160,160,x)` 这类分量；
@@ -142,8 +142,8 @@
 | 按钮蒙版（旧称「其他颜色」，2026-10-11 改名） | `overlayColor`（空串 = 跟随主题色）+ `overlayAlpha` | `--other-overlay-rgb` + `--other-overlay-alpha`（派生 `-nav-alpha` = ×1.4、`-btn-alpha` = ×2） | `var(--accent-rgb)` + `0.1` | 选中态 border + 蒙版 + icon + 文字；**并接管文字色与图标色的色相**（见下）；含**下拉框选项的悬停 / 选中**（见 §界面 12）、**音乐选中框**（`.music-tr.sel` / `.music-mt.sel` 的整圈色框 + 淡填充）与**音乐播放模式按钮的激活态文字** |
 
 - **三条派生链（`applyFourClassNeutrals`，JS 算、CSS 只消费；规则：颜色字段空串 ⇒ 用主题色 `--accent`）**：
-  1. **文字 / 图标 ← 蒙版色（overlay）**：`--text` / `--text-dim` / `--text-muted` 的**色相与饱和取自 overlay**（饱和收敛到 ≤30），**亮度** = 默认可读档（89 / 68 / 50）× `overlayHSL_L / 69`，再加上 **`textLight`（文字明度滑块）偏移**。偏移在缩放**前**加 ⇒ overlay 全黑时三档文字**恒为 0（黑）**，滑块拉到极端也不越界。`--ink-rgb`（半透明叠加基色）取同一份「overlay 色相 + 文字亮度」。
-     - **默认实际取值**（overlay = `--accent` #c0a0a0，hsl(0,20%,69%) ⇒ 缩放系数 1）：`--text` = `hsl(0, 20%, 89%)` = `rgb(233,221,221)`；`--text-dim` = `hsl(0,17%,68%)` = `rgb(187,160,160)`；`--text-muted` = `hsl(0,14%,50%)` = `rgb(145,110,110)`；`--ink-rgb` = `233, 221, 221`。**可读性**：正文 `rgb(233,221,221)` 在默认底色 `rgb(31,25,25)` 上对比度 ≈ **13:1**（远高于 WCAG AA 的 4.5:1），三档均清晰。
+  1. **文字 / 图标 ← 蒙版色（overlay）**：`--text` 的**色相与饱和取自 overlay**（饱和收敛到 ≤30），**亮度** = 默认可读档（89）× `overlayHSL_L / 69`，再加上 **`textLight`（文字明度滑块）偏移**；**`--text-dim` / `--text-muted` 在 `--text` 的最终亮度上再**各挪一档**（±21 / ±42，方向由底色明暗定：深底调暗、浅底调亮）—— 这叫「过程 / 次要在正文基础上相对明暗」（2026-10-16 修：旧写法三档各自 `(base+delta)×k` 再 clamp，把「文字明度」往正方向拉时三档会齐平、过程与正文同色 ⇒ 层级失效）。偏移在缩放**前**加 ⇒ overlay 全黑时三档文字**恒为 0（黑）**（暗底方向调暗、`0−step` 钳回 0），滑块拉到极端也不越界。`--ink-rgb`（半透明叠加基色）取同一份「overlay 色相 + 文字亮度」。
+     - **默认实际取值**（overlay = `--accent` #c0a0a0，hsl(0,20%,69%) ⇒ 缩放系数 1）：`--text` = `hsl(0, 20%, 89%)` = `rgb(233,221,221)`；`--text-dim` = `hsl(0,17%,68%)` = `rgb(187,160,160)`；`--text-muted` = `hsl(0,14%,47%)` = `rgb(137,103,103)`；`--ink-rgb` = `233, 221, 221`。**可读性**：正文 `rgb(233,221,221)` 在默认底色 `rgb(31,25,25)` 上对比度 ≈ **13:1**（远高于 WCAG AA 的 4.5:1），三档均清晰。
   2. **描边 ← 按钮线条（btnLine）**：`--border-glass` = `--ctx-border-glass` = `rgba(var(--btn-line-rgb), 0.10)`（α 固定、不随 `btnLineAlpha`）。默认 = `rgba(192,160,160,0.10)`，与改造前 `rgba(232,216,202,0.10)` 观感接近（同为 10% 淡描边）。
   3. **中性黑遮罩 ← 底色（base）**：`--shade-rgb` = 底色各通道 ×0.25（暗变体、近黑；黑底 ⇒ 全黑）；`--shade-scale` = 暗底 `1` / 亮底 `0.35`。默认 = `8, 6, 6`（在默认底色 `31,25,25` 上，与原纯黑 `0,0,0` 近乎不可分）。消费方一律写 `rgba(var(--shade-rgb), calc(α * var(--shade-scale)))`。反差四件套 `--ctx-*` 同源：叠加基色取 ink、凹陷基色取 shade、描边取 line。
 - **派生规则**：颜色字段是**空串哨兵** —— 空串 = 用户没动过 ⇒ 回落 `:root`（= `var(--accent-rgb)`，跟随主题色）；用户一动取色器就写成真 hex，从此以用户值优先。
@@ -154,7 +154,7 @@
   - 插件是**独立窗口**：CSS 与主窗共用同一份 `styles.css`，但变量靠 `broadcastThemeVars()`（`lunac-theme-vars` 事件）转发 —— 插件里**直接用 `var(--btn-*)` / `var(--other-overlay-*)` / `var(--ink-rgb)` / `var(--shade-rgb)` 即可**（主窗已把内联值转发过来），**不要假设 `:root` 之外会自动继承**，也不要自己再算一份派生。
   - 遇到「看起来不受按钮颜色控制」的反馈：先对齐**形状**（尺寸 / 圆角 / 边框）与**状态规则**，确认同源后再查颜色来源。
 - **白名单（故意不并入四类，保持固定；把四类全设黑后仍允许存在的颜色与理由）**：
-  - **语义色**（固定、不随主题）：`--red` / `--green` / `--yellow` / `--blue` 及其字面量 —— `rgba(192,138,138,*)`（危险）/ `rgba(157,180,172,*)`（成功）/ `rgba(201,184,150,*)`·`rgba(198,168,106,*)`·`rgba(214,187,121,*)`（警告）/ `rgba(148,144,180,*)`（信息）。**理由**：它们表达状态（成功 / 失败 / 警告 / 信息），若跟随四类会丢失语义。
+  - **语义色**（固定、不随主题）：`--danger-rgb`（危险 / 失败 / 拒绝 / 告警红，**唯一数值来源**）与 `--green` / `--yellow` / `--blue` 及其字面量 —— `rgba(var(--danger-rgb),*)`（危险，2026-10-16 起由 `--danger-rgb` 单一来源供给，见 §界面 16）/ `rgba(157,180,172,*)`（成功）/ `rgba(201,184,150,*)`·`rgba(198,168,106,*)`·`rgba(214,187,121,*)`（警告）/ `rgba(148,144,180,*)`（信息）。**理由**：它们表达状态（成功 / 失败 / 警告 / 信息），若跟随四类会丢失语义。
   - **音乐「正在播放」文字高亮**（`.music-*.playing`：正在播放那一行 / 歌单只提亮文字）与**左栏编辑态勾中行**（`.music-pl.sel` 的 `--accent` 底 + 左缘）。**理由**：与「正在播放」/ 编辑勾选这一**插件内运行态**绑定。（注：`.music-*.playing` 的文字强调**实际已走 `rgb(var(--other-overlay-rgb))`**，见 §界面 2；但本轮未点名收编它，按用户口径**保留**。）**2026-10-11 第 4 轮：播放 / 扫描进度条与选中框已收编** —— 进度条填充（`.music-bp-fill` / `.music-progress-fill` / `.music-scan-fill`）改走**按钮线条**、其轨道改走**底色**派生的中性黑；选中框（`.music-tr.sel` / `.music-mt.sel`）改走**按钮蒙版**；**正在播放文字高亮仍保留**。
   - **封面占位渐变**（`.music-pl-liked-cover` 紫色渐变、`.music-pl-trend-cover`）、**截屏暗幕**（`.shot-body{background:#000}` 与 `#shot-size` / `#shot-hint` 的 `#fff`）、**终端底 / 前景**（`.tool-card .tool-term{background:#0b0b0c}` 与 `main.ts` 的 xterm theme）、**取色器自身彩虹 / 黑白渐变与 `.ap-sv-cursor` 描边**。**理由**：这些是**内容本身**（图片像素 / 屏幕像素 / 终端 ANSI），不是界面配色。
   - **`--glass-sheen-image` 反光白**。**理由**：镜面高光物理上就是白的。
@@ -367,8 +367,8 @@
 /* styles.css .approval-allow / .approval-deny */
 .approval-allow { border-color: rgba(157,180,172,0.35); color: var(--green); }
 .approval-allow:hover { background: rgba(157,180,172,0.15); }
-.approval-deny  { border-color: rgba(192,138,138,0.35); color: var(--red); }
-.approval-deny:hover  { background: rgba(192,138,138,0.15); }
+.approval-deny  { border-color: rgba(var(--danger-rgb),0.35); color: var(--red); }
+.approval-deny:hover  { background: rgba(var(--danger-rgb),0.15); }
 ```
 
 样式（选中态 / 禁用态）：
@@ -500,6 +500,39 @@
 
 - **字数限制的写法**：用 `maxlength` 属性（值来自**宿主那一份上限**的唯一真相源 —— 如 `storage::MAX_PERSONA_CHARS` / `get_pet_persona` 回的 `maxChars`），JS 侧**只做回显**（`ta.maxLength = …`），**不另立一份上限**。示例：`pet.ts` 的 `<textarea … maxlength="8000">` + `if (st?.maxChars) ta.maxLength = st.maxChars;`。
 - **焦点 / 输入**：`caret-color` 一律走 `rgb(var(--other-overlay-rgb))`（见 §界面 2 / §界面 7）；文本输入遵守「失焦 / 回车才提交」。
+
+---
+
+## §界面 15 对话区栅格（右侧置顶 + 左侧留 ~1/6）
+
+> 2026-10-16（用户裁定）：对话气泡 / 正文原先**一行铺满**，改为**靠右 + 左侧留白约 1/6**。
+
+- **作用范围 = AI 会话列 `#chat-log`**（聊天独立窗 `plugin-chat` 与主窗共用的会话容器）。桌宠输出框是
+  另一套 DOM（`.pet-chat-output`），**不在此列**；插件面板（`.plugin-result`）也不受影响。
+- **实现**：`:root` 的 `--chat-gutter: 16.6667%`（唯一布局 token）+ `#chat-log { margin-left: var(--chat-gutter); }`。
+  **不硬编码 px** —— 用百分比，聊天窗可缩放、窄窗下空档同比收缩，不会把内容挤没；「右侧置顶」= 块级元素
+  右对齐（左边距顶开）+ 自顶部起排（它本就是流的第一个块，无需 `align-self`）。
+- **响应式判据**：把聊天窗拖到最窄，正文列仍占剩余 5/6 且可读；窗口拉宽，空档同比放大。`#chat-log` **不设**
+  `max-width` —— 那会变成固定列宽，与「留 1/6」是两个口径。
+
+## §界面 16 危险色（`--danger-*`：固定、不随主题漂移）
+
+> 2026-10-16（用户裁定）：把所有「危险 / 失败 / 拒绝 / 告警红」统一到**唯一数值来源** `--danger-rgb`，并调得更显眼。
+
+- **定义处**：`styles.css` 的 `:root` —— `--danger-rgb: 222, 115, 115;`（hsl(0,59%,64%)）、
+  `--danger: rgb(var(--danger-rgb));`、`--red: var(--danger);`（历史别名，沿用约 120 处既有调用点）。
+  整族**只有一个数值**（§禁用 62）；带 alpha 一律写 `rgba(var(--danger-rgb), α)`，不得再出现
+  `rgba(192,138,138,α)` 这类硬编码分量（§禁用 17）。
+- **为什么它不受主题色影响**：`--danger-rgb` 是 `:root` 上的**固定常量**，既不由 `--accent` 派生，
+  也不经 `applyAppearance()` / `applyFourClassNeutrals()` 重写 —— 改主题色 / 四类自定义色都不会动它。
+  旧值 `#c08a8a` 是低饱和「尘玫瑰」，与**默认主题色** `#c0a0a0` 几乎同色；用户把主色改成红系时危险红
+  会被日常 UI 淹没（这就是「警告红被主题色影响」的真实来历）。新值提高饱和度、拉开与任何主题色的距离，
+  暗底 / 亮底都可辨识。
+- **什么场景用**：拒绝 / 失败 / 危险 / 删除 / 两段式确认 —— `approval-deny`、`.run-mode-auto` 警示、
+  `.tool-card.failed`、`.tool-secret-warn`、`.sys-note-error`、`[data-armed="1"]`、各处删除按钮…
+- **不改哪些**：品牌色 / 装饰 / 链接的红**不在此列** —— 主色「尘玫瑰」是 `--accent`（跟随主题，§界面 11）；
+  链接 / 信息用 `--blue`；「要人看一眼但不确认危险」的告警（无法静态判定、疑似凭据）用 `--yellow`。
+  终端底 / 前景、截屏暗幕、封面渐变等**内容色**同样不动（§界面 11 白名单）。
 
 ---
 

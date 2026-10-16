@@ -278,12 +278,18 @@ const SUBAGENT_BUDGET_TOKENS: u64 = 300_000;
 /// （那条路只覆盖内置工具），不在这里收口的话，一份长报告能直接把主对话上下文顶爆。
 const SUBAGENT_REPORT_CHARS: usize = 8_000;
 /// 子代理**内部过程转发**的**单条**内容上限（字符）。转发的初衷是让用户看到「它在做什么」，
-/// 不是把每个文件原样搬进前端 —— 单块文本（thinking / text / tool 入参 / tool_result）超过它
-/// 就用 `log::truncate_chars` 截断，超限处带 `…(truncated)` 标记（绝不静默丢）。
-const SUBAGENT_EVENT_ITEM_CHARS: usize = 4_000;
+/// 且（2026-10-16 用户要求「让用户清楚看到子代理干了什么」）**不再把内容截短** —— 旧值
+/// 4000 会在单块文本（thinking / text / tool 入参 / tool_result）稍长时就切掉，用户看不到全貌。
+/// 新上限 **200_000**（与前端单命令终端缓冲 `TERM_BUF_MAX=200_000` 同量级），仍保留
+/// `log::truncate_chars` + `…(truncated)` 作为**极端兜底**（绝不静默丢），只是现实里够不着。
+/// 超限的代价评估：前端本就对渲染做二次收敛（`.tool-out` 只显示前 600 字符、思考展开走
+/// `THINK_INLINE_MAX`、终端缓冲封顶 200k），所以放开这里不会把 DOM 撑爆；涨的是单行 IPC 体积。
+const SUBAGENT_EVENT_ITEM_CHARS: usize = 200_000;
 /// 子代理**内部过程转发**的**整段**上限（字符，跨所有轮累计）。一个 8 轮、每轮跑命令的子代理
-/// 能产出几十万字符；不封顶会把前端拖垮。用尽后只发一条 `truncated:true` 标记，之后不再转发。
-const SUBAGENT_EVENT_TOTAL_CHARS: usize = 40_000;
+/// 能产出几十万字符；完全不设上限有风险（单行 IPC / 前端内存），故给**足够大的新上限**
+/// **2_000_000**（≈ 10 条满额块；覆盖「8 轮 × 每轮 1–2 条大块」的常态，只有病态外溢才触发兜底）。
+/// 用尽后只发一条 `truncated:true` 标记，之后不再转发（明确标记，不静默丢）。
+const SUBAGENT_EVENT_TOTAL_CHARS: usize = 2_000_000;
 /// 子代理的系统提示词（**角色段**）。英文的原因同 `TRIMMED_MARKER`：这是给模型看的元信息，不进 i18n。
 ///
 /// 它在 `main()` 里被拼成完整提示词时**还会接上环境块与技能清单**（见那里的 `subagent_system`）

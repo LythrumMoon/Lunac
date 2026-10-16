@@ -3557,7 +3557,7 @@ const PET_CSS = `
 .pet-list-acts{display:flex;flex-wrap:wrap;gap:6px;}
 .pet-list-empty{color:var(--text-muted);font-size:.7rem;line-height:1.7;}
 /* 两段式确认态（删除 / 清空 / 接受合并）：红色确认，见 docs/ui-style.md §界面 2 / §界面 11 白名单。 */
-.pet-list-del[data-armed="1"],.pet-list-clear[data-armed="1"],.pet-suggest-accept[data-armed="1"]{color:var(--red);background:rgba(192,138,138,0.14);border-color:var(--red);}
+.pet-list-del[data-armed="1"],.pet-list-clear[data-armed="1"],.pet-suggest-accept[data-armed="1"]{color:var(--red);background:rgba(var(--danger-rgb),0.14);border-color:var(--red);}
 .pet-debug{margin-top:12px;border-top:1px solid var(--border-glass);padding-top:11px;}
 .pet-debug-title{font-weight:600;color:var(--text);margin-bottom:8px;}
 .pet-debug-note{color:var(--text-dim);font-size:.68rem;line-height:1.7;margin-bottom:8px;}

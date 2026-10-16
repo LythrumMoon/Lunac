@@ -177,7 +177,7 @@ export function attachToolEditorListeners() {
       .tool-item-desc { font-size:0.7rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
       .tool-status { font-size:0.6rem;padding:1px 6px;border-radius:4px;font-weight:600; }
       .tool-status.valid { background:rgba(157,180,172,0.15);color:var(--green); }
-      .tool-status.invalid { background:rgba(192,138,138,0.15);color:var(--red); }
+      .tool-status.invalid { background:rgba(var(--danger-rgb),0.15);color:var(--red); }
       .tool-item-actions { display:flex;gap:4px;flex-shrink:0; }
       .tool-item-actions button { padding:3px 10px;font-size:0.68rem;border-radius:4px;border:1px solid var(--border-glass);background:rgba(var(--ink-rgb), 0.05);color:var(--text-dim);cursor:pointer;transition:background 0.1s; }
       .tool-item-actions button:hover { background:rgba(var(--ink-rgb), 0.1);color:var(--text); }

@@ -1194,7 +1194,8 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "실행 중",
     "en": "Running",
   },
-  // E2（2026-10-16）：子代理内部过程整段超限（`task_event` 只发一条 `truncated:true`，无 message）
+  // E2（2026-10-16）：子代理内部过程整段超限（`task_event` 只发一条 `truncated:true`，无 message）。
+  // **极端兜底**：转发双上限已放大到 200k / 2M 字符，现实里够不着；保留此键供病态外溢时如实提示。
   "agent.subtask_truncated": {
     "zh-CN": "内部过程过长，已截断",
     "zh-TW": "內部過程過長，已截斷",
