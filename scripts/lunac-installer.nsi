@@ -124,6 +124,13 @@ Section "Install" SecCore
     File "Lunac\Modules\README.md"
     SetOutPath "$INSTDIR"
   !endif
+  ; `reuse` 面板骨架 / DOM 契约（panel-templates.md，2026-10-16）：README 里指路的那份
+  ; 「照抄前先读」资产。不随包发的话，装完的 Modules\README.md 里那条链接就是死链。
+  !if /FileExists "Lunac\Modules\panel-templates.md"
+    SetOutPath "$INSTDIR\Modules"
+    File "Lunac\Modules\panel-templates.md"
+    SetOutPath "$INSTDIR"
+  !endif
 
   ; VSCode extension -- optional, auto-installed by the "Attach to VSCode" button
   ; if present alongside lunac.exe

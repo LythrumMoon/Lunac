@@ -268,12 +268,32 @@ fn elidable_tool(name: Option<&str>) -> bool {
 //   ④ **进度回前端**：`task_started` / `task_progress` / `task_done`；
 //   ⑤ **防递归**：子代理的工具集里**剔掉 `Agent`** —— 否则一个任务能派无限层子代理。
 
-/// 子代理自己的工具往返上限。比主对话的 `MAX_TOOL_ROUNDS`(16) 小：子代理是
-/// 「查清一件事」而不是「做完整个任务」，8 轮足够，也把失控成本压住。
-const MAX_SUBAGENT_ROUNDS: usize = 8;
+/// 子代理自己的工具往返上限。
+///
+/// **2026-10-16 由 8 提高到 20**。依据：实测 13/13 个子代理**全部**在 8 轮撞顶，而
+/// `SUBAGENT_BUDGET_TOKENS`（30 万）平均只用了约 40% ⇒ 卡住它们的是**轮数**不是钱，
+/// 8 轮把「明明没花完钱」的任务提前截断成了部分报告。
+///
+/// 提到 20 后**真正的钱闸换成 token 预算**：按 8 轮约 12 万 token（= 30 万的 40%）
+/// 反推，线性外推约在第 20 轮触顶；但子代理上下文逐轮增长、后段每轮更贵，实际会
+/// 更早触发，**大致第 13–15 轮**。⇒ 单个子代理成本仍封顶在 30 万 token 量级，
+/// 轮数退化成**纯兜底**（防「预算判据失效 + 模型失控」的组合失效），与主对话
+/// `MAX_TOOL_ROUNDS` 的分工一致。后台复盘**不跟这个值走**（保持 `MAX_REVIEW_ROUNDS = 4`）。
+const MAX_SUBAGENT_ROUNDS: usize = 20;
 /// 单个子代理的 token 预算封顶（输入 + 输出 + 缓存命中的**全部吞吐**）。
 /// 超了就把**已有结论**交回去，而不是继续烧钱 —— 见约束③。
 const SUBAGENT_BUDGET_TOKENS: u64 = 300_000;
+/// 子代理**倒数第二轮**的收口指令：拼进最后一条 `tool_result`，提醒它「下一轮就是最后一轮，
+/// 用完整报告收口」，避免拖到轮数打满才被硬截成部分报告（2026-10-16）。
+///
+/// 落点纪律同 `TURN_BUDGET_HINT`：**拼进已有 `tool_result` 的文本内部**，不动消息条数 /
+/// 块结构。此刻那条 `tool_result` 是上一轮刚 push、**还没发出去过**的（不在任何已缓存前缀
+/// 里）⇒ 改它对子代理自己的前缀缓存**零代价**，且全程**只注入一次**。它只进子代理自己的
+/// history，**不碰主对话前缀**。
+const SUBAGENT_WRAP_HINT: &str =
+    "You are about to enter your FINAL round (one round left after this). Do not start new \
+exploration -- use the final round to write your complete report: answer the task, cite the \
+exact file paths / line ranges / commands you relied on, and flag anything you could not verify.";
 /// 回灌给主对话的子代理报告字符上限。子代理的返回值**不走** `tools::apply_budget`
 /// （那条路只覆盖内置工具），不在这里收口的话，一份长报告能直接把主对话上下文顶爆。
 const SUBAGENT_REPORT_CHARS: usize = 8_000;
@@ -285,11 +305,17 @@ const SUBAGENT_REPORT_CHARS: usize = 8_000;
 /// 超限的代价评估：前端本就对渲染做二次收敛（`.tool-out` 只显示前 600 字符、思考展开走
 /// `THINK_INLINE_MAX`、终端缓冲封顶 200k），所以放开这里不会把 DOM 撑爆；涨的是单行 IPC 体积。
 const SUBAGENT_EVENT_ITEM_CHARS: usize = 200_000;
-/// 子代理**内部过程转发**的**整段**上限（字符，跨所有轮累计）。一个 8 轮、每轮跑命令的子代理
-/// 能产出几十万字符；完全不设上限有风险（单行 IPC / 前端内存），故给**足够大的新上限**
-/// **2_000_000**（≈ 10 条满额块；覆盖「8 轮 × 每轮 1–2 条大块」的常态，只有病态外溢才触发兜底）。
-/// 用尽后只发一条 `truncated:true` 标记，之后不再转发（明确标记，不静默丢）。
-const SUBAGENT_EVENT_TOTAL_CHARS: usize = 2_000_000;
+/// 子代理**内部过程转发**的**整段**上限（字符，跨所有轮累计）。一个多轮、每轮跑命令的子代理
+/// 能产出几十万字符；完全不设上限有风险（单行 IPC / 前端内存），故给一个与**轮数上限匹配**的
+/// 足够大上限 —— 否则轮数越多越容易在正常任务上撞顶（旧值 `2_000_000` ≈ 10 条满额块，而轮数
+/// 已从 8 提到 `MAX_SUBAGENT_ROUNDS = 20`，20 轮下更易撞顶）。
+///
+/// **取值依据（2026-10-16）**：`MAX_SUBAGENT_ROUNDS` 轮 × 每轮最多 2 条转发消息（assistant
+/// 内容块 + `tool_result`）× 单条上限 `SUBAGENT_EVENT_ITEM_CHARS` = `20 × 2 × 200_000`
+/// = **8_000_000**。绝大多数子代理远达不到，只有病态外溢才触发兜底。仍保留整段上限（而非
+/// 取消）：它是**极端兜底**，防「模型失控 + 逐块都不超单条上限」的组合把单行 IPC / 前端内存
+/// 一起顶爆。用尽后只发一条 `truncated:true` 标记，之后不再转发（明确标记，不静默丢）。
+const SUBAGENT_EVENT_TOTAL_CHARS: usize = 8_000_000;
 /// 子代理的系统提示词（**角色段**）。英文的原因同 `TRIMMED_MARKER`：这是给模型看的元信息，不进 i18n。
 ///
 /// 它在 `main()` 里被拼成完整提示词时**还会接上环境块与技能清单**（见那里的 `subagent_system`）
@@ -344,7 +370,7 @@ static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 一天至多几次足够；再密只是把同样的结论反复写。
 const REVIEW_MIN_GAP_SECS: i64 = 30 * 60;
 
-/// 复盘 fork 的轮次上限与 token 预算。比子代理（8 轮 / 30 万）更小：它只做
+/// 复盘 fork 的轮次上限与 token 预算。比子代理（20 轮 / 30 万）更小：它只做
 /// 「判断 + 写几条」，正常一两轮就结束；上限只是防它失控烧钱。
 const MAX_REVIEW_ROUNDS: usize = 4;
 const REVIEW_BUDGET_TOKENS: u64 = 120_000;
@@ -5815,7 +5841,34 @@ impl SubtaskForward {
     }
 }
 
-/// 跑一个子代理，返回它的最终文本（`Err` = 整条链路失败）。
+/// `run_subagent` 的产出：最终文本 + 是否「部分报告」。
+///
+/// `partial = true` 只在两种**撞墙**情形置位：撞轮数上限（`max_rounds`）或撞 token 预算
+/// （`budget_tokens`）—— 此时交回的是「做到一半的结论」，不是任务的自然收尾。调用方据此把
+/// `task_done` 事件标上 `partial: true` 并在日志里留痕（前端据此提示用户，另见前端任务）。
+struct SubagentOutcome {
+    text: String,
+    partial: bool,
+}
+
+/// 撞墙上限的**日志单一真相源**：带齐 `task_id` + 撞的是哪种上限（`rounds` / `tokens`）
+/// + 已花费的 token 与轮次。抽成纯函数是为了让「撞墙必留日志」这条可被单测钉住
+/// （轮数与 token 两条路径共用同一份措辞）。
+fn subagent_wall_note(task_id: &str, wall: &str, limit: u64, round: usize, spent: u64) -> String {
+    format!(
+        "子代理 {task_id} 撞 {wall} 上限（limit={limit}，第 {round} 轮，已花 {spent} token），交回部分报告"
+    )
+}
+
+/// 收口提示的注入时机：**恰在倒数第二轮**（`round == max_rounds - 1`）注入一次。
+///
+/// 抽成纯函数便于单测钉住「只在这一轮、只注入一次」；`max_rounds < 2` 时不注入
+/// （只有一轮的 fork 没有「最后一轮」可言，注了反而误导）。
+fn subagent_wrap_hint_due(round: usize, max_rounds: usize) -> bool {
+    max_rounds >= 2 && round + 1 == max_rounds
+}
+
+/// 跑一个子代理，返回它的产出（`Err` = 整条链路失败）。
 ///
 /// **走非流式**（`stream: false`）：主对话只要结果，中间过程不进 UI，一次取回整包
 /// 还能省掉一整套 SSE 解析分支。代价是子代理内部没有逐字流式 —— 这是刻意的。
@@ -5833,7 +5886,7 @@ fn run_subagent(
     spec: &ForkSpec,
     mut bridge: Option<&mut mcp::McpSet>,
     prompt: &str,
-) -> Result<String, String> {
+) -> Result<SubagentOutcome, String> {
     let task_id = spec.task_id;
     let max_rounds = spec.max_rounds;
     let budget_tokens = spec.budget_tokens;
@@ -5866,6 +5919,12 @@ fn run_subagent(
     let mut fwd = subtask_forwarder(spec.emit_subtask);
 
     for round in 1..=max_rounds {
+        // 倒数第二轮：往**最后一条 `tool_result` 内部**拼一句收口提示（落点纪律同
+        // `TURN_BUDGET_HINT`）—— 让子代理用最后一轮写完整报告，而不是拖到打满才被硬截。
+        // 放在兄弟消息 drain **之前**：此刻末条仍是上一轮刚 push、还没发出去的 `tool_result`。
+        if subagent_wrap_hint_due(round, max_rounds) {
+            append_hint_to_last_tool_result(&mut history, SUBAGENT_WRAP_HINT);
+        }
         // 多代理通信（A13，2026-10-05）：先把兄弟投来的消息读进本子代理的 history
         // （每轮取一次，取走即清空）再发请求，这样本轮就能看到它。按 §11 规则 54 的口径，
         // 消息只进**本子代理**的 history，绝不回灌主对话 —— 通道只存在于兄弟之间。
@@ -6027,19 +6086,26 @@ fn run_subagent(
         }
 
         if calls.is_empty() {
-            return Ok(if last_text.trim().is_empty() {
+            let text = if last_text.trim().is_empty() {
                 format!("(subagent {task_id} finished without writing a report)")
             } else {
                 last_text
-            });
+            };
+            // 模型自己收尾 ⇒ 不是撞墙，partial 为假。
+            return Ok(SubagentOutcome { text, partial: false });
         }
 
         // 预算闸门：**先检查再执行下一批工具**，把「已经烧掉多少」如实算进去
         if spent > budget_tokens {
-            return Ok(format!(
-                "[subagent {task_id}: hit the {budget_tokens}-token budget at round \
-                 {round}; reporting what it has so far]\n\n{last_text}"
-            ));
+            // 撞墙要能被看见（2026-10-16）：日志留痕 + `task_done.partial`（见调用方）。
+            log::warn(subagent_wall_note(task_id, "tokens", budget_tokens, round, spent));
+            return Ok(SubagentOutcome {
+                text: format!(
+                    "[subagent {task_id}: hit the {budget_tokens}-token budget at round \
+                     {round}; reporting what it has so far]\n\n{last_text}"
+                ),
+                partial: true,
+            });
         }
 
         // 工具串行执行（子代理里不做只读并行：收益小于「多一层并发状态」的复杂度）
@@ -6114,10 +6180,29 @@ fn run_subagent(
         history.push(json!({ "role": "user", "content": results }));
     }
 
-    Ok(format!(
-        "[subagent {task_id}: hit its {max_rounds}-round ceiling; partial report \
-         follows]\n\n{last_text}"
-    ))
+    // 打满轮数上限：撞墙要能被看见（2026-10-16）—— 日志留痕 + `task_done.partial`（见调用方）。
+    log::warn(subagent_wall_note(task_id, "rounds", max_rounds as u64, max_rounds, spent));
+    Ok(SubagentOutcome {
+        text: format!(
+            "[subagent {task_id}: hit its {max_rounds}-round ceiling; partial report \
+             follows]\n\n{last_text}"
+        ),
+        partial: true,
+    })
+}
+
+/// 由 `run_subagent` 的产出构造 `task_done` 事件（`Agent` 工具与 fork 技能共用）。
+///
+/// `partial` 字段（2026-10-16 新增）：撞轮数上限 / token 预算时为 `true` —— 交回的是
+/// **部分报告**。前端据此提示用户（字段名与语义登记在协议契约表；前端兼容缺字段，
+/// 缺失时按「非部分报告」处理）。`ok` 仍按 `Result::is_ok`（撞墙是 `Ok` 分支 ⇒ `ok` 为真）。
+fn task_done_event(task_id: &str, out: &Result<SubagentOutcome, String>, ms: u64) -> Value {
+    json!({
+        "type": "system", "subtype": "task_done",
+        "task_id": task_id, "ok": out.is_ok(),
+        "partial": matches!(out, Ok(o) if o.partial),
+        "ms": ms,
+    })
 }
 
 /// `Agent` 工具的执行入口：校验参数 → 派子代理 → 把报告包成模型能读的 `tool_result`。
@@ -6181,14 +6266,10 @@ fn run_agent_tool(
         None,
         prompt,
     );
-    emit(json!({
-        "type": "system", "subtype": "task_done",
-        "task_id": task_id, "ok": out.is_ok(),
-        "ms": started.elapsed().as_millis() as u64,
-    }));
+    emit(task_done_event(&task_id, &out, started.elapsed().as_millis() as u64));
     let ms = started.elapsed().as_millis();
     match out {
-        Ok(text) => {
+        Ok(SubagentOutcome { text, .. }) => {
             log::info(format!("子代理 {task_id} 完成（{ms}ms，报告 {} 字）", text.chars().count()));
             let clipped = crate::log::truncate_chars(&text, SUBAGENT_REPORT_CHARS);
             (
@@ -6326,14 +6407,10 @@ fn run_forked_skill(
         None,
         &format!("Execute this skill end to end, then report the result.\n\n{task}"),
     );
-    emit(json!({
-        "type": "system", "subtype": "task_done",
-        "task_id": task_id, "ok": out.is_ok(),
-        "ms": started.elapsed().as_millis() as u64,
-    }));
+    emit(task_done_event(&task_id, &out, started.elapsed().as_millis() as u64));
     let ms = started.elapsed().as_millis();
     match out {
-        Ok(text) => {
+        Ok(SubagentOutcome { text, .. }) => {
             log::info(format!(
                 "fork 技能 {} 完成（{ms}ms，报告 {} 字）",
                 skill.key,
@@ -6578,6 +6655,9 @@ fn run_review_fork(job: ReviewJob) -> Result<String, String> {
         bridge.as_mut(),
         &job.prompt,
     )
+    // 复盘只把最终文本交给调用方（`join_review` 只记日志）：`partial` 对复盘无消费者，
+    // 撞墙的日志已在 `run_subagent` 内按 `review-*` 的 task_id 落过。
+    .map(|o| o.text)
 }
 
 /// 复盘 fork 的**启动期常量部分**：工具集 / 技能 / 系统提示词 / 审批开关 / 桥的 spec /
@@ -12020,6 +12100,20 @@ mod tests {
         assert_eq!(markers, 1, "整段预算用尽只发一条标记");
     }
 
+    /// 整段上限须与「子代理轮数上限」**匹配**（防止后人再把整段上限调回与轮数脱节的过小值）：
+    /// 至少要覆盖 `MAX_SUBAGENT_ROUNDS` 轮 × 每轮最多 2 条转发消息 × 单条上限
+    /// `SUBAGENT_EVENT_ITEM_CHARS`。轮数从 8 提到 20 后，旧的 2_000_000（≈10 条满额块）会在
+    /// 正常的多轮子代理上更早撞顶 ⇒ 本断言把「上限 ↔ 轮数」的匹配关系钉住。
+    #[test]
+    fn subtask_forward_total_budget_matches_max_rounds() {
+        assert!(
+            SUBAGENT_EVENT_TOTAL_CHARS >= MAX_SUBAGENT_ROUNDS * 2 * SUBAGENT_EVENT_ITEM_CHARS,
+            "整段上限须覆盖「轮数上限 × 每轮 2 条 × 单条上限」：{} < {}",
+            SUBAGENT_EVENT_TOTAL_CHARS,
+            MAX_SUBAGENT_ROUNDS * 2 * SUBAGENT_EVENT_ITEM_CHARS,
+        );
+    }
+
     /// 转发策略（单一真相源）：`Agent` 工具调用与 fork 技能都开（前端都有落点）、后台复盘保持静默
     ///（静默不变量：无人值守的后台过程零 `task_event`）。
     #[test]
@@ -12036,5 +12130,91 @@ mod tests {
             subtask_forwarder(REVIEW_EMIT_SUBTASK).is_none(),
             "后台复盘必须保持零 task_event"
         );
+    }
+
+    // ── 子代理撞墙：轮数上限 / 收口提示 / 部分报告可见性（2026-10-16）──────────
+
+    /// 行为证据 ①＋④：默认轮数 = 20；复盘 fork 仍 4 轮且保持静默。
+    #[test]
+    fn subagent_round_ceiling_is_20_and_review_stays_4_silent() {
+        assert_eq!(MAX_SUBAGENT_ROUNDS, 20, "子代理的轮数上限应为 20");
+        assert_eq!(MAX_REVIEW_ROUNDS, 4, "复盘 fork 的轮数上限必须保持 4");
+        assert!(!REVIEW_EMIT_SUBTASK, "复盘 fork 必须保持静默（零 task_event）");
+        assert!(AGENT_EMIT_SUBTASK && FORK_SKILL_EMIT_SUBTASK, "前台两条路径都转发");
+    }
+
+    /// 行为证据 ②：收口提示**恰在倒数第二轮**（`round == max_rounds - 1`）注入一次，
+    /// 且只拼进那一轮的 `tool_result` 文本内部，别的消息一个字不动。
+    #[test]
+    fn wrap_hint_fires_once_on_penultimate_round_only() {
+        let max = MAX_SUBAGENT_ROUNDS;
+        let due: Vec<usize> =
+            (1..=max).filter(|r| subagent_wrap_hint_due(*r, max)).collect();
+        assert_eq!(due, vec![max - 1], "只在倒数第二轮触发，且只触发一次");
+
+        // 模拟每轮入口：只有 round == max-1 那一轮末条 tool_result 被改。
+        let mut history = vec![
+            json!({"role":"user","content":[{"type":"text","text":"task"}]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"R1"}
+            ]}),
+        ];
+        for round in 1..=max {
+            if subagent_wrap_hint_due(round, max) {
+                assert!(append_hint_to_last_tool_result(&mut history, SUBAGENT_WRAP_HINT));
+            }
+        }
+        let blocks = history[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "不许新增内容块");
+        let text = blocks[0]["content"].as_str().unwrap();
+        assert!(text.starts_with("R1\n\n"), "是拼进既有 tool_result 文本内部");
+        assert_eq!(text.matches("FINAL round").count(), 1, "全程只注入一次");
+        assert_eq!(history[0]["content"][0]["text"], "task", "别的消息不许动");
+
+        // 只有一轮的 fork 没有「最后一轮」可言 ⇒ 不注入。
+        assert!(!subagent_wrap_hint_due(1, 1));
+        assert!(!subagent_wrap_hint_due(0, 1));
+    }
+
+    /// 行为证据 ③（值部分）：`task_done.partial` 只在撞墙（`Ok` 且 `partial=true`）时为真；
+    /// 自然收尾（`partial=false`）与整体失败（`Err`）都不是 `true`。
+    #[test]
+    fn task_done_event_marks_partial_only_on_wall() {
+        let full: Result<SubagentOutcome, String> =
+            Ok(SubagentOutcome { text: "done".into(), partial: false });
+        let ev = task_done_event("task-1", &full, 12);
+        assert_eq!(ev["type"], "system");
+        assert_eq!(ev["subtype"], "task_done");
+        assert_eq!(ev["task_id"], "task-1");
+        assert_eq!(ev["ok"], true);
+        assert_eq!(ev["partial"], false, "未撞墙时 partial 不为 true");
+        assert_eq!(ev["ms"], 12);
+
+        let wall: Result<SubagentOutcome, String> =
+            Ok(SubagentOutcome { text: "partial".into(), partial: true });
+        let ev = task_done_event("task-2", &wall, 34);
+        assert_eq!(ev["ok"], true, "撞墙仍是 Ok 分支 ⇒ ok 为真");
+        assert_eq!(ev["partial"], true, "撞墙时 partial 必须为 true");
+
+        let err: Result<SubagentOutcome, String> = Err("boom".into());
+        let ev = task_done_event("task-3", &err, 5);
+        assert_eq!(ev["ok"], false);
+        assert_eq!(ev["partial"], false, "失败不是「部分报告」");
+    }
+
+    /// 行为证据 ③（日志部分）：撞墙日志的单一真相源带齐 `task_id`、上限种类与用量
+    /// （轮数 / token 两条路径共用），使「撞墙必留日志」可被单测钉住。
+    #[test]
+    fn subagent_wall_note_names_task_limit_and_usage() {
+        let rounds =
+            subagent_wall_note("task-7", "rounds", MAX_SUBAGENT_ROUNDS as u64, MAX_SUBAGENT_ROUNDS, 123_456);
+        assert!(rounds.contains("task-7"), "{rounds}");
+        assert!(rounds.contains("rounds"), "要写清撞的是轮数上限: {rounds}");
+        assert!(rounds.contains("123456"), "要带已花 token: {rounds}");
+
+        let tokens = subagent_wall_note("task-7", "tokens", SUBAGENT_BUDGET_TOKENS, 14, 300_001);
+        assert!(tokens.contains("tokens"), "要写清撞的是 token 预算: {tokens}");
+        assert!(tokens.contains("300001"), "要带已花 token: {tokens}");
+        assert!(tokens.contains("14"), "要带触发轮次: {tokens}");
     }
 }

@@ -161,6 +161,21 @@ const WATCH_SEC_MAX = 600;
 const WATCH_DIFF_MIN = 1;
 const WATCH_DIFF_MAX = 120;
 
+/** ① 屏幕反应**专属**的最小间隔（秒，2026-10-16）。此前「屏幕变化触发」触发后的冷却直接复用
+ *  主动对话的 `intervalMin`（原 `fireScreenChange` 的 `Math.max(pr.intervalMin, 1) * 60_000`）
+ *  ⇒ 两条链路的节奏被**耦合**：用户把 `intervalMin` 调小以换取更勤的主动说话时，屏幕反应会被
+ *  一并拖密，高频截屏轮把真实对话挤出单会话的 12 轮上下文（「上下不连贯」）。
+ *  取值依据：固定 **600s（10 分钟）**，与 `intervalMin` **解耦**；远高于默认轮询间隔
+ *  （`screenWatchSec` 默认 20s）⇒ 无论用户怎么调主动对话间隔，屏幕反应都被钉在 ≤1 次/10 分钟，
+ *  不再能把高频截屏轮灌进上下文。⚠️ 代价如实记：默认 `intervalMin=30` 时这比旧的「复用 30 分钟」
+ *  略更灵敏，但已被合并窗口 + 每日上限（`dailyCap`）兜住 —— 这是「解耦」刻意换来的。 */
+const SCREEN_MIN_GAP_SEC = 600;
+/** ① 屏幕变化的**短合并窗口**（毫秒，2026-10-16）。检测到变化后**先挂起**这么久再发一条；
+ *  窗口内画面继续变也只发**到点时最新的一屏**（不逐次叠发、不把多次变化的语义糊在一起）。
+ *  取值依据：**60s** ≥ 默认轮询间隔（20s）⇒ 一串连续变化能折进同一条；同时短到不牺牲
+ *  「看到就反应」的体感。 */
+const SCREEN_MERGE_MS = 60_000;
+
 /** 桌宠窗的三段布局（逻辑像素）与整体尺寸的**唯一真相源在 `./pet-window-size`**：
  *  缺省下 输出带（下限）75 + 模型区（参考）400 + 输入带 35 = **510**，三条**紧贴、无空隙**。
  *  ⚠️ 2026-10-13 第二轮起：模型区**不再定尺 400**，而是用 flex **跟随窗口剩余空间**
@@ -1519,6 +1534,47 @@ async function refreshHotkeys(): Promise<void> {
   );
 }
 
+/** 设置窗**上次选中的分页**的 localStorage 键（`data-pet-page` 的值）。
+ *  **为什么要持久化**：分页切换原先只改 DOM、记不住 —— 重开设置窗总回到第一个 tab，
+ *  用户反复调同一页（语音 / 主动反应 / 人格）时每次都要重选一遍。
+ *  与宿主全局设置同用 `lunac-*` 命名（见 `main.ts` 的 `lunac-recency` 等）。 */
+const PET_TAB_KEY = "lunac-pet-settings-tab";
+
+/** 读上次选中的分页名（无记录 / 读不到 ⇒ 空串）。 */
+function loadPetTab(): string {
+  try {
+    return localStorage.getItem(PET_TAB_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** 记下选中的分页名（无痕模式 / 配额满 ⇒ 静默忽略，不影响本次使用）。 */
+function savePetTab(tab: string): void {
+  try {
+    localStorage.setItem(PET_TAB_KEY, tab);
+  } catch {
+    /* 记不住分页不影响本次使用 */
+  }
+}
+
+/** 把设置窗切到 `tab` 那一页（`.pet-tab` 加 `on` / 只显示对应的 `.pet-tabpage`）。
+ *  ⚠️ **必须校验 `tab`**：老版本 / 手改 localStorage 存了非法页名时**回落第一个分页**
+ *  （保持「首次打开 = 第一页」的既有行为，绝不白屏）。合法页名以**当前渲染出来的**
+ *  `.pet-tabpage` 为准（不在别处再抄一份页名清单）。返回实际生效的页名。 */
+function applyPetTab(root: HTMLElement, tab: string): string {
+  const pages = Array.from(root.querySelectorAll<HTMLElement>(".pet-tabpage"));
+  const fallback = pages[0]?.dataset.petPage ?? "";
+  const target = pages.some(p => p.dataset.petPage === tab) ? tab : fallback;
+  root.querySelectorAll<HTMLElement>(".pet-tab").forEach(b => {
+    b.classList.toggle("on", b.dataset.petTab === target);
+  });
+  pages.forEach(p => {
+    p.hidden = p.dataset.petPage !== target;
+  });
+  return target;
+}
+
 /** **桌宠设置界面**的内容 —— 它现在**只在独立的设置窗里**渲染
  *  （主窗搜索「桌宠」由 `main.ts` 的 `executePlugin` 特判、直接开那扇窗）。 */
 function settingsHtml(cfg: PetConfig): string {
@@ -2402,16 +2458,12 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     const onClick = (ev: Event) => {
       const t = ev.target as HTMLElement | null;
       if (!t) return;
-      // 分页切换（模型调试 / 热键）：两页互斥，照 `.music-tab` 的语言（胶囊芯片 + on 选中态）。
+      // 分页切换（模型调试 / 热键 / …）：互斥，照 `.music-tab` 的语言（胶囊芯片 + on 选中态）。
+      // 选中页**落 localStorage**（键 `lunac-pet-settings-tab`）—— 重开设置窗回到这一页。
       const tab = t.closest<HTMLElement>("[data-pet-tab]");
       if (tab) {
-        const page = tab.dataset.petTab;
-        root.querySelectorAll<HTMLElement>(".pet-tab").forEach(b => {
-          b.classList.toggle("on", b.dataset.petTab === page);
-        });
-        root.querySelectorAll<HTMLElement>(".pet-tabpage").forEach(p => {
-          p.hidden = p.dataset.petPage !== page;
-        });
+        const page = applyPetTab(root, tab.dataset.petTab ?? "");
+        if (page) savePetTab(page);
         return;
       }
       if (t.closest("#pet-toggle")) {
@@ -3355,6 +3407,8 @@ async function attachSettings(root: HTMLElement): Promise<void> {
   }
 
   injectPetStyle();
+  // 恢复**上次选中的分页**（键 `lunac-pet-settings-tab`）；存的页名非法 / 没存过 ⇒ 回落第一页。
+  applyPetTab(root, loadPetTab());
   renderFile();
   renderThrough(loadConfig().clickThrough);
   void loadPetPersona();
@@ -4360,14 +4414,61 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     return true;
   }
 
-  // ── 主动反应：定时触发（2026-10-09）────────────────────────────
+  // ── 统一调度核心（B1，2026-10-16）：三个「主动发起」触发源共用一套闸与出口 ─────────
   // **成本红线**（用户口径）：默认关、有最小间隔 + 每日上限；**隐藏 / 最小化必须暂停**。
-  // 三道闸都在 `scheduleProactive` 里判：启用 + 可见 + 未触顶。计时状态在暂停时保留剩余量。
-  let proactiveRemainMs = 0; // 剩余毫秒（暂停时保留，恢复可见后从余量继续）
-  let proactiveDeadline = 0; // 运行态：本次到点时刻（`performance.now` 基准）
-  let proactiveTimer: ReturnType<typeof setTimeout> | null = null;
-  let proactiveWatchdog: ReturnType<typeof setTimeout> | null = null; // 一轮的兜底超时
-  let proactiveBusy = false; // 上一轮未收尾（还在「思考中」）⇒ 不叠发
+  // 原先 proactive / autoshot / watch 各排各的 timer、各判一遍闸；现收成一个核心：
+  //   · 唯一的计时表 `sched`（每源一格：timer / 余量 / 到点时刻）；
+  //   · 唯一的到点分派 `onDue`；
+  //   · 唯一的发送出口 `dispatch`（三道共享闸 + 单轮互斥 + 每日计数 + 看门狗都在这里）；
+  //   · 每个触发源 = 一个 **intent**（见 `INTENTS`）。
+  // ⚠️ **只落桌宠侧**（裁决依据，防后人误接）：这里管的是「桌宠要不要**自发**说一句 / 看一眼」，
+  //    **不是**「某条消息过不过 API」。后者（把本地判定接成「输入门」）**已被用户否决**并回滚 ——
+  //    见 `docs/archive/agent-feature-backlog.md` §4.1.7：「『这条消息过不过 API』是**桌宠侧**的
+  //    形态 —— 曾按此实现，用户否决并已回滚」。故本核心**不得**演进成对 agent 对话流的门控：
+  //    它只决定桌宠**自发**要不要产生一轮，**不**拦截 / 不放行 / 不审查任何**已有**消息。
+  // ⚠️ **行为等价优先**：除 ① 的屏幕反应降频 / 合并窗口外，默认行为与重构前一致（各源的
+  //    reschedule 策略见 `onDue`：主动对话「收尾再排 / 失败立排」、自动抓屏「到点即排」、
+  //    屏幕变化「轮询 + 触发后冷却」）。三源的 timer **不合并成一条**：它们节奏不同（主动对话要
+  //    跨隐藏续接余量、自动抓屏是固定周期、屏幕变化是轮询 + 冷却），硬并会改行为。
+
+  /** 三个「主动发起」触发源。 */
+  type PetTriggerKind = "proactive" | "autoshot" | "watch";
+
+  /** 一次「桌宠**自发**发起」的**意图**：核心据此决定「说什么」与「带不带图」。
+   *  ⚠️ **payload 形状差异**就靠 `needsShot` 表达（**不能**强行统一成同一种消息）：
+   *    · `needsShot=false`（主动对话）⇒ `sendToAI(prompt)` ⇒ `emit(pet-chat-send, { query })`；
+   *    · `needsShot=true`（抓屏）⇒ `sendScreenToAI(prompt)` ⇒ `emit(..., { query, files:[png] })`。
+   *  `promptKey` 存 i18n 键而非成品串（i18n 运行时才初始化，到点那一刻才 `t()` 解析）。
+   *  任务书里的 `{ kind, prompt, files? }` 把 `files` 换成 `needsShot` 是有意的：截图路径只能在
+   *  **到点 + vision 检查之后**异步取得，无法在注册时给出；两种形状并未合并，只是从「预先给文件」
+   *  变成「到点抓文件」。 */
+  interface PetIntent {
+    kind: PetTriggerKind;
+    promptKey: string;
+    needsShot: boolean;
+  }
+  const INTENTS: Record<PetTriggerKind, PetIntent> = {
+    proactive: { kind: "proactive", promptKey: "pet.proactive_prompt", needsShot: false },
+    autoshot: { kind: "autoshot", promptKey: "pet.autoshot_prompt", needsShot: true },
+    watch: { kind: "watch", promptKey: "pet.watch_prompt", needsShot: true },
+  };
+  const KINDS: PetTriggerKind[] = ["proactive", "autoshot", "watch"];
+
+  /** 每个触发源的计时状态（原先三组并列局部变量收进一张表）。`remainMs` 只对 proactive 有意义
+   *  （隐藏 → 显示要**续接余量**）；另两个恢复时从完整间隔重排。 */
+  const sched: Record<PetTriggerKind, { timer: ReturnType<typeof setTimeout> | null; remainMs: number; deadline: number }> = {
+    proactive: { timer: null, remainMs: 0, deadline: 0 },
+    autoshot: { timer: null, remainMs: 0, deadline: 0 },
+    watch: { timer: null, remainMs: 0, deadline: 0 },
+  };
+  let proactiveWatchdog: ReturnType<typeof setTimeout> | null = null; // 一轮的兜底超时（三源共用）
+  let proactiveBusy = false; // 上一轮未收尾（还在「思考中」）⇒ 不叠发（三源**共用**的单轮互斥）
+  /** 「屏幕变化」用的**上一张指纹**（不落盘，关窗即弃）；发过一轮后置 null 重新建基准。 */
+  let lastSig: number[] | null = null;
+  /** ① 屏幕变化的**短合并窗口**计时器：窗口内连续变化合成一条再发（见 `watchDue` / `fireWatchSend`）。 */
+  let screenMergeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 「图片输入没开 ⇒ 抓了也白抓」这条只记**一条**日志（整窗生命周期一次），免得每轮刷屏。 */
+  let visionWarned = false;
   let outputBoxTimer: ReturnType<typeof setTimeout> | null = null; // 自动弹输出的自动收起
   let outputBoxAuto = false; // 输出区是不是「本轮自动展开」的（用户自己开着的不自动收）
   /** **语音是否还在播**（2026-10-13）：为真时**不起算**自动收起 —— 等宿主 `TTS_DONE_EVENT`
@@ -4378,73 +4479,102 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   let ttsWatchdog: ReturnType<typeof setTimeout> | null = null;
   const TTS_WAIT_MAX_MS = 180_000;
 
-  function clearProactiveTimer() {
-    if (proactiveTimer) {
-      clearTimeout(proactiveTimer);
-      proactiveTimer = null;
+  /** 触发源当前是否启用。**刻意各自判**，不共用一个总开关 —— 两个抓屏子开关是独立的显式
+   *  opt-in（2026-10-10 用户报障口径：挂在总开关下面会造成「开了子开关却什么都不发生」）。 */
+  function intentEnabled(kind: PetTriggerKind, pr: ProactiveCfg): boolean {
+    if (kind === "proactive") return pr.enabled;
+    if (kind === "autoshot") return pr.autoShot;
+    return pr.screenWatch;
+  }
+
+  /** 触发源的常规间隔（ms）：主动对话 = intervalMin、自动抓屏 = autoShotMin、屏幕变化 = screenWatchSec。 */
+  function intentIntervalMs(kind: PetTriggerKind, pr: ProactiveCfg): number {
+    if (kind === "proactive") return pr.intervalMin * 60_000;
+    if (kind === "autoshot") return pr.autoShotMin * 60_000;
+    return pr.screenWatchSec * 1000;
+  }
+
+  function clearSched(kind: PetTriggerKind) {
+    const st = sched[kind];
+    if (st.timer) {
+      clearTimeout(st.timer);
+      st.timer = null;
     }
   }
 
-  /** 安排下一次主动反应。`reset=true` = 从**完整间隔**重新起算（开关 / 参数改动后）；
-   *  否则沿用暂停留下的余量（隐藏 → 显示「继续」）。三道闸任一不过就不排。 */
-  function scheduleProactive(reset = false) {
-    clearProactiveTimer();
+  /** 撤掉「屏幕变化」的合并窗口计时器（隐藏 / 关掉该子开关 / 改轮询频率时用）。 */
+  function clearMergeTimer() {
+    if (screenMergeTimer) {
+      clearTimeout(screenMergeTimer);
+      screenMergeTimer = null;
+    }
+  }
+
+  /** 排到点。`recheck=true` 时到点**只重排、不发送**（跨日自愈用，见 `scheduleMidnightRecheck`）。 */
+  function armSched(kind: PetTriggerKind, ms: number, recheck = false) {
+    clearSched(kind);
+    const st = sched[kind];
+    st.remainMs = kind === "proactive" ? ms : 0; // 只有主动对话需要在隐藏时保留余量
+    st.deadline = performance.now() + ms;
+    st.timer = setTimeout(() => {
+      st.timer = null;
+      st.remainMs = 0;
+      if (recheck) schedule(kind, { reset: true });
+      else void onDue(kind);
+    }, ms);
+  }
+
+  /** **统一调度入口**：为某个触发源排下一次到点。
+   *  `opts.reset` = 从完整间隔重起算（开关 / 参数改动后）；`opts.ms` = 强制间隔（屏幕变化的冷却窗）。
+   *  三道共享闸任一不过就不排（触顶时改排**跨日自愈**）。 */
+  function schedule(kind: PetTriggerKind, opts: { reset?: boolean; ms?: number } = {}) {
+    clearSched(kind);
     const pr = loadConfig().proactive;
-    if (!pr.enabled) return; // 关：不跑
-    if (!visible) return; // 不可见：不跑（恢复可见时再排，见 offVis）
+    if (!intentEnabled(kind, pr) || !visible) return;
     if (proactiveUsedToday() >= pr.dailyCap) {
       scheduleMidnightRecheck(); // 触顶：停到下一个自然日零点再自动重排（跨日自动恢复）
       return;
     }
-    if (reset) proactiveRemainMs = 0;
-    if (proactiveRemainMs <= 0) proactiveRemainMs = pr.intervalMin * 60_000;
-    proactiveDeadline = performance.now() + proactiveRemainMs;
-    proactiveTimer = setTimeout(fireProactive, proactiveRemainMs);
+    let ms = opts.ms && opts.ms > 0 ? opts.ms : intentIntervalMs(kind, pr);
+    if (kind === "proactive" && !(opts.ms && opts.ms > 0)) {
+      const st = sched[kind];
+      if (opts.reset) st.remainMs = 0;
+      if (st.remainMs > 0) ms = st.remainMs; // 隐藏 → 显示：续接余量
+    }
+    armSched(kind, ms);
   }
 
-  /** 触顶后停到**下一个自然日零点**再重排一次（跨日计数归零后自动恢复）。也占 `proactiveTimer`，
-   *  所以隐藏 / 最小化时同样被 `pauseProactive` 暂停（用户口径：不可见时绝不烧 token）。 */
+  /** 触顶后停到**下一个自然日零点**再重排（跨日计数归零后自动恢复）。三源各占自己的 timer；
+   *  主动对话那份同样会被 `pauseSched` 在隐藏时暂停（用户口径：不可见时绝不烧 token）。 */
   function scheduleMidnightRecheck() {
     const ms = msUntilNextMidnight();
-    proactiveRemainMs = ms;
-    proactiveDeadline = performance.now() + ms;
-    proactiveTimer = setTimeout(() => {
-      proactiveTimer = null;
-      proactiveRemainMs = 0;
-      scheduleProactive(true);
-      scheduleAutoShot(); // 跨日计数归零 ⇒ 两个子开关也恢复节奏
-      scheduleScreenWatch();
-    }, ms);
+    const pr = loadConfig().proactive;
+    for (const kind of KINDS) {
+      if (!intentEnabled(kind, pr) || !visible) continue;
+      armSched(kind, ms, true);
+    }
   }
 
   /** 暂停（隐藏 / 最小化）：撤掉计时器，把**剩余毫秒**留给下一次恢复。 */
-  function pauseProactive() {
-    if (!proactiveTimer) return;
-    clearTimeout(proactiveTimer);
-    proactiveTimer = null;
-    proactiveRemainMs = Math.max(0, proactiveDeadline - performance.now());
+  function pauseSched(kind: PetTriggerKind) {
+    const st = sched[kind];
+    if (!st.timer) return;
+    clearTimeout(st.timer);
+    st.timer = null;
+    st.remainMs = Math.max(0, st.deadline - performance.now());
   }
 
-  /** 到点开跑一轮：只发一次（走统一出口 `sendToAI`）。这一轮的收尾由 `pet-chat-reply`
-   *  触发（见 `onProactiveReply`），看门狗兜底。 */
-  function fireProactive() {
-    proactiveTimer = null;
-    const pr = loadConfig().proactive;
-    if (!pr.enabled || !visible) return;
-    if (proactiveUsedToday() >= pr.dailyCap) {
-      scheduleProactive(); // 期间上限被调小 ⇒ 转去等下一个自然日再排
-      return;
-    }
-    if (proactiveBusy) {
-      scheduleProactive(); // 上一轮没结束 ⇒ 跳过本轮，重排
-      return;
-    }
-    proactiveRemainMs = 0;
+  /** **统一发送核心**（三道闸已由调用方判过）：单轮互斥 → 按 intent 形状取 payload → 计数 → 看门狗。 */
+  async function dispatch(intent: PetIntent): Promise<boolean> {
+    if (proactiveBusy) return false;
     proactiveBusy = true;
-    if (!sendToAI(t("pet.proactive_prompt"))) {
+    const prompt = t(intent.promptKey);
+    // payload 形状差异在这里落地：图片轮走 `sendScreenToAI`（{query, files:[png]}），纯文本轮走
+    // `sendToAI`（{query}）—— 两者最终都从唯一出口 `sendToAI` 出去，但**不是同一种消息**。
+    const ok = intent.needsShot ? await sendScreenToAI(prompt) : sendToAI(prompt);
+    if (!ok) {
       proactiveBusy = false;
-      scheduleProactive();
-      return;
+      return false;
     }
     bumpProactiveUsed();
     void emit(CTL_EVENT, { type: "proactive-used" }); // 让设置窗的「今日已用」当场刷新
@@ -4452,12 +4582,39 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
       proactiveWatchdog = null;
       if (!proactiveBusy) return;
       proactiveBusy = false;
-      scheduleProactive();
+      // 主动对话靠回复收尾；超时没等到收尾 ⇒ 补排下一轮（另两源到点即已自排，无需补）。
+      if (intent.kind === "proactive") schedule("proactive");
     }, PROACTIVE_ROUND_TIMEOUT_MS);
+    return true;
   }
 
-  /** 主动反应那一轮收尾：让用户看到回复（自动弹输出一瞬）+ 排下一轮。用户手打 / 抓屏
-   *  发起的轮次 `proactiveBusy` 为 false ⇒ 这里是空操作，不会误动它们的节奏。 */
+  /** **统一到点分派**：三源的计时器都指向它。 */
+  async function onDue(kind: PetTriggerKind) {
+    const pr = loadConfig().proactive;
+    if (!visible || !intentEnabled(kind, pr)) return; // 不可见 / 已关 ⇒ 静默（恢复 / 重开时再排）
+    if (kind === "watch") {
+      await watchDue(pr);
+      return;
+    }
+    if (proactiveUsedToday() >= pr.dailyCap) {
+      scheduleMidnightRecheck(); // 期间上限被调小 ⇒ 转去等下一个自然日再排
+      return;
+    }
+    if (proactiveBusy) {
+      schedule(kind); // 上一轮没结束 ⇒ 跳过本轮，重排
+      return;
+    }
+    const ok = await dispatch(INTENTS[kind]);
+    if (kind === "proactive") {
+      // 主动对话：成功 ⇒ 等回复 / 看门狗收尾时再排（见 `onProactiveReply`）；失败 ⇒ 立刻重排。
+      if (!ok) schedule("proactive");
+    } else {
+      schedule("autoshot"); // 自动抓屏：固定周期，到点即排下一轮（不看回复）
+    }
+  }
+
+  /** 那一轮收尾（回复到达）：结束「思考中」+ 排下一轮主动对话。重构前它对**任何** busy 轮都生效
+   *  （含抓屏轮）—— 保持等价，故这里不加 kind 判断。 */
   function onProactiveReply() {
     if (!proactiveBusy) return;
     proactiveBusy = false;
@@ -4465,20 +4622,15 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
       clearTimeout(proactiveWatchdog);
       proactiveWatchdog = null;
     }
-    scheduleProactive(); // 让用户看到回复的那一步由下面 `pet-chat-reply` 的 showOutputBox 统一处理
+    schedule("proactive"); // 让用户看到回复的那一步由 `pet-chat-reply` 的 showOutputBox 统一处理
   }
 
-  // ── 主动反应的两个**显式 opt-in 子开关**（2026-10-10）──────────────────
+  // ── 两个**显式 opt-in 子开关**（2026-10-10）：自动抓屏 / 屏幕变化触发 ─────────────
   // **隐私红线**（预检 #72 ①）：抓屏**只在用户显式开启**时才发生，且桌宠不可见一律停（`visible` 闸）。
   //  · 「自动抓屏」：每 `autoShotMin` 分钟抓整屏 → 交给 AI 看（走 `screenshot_monitor`）。
   //  · 「屏幕变化触发」：每 `screenWatchSec` 秒抓一张 16×9 指纹（**不落盘**）比上一次，
-  //    平均绝对差 ≥ `screenDiff` 就当画面变了 → 主动说一句（走 `screenshot_signature`）。
+  //    平均绝对差 ≥ `screenDiff` 就当画面变了 → 进**短合并窗口** → 主动说一句（走 `screenshot_signature`）。
   // 两者都计入**同一个**每日上限（与主链路共享预算），抓屏那一刻都有可见的 toast 提示。
-  let autoShotTimer: ReturnType<typeof setTimeout> | null = null;
-  let screenWatchTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastSig: number[] | null = null; // 上一张指纹（变化检测用；不持久化，关窗即弃）
-  /** 「图片输入没开 ⇒ 抓了也白抓」这条只记**一条**日志（整窗生命周期一次），免得每轮刷屏。 */
-  let visionWarned = false;
 
   /** 抓当前显示器整屏 → 作为图片附件送进**现有** AI 链路（同 `lookScreen`，但这里是自动触发）。
    *  vision 关着 ⇒ 图片块会被静默丢弃 —— 直接不发（别白烧 token）。返回是否真的发出。 */
@@ -4515,80 +4667,13 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     return sendToAI(prompt, [path]);
   }
 
-  const clearAutoShotTimer = () => {
-    if (autoShotTimer) {
-      clearTimeout(autoShotTimer);
-      autoShotTimer = null;
-    }
-  };
-  const clearScreenWatchTimer = () => {
-    if (screenWatchTimer) {
-      clearTimeout(screenWatchTimer);
-      screenWatchTimer = null;
-    }
-  };
-
-  /** 安排下一次「自动抓屏」。两道闸：子开关开 + 可见（+ 未触顶）。
-   *  ⚠️ **刻意不看「主动反应」总开关**（2026-10-10 用户报障后定）：两个抓屏子开关各自就是
-   *  一次**显式 opt-in**（默认关、有间隔与每日上限、有可见 toast），挂在总开关下面只会造成
-   *  「开了子开关却什么都不发生、也没有任何提示」——正是用户报的「并没有发送给 AI」。 */
-  function scheduleAutoShot() {
-    clearAutoShotTimer();
-    const pr = loadConfig().proactive;
-    if (!pr.autoShot || !visible) return;
+  /** 屏幕变化到点：抓一张极小的指纹与上一张比。变了（且上一轮已收尾）⇒ 进**短合并窗口**。 */
+  async function watchDue(pr: ProactiveCfg) {
     if (proactiveUsedToday() >= pr.dailyCap) {
-      // 触顶：跨日自愈（用**自己的**定时器重排，不去抢主链路那个 `proactiveTimer`）
-      autoShotTimer = setTimeout(scheduleAutoShot, msUntilNextMidnight());
+      // 触顶：停到跨日自愈（重构前 `fireWatchTick` 触顶只 `return` ⇒ 不再自愈，这里补齐）。
+      scheduleMidnightRecheck();
       return;
     }
-    autoShotTimer = setTimeout(fireAutoShot, pr.autoShotMin * 60_000);
-  }
-
-  /** 到点抓一屏交给 AI。`proactiveBusy` 与主链路共用 —— 上一轮没收尾就跳过本轮、重排。 */
-  async function fireAutoShot() {
-    autoShotTimer = null;
-    const pr = loadConfig().proactive;
-    if (!pr.autoShot || !visible) return;
-    if (proactiveUsedToday() >= pr.dailyCap || proactiveBusy) {
-      scheduleAutoShot();
-      return;
-    }
-    proactiveBusy = true;
-    const ok = await sendScreenToAI(t("pet.autoshot_prompt"));
-    if (!ok) {
-      proactiveBusy = false;
-      scheduleAutoShot();
-      return;
-    }
-    bumpProactiveUsed();
-    void emit(CTL_EVENT, { type: "proactive-used" }); // 设置窗的「今日已用」当场刷新
-    proactiveWatchdog = setTimeout(() => {
-      proactiveWatchdog = null;
-      if (!proactiveBusy) return;
-      proactiveBusy = false;
-    }, PROACTIVE_ROUND_TIMEOUT_MS);
-    scheduleAutoShot();
-  }
-
-  /** 安排下一次「屏幕变化」轮询。`cooldownMs>0` 时用它当间隔（触发后的冷却），否则用配置的秒数。
-   *  与 `scheduleAutoShot` 同一口径：**不看「主动反应」总开关**（见那里的注释）。 */
-  function scheduleScreenWatch(cooldownMs = 0) {
-    clearScreenWatchTimer();
-    const pr = loadConfig().proactive;
-    if (!pr.screenWatch || !visible) return;
-    if (proactiveUsedToday() >= pr.dailyCap) {
-      screenWatchTimer = setTimeout(scheduleScreenWatch, msUntilNextMidnight());
-      return;
-    }
-    screenWatchTimer = setTimeout(fireWatchTick, cooldownMs > 0 ? cooldownMs : pr.screenWatchSec * 1000);
-  }
-
-  /** 抓一张极小的指纹与上一张比：变了（且上一轮已收尾）就触发；没变就把这一张当成新基准。 */
-  async function fireWatchTick() {
-    screenWatchTimer = null;
-    const pr = loadConfig().proactive;
-    if (!pr.screenWatch || !visible) return;
-    if (proactiveUsedToday() >= pr.dailyCap) return;
     let sig: number[] | null = null;
     try {
       const r = await invoke<number[]>("screenshot_signature", { label: PET_LABEL });
@@ -4600,30 +4685,38 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
       const changed = !!lastSig && lastSig.length === sig.length && meanAbsDiff(lastSig, sig) >= pr.screenDiff;
       lastSig = sig;
       if (changed && !proactiveBusy) {
-        void fireScreenChange(pr);
-        return; // 触发那一支在收尾时自行重排
+        // ① **短合并窗口**：检测到变化后**先挂起** `SCREEN_MERGE_MS`，不立刻发 —— 窗口内画面继续变
+        //    也只会被同一轮覆盖（发的是**到点时最新的一屏**，不逐次叠发、不把多次变化的语义糊在一起）。
+        //    挂起期间不再排轮询（收尾由 `fireWatchSend` 重排），故至多一个合并窗口在飞。
+        if (!screenMergeTimer) {
+          screenMergeTimer = setTimeout(() => {
+            screenMergeTimer = null;
+            void fireWatchSend();
+          }, SCREEN_MERGE_MS);
+        }
+        return; // 收尾（发送 + 重排）由 `fireWatchSend` 负责
       }
     }
-    scheduleScreenWatch();
+    schedule("watch");
   }
 
-  /** 画面变化的触发：抓整屏 + 一句 prompt 交给 AI。冷却 = 主链路的**最小间隔**（避免连续变化连发）。 */
-  async function fireScreenChange(pr: ProactiveCfg) {
-    proactiveBusy = true;
-    const ok = await sendScreenToAI(t("pet.watch_prompt"));
-    if (!ok) {
-      proactiveBusy = false;
-    } else {
-      bumpProactiveUsed();
-      void emit(CTL_EVENT, { type: "proactive-used" });
-      proactiveWatchdog = setTimeout(() => {
-        proactiveWatchdog = null;
-        if (!proactiveBusy) return;
-        proactiveBusy = false;
-      }, PROACTIVE_ROUND_TIMEOUT_MS);
+  /** 合并窗口到点：抓整屏 + 一句 prompt 交给 AI。冷却 = 屏幕反应**专属**最小间隔
+   *  `SCREEN_MIN_GAP_SEC`（重构前复用 `intervalMin`，把「主动对话」与「屏幕反应」的节奏耦合在一起：
+   *  用户把 `intervalMin` 调小换取更勤的主动说话时，屏幕反应会被一并拖密）。 */
+  async function fireWatchSend() {
+    const pr = loadConfig().proactive;
+    if (!visible || !pr.screenWatch) return; // 期间被关 / 不可见 ⇒ 静默
+    if (proactiveUsedToday() >= pr.dailyCap) {
+      scheduleMidnightRecheck();
+      return;
     }
-    lastSig = null; // 触发过：下一次重新建立基准，免得同一次变化反复触发
-    scheduleScreenWatch(Math.max(pr.intervalMin, 1) * 60_000);
+    if (proactiveBusy) {
+      schedule("watch");
+      return;
+    }
+    await dispatch(INTENTS.watch);
+    lastSig = null; // 触发过：下一轮重新建基准，免得同一次变化反复触发（沿用重构前口径）
+    schedule("watch", { ms: SCREEN_MIN_GAP_SEC * 1000 }); // 屏幕反应**专属**冷却
   }
 
   /** 进入「不可见」态：停动画 / 关菜单 / 暂停主动反应与两个抓屏子开关。
@@ -4634,20 +4727,21 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     stopLoop();
     l2dHandle?.setRunning(false); // Live2D 自己那份 ticker 也要停，见 ai-spec §4.8
     closeMenu();
-    pauseProactive(); // 看不见时绝不烧 token
-    clearAutoShotTimer(); // 两个抓屏子开关也停（隐私红线）；指纹基准一并丢掉
-    clearScreenWatchTimer();
+    pauseSched("proactive"); // 看不见时绝不烧 token（主动对话**续接余量**）
+    clearSched("autoshot"); // 两个抓屏子开关直接撤（隐私红线；恢复时按完整间隔重排）
+    clearSched("watch");
+    clearMergeTimer(); // ① 合并窗口也一并撤
     lastSig = null;
   }
 
-  /** 恢复「可见」态：接着跑动画 + 重排主动反应三个调度器。 */
+  /** 恢复「可见」态：接着跑动画 + 重排三个触发源。 */
   function applyShown() {
     visible = true;
     if (l2dHandle) l2dHandle.setRunning(true);
     else startLoop();
-    scheduleProactive();
-    scheduleAutoShot();
-    scheduleScreenWatch();
+    schedule("proactive");
+    schedule("autoshot");
+    schedule("watch");
     applyOutHeight(true); // 唤出 ⇒ 按当前正文重新对齐输出带高（隐藏期间没下发过）
   }
 
@@ -5222,10 +5316,13 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
           screenDiff: clampNum(p.screenDiff, WATCH_DIFF_MIN, WATCH_DIFF_MAX, pd.screenDiff),
         },
       });
-      scheduleProactive(true);
-      if (p.screenWatch !== true || p.screenWatchSec !== c.proactive.screenWatchSec) lastSig = null;
-      scheduleAutoShot();
-      scheduleScreenWatch();
+      schedule("proactive", { reset: true });
+      if (p.screenWatch !== true || p.screenWatchSec !== c.proactive.screenWatchSec) {
+        lastSig = null;
+        clearMergeTimer(); // 关掉该子开关 / 改了轮询频率 ⇒ 正在挂起的合并窗口作废
+      }
+      schedule("autoshot");
+      schedule("watch");
       return;
     }
     // 模型调试：**仅 Live2D 模型模式**处理（图片模式下 `l2dHandle` 恒为 null ⇒ 自然忽略）。
@@ -5340,9 +5437,9 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   if (cfg.clickThrough) await applyClickThrough(true);
   // 开窗时把当前穿透状态广播一次：若设置窗正开着，让它那条按钮与这里对齐（两处状态一致）。
   void emit(CTL_EVENT, { type: "click-through-changed", value: cfg.clickThrough });
-  scheduleProactive(true); // 开窗按配置排一次（默认关 ⇒ 空操作；关着时不排）
-  scheduleAutoShot(); // 两个抓屏子开关：开窗也按配置排一次（默认关 ⇒ 空操作）
-  scheduleScreenWatch();
+  schedule("proactive", { reset: true }); // 开窗按配置排一次（默认关 ⇒ 空操作；关着时不排）
+  schedule("autoshot"); // 两个抓屏子开关：开窗也按配置排一次（默认关 ⇒ 空操作）
+  schedule("watch");
 
   // 穿透态下，宿主全局钩子命中 Alt+右键 后**定向**发到本窗（label `plugin-pet`）的事件。
   // 收到即唤出菜单；唤出时的「临时关穿透 → 关菜单恢复」在 `openMenuFromScreen`/`closeMenu` 里。
@@ -5358,10 +5455,9 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     stopLoop();
     dropModel();
     if (toastTimer) clearTimeout(toastTimer);
-    // 主动反应的三个计时器一并清（别泄漏）
-    clearProactiveTimer();
-    clearAutoShotTimer();
-    clearScreenWatchTimer();
+    // 三个触发源的计时器 + 屏幕变化的合并窗口一并清（别泄漏）
+    for (const kind of KINDS) clearSched(kind);
+    clearMergeTimer();
     if (proactiveWatchdog) clearTimeout(proactiveWatchdog);
     if (outputBoxTimer) clearTimeout(outputBoxTimer);
     if (ttsWatchdog) clearTimeout(ttsWatchdog); // 语音等待的兜底看门狗

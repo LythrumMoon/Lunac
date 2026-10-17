@@ -503,17 +503,33 @@
 
 ---
 
-## §界面 15 对话区栅格（右侧置顶 + 左侧留 ~1/6）
+## §界面 15 对话区栅格（仅用户气泡右移）
 
-> 2026-10-16（用户裁定）：对话气泡 / 正文原先**一行铺满**，改为**靠右 + 左侧留白约 1/6**。
+> 2026-10-16（用户裁定）：**只有「我们问出去的问题」那个对话框向右移、左侧留约 1/6 空档**；
+> **AI 的回答仍旧铺满屏幕**。
+>
+> **同日订正**：本节初版（同日）曾把**整列** `#chat-log` 左缩进（`#chat-log { margin-left: var(--chat-gutter) }`）
+> —— 那样连 **AI 的回答与所有过程块**一起被挤窄了，与用户口径相反。现改为**只右移用户气泡**
+> （`.chat-msg-user`）；`#chat-log` / `.chat-msg-assistant` / `.agent-flow` 一律**全宽**。
 
-- **作用范围 = AI 会话列 `#chat-log`**（聊天独立窗 `plugin-chat` 与主窗共用的会话容器）。桌宠输出框是
-  另一套 DOM（`.pet-chat-output`），**不在此列**；插件面板（`.plugin-result`）也不受影响。
-- **实现**：`:root` 的 `--chat-gutter: 16.6667%`（唯一布局 token）+ `#chat-log { margin-left: var(--chat-gutter); }`。
-  **不硬编码 px** —— 用百分比，聊天窗可缩放、窄窗下空档同比收缩，不会把内容挤没；「右侧置顶」= 块级元素
-  右对齐（左边距顶开）+ 自顶部起排（它本就是流的第一个块，无需 `align-self`）。
-- **响应式判据**：把聊天窗拖到最窄，正文列仍占剩余 5/6 且可读；窗口拉宽，空档同比放大。`#chat-log` **不设**
-  `max-width` —— 那会变成固定列宽，与「留 1/6」是两个口径。
+- **作用范围 = 用户气泡 `.chat-msg-user`**（聊天独立窗 `plugin-chat` 与主窗共用同一份
+  `main.ts` / `index.html`）。渲染路径两条都吃同一套类名 ⇒ 实时（`appendUserMsg`）与历史回放
+  （`renderChatLogHtml`）**一致右移**。**不受影响**：AI 回答 / 过程块（`.chat-msg-assistant` /
+  `.agent-flow`）**全宽**；桌宠输出框（`.pet-chat-output`，另一套 DOM）不动；插件面板不动。
+- **实现**：`:root` 的 `--chat-gutter: 16.6667%`（唯一布局 token，**唯一消费方 = `.chat-msg-user`**）
+  + `.chat-msg-user { margin-left: var(--chat-gutter) }`。`#chat-log` **不设** `margin-left`，
+  也**不设** `max-width`（那会变成固定列宽，与「留 1/6」是两个口径）。
+- **响应式判据**：用百分比而非硬编码 px ⇒ 把聊天窗拖到最窄，空档同比缩小、气泡仍占剩余 5/6
+  且可读；窗口拉宽，空档与气泡同步放大。
+- **每段「正式回答」开头的人格名 = `.chat-answer-persona`**（2026-10-16，取代同日早先的
+  「左上常驻一行 `#chat-persona-name`」—— 那版已删）：在该段**最终答案块之前**另起一行显示
+  当前人格名，次要文字档 `--text-dim`（不高亮、不描边）。它是**独立 DOM 节点**，不进
+  `textSegs` / `chatHistory` / 主请求 / `persona.md` ⇒ **复制正文拿不到它**（复制取 `chatHistory`
+  原文，不读 DOM）。**实时**（`cliDoneCallback` 把该行插到最后一个 `.agent-text:not([data-mid])`
+  之前）与**历史回放**（`renderChatLogHtml` 的助手气泡，逐气泡一行）**一致**；一段回答**只一行**
+  （思考块 / 工具卡 / 中间小输出都不加）。名字 = `lunac-persona-active` 预设名 || 内置名 `Lunac`
+  （唯一真相源 `main.ts` 的 `currentPersonaName()`）。**只在主对话 / 聊天窗渲染**，桌宠窗
+  （`.pet-chat-output`，`pet.ts`）不含此行。
 
 ## §界面 16 危险色（`--danger-*`：固定、不随主题漂移）
 
@@ -617,3 +633,16 @@
 - **记忆查看** = `<details class="sys-note">` + `pre.sys-note-body`（可展开；与 hooks / 附件提示同族，避免 6000 字铺屏）。
 - **破坏性命令的二次确认条** = `.run-mode-confirm`（`msg` / `ok` / `cancel`；与「切自动档」同款，`ok` 走语义红 —— 属 §界面 11 白名单语义色）。**据此确认**：这两族既有样式已够，斜杠命令**未新增任何颜色字面量、未新增滚动条、未新增容器**。
 - **纪律**：命令文案全走 `t()`（`chat.slash_*`，五语言）；命令**不进模型**、不写会话历史（旁注节点纪律同「上下文压缩提示」）。
+
+---
+
+## 本轮改动记录（2026-10-16 · 对话区栅格订正 + 人格名改为「每段正式回答开头」+ 人格预设）
+
+> 用户口径（2026-10-16）：「把我们问出去的问题的对话框向右移动，AI 模型的回答依旧铺满屏幕」；
+> 「对话中的人格名称应该放置在每一段回答的开头」；「预设列表直接放在人格分页处，在人格上方放置预设按钮」。
+> 代码 = `app/src/{styles.css,index.html,main.ts,i18n.ts}`、`docs/ui-style.md`（§界面 15）。
+
+- **§界面 15 订正（从「整列左缩进」改为「仅用户气泡右移」）**：撤掉 `#chat-log { margin-left: var(--chat-gutter) }`（它把 AI 回答与过程块一起挤窄了），改由**用户气泡 `.chat-msg-user` 单独**吃 `--chat-gutter`（`margin-left`）。`--chat-gutter` **保留**，唯一消费方改为 `.chat-msg-user`（不留「看着在用其实没效果」的死变量）。
+- **人格名改呈现方式（删「左上常驻一行」，改为「每段正式回答开头一行」）**：删除 `#chat-persona-name` 及其 CSS / 逻辑（含同一批的「行内人格名输入行」与 localStorage `lunac-persona-name`）；新增 `.chat-answer-persona`——在每段**最终答案块之前**另起一行显示当前人格名（`--text-dim`）。独立 DOM 节点 ⇒ **不进 `textSegs` / `history` / 复制正文**；实时与历史回放一致。
+- **人格预设（`lunac-persona-presets` / `lunac-persona-active`）**：入口「预设」按钮 + 新建按钮内联在**人格分页**（不另起页）；命名弹框自绘（标题=人格名称、一行文本框、保存/取消），复用玻璃面板 + 动作按钮族、**绝不用 `window.prompt`**；点列表某条 = 把该预设文本写进人格框并走既有 `savePersona()`；高亮用「名 + 文本双判」。
+- **「⋯ 更多设置」宽度 288 → 320px**（`#chat-more-menu`），并核实各页控件不再换行。

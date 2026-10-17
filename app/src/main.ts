@@ -28,6 +28,7 @@ import {
   type UsageSourceFilter,
 } from "./usage-cost.js";
 import { lineDiff } from "./text-diff.js";
+import { FILE_CHIP_LIMIT } from "./file-chips.js";
 import { initI18n, loadSavedLanguage, t, pluginName, pluginDesc, lang } from "./i18n.js";
 // 命令卡终端（2026-10-05，用户要求）：命令类工具（Cmd / PowerShell）的正文改用
 // xterm.js 渲染，可实时看到输出、也能键入（键入经 tool_control 转发给子进程 stdin）。
@@ -187,6 +188,8 @@ const drawerSibling = resultsList;
 const chatNewBtn = el("chat-new-btn");
 const chatMoreBtn = el("chat-more-btn");
 const chatMoreMenu = el("chat-more-menu");
+/** 「更多设置」分页页签栏（2026-10-16）。 */
+const chatMoreTabs = el("chat-more-tabs");
 /** 斜杠命令候选菜单（输入 `/` 时随输入过滤；贴输入行上方弹出）。 */
 const chatSlashMenu = el("chat-slash-menu");
 const chatMoreThinkIc = el("chat-more-think-ic");
@@ -216,6 +219,19 @@ const chatPersonaRestart = el("chat-persona-restart") as HTMLButtonElement;
 const chatDebugPhaseLabel = el("chat-debugphase-label");
 const chatDebugPhaseSeg = el("chat-debugphase-seg");
 const chatPersonaMsg = el("chat-persona-msg");
+/** 人格预设（2026-10-16）：人格页内联的预设按钮 / 列表 / 命名弹框。 */
+const chatPersonaPresetToggle = el("chat-persona-preset-toggle") as HTMLButtonElement;
+const chatPersonaPresetPanel = el("chat-persona-preset-panel");
+const chatPersonaPresetList = el("chat-persona-preset-list");
+const chatPersonaPresetAdd = el("chat-persona-preset-add") as HTMLButtonElement;
+/** 预设的可见反馈（保存成功 / 切换后「重启 AI 后生效」）。 */
+const chatPersonaPresetMsg = el("chat-persona-preset-msg");
+const chatPersonaPresetModal = el("chat-persona-preset-modal");
+const chatPersonaPresetModalTitle = el("chat-persona-preset-modal-title");
+const chatPersonaPresetName = el("chat-persona-preset-name") as HTMLInputElement;
+const chatPersonaPresetModalMsg = el("chat-persona-preset-modal-msg");
+const chatPersonaPresetModalSave = el("chat-persona-preset-modal-save") as HTMLButtonElement;
+const chatPersonaPresetModalCancel = el("chat-persona-preset-modal-cancel") as HTMLButtonElement;
 // 任务抽屉（2026-09-21）：输入框上方那条小抽屉的六个节点，见 renderTodoDrawer()
 const todoDrawer = el("todo-drawer");
 const todoDrawerTitle = el("todo-drawer-title");
@@ -698,23 +714,37 @@ function refreshSearchResults() {
   searchInput.dispatchEvent(new Event("input"));
 }
 
-/** Add a file path as a chip in the search bar */
-function addFileChip(path: string) {
-  if (!path.trim()) return;
+/** Add a file path as a chip in the search bar. 返回是否真的加进去了。
+ *
+ *  ⚠️ 注册语义（2026-10-16 定，防后人把自动注册加回来）：**粘贴 / 拖放 / 剪贴板自动识别
+ *  = 只做「本次附件」**（搜索栏里的泡泡），**绝不**写进自定义启动项注册表（`add_custom_app`）。
+ *  用户原话：「用户明明没有添加，也会添加进去」—— 旧实现「按可见位次 / 数量自动注册前 N 个」
+ *  正是这个 bug 的变体（用户没添加也被注册），已整体删除。
+ *
+ *  注册的**唯一入口** = 用户在「自定义启动」插件面板里点「添加启动项」
+ *  （`plugins/builtin/quick-launch.ts` 的 `.ql-add-btn` → 宿主 `add_custom_app`）。
+ *  本函数**没有任何注册分支**，全仓也不得再有第二条自动注册路径。
+ *
+ *  去重口径：与宿主 `app_indexer.rs::add_custom_app` 对齐 —— 那边用 `eq_ignore_ascii_case`
+ *  （大小写不敏感）⇒ 这里也**大小写不敏感**（同一路径的不同大小写只算一条，§禁用 62）。
+ *
+ *  注意：本次附件是**进程内存数组**，**不跨重启** —— 重启后自然不在启动项，这是**刻意的**
+ *  （旧注释里「粘贴路径重启后不丢」的意图正是本 bug 的来源）。想让某文件长期留在启动项，
+ *  请到插件面板显式添加。 */
+function addFileChip(path: string): boolean {
   const resolved = path.trim();
-  if (attachedFiles.includes(resolved)) return; // no duplicates
+  if (!resolved) return false;
+  // 去重口径与宿主同口径（大小写不敏感）；此处不再另写「是否注册」判据（§禁用 62）。
+  const key = resolved.toLowerCase();
+  if (attachedFiles.some((p) => p.toLowerCase() === key)) return false; // 重复 ⇒ 不加
   attachedFiles.push(resolved);
   renderFileChips();
   syncChipsEmpty();
-  // Expose to quick-launch plugin
+  // Expose to quick-launch plugin（面板据此把「本次附件」列为未注册的临时项）
   (window as any).__lunac_attached_files = attachedFiles;
-  // Persist as a custom launch entry (点12): pasted/dragged paths should
-  // survive a restart. Quick-launch execute() also registers, but that only
-  // runs when the user explicitly opens the launch panel — without this the
-  // entry was lost on restart. Duplicate/missing-path errors are ignored.
-  invoke("add_custom_app", { name: "", path: resolved }).catch(() => {});
-  // Re-trigger search to show "Custom Launch" entry
+  // 刷新结果区以反映新增附件（**不涉及注册** —— 附件只是本次附件）
   refreshSearchResults();
+  return true;
 }
 
 /** Image extension check — images get thumbnail previews, other files stay
@@ -744,8 +774,6 @@ function clearHiddenFileChips() {
   refreshSearchResults();
 }
 
-/** 前 N 个文件正常显示为独立泡泡；更多文件折叠进一个“省略泡泡”分支 */
-const FILE_CHIP_LIMIT = 3;
 let chipMoreOpen = false; // 省略泡泡是否展开（会话内状态）
 
 /** 单个文件泡泡 HTML */
@@ -1443,6 +1471,45 @@ chatDebugPhaseSeg?.querySelectorAll<HTMLButtonElement>("button[data-mode]").forE
   });
 });
 
+// ── 「更多设置」分页（2026-10-16，用户要求「⋯ 菜单改成分页」）──────────────────
+// 页签 = 权限 / 工作区 / 工具 / 人格 / 其他，默认选中「权限」。切换照桌宠那套
+// （data-more-tab / data-more-page + hidden），但用宿主类名（.chat-hist-tab + .on）——
+// **不**引设置面板的 data-cat / .active（两套选择器对不上）。
+const MORE_TAB_ORDER = ["profile", "workspace", "tools", "persona", "other"] as const;
+type MoreTab = typeof MORE_TAB_ORDER[number];
+/** 页签文案：权限 / 工作区 / 人格复用既有键；工具 / 其他用新增短标签键（原键是长句）。 */
+const MORE_TAB_LABEL_KEY: Record<MoreTab, string> = {
+  profile: "settings.security_profile",
+  workspace: "settings.workspace",
+  tools: "chat.more_tab_tools",
+  persona: "settings.persona_title",
+  other: "chat.more_tab_other",
+};
+let moreTab: MoreTab = MORE_TAB_ORDER[0];
+
+/** 刷新页签文案 / 选中态与各页显隐（打开菜单、切语言、切页都要调）。 */
+function renderMoreTabs() {
+  chatMoreTabs.querySelectorAll<HTMLButtonElement>("[data-more-tab]").forEach(b => {
+    const tab = b.dataset.moreTab as MoreTab;
+    b.textContent = t(MORE_TAB_LABEL_KEY[tab]);
+    const on = tab === moreTab;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  chatMoreMenu.querySelectorAll<HTMLElement>("[data-more-page]").forEach(p => {
+    p.hidden = p.dataset.morePage !== moreTab;
+  });
+}
+// 事件委托：点页签只切页（页签本就在菜单 wrap 内，不会触发 outside-click 关闭，这里再挡一道更稳）。
+chatMoreTabs.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-more-tab]");
+  const tab = btn?.dataset.moreTab as MoreTab | undefined;
+  if (!tab || tab === moreTab) return;
+  moreTab = tab;
+  renderMoreTabs();
+});
+
 /** 「更多」菜单的静态文案与行图标（语言切换时也要重刷）。 */
 function renderMoreMenuLabels() {
   if (chatMoreBtn) {
@@ -1460,6 +1527,7 @@ function renderMoreMenuLabels() {
   renderToolsBlacklistLabels();
   renderPersonaLabels();
   renderDebugPhaseSeg();
+  renderMoreTabs();
 }
 
 /** 打开菜单时把各行的动态状态刷新一遍。 */
@@ -1941,7 +2009,13 @@ function renderChatLogHtml(opts: { reset?: boolean; from?: number } = {}) {
     // 用户气泡走 `userBubbleText()`：把存着的 `[Attached files]…[User query]…` 还原成
     // 与实时气泡一致的「提问 + 📎 文件名」（否则进历史后附件行消失，见该函数注释）。
     const body = msg.role === "user" ? userBubbleText(msg.content) : msg.content;
-    html += `<div class="${bubble}" data-idx="${idx}">${mdImagesToHtml(body)}</div>`;
+    // 助手气泡 = 一段**正式回答**：在其**之前**另起一行显示当前人格名。放在气泡**之外**
+    // 作兄弟节点 ⇒ 连「按气泡文本兜底复制」（`copyMsgText` 的 `msg.textContent` 回落）也
+    // 拿不到这一行；复制正常路径本就取 `chatHistory` 原文。单行、无缩进（§禁用 23）。
+    const persona = msg.role === "assistant"
+      ? `<div class="chat-answer-persona">${esc(currentPersonaName())}</div>`
+      : "";
+    html += `${persona}<div class="${bubble}" data-idx="${idx}">${mdImagesToHtml(body)}</div>`;
   });
   html += '</div>';
   resultsList.innerHTML = html;
@@ -3510,11 +3584,11 @@ chatToolsList?.addEventListener("click", (e) => {
 // 退出 agent.exe → 重启 agent.exe 应用新黑名单（具体在 __lunac_save_tool_blacklist）
 chatToolsSave?.addEventListener("click", async () => {
   if (!chatToolsSave) return;
-  const custom: string[] = [];
-  chatToolsList?.querySelectorAll<HTMLInputElement>("input[type=checkbox]:checked:not(:disabled)").forEach(cb => {
-    const name = cb.getAttribute("data-tool");
-    if (name) custom.push(name);
-  });
+  // 取**真实状态**：行是 `.chat-tools-toggle` 按钮（没有 checkbox），页面上不存在
+  // `input[type=checkbox]` ⇒ 旧写法每次都取到空数组，保存等于把黑名单**清空**。
+  // toolsOffSet 是「已禁用」的唯一真相源：renderToolsBlacklist 据它渲染、
+  // 行内点击据它切换，故保存直接照它取，做到「点选即生效、保存不再清空」。
+  const custom: string[] = Array.from(toolsOffSet);
   (chatToolsSave as HTMLButtonElement).disabled = true;
   chatToolsSave.textContent = t("chat.tools_restarting");
   try {
@@ -3548,12 +3622,180 @@ let personaMax = 8000;
 /** 每次进程内只装载一次：避免「收起再展开」把用户没保存的草稿冲掉。 */
 let personaLoaded = false;
 
+/** 当前**正在应用**的人格名（展示用，唯一来源）。
+ *
+ *  **默认值** = 内置人格的自我命名：core-agent 的 `PERSONA_AND_STYLE`
+ *  （`core-agent/src/main.rs`，`You are "Lunac" …`）—— 它就是「当前正在应用的人格」的名字。
+ *  一条**不改变该默认名**的既有事实：用户人格（`config\persona.md`，`set_persona`）是
+ *  在内置人格**之后**追加的块（`persona_block()`），是「追加约束」不是「换人」。
+ *  用户**应用**了人格预设（见下方 `lunac-persona-active`）时改显示预设名。
+ *  它只是**展示层的名字**：绝不写进 `config\persona.md` / 固定前缀 / 系统提示词（§禁用 45），
+ *  也不进 `history` / `textSegs` / 复制正文。默认名是专有名词、不进 i18n。 */
+const PERSONA_NAME = "Lunac";
+
+/** 人格预设的存储键（2026-10-16，用户裁决用 localStorage）。**单一真相源**：
+ *  `lunac-persona-presets` = `[{name,text}]`；`lunac-persona-active` = 当前应用预设名。
+ *  空 / 不存在 ⇒ 回落到内置名 `PERSONA_NAME`。只作展示名，不进 prompt。 */
+const PERSONA_PRESETS_KEY = "lunac-persona-presets";
+const PERSONA_ACTIVE_KEY = "lunac-persona-active";
+
+interface PersonaPreset { name: string; text: string }
+
+/** 读全部预设（解析失败 / 形状不对一律当空，绝不抛）。 */
+function loadPersonaPresets(): PersonaPreset[] {
+  try {
+    const raw = localStorage.getItem(PERSONA_PRESETS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((p) => p && typeof p.name === "string" && typeof p.text === "string")
+      .map((p) => ({ name: p.name as string, text: p.text as string }));
+  } catch { return []; }
+}
+function storePersonaPresets(list: PersonaPreset[]) {
+  // 存不了（隐私模式等）就只在本次会话内可见，不阻断交互
+  try { localStorage.setItem(PERSONA_PRESETS_KEY, JSON.stringify(list)); } catch { /* noop */ }
+}
+function getActivePersonaName(): string {
+  try { return (localStorage.getItem(PERSONA_ACTIVE_KEY) || "").trim(); } catch { return ""; }
+}
+function setActivePersonaName(name: string) {
+  try {
+    if (name) localStorage.setItem(PERSONA_ACTIVE_KEY, name);
+    else localStorage.removeItem(PERSONA_ACTIVE_KEY);
+  } catch { /* noop */ }
+}
+
+/** 当前展示用的人格名：应用中的预设名 || 内置名（唯一真相源）。 */
+function currentPersonaName(): string {
+  return getActivePersonaName() || PERSONA_NAME;
+}
+
+/** 每段**正式回答**开头那一行人格名（独立 DOM 节点 ⇒ 不进 `textSegs` / 复制正文）。 */
+function personaLineEl(): HTMLElement {
+  const d = doc("div");
+  d.className = "chat-answer-persona";
+  d.textContent = currentPersonaName();
+  return d;
+}
+
+/** 若「活动预设」已与当前人格文本脱钩（手改过文本 / 预设被删），清掉活动名 ——
+ *  免得人格名继续显示旧预设名、列表也一直亮着（双判高亮见 `renderPersonaPresets`）。 */
+function dropStaleActivePersona() {
+  const name = getActivePersonaName();
+  if (!name) return;
+  const p = loadPersonaPresets().find((x) => x.name === name);
+  if (!p || p.text !== chatPersonaText.value) setActivePersonaName("");
+}
+
+/** 预设列表（**直接内联在人格分页**，不另起一页）。 */
+function renderPersonaPresets() {
+  const list = loadPersonaPresets();
+  const active = getActivePersonaName();
+  const cur = chatPersonaText.value;
+  if (!list.length) {
+    const empty = doc("div");
+    empty.className = "chat-persona-preset-empty";
+    empty.textContent = t("settings.persona_preset_empty");
+    chatPersonaPresetList.replaceChildren(empty);
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  list.forEach((p) => {
+    const b = doc("button") as HTMLButtonElement;
+    b.type = "button";
+    b.className = "chat-persona-preset-item";
+    b.textContent = p.name;
+    // 「名 + 文本双判」：名字对**且**当前人格文本与该预设完全一致才高亮（防手改后旧预设还亮着）。
+    const on = p.name === active && p.text === cur;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.addEventListener("click", () => applyPersonaPreset(p));
+    frag.appendChild(b);
+  });
+  chatPersonaPresetList.replaceChildren(frag);
+}
+
+/** 应用一条预设：文本写进人格框 → 记活动名 → 走既有 `savePersona()`（落盘 `config\persona.md`）。
+ *  保存 ≠ 生效，`savePersona` 会照旧提示「重启 AI 后生效」。 */
+function applyPersonaPreset(p: PersonaPreset) {
+  chatPersonaText.value = p.text;
+  setActivePersonaName(p.name);
+  renderPersonaPresets();
+  // 可见反馈（列表就在旁边）：应用后同样「保存 ≠ 生效」，提示重启 AI（复用既有键）。
+  chatPersonaPresetMsg.textContent = t("settings.persona_saved") + t("settings.persona_takes_effect");
+  void savePersona(p.text, t("settings.persona_saved"));
+}
+
+/** 命名弹框（自绘，复用玻璃面板 + 动作按钮族；绝不用 `window.prompt` —— WebView2 不支持）。 */
+function openPersonaPresetModal() {
+  chatPersonaPresetName.value = "";
+  chatPersonaPresetModalMsg.textContent = "";
+  chatPersonaPresetModal.classList.remove("hidden");
+  chatPersonaPresetName.focus();
+}
+function closePersonaPresetModal() {
+  chatPersonaPresetModal.classList.add("hidden");
+}
+
+/** 保存命名弹框：把**当前人格文本** + 名称存成一条预设（边界：空名 / 重名 / 超长）。 */
+function savePersonaPreset() {
+  const name = chatPersonaPresetName.value.trim();
+  if (!name) { chatPersonaPresetModalMsg.textContent = t("settings.persona_preset_name_empty"); return; }
+  const list = loadPersonaPresets();
+  if (list.some((p) => p.name === name)) {
+    chatPersonaPresetModalMsg.textContent = t("settings.persona_preset_name_dup");
+    return;
+  }
+  const text = chatPersonaText.value;
+  if (text.length > personaMax) {
+    chatPersonaPresetModalMsg.textContent = t("settings.persona_preset_too_long", { n: String(personaMax) });
+    return;
+  }
+  list.push({ name, text });
+  storePersonaPresets(list);
+  closePersonaPresetModal();
+  chatPersonaPresetMsg.textContent = t("settings.persona_saved"); // 保存成功给可见提示
+  renderPersonaPresets();
+}
+
+// 入口「预设」按钮：内联展开 / 收起预设列表（不新开页 / tab）。
+chatPersonaPresetToggle?.addEventListener("click", () => {
+  const willOpen = chatPersonaPresetPanel.classList.contains("hidden");
+  chatPersonaPresetPanel.classList.toggle("hidden", !willOpen);
+  chatPersonaPresetToggle.setAttribute("aria-pressed", willOpen ? "true" : "false");
+  if (!willOpen) return;
+  // 双判高亮要用当前人格文本：还没装载就先装载（loadPersona 收尾会重画列表）。
+  if (!personaLoaded) { personaLoaded = true; void loadPersona(); }
+  else renderPersonaPresets();
+});
+chatPersonaPresetAdd?.addEventListener("click", openPersonaPresetModal);
+chatPersonaPresetModalSave?.addEventListener("click", savePersonaPreset);
+chatPersonaPresetModalCancel?.addEventListener("click", closePersonaPresetModal);
+chatPersonaPresetName?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); savePersonaPreset(); }
+});
+// 弹框在 .chat-more-wrap 内 ⇒ ⋯ 菜单的 outside-click（只关「wrap 之外」的点击）不会误关菜单；
+// 这里再挡一道 stopPropagation，并支持点遮罩（非面板）关闭。
+chatPersonaPresetModal?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (e.target === chatPersonaPresetModal) closePersonaPresetModal();
+});
+
 function renderPersonaLabels() {
   chatPersonaLabel.textContent = t("settings.persona_title");
   chatPersonaEdit.textContent = t("settings.persona_edit");
   chatPersonaSave.textContent = t("settings.persona_save");
   chatPersonaReset.textContent = t("settings.persona_reset");
   chatPersonaRestart.textContent = t("settings.persona_restart");
+  // 人格预设：入口按钮 / 新建按钮 / 命名弹框（标题 = 人格名称）
+  chatPersonaPresetToggle.textContent = t("settings.persona_preset");
+  chatPersonaPresetAdd.textContent = t("settings.persona_preset_new");
+  chatPersonaPresetModalTitle.textContent = t("settings.persona_name");
+  chatPersonaPresetModalSave.textContent = t("settings.persona_save");
+  chatPersonaPresetModalCancel.textContent = t("settings.cancel");
+  renderPersonaPresets();
 }
 
 async function loadPersona() {
@@ -3573,6 +3815,7 @@ async function savePersona(text: string, okMsg: string) {
     await invoke("set_persona", { text });
     // 保存 ≠ 生效：改的是系统提示词的固定前缀，得重启 agent 才读得到（如实告知）
     chatPersonaMsg.textContent = okMsg + t("settings.persona_takes_effect");
+    renderPersonaPresets(); // 文本变了 ⇒ 重判高亮（名字 + 文本双判）
   } catch (e) {
     chatPersonaMsg.textContent = t("settings.persona_failed", { err: String(e) });
   }
@@ -3588,10 +3831,13 @@ chatPersonaEdit?.addEventListener("click", async () => {
   }
 });
 chatPersonaSave?.addEventListener("click", () => {
+  // 手动保存 = 自定义文本：若已与活动预设脱钩则清掉活动名（人格名随之回落内置名）。
+  dropStaleActivePersona();
   void savePersona(chatPersonaText.value, t("settings.persona_saved"));
 });
 chatPersonaReset?.addEventListener("click", async () => {
   chatPersonaText.value = "";
+  setActivePersonaName(""); // 恢复内置人格 ⇒ 不再应用任何预设
   await savePersona("", t("settings.persona_reset_done"));
 });
 chatPersonaRestart?.addEventListener("click", async () => {
@@ -3618,6 +3864,8 @@ chatMoreBtn?.addEventListener("click", (e) => {
   const willOpen = chatMoreMenu?.classList.contains("hidden") ?? false;
   if (willOpen) {
     renderMoreMenu();      // 打开时刷新各行状态（含工作区路径）
+    // 人格页的预设高亮要用「当前人格文本」—— 首次打开菜单就装载一次（幂等，见 personaLoaded）。
+    if (!personaLoaded) { personaLoaded = true; void loadPersona(); }
     loadToolsBlacklistSel();
     renderToolsBlacklist();
     chatMoreMenu?.classList.remove("hidden");
@@ -5494,7 +5742,7 @@ interface CliEventLine {
     viaHttp?: boolean;
   };
   /** system/task_started|task_progress|task_done（子代理事件，A14）：`task_id` 归组，
-   *  `description` 只在 started 上、`tool`/`round` 只在 progress 上、`ok`/`ms` 只在 done 上。
+   *  `description` 只在 started 上、`tool`/`round` 只在 progress 上、`ok`/`ms`/`partial` 只在 done 上。
    *  后台复盘 fork 刻意不发这三个事件。 */
   task_id?: string;
   description?: string;
@@ -5502,6 +5750,10 @@ interface CliEventLine {
   round?: number;
   ok?: boolean;
   ms?: number;
+  /** `task_done` 的可选字段（2026-10-16）：子代理**撞轮数 / token 上限**、交回的是
+   *  「做到一半的结论」时为真（后端 `core-agent` 只在撞墙时带上它）。
+   *  **字段可选、缺失即按原逻辑**（旧 agent 不发）—— 前端只做「有则提示」的向后兼容。 */
+  partial?: boolean;
   /** system/task_event（E1，2026-10-16）：子代理内部过程。与 `task_started` 同 `task_id`
    *  —— 靠它把事件挂到对应的 `Agent` 卡片（见 `agentSubtaskEventLine`）。
    *  `message.role=assistant` 是模型产出、`user` 是工具结果；块形状与主流程同名。
@@ -5701,6 +5953,9 @@ interface AgentSubtask {
   ok?: boolean;
   /** `task_done` 的 `ms` */
   ms?: number;
+  /** `task_done` 的 `partial`（done 且 ok 才有意义）：子代理撞轮数 / token 上限、
+   *  交回部分报告 —— 展示要标黄提示「已达上限、结果可能不完整」（不是失败，故不用红）。 */
+  partial?: boolean;
   /** 面板里的那一行；**已绑到 `Agent` 卡的任务没有这一行**（内容进卡片框格）。 */
   el?: HTMLElement;
   /** E2：该任务已并入某张 `Agent` 卡片 ⇒ 不再在面板里单独占一行（避免同一子代理显示两次）。 */
@@ -5759,8 +6014,16 @@ function renderSubtaskRow(s: AgentSubtask) {
   if (!stateEl) return;
   if (s.done) {
     // 单色状态符号（icon-style.md §4 允许），不是装饰 emoji
-    const mark = s.ok === false ? "✗" : "✓";
-    stateEl.textContent = s.ms === undefined ? mark : `${mark} ${formatDuration(s.ms)}`;
+    if (s.ok === false) {
+      stateEl.textContent = s.ms === undefined ? "✗" : `✗ ${formatDuration(s.ms)}`;
+    } else if (s.partial) {
+      // 撞上限、交回部分报告：**不是失败**，走 `--yellow` 告警系（与 running 同色），
+      // 如实说「已达上限、结果可能不完整」—— 不画成绿色 done，免得看不出被截断。
+      const warn = `⚠ ${t("agent.subtask_partial")}`;
+      stateEl.textContent = s.ms === undefined ? warn : `${warn} · ${formatDuration(s.ms)}`;
+    } else {
+      stateEl.textContent = s.ms === undefined ? "✓" : `✓ ${formatDuration(s.ms)}`;
+    }
   } else {
     stateEl.textContent = s.tool
       ? t("agent.tool", { tool: s.tool }) + (s.round > 1 ? ` · ${s.round}` : "")
@@ -6005,9 +6268,18 @@ function agentSubtaskEvent(data: CliEventLine) {
     sub.done = true;
     sub.ok = data.ok !== false;
     sub.ms = typeof data.ms === "number" ? data.ms : undefined;
+    // 撞上限、交回部分报告（后端可选字段；旧 agent 不发 ⇒ 视为完整收尾）。
+    sub.partial = sub.ok === true && data.partial === true;
     if (sub.el) {
       sub.el.classList.remove("running");
-      sub.el.classList.add(sub.ok ? "done" : "failed");
+      sub.el.classList.add(sub.ok ? (sub.partial ? "partial" : "done") : "failed");
+    }
+    // 已并入 `Agent` 卡的任务没有面板行，状态落在卡片的 `.tool-state`（由随后的
+    // `fillToolCard` 写）。这里先把卡标上 `.partial` ⇒ 它不再画成绿色 ok，而是标黄 + 文案
+    // （`fillToolCard` 认这个类，不覆盖成 ok）。卡还没建（时序倒挂）时不标，交由面板行提示。
+    if (sub.boundToCard && sub.partial) {
+      const card = v.taskViews.get(id)?.flow.closest("details.tool-card");
+      card?.classList.add("partial");
     }
   }
   renderSubtaskRow(sub);
@@ -7561,6 +7833,10 @@ function fillToolCard(
     // 工具本身没失败，是命令返回非零 —— 用黄色，不标红
     el.classList.add("exit-nonzero");
     if (stateEl) stateEl.textContent = t("agent.tool_exit_nonzero", { code: String(exitCode) });
+  } else if (el.classList.contains("partial")) {
+    // 子代理撞上限、交回部分报告（`task_done` 已给这张卡标 `.partial`）：工具本身跑完了，
+    // 但报告不完整 ⇒ 标黄 + 文案，**不**画成绿色「完成」（与 `.subtask-row.partial` 同口径）。
+    if (stateEl) stateEl.textContent = `⚠ ${t("agent.subtask_partial")}`;
   } else {
     el.classList.add("ok");
     if (stateEl) stateEl.textContent = t("agent.tool_ok");
@@ -10975,6 +11251,11 @@ async function startAgentChat(query: string, imagePaths: string[] = []) {
     let assistantIdx = -1;
     if (finalText) {
       chatHistory.push({ role: "assistant", content: finalText });
+      // 正式回答开头另起一行显示当前人格名 —— 独立 DOM 节点，只作展示：
+      // `textSegs` / `chatHistory` / `finalText`（复制正文）都拿不到这一行。
+      const answerEl = Array.from(flowEl.querySelectorAll<HTMLElement>(".agent-text"))
+        .filter((e) => e.dataset.mid !== "1").pop();
+      if (answerEl) flowEl.insertBefore(personaLineEl(), answerEl);
       // 复制按钮（同主题）——实时对话的助手全文，挂在 agent-flow 结尾
       const copyBtn = doc("button");
       copyBtn.className = "flow-copy";
@@ -13280,10 +13561,10 @@ function processClipboardText(text: string) {
     if (!trimmed) continue;
     // Windows 路径 → 添加为泡泡框 + 剪贴板历史
     if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
-      if (!attachedFiles.includes(trimmed)) {
-        addFileChip(trimmed);
-        hasFiles = true;
-      }
+      // 去重口径收口在 addFileChip（大小写不敏感，与宿主 eq_ignore_ascii_case 同口径）——
+      // 此处不再自带一份 `attachedFiles.includes`，避免两套判据漂移（§禁用 62）。
+      // 注意：粘贴**只进本次附件**，不注册（注册只由插件面板的显式添加触发，见 addFileChip）。
+      if (addFileChip(trimmed)) hasFiles = true;
       // 记进剪贴板历史：走**宿主命令**，不 import 插件模块（2026-09-29）——
       // 剪贴板历史已是拓展插件，可能根本没装，而「粘贴就记一条」是主窗口自己的行为。
       void invoke("append_clipboard_entry", { text: trimmed }).catch(() => {});

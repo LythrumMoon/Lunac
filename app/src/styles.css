@@ -51,9 +51,11 @@
   --blue: #9490b4;
   --radius: 14px;
   --search-height: 52px;
-  /* 对话区栅格（2026-10-16 用户要求「右侧置顶 + 左侧留 ~1/6」）：正文列右对齐、左侧留
-     约 1/6 空档。用百分比而**不是硬编码 px** —— 聊天窗可缩放、桌宠窗更窄，百分比空档在
-     窄窗下同比收缩、不会把内容挤没。唯一消费方 = `#chat-log`（见 §界面 15）。 */
+  /* 对话区栅格（2026-10-16 订正）：**只把用户气泡 `.chat-msg-user` 右移**、左侧留约 1/6
+     空档；AI 回答 / 过程块（`.chat-msg-assistant` / `.agent-flow`）**仍是全宽** —— 上一轮
+     误把整列 `#chat-log` 左缩进，把 AI 回答也一起挤窄了，本轮回退该做法（见 §界面 15）。
+     用百分比而**不是硬编码 px** —— 聊天窗可缩放，窄窗下空档同比收缩、气泡不会被挤没。
+     唯一消费方 = 用户气泡 `.chat-msg-user`。 */
   --chat-gutter: 16.6667%;
 
   /* ── 外观可调项（2026-09-19 新增，设置 → 风格）──────────────────
@@ -2325,6 +2327,8 @@ body.plan-open #todo-drawer {
 
 .tool-card.running .tool-state { color: var(--text); }
 .tool-card.ok .tool-state { color: var(--green); }
+/* 子代理撞上限的部分报告（2026-10-16）：不完整 ≠ 失败 ⇒ 黄系（`.failed` 仍排其后，红优先）。 */
+.tool-card.partial .tool-state { color: var(--yellow); }
 .tool-card.exit-nonzero .tool-state,
 .tool-card.timeout .tool-state { color: var(--yellow); }
 .tool-card.failed .tool-state { color: var(--red); }
@@ -3537,6 +3541,8 @@ summary.subtask-row-head { cursor: pointer; }
 }
 .subtask-panel .subtask-row.running .subtask-id { color: var(--yellow); }
 .subtask-panel .subtask-row.done .subtask-state { color: var(--green); }
+/* 撞上限、交回部分报告：语义是「不完整」不是「失败」⇒ 黄系，不是红（2026-10-16）。 */
+.subtask-panel .subtask-row.partial .subtask-state { color: var(--yellow); }
 .subtask-panel .subtask-row.failed .subtask-state { color: var(--red); }
 
 /* E2（2026-10-16）：`Agent` 卡片里「子代理内部过程」的**框格** —— 把子代理的思考 / 工具 /
@@ -3997,14 +4003,11 @@ input[type="number"]::-webkit-inner-spin-button {
   user-modify: read-only;
 }
 
-/* 对话区栅格（2026-10-16 用户要求「右侧置顶 + 左侧留 ~1/6」）：会话列**右对齐 + 左侧留
-   约 1/6 空档**，自顶部起排。`#chat-log` 是聊天独立窗（`plugin-chat`）与主窗共用的会话
-   容器；桌宠输出框是另一套 DOM（`.pet-chat-output`），不受此规则影响。空档走
-   `--chat-gutter`（百分比），窄窗下同比收缩，不硬编码 px。 */
-#chat-log {
-  margin-left: var(--chat-gutter);
-}
-
+/* 对话区栅格（2026-10-16 订正）：**只让用户气泡 `.chat-msg-user` 右移**、左侧留约 1/6
+   空档；AI 回答 / 过程块（`.chat-msg-assistant` / `.agent-flow`）**保持全宽** —— 上一轮
+   误把整列 `#chat-log` 左缩进（AI 回答跟着被挤窄），已撤（见 ui-style.md §界面 15）。
+   空档走 `--chat-gutter`（百分比），窄窗下同比收缩、气泡不被挤没。桌宠输出框是另一套
+   DOM（`.pet-chat-output`），不受影响。 */
 .chat-msg-user {
   position: relative;
   background: rgba(var(--other-overlay-rgb), 0.08);
@@ -4012,6 +4015,7 @@ input[type="number"]::-webkit-inner-spin-button {
   border-radius: 10px;
   padding: 8px 12px;
   margin: 6px 0;
+  margin-left: var(--chat-gutter);
   font-size: 0.82rem;
   color: var(--text);
   white-space: pre-wrap;
@@ -4026,6 +4030,20 @@ input[type="number"]::-webkit-inner-spin-button {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 每段「正式回答」开头的人格名（2026-10-16）：独立一行、**在答案块之上**，颜色走次要文字档。
+   它是**独立 DOM 节点**，不进 `textSegs` / `agentFinalText` ⇒ 复制按钮拿不到这一行。
+   取值 = 当前预设名（`lunac-persona-active`）|| `Lunac`（唯一来源，见 main.ts currentPersonaName）；
+   只在主对话 / 聊天窗渲染（桌宠窗是另一套紧凑 DOM，不含此行 —— 任务要求不改 pet.ts）。 */
+.chat-answer-persona {
+  margin-top: 2px;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── Roll-back / Retry buttons on each chat bubble (需求4) ──
@@ -4615,10 +4633,15 @@ input[type="number"]::-webkit-inner-spin-button {
   bottom: calc(100% + 6px);
   right: 0;
   z-index: 60;
-  width: 288px;
+  /* 2026-10-16 用户要求加宽到 320px（288px 时人格页几个按钮被迫另起一行）。
+     `max-width` 兜窄窗：菜单右对齐 wrap，窗口窄到装不下 320px 时按视口收窄，
+     避免向左溢出窗口；窗口最小宽 480、正常缩放下 320px 不会触到这条。 */
+  width: 320px;
+  max-width: calc(100vw - 72px);
   max-height: min(320px, 60vh);
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  /* 分页改造（2026-10-16）：菜单本体**不再滚动**，滚动交给页内容区（.chat-more-pages）——
+     只有一层滚动条，且页签栏常驻顶部不随内容滚走。 */
+  overflow: hidden;
   padding: 8px;
   display: flex;
   flex-direction: column;
@@ -4631,6 +4654,34 @@ input[type="number"]::-webkit-inner-spin-button {
   pointer-events: auto;
 }
 #chat-more-menu.hidden {
+  display: none;
+}
+
+/* 「更多设置」分页（2026-10-16）—— 页签复用宿主历史的胶囊芯片（.chat-hist-tabs / .chat-hist-tab，
+   配方与桌宠 .pet-tab 逐条一致），这里只补布局，不再新造一份页签样式：
+   页签栏固定在菜单顶部（不滚动）；页内容区独占滚动（flex + min-height:0），保证**只有一层滚动条**。 */
+.chat-more-tabs {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0 0 6px;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+}
+.chat-more-pages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chat-more-page {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* 页容器设了 display:flex ⇒ 必须自己兜住 [hidden]（否则 hidden 失效、五页全显示） */
+.chat-more-page[hidden] {
   display: none;
 }
 
@@ -5041,6 +5092,107 @@ input[type="number"]::-webkit-inner-spin-button {
   color: var(--text-dim);
 }
 
+/* ── 人格预设（2026-10-16，内嵌在「更多设置」人格页）────────────────
+   按钮在人格编辑区上方；点开在本页内联展开列表（不新开页 / tab）。列表底 / 描边 / 圆角
+   与同页小按钮同源，颜色全走既有变量（不自造色值）。滚动走 §界面 6 那条唯一全局规则。 */
+.chat-persona-preset-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+}
+.chat-persona-preset-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.chat-persona-preset-item {
+  text-align: left;
+  padding: 4px 8px;
+  font-size: 0.7rem;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: rgba(var(--ink-rgb), 0.06);
+  color: var(--text);
+  cursor: pointer;
+}
+.chat-persona-preset-item:hover {
+  background: rgba(var(--ink-rgb), 0.12);
+}
+/* 正在应用的预设（名 + 文本双判命中）：走按钮蒙版 + 按钮线条，与页签选中同族 */
+.chat-persona-preset-item.on {
+  background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha));
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+}
+.chat-persona-preset-empty {
+  padding: 4px 8px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+/* ── 人格预设命名弹框（2026-10-16）──────────────────────────────────
+   仓库无通用 modal ⇒ 自绘：遮罩参照 #chat-drawer-backdrop（同一条 shade 蒙版配方）、
+   面板参照 #chat-more-menu（玻璃底 + 描边 + 圆角 + 阴影）；按钮复用 .chat-more-actions button。
+   它放在 .chat-more-wrap 内、position:fixed ⇒ 相对 #results-container（backdrop-filter 使其
+   成为包含块）覆盖整个对话区，且点它不会触发 ⋯ 菜单的 outside-click 关闭。 */
+.chat-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(var(--shade-rgb), calc(0.35 * var(--shade-scale)));
+}
+.chat-modal.hidden {
+  display: none;
+}
+.chat-modal-panel {
+  width: min(320px, calc(100% - 32px));
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(var(--shade-rgb), calc(0.4 * var(--shade-scale)));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+.chat-modal-title {
+  font-size: 0.8rem;
+  color: var(--text);
+}
+.chat-modal-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 0.74rem;
+  color: var(--text);
+  background: rgba(var(--ink-rgb), 0.06);
+  border: 1px solid var(--border-glass);
+  border-radius: 6px;
+  outline: none;
+  caret-color: rgb(var(--other-overlay-rgb));
+}
+.chat-modal-input:focus {
+  border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+}
+/* 弹框内的校验提示（空名 / 重名）：与语义红同源 */
+.chat-modal-msg {
+  min-height: 0.9em;
+  font-size: 0.68rem;
+  color: var(--danger);
+}
+.chat-modal-actions {
+  justify-content: flex-end;
+}
 
 /* ── Agent status badge ───────────────────────────────────────── */
 .agent-status {

@@ -323,15 +323,20 @@
               </svg>
             </button>
             <div id="chat-more-menu" class="hidden">
-              <!-- 思考开关：两档分段（开 / 关，图标由 main.ts 用既有 THINK_SVG 填入，不再造路径） -->
-              <div class="chat-more-row">
-                <span class="chat-more-ic" id="chat-more-think-ic"></span>
-                <span class="chat-more-label" id="chat-more-think-label"></span>
-                <div class="chat-more-seg" id="chat-mode-seg">
-                  <button type="button" data-mode="on"></button>
-                  <button type="button" data-mode="off"></button>
-                </div>
+              <!-- 分页页签（2026-10-16）：权限 / 工作区 / 工具 / 人格 / 其他，默认选中「权限」。
+                   样式复用宿主历史的胶囊页签（.chat-hist-tabs / .chat-hist-tab），不再新造一份；
+                   切换走 data-more-tab / data-more-page + hidden（照桌宠那套，但用宿主类名）。 -->
+              <div class="chat-hist-tabs chat-more-tabs" id="chat-more-tabs">
+                <button type="button" class="chat-hist-tab" data-more-tab="profile" aria-pressed="false"></button>
+                <button type="button" class="chat-hist-tab" data-more-tab="workspace" aria-pressed="false"></button>
+                <button type="button" class="chat-hist-tab" data-more-tab="tools" aria-pressed="false"></button>
+                <button type="button" class="chat-hist-tab" data-more-tab="persona" aria-pressed="false"></button>
+                <button type="button" class="chat-hist-tab" data-more-tab="other" aria-pressed="false"></button>
               </div>
+              <!-- 页容器：只有这一层滚动（.chat-more-pages）；页签栏常驻其外，不随内容滚走。 -->
+              <div class="chat-more-pages">
+                <!-- 权限页：命令运行方式（决定「问不问」）+ 文件边界权限（决定「允不允许」），两者正交 -->
+                <div class="chat-more-page" data-more-page="profile" hidden>
               <!-- 命令运行方式：图标 + 档位点阵（不写档位名）+ 一句功能简述 -->
               <div class="chat-more-row">
                 <button id="chat-runmode-btn" type="button">
@@ -356,6 +361,18 @@
                 <span class="chat-more-label" id="chat-profile-label"></span>
                 <button id="chat-profile-btn" type="button"></button>
               </div>
+              <!-- 思考开关：两档分段（开 / 关，图标由 main.ts 用既有 THINK_SVG 填入）。
+                   2026-10-16 用户要求从「其他」页挪到「权限」页（id 与逻辑一个不动）。 -->
+              <div class="chat-more-row">
+                <span class="chat-more-ic" id="chat-more-think-ic"></span>
+                <span class="chat-more-label" id="chat-more-think-label"></span>
+                <div class="chat-more-seg" id="chat-mode-seg">
+                  <button type="button" data-mode="on"></button>
+                  <button type="button" data-mode="off"></button>
+                </div>
+              </div>
+                </div>
+                <div class="chat-more-page" data-more-page="workspace" hidden>
               <!-- 工作区：原独立弹窗的内容，扁平化成一行（无嵌套弹窗） -->
               <div class="chat-more-row chat-more-block">
                 <span class="chat-more-ic">
@@ -375,6 +392,8 @@
                   <button id="chat-workspace-reset" type="button"></button>
                 </div>
               </div>
+                </div>
+                <div class="chat-more-page" data-more-page="tools" hidden>
               <!-- 工具黑名单：勾选后重启 agent 生效（第19点前缀缓存优化） -->
               <div class="chat-more-row chat-more-block">
                 <span class="chat-more-ic">
@@ -393,6 +412,24 @@
                   <button id="chat-tools-save" type="button"></button>
                   <span id="chat-tools-msg" class="chat-tools-msg"></span>
                 </div>
+              </div>
+                </div>
+                <div class="chat-more-page" data-more-page="persona" hidden>
+              <!-- 人格预设（2026-10-16）：按钮在人格编辑区**上方**；点开在**本页内联**展开预设列表
+                   （不新开页面 / 不新开 tab）。列表存 localStorage（lunac-persona-presets），
+                   点某条 = 切换（把该预设文本写进人格框，走既有 savePersona 生效链路）。 -->
+              <div class="chat-more-row">
+                <div class="chat-more-actions">
+                  <button id="chat-persona-preset-toggle" type="button"></button>
+                </div>
+              </div>
+              <div id="chat-persona-preset-panel" class="chat-persona-preset-panel hidden">
+                <div id="chat-persona-preset-list" class="chat-persona-preset-list"></div>
+                <div class="chat-more-actions">
+                  <button id="chat-persona-preset-add" type="button"></button>
+                </div>
+                <!-- 预设的可见反馈（保存成功 / 切换后「重启 AI 后生效」）：复用 .chat-persona-msg 的次要文字样式 -->
+                <span id="chat-persona-preset-msg" class="chat-persona-msg"></span>
               </div>
               <!-- 人格 / 自定义提示词（L2，2026-09-21 从设置面板搬进「更多设置」）：
                    进阶用户才会改的一段固定文本，不占设置面板；描述压成一句。 -->
@@ -413,6 +450,8 @@
                   <span id="chat-persona-msg" class="chat-persona-msg"></span>
                 </div>
               </div>
+                </div>
+                <div class="chat-more-page" data-more-page="other" hidden>
               <!-- 阶段状态栏（L4 调试，默认关）：开启后窗口右上角浮出一条「agent 当前阶段」。
                    与上面几行同构（label + 两档分段）；浮标颜色走四类自定义变量，
                    定位 fixed + pointer-events:none（不占布局、不挡输入框）。见 main.ts setDebugPhase。 -->
@@ -421,6 +460,22 @@
                 <div class="chat-more-seg" id="chat-debugphase-seg">
                   <button type="button" data-mode="on"></button>
                   <button type="button" data-mode="off"></button>
+                </div>
+              </div>
+                </div>
+              </div>
+            </div>
+            <!-- 人格预设命名弹框（2026-10-16）：仓库无通用 modal ⇒ 自绘；放进 .chat-more-wrap 内
+                 ⇒ 点它不会被 ⋯ 菜单的 outside-click 关掉。遮罩/面板复用既有玻璃件与动作按钮族，
+                 颜色全走既有 CSS 变量（不硬编码）。**绝不用 window.prompt**（WebView2 不支持）。 -->
+            <div id="chat-persona-preset-modal" class="chat-modal hidden">
+              <div class="chat-modal-panel" role="dialog" aria-modal="true">
+                <div class="chat-modal-title" id="chat-persona-preset-modal-title"></div>
+                <input id="chat-persona-preset-name" class="chat-modal-input" type="text" maxlength="32" spellcheck="false" autocomplete="off" />
+                <span id="chat-persona-preset-modal-msg" class="chat-modal-msg"></span>
+                <div class="chat-more-actions chat-modal-actions">
+                  <button id="chat-persona-preset-modal-save" type="button"></button>
+                  <button id="chat-persona-preset-modal-cancel" type="button"></button>
                 </div>
               </div>
             </div>

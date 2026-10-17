@@ -825,6 +825,476 @@
 - **分期建议**：**先做 B**（收益最大、不碰注入不变量、有 `SessionSearch` 先例），**再评估 C**（要动注入路径 + 改规则 56，代价最大、需拍板），**A 不动**（兜底，删了会放大「忘了查」）。
 - **依据**：`docs/archive/agent-feature-backlog.md` §4.1.1 / §4.1.7、`docs/archive/ai-spec.md` §11 规则 56 与 §3.5、`docs/forbidden.md` §禁用 45 / §禁用 61、现状代码 `app/src-tauri/src/mcp_server.rs`（6000 上限）/ `core-agent/src/main.rs`（冻结快照注入）。
 
+### §待办 3-10 插件清单「引脚」与「主控芯片 ↔ 插件芯片」单信道方案（2026-10-17 设计修订，未施工）
+
+> **修订说明（2026-10-17 第二轮）**：本条目原为「引脚最小施工」调研。用户新要求是——**即使全库没有 dev 环境**，AI 也能通过装插件、并在**用户允许**下装 SDK / 开发环境，进而制造**前端 + 后端 + 架构 + 依赖**；**默认遵守 `ui-style.md`**，用户需要独立前端外观时**可以显式绕开**。Lunac 视为主控芯片，插件系统是插件芯片，两者只经**一条信道**通信；用户自主开发可把插件封装为**独立芯片**交付，过程含**传输、接收、边界隔离**。追加裁定：**可以调用 dev 环境以及 SDK**。**与前一轮结论冲突处，以本段为准。**
+>
+> **一句话结论**：方案主轴改为**双轨制**——**轨道 L**（两个纯文本文件，无工具链）保留为 AI 自建插件的立身之本；**轨道 H**（用户显式授权的 SDK / 开发工具链）新增，用来产出前端 + 后端 + 架构 + 依赖。前端默认 `inherit` 遵守 `ui-style.md`，声明 `custom` 才绕开；宿主与插件只走 `postMessage` 单信道；iframe 作为 **opt-in**，且**只是 DOM/CSS/脚本作用域边界，不是沙箱**（`forbidden.md` §禁用 1）。
+>
+> **状态**：本节全部为**设计**，**未施工**；`provides` 本轮**只出设计、不施工**（用户已拍板）。落盘纪律按 `docs/README.md:209`，只登记在 `todo.md`，不回写 `archive/`。
+
+#### A. 双轨制：轨道 L（低门槛）与轨道 H（用户授权的开发环境）
+
+##### A.1 轨道 L：两个纯文本文件即可（保留，不可丢）
+
+- **最小产物** = `Modules\<id>\lunac-plugin.json` + `index.js`：清单文件名 `plugin_market.rs:47`，字段与默认入口 `:186-244`、`:246-248`，入口必须是包内相对 `.js` / `.mjs`（`:636-649`）。
+- **不需要** Node、包管理器、构建器、类型包、SDK；AI 直接写两个文本文件即可被扫描、注册、执行（`plugin_market.rs:1517-1585`、`market.ts:155-193`）。
+- **这是 AI 自建插件的默认路径**。轨道 H 只能**增量**提供能力，不得把轨道 L 变成「必须先有工具链」。
+
+##### A.2 轨道 H：用户显式授权后装 SDK / 开发工具链
+
+- **能产出什么**：前端（单入口内联，或 `ui/` 多文件后打包）、后端（sidecar 二进制 / 本机服务）、架构（目录与模块拆分、构建脚本）、依赖（`dependencies[]` + 锁文件）。产物仍须落回 `Modules\<id>\`，仍受清单校验。
+- **授权模型（设计，待施工）**：
+  - **谁能装 = 只有用户**。AI 只能**提议**（写 `dev` 声明 / 触发「申请开发工具链」命令），**不能自批**；批准入口是一张宿主信任卡，与 sidecar 信任卡同构（`plugin_sidecar.rs:18`「模型只能提议，不能自己把门推开」、`:250-263` 的 `start()` 信任门）。
+  - **授予单位** = `(plugin_id, profile, version, sha256)` 指纹；任一变化即旧授权失效、重新弹卡（沿用 `fingerprint()` 的思路，`plugin_sidecar.rs:156-164`）。
+  - **落点** = **推荐 `<插件目录>\.toolchain\<profile>\`**（比较见 A.3）。
+  - **撤销** = 删授权记录 → 杀该插件的构建进程（Job Object）→ 可选删 `.toolchain\`；撤销后未重新授权不得再执行任何构建命令。
+  - **审计** = `<exe 根>\logs\` 落盘，记录 grant / revoke / 构建命令（过 `mask_secrets()`）/ 退出码 / 时长；**不记凭据**（`logging.md` 口径）。
+  - **单一真相源** = `config\plugin-toolchain.json` 只存**授权记录**（与 `plugin-trusted.json` 同处，`plugin_sidecar.rs:51-52`）；插件能力声明仍只在 `lunac-plugin.json`（`forbidden.md` §禁用 62）。**不得**把工具链能力再抄一份到前端常量表。
+- **SDK 的定义**：全仓**未查到**现成的 `@lunac/plugin-sdk` 包。设计口径 = 宿主随包提供**本地类型声明 + 信道客户端胶水**（`app/src/plugins/host.ts` 的 `.d.ts` 镜像 + C 节协议类型），Track H 可复制进插件 `sdk\` 供 TS 编译；**不发布、不新增运行时 npm 包**，因此不破坏「零新增运行时依赖」。
+- **安装方式**：优先**单文件二进制 profile**（如独立构建器可执行文件），其次 Node + 包管理器；npm 安装工具链依赖时默认 `--ignore-scripts`，需要生命周期脚本的包必须单独在信任卡上列出并由用户批准【推论：具体哪些包需要脚本，需按 profile 清单实测】。
+- **与 `dependencies[]` 三分闸的关系**：
+  - **复用**同一套下载 / 校验 / 落盘管线：https only、`safe_join`、`sha256`、单条 4 GiB（`plugin_market.rs:60`）、解压 1 GiB（`:66`）、≤32 条（`:62`）、staging + 原子替换（`:895-916`、`:1009-1058`）。
+  - **不新增** `dependencies[].type="toolchain"`，改用独立顶层 `dev` 段。理由：① `dependencies[]` 是**运行时资产**，装插件时自动拉取；工具链是**构建期**能力，必须**逐次授权**，不能被「装个插件」顺带执行；② 混在一起会让「生产运行需要什么」与「开发需要什么」失去边界；③ `npm` 类型已覆盖运行时 JS 包（`plugin_market.rs:259-260`、`commands.rs:2956-2961`），再叠一个会变成第二套包管理器。
+  - `dev` 段**不随插件安装自动执行**；`build.command` **永不自动运行**，每次执行都要用户确认（可「本次允许 / 始终允许该指纹」）。
+- **与「卸载 = 完全不存在」的关系**：推荐落点在插件目录内 ⇒ 卸载删目录即回收工具链，满足 `forbidden.md` §禁用 51。**本轮不做**宿主共享的可写工具链缓存（它会让卸载后仍有残留）；若将来要做，必须带引用计数与显式 GC，并明确它是宿主资产而非插件资产。
+- **诚实边界（必须原样写进 UI / 文档）**：装了工具链 = 本机可执行代码 + 构建期脚本执行 ⇒ **不是沙箱**（`forbidden.md` §禁用 1）。文案只能写「**用户授权的开发环境**」，不得写「安全沙箱」「隔离环境」「受控执行」。审批是**策略级**边界，不提供 OS 级隔离；构建脚本仍可能直接起进程、写文件、联网。
+
+##### A.3 安装落点比较（推荐：插件目录内）
+
+| 方案 | 落点 | 优点 | 问题 | 结论 |
+|---|---|---|---|---|
+| **插件目录内** | `<exe 根>\Modules\<id>\.toolchain\` | 卸载=删目录即回收（禁用 51）；与 `dependencies[]` 落点同源；无管理员权限；可移植；版本互不污染 | 每个插件各存一份，占磁盘；Windows 路径长度要注意 | **推荐** |
+| 宿主共享（可写） | `<exe 根>\ModuleData\toolchain\` | 多插件复用、省磁盘 | 卸载后仍残留 ⇒ 破坏「卸载=不存在」；需要引用计数 / GC；升级互相影响 | 本轮不做 |
+| 用户目录 | `%LOCALAPPDATA%\...` | 不占 exe 根 | 违反「数据根 = exe 根」的便携式约定（`code-standards.md:21`）；dev / release 各一份 | **拒绝** |
+| 系统全局 | 全局 `PATH` / `npm -g` / `Program Files` | 一次装处处用 | 需管理员；卸载不干净；与用户已有环境冲突；AV 误报 | **拒绝** |
+
+#### B. 前端外观：默认 `inherit` 遵守 `ui-style.md`，声明 `custom` 才绕开
+
+##### B.1 两级规范
+
+| 级别 | 清单字段 | 行为 | 宿主提示 |
+|---|---|---|---|
+| **inherit（默认）** | `render.appearance: "inherit"` | 继承宿主 token / 间距 / 圆角 / 按钮与态 / 滚动条 / 焦点规则；只消费 CSS 变量，**不复制 token 表** | 无额外提示 |
+| **custom（显式）** | `render.appearance: "custom"` | 允许独立外观；仍须满足 B.2 最低要求 | 插件市场详情 / 设置页插件条目显示「独立外观」标签；安装或首次打开时给一次可见提示 |
+
+- 旧的 `render.styleScope` 方案**撤销**（从未施工，无迁移成本）；外观只有 `inherit` / `custom` 两级，避免第二真相源。
+- `inherit` 的规范引用：`ui-style.md` §界面 1（色板与变量）、§界面 2（按钮类型与态）、§界面 3（圆角 / 间距 / 边框）、§界面 7（选中 / 禁用 / hover / focus）、§界面 8（主题色明暗与主题包）、§界面 9（视窗与布局硬边界）。**本文不复制任何 token 值**。
+- 插件自带 UI 框架仍允许（`agent-templates/modules/README.md:399-424`），但 `inherit` 时框架主题必须接到宿主变量；`custom` 时才可完全自绘。
+
+##### B.2 `custom` 的最低要求（绕开外观 ≠ 绕开宿主边界）
+
+| # | 要求 | 说明 |
+|---|---|---|
+| 1 | **Esc 归宿主** | 插件不得吞掉 Esc；Esc 先关插件内弹层，再交由宿主关闭面板。 |
+| 2 | **键盘可达 + 焦点可见** | Tab 顺序合理；不得有键盘陷阱（模态内可循环，但 Esc 必须能退出）；焦点样式不得去掉（`ui-style.md` §界面 7）。 |
+| 3 | **可访问性** | 语义化元素 / label / `aria-live` 状态；对比度可读；不得只把文字画在 canvas 上；尊重 `prefers-reduced-motion`。 |
+| 4 | **主题不崩** | 必须响应 `theme.changed` 的明暗模式；固定配色须在清单声明 `theme: "fixed"` 并由宿主提示；不得在深色主题下闪白。 |
+| 5 | **布局边界** | 不产生横向滚动；单层滚动；高度必须上报（B.3）；不得覆盖宿主标题栏 / 状态栏。 |
+| 6 | **作用域** | 不得读写宿主 DOM（iframe 下天然做不到）；不得依赖宿主 class 名；CSS 必须带插件前缀（旧 light-DOM 兼容期）。 |
+| 7 | **无全局副作用** | 不得改宿主 CSS 变量、`document.body`、全局快捷键；不得静默常驻定时器（`detach` 时清理）。 |
+
+> `custom` 只改变**视觉语言**，不改变 C 节的能力审批、D 节的卸载语义与 E 节的测试要求。
+
+##### B.3 iframe 下的 token 注入与尺寸自适应（设计）
+
+- **token 真相源不变**：仍是主窗口算好的内联变量，经 `broadcastThemeVars()` 广播（`main.ts:13247-13252`）；插件窗已有同构接收（`plugin-window.ts:57-70`、`:194-195`）。iframe 不能读宿主 CSSOM，改为**握手后由宿主发快照**。
+- **注入顺序**：`hello`（含 `themeMode`）→ `theme.changed`（`inherit` 带 token 快照，`custom` 只带 `mode`，除非声明 `themeTokens: true`）→ `mount`。先注入再挂载，避免首帧白闪。
+- **iframe 内落地**：插件把收到的变量写到**自己**的 `documentElement.style`；`inherit` 必须使用 `var(--...)`，不得硬编码色值（`forbidden.md` §禁用 17 / 19）。
+- **尺寸上报**：插件用 `ResizeObserver` 观察根节点，发 `ui.resize {height}`；宿主 clamp 到 100–4000（与 `plugin_market.rs:151-152` 同口径）。合并上报用 16–50ms 定时器，**不得用 `requestAnimationFrame` 断言布局完成**（`code-standards.md` §规范 7）。
+- **初始高度**：`results` 槽位由宿主给初值，插件首帧后覆盖；`document` 槽位固定为视口高，不随内容伸缩。
+
+#### C. 主控芯片 ↔ 插件芯片：一条信道（传输 / 接收 / 边界隔离）
+
+##### C.1 信道形态与硬禁止
+
+- **唯一通道** = iframe ↔ 宿主的 `postMessage`。宿主侧唯一入口 `app/src/plugins/channel/host.ts`【待建】，插件侧唯一入口 channel client【待建】；两端都只依赖同一份协议类型文件。
+- **禁止**：
+  - 插件直接 `fetch()` 宿主内部接口或 `127.0.0.1`（现有 CSP 与侧车口径：`tauri.conf.json:35`、`forbidden.md` §禁用 10 / §禁用 3 第 31 条）。
+  - 插件访问 `parent.document` / 宿主 `globalThis` / `__lunac_host`。旧 light-DOM 插件仍走 `host.ts:64-69` 的全局桥；**iframe 插件不得使用**，否则边界失效。
+  - 宿主放宽 CSP、给 iframe 加 `allow-same-origin` 后又不做来源校验；`targetOrigin` 不得写 `*`。
+- **来源校验**：宿主必须校验 `event.source === iframe.contentWindow` 与预期 origin；插件必须校验 `event.source === window.parent`。消息只接受结构化克隆数据，不 `eval`、不 `Function`、不传 DOM 节点。
+
+##### C.2 消息信封与版本协商
+
+```jsonc
+{
+  "v": 1,                                  // 信道协议版本，独立于 apiVersion
+  "id": "3f2a…",                           // 请求/响应关联；事件也带，便于去重与排障
+  "type": "req | res | err | event",
+  "method": "ui.resize",                   // res/err 回填原请求 method
+  "payload": {},                           // 只允许结构化克隆数据
+  "ts": 0                                  // 毫秒时间戳，仅排障
+}
+```
+
+- **版本分离**：`v` = 信道协议版本，从 `1` 开始；`apiVersion` = 宿主桥能力版本，现状为 `2`（`host.ts:59`、`main.ts:2812`、`plugin-window.ts:178`），信道落地时升到 `3`。两者**不得合并**，否则旧插件无法判断「有没有信道」。
+- **协商**：宿主 `hello` 里给 `channelVersions: [1]` 与 `apiVersion`；插件回 `ready` 选最高共同版本；无交集 ⇒ `E_VERSION` 并终止挂载。未知 `method`：请求回 `E_UNSUPPORTED`，事件忽略并 warn。**只增不减**；删字段/改语义必须升大版本，并按「至少兼容两个 minor」执行。
+- **旧插件**：不握手 ⇒ 宿主继续走 light-DOM 旧路径；新宿主不得因缺少信道而拒绝旧插件。iframe 插件 3s 内不 `ready` ⇒ 显示错误占位，不得空白。
+
+##### C.3 请求-响应、事件、超时与错误码
+
+| 类别 | 语义 | 关联 | 超时 |
+|---|---|---|---|
+| `req` / `res` / `err` | 一问一答；同一 `id` 只能有一个终态 | `id` | 控制类 10s；`net.fetch` 30s；sidecar 启动用 `sidecar.readyTimeoutSec`（缺省 10s，见 `agent-templates/modules/README.md:270-272`） |
+| `event` | 单向通知，不回复 | `id` 仅去重 | 无 |
+| 取消 | `type:"req", method:"cancel"` 或复用 `id` 的 `cancel` | `id` | 立即 |
+
+| 错误码 | 含义 | 典型场景 |
+|---|---|---|
+| `E_TIMEOUT` | 超时 | 宿主/插件未在时限内回包 |
+| `E_DENIED` | 能力未授权或用户拒绝 | 未声明 `net.fetch`、信任卡拒绝 |
+| `E_UNSUPPORTED` | 方法/能力不认识 | 新插件在旧宿主 |
+| `E_VERSION` | 无共同协议版本 | 握手失败 |
+| `E_INVALID` | 载荷不合法 | 越界尺寸、路径穿越 |
+| `E_NOT_READY` | sidecar / 资源未就绪 | 依赖未下载 |
+| `E_LIMIT` | 超过并发/体积/频率上限 | 请求队列满 |
+| `E_CANCELLED` | 被取消 | 面板关闭 / 用户取消 |
+| `E_HOST` | 宿主内部失败 | 下载失败、IO 错误；**不回传原始凭据/URL**（`forbidden.md` §禁用 59） |
+
+##### C.4 能力表（caps）：清单声明 → 信道可校验
+
+> 原则：**能力只从 `lunac-plugin.json` 派生**，信道不另存一份；宿主对每个请求按能力表校验，未声明的能力一律 `E_DENIED`。
+
+| 能力（信道名） | 清单来源（现状） | 必须宿主代执行 | iframe 可用 | 备注 |
+|---|---|---|---|---|
+| `ui.mount` | 隐含（所有插件） | 挂载 / 卸载 | ✅ | 基础能力 |
+| `ui.layout.takeover` | `permissions: ["layout.takeover"]`（`plugin_market.rs:76-81`） | `document` 槽位铺满 | ✅（槽位内） | 不再直接把 `document.body` 交给插件（`main.ts:10789-10804`） |
+| `ui.window.float` | `permissions: ["window.float"]` | 开独立窗 | ✅ | 窗口仍由宿主建 |
+| `ui.window.resize` | `permissions: ["window.resize"]` | 改宿主窗口尺寸 | ✅ | 与 `ui.resize`（内容高度）区分 |
+| `ui.reuse` | `reuse: [...]`（`plugin_market.rs:231`） | 挂内置面板监听 | ❌ | 需要与宿主同 DOM；iframe 插件**不支持 `reuse`** |
+| `process.spawn` | `permissions: ["process.spawn"]` + `sidecar`（`plugin_market.rs:238-243`） | 起/停/请求本机进程 | ✅ | 仍需独立信任卡（`plugin_sidecar.rs:250-263`） |
+| `net.sidecar.http` | `sidecar.allowLocalPorts` / `allowLocalAny` | 代请求本机端口 | ✅ | 现存口径 `plugin_sidecar.rs:607-653` |
+| `net.fetch` | 新增（待设计） | 代请求远端；域名白名单 | ✅ | **未查到**现成的通用 `net.fetch` 能力；不得让插件直连 |
+| `fs.pick` | 新增（待设计） | 弹宿主文件选择 | ✅ | 复用 `@tauri-apps/plugin-dialog` |
+| `fs.read` / `fs.write` | 新增（待设计） | 只限用户刚选中的路径 / 插件目录 | ✅ | 需逐次确认或会话授权 |
+| `clipboard.read` / `clipboard.write` | 新增能力名（现有命令） | 读写剪贴板 | ✅ | 现有命令 `commands.rs:3197-3220` 等；剪贴板读取必须在主线程（`code-standards.md` §规范 8） |
+| `screenshot.capture` | 新增能力名（现有命令） | 截图 overlay | ✅ | 现有入口 `screenshot.rs:84 / :111 / :128`；隐私口径见 `screenshot.rs:382-385` |
+| `shell.openUrl` | 新增能力名（现有 `plugin-shell`） | 只开 URL | ✅ | 本地路径必须走宿主 `open_path`，见 `code-standards.md:65` |
+| `assets.installed` | `dependencies[]` | 提供只读路径 | ✅ | 文件已按 `safe_join` 落在插件目录 |
+| `notify` | 新增（待设计） | 宿主通知 | ✅ | **未查到**现成的插件通知能力；不得用 DOM 伪造宿主提示 |
+
+> 表中「新增（待设计）」= 当前没有对应的插件能力名 / 通用入口，只有宿主内部实现或完全没有；施工前必须先立项，**不能假定已存在**。
+
+##### C.5 消息清单（传输与接收）
+
+**宿主 → 插件（传输）**
+
+| method | 类型 | payload | 说明 |
+|---|---|---|---|
+| `hello` | event | `{channelVersions, apiVersion, pluginId, caps, themeMode, locale}` | 握手起点 |
+| `mount` | req | `{input, slot, size}` | 挂载；`slot` ∈ `results` / `document` / `window` |
+| `execute` | req | `{input}` | 重新执行（等价现有 `execute(input)`） |
+| `theme.changed` | event | `{mode, tokens?}` | `inherit` 带 token；`custom` 默认只带 `mode` |
+| `locale.changed` | event | `{locale}` | 语言切换 |
+| `host.resize` | event | `{width, height}` | 宿主视口变化 |
+| `visibility.changed` | event | `{visible}` | 面板显示 / 隐藏 |
+| `lifecycle` | event | `{phase: "suspend"\|"resume"\|"dispose"}` | 生命周期；`dispose` 后不得再发请求 |
+| `ping` | req | `{}` | 健康检查 / 超时探测 |
+
+**插件 → 宿主（接收）**
+
+| method | 类型 | payload | 说明 |
+|---|---|---|---|
+| `ready` | event | `{channelVersion, capabilitiesUsed}` | 握手应答；宿主据此决定是否放行 |
+| `ui.resize` | event | `{height, width?}` | 内容尺寸上报；宿主 clamp |
+| `ui.status` | event | `{text}` | 状态行文本（走 `t()`，不得内嵌 emoji） |
+| `ui.notify` | req | `{level, message}` | 宿主通知；需 `notify` 能力 |
+| `net.fetch` | req | `{url, method, headers?, body?, timeoutMs?}` | 宿主代请求；域名白名单；响应体限长 |
+| `fs.pick` | req | `{mode: "open"\|"save", filters?}` | 用户选择路径 |
+| `fs.read` / `fs.write` | req | `{path, ...}` | 只限授权范围 |
+| `clipboard.read` / `clipboard.write` | req | `{text?}` | 剪贴板 |
+| `screenshot.capture` | req | `{mode}` | 截图 |
+| `shell.openUrl` | req | `{url}` | 只开 URL |
+| `process.start` / `stop` | req | `{}` | sidecar 生命周期（映射 `sidecar.ts:168-208`） |
+| `process.request` | req | `{method, params}` | stdio NDJSON 请求 |
+| `process.http` | req | `{method, path, body?, port?}` | 宿主代请求本机端口（`sidecar.ts:211-219`） |
+| `log` | event | `{level, message}` | 插件日志；宿主脱敏并限频 |
+| `bye` | event | `{}` | 主动退出；宿主清理 |
+
+##### C.6 传输与接收语义（背压 / 限额 / 顺序）
+
+- **顺序**：同一方向的事件按发送顺序处理；请求可交错，响应按 `id` 关联，不保证全局顺序。
+- **并发**：宿主 → 插件最多 8 个未决请求；插件 → 宿主最多 16 个；超限排队，队列上限 32，再超 `E_LIMIT`。`ui.resize` / `log` 不排队，直接合并 / 丢弃并计数。
+- **体积**：控制类 payload ≤ 1 MiB；`net.fetch` 响应默认 ≤ 8 MiB（按能力配置）；`fs.read` 走分块或返回临时文件句柄【推论：分块协议需在施工时定稿】。
+- **频率**：`ui.resize` 16–50ms 合并；`log` ≤ 20 条/秒；`ui.status` ≤ 5 条/秒。
+- **背压**：队列满时宿主回 `E_LIMIT`，插件必须降级（丢弃低优先级事件），不得无限重试。
+- **关闭**：面板关闭 → 宿主发 `lifecycle:dispose` → 等待 200ms → 摘 iframe；期间到达的响应按 `E_CANCELLED` 处理。
+
+##### C.7 边界隔离的诚实结论（必须写进实现与文案）
+
+- **能做到**（仅当 iframe 为**不透明源**且协议正确）：DOM / CSS / 脚本作用域隔离；插件拿不到宿主 DOM、变量、`__lunac_host`；宿主按 caps 逐请求审批。
+- **做不到**：本机权限隔离。插件代码一旦被安装并运行，仍是**本机可执行代码**；它能拿到的能力由用户授权决定，审批是策略级，不是 OS 级（`forbidden.md` §禁用 1）。
+- **同源 iframe 不算边界**：`allow-same-origin` 下插件可访问 `parent.document`，只能算「样式/布局隔离」。**不得**把这种形态宣传成「隔离」或「沙箱」。
+- **postMessage 本身不是安全边界**：必须做 `source` / `origin` 校验与 caps 校验；不得把「用了 postMessage」当作安全证明。
+- **一句话**：信道解决「主控芯片与插件芯片怎么说话、说什么、能要什么」；**不解决「插件是不是恶意代码」**。装谁 = 信任谁，这条没有变。
+
+#### D. 芯片封装：把插件打成独立可交付单元
+
+##### D.1 封装产物（目录 / 清单 / 入口 / 依赖 / 资源 / 校验）
+
+```text
+Modules\<id>\
+  lunac-plugin.json        # 唯一清单 / 唯一真相源（现有，plugin_market.rs:47, :190-244）
+  index.js                 # DOM 引擎入口；iframe 插件也保留一份「旧宿主降级占位」入口
+  ui\index.html            # iframe 引擎入口（可选；render.engine = "iframe" 时必需）
+  ui\...                   # 前端资源（打包产物）
+  server\...               # 后端 sidecar（可选；由 sidecar.command 声明）
+  assets\...               # 其它资源
+  .toolchain\              # 轨道 H 的开发工具链（安装期生成，**不进发布包**）
+  node_modules\            # 现有 npm 依赖落点（可选，不进发布包）
+```
+
+- **清单新增字段（设计，待施工）**：`render.engine: "dom" | "iframe"`（默认 `dom`）、`render.appearance: "inherit" | "custom"`（默认 `inherit`）、`dev`（工具链声明）。`provides` / `consumes` 仍按上一轮设计，但**本轮不施工**。
+- **入口规则**：`entry` 仍是 ESM（`plugin_market.rs:636-649`）；`render.engine="iframe"` 时额外要求 `ui/index.html` 存在。**`index.js` 不得删除**——它是旧宿主上的降级占位，避免「装了新插件在旧宿主上一片空白」。
+- **依赖**：运行时资产继续走 `dependencies[]`，复用 4 GiB / 1 GiB / 32 条 / 32 MiB / 192 MiB / 4000 条闸（`plugin_market.rs:49-53`、`:60-66`）。
+- **校验**：
+  - 依赖与 sidecar 已有 `sha256` 口径（`plugin_market.rs:283-286`、`:344`、`:1066-1094`、`:1123-1146`）。
+  - **插件包本体目前没有 sha256**：市场索引 `PluginIndexEntry` 无该字段（`plugin_market.rs:717-735`），安装路径只校验 https 与体积（`commands.rs:2894-2944`）。芯片封装**必须补** `index.json` 的 `sha256` + 安装前校验；这是新增缺口，不是现状。
+  - 构建元数据（buildId、文件哈希）放**包外**的 `SHA256SUMS` / 索引条目，**不放进插件目录当运行时真相**，避免第二份清单（禁用 62）。
+
+##### D.2 「独立芯片」的含义边界
+
+- **可以**：独立交付（zip / 目录）、独立版本号、干净卸载（删 `Modules\<id>\` 即不存在）、独立依赖与资源。
+- **不可以脱离宿主独立运行前端**：
+  - 加载依赖 `convertFileSrc` + 动态 `import()`（`market.ts:222-231`）；
+  - CSP 只放行 `'self'` 与 asset 协议（`tauri.conf.json:35`）；
+  - 宿主桥 `__lunac_host` 由宿主注入（`host.ts:64-69`、`main.ts:2812`、`plugin-window.ts:178`）；
+  - 即使改成 iframe + 自定义 scheme，iframe 仍由宿主创建、注入 token、代执行能力。
+- **后端 sidecar 也不能原样脱离宿主**：`spawn_proc` 依赖 `AppHandle`（`plugin_sidecar.rs:317-323`），事件走 `emit_to`（`:523`）。它可以作为独立进程被别的程序启动，但那就不是「Lunac 插件」语义了。
+- **结论**：独立芯片 = **可独立交付 / 可独立卸载**，不是**可独立运行**。文案必须写清，避免用户以为能脱离 Lunac。
+
+##### D.3 迁移路径与兼容矩阵
+
+- **迁移是 opt-in**：`render.engine` 默认 `dom`，现有 light-DOM 插件零变化；只有显式声明 `iframe` 的插件走新路径。
+- **旧插件 → iframe**：不是自动迁移；由插件作者（或 AI 在轨道 H 下）重写入口为 `ui/index.html` + 信道客户端，同时保留 `index.js` 占位。
+
+| 产物 \ 宿主 | 旧宿主（无信道 / `apiVersion < 3`） | 新宿主（有信道） |
+|---|---|---|
+| 旧 DOM 插件（无 `render`） | 正常 | 正常，走旧路径，零变化 |
+| 旧 DOM 插件（有 `reuse`） | 正常 | 正常；`reuse` 仍只在 DOM 引擎可用 |
+| iframe 插件（带 `index.js` 占位） | 显示「需要更新宿主」占位，不崩 | 走 iframe + 信道 |
+| iframe 插件（不带占位） | **可能空白 / 加载失败** | 正常 |
+| `custom` 外观 + 旧宿主 | 字段被忽略，light-DOM 下样式可能外泄 | iframe 内天然有样式边界 |
+| 带 `dev` 段 + 旧宿主 | 字段被忽略，无影响 | 可见「需要授权开发工具链」，不自动安装 |
+
+- **兼容纪律**：新宿主必须同时支持 `dom` 与 `iframe`；旧宿主不认识的新字段由 serde 忽略（全仓无 `deny_unknown_fields`，见 G 表 1.3），但**不能保证 iframe 插件可用**——所以必须带占位入口。
+
+#### E. 施工顺序（设计阶段，不施工）
+
+> 顺序按用户已拍板：`provides`（身份）→ 信道协议 + iframe opt-in（**先落 vitest**）→ 外观双级 → 工具链授权（轨道 H）→ 芯片封装 → Job Object 限额。**`provides` 本轮只出设计，不施工。**
+
+##### E.0 先落 vitest（对「零新增依赖」的一次破例）
+
+- **破例范围**：只新增 `vitest` 到 `app/package.json` 的 `devDependencies`（现状 `:25-31`），并加 `test` / `test:watch` 脚本（现状 `:6-13`）。**不改** `dependencies`（`:14-24`）、**不加**运行时依赖、**不引** UI 框架 / 图标库 / 动画库；`code-standards.md:55` 的「不新增前端依赖」按「不新增运行时依赖」解释，本次破例仅限 devDependency。
+- **测试范围**：先测**纯协议逻辑**（信封校验、版本协商、caps 校验、超时/错误码、resize 合并），不测真实 iframe DOM；DOM 级测试等信道落地后再评估是否需要额外 devDependency。
+- **为什么必须破例**：前端现状无 test 脚本、无 vitest（`app/package.json:6-13`、`:25-31`），`app/src` 无自有测试；不改宿主前端逻辑则无法做到「先红后绿」。
+
+##### E.1 阶段 1：`provides` 身份（本轮只设计）
+
+- **已拍板规则**：多个插件声明同一 `provides` ⇒ **warn + 按 id 升序取第一个**，不拒装。
+- **设计要点**：`provides: string[]`，默认 `[]`，上限 8，元素沿用 `[a-z0-9._-]`、≤32（`plugin_market.rs:505-519` 的口径）；新增唯一解析器 `resolve_plugin_dir(root, key)`（精确 id/目录优先，再按 `provides` 扫）；`id = 目录名` 仍是硬契约（`plugin_market.rs:192`），`provides` **不用于改目录名**。
+- **施工时改动点（本轮不动）**：`plugin_market.rs:190-244`、`:525-566`、`:652-711`、`:1517-1585`；`commands.rs:639-660`、`:2956-2961`；`plugin_sidecar.rs:166-181`；`plugin_window.rs:280-286`；`market.ts:232-235`；`settings.ts:2931`；`kinds.ts:72-74`；`scripts/build-plugins.ps1:294`、`:423-434`；`agent-templates/modules/README.md:93-107`。
+- **兼容**：旧插件无 `provides` ⇒ 回落到目录名，仅 warn 一次；新插件在旧宿主 ⇒ serde 忽略，目录名=id 时行为不变。
+- **测试（施工时）**：`manifest_parses_provides_identity`、`resolve_plugin_dir_prefers_declared_provides`、`resolve_plugin_dir_falls_back_to_directory_for_legacy`、`resolve_plugin_dir_ignores_invalid_manifest`、`provides_conflict_warns_and_picks_lowest_id`。
+- **风险**：把 `provides` 误当「可任意重命名目录」⇒ 窗口 label / 会话 key / 构建白名单全部错位；文档必须写明只用于**按能力定位**。
+- **越界**：不新增运行时依赖；不引入注册表；不按插件 id 写 bundle 分支（`forbidden.md` §禁用 51）。**本轮不施工**。
+
+##### E.2 阶段 2：信道协议 + iframe opt-in（先落 vitest）
+
+- **改动点（施工时）**：
+  - 新增 `app/src/plugins/channel/protocol.ts`（纯类型 + 校验 + 版本协商 + 错误码）与 `host.ts` / `client.ts`【待建】；测试同目录 `*.test.ts`。
+  - `plugin_market.rs:190-244` 加 `render.engine` / `render.appearance` 的解析与校验；`InstalledPlugin`（`:525-566`）下发。
+  - `main.ts:10783-10805` 按 `render.engine` 分支：`dom` 走现状；`iframe` 建 iframe、发 `mount`；`plugin-window.ts:74-104` 同步。
+  - `tauri.conf.json:35` 的 CSP 需增加 `frame-src`（当前没有）；是否新增自定义 scheme 见 H.4。
+  - 主题注入复用 `main.ts:13247-13252` / `plugin-window.ts:57-70`。
+- **兼容**：默认 `dom`；旧插件零变化；iframe 插件必须带 `index.js` 占位（D.3）。
+- **测试**：vitest：`channel_handshake_negotiates_lowest_common_version`、`channel_rejects_unknown_version_with_E_VERSION`、`channel_unknown_method_returns_E_UNSUPPORTED`、`channel_request_times_out_with_E_TIMEOUT`、`channel_requires_cap_for_net_fetch`、`channel_resize_events_are_coalesced`、`channel_rejects_cross_origin_source`。Rust：`manifest_accepts_iframe_engine_with_entry_html`、`manifest_rejects_iframe_engine_without_entry_html`、`manifest_engine_defaults_to_dom`。
+- **风险**：iframe 加载 asset 的跨源 / CSP（H.4 未决）；`reuse` 在 iframe 不可用；旧插件样式外泄不会因新字段自动修好。
+- **越界**：不放宽 CSP 的 `connect-src` / `script-src`；不让插件直连端口（`forbidden.md` §禁用 10）；不称「沙箱」。
+
+##### E.3 阶段 3：外观双级（`inherit` / `custom`）
+
+- **改动点**：`plugin_market.rs` 的 `RenderSpec` 增加 `appearance` 枚举；`market.ts` / `registry.ts:15-43` 透传；`settings.ts` 插件条目显示「独立外观」；iframe 侧 token 注入（B.3）。
+- **兼容**：默认 `inherit`；`custom` 只在显式声明时生效；旧宿主忽略字段，light-DOM 下仍可能外泄 ⇒ 文档要求插件 CSS 加前缀。
+- **测试**：`manifest_appearance_defaults_to_inherit`、`manifest_rejects_unknown_appearance`、vitest `theme_snapshot_is_sent_only_for_inherit`、`theme_mode_is_sent_to_custom`、`resize_payload_is_clamped`。
+- **风险**：custom 绕开导致视觉割裂 / 可访问性回退；宿主必须保留 B.2 的最低要求并可见提示。
+- **越界**：不新增主题机制；不复制 `ui-style.md` token；不硬编码色值（`forbidden.md` §禁用 17-20）。
+
+##### E.4 阶段 4：工具链授权（轨道 H）
+
+- **改动点（施工时）**：
+  - 新增 `app/src-tauri/src/plugin_toolchain.rs`【待建】：授权记录读写（`config\plugin-toolchain.json`）、`install_toolchain` / `revoke_toolchain` / `run_build` 命令；所有命令 `async` 薄壳 + `run_blocking`（`code-standards.md` §规范 5）。
+  - 复用 `plugin_market.rs` 的 `safe_join` / `sha256` / 体积闸 / staging（`:895-916`、`:1066-1146`）。
+  - `plugin_sidecar.rs:51-52` 的信任文件模式作为授权账本先例；构建进程 spawn 后立刻 `child_job::assign`（`:367`）。
+  - `app/src/plugins/...` 的申请入口 + 设置页授权 / 撤销 UI；`settings.ts` 加「开发工具链」分区。
+  - `agent-templates/modules/README.md` 增加 `dev` 段说明（`:93-107`、`:426-484` 附近）。
+- **兼容**：无 `dev` 段 = 无变化；旧宿主忽略；工具链安装不影响插件运行。
+- **测试**：`toolchain_grant_requires_user_approval`、`toolchain_fingerprint_changes_invalidate_grant`、`toolchain_install_stays_inside_plugin_dir`、`toolchain_revoke_removes_grant_and_kills_build`、`toolchain_archive_respects_dep_size_gates`；Windows 手工：撤销后无法再跑构建、删除插件目录后 `.toolchain\` 不残留。
+- **风险**：任意代码执行 / 供应链；`npm` 生命周期脚本；磁盘占用；AV 误报；构建脚本绕过宿主直连网络。
+- **越界**：不是沙箱（禁用 1）；不写全局 `PATH` / 全局 npm；不把工具链塞进 `dependencies[]` 自动安装；不新增运行时依赖。
+
+##### E.5 阶段 5：芯片封装（构建 / 发布 / 校验）
+
+- **改动点**：`scripts/build-plugins.ps1`（清单白名单 `:423-434`、`local-model` 元数据 `:294`）与 `scripts/publish-plugins.ps1:63 / :71` 支持 `render.engine` / `appearance` / 可选 `dev`；生成包外 `SHA256SUMS`；`plugin_market.rs:717-735` 的索引条目加 `sha256`，`commands.rs:2894-2944` 安装前校验；打包时**排除** `.toolchain\`、`node_modules\`、`sdk\`。
+- **兼容**：旧包无 `sha256` ⇒ 首次仍可装但 warn（或按发布策略拒装，需拍板）；旧宿主忽略新字段。
+- **测试**：Rust `index_sha256_is_required_for_chip_packages`、`install_rejects_zip_hash_mismatch`；脚本级 `npm run verify`（BOM）+ 构建产物大小 / 条目数断言。
+- **风险**：构建产物混入开发文件 / 模型；zip 体积超 32 MiB 需改走 `dependencies[]`；哈希发布流程要防「索引与包不同步」。
+- **越界**：不新增第二份运行时清单；不手工改 `release\Lunac\Modules\README.md`（构建产物）。
+
+##### E.6 阶段 6：Job Object 限额（资源闸，不是隔离）
+
+- **现状**：随宿主退出回收已有（`child_job.rs:88-105`、`plugin_sidecar.rs:367`）；`ExtendedLimits` 的 `process_memory_limit` / `job_memory_limit` 仍为 0（`child_job.rs:70-73`）。
+- **改动点**：为每个 sidecar 建独立 job（不能直接在包含 agent 的全局 job 上加内存上限）；新增 `sidecar.memoryLimitMiB` / `processLimit`（或宿主缺省），`plugin_sidecar.rs:317-367` 使用；保留 kill-on-close。
+- **测试**：`sidecar_job_limits_are_positive`、`sidecar_job_limits_do_not_apply_to_global_agent_job`；Windows 真机用任务管理器确认触顶行为与退出回收。
+- **风险**：限额过小会杀大模型 sidecar（如 4B 模型）；必须可配置并给缺省建议值。
+- **越界**：资源闸 ≠ 隔离，不得据此自称沙箱；不改变全局 agent job 的语义。
+
+##### E.7 不做清单（本轮刻意边界）
+
+1. **不重设计骨架**：目录即真相源、清单声明式、additive 三条保留；不引入注册表 / 数据库。
+2. **不把插件系统说成沙箱**：没有 OS 级隔离（`forbidden.md` §禁用 1）。
+3. **不做全局包管理器**：不建全局 `PATH` / `npm -g` / 共享可写工具链缓存；工具链只在插件目录内。
+4. **不自动执行构建**：`dev.build.command` 永不随安装自动跑。
+5. **不把 iframe 设为默认**：默认 `dom`，避免一次全炸。
+6. **不在 iframe 里支持 `reuse`**：它依赖与宿主同 DOM；新引擎不承诺。
+7. **不做 AppContainer 底座**：会拦设备 / 网络（CUDA / Vulkan 走不通为【推论】，仓库无实现可实测）。
+8. **不做目录名与 id 脱钩**：`id = 目录名` 仍是硬契约。
+9. **不手工改 `release\Lunac\Modules\README.md`**：构建产物由脚本重新生成（当前副本已写 `2`）。
+
+#### F. 明确「推翻 / 保留 / 新增」
+
+| # | 上一版结论 | 本次修订后 | 依据 / 说明 |
+|---|---|---|---|
+| 1 | 不做 SDK | **可选 SDK（需用户授权）**；轨道 L 最低门槛保留 | A.1 / A.2；SDK = 本地类型 + 信道胶水，不发 npm 包 |
+| 2 | 不扩依赖 / 不要 node_modules | **保留 `dependencies[].type="npm"`**（已支持），**新增工具链授权**（不入运行时依赖） | `plugin_market.rs:259-260`、`:1288-1352`；A.2 |
+| 3 | 不做 iframe，shadow root 作 opt-in | **iframe 作 opt-in**；shadow root **放弃** | 用户已拍板；B.3 / D.3 |
+| 4 | `apiVersion` 文档要修 | **已不成立，撤掉** | 源 `agent-templates/modules/README.md:370` 与 release `:354` 都是 `2` |
+| 5 | `provides` 本轮施工 | **本轮只出设计，不施工** | 用户已拍板；E.1 |
+| 6 | 同 `provides` 冲突待拍板 | **warn + 按 id 升序取第一个**，不拒装 | 用户已拍板；E.1 |
+| 7 | 前端无 runner，零新增依赖 | **引入 vitest**，破例仅限 devDependency | 用户已拍板；E.0；`app/package.json:6-31` |
+| 8 | 包管理器 / node_modules 不进本轮 | **不建全局包管理器**；工具链 profile 只在插件目录内，需授权 | A.3 / E.4 |
+| 9 | 「沙箱 / 隔离」措辞 | **不是沙箱**；iframe 只是 DOM/CSS/脚本作用域边界 + 能力边界 | `forbidden.md` §禁用 1；C.7 |
+| 10 | `render.styleScope: plugin/global` | **改为 `render.appearance: inherit/custom`** + `render.engine: dom/iframe` | B.1；旧字段从未施工，无迁移 |
+| 11 | `consumes` 声明（只 warn） | **保留为可选设计**，不进入本轮施工 | 上一版 C 节；能力定位仍以 `provides` 为主 |
+| 12 | Job Object 随宿主退出已有 | **保留**；只补内存 / 进程数上限 | `child_job.rs:88-105`、`plugin_sidecar.rs:367` |
+| 13 | 目录即真相源、卸载=删目录、additive、`id = 目录名` | **全部保留** | G 表 1.1-1.3、2.1；`plugin_market.rs:192` |
+
+- **仍成立的三条骨架**：① 目录即真相源（扫描 `plugin_market.rs:1517-1585`，卸载 `:1588-1605`）；② 清单声明式扩展点（`permissions` / `reuse` / `window` / `sidecar`，`:220-243`）；③ additive 演进（未知 permission 只 warn `:682-688`，未知 reuse 只 warn `attach.ts:69-73`，serde 忽略未知字段）。
+- **仍成立的硬契约**：`id = 目录名`（`plugin_market.rs:192`）；`provides` 只解决「按能力定位」，**不支持任意改目录名**。
+
+#### G. 核实底账（沿用 2026-10-17 只读调研，只记事实）
+
+> 本表是上一轮的核实结果，**只作为事实底账**；方案与顺序以 A–F 为准。表中旧建议（尤其 3.3「不要 node_modules」、3.6「建议顺序」）**已被本轮修订取代**。
+
+##### G.1 逐条核对面（2026-10-17 只读调研）
+
+| # | 对话结论 | 判定 | 证据 / 现状 |
+|---|---|---|---|
+| 1.1 | 目录即真相源：`Modules\<id>\` 存在即插件存在，无注册表，卸载=删目录 | ✅ 仍成立 | 扫描只读目录：`plugin_market.rs:1517-1585`；卸载只删 `<plugins_root>\<id>`：`:1588-1605`；前端 `market.ts:155-192` 先摘后挂、不持久化任何注册表；清单注释明写「id 同时是目录名」：`plugin_market.rs:192`。 |
+| 1.2 | 清单声明式扩展点：`permissions` / `reuse` / `window` / `sidecar` | ✅ 仍成立 | `PluginManifest` 字段：`permissions` `plugin_market.rs:220`、`reuse` `:231`、`window` `:237`、`sidecar` `:243`；已知能力仅 4 个：`KNOWN_PERMISSIONS` `:76-81`（`layout.takeover` / `process.spawn` / `window.resize` / `window.float`）。 |
+| 1.3 | additive 演进：不认识 permission / reuse 只 warn，未知字段不报错 | ✅ 仍成立 | 未知 permission 只 warn：`plugin_market.rs:682-688`；未知 reuse 由前端 warn、不拒装：`attach.ts:69-73`；Rust 侧无 `deny_unknown_fields`（全文件 grep 零命中）⇒ serde 默认忽略未知字段。 |
+| 2.1 | 债 1：`local_model_env()` 直接按目录名 `local-model` 读清单 | ✅ 仍成立 | `commands.rs:639-660`（`:644-646` 拼 `plugins_dir().join("local-model").join("lunac-plugin.json")`）；调用点 `:460-468`。 |
+| 2.2 | 债 2：`reuse` 只认内置面板 id，白名单硬编码；`MAX_REUSE = 4` | ✅ 仍成立 | 硬编码 switch：`attach.ts:27-57`，实际可复用 **5 个**：`settings` / `tool-editor` / `quick-launch` / `memo` / `translate`；`MAX_REUSE = 4`：`plugin_market.rs:72`（Rust 只校验形状与条数 `:693-705`，不认识的面板 id 由前端 warn `attach.ts:72`）。 |
+| 2.3 | 债 3：`agent-templates\modules\README.md:344` 写「桥的协议版本，当前 1」，与实际 2 矛盾 | ❌ **已不成立（文档已修）** | 源 README `:370` = 版本当前 **`2`**；`:257` = `apiVersion >= 2` 才有 sidecar；发布副本 `release\Lunac\Modules\README.md:354` = **`2`**、`:241` = `>= 2`；宿主 `host.ts:59` = 当前 2；实际注入 `main.ts:2812` / `plugin-window.ts:178` 均为 `apiVersion: 2`。全仓 grep「当前 1 / 协议版本 1」零命中 ⇒ **当前无矛盾**。对话引用的 `:344` 现为 `attach/detach` 代码示例行，不是版本声明。 |
+| 2.4 | 债 4：单条 ≤ 4 GiB、解压 ≤ 1 GiB、依赖 ≤ 32 条；是刻意边界 | ⚠️ **数值全对，适用对象需写清** | `MAX_DEP_BYTES = 4 GiB`：`plugin_market.rs:60`；`MAX_DEP_ENTRIES = 32`：`:62`；`MAX_DEP_EXTRACT_BYTES = 1 GiB`：`:66`。三者都是清单 **`dependencies[]`** 的闸；`sidecar` 段本身**没有**独立体积闸（其 `command` 由依赖下载闸约束）。插件包另有 32 MiB / 192 MiB / 4000 条：`:49 / :51 / :53`。 |
+| 3.1 | 引脚提案：清单加 `provides` / `consumes` / `render` | ✅ 确认为「新增」 | 现有清单字段只有 `id/name/description/keywords/icon/version/entry/homepage/dependencies/permissions/reuse/window/sidecar`（`plugin_market.rs:190-244`）；全仓（排除 `target/`）grep `provides` / `consumes` / `render` 只命中 `tuning-engine/src/main.rs:73` 的无关命令 ⇒ **三字段均不存在**。 |
+| 3.2 | 当前插件与宿主同一 document，全仓无 iframe / shadowRoot；id 冲突 / 全局 CSS / `innerHTML` 注入是真实洞 | ✅ 仍成立 | `app/src` grep `iframe` / `shadowRoot` / `attachShadow` **零命中**；非 takeover 直接 `resultsList.innerHTML`：`main.ts:10794-10797`，takeover 直接铺满：`:10789-10792`；`attach` 的 root 在 takeover 时是 `document.body`：`:10804`；插件窗同样 `root.innerHTML`：`plugin-window.ts:40 / :100-104`、`plugin.html:54`。`type:"html"` 走 `innerHTML` 的说明见 `README.md:313`、`market.ts:20-22`。 |
+| 3.3 | 依赖：CSP 只许本地加载、禁 http import ⇒ 第三方库打进单一入口；不要 node_modules / 包管理器 | ⚠️ **CSP 部分成立；「不要 node_modules」与现状不符** | CSP 仅放行 `'self'` + asset：`tauri.conf.json:35`；加载确实走 `convertFileSrc` + 动态 `import()`：`market.ts:227-228`。但清单**已支持** `dependencies[].type="npm"`（`plugin_market.rs:259-260`、`:469-486`、`:1292+`），装进插件目录 `node_modules\`；模块 README 也把它列为可选路径（`:409`、`:459-461`），只是推荐「打进入口」（`:408`、`:418`）。⇒ **只能「不扩、降级为最后手段」，不能直接删**。 |
+| 3.4 | 真 OS 沙箱：Job Object 便宜有用（内存/进程数上限 + 随宿主退出回收），但只是资源闸；AppContainer 能真隔离但设备访问报废 | ⚠️ **部分已实现** | 随宿主退出回收**已有**：`plugin_sidecar.rs:367` 每次 spawn 后 `child_job::assign`；`child_job.rs:88-105` 只设 `KILL_ON_JOB_CLOSE`，**未设**内存 / 进程数上限（`ExtendedLimits` 的 `process_memory_limit` / `job_memory_limit` `:70-73` 保持 0）。AppContainer 全仓无实现（仅 `todo.md:731` 等调研条目）⇒「设备访问报废」为【推论】，未在代码/实测中验证。 |
+| 3.5 | TDD 现实：Rust 可严格 TDD；前端无 runner；CDP 夹具是事后取证 | ⚠️ **Rust 成立；CDP 一项部分过时** | Rust 先例：`plugin_market.rs:1608-2064` 共 19 条单测，含 `manifest_validates_permissions` `:1953`、`manifest_validates_reuse` `:1972`。前端：`app/package.json:6-13` **无 test 脚本**、`:25-31` **无 vitest**（全仓 JSON grep `vitest|jest|mocha` 零命中），`app/src` 无自有 `*.test.*`（唯一命中 `target/debug/temp/mcp-fixture.test.mjs` 是构建产物）。`scripts/agent-e2e.ps1` 存在；`temp/pet-e2e.mjs` **当前检出未查到**（gitignore）。 |
+| 3.6 | 建议顺序：引脚 → 外观隔离（先落 vitest）→ sidecar Job Object 资源上限 | ⚠️ **方向成立，需修正两点** | ① `apiVersion` 文档**无需再修**（已正确）；② Job Object 的「随宿主退出回收」已存在，只剩内存/进程数上限是新增量。建议顺序改为：`provides` → `render`/`consumes`（声明+校验）→ 外观隔离（先定前端 runner）→ Job Object 限额。 |
+| 4 | 不能脱离 Tauri + WebView2 | ✅ 仍成立 | 前端死绑：`market.ts:227-228`（`convertFileSrc` + 动态 `import()`，只有 asset 协议可加载）；`tauri.conf.json:35`（`script-src` 无 http/https，只有 `'self'` + asset）；`host.ts:64-69` 的 `globalThis.__lunac_host` 桥 + `apiVersion: 2`；插件碰 `127.0.0.1` 必须宿主代请求：`sidecar.ts:211-219`、`README.md:268-269`、`forbidden.md:22`。后端 sidecar 只是**进程形态**可独立：当前 `spawn_proc` 依赖 `AppHandle`（`plugin_sidecar.rs:317-323`）、事件 `emit_to`（`:523`），不能原样脱离宿主。 |
+| A8 | 「宿主一条引用路径」仍成立 | ✅（有 2 条旁路） | 启动：`main.ts:2816` / `plugin-window.ts:182`；手动重扫：`settings.ts:1938`；AI 写 `Modules\` 后：`main.ts:1041-1050` 标记 → `:9974-9979` 广播 → `:12256-12257` 各窗重扫，另有唤出兜底 `:13684`。统一入口 = `market.ts:155-158` → `commands.rs:2751-2753` → `plugin_market.rs:1517-1585`。**旁路**（不经扫描、直接 `join(id)` 读清单）：`commands.rs:644-650`、`plugin_sidecar.rs:175-177`、`plugin_window.rs:280-286`。 |
+
+**债 1 的宿主 id 硬编码全量清单（本轮 grep 结果）**
+
+- **Rust 运行时**：`commands.rs:644-646`（按目录名找清单）、`:2958`（`install_plugin_dependencies` 直接 `join(id)`）；`plugin_sidecar.rs:171`（`plugins_dir().join(id)`）；`plugin_window.rs:281-283`（按 id 读窗口形态）。
+- **前端运行时**：`main.ts:2825-2827`（`hasDiskPlugin` / `pluginSidecarRunning` / `plugin_sidecar_start` 均传 `"local-model"`）；`settings.ts:1302-1303`、`:2931`、`:2952`、`:2983-2991`；`kinds.ts:72-74`（`HEADLESS_PLUGIN_IDS`）。
+- **构建期**：`vite.plugins.config.ts:47`、`scripts/build-plugins.ps1:294`（`local-model` 元数据）与 `:423-434`（清单字段白名单）、`scripts/publish-plugins.ps1:63 / :71`。
+- **文档**：`README.md:57`。
+- 说明：`storage.rs:121-155` 的 `config\local_model.json` 是**功能开关配置**，不是插件查找点，不纳入本债。
+- 额外发现（不在债 1 范围，但同属「按 id 特判」）：`main.ts:10702`（`ai-agent`）、`:10706`（`music` 过渡兜底）、`:10714`（`pet`）。这些是 `forbidden.md:71` 已禁止的形态，建议后续用 `provides`/能力声明逐个收口。
+
+#### H. 仍未决 / 需我拍板
+
+| # | 事项 | 我的建议 | 为什么必须拍板 |
+|---|---|---|---|
+| 1 | **工具链装在哪** | `<插件目录>\.toolchain\`；不做宿主共享 / 用户目录 / 全局 | 直接决定「卸载 = 完全不存在」能否成立；共享缓存需要引用计数与 GC，是另一套工程 |
+| 2 | **iframe 内如何注入主题 token** | 握手后由宿主 `postMessage` 发快照；`inherit` 全量、`custom` 只发 `mode`（可选 token） | iframe 读不到宿主 CSSOM；发多了会把宿主 token 变成插件契约，发少了 `inherit` 失效 |
+| 3 | **是否新增挂载锚点** | **不新增**，继续只有 `results` / `document` / `window` 三个（`index.html:223`、`plugin.html:54`、`plugin-window.ts:40`） | 新增聊天侧栏 / 设置分组会扩大宿主 DOM 契约与回归面；产品侧未提需求 |
+| 4 | **iframe 的源模型** | 目标 = `sandbox`（不透明源）；同源 iframe 只能叫「样式隔离」，不算边界 | 不透明源下 `asset.localhost` 的跨源加载 / CORS **未查到**结论；可能需要自定义 scheme，属实现前必须验证的技术风险 |
+| 5 | **工具链 profile / 版本白名单** | 先只做「单文件构建器」与「Node LTS + 包管理器」两档；版本与哈希写死 | 决定攻击面、磁盘占用与可复现性；无白名单等于允许任意 npm 包 |
+| 6 | **工具链联网策略** | 构建期联网走宿主代理 + registry 白名单；不允许插件脚本自行直连 | 与 `forbidden.md` §禁用 10 的「HTTP 一律宿主代请求」对齐；否则工具链成为绕过口 |
+| 7 | **市场插件是否允许 `dev` 段** | 允许声明，但**默认永不授权**；只对本地 / 用户自建插件提供「申请授权」 | 防止「装个市场插件顺带索要开发环境」；供应链风险显著高于本地自建 |
+| 8 | **`reuse` 在 iframe 不可用** | 接受；`reuse` 只保留给 DOM 引擎，文档写明 | 它依赖与宿主同 DOM；强行支持等于给 iframe 开宿主 DOM 口子 |
+| 9 | **`custom` 的可见提示放哪** | 插件市场详情 + 设置页插件条目；首次打开给一次轻提示；不放进结果区 | 放结果区会占布局 / 破坏视觉一致性；只放设置又可能不够可见 |
+| 10 | **Job Object 缺省限额** | 内存与进程数都可配，缺省值需按 4B 模型 sidecar 实测后定 | 定小了会杀本地模型；定大了等于没闸 |
+| 11 | **插件包 `sha256` 是否强制** | 新增字段并**强制**（芯片封装必须）；旧包给迁移期 warn | 现在插件包本体无哈希（`PluginIndexEntry` `:717-735`、`commands.rs:2894-2944`），无法证明交付物未被替换 |
+| 12 | **CDP 夹具现状** | `temp/pet-e2e.mjs` 当前检出**未查到**（gitignore）；`scripts/agent-e2e.ps1` 存在 | 若后续要用 CDP 做端到端验收，需要先确认夹具是否仍在 |
+
+### §待办 3-11 插件面板「图片化 / 可视化设计 ↔ 代码」可行性（2026-10-17 只读调研，未施工）
+
+> 来源：用户提问「是否可以**直接通过前端的图片化可视化设计来与代码本身交互**」。本文只给结论与路线，**不构成施工任务**；与 **§待办 3-10**（引脚 / 单信道 / 芯片封装）配套阅读 —— 本文的 B 方案正是「IR 走那条信道」的载荷。
+
+**一句话结论**
+- **单向（图片 → 代码）：能，但只是「高概率可用的初稿」**，不是编译器。静态布局 / 文字 / 配色可用；**像素级间距、响应式、交互态**是明确短板。
+- **双向（可视化 ↔ 任意代码）：不能「直接」做到。** 工程上只有两条路：**IR 为单一真相源**，或**代码为真相源 + 插桩 + 限制编辑范围**。前者适合 Lunac，后者不适合（详见 C）。
+
+**A. 单向「图片 → 代码」的能力边界（有据）**
+
+| 事实 | 出处 |
+|---|---|
+| Design2Code（截图→HTML/CSS）人工评估：GPT-4V 产物 **49%** 可替代原页面；细粒度上主要落后在「召回视觉元素」和「生成正确布局」，文字/配色可微调改善 | [项目页](https://salt-nlp.github.io/Design2Code/) · [arXiv 2403.03163](https://arxiv.org/abs/2403.03163) |
+| **交互生成明显弱于整页生成**；十类失败模式；视觉上不明显的交互表现差（127 网页 / 374 交互 / 31 类交互） | [Interaction2Code, ASE 2025](https://arxiv.org/abs/2411.03292) |
+| **「保真度—响应式悖论」**：视觉还原越高的模型越容易抄绝对坐标、产出非响应式代码（metadata trap） | [FigmaBench（OpenReview）](https://openreview.net/attachment?id=VCyvem1v0R&name=pdf) |
+| 从零生成可交互站点：最好组合（Bolt.diy + DeepSeek-R1）**27.8%** 用例通过 | [WebGen-Bench, NeurIPS 2025](https://papers.nips.cc/paper_files/paper/2025/hash/6841eed8bb6a2ec49e49235c8115efee-Abstract-Datasets_and_Benchmarks_Track.html) |
+| 成熟度分三档（可靠性递增，原因是**输入信息更多**不是模型更聪明）：截图 → 设计文件（变量/组件/布局）→ 设计系统（Code Connect） | [Figma MCP](https://help.figma.com/hc/en-us/articles/32132100833559-Guide-to-the-Dev-Mode-MCP-Server) · [Builder.io](https://www.builder.io/figma-to-code) |
+
+⚠️ **未查到**：2026 年当代模型在同一口径（Design2Code / Interaction2Code）上的最新权威分数；现有数字基于 2024–2025 模型，**不能直接外推**。
+
+**B. 双向为什么难（七类丢信息点）**：节点身份、格式/结构、样式语义、token 语义、动态行为、响应式、**真相源漂移**。
+- **CSSOM 不可靠**：浏览器会规范化 shorthand、把颜色转 `rgba()`、重排值顺序；CSS 变量在 shorthand 里可能序列化成空串（[GrapesJS 官方警告](https://grapesjs.com/docs/guides/Custom-CSS-parser.html)）。
+- **最直白的反例**：**Webflow 导出不能导回**（[官方](https://help.webflow.com/hc/en-us/articles/33961386739347-Code-export) · [社区](https://discourse.webflow.com/t/exporting-and-importing-website/38734/1)）；DevLink Export 也只承诺「Webflow → 代码」单向（[官方](https://help.webflow.com/hc/en-us/articles/44746282129427-Export-components-with-DevLink-Export)）。
+
+**两条工程化路线**
+
+| 路线 | 真相源 | 代表 | 对 Lunac 的适配 |
+|---|---|---|---|
+| **IR 为单一真相源** | 结构化 JSON（节点树） | Puck（`Data.content/root/zones`）、Retool（App JSON 可导出/导入）、Node-RED / n8n（Flow JSON） | ✅ **适配**：符合 §禁用 62；token 可强制；无需 `innerHTML` |
+| **代码为真相源 + 插桩** | 源码 + AST | Onlook（宣称 code is source of truth，构建期注入标记；**只支持 React 仓库**） | ❌ **不适配**：Lunac 插件是单文件 ESM、无统一构建步骤、`type:"html"` 是字符串子语言、无 source map |
+
+**C. Lunac 内的三个递进方案（推荐 A → B；C 不做）**
+
+| | A 截图反馈（现在） | B IR 单一真相源（iframe 后） | C 代码双向（不做） |
+|---|---|---|---|
+| 真相源 | 代码（`index.js`） | **IR（`panel.json`）** | 代码 + AST |
+| 双向 | 否（是「重新生成 + 人工复核」） | 是（IR ↔ 可视化/AI） | 是 |
+| 表达力 | 任意 HTML/CSS | 节点白名单（v1 建议 10–12 个） | 任意代码 |
+| 主题合规 | 靠提示 + lint | **渲染器强制**（IR 只存 token 名） | 难保证 |
+| 新增运行时依赖 | 0 | 0 | 需 parser（与零依赖冲突） |
+| 成本 | 1–2 人日 | 3–5 周 MVP（不做编辑器则 1.5–2 周） | 1–3 人月起，长期维护重 |
+
+**A 的失败模式与缓解**（按概率）：抄绝对坐标 → 提示强制 flex/grid + 4/6/8/12、禁绝对定位；响应式没做 → 至少给 2–3 个宽度截图；交互态缺失 → 明确列出 hover/focus/disabled/空/错误态；**硬编码颜色** → 加 lint 禁 `#rrggbb`/`rgb()` 只许 `var(--…)`；引网络 import → 提示「单文件 ESM、零网络 import」；**跨域 iframe 是黑盒** → 用宿主级 OS 截图，不要试图读 iframe DOM（tldraw Make Real 同遇此问题，[原文](https://tldraw.substack.com/p/make-real-the-story-so-far)）。
+
+**B 的 IR 骨架（要点）**
+- 节点：`panel/row/column/grid/scroll/divider/spacer` + `text/heading/icon/image` + `button/input/textarea/toggle/slider/select/progress/list`。
+- **颜色只允许 token 名**（`text` / `text-dim` / `text-muted` / `surface-glass` / `border-glass` / `accent` / `green` / `red` / `yellow` / `blue`）；间距只允许 `4/6/8/12`；按钮 `variant` 只允许 `action/neutral/danger`；**IR 里出现 hex/rgb 即构建失败**。
+- 事件只写「事件 → 动作名」；`actions` 只允许 `set/toggle/increment/call/emit`；`call` 指向 `index.js` 的 handler，**IR 不嵌入可执行代码**；插值只允许 `{{state.x}}`。
+- **单一真相源**：`panel.json` 管结构与样式；`index.js` 只留行为；`renderIR()` 是唯一 IR→DOM 实现；`styles.css` 仍是 token 值的唯一来源，**加一条测试：IR 用到的每个 token 必须在 `:root` 存在**。
+- 与信道：`ir:render`（全量快照，MVP 够用）/ `state:patch` / `theme` / `resize` / `reload` + 插件侧 `action` / `bind` / `ready` / `error`；**IR 过信道而不是 HTML 字符串**（渲染用 `textContent`/DOM API，不 `innerHTML`）。
+- 兼容：保留 `type:"html"`，新插件才走 `type:"ir"`，**不强制迁移**。
+
+**D. 对 §待办 3-10 的两条直接影响**
+1. **iframe 不只隔离 CSS/DOM，也能隔离脚本执行** —— 参照 Retool 把 JS 放**不同域独立 iframe**（[官方](https://docs.retool.com/3.300/queries/concepts/javascript)）；这为「把 `type:"html"` 从 `innerHTML` 迁移到 iframe」提供了产品级先例。
+2. **B 方案的保存路径缺一个窄命令**：仓库**未查到**现成的 `write_file` / `write_text` 宿主命令 ⇒ 可视化编辑器「保存 `panel.json`」需要新增**窄范围**写入命令（路径白名单 + 原子写），或走 agent 写盘。
+
+**E. 建议顺序**
+1. **现在**：A（加「截图并问 AI」动作，提示词固定带 `Modules\README.md` + `docs/ui-style.md` + 当前 `index.js`；加生成后 lint）。
+2. **iframe 信道落地后**：B（先 `panel.json` + 渲染器 + `type:"ir"`，**不先做可视化编辑器**）。
+3. **再做**：可视化编辑器（树 + 属性面板 + 预览 + 保存）。
+4. **C 不做**（除非将来插件改成 React/TS + 构建链，且宿主愿意维护 parser / 插桩 / source map）。
+
 ## §待办 4 长期方向（方向性、不排期；进入实施前先提升为 §待办 1–3 正文）
 
 > 来源：用户 2026-10-09 立项的**长期 AI 侧规划**（分阶段能力成熟度路线图 S0–S4）。主题 = 本地模型只参与决策 / agent 整体框架图 / skills + tools 完善与长任务托管 / 到达 AGI 的要求。**本节不构成待办**，只登记方向与已对齐的调研结论。

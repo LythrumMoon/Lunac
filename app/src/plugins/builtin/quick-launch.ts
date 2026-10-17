@@ -1,14 +1,15 @@
 // Custom Local Launch plugin — manages user-added paths/files/shortcuts.
 //
 // 数据源（2026-09 修订）：持久注册表 <exe 根>\ModuleData\custom\app_registry.json。
-// 入口：
-//   1. 搜索栏拖入 / 粘贴的文件（addFileChip → add_custom_app 自动注册）
-//   2. 本面板「添加启动项」按钮（原生文件选择框）
-//   3. 命令行/手动粘贴路径后回车（搜索栏气泡）
 //
-// 面板行为：打开即列出全部已注册自定义文件（含会话内附加但未注册的临时项），
-// 支持逐条启动 / 删除（删除 = 注销 + 移除对应气泡）；删除/新增后派发事件让主
-// 程序刷新面板，数据不会“消失”。
+// ⚠️ 注册的**唯一入口**（2026-10-16 定，防后人把自动注册加回来）：本面板「添加启动项」
+//   按钮（原生文件选择框）→ 宿主 `add_custom_app`。搜索栏的粘贴 / 拖放 / 剪贴板自动识别
+//   **只做本次附件**（`main.ts::addFileChip` 已无任何注册分支），**不得**再从这里或别处
+//   自动补注册 —— 用户没显式添加就不该被注册（用户原话：「明明没有添加，也会添加进去」）。
+//
+// 面板行为：打开即列出全部已注册自定义文件 + 本会话附加但**未注册**的临时项
+//（badge 区分「已注册」/「本次」）；支持逐条启动 / 删除（删除 = 注销 + 移除对应气泡）；
+// 删除/新增后派发事件让主程序刷新面板，数据不会“消失”。
 //
 // 入口词已做多语言/拼音覆盖（launch/open/qidong/dakai/自定义/快速启动…），
 // pluginRegistry 会对中文关键词自动生成拼音索引。
@@ -55,11 +56,9 @@ export const quickLaunchPlugin: Plugin = {
       // registry 不可读时仅显示会话附加项
     }
 
-    // 兜底：会话气泡若尚未写进注册表（旧会话 / 偶发失败）补注册，保证面板可见
-    for (const p of attachedFiles) {
-      invoke("add_custom_app", { name: "", path: p }).catch(() => {});
-    }
-
+    // ⚠️ 这里**不做**任何「补注册」：会话附件只以「本次」行列在面板里，注册只由用户
+    // 点「添加启动项」触发（见文件头）。旧代码曾按 FILE_CHIP_LIMIT 自动补注册前 N 个，
+    // 那正是「用户没添加也被注册」的 bug，已删除，不得加回。
     const byPath = new Map<string, LaunchRow>();
     for (const r of registered) {
       if (!r.path) continue;

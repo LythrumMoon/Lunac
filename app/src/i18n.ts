@@ -657,6 +657,21 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "사고",
     "en": "Thinking",
   },
+  // 「更多设置」分页页签（2026-10-16）：权限 / 工作区 / 人格 复用既有键，工具 / 其他新增短标签
+  "chat.more_tab_tools": {
+    "zh-CN": "工具",
+    "zh-TW": "工具",
+    "ja": "ツール",
+    "ko": "도구",
+    "en": "Tools",
+  },
+  "chat.more_tab_other": {
+    "zh-CN": "其他",
+    "zh-TW": "其他",
+    "ja": "その他",
+    "ko": "기타",
+    "en": "Other",
+  },
   // 思考开关只有开 / 关两档（端点上没有「力度」旋钮，见 ai-spec §3.5）
   "chat.mode_on": {
     "zh-CN": "开",
@@ -1202,6 +1217,15 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "内部トレースが長すぎるため、切り詰めました",
     "ko": "내부 과정이 너무 길어 잘렸습니다",
     "en": "Subagent trace was too long and has been truncated",
+  },
+  // 子代理撞轮数 / token 上限、交回**部分报告**（`task_done.partial`，2026-10-16）。
+  // 语义是「不完整」不是「失败」⇒ 前端用 `--yellow` 告警系，不用危险红。
+  "agent.subtask_partial": {
+    "zh-CN": "已达上限，结果可能不完整",
+    "zh-TW": "已達上限，結果可能不完整",
+    "ja": "上限に達しました。結果が不完全な可能性があります",
+    "ko": "상한에 도달했습니다 — 결과가 불완전할 수 있습니다",
+    "en": "Reached its limit — the result may be incomplete",
   },
   // 命令静态安全分析（agent 随 can_use_tool 上报 analysis 字段，见 ai-spec §3.5）
   "agent.static_danger": {
@@ -7148,6 +7172,59 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "ペルソナ",
     "ko": "페르소나",
     "en": "Persona",
+  },
+  // 「人格名」（2026-10-16）：现作**人格预设命名弹框的标题**（命名 ≠ AI 配置，
+  // 只落 localStorage、不进 prompt）。
+  "settings.persona_name": {
+    "zh-CN": "人格名",
+    "zh-TW": "人格名",
+    "ja": "ペルソナ名",
+    "ko": "페르소나 이름",
+    "en": "Persona name",
+  },
+  // 人格预设（2026-10-16）：列表内联在人格分页；「预设」= 入口按钮文案，「新建预设」=
+  // 列表下方的新建按钮（点开命名弹框）。存储键 lunac-persona-presets / lunac-persona-active。
+  "settings.persona_preset": {
+    "zh-CN": "预设",
+    "zh-TW": "預設",
+    "ja": "プリセット",
+    "ko": "프리셋",
+    "en": "Preset",
+  },
+  "settings.persona_preset_new": {
+    "zh-CN": "新建预设",
+    "zh-TW": "新增預設",
+    "ja": "プリセットを新規作成",
+    "ko": "프리셋 새로 만들기",
+    "en": "New preset",
+  },
+  "settings.persona_preset_empty": {
+    "zh-CN": "暂无预设",
+    "zh-TW": "尚無預設",
+    "ja": "プリセットがありません",
+    "ko": "프리셋 없음",
+    "en": "No presets yet",
+  },
+  "settings.persona_preset_name_empty": {
+    "zh-CN": "请输入名称",
+    "zh-TW": "請輸入名稱",
+    "ja": "名前を入力してください",
+    "ko": "이름을 입력하세요",
+    "en": "Enter a name",
+  },
+  "settings.persona_preset_name_dup": {
+    "zh-CN": "该名称已存在",
+    "zh-TW": "此名稱已存在",
+    "ja": "その名前は既に存在します",
+    "ko": "이미 있는 이름입니다",
+    "en": "That name already exists",
+  },
+  "settings.persona_preset_too_long": {
+    "zh-CN": "人格内容超出上限（{n} 字），无法保存为预设",
+    "zh-TW": "人格內容超出上限（{n} 字），無法儲存為預設",
+    "ja": "ペルソナ本文が上限（{n} 文字）を超えているため保存できません",
+    "ko": "페르소나 내용이 상한({n}자)을 초과해 저장할 수 없습니다",
+    "en": "Persona text exceeds the {n}-character limit and can't be saved",
   },
   // 人格（L2）2026-09-21 搬进输入栏「更多设置」。**刻意不留任何说明文案**（2026-10-06 用户
   // 要求：标题只留「人格」，标题下方那句说明与文本框的 placeholder 全部删掉）—— 功能自解释；

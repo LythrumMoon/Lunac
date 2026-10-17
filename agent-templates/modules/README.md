@@ -158,6 +158,22 @@ Lunac 的搜索结果里，除了内置功能，还能出现**插件**。
 
 > 什么时候用它：你想「照抄设置面板的样式和交互做一个变体」时。纯自绘面板不需要它。
 
+### `reuse` 的面板骨架 / DOM 契约（**照抄前先读**）
+
+`reuse` **不是**「抄个大概就行」——它要求你的结果 HTML 里的**节点 id / class 与内置面板逐一对齐**，
+否则那套监听找不到元素：轻则某个按钮点了没反应，重则整块不挂（`translate` 就是「五个必需节点缺一个就全不挂」）。
+
+- **可复用的 id 只有这五个基础插件**（写别的只记一条警告、不生效）：
+  `translate`（翻译）/ `quick-launch`（快速启动）/ `memo`（备忘录）/ `settings`（设置）/ `tool-editor`（工具编辑器）。
+- **推荐用 `translate`**：契约最小，只要 `#xl-input` / `#xl-from` / `#xl-to` / `#xl-go` / `#xl-result` 五个节点。
+- **不建议用 `settings` / `tool-editor`**：前者要整段抄面板 HTML；后者用**全局 `document`**
+  （不是 `root`），`layout.takeover` 下永远不生效。
+- **最常见的错**：id / class 抄错一个（按钮变死）；写了拓展插件 id 当 `reuse`（不生效）；
+  自己 `attach` 里重画 `root.innerHTML` 却没重挂监听。
+
+> **逐面板的必需 id / class、可直接复制的 `lunac-plugin.json` + `index.js` 骨架、完整常见错误清单与
+> `文件:行号` 依据，见同目录 [`panel-templates.md`](./panel-templates.md)。**
+
 ### 窗口形态：`window`
 
 `permissions` 回答的是「**这个插件被允许动什么**」，这一段回答的是「**它的悬浮窗长什么样**」——
