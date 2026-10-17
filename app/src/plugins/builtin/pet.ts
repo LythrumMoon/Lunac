@@ -47,6 +47,7 @@ import {
   makeHotkey,
   readCdi3Names,
   readExpressionParams,
+  readPhysicsParams,
   readVtsHotkeys,
   readVtsParamIds,
   saveHotkeys,
@@ -238,6 +239,10 @@ interface PetConfig {
   /** 各模型**参数类型的手动覆盖**（模型绝对路径 → { 参数 id → "switch" | "range" }）。
    *  自动判定（区间 0..1 + 实际只取 0/1）不可能 100% 准 ⇒ 给人一个出口；缺省 = 用自动判定。 */
   paramKinds: Record<string, Record<string, "switch" | "range">>;
+  /** **动作模板是否包含物理输出参数**（默认 `false`）。
+   *  物理输出的参数每帧都会被物理写值 ⇒ 模板里给它们铺曲线**无效**（会被物理覆盖）。
+   *  只有用户**关掉物理**、想手动驱动头发 / 尾巴时才需要打开（动作页的同名开关）。 */
+  motionTemplateIncludePhysics: boolean;
   /** 各模型勾为**循环播放**的动作（模型绝对路径 → 动作文件名词干数组）。**空 = 没有**。
    *  桌宠窗装载时把它们交给引擎（`MountOptions.idleMotions`）；引擎在动作队列空时按顺序轮播，
    *  并用各文件自己的 `Meta.Duration` 做超时兜底。
@@ -297,7 +302,7 @@ interface LegacyProactiveCfg {
 }
 
 const DEFAULT_CFG: PetConfig = {
-  image: "", model: "", scale: 1, offsetX: 0, offsetY: 0, rotation: 0, clickThrough: false, expressions: {}, params: {}, paramKinds: {}, idleMotions: {}, hotkeyStates: {},
+  image: "", model: "", scale: 1, offsetX: 0, offsetY: 0, rotation: 0, clickThrough: false, expressions: {}, params: {}, paramKinds: {}, motionTemplateIncludePhysics: false, idleMotions: {}, hotkeyStates: {},
   proactive: { enabled: false, intervalMin: 30, dailyCap: 20, date: "", used: 0 },
   tts: true,
   speechRate: RATE_DEFAULT,
@@ -410,6 +415,8 @@ function loadConfig(): PetConfig {
       expressions,
       params,
       paramKinds,
+      // 动作模板默认**排除物理输出**（老配置缺这个字段 ⇒ false，物理每帧覆盖的曲线没必要生成）。
+      motionTemplateIncludePhysics: o.motionTemplateIncludePhysics === true,
       idleMotions,
       hotkeyStates,
       proactive,
@@ -709,7 +716,7 @@ function hotkeyBlock(): string {
  *  （宿主 `list_motion_files`），每行可改名 / 删除 / 播放。播放入口 = 引擎合成组的下标
  *  （`MOTION_EXTRA_GROUP` + 文件在扫描序里的位置），**文件名是 AI 侧的调用键**。
  *  与热键页同一纪律：行是 JS 渲染的动态列表，样式按结构类写。 */
-function motionBlock(): string {
+function motionBlock(cfg: PetConfig): string {
   return `
   <div class="pet-motions" id="pet-motions">
     <!-- **动作链**（2026-10-10 用户口径：与「恢复默认」一样放在动作页**最上面**）：
@@ -722,8 +729,13 @@ function motionBlock(): string {
       <div class="pet-note" id="pet-chain-msg"></div>
     </div>
     <div class="pet-row">
-      <button type="button" id="pet-mo-add" class="pet-btn pet-btn-primary" title="在模型文件夹里生成一个覆盖本模型全部参数的 *.motion3.json 模板（1 秒 / 30fps / 循环），交给 AI 去编曲线。">新建动作（motion3 模板）</button>
+      <button type="button" id="pet-mo-add" class="pet-btn pet-btn-primary" title="在模型文件夹里生成一个参数模板（*.motion3.json，1 秒 / 30fps / 循环），交给 AI 去编曲线。默认跳过物理输出参数。">新建动作（motion3 模板）</button>
     </div>
+    <div class="pet-row">
+      <span class="pet-label">${esc(t("pet.motion_tpl_include_physics"))}</span>
+      <button type="button" id="pet-mo-tpl-physics" class="pet-btn pet-btn-toggle${cfg.motionTemplateIncludePhysics ? " on" : ""}" aria-pressed="${cfg.motionTemplateIncludePhysics ? "true" : "false"}">${esc(onOffText(cfg.motionTemplateIncludePhysics))}</button>
+    </div>
+    <div class="pet-note">${esc(t("pet.motion_tpl_include_physics_note"))}</div>
     <div class="pet-mo-list" id="pet-mo-list"></div>
     <div class="pet-note" id="pet-mo-msg"></div>
   </div>`;
@@ -804,6 +816,38 @@ async function readCoreIdsAsync(modelPath: string): Promise<CoreIdTable> {
 
 /** 调试区当前渲染出的参数范围（id → {min,max}）。**每次重画整体重建**，供数值框夹取用。 */
 let debugMeta = new Map<string, { min: number; max: number }>();
+
+/** 各模型**物理输出参数集**的同步镜像（小写模型路径 → Set）。
+ *  持久化 / 恢复是高频路径，不能每拖一格都去读文件；真正的刷新点在调试页、
+ *  热键页与桌宠挂载（它们都调 `readPhysicsParams`，后者自己按 mtime / size 失效）。 */
+const physicsOutputsByModel = new Map<string, Set<string>>();
+const EMPTY_PHYSICS_OUTPUTS = new Set<string>();
+
+/** 读一次物理输出（走唯一解析器）并刷新同步镜像。 */
+async function loadPhysicsOutputs(modelPath: string): Promise<Set<string>> {
+  const { outputs } = await readPhysicsParams(modelPath);
+  const set = new Set(outputs);
+  physicsOutputsByModel.set(modelPath.toLowerCase(), set);
+  return set;
+}
+
+/** 取物理输出集：已加载过就直接用镜像（高频路径），否则先读一次。 */
+async function ensurePhysicsOutputs(modelPath: string): Promise<Set<string>> {
+  return physicsOutputsByModel.get(modelPath.toLowerCase()) ?? loadPhysicsOutputs(modelPath);
+}
+
+/** 从一份「参数 id → 值」里剔除物理输出（读取 / 重放 / 落盘前的统一口径）。 */
+function withoutPhysicsOutputs(
+  rec: Record<string, number>,
+  physicsOutputs: Set<string>,
+): Record<string, number> {
+  if (!physicsOutputs.size) return { ...rec };
+  const out: Record<string, number> = {};
+  for (const [id, v] of Object.entries(rec)) {
+    if (!physicsOutputs.has(id)) out[id] = v;
+  }
+  return out;
+}
 
 let hkList: Hotkey[] = [];
 let hkTargets: HotkeyTargets = {
@@ -1258,13 +1302,29 @@ function setChainBar(chainId: string | null, index: number, pct: number | null):
 }
 
 
+/** 模板要铺曲线的参数 id（**纯函数**，便于断言 / 复用）。
+ *  默认**跳过物理输出**：这些参数每帧都会被物理写值，模板里的曲线会被覆盖 ⇒ 写了也无效。
+ *  `includePhysics = true` 只在用户关掉物理、想手动驱动头发 / 尾巴时才该用。 */
+export function motionTemplateParamIds(
+  parameters: string[],
+  physicsOutputs: Iterable<string>,
+  includePhysics: boolean,
+): string[] {
+  if (includePhysics) return [...parameters];
+  const skip = new Set(physicsOutputs);
+  return parameters.filter(id => !skip.has(id));
+}
+
 /** 按当前模型的运行时参数表生成一个 motion3 模板（每个参数一条**常数曲线**，取模型默认值）。
  *  这**不是**「好看的动作」—— 它只是把参数铺齐、时长 1s / 30fps / 循环，留给 AI 往里编曲线。
+ *  **默认排除物理输出**（见 `motionTemplateParamIds`）；动作页的 opt-in 开关才打开它们。
  *  拿不到运行时参数表（从没显示过桌宠）⇒ 返回 null（调用方提示先显示一次）。 */
 async function buildMotionTemplate(modelPath: string): Promise<string | null> {
   const core = await readCoreIdsAsync(modelPath);
   if (!core.parameters.length) return null;
-  const curves = core.parameters.map(id => {
+  const includePhysics = loadConfig().motionTemplateIncludePhysics;
+  const physicsOutputs = includePhysics ? [] : (await loadPhysicsOutputs(modelPath));
+  const curves = motionTemplateParamIds(core.parameters, physicsOutputs, includePhysics).map(id => {
     const r = core.parameterRanges[id];
     const v = r && Number.isFinite(r.def) ? r.def : 0;
     // `Segments` 是扁平数组：`[起点x, 起点y, 段类型, x, y]`；类型 0 = 线性（这里是一条常数段）。
@@ -1491,6 +1551,8 @@ async function refreshHotkeys(): Promise<void> {
   // 挂载模型时写进 localStorage 的那份；都没开过 ⇒ 只剩动作 / 表情 / 物理三类可选（提示用户开一次桌宠）。
   const core = await readCoreIdsAsync(model);
   hkTargets = await enumerateTargets(model, core);
+  // `enumerateTargets` 内部走唯一解析器；顺手把物理输出镜像刷新给持久化 / 重放用。
+  physicsOutputsByModel.set(model.toLowerCase(), new Set(hkTargets.physicsOutputs));
   hkList = await loadHotkeys(model);
   // 老文件里 `keys` 可能是空串（早期导入只建条目、不绑键）⇒ 补齐默认键并落盘一次。
   if (assignDefaultKeys(hkList)) {
@@ -1586,6 +1648,7 @@ function settingsHtml(cfg: PetConfig): string {
     <div class="pet-row pet-reset-row">
       <button type="button" id="pet-reset-debug" class="pet-btn" title="把该模型调过的参数全部恢复默认（会清掉你的调整）">恢复默认</button>
     </div>
+    <div class="pet-note">${esc(t("pet.debug_phys_pin_note"))}</div>
     <div class="pet-debug" id="pet-debug">
       <div class="pet-debug-note" id="pet-debug-note" hidden></div>
       <div class="pet-debug-body" id="pet-debug-body"></div>
@@ -1601,7 +1664,7 @@ function settingsHtml(cfg: PetConfig): string {
     <div class="pet-row pet-reset-row">
       <button type="button" id="pet-reset-motions" class="pet-btn" title="删掉本模型文件夹里由本插件生成的 *.motion3.json">恢复默认</button>
     </div>
-    ${motionBlock()}
+    ${motionBlock(cfg)}
   </div>
   <!-- 三个新分页（2026-10-13）：把原先散在页签之外的三块控件搬进来。
        迁移只挪节点、接线（事件委托 / 落盘）原样复用，语义不分叉。 -->
@@ -1787,14 +1850,19 @@ async function attachSettings(root: HTMLElement): Promise<void> {
   /** 读某模型**持久化**的调试参数（缺省 = 空对象 = 全默认）。**优先读 `lunac.params.json`
    *  里的 `params`**（AI 可直接改它、重开设置窗反向同步），文件没有 / 为空再回退配置。 */
   const savedParams = async (modelPath: string): Promise<Record<string, number>> => {
+    // **物理输出不参与恢复**：老版本把物理输出值也存了下来（拖一次就永久钉住）；这里读时
+    // 直接忽略这些键 —— 不删用户已有文件，只是不再把它们当「用户设定」重放。
+    const physicsOutputs = await ensurePhysicsOutputs(modelPath);
     try {
       const cache = await loadPetParams(modelPath);
-      if (cache && Object.keys(cache.params).length) return cache.params;
+      if (cache && Object.keys(cache.params).length) {
+        return withoutPhysicsOutputs(cache.params, physicsOutputs);
+      }
     } catch {
       /* 读文件失败 ⇒ 回退配置 */
     }
     const p = loadConfig().params[modelPath];
-    return p && typeof p === "object" ? p : {};
+    return p && typeof p === "object" ? withoutPhysicsOutputs(p, physicsOutputs) : {};
   };
 
   /** 把某模型的 params **写回文件**——**约 400ms 防抖**（拖动时 `emitParamThrottled` 每 50ms
@@ -1811,7 +1879,10 @@ async function attachSettings(root: HTMLElement): Promise<void> {
       try {
         const cache = (await loadPetParams(model)) ?? emptyPetParamCache(model);
         const cur = loadConfig().params[model];
-        cache.params = cur && typeof cur === "object" ? { ...cur } : {};
+        // 落盘也剔除物理输出：下次写入自然收敛掉老版本存下的「钉住值」，不必额外迁移。
+        const physicsOutputs = await ensurePhysicsOutputs(model);
+        cache.params =
+          cur && typeof cur === "object" ? withoutPhysicsOutputs(cur, physicsOutputs) : {};
         await savePetParams(model, cache);
       } catch (e) {
         console.warn("[pet] 写 lunac.params.json 失败", e);
@@ -1827,11 +1898,18 @@ async function attachSettings(root: HTMLElement): Promise<void> {
   /** 把某模型某个参数的当前值写回持久化（与 expressions 同一口径：按模型路径分键）。
    *  **同时更新模型目录下 `lunac-live2d\lunac.params.json`**（防抖，见 `scheduleParamFile`）。 */
   const persistParam = (modelPath: string, id: string, value: number) => {
-    const c = loadConfig();
-    const all = { ...c.params };
-    all[modelPath] = { ...(all[modelPath] ?? {}), [id]: value };
-    saveConfig({ ...c, params: all });
-    scheduleParamFile(modelPath);
+    void (async () => {
+      // **物理输出不持久化（本次修复的核心）**：物理每帧都会写这些参数。如果把拖到的值
+      // 存进 `PetConfig.params` / `lunac.params.json`，挂载时再重放，就等于「拖一次就永久
+      // 钉住」——物理再也拿不回控制权。拖条仍能临时压过物理（引擎的 heldParams 不动），
+      // 但只活在本次会话：隐藏 / 重开桌宠或设置窗后交还给物理自己算。
+      if ((await ensurePhysicsOutputs(modelPath)).has(id)) return;
+      const c = loadConfig();
+      const all = { ...c.params };
+      all[modelPath] = { ...(all[modelPath] ?? {}), [id]: value };
+      saveConfig({ ...c, params: all });
+      scheduleParamFile(modelPath);
+    })();
   };
 
   /** 按某模型持久化的值**恢复**调试区控件（拉条 + 数值框）：缺省用 0（引擎默认）。
@@ -2233,7 +2311,7 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     const tag = o.physIn
       ? `<span class="pet-phys-tag">${esc(t("pet.debug_phys_in"))}</span>`
       : o.physOut
-        ? `<span class="pet-phys-tag">${esc(t("pet.debug_phys_out"))}</span>`
+        ? `<span class="pet-phys-tag" title="${esc(t("pet.debug_phys_pin_note"))}">${esc(t("pet.debug_phys_out"))}</span>`
         : "";
     const kindBtn = `<button type="button" class="pet-param-kind" data-param-kind="${esc(id)}" data-kind="${o.isSwitch ? "switch" : "range"}" title="切换控件形态（开关 / 拉条）">${KIND_ICON}</button>`;
     // 开关行：留一个**隐藏的 range** 当值容器（`restoreParams` / 委托都按 `.pet-range[data-param]` 取），
@@ -2270,15 +2348,11 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     const core = await readCoreIdsAsync(model);
     const side = await findModelSideFiles(model); // vtube.json / cdi3.json
     const cdi3 = side.cdi3 ? await readCdi3Names(side.cdi3) : EMPTY_CDI3;
-    // 参数 / 物理输入输出与热键页**同一份枚举**（模型文件 + 运行时 id 表现取现算）。
-    let targets: HotkeyTargets | null = null;
-    try {
-      targets = await enumerateTargets(model, core);
-    } catch {
-      targets = null;
-    }
-    const physIn = new Set(targets?.physicsInputs ?? []);
-    const physOut = new Set(targets?.physicsOutputs ?? []);
+    // 物理输入 / 输出**与热键页同一个解析器**（唯一入口 `readPhysicsParams`，带 mtime 缓存）。
+    const phys = await readPhysicsParams(model);
+    physicsOutputsByModel.set(model.toLowerCase(), new Set(phys.outputs));
+    const physIn = new Set(phys.inputs);
+    const physOut = new Set(phys.outputs);
 
     // **精简**（用户 2026-10-10 口径）：来源 = 运行时 id 表（拿不到时退回静态 9 个常用项），
     // 但**减去两类「已有归属」的参数** —— 它们在别处被驱动，铺在调试区只是噪音：
@@ -3159,9 +3233,23 @@ async function attachSettings(root: HTMLElement): Promise<void> {
         if (id) void emit(CTL_EVENT, { type: "chain-play", id });
         return;
       }
+      if (t.closest("#pet-mo-tpl-physics")) {
+        // 动作模板的 opt-in：默认排除物理输出；只有关掉物理想手动驱动头发 / 尾巴时才打开。
+        const c = loadConfig();
+        const next = !c.motionTemplateIncludePhysics;
+        saveConfig({ ...c, motionTemplateIncludePhysics: next });
+        const btn = t.closest<HTMLElement>("#pet-mo-tpl-physics");
+        if (btn) {
+          btn.classList.toggle("on", next);
+          btn.setAttribute("aria-pressed", next ? "true" : "false");
+          btn.textContent = onOffText(next);
+        }
+        return;
+      }
       if (t.closest("#pet-mo-add")) {
-        // 「新建动作」= 在模型文件夹里**生成一个覆盖全参数的 motion3 模板**（用户口径），
-        // 交给 AI 去编曲线。拿不到运行时参数表就提示先显示一次桌宠。
+        // 「新建动作」= 在模型文件夹里生成 motion3 参数模板，交给 AI 去编曲线。
+        // **默认跳过物理输出**（物理每帧覆盖，曲线无效）；动作页的开关可 opt-in。
+        // 拿不到运行时参数表就提示先显示一次桌宠。
         void (async () => {
           const model = loadConfig().model.trim();
           if (!model) {
@@ -3791,20 +3879,24 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
         // **运行时 id 表 + 调试参数**一并落模型目录下的 `lunac-live2d\lunac.params.json`（2026-10-10，backlog ㉝③）：
         //   · `coreIds` 用引擎刚给的运行时表覆盖 ⇒ 设置窗**进插件读取之前**就能拿到它列目标
         //     （以前只有 localStorage 那份，没开过桌宠时是空的 —— 调试区 / 热键页一片空）；
-        //   · 附带 `enumerateTargets` 的**物理输入 / 输出分类** ⇒ 桌宠轮把它注进给 AI 的参数词表，
-        //     让 AI 知道哪些参数会被物理每帧覆盖（见 main.ts 的 buildPetActionHint）；
+        //   · **物理输入 / 输出分类**走唯一解析器 `readPhysicsParams`（禁止在这里再解析一遍
+        //     physics3.json）⇒ 桌宠轮把它注进给 AI 的参数词表，让 AI 知道哪些参数会被物理每帧覆盖；
         //   · `params` 优先用**文件里的**（AI 可能刚改过，别覆盖它），文件为空再回退 config 播种；
         //   · 失败只 warn：一份坏缓存不该把桌宠窗搞崩。
         let fileParams: Record<string, number> | null = null;
+        // 物理输出：本次挂载的「重放 / 播种」都要跳过它们（见下面的注释）。
+        let physicsOutputs = EMPTY_PHYSICS_OUTPUTS;
         try {
           const ids = h.listCoreIds();
+          const phys = await readPhysicsParams(modelPath);
+          physicsOutputs = new Set(phys.outputs);
+          physicsOutputsByModel.set(modelPath.toLowerCase(), physicsOutputs);
           const cache = (await loadPetParams(modelPath)) ?? emptyPetParamCache(modelPath);
           if (ids.parameters.length || ids.drawables.length || ids.parts.length) {
-            const tg = await enumerateTargets(modelPath, ids);
             const coreIds: CoreIdTable = {
               ...ids,
-              physicsInputs: tg.physicsInputs,
-              physicsOutputs: tg.physicsOutputs,
+              physicsInputs: phys.inputs,
+              physicsOutputs: phys.outputs,
             };
             cache.coreIds = coreIds;
             // localStorage 那份仍写：文件尚未生成时的老路径继续可用（桌宠轮读的就是它）。
@@ -3812,7 +3904,8 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
           }
           const cfgParams = latest.params[modelPath];
           if ((!cache.params || !Object.keys(cache.params).length) && cfgParams && typeof cfgParams === "object") {
-            cache.params = { ...cfgParams };
+            // 老配置里可能存着物理输出的「钉住值」—— 播种时就不带它们（文件的旧内容不删）。
+            cache.params = withoutPhysicsOutputs(cfgParams, physicsOutputs);
           }
           fileParams = cache.params;
           await savePetParams(modelPath, cache);
@@ -3828,11 +3921,16 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
         if (savedExpr) h.setExpression(savedExpr);
         // 该模型**调试参数**：装载后自动应用（**优先用文件里的 `params`**，文件为空再回退 config）——
         // 重开桌宠窗参数仍在，且 AI 直接改文件的值能反向生效。
+        // ⚠️ **物理输出不重放**：老版本会把物理输出值一起存下来（拖一次就永久钉住）。
+        // 这里显式跳过 ⇒ 升级后这些老值会被**释放**（物理重新接管），用户不用手动清文件；
+        // 文件里的旧键保留原样，等下一次参数写入时自然收敛（见 `flushParamFile`）。
         const applyParams =
           fileParams && Object.keys(fileParams).length ? fileParams : latest.params[modelPath];
         if (applyParams) {
           for (const [id, value] of Object.entries(applyParams)) {
-            if (typeof value === "number") h.setParameter(id, value);
+            if (typeof value !== "number") continue;
+            if (physicsOutputs.has(id)) continue; // 物理输出：临时钉住可以，重放不行
+            h.setParameter(id, value);
           }
         }
         // **热键开关状态**：上次开着的那批重新施加（保持「先应用参数，再 restoreHotkeyStates」的既有次序）。

@@ -165,30 +165,63 @@ export async function saveHotkeys(modelPath: string, hotkeys: Hotkey[]): Promise
 //  目标枚举
 // ══════════════════════════════════════════════════════════════════
 
-async function readJsonAbs(absPath: string): Promise<unknown> {
-  const res = await fetch(convertFileSrc(absPath));
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+/** **物理输入 / 输出参数 id**（去重、保持出现次序）。 */
+export interface PhysicsParamIds {
+  inputs: string[];
+  outputs: string[];
 }
 
-/** 从 `.physics3.json` 取**物理的输入 / 输出参数 id**（去重、保持出现次序）。
- *  Cubism 公开 schema：`PhysicsSettings[].Input[].Source` / `[].Output[].Destination`，
- *  其中 `Target` 是**目标类型名**（恒为 `"Parameter"` 这类字面量）、**真正的参数 id 在 `Id`**
- *  ⇒ 取 `Id`，仅在缺 `Id` 时退回 `Target`。文件读不到 / 结构不认识 ⇒ 两个空数组。 */
-async function physicsParams(absPath: string): Promise<{ inputs: string[]; outputs: string[] }> {
-  const json = (await readJsonAbs(absPath)) as { PhysicsSettings?: unknown } | null;
+/** 解析结果的模块级缓存。key = 物理文件**绝对路径**（小写：Windows 大小写不敏感）。
+ *  每个条目带 `mtimeMs` / `size` / `stamp` —— 模型重新导出后（mtime 或 size 变化）自动重解析。
+ *
+ *  ⚠️ **为什么还要 `stamp` 兜底**：Tauri 的 asset 协议只回 `Content-Length`、**不回
+ *  `Last-Modified`**（`tauri/src/protocol/asset.rs` 只写 CONTENT_TYPE / CONTENT_LENGTH），
+ *  所以浏览器里拿不到可靠的 mtime。拿不到时退化为「正文长度 + 文本哈希」指纹 ——
+ *  同样能发现文件被改，且不会在磁盘上另存一份名单（单一真相源仍是 `.physics3.json`）。 */
+interface PhysicsCacheEntry {
+  /** 内容指纹：`m:<mtimeMs>:<size>`（有 mtime）或 `h:<len>:<hash>`（无 mtime）。 */
+  stamp: string;
+  mtimeMs: number;
+  size: number;
+  value: PhysicsParamIds;
+}
+const physicsFileCache = new Map<string, PhysicsCacheEntry>();
+/** 已经 warn 过的路径 —— 同一份坏文件只吵一次，不刷屏、不阻断挂载。 */
+const physicsWarned = new Set<string>();
+
+/** 轻量文本指纹（FNV-1a 32 位）：只为「文件变没变」，不做安全用途。 */
+function textHash(s: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function warnPhysicsOnce(absPath: string, err: unknown): void {
+  const key = absPath.toLowerCase();
+  if (physicsWarned.has(key)) return;
+  physicsWarned.add(key);
+  console.warn("[pet] 读不到物理文件，已按空集合处理", absPath, err);
+}
+
+/** 从 `.physics3.json` 的对象取物理输入 / 输出参数 id。
+ *
+ *  Cubism 公开 schema：`PhysicsSettings[].Input[].Source` / `[].Output[].Destination`。
+ *  **真正的参数 id 在 `Id`**；`Target` 只是**类型标记**（恒为 `"Parameter"`），
+ *  绝不能当参数 id —— 否则每个输出都会变成同一个叫 "Parameter" 的假参数。 */
+function parsePhysicsSettings(json: unknown): PhysicsParamIds {
   const inputs: string[] = [];
   const outputs: string[] = [];
   const push = (arr: string[], v: string) => {
     if (v && !arr.includes(v)) arr.push(v);
   };
   const pickId = (obj: unknown): string => {
-    const o = obj as { Target?: unknown; Id?: unknown } | null | undefined;
-    if (typeof o?.Id === "string" && o.Id) return o.Id;
-    if (typeof o?.Target === "string" && o.Target) return o.Target;
-    return "";
+    const o = obj as { Id?: unknown } | null | undefined;
+    return typeof o?.Id === "string" ? o.Id : "";
   };
-  const settings = json?.PhysicsSettings;
+  const settings = (json as { PhysicsSettings?: unknown } | null)?.PhysicsSettings;
   if (!Array.isArray(settings)) return { inputs, outputs };
   for (const s of settings) {
     const inp = (s as { Input?: unknown })?.Input;
@@ -201,6 +234,77 @@ async function physicsParams(absPath: string): Promise<{ inputs: string[]; outpu
     }
   }
   return { inputs, outputs };
+}
+
+/** 读一个物理文件并走 mtime / size 缓存。读不到 ⇒ 空集合 + 一条 warn（不抛）。 */
+async function readPhysicsFile(absPath: string): Promise<PhysicsParamIds> {
+  const key = absPath.toLowerCase();
+  let mtimeMs = 0;
+  let size = 0;
+  let text: string;
+  try {
+    // HEAD 只取元数据：mtime（若协议给）+ 大小；命中缓存时连正文都不读。
+    const head = await fetch(convertFileSrc(absPath), { method: "HEAD" });
+    if (!head.ok) throw new Error(`HTTP ${head.status}`);
+    const len = Number(head.headers.get("content-length"));
+    if (Number.isFinite(len) && len >= 0) size = len;
+    const lm = head.headers.get("last-modified");
+    if (lm) {
+      const t = Date.parse(lm);
+      if (Number.isFinite(t)) mtimeMs = t;
+    }
+    const cached = physicsFileCache.get(key);
+    if (cached && mtimeMs > 0 && cached.mtimeMs === mtimeMs && cached.size === size) {
+      return cached.value;
+    }
+    const res = await fetch(convertFileSrc(absPath));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    text = await res.text();
+  } catch (e) {
+    warnPhysicsOnce(absPath, e);
+    return { inputs: [], outputs: [] };
+  }
+  // mtime 拿不到时用正文指纹兜底；两者都没有歧义地覆盖「重新导出」场景。
+  const stamp = mtimeMs > 0 ? `m:${mtimeMs}:${size}` : `h:${text.length}:${textHash(text)}`;
+  const cached = physicsFileCache.get(key);
+  if (cached && cached.stamp === stamp) {
+    cached.mtimeMs = mtimeMs;
+    cached.size = size;
+    return cached.value;
+  }
+  let value: PhysicsParamIds;
+  try {
+    value = parsePhysicsSettings(JSON.parse(text));
+  } catch (e) {
+    warnPhysicsOnce(absPath, e);
+    return { inputs: [], outputs: [] };
+  }
+  physicsFileCache.set(key, { stamp, mtimeMs, size, value });
+  return value;
+}
+
+/** **桌宠物理解析的唯一入口**：走 `model3.json` 的 `FileReferences.Physics` 找到
+ *  `.physics3.json`，再取 `PhysicsSettings[].Input[].Source.Id` / `[].Output[].Destination.Id`。
+ *
+ *  · `Id` 优先且**只认 `Id`**（`Target` 是类型标记，恒为 `"Parameter"`，不是参数 id）；
+ *  · 去重、保持出现顺序；
+ *  · 结果按「物理文件绝对路径 + mtimeMs + size（无 mtime 时用内容指纹）」缓存，
+ *    模型重新导出后自动失效；
+ *  · 文件缺失 / 解析失败 ⇒ 空集合 + 一条 warn，**不抛、不阻断挂载**。
+ *
+ *  热键页、调试页、桌宠挂载、动作模板都**只调它** —— 不允许再出现第二份 physics3 解析。 */
+export async function readPhysicsParams(modelPath: string): Promise<PhysicsParamIds> {
+  let json: Awaited<ReturnType<typeof readModelJson>> | null = null;
+  try {
+    json = await readModelJson(modelPath);
+  } catch (e) {
+    warnPhysicsOnce(modelPath, e);
+    return { inputs: [], outputs: [] };
+  }
+  const rel = json?.FileReferences?.Physics;
+  // 没有物理文件是合法状态（很多模型就是没有），不算失败、不打 warn。
+  if (typeof rel !== "string" || !rel) return { inputs: [], outputs: [] };
+  return readPhysicsFile(joinPath(dirName(modelPath), rel));
 }
 
 /**
@@ -243,18 +347,10 @@ export async function enumerateTargets(
     out.expressions = [];
   }
 
-  // 物理文件由 model3.json 的 `FileReferences.Physics` 指过来（相对模型目录）。
-  const physRel = json?.FileReferences?.Physics;
-  if (typeof physRel === "string" && physRel) {
-    try {
-      const abs = joinPath(dirName(modelPath), physRel);
-      const { inputs, outputs } = await physicsParams(abs);
-      out.physicsInputs = inputs;
-      out.physicsOutputs = outputs;
-    } catch {
-      /* 读不到物理文件：留空即可，不影响其它目标 */
-    }
-  }
+  // 物理输入 / 输出**只走唯一解析器**（内部按 mtime / size 缓存，失败返回空集合 + warn）。
+  const physics = await readPhysicsParams(modelPath);
+  out.physicsInputs = physics.inputs;
+  out.physicsOutputs = physics.outputs;
   return out;
 }
 

@@ -2187,6 +2187,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ko": "프리셋 동작",
     "en": "Motion presets",
   },
+  "pet.motion_tpl_include_physics": {
+    "zh-CN": "模板包含物理输出",
+    "zh-TW": "模板包含物理輸出",
+    "ja": "テンプレートに物理出力を含める",
+    "ko": "템플릿에 물리 출력 포함",
+    "en": "Include physics outputs in template",
+  },
+  "pet.motion_tpl_include_physics_note": {
+    "zh-CN": "默认排除物理输出参数（物理每帧会覆盖它们的曲线，写了也无效）。只有关掉物理、想手动驱动头发 / 尾巴时才需要打开。",
+    "zh-TW": "預設排除物理輸出參數（物理每幀會覆寫它們的曲線，寫了也無效）。只有關掉物理、想手動驅動頭髮 / 尾巴時才需要開啟。",
+    "ja": "既定では物理出力パラメータを除外します（物理が毎フレーム上書きするため、カーブを書いても無効です）。物理を切って髪や尻尾を手動で動かしたい場合だけオンにしてください。",
+    "ko": "기본적으로 물리 출력 파라미터는 제외됩니다(물리가 매 프레임 덮어써서 곡선이 무효가 됩니다). 물리를 끄고 머리카락/꼬리를 직접 움직일 때만 켜세요.",
+    "en": "Physics output parameters are excluded by default (physics overwrites their curves every frame, so the curves have no effect). Turn this on only when physics is off and you want to drive hair/tail manually.",
+  },
   "pet.debug_phys_in": {
     "zh-CN": "物理输入",
     "zh-TW": "物理輸入",
@@ -2200,6 +2214,13 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "物理出力",
     "ko": "물리 출력",
     "en": "Physics out",
+  },
+  "pet.debug_phys_pin_note": {
+    "zh-CN": "物理输出：仅临时钉住，不保存",
+    "zh-TW": "物理輸出：僅臨時釘住，不儲存",
+    "ja": "物理出力：一時的に固定されるだけで、保存されません",
+    "ko": "물리 출력: 임시로 고정될 뿐 저장되지 않습니다",
+    "en": "Physics outputs: pinned temporarily only, not saved",
   },
   "pet.debug_need_model": {
     "zh-CN": "先在「更换形象」里导入一个 Live2D 模型（*.model3.json），才能调试参数。",
