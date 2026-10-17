@@ -138,8 +138,8 @@ function wireTitlebar() {
     void invoke("plugin_window_close").catch(() => {});
   });
 
-  // 置顶初始态**必须问宿主**：建窗时就是 always_on_top(true)，
-  // 前端自己猜会出现「按钮显示未置顶、实际已置顶」的错位。
+  // 置顶初始态**必须问宿主**：建窗默认由宿主 `default_always_on_top()` 决定
+  // （只有桌宠模型窗默认置顶），前端自己猜会出现「按钮显示未置顶、实际已置顶」的错位。
   void invoke<boolean>("plugin_window_pin_state")
     .then(pinned => {
       const el = btn("plugin-pin");

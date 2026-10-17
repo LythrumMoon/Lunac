@@ -1025,25 +1025,59 @@ let queueDlgFiles: string[] = [];
  *  删除是**不可恢复**动作 ⇒ 单独一扇居中确认卡（复用 `#music-queue-dlg` 那套 `.music-dlg-mask`
  *  观感），**不用 `window.confirm`**（WebView2 里那套原生框与本仓观感不一致）。 */
 let delDlgTarget: { path: string; name: string } | null = null;
-/** **统一的行「选中集合」**（2026-10-11 用户第 5 条）：本地媒体库 / 队列详情 / 在线歌单
- *  的歌曲行**共用一套选中态**。存的是「哪一行」的稳定标识 —— 本地 = `MediaTrackDto.path`、
- *  在线 = `TrackDto.uri`（两套标识互不冲突；切页 / 切列表时清空，不跨页残留）。
+/** **行选择的唯一交互模型**（2026-10-17，资源管理器语义）。
  *
- *  单击一行 = 加入 / 移出本集合（高亮）；双击 = 播该曲；右键 = 上下文菜单。
- *  **旧 `queuePickSel` 并入这里**：那条只在 `queueEditOn` 期间有意义，与队列详情页的
- *  选中概念本来就是同一件事，合成一个集合之后「两套选中态打架」就不存在了。
+ *  每个列表一份状态（互不串），但单击 / Ctrl / Shift / Ctrl+A / Esc 的判定只写这一套。
+ *  key：本地行 / 播放队列行 = `MediaTrackDto.path`；在线行 = `TrackDto.uri`；
+ *  左栏自定义队列行 = `LocalQueue.id`。
  *
  *  ⚠️ **与 `mediaSel` 分开**：后者是左栏「目录」编辑态的勾选集 —— 🗑 会把它喂给宿主
- *  `media_remove_root` **落盘删目录**。把文件路径混进那一个集合，就有「把某个文件当成
- *  目录根删掉」的风险（安全边界，见 `queueItemDel` 的注释）。故行选中一律走本集合。 */
-let trackSel: Set<string> = new Set();
+ *  `media_remove_root`（从媒体库移除目录）。把歌曲路径混进那一个集合，就有
+ *  「把某个文件当成目录根删掉」的风险。故行选中一律走本模型。
+ *
+ *  ⚠️ **播放队列（`#music-lq-dd` 里的 `queue-play` 行）不在这套模型里**：它是
+ *  「点一下就是播这一首」的速览浮层，不是可多选的资源列表（2026-10-17 用户口径）。 */
+type TrackList = "library" | "queue" | "onlineMain" | "onlineQueue" | "queueList";
+interface ListSelection {
+  /** 选中的行 key。 */
+  ids: Set<string>;
+  /** Shift 范围选择的起点（最后一次「单击 / Ctrl+单击」落下的那一行）。 */
+  anchor: string | null;
+}
+const SELECTIONS: Record<TrackList, ListSelection> = {
+  library: { ids: new Set(), anchor: null },
+  queue: { ids: new Set(), anchor: null },
+  onlineMain: { ids: new Set(), anchor: null },
+  onlineQueue: { ids: new Set(), anchor: null },
+  queueList: { ids: new Set(), anchor: null },
+};
+/** 行 `data-act` → 所属列表。**唯一映射**（渲染 / 点击 / 右键 / 键盘都读它）。
+ *  ⚠️ `queue-play` **故意不登记**：播放队列的单击 = 立即播放，不参与多选（同 `TrackList` 注释）。 */
+const ACT_LIST: Record<string, TrackList> = {
+  "local-track": "library",
+  "queue-track": "queue",
+  "main-track": "onlineMain",
+  "play-uri": "onlineQueue",
+  "local-queue": "queueList",
+};
+/** 每个列表的 DOM 容器（`[data-act]` 行都在里面）。 */
+const LIST_CONTAINER_SEL: Record<TrackList, string> = {
+  library: "#music-mt-list",
+  queue: "#music-lq-list",
+  onlineMain: "#music-main",
+  onlineQueue: "#music-q, #music-q-dd",
+  queueList: ".music-lqs",
+};
+/** 上一次点过的列表 = 「当前聚焦列表」（Ctrl+A / Esc 的作用对象）。
+ *  任何一次落在列表行上的指针 / 焦点都会刷新它；点别处即清空。 */
+let focusedList: TrackList | null = null;
 /** 队列详情页筛选框的词（2026-10-11 用户第 3 条：队列页要有搜索栏，只过滤该队列）。 */
 let queueQuery = "";
 /** 队列页筛选的防抖表（每敲一个字不必立刻重画整张列表）。 */
 let queueQueryTimer: number | undefined;
 /** 右键上下文菜单当前指向的那一行（右键时记下；点菜单项时才读）。`null` = 菜单关着。 */
 interface CtxTarget {
-  /** local-track / queue-track / main-track / play-uri / queue-play。 */
+  /** local-track / queue-track / main-track / play-uri。 */
   act: string;
   /** 行下标（各列表各自的下标语义）。 */
   i: number;
@@ -1062,8 +1096,12 @@ let ctxTarget: CtxTarget | null = null;
  *  `media_remove_root` 落盘），本份存的是「某条自定义队列里的曲目路径」，落只在内存 / localStorage
  *  里改 `activeQueue().items`，**绝不动磁盘文件**。两件事混进一个集合迟早会把用户的文件删掉。
  *  只在「选中了某条队列（`activeQueueId !== null`）且 `mediaEditMode`」期间有意义 —— 退出
- *  （× 保存 / 返回 / 换队列）都清空。 */
+ *  （× 保存 / 点左栏换队列或回媒体库）都清空。 */
 let queueItemDel: Set<string> = new Set();
+/** 「修改列表」编辑态里**已暂存删除的左栏自定义队列 id**。
+ *  与 `queueItemDel`（队列里的歌）分开：本份只删队列条目本身，不动队列里的歌、不动磁盘。
+ *  只在 `mediaEditMode` 期间有意义，× 保存时才从 `localQueues` 里真正摘掉。 */
+let queueListPendingDel: Set<string> = new Set();
 /** 列表要滚到的那个路径（需求 3「播放时 / 重开插件时滚到当前那一首」）。
  *  设了它之后，下一次列表渲染（或 `startLocalPlay` 落地）会把对应那一行滚进视野并清空
  *  —— 用「设一次、消费一次」而不是每拍都滚，免得与用户自己滚动打架。 */
@@ -2342,6 +2380,18 @@ function applyGearQueueState(root: HTMLElement) {
  *     连同旧骨架一起销毁（监听按 id 绑 ⇒ 永久失效，表现是「开一次队列详情 / 返回一次媒体库后设置
  *     按钮就没了」）。修法：**只认「当前页自己的那一行」**——换页那一刻目标行还不存在 ⇒ 齿轮先留在
  *     工具条，等 `renderLocalMain` 建好骨架后由它末端的 `placeGear` 搬回去。 */
+/** 骨架整块重写前把设置齿轮**先收回工具条**。
+ *
+ *  齿轮是共享节点（点击监听按 id 绑死，见 placeGear）。它此刻可能正躺在即将被
+ *  `innerHTML` 换掉的那一行里 —— 直接重写会把它连同旧骨架一起销毁，之后 `placeGear`
+ *  再也找不到它，表现就是「进过自定义队列页再回媒体库，设置按钮永久消失」
+ *  （2026-10-17 用户报障）。收回后由 renderLocalMain 末尾的 placeGear 搬进新骨架。 */
+function parkGear(root: HTMLElement) {
+  const gear = root.querySelector<HTMLElement>("#music-setup-toggle");
+  const bar = root.querySelector<HTMLElement>(".music-toolbar");
+  if (gear && bar && gear.parentElement !== bar) bar.appendChild(gear);
+}
+
 function placeGear(root: HTMLElement) {
   const gear = root.querySelector<HTMLElement>("#music-setup-toggle");
   const bar = root.querySelector<HTMLElement>(".music-toolbar");
@@ -2361,8 +2411,8 @@ function placeGear(root: HTMLElement) {
   }
   // 落点：
   //  · 媒体库页 = 左侧第一枚功能钮（扫描钮）**右边**（2026-10-01 用户口径）。
-  //  · 队列详情页 = 行末（**最右**，2026-10-11 用户第 3 条：那一行是 `[返回] [搜索框] [设置]`，
-  //    齿轮在搜索框右边；搜索框 flex:1 会把它顶到最右）。幂等：已经在行末就不动。
+  //  · 队列详情页 = 行末（**最右**，那一行是 `[搜索框] [设置]`，齿轮在搜索框右边；
+  //    搜索框 flex:1 会把它顶到最右）。幂等：已经在行末就不动。
   if (activeQueueId === null) {
     const anchor = row.querySelector<HTMLElement>("#music-scan-btn");
     if (anchor) {
@@ -3799,10 +3849,10 @@ function note(root: HTMLElement, text: string) {
  *  这个副作用必须让用户看得到（Spotify 没有删队列项的接口，这是最接近的效果）。 */
 function trackRowHtml(tr: TrackDto, idx: number, act: string, dataI = "", title = ""): string {
   // 在线歌单那一侧的「行的交互」与本地一致（2026-10-11 用户第 5 条）：单击 = 选中、双击 = 播。
-  // 选中落点也是同一个 `trackSel`（存 uri）—— 主区 / 搜索详细页（`main-track`）与播放队列
-  // （`play-uri`）的曲目行都参与；搜索下拉速览（`dd-track`）不参与，点它仍直接播。
-  const selectable = act === "main-track" || act === "play-uri";
-  const sel = selectable && trackSel.has(tr.uri);
+  // 选中落点按「行所属列表」分流（见 SELECTIONS / ACT_LIST）—— 主区 / 搜索详细页
+  // （`main-track`）与播放队列（`play-uri`）各自独立；搜索下拉速览（`dd-track`）不参与。
+  const list = ACT_LIST[act];
+  const sel = !!list && SELECTIONS[list].ids.has(tr.uri);
   return `<button class="music-tr${isCurrentTrack(tr) ? " playing" : ""}${sel ? " sel" : ""}" data-act="${act}" data-uri="${esc(tr.uri)}"${dataI ? ` data-i="${esc(dataI)}"` : ""}${title ? ` title="${esc(title)}"` : ""}>
     <span class="music-tr-i">${idx + 1}</span>
     <span class="music-tr-main">
@@ -4258,13 +4308,14 @@ function renderLocalSide(root: HTMLElement) {
 
 /** 左栏一行的「自定义队列」：名字 + 曲目数；**当前选中的加 `.on`**（与目录选中同一套语言）。
  *  **行内不放删除按钮**（2026-10-11 用户澄清）：自定义队列（= 歌单）的增删改与媒体库那套
- *  「修改列表」编辑态**是同一套** —— 点进这条队列 → 左栏 ✎「修改列表」→ 勾选 → 🗑 → × 保存
- *  （删的是这条队列的 items，**不动磁盘**，见 enterMediaEdit / stageMediaDelete / saveMediaEdit）。
- *  上一轮曾在行尾挂一枚小 ×（`local-queue-del`），本轮删除 —— 那会绕开同一套编辑态、多出第二套手势。 */
+ *  「修改列表」编辑态**是同一套** —— 点 ✎ 进编辑态 → 勾选队列行 → 🗑 暂存 → × 保存
+ *  （删的是队列条目本身，**不动队列里的歌、不动磁盘**，见 stageMediaDelete / saveMediaEdit）。
+ *  上一轮曾在行尾挂一枚小 ×、标题行加一枚 ✎，都已删除 —— 那会绕开同一套编辑态、多出第二套手势。 */
 function localQueueRowHtml(q: LocalQueue): string {
   const on = q.id === activeQueueId;
+  const sel = mediaEditMode && SELECTIONS.queueList.ids.has(q.id);
   const name = q.name || t("music.local_queue_edit");
-  return `<div class="music-pl${on ? " on" : ""}">
+  return `<div class="music-pl${on ? " on" : ""}${sel ? " sel" : ""}">
     <button class="music-pl-btn" data-act="local-queue" data-qid="${esc(q.id)}" title="${esc(name)}">
       <span class="music-pl-cover music-pl-dir">${SVG.list}</span>
       <span class="music-pl-main">
@@ -4276,24 +4327,27 @@ function localQueueRowHtml(q: LocalQueue): string {
 }
 
 /** 「自定义队列」那一段（标题 + 若干行）。**空列表时不再画任何提示行**（2026-10-11 用户
- *  第 2 条：段下方那行空态 / 数量提示删掉、不留空占位）—— 只留标题，队列建出来才有行。 */
+ *  第 2 条：段下方那行空态 / 数量提示删掉、不留空占位）—— 只留标题，队列建出来才有行。
+ *  标题行右端**不另放按钮**：队列条目的删除走左栏头部那套「修改列表」编辑态。 */
 function localQueuesHtml(): string {
-  const body = localQueues.map(localQueueRowHtml).join("");
+  const body = localQueues
+    .filter(q => !queueListPendingDel.has(q.id))
+    .map(localQueueRowHtml)
+    .join("");
   return `<div class="music-lqs">
     <div class="music-lqs-head">${esc(t("music.local_queue_edit"))}</div>
     ${body}
   </div>`;
 }
 
-/** 一条本地曲目。**单击 = 选中 / 取消（`trackSel`），双击 = 播这一首，右键 = 上下文菜单**
- *  （2026-10-11 用户第 5 条「取消按钮态」）。整个可见列表就是这一轮的队列，顺序就是屏幕上的顺序
- *  （见 `localQueue`）。`data-path` 是「正在播的那一行」与「选中的那一行」的凭据（本地没有 URI）；
- *  `title` 放完整路径 —— 用户的文件常常同名，列表上那一行是认不出来的。
+/** 一条本地曲目。本地媒体库 / 队列详情页 / 播放队列浮层共用这一份渲染。
  *
- *  **选中落点 = `trackSel`（唯一集合）**：本地媒体库页（`act === "local-track"`）与队列详情页
- *  （`act === "queue-track"`）共用。勾选框在两类场合出现：① 编辑态（`queueEditOn` 或队列页的
- *  `mediaEditMode`）；② 该行已被选中（单击之后的随身反馈）。非这两类行首仍是序号。
- *  `queue-play`（本地播放队列浮层）**不参与选中** —— 它是个速览浮层，点行仍是从该首起播。 */
+ *  **媒体库与队列详情页**：单击 / Ctrl / Shift = 资源管理器式选中，双击 = 播这一首，
+ *  右键 = 上下文菜单。选中落点按列表分流（`SELECTIONS`），勾选框只在编辑态出现
+ *  （`queueEditOn` 或队列页的 `mediaEditMode`）；非编辑态的选中靠 `.sel` 高亮。
+ *
+ *  **播放队列（`queue-play`）不参与这套多选**：单击 = 播这一首（见 onListClick），
+ *  悬停高亮 + 右侧显形 ×（见 styles.css 的 .music-mt-wrap）。 */
 function mediaTrackRowHtml(tr: MediaTrackDto, i: number, act = "local-track"): string {
   // 封面是宿主落到 `temp\music-covers\` 的文件 ⇒ 必须 `convertFileSrc`
   // （WebView2 的 CSP `img-src` 没有 `file:`，见 main.ts 里同类用法）。
@@ -4302,17 +4356,17 @@ function mediaTrackRowHtml(tr: MediaTrackDto, i: number, act = "local-track"): s
     : `<span class="music-mt-ico">${SVG.note}</span>`;
   const sub = [tr.artist, tr.album].filter(Boolean).join(" · ");
   const playing = !!localPlayer?.active && localPlayer.path === tr.path;
-  const selectable = act === "local-track" || act === "queue-track";
-  const selected = selectable && trackSel.has(tr.path);
+  const list = ACT_LIST[act];
+  const selected = !!list && SELECTIONS[list].ids.has(tr.path);
   const editCtx = queueEditOn || (mediaEditMode && activeQueueId !== null);
   // 行首那枚勾选框**只在编辑态出现**（`queueEditOn` / 队列页的「修改列表」）；非编辑态的「选中」
   // 靠 `.sel` 高亮表达（不加勾选框 —— 那会改写行首子节点、把同一行两次 click 的 target 拆开，
-  // 双击播放反而触发不了，见 paintLocalRowSel）。
-  const showCheck = selectable && editCtx;
+  // 双击播放反而触发不了，见 repaintListSelection）。
+  const showCheck = (act === "local-track" || act === "queue-track") && editCtx;
   const lead = showCheck
     ? `<span class="music-mt-i music-mt-check${selected ? " on" : ""}">${selected ? SVG.check : ""}</span>`
     : `<span class="music-mt-i">${i + 1}</span>`;
-  return `<button class="music-mt${playing ? " playing" : ""}${selected ? " sel" : ""}" data-act="${act}" data-i="${i}" data-path="${esc(tr.path)}" title="${esc(tr.path)}">
+  const row = `<button class="music-mt${playing ? " playing" : ""}${selected ? " sel" : ""}" data-act="${act}" data-i="${i}" data-path="${esc(tr.path)}" title="${esc(tr.path)}">
     ${lead}
     <span class="music-mt-cover">${cover}</span>
     <span class="music-mt-main">
@@ -4321,6 +4375,12 @@ function mediaTrackRowHtml(tr: MediaTrackDto, i: number, act = "local-track"): s
     </span>
     <span class="music-mt-d">${fmtMs(tr.duration_ms)}</span>
   </button>`;
+  // 播放队列（`queue-play`）每行右侧内置一个 ×（2026-10-17 用户口径）：
+  // 它必须是行按钮的**兄弟**（button 里不能嵌 button）⇒ 外面包一层定位盒，
+  // 悬停 / 键盘聚焦时由 CSS 显形（见 styles.css 的 .music-mt-wrap）。
+  if (act !== "queue-play") return row;
+  const rm = t("music.play_queue_remove");
+  return `<div class="music-mt-wrap">${row}<button type="button" class="music-mt-x" data-act="queue-remove" data-i="${i}" title="${esc(rm)}" aria-label="${esc(rm)}">${SVG.x}</button></div>`;
 }
 
 /** 主区那一页：筛选框 + 扫描进度 + 曲目表。
@@ -4336,44 +4396,29 @@ function renderLocalMain(root: HTMLElement) {
   // 之后只 patch 里面的列表。判据 = `activeQueueId !== null`（不再有独立的 queuePageOpen 标志）。
   // ⚠️ 这一支必须排在下面「本地媒体库骨架」**之前** —— 否则每一拍都会把队列页换回媒体库页。
   if (activeQueueId !== null) {
-    if (!box.querySelector("#music-queue-page")) box.innerHTML = queuePageSkeletonHtml();
+    if (!box.querySelector("#music-queue-page")) {
+      // 先救齿轮：它此刻可能还在媒体库页那一行里，整块重写会把它销毁（见 parkGear）。
+      parkGear(root);
+      box.innerHTML = queuePageSkeletonHtml();
+    }
     // 骨架只在缺了时建一次 ⇒ 换队列 / 回来时把筛选框的值同步成当前 `queueQuery`（否则会
     // 停在上一次的词上，与列表过滤结果对不上）。
     const qEl = root.querySelector<HTMLInputElement>("#music-lq-q");
     if (qEl && qEl.value !== queueQuery) qEl.value = queueQuery;
     renderQueuePageList(root);
-    // 齿轮落点：队列页这一行 = `[返回] [搜索框] [设置]`，placeGear 把齿轮追加到**行末（最右）**
+    // 齿轮落点：队列页这一行 = `[搜索框] [扫描] [设置]`，placeGear 把齿轮追加到**行末（最右）**
     // （2026-10-11 用户第 3 条：右侧只留设置齿轮）。
     placeGear(root);
-    // 队列页里没有 qmode / 扫描钮，这里调一次只是为了「离开队列页回到媒体库后」那套视觉已被刷新。
+    // 队列页没有 qmode（那枚开关只对媒体库列表有意义），但扫描钮与媒体库页共用同一枚
+    // ⇒ 这里仍调一次，保证两页的扫描钮视觉 / 语义同源（幂等）。
     applyQueueModeUi(root);
     return;
   }
   if (!box.querySelector("#music-local-page")) {
+    // 先救齿轮：它此刻可能还躺在（即将被整块换掉的）旧骨架里，见 parkGear。
+    parkGear(root);
     box.innerHTML = `<div class="music-local-page" id="music-local-page">
-      <div class="music-local-head-row">
-        <input class="music-local-q" id="music-mt-q" type="search" autocomplete="off" spellcheck="false"
-               placeholder="${esc(t("music.local_filter_ph"))}" value="${esc(mediaQuery)}">
-        <span class="music-list-chip hidden" id="music-list-chip">
-          <span class="music-list-chip-n" id="music-list-chip-n"></span>
-          <button class="music-pl-x" data-act="media-list-close" title="${esc(t("music.local_close_playlist"))}">${SVG.x}</button>
-        </span>
-        <!-- 重扫（2026-10-01 用户口径）：**只留图标**，「重扫」那两个可见字去掉 ——
-             它右边紧挨着设置齿轮（见 placeGear），带文字那一行会挤。
-             title 仍然留着（鼠标悬浮还能问出这是什么）；去掉的是**可见文字**。
-             **这是全页唯一一枚扫描按钮**（2026-10-10 用户口径：扫描只留一枚，左栏那枚已删）；
-             「自定义队列」模式开启时它会变成「退出」（图标 ×，见 applyQueueModeUi）。
-             ⚠️ 本行属于**动态骨架**（#music-main 会被 renderMain 整块重写、回来时重建），
-             所以它（与右边那枚 qmode）只能走 data-act 委托，直接 addEventListener 会在下次重建时失效。 -->
-        <button class="music-ghost-btn music-icon-btn" id="music-scan-btn" data-act="media-scan" title="${esc(t("music.local_rescan"))}">${SVG.refresh}</button>
-        <!-- 「自定义队列」开关（2026-10-10 用户口径）：放在筛选标题行**最右侧**、只在本地页显示
-             （它长在本骨架里，离开本地页整页被换掉 ⇒ 天然隐藏）。开启时高亮，并把上面那枚扫描
-             变成「退出」；开启 = 进「自定义队列编辑态」（列表每行可勾选，见 mediaTrackRowHtml /
-             onListClick），把这批勾中的歌用**齿轮「添加到队列」**追加进 localQueue（2026-10-11
-             用户口径，齿轮语义见 applyGearQueueState）。同样走 data-act 委托。
-             注：本段在模板字符串里，注释里一个反引号都不能出现（预检 #15 / #39 ⑩）。 -->
-        <button class="music-ghost-btn music-icon-btn music-local-qmode" id="music-local-qmode" data-act="qmode" aria-pressed="false" title="${esc(t("music.local_queue_edit"))}">${SVG.list}</button>
-      </div>
+      ${localHeadRowHtml("library")}
       <div class="music-scan hidden" id="music-scan"></div>
       <!-- 视频的**画面层**（2026-10-01 用户第 8 条）。里面那个 video 元素由
            renderLocalVideo 现造现拆（离开 / 换曲时整块清掉，见那里的注释）。
@@ -4512,25 +4557,55 @@ function scrollLocalListToCurrent(root: HTMLElement) {
   localScrollToPath = "";
 }
 
-/** 队列详情页的骨架（`#music-queue-page`，占满内容区）。筛选标题行 = **`[返回] [搜索框] [设置]`**
- *  （2026-10-11 用户第 3 条）—— 返回走 `data-act` 委托（这一页会被整体重建，直接绑会绑在被换掉的
- *  节点上）；搜索框只过滤**这一条队列**（见 renderQueuePageList）；设置齿轮由 `placeGear`
- *  **追加到行末（最右）**。`queue-back` 的语义 = **清空 `activeQueueId`**（回到媒体库）。 */
+/** 本地页两种骨架（媒体库 / 队列详情）**共用**的筛选标题行（§禁用 62）：
+ *  `[搜索框] [清单标记] [扫描] [自定义队列开关]`，设置齿轮由 `placeGear` 追加到行末。
+ *
+ *  **两页的公共按钮集合固定为「搜索框 + 扫描 + 设置」**：队列页上一轮删掉了「退出」，
+ *  返程改走左栏（点目录 / 另一条队列）；扫描是全局动作，两页都保留，切页时才不会
+ *  出现某一枚凭空消失。`清单标记` 与 `自定义队列开关` 只属于媒体库页 ——
+ *  队列页没有「打开的播放列表文件」，qmode 也只对媒体库列表的勾选有意义
+ *  （放到队列页就是一枚点了没反应的死键）。
+ *  注：本段在模板字符串里，注释里一个反引号都不能出现（预检 #15 / #39 ⑩）。 */
+function localHeadRowHtml(kind: "library" | "queue"): string {
+  const queue = kind === "queue";
+  const input = queue
+    ? `<input class="music-local-q" id="music-lq-q" type="search" autocomplete="off" spellcheck="false"
+             placeholder="${esc(t("music.local_filter_ph"))}" value="${esc(queueQuery)}">`
+    : `<input class="music-local-q" id="music-mt-q" type="search" autocomplete="off" spellcheck="false"
+             placeholder="${esc(t("music.local_filter_ph"))}" value="${esc(mediaQuery)}">`;
+  const chip = queue
+    ? ""
+    : `<span class="music-list-chip hidden" id="music-list-chip">
+          <span class="music-list-chip-n" id="music-list-chip-n"></span>
+          <button class="music-pl-x" data-act="media-list-close" title="${esc(t("music.local_close_playlist"))}">${SVG.x}</button>
+        </span>`;
+  const qmode = queue
+    ? ""
+    : `<button class="music-ghost-btn music-icon-btn music-local-qmode" id="music-local-qmode" data-act="qmode" aria-pressed="false" title="${esc(t("music.local_queue_edit"))}">${SVG.list}</button>`;
+  return `<div class="music-local-head-row">
+        ${input}
+        ${chip}
+        <button class="music-ghost-btn music-icon-btn" id="music-scan-btn" data-act="media-scan" title="${esc(t("music.local_rescan"))}">${SVG.refresh}</button>
+        ${qmode}
+      </div>`;
+}
+
+/** 队列详情页的骨架（`#music-queue-page`，占满内容区）。筛选标题行与媒体库页**同源**
+ *  （见 localHeadRowHtml）：`[搜索框] [扫描] [设置]`——上一轮已删掉「退出」，
+ *  回到媒体库 / 换歌单一律点左栏。搜索框只过滤**这一条队列**（见 renderQueuePageList）；
+ *  设置齿轮由 `placeGear` **追加到行末（最右）**。左栏由 `data-act` 委托处理。 */
 function queuePageSkeletonHtml(): string {
   return `<div class="music-local-page" id="music-queue-page">
-    <div class="music-local-head-row">
-      <button class="music-ghost-btn music-icon-btn" data-act="queue-back" title="${esc(t("music.settings_back"))}">${SVG.back}</button>
-      <input class="music-local-q" id="music-lq-q" type="search" autocomplete="off" spellcheck="false"
-             placeholder="${esc(t("music.local_filter_ph"))}" value="${esc(queueQuery)}">
-    </div>
+    ${localHeadRowHtml("queue")}
     <div class="music-list" id="music-lq-list"></div>
   </div>`;
 }
 
 /** 队列详情页里的列表。数据源 = **当前选中的那条队列**（`activeQueue`），再按 `queueQuery`
  *  **只过滤这一条队列**（标题 / 歌手 / 专辑，客户端模糊匹配）。
- *  单击一行 = 选中（`trackSel`），双击 = 从它开始播（于是这条队列成为这一轮的播放队列，见
- *  双击分派）；编辑态（`mediaEditMode`）下 🗑 把选中的曲目暂存进 `queueItemDel`，已暂存的行
+ *  单击 / Ctrl / Shift = 资源管理器式选中（`SELECTIONS.queue`），双击 = 从它开始播（于是这条
+ *  队列成为这一轮的播放队列，见双击分派）；右键 → 删除所选（只改队列）。
+ *  编辑态（`mediaEditMode`）下 🗑 把选中的曲目暂存进 `queueItemDel`，已暂存的行
  *  **先隐藏** —— 与媒体库编辑态 `mediaPendingDel` 滤掉目录同一条纪律：「× 退出并保存」之前
  *  都还能反悔。⚠️ 这里**绝不动磁盘**（只改 `activeQueue().items` + localStorage）。 */
 function renderQueuePageList(root: HTMLElement) {
@@ -4629,7 +4704,7 @@ function submitQueueDialog(root: HTMLElement) {
   persistLocalQueues();
   queueDlgOpen = false;
   queueEditOn = false;
-  trackSel.clear();
+  clearListSelection("library");
   renderQueueDialog(root);
   if (localPage) {
     renderLocalSide(root);   // 左栏多出一行、编辑态那套视觉还原
@@ -4643,12 +4718,12 @@ function submitQueueDialog(root: HTMLElement) {
 
 /** 「添加到队列」（2026-10-11 用户口径，本任务第 3 条）：**打开居中创建窗口**（`#music-queue-dlg`），
  *  把编辑态里勾中的歌作为**待创建队列的 items 暂存**（经同一条「文件草稿」的路），确定后按第 1 条
- *  新建一条队列。数据来源是 `mediaTracks.items` ∩ `trackSel`（按列表顺序）—— 选中存的是路径，
+ *  新建一条队列。数据来源是 `mediaTracks.items` ∩ 本地列表选中集（按列表顺序）—— 选中存的是路径，
  *  用户可能在选中后又改了筛选，取交集天然只认「现在还看得见的那几首」。
  *  **未选中任何一首歌时也打开同一个窗口**（用户可在窗口里用「选文件」补）—— 不再有「另一套路径」。 */
 function addPickedToQueue(root: HTMLElement) {
   const items = mediaTracks?.items ?? [];
-  const picked = items.filter(tr => trackSel.has(tr.path));
+  const picked = items.filter(tr => SELECTIONS.library.ids.has(tr.path));
   openQueueDialog(root, picked.map(tr => tr.path));
 }
 
@@ -4695,8 +4770,12 @@ async function confirmDeleteFile(root: HTMLElement) {
     note(root, String(e));
     return;
   }
-  // 把该行移出统一选中集合（它已经不在列表里了）。
-  trackSel.delete(path);
+  // 把该行移出选中集合（它已经不在列表里了）—— 媒体库与队列详情各有一份状态。
+  for (const list of ["library", "queue"] as const) {
+    const st = SELECTIONS[list];
+    st.ids.delete(path);
+    if (st.anchor === path) st.anchor = null;
+  }
   // 正在播的正是这首 ⇒ 走现有的「停止本地播放」（删除不该偷偷续播下一首）。
   if (localPlayer?.path === path) await stopLocalPlayback(root);
   // 刷新曲目列表（复用既有媒体库刷新路径；队列详情页开着时它也会重画队列列表）。
@@ -4708,8 +4787,10 @@ async function confirmDeleteFile(root: HTMLElement) {
 //
 // 单例节点 `#music-ctx`（长在 shell 里，见 shellHtml），在**鼠标位置**弹出、非居中模态；
 // 点外部 / Esc 关闭。做法照桌宠窗的 `.pet-menu`（静态节点 + `.open` 类 + 鼠标位置定位）——
-// 不另造第二套观感。菜单项按上下文现给：本地媒体库的歌 → 添加进队列 / 在资源管理器中显示；
-// 自定义队列里的歌 → 从队列中移除（**只改队列，不动磁盘**）/ 在资源管理器中显示；在线行 → 播放。
+// 不另造第二套观感。菜单项按上下文现给：本地媒体库的歌 → 添加到播放队列 / 在资源管理器中显示 /
+// 删除本地文件；自定义队列里的歌 → 删除所选（**只改队列，不动磁盘**）/ 在资源管理器中显示 /
+// 删除本地文件；在线行 → 播放。左栏队列条目不挂右键菜单（删除走既有「修改列表」编辑态）。
+// 加进**自定义队列**不走这里：那是右上角齿轮「添加到队列」的路径（见 addPickedToQueue）。
 
 /** 当前右键菜单指向的那一行在**哪个列表**、对应哪条轨道数据（本地 = path、在线 = uri）。 */
 function ctxMenuItemsHtml(): string {
@@ -4719,10 +4800,14 @@ function ctxMenuItemsHtml(): string {
     `<button class="music-ctx-item${danger ? " danger" : ""}" data-ctx="${id}">${esc(label)}</button>`;
   const items: string[] = [];
   if (c.act === "local-track") {
-    items.push(row("add-queue", t("music.ctx_add_queue")));
+    // 作用对象 = `SELECTIONS.library`（右键那一行若原本没选中，已先切成只选它）⇒
+    // 与批量删除同一条「右键迁移选择」语义。允许重复：播放队列是播放顺序，不是集合。
+    items.push(row("add-play-queue", t("music.add_to_play_queue")));
   }
   if (c.act === "queue-track") {
-    items.push(row("remove-queue", t("music.ctx_remove_queue"), true));
+    // 批量：作用对象是 `SELECTIONS.queue`（右键那一行若原本没选中，已先切成只选它）。
+    const n = selectedQueueTracks().length;
+    items.push(row("remove-queue", t("music.ctx_remove_selected", { n: String(n) }), true));
   }
   if ((c.act === "local-track" || c.act === "queue-track") && c.path) {
     // 本地库 / 队列详情里的歌都指向本机一个**真实文件** ⇒ 两件事都能做：
@@ -4732,7 +4817,7 @@ function ctxMenuItemsHtml(): string {
     items.push(row("reveal", t("music.ctx_reveal")));
     items.push(row("delete-file", t("music.ctx_delete_file"), true));
   }
-  if (c.act === "main-track" || c.act === "play-uri" || c.act === "queue-play") {
+  if (c.act === "main-track" || c.act === "play-uri") {
     items.push(row("play", t("music.ctx_play")));
   }
   return items.join("");
@@ -4769,27 +4854,17 @@ function openCtxMenu(root: HTMLElement, x: number, y: number) {
   positionCtxMenu(root, x, y);
 }
 
-/** 「添加进队列」的二级：把当前菜单换成「已有队列 + 新建队列…」（同一个单例节点，原地换内容）。 */
-function showQueuePickerMenu(root: HTMLElement, x: number, y: number) {
-  const box = root.querySelector<HTMLElement>("#music-ctx");
-  if (!box) return;
-  const rows = localQueues.map(q =>
-    `<button class="music-ctx-item" data-ctx="pick:${esc(q.id)}">${esc(q.name || t("music.local_queue_edit"))}</button>`);
-  rows.push(`<button class="music-ctx-item" data-ctx="pick-new">${esc(t("music.ctx_new_queue"))}</button>`);
-  setHtml(box, rows.join(""));
-  positionCtxMenu(root, x, y);
-}
-
 /** 关掉右键菜单并清掉它指向的行。 */
 function closeCtxMenu(root: HTMLElement) {
   root.querySelector("#music-ctx")?.classList.remove("open");
   ctxTarget = null;
 }
 
-/** 当前选中的本地曲目（`trackSel` ∩ 当前主区列表）。取不到就退回右键那一行（右键时已把它选中）。 */
+/** 当前选中的本地曲目（`SELECTIONS.library` ∩ 当前主区列表）。取不到就退回右键那一行
+ *  （右键时已把它选中 —— 双保险，避免个别入口漏掉选中迁移）。 */
 function selectedLocalTracks(): MediaTrackDto[] {
   const items = mediaTracks?.items ?? [];
-  const picked = items.filter(tr => trackSel.has(tr.path));
+  const picked = items.filter(tr => SELECTIONS.library.ids.has(tr.path));
   if (picked.length) return picked;
   if (ctxTarget?.path) {
     const hit = items.find(tr => tr.path === ctxTarget!.path);
@@ -4798,25 +4873,105 @@ function selectedLocalTracks(): MediaTrackDto[] {
   return [];
 }
 
-/** 把选中的本地曲目追加进一条**已有**自定义队列（按路径小写去重；**只改队列，不动磁盘**）。 */
-function addSelectedToQueue(root: HTMLElement, qid: string) {
-  const q = localQueues.find(x => x.id === qid);
-  if (!q) return;
+/** 自定义队列详情页里**当前选中**的曲目（按队列顺序）。右键菜单的计数与批量删除共用。 */
+function selectedQueueTracks(): MediaTrackDto[] {
+  const q = activeQueue();
+  if (!q) return [];
+  const ids = SELECTIONS.queue.ids;
+  return q.items.filter(tr => ids.has(tr.path));
+}
+
+/** 右键「删除所选」：只改 `activeQueue().items`（+ localStorage），**不碰磁盘、不碰媒体库**。
+ *  这就是用户要核对的语义 (a)「选取的歌曲从队列中删除」。 */
+function removeSelectedFromActiveQueue(root: HTMLElement) {
+  const q = activeQueue();
+  const picked = selectedQueueTracks();
+  if (!q || !picked.length) return;
+  const drop = new Set(picked.map(tr => tr.path));
+  const before = q.items.length;
+  q.items = q.items.filter(tr => !drop.has(tr.path));
+  const n = before - q.items.length;
+  clearListSelection("queue");
+  persistLocalQueues();
+  renderQueuePageList(root);
+  if (n > 0) note(root, t("music.ctx_removed_n_from_queue", { n: String(n) }));
+}
+
+/** 右键「添加到播放队列」：把**当前选中的库曲目按列表顺序**追加进播放队列（`localQueue`）。
+ *  选中语义与批量删除一致 —— 右键那行已选中 ⇒ 对全部选中项生效；未选中 ⇒ 右键时已切成只选它。
+ *  **允许重复**：播放队列是「播放顺序」而不是集合，用户可能故意把同一首排两次；
+ *  自定义队列那种「加入歌单」才去重（见 addPickedToQueue 那条创建路径）。 */
+function addSelectedToPlayQueue(root: HTMLElement) {
   const picked = selectedLocalTracks();
   if (!picked.length) return;
-  const seen = new Set(q.items.map(tr => tr.path.toLowerCase()));
-  let added = 0;
-  for (const tr of picked) {
-    const k = tr.path.toLowerCase();
-    if (seen.has(k)) continue;
-    seen.add(k);
-    q.items.push(tr);
-    added++;
+  localQueue.push(...picked);
+  if (localQueueIndex < 0) {
+    // 队列原本是空的：把游标落在第一首上（不自动出声），这样栏上有内容、按播放键能续上。
+    localQueueIndex = 0;
+    localResumeMs = 0;
   }
-  if (!added) return;   // 全都在里面了：不改、不提示（免得说一句「加成功」其实没加）
-  persistLocalQueues();
-  note(root, t("music.ctx_added_to_queue", { name: q.name || t("music.local_queue_edit") }));
-  renderLocalSide(root);
+  writeLocalLast();
+  renderLocalNowbar(root);
+  note(root, t("music.added_to_play_queue", { n: String(picked.length) }));
+}
+
+/** 播放队列行右侧的 ×（2026-10-17 用户口径）：按下标从 `localQueue` 移除。
+ *
+ *  **移除的是正在播的那一首**：有会话时让「原位置的下一首」接上（队尾则夹回新的队尾），
+ *  队列空了才真正停止；没有会话时只把游标挪到新的当前位置，不出声。
+ *  另一条关键语义：**只改播放队列**（内存 + localStorage），不动自定义队列 / 磁盘 / 媒体库。 */
+async function removePlayQueueItem(root: HTMLElement, i: number) {
+  const tr = localQueue[i];
+  if (!tr) return;
+  const wasCurrent = i === localQueueIndex;
+  const hadSession = !!(localPlayer && localPlayer.path);
+  localQueue.splice(i, 1);
+  localHistory = [];
+  if (localQueue.length === 0) {
+    await emptyPlayQueue(root, hadSession);
+  } else if (wasCurrent) {
+    localQueueIndex = Math.min(i, localQueue.length - 1);
+    localResumeMs = 0;
+    if (hadSession) {
+      const ok = await startLocalPlay(root, localQueue[localQueueIndex].path);
+      if (!ok) await stopLocalPlayback(root);
+    } else {
+      writeLocalLast();
+      renderLocalNowbar(root);
+    }
+  } else {
+    if (i < localQueueIndex) localQueueIndex--;
+    writeLocalLast();
+    renderLocalNowbar(root);
+  }
+}
+
+/** 把播放队列收成「空队列」态 —— **移除最后一首**与**一键清除**共用这一份收尾。
+ *
+ *  清内存（队列 / 游标 / 续播位置 / 随机历史）+ 删掉「上次播放」快照（否则下次打开
+ *  会被它复活）；有会话时走 `stopLocalPlayback`（连音频设备一起放掉，栏随之收成空态），
+ *  没有会话就只重画栏。**只改播放队列**（内存 + localStorage），不动自定义队列 / 磁盘 / 媒体库。
+ *  `hadSession` 由调用方在改动前判定（`localPlayer` 会在停止过程中被清掉）。 */
+async function emptyPlayQueue(root: HTMLElement, hadSession: boolean) {
+  localQueue = [];
+  localQueueIndex = -1;
+  localResumeMs = 0;
+  localHistory = [];
+  try { localStorage.removeItem(LOCAL_LAST_KEY); } catch { /* 隐私模式 / 配额 */ }
+  if (hadSession) await stopLocalPlayback(root);
+  else renderLocalNowbar(root);
+}
+
+/** 播放队列浮层右上角的「一键清除队列」（2026-10-17 用户口径）：一次清空 `localQueue`。
+ *
+ *  **不做二次确认**（用户要「一键」）；误触由 CSS 兜住 —— 按钮只在浮层 hover 时显形，
+ *  非 hover 态 `pointer-events: none`。正在播时按既有「空队列即停」语义收尾
+ *  （与移除最后一首同一条路径，见 `emptyPlayQueue`）⇒ 停止播放、栏回到空态。
+ *  浮层保持打开（`localQueueOpen` 不动），重绘后显示空态。 */
+async function clearPlayQueue(root: HTMLElement) {
+  if (localQueue.length === 0) return;
+  const hadSession = !!(localPlayer && localPlayer.path);
+  await emptyPlayQueue(root, hadSession);
 }
 
 // ── 视频的**画面层**（2026-10-01 用户第 8 条）────────────────────────
@@ -4945,10 +5100,14 @@ function renderLocalMini(root: HTMLElement) {
  *  这枚按钮问的是「现在/接下来放什么」，与左栏那些存下来的歌单（`localQueues` / `activeQueueId`）
  *  是两件事。上一轮曾错把它接到 `activeQueue()`，本轮改回。（左栏选中某条队列 → 主区显示它，
  *  那是**另一个**入口，见 renderLocalMain 的队列详情页分支。）
- *  行沿用 `queue-play`（点击 = 从这一首开始播，游标落到 `localQueueIndex`，见 onListClick）；
+ *  行沿用 `queue-play`（**单击 = 从这一首起播**，游标落到 `localQueueIndex`；行尾悬停显形
+ *  × = 从播放队列移除，见 onListClick / removePlayQueueItem）；
  *  空态给一句 i18n。显隐由 `localQueueOpen` 管；两枚触发按钮（本地条 `#music-l-queue` /
  *  本地小窗 `#music-lp-queue`）的按下态加 `.on`。**它自己不做早退**：bar 不可见时它随 bar
- *  一起藏，没什么成本。 */
+ *  一起藏，没什么成本。
+ *  **没有独立的标题行**（这里只塞行 / 空态）⇒ 右上角的「一键清除队列」按钮自带一条
+ *  `.music-lq-head`（仅图标、浮层 hover 时显形，见 styles.css）；队列为空时**整条不画**
+ *  （按钮不显示，而不是禁用）。 */
 function renderLocalQueueDD(root: HTMLElement) {
   const box = root.querySelector<HTMLElement>("#music-lq-dd");
   if (!box) return;
@@ -4957,9 +5116,11 @@ function renderLocalQueueDD(root: HTMLElement) {
   root.querySelector("#music-l-queue")?.classList.toggle("on", localQueueOpen);
   root.querySelector("#music-lp-queue")?.classList.toggle("on", localQueueOpen);
   if (!localQueueOpen) return;
+  const clr = esc(t("music.play_queue_clear"));
   const html = localQueue.length === 0
     ? `<div class="music-empty">${esc(t("music.local_play_queue_empty"))}</div>`
-    : localQueue.map((tr, i) => mediaTrackRowHtml(tr, i, "queue-play")).join("");
+    : `<div class="music-lq-head"><button type="button" class="music-lq-clear" data-act="queue-clear" title="${clr}" aria-label="${clr}">${SVG.trash}</button></div>`
+      + localQueue.map((tr, i) => mediaTrackRowHtml(tr, i, "queue-play")).join("");
   setHtml(box, html);
 }
 
@@ -5215,14 +5376,16 @@ function pickAddedRoot(picked: string): string {
 
 /** 进编辑态（左栏头部那枚笔「修改列表」）。
  *
- *  这一套编辑态**同时服务两个页面**（2026-10-11 用户澄清）：
+ *  这一套编辑态**同时服务三个位置**（2026-10-11 用户澄清 + 2026-10-17 左栏队列）：
  *  ① 本地媒体库页 —— 勾选的是**磁盘目录**（左栏，`mediaSel`），🗑 暂存进 `mediaPendingDel`，
  *     × 保存时调宿主 `media_remove_root` **落盘**；
- *  ② 队列详情页（`activeQueueId !== null`）—— 选中的是**这条队列的曲目**（`trackSel`，
+ *  ② 队列详情页（`activeQueueId !== null`）—— 选中的是**这条队列的曲目**（`SELECTIONS.queue`，
  *     由行的单击维持），🗑 暂存进 `queueItemDel`，× 保存时只从 `activeQueue().items` 里移除、
  *     写 localStorage，**绝不动磁盘**。
- *  两者靠 `activeQueueId` 分流（见 stageMediaDelete / saveMediaEdit 的首行分支）。
- *  ⚠️ **不清 `trackSel`**（2026-10-11 用户第 5 条）：行的选中态是「单击即选中」的常驻概念，
+ *  ③ 左栏「自定义队列」条目 —— 选中的是**队列本身**（`SELECTIONS.queueList`），🗑 暂存进
+ *     `queueListPendingDel`，× 保存时只从 `localQueues` 摘掉，**不删队列里的歌、不动磁盘 / 媒体库**。
+ *  三者共用同一个 `mediaEditMode` 与同一套 🗑 / × 按钮（没有第二套编辑状态）。
+ *  ⚠️ **不清行选中集**（2026-10-11 用户第 5 条）：行的选中态是「单击即选中」的常驻概念，
  *  进编辑态 = 把 🗑 亮出来（编辑态 = 选中集合 + 删除按钮）；清掉反而会让「先选歌再点✎」白选。 */
 function enterMediaEdit(root: HTMLElement) {
   mediaEditMode = true;
@@ -5230,6 +5393,9 @@ function enterMediaEdit(root: HTMLElement) {
   queueEditOn = false;
   mediaSel.clear();
   queueItemDel.clear();
+  // 左栏队列条目只有编辑态里才可选 ⇒ 进编辑态从空选择开始。
+  clearListSelection("queueList");
+  queueListPendingDel.clear();
   renderLocalSide(root);
   // 队列详情页也在用这套编辑态 ⇒ 把它那页的勾选框也当场画出来（媒体库那页由下一次 renderLocalMain 收尾）。
   if (activeQueueId !== null) renderLocalMain(root);
@@ -5239,20 +5405,30 @@ function enterMediaEdit(root: HTMLElement) {
  *
  *  ⚠️ **只改前端集合，不落盘** —— 用户口径是「× 退出并保存」，也就是
  *  在按下 × 之前，删错了都还能反悔。媒体库页真正调宿主 `media_remove_root`（落盘）、
- *  队列详情页只改内存里的 `activeQueue().items`（写 localStorage），都在 `saveMediaEdit`。
- *  两页的选中集合不同：媒体库页 = 左栏目录（`mediaSel`）、队列页 = 曲目行（`trackSel`）。 */
+ *  队列详情页只改内存里的 `activeQueue().items`（写 localStorage）、左栏队列只摘条目，
+ *  都在 `saveMediaEdit`。选中集合分三份：媒体库目录 = `mediaSel`、队列曲目 =
+ *  `SELECTIONS.queue`、左栏队列 = `SELECTIONS.queueList`。 */
 function stageMediaDelete(root: HTMLElement) {
-  // 队列详情页：暂存的是**队列曲目**（`trackSel`，不碰磁盘），只重画队列列表（被暂存的行先隐藏）。
+  // 左栏自定义队列条目：只暂存队列 id（不删队列里的歌、不动磁盘 / 媒体库）。
+  const qids = SELECTIONS.queueList.ids;
+  const stagedQueues = qids.size > 0;
+  for (const id of qids) queueListPendingDel.add(id);
+  clearListSelection("queueList");
+  // 队列详情页：暂存的是**队列曲目**（`SELECTIONS.queue`，不碰磁盘），只重画队列列表（被暂存的行先隐藏）。
   if (activeQueueId !== null) {
-    if (!trackSel.size) return; // 一个都没选 = 什么也不做
-    for (const p of trackSel) queueItemDel.add(p);
-    trackSel.clear();
-    renderQueuePageList(root);
+    const ids = SELECTIONS.queue.ids;
+    if (ids.size) {
+      for (const p of ids) queueItemDel.add(p);
+      clearListSelection("queue");
+      renderQueuePageList(root);
+    }
+    if (stagedQueues) renderLocalSide(root);
     return;
   }
-  if (!mediaSel.size) return; // 一个都没勾 = 什么也不做（不是「清空整个列表」）
-  for (const p of mediaSel) mediaPendingDel.add(p);
-  mediaSel.clear();
+  if (mediaSel.size) {
+    for (const p of mediaSel) mediaPendingDel.add(p);
+    mediaSel.clear();
+  }
   renderLocalSide(root);
 }
 
@@ -5266,14 +5442,37 @@ function stageMediaDelete(root: HTMLElement) {
  *     一串删除里有一条失败不该把前面成功的回滚掉 —— 失败的那条**留在列表里**（它还在
  *     `mediaRoots` 中），用户看得见。
  *  ② 队列详情页：把暂存的删除从这条队列的 items 里移除（**只改 localStorage，不动磁盘**）。
- *     队列是内存 / localStorage 里的偏好数据，没有「落盘会失败」这一说，所以同步收尾即可。 */
+ *     队列是内存 / localStorage 里的偏好数据，没有「落盘会失败」这一说，所以同步收尾即可。
+ *  ③ 左栏自定义队列：把暂存的队列条目从 `localQueues` 摘掉（**不删队列里的歌、不动磁盘**）；
+ *     删的正是当前打开的那条时，主区退回媒体库。 */
 async function saveMediaEdit(root: HTMLElement) {
+  // 左栏自定义队列：先摘条目（与队列内歌曲、媒体库目录分属三套互不相干的暂存集）。
+  const delQueues = Array.from(queueListPendingDel);
+  queueListPendingDel.clear();
+  clearListSelection("queueList");
+  let activeQueueDeleted = false;
+  if (delQueues.length) {
+    const drop = new Set(delQueues);
+    localQueues = localQueues.filter(q => !drop.has(q.id));
+    if (activeQueueId && drop.has(activeQueueId)) {
+      activeQueueId = null;
+      activeQueueDeleted = true;
+      mediaEditMode = false;
+      mediaSel.clear();
+      queueItemDel.clear();
+      clearListSelection("queue");
+      queueQuery = "";
+      if (queueQueryTimer !== undefined) { window.clearTimeout(queueQueryTimer); queueQueryTimer = undefined; }
+    }
+    persistLocalQueues();
+  }
   if (activeQueueId !== null) {
     const q = activeQueue();
     const del = Array.from(queueItemDel);
     mediaEditMode = false;
     mediaSel.clear();
-    trackSel.clear();
+    clearListSelection("queue");
+    clearListSelection("library");
     queueItemDel.clear();
     renderLocalHead(root);
     renderLocalSide(root);
@@ -5292,6 +5491,7 @@ async function saveMediaEdit(root: HTMLElement) {
   renderLocalHead(root);
   if (!del.length) {
     renderLocalSide(root);
+    if (activeQueueDeleted) renderLocalMain(root);  // 当前队列被删 ⇒ 主区退回媒体库
     return;
   }
   let err = "";
@@ -5307,6 +5507,7 @@ async function saveMediaEdit(root: HTMLElement) {
   if (mediaRootSel && !(mediaRoots ?? []).some(r => r.path === mediaRootSel)) mediaRootSel = "";
   renderLocalSide(root);
   await loadMediaTracks(root);
+  if (activeQueueDeleted) renderLocalMain(root);
   if (err) note(root, err);
 }
 
@@ -5439,9 +5640,11 @@ async function playLocalTrack(root: HTMLElement, i: number) {
 /** 队列详情页那一行起播：详情页列的就是**当前选中那条队列** ⇒ 它成为这一轮的播放队列
  *  （与「本地媒体库那批可见曲目就是队列」同一种约定）。双击触发（见 dblclick 分派）。
  *  ⚠️ 按 **path** 定位而不是行下标：队列页上方有筛选框（`queueQuery`），列表可能被过滤过，
- *  `data-i` 只是**过滤后**的下标，直接拿去索引 `q.items` 会指错歌。 */
-async function playQueueTrack(root: HTMLElement, path: string) {
-  const q = activeQueue();
+ *  `data-i` 只是**过滤后**的下标，直接拿去索引 `q.items` 会指错歌。
+ *  `q` 默认取当前选中的队列；左栏双击某条队列时显式传入那一条 —— 于是「设 `localQueue` +
+ *  从第 N 首起播」仍只有这一份实现。左栏双击媒体库目录 / 「全部曲目」传入的是刚取回的
+ *  `MediaTracksDto`：这条路径只用到 `items`（那批曲目就是这一轮的播放队列）。 */
+async function playQueueTrack(root: HTMLElement, path: string, q: { items: MediaTrackDto[] } | null = activeQueue()) {
   if (!q || !path) return;
   const qi = q.items.findIndex(tr => tr.path === path);
   if (qi < 0) return;
@@ -5461,32 +5664,130 @@ async function playLocalQueueItem(root: HTMLElement, qi: number) {
   await startLocalPlay(root, tr.path);
 }
 
-/** 单击一行 = 加入 / 移出**统一选中集合** `trackSel`。返回「是否变为选中」。
- *  本地行用 `path`、在线行用 `uri` 作键（两套标识互不冲突）。 */
-function toggleTrackSel(key: string): boolean {
-  if (!key) return false;
-  const on = !trackSel.has(key);
-  if (on) trackSel.add(key); else trackSel.delete(key);
-  return on;
+// ── 行选择（资源管理器语义，2026-10-17）──────────────────────────────
+//
+// 一份实现、六个独立状态（SELECTIONS）。单击 = 只选它；Ctrl(⌘)+单击 = 切换；
+// Shift+单击 = 以 anchor 为起点做范围选择；Ctrl+A = 当前聚焦列表全选；Esc = 清空。
+// 只在**行 DOM 上就地改 class**（不重建列表）—— 重建会把 click 目标换掉、dblclick 再也发不出来。
+
+/** 指针 / 焦点落在哪一行 → 它属于哪个列表、容器是谁。不在行上 ⇒ null。 */
+function listHit(node: EventTarget | null): { list: TrackList; container: HTMLElement } | null {
+  if (!(node instanceof HTMLElement)) return null;
+  const el = node.closest<HTMLElement>("[data-act]");
+  const list = el ? ACT_LIST[el.dataset.act || ""] : undefined;
+  if (!el || !list) return null;
+  return { list, container: el.closest<HTMLElement>(LIST_CONTAINER_SEL[list]) ?? el };
 }
 
-/** **就地**刷新一条本地曲目行的选中样子（不重建列表）。
- *  为什么不重建：`setHtml` 会把被点的节点整个换掉，浏览器就不会再发 `dblclick`（两次 click 必须
- *  落在同一 target，见 `syncSideSelection` 的注释）—— 而「单击 = 选中、双击 = 播放」正需要它。
- *  行首**已经是勾选框**（编辑态）时才更新那枚勾选框；非编辑态行首是序号，**不动它**（改它的内容
- *  会把同一行两次 click 的 target 拆开、dblclick 触发不了）。 */
-function paintLocalRowSel(el: HTMLElement, on: boolean) {
-  el.classList.toggle("sel", on);
-  const lead = el.querySelector<HTMLElement>(".music-mt-i");
-  if (lead && lead.classList.contains("music-mt-check")) {
-    lead.classList.toggle("on", on);
-    lead.innerHTML = on ? SVG.check : "";
+/** 一行的稳定 key（本地 / 播放队列 = path，在线 = uri，左栏队列 = id）。 */
+function rowKey(el: HTMLElement): string {
+  const act = el.dataset.act || "";
+  if (act === "local-queue") return el.dataset.qid || "";
+  return el.dataset.path || el.dataset.uri || "";
+}
+
+/** 容器内**当前可见**的行 key（按 DOM 顺序；Shift 范围选择靠它）。 */
+function keysInContainer(container: HTMLElement, list: TrackList): string[] {
+  const out: string[] = [];
+  container.querySelectorAll<HTMLElement>("[data-act]").forEach(el => {
+    if (ACT_LIST[el.dataset.act || ""] !== list) return;
+    const k = rowKey(el);
+    if (k && !out.includes(k)) out.push(k);
+  });
+  return out;
+}
+
+/** 把某个列表的选中态**就地**刷到所有容器里的行上（不重建列表，保住 dblclick）。 */
+function repaintListSelection(root: HTMLElement, list: TrackList) {
+  const st = SELECTIONS[list];
+  root.querySelectorAll<HTMLElement>(LIST_CONTAINER_SEL[list]).forEach(container => {
+    container.querySelectorAll<HTMLElement>("[data-act]").forEach(el => {
+      if (ACT_LIST[el.dataset.act || ""] !== list) return;
+      const key = rowKey(el);
+      const on = !!key && st.ids.has(key);
+      const row = el.closest<HTMLElement>(".music-pl, .music-mt, .music-tr") ?? el;
+      row.classList.toggle("sel", on);
+      const lead = row.querySelector<HTMLElement>(".music-mt-i");
+      if (lead?.classList.contains("music-mt-check")) {
+        lead.classList.toggle("on", on);
+        lead.innerHTML = on ? SVG.check : "";
+      }
+    });
+  });
+}
+
+/** 清空某个列表的选择。返回「原本是否有东西可清」。 */
+function clearListSelection(list: TrackList): boolean {
+  const st = SELECTIONS[list];
+  if (!st.ids.size && !st.anchor) return false;
+  st.ids.clear();
+  st.anchor = null;
+  return true;
+}
+
+/** 清空全部选择（切页 / 换队列 / 重开面板时用，等价于旧的 `trackSel.clear()`）。 */
+function clearAllSelections() {
+  for (const k of Object.keys(SELECTIONS) as TrackList[]) clearListSelection(k);
+  focusedList = null;
+}
+
+/** 当前聚焦列表全选（只选**现在画出来的**行；Ctrl+A 的落点）。 */
+function selectAllInList(root: HTMLElement, list: TrackList) {
+  const keys: string[] = [];
+  root.querySelectorAll<HTMLElement>(LIST_CONTAINER_SEL[list]).forEach(c => {
+    for (const k of keysInContainer(c, list)) if (!keys.includes(k)) keys.push(k);
+  });
+  const st = SELECTIONS[list];
+  st.ids.clear();
+  for (const k of keys) st.ids.add(k);
+  st.anchor = keys[0] ?? null;
+  repaintListSelection(root, list);
+}
+
+/** 双击播放前保证该行处于选中态（两次 click 在 Ctrl 下可能净变化为零）。 */
+function ensureRowSelected(root: HTMLElement, list: TrackList, key: string) {
+  if (!key) return;
+  SELECTIONS[list].ids.add(key);
+  SELECTIONS[list].anchor = key;
+  repaintListSelection(root, list);
+}
+
+/** 单击 / Ctrl+单击 / Shift+单击的统一判定。`ev` 为 null 时等价于普通单击。
+ *
+ *  **「自定义队列」编辑态（`queueEditOn`）是个例外**：本地库的普通单击 = **累加切换**
+ *  （点第二首不清第一首，再点同一首 = 取消）—— 那个态的用途就是勾一批歌再加进队列。
+ *  该态之外保持资源管理器语义（单击清空其他只选它）。这里只改「普通单击走哪一支」，
+ *  不复制第二套 click handler（见 forbidden.md §禁用 62）。 */
+function applyRowClick(root: HTMLElement, el: HTMLElement, ev: MouseEvent | null) {
+  const list = ACT_LIST[el.dataset.act || ""];
+  const key = rowKey(el);
+  if (!list || !key) return;
+  const st = SELECTIONS[list];
+  const container = el.closest<HTMLElement>(LIST_CONTAINER_SEL[list]);
+  const keys = container ? keysInContainer(container, list) : [key];
+  // 模式判据：只有「本地库 + 自定义队列编辑态」才把普通单击当累加切换。
+  const additive = list === "library" && queueEditOn;
+  if (ev?.shiftKey && st.anchor) {
+    const a = keys.indexOf(st.anchor);
+    const b = keys.indexOf(key);
+    if (a >= 0 && b >= 0) {
+      // Shift 范围 = **替换**当前选择（与资源管理器一致）；anchor 不动。
+      st.ids.clear();
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) st.ids.add(keys[i]);
+    } else {
+      st.ids.clear();
+      st.ids.add(key);
+      st.anchor = key;
+    }
+  } else if (ev?.ctrlKey || ev?.metaKey || additive) {
+    if (st.ids.has(key)) st.ids.delete(key); else st.ids.add(key);
+    st.anchor = key;
+  } else {
+    st.ids.clear();
+    st.ids.add(key);
+    st.anchor = key;
   }
-}
-
-/** 在线曲目行的选中样子（**只染色**，不加勾选框 —— 在线那侧不做勾选框那套视觉）。 */
-function paintOnlineRowSel(el: HTMLElement, on: boolean) {
-  el.classList.toggle("sel", on);
+  repaintListSelection(root, list);
 }
 
 /** 上一首 / 下一首 / 自动续播。
@@ -6792,7 +7093,8 @@ export async function attachMusicListeners(root: HTMLElement) {
   queueEditOn = false;
   queueDlgOpen = false;
   queueDlgFiles = [];
-  trackSel = new Set();
+  queueListPendingDel.clear();
+  clearAllSelections();
   queueQuery = "";
   if (queueQueryTimer !== undefined) { window.clearTimeout(queueQueryTimer); queueQueryTimer = undefined; }
   ctxTarget = null;
@@ -7209,7 +7511,8 @@ export async function attachMusicListeners(root: HTMLElement) {
       // 小窗是 .music-root 的子节点、不随 #music-main 重建 ⇒ 这里必须显式收掉）。
       // **`activeQueueId` 不收**：它是跨会话持久化的选中态（见 readLocalQueues），回来还在。
       queueEditOn = false;
-      trackSel.clear();       // 行的选中不跨页残留（它只在这两张列表上有意义）
+      queueListPendingDel.clear();
+      clearAllSelections();   // 行的选中不跨页残留（这些列表只在本地页里有意义）
       queueQuery = "";        // 队列页的筛选词同样不跨页
       if (queueQueryTimer !== undefined) { window.clearTimeout(queueQueryTimer); queueQueryTimer = undefined; }
       ctxTarget = null;       // 右键菜单指向的行随页一起作废
@@ -7352,6 +7655,7 @@ export async function attachMusicListeners(root: HTMLElement) {
   q<HTMLElement>("#music-del-dlg")?.addEventListener("pointerdown", (ev) => {
     if ((ev.target as HTMLElement).classList.contains("music-dlg-mask")) closeDeleteDialog(view);
   });
+
   // 左端那枚「换到另一侧」的抽屉（2026-10-03）：点它把**另一条**控制栏换出来。
   // 两条栏的显隐只由 `barSwap` 决定（见 localBarVisible），所以这里只翻标志 + 重画两处。
   q<HTMLElement>("#music-b-drawer")?.addEventListener("click", () => {
@@ -7621,11 +7925,113 @@ export async function attachMusicListeners(root: HTMLElement) {
   // 左栏 / 主区 / 搜索预览 / 搜索详细页 / 设备弹层**整块都会被重建**，
   // 逐个给行挂监听会变成孤儿监听；而且「按 data-act 分派」的逻辑只该有一份
   // （多一份必然漏掉新加的动作）。**四个容器都要挂** —— 弹层里的行不在列表里。
+  //
+  // 左栏单击 / 双击的区分（2026-10-17 **第三版，自实现双击判定**）：单击 = 切换 / 打开，
+  // 双击 = 直接播放。**根因**：上一版把单击延后 220ms、靠浏览器 dblclick 撤销 —— 但 220ms
+  // 比 Windows 默认双击间隔（500ms）短：第一次 click 的定时器先跑，switchToLocalQueue 会
+  // 因 `.on` 类变化整块替换左栏，第二次 click 落在新节点上，浏览器**不再派发 dblclick**
+  // ⇒ 双击永远不生效。现在判定挂在**稳定的 #music-side-list 容器**上，只记「行 key + 时间戳」，
+  // 与行节点是否被重画无关 ⇒ 在线歌单 / 本地队列 / 媒体库目录三类都稳。
+  // 单击语义不变（仍延后生效）：延迟与双击窗口取同一个值 —— 窗口内第一次 click 先不切页，
+  // 等窗口过去才执行；第二次命中同一行就撤销单击、直接播。
+  // 取 500ms：对齐 Windows 默认双击间隔（220ms 会漏掉较慢的双击；代价是单击最多迟 0.5s）。
+  const SIDE_CLICK_DELAY_MS = 500;
+  let sideClickTimer: number | undefined;
+  let lastSideHit: { key: string; at: number } | undefined;
+  const cancelSideClick = () => {
+    if (sideClickTimer === undefined) return;
+    window.clearTimeout(sideClickTimer);
+    sideClickTimer = undefined;
+  };
+  const scheduleSideClick = (fn: () => void) => {
+    cancelSideClick();
+    sideClickTimer = window.setTimeout(() => {
+      sideClickTimer = undefined;
+      fn();
+    }, SIDE_CLICK_DELAY_MS);
+  };
+  /** 记录 / 判定一次左栏行点击（true = 同一行在窗口内的第二次点击 = 双击）。 */
+  const hitSideRow = (key: string): boolean => {
+    const now = Date.now();
+    const dbl = !!lastSideHit && lastSideHit.key === key && now - lastSideHit.at <= SIDE_CLICK_DELAY_MS;
+    lastSideHit = dbl ? undefined : { key, at: now };
+    return dbl;
+  };
+  /** 点左栏一条自定义队列 = 切到它的详情（替代原来的「退出」按钮的返程）。
+   *  **临时态一律重来**：筛选词 / 选择集 / 两种编辑态 / 暂存删除集合都不跨队列。 */
+  const switchToLocalQueue = (qid: string) => {
+    if (!localQueues.some(q => q.id === qid)) return;
+    activeQueueId = qid;
+    persistLocalQueues();
+    queueEditOn = false;
+    mediaEditMode = false;
+    mediaSel.clear();
+    queueItemDel.clear();
+    queueListPendingDel.clear();
+    clearAllSelections();
+    queueQuery = "";
+    if (queueQueryTimer !== undefined) { window.clearTimeout(queueQueryTimer); queueQueryTimer = undefined; }
+    if (!localPage) setLocalPage(true);
+    mode = "default";
+    renderMode(view);
+  };
+  /** 左栏双击的「播放」那一半：复用既有播放函数，不另写播放逻辑。 */
+  const playSideItem = (kind: MainKind, id: string) => {
+    if (!id) return;
+    // 空歌单 ⇒ 不播 + 友好提示（复用既有空态文案）。
+    if (kind === "playlist" && findItem(kind, id)?.total === 0) {
+      note(view, t("music.playlist_empty"));
+      return;
+    }
+    void playWholeItem(view, kind, id);
+  };
+  const playSideQueue = (qid: string) => {
+    const q = localQueues.find(x => x.id === qid);
+    if (!q) return;
+    if (q.items.length === 0) {
+      note(view, t("music.local_queue_page_empty"));
+      return;
+    }
+    void playQueueTrack(view, q.items[0].path, q);
+  };
+  /** 左栏双击媒体库目录 / 「全部曲目」：**按 data-path 重新取该目录的曲目**再播。
+   *  不拿当前 `mediaTracks` 凑数 —— 它可能正停着别的目录 / 播放列表 / 筛选结果。
+   *  **不切页、不动任何选中态**：双击只负责「把这批曲目设为播放队列并从第一首起播」。 */
+  const playSideRoot = async (path: string) => {
+    const rr = path ? mediaRoots?.find(r => r.path === path) : undefined;
+    if (rr?.missing) {
+      note(view, t("music.local_missing"));
+      return;
+    }
+    let dto: MediaTracksDto;
+    try {
+      dto = await invoke<MediaTracksDto>("media_tracks", {
+        root: path || null,   // 空串 ⇒ 全部曲目（宿主 `Option<String>` 收 None）
+        query: null,          // 双击播的是整个目录，不是当前筛选后的子集
+        limit: MEDIA_LIMIT,   // 与主区列表同一个上限，双击播到的就是会显示的那批
+      });
+    } catch (e) {
+      note(view, mediaErrText(e));
+      return;
+    }
+    if (dto.items.length === 0) {
+      note(view, t("music.local_empty"));
+      return;
+    }
+    void playQueueTrack(view, dto.items[0].path, dto);
+  };
   const onListClick = (ev: Event) => {
     const el = (ev.target as HTMLElement | null)?.closest<HTMLElement>("[data-act]");
     if (!el) return;
     const kind = (el.dataset.kind || "") as MainKind;
     const id = el.dataset.id || "";
+    // 任何「不是左栏歌单 / 队列 / 目录行」的点击都撤销还在等的那次单击，并清掉双击判定 ——
+    // 否则先点队列、再点别处、又在窗口内点回同一行，会被误判成双击。
+    const sideRowAct = el.dataset.act === "open" || el.dataset.act === "local-queue" || el.dataset.act === "media-root";
+    if (!el.closest("#music-side-list") || !sideRowAct) {
+      cancelSideClick();
+      lastSideHit = undefined;
+    }
     switch (el.dataset.act) {
       case "side-tab":
         sideTab = (el.dataset.tab || "playlist") as SideKind;
@@ -7636,14 +8042,22 @@ export async function attachMusicListeners(root: HTMLElement) {
         searchTab = (el.dataset.tab || "tracks") as typeof searchTab;
         renderMain(view);
         break;
-      case "open":
-        void openItem(view, kind, id);
+      case "open": {
+        // 搜索预览 / 搜索详细页的卡片仍当场打开（它们不属于「双击播左栏」那条手势）。
+        if (!el.closest("#music-side-list")) { void openItem(view, kind, id); break; }
+        // 左栏行：双击 = 直接播（不先开详情）；单击 = 延后打开。
+        if (hitSideRow(`open:${kind}:${id}`)) {
+          cancelSideClick();
+          playSideItem(kind, id);
+          break;
+        }
+        scheduleSideClick(() => void openItem(view, kind, id));
         break;
+      }
       case "main-track": {
-        // 在线主区 / 搜索详细页的曲目行（2026-10-11 用户第 5 条）：单击 = 选中 / 取消（就地染色，
+        // 在线主区 / 搜索详细页的曲目行：单击 / Ctrl / Shift = 资源管理器式选择（就地染色，
         // 不重建 —— 重建会让双击触发不了），双击 = 播（见 view 上的 dblclick 分派）。
-        const uri = el.dataset.uri || "";
-        if (uri) paintOnlineRowSel(el, toggleTrackSel(uri));
+        applyRowClick(view, el, ev as MouseEvent);
         break;
       }
       case "main-play-all":
@@ -7654,10 +8068,9 @@ export async function attachMusicListeners(root: HTMLElement) {
         if (el.dataset.uri) void playUri(view, el.dataset.uri);
         break;
       case "play-uri": {
-        // 播放队列那一列（`#music-q` / `#music-q-dd` 里的行）。**单击 = 选中**（与主区一致），
-        // 双击 = 从这一首开始重排队列（见 dblclick）。
-        const uri = el.dataset.uri || "";
-        if (uri) paintOnlineRowSel(el, toggleTrackSel(uri));
+        // 在线播放队列那一列（`#music-q` / `#music-q-dd` 里的行）。单击 / Ctrl / Shift = 选中
+        // （与主区一致、独立一份状态），双击 = 从这一首开始重排队列（见 dblclick）。
+        applyRowClick(view, el, ev as MouseEvent);
         break;
       }
       case "search-all":
@@ -7681,16 +8094,48 @@ export async function attachMusicListeners(root: HTMLElement) {
         // **编辑态里这一下的语义完全不同**：不是「换来源」，而是「勾选它」。
         // 两个语义共用同一次点击是有意的 —— 但绝不能同时生效：编辑态下顺手换了
         // 主区来源，用户会以为那一勾没生效（主区确实变了，可列表上看不出来）。
+        // 双击同样不播（这里早退，不参与下面的双击判定）。
         if (mediaEditMode) {
+          cancelSideClick();
+          lastSideHit = undefined;
           if (p) (mediaSel.has(p) ? mediaSel.delete(p) : mediaSel.add(p));
           renderLocalSide(view);
           break;
         }
-        // 换一根目录：只重拉曲目（左栏那一列的选中态用 renderLocalSide 重画，
-        // 它的内容没变，重画是一次幂等的 setHtml）
-        mediaRootSel = p;
-        renderLocalSide(view);
-        void loadMediaTracks(view);
+        // 与在线歌单 / 自定义队列共用同一套双击判定（稳定容器 + 行 key + 500ms 窗口）。
+        // key 用 `data-path`：不同目录不会互相误判；`path=""`（全部曲目）用固定标记。
+        // **`queueEditOn` 下不播**：那个态的目录单击仍是「切目录」（连续两下 = 两次单击，
+        // 各自重新计时），勾选编辑语义原样保留。
+        const sideKey = p ? `media-root:${p}` : "media-root:*";
+        if (queueEditOn) {
+          lastSideHit = undefined;
+        } else if (hitSideRow(sideKey)) {
+          cancelSideClick();
+          void playSideRoot(p);
+          break;
+        }
+        // 单击：仍延后 500ms 再切到该目录（与另外两类左栏行同一条手势）。
+        scheduleSideClick(() => {
+          // 换一根目录：只重拉曲目（左栏那一列的选中态用 renderLocalSide 重画，
+          // 它的内容没变，重画是一次幂等的 setHtml）
+          // **从队列详情里点左栏目录 = 直接切回媒体库**（替代原来的「退出」按钮）：
+          // 清掉 `activeQueueId` 与上一队列的临时态，否则主区会继续停在队列页、这一下看起来没反应。
+          cancelSideClick();   // 撤销可能还在等的「切到某条队列」
+          mediaRootSel = p;
+          if (activeQueueId !== null) {
+            activeQueueId = null;
+            mediaEditMode = false;
+            mediaSel.clear();
+            queueItemDel.clear();
+            queueListPendingDel.clear();
+            clearAllSelections();
+            queueQuery = "";
+            if (queueQueryTimer !== undefined) { window.clearTimeout(queueQueryTimer); queueQueryTimer = undefined; }
+            persistLocalQueues();
+          }
+          renderLocalSide(view);
+          void loadMediaTracks(view);
+        });
         break;
       }
       case "media-scan":
@@ -7698,7 +8143,7 @@ export async function attachMusicListeners(root: HTMLElement) {
         // 不扫描。正常态才是全量重扫。退出时清空选中并把列表还原（行首勾选框收起）。
         if (queueEditOn) {
           queueEditOn = false;
-          trackSel.clear();
+          clearListSelection("library");
           applyQueueModeUi(view);
           renderLocalList(view);
           break;
@@ -7712,7 +8157,7 @@ export async function attachMusicListeners(root: HTMLElement) {
         // **不再弹「添加队列」小窗**（那扇浮层会盖住列表、没法勾选）—— 旧的文件选择路径改由
         // 「添加到队列（齿轮）在没选中任何一首时」兜底打开，见 addPickedToQueue。
         queueEditOn = !queueEditOn;
-        trackSel.clear();
+        clearListSelection("library");
         if (queueEditOn) addMenuOpen = false;  // ＋ 那个二选一浮层别与编辑态同时开着
         applyQueueModeUi(view);
         renderLocalList(view);
@@ -7733,61 +8178,57 @@ export async function attachMusicListeners(root: HTMLElement) {
         closeMediaPlaylist(view);
         break;
       case "local-track": {
-        // 单击一行 = **选中 / 取消**（2026-10-11 用户第 5 条：取消按钮态；播放挪到双击）。
+        // 单击 / Ctrl / Shift = 资源管理器式选择（2026-10-17；播放仍是双击）。
         // **就地刷新、不重建列表** —— 重建会把被点的节点整个换掉，浏览器就不会再发 dblclick
-        // （见 paintLocalRowSel / syncSideSelection 的注释）。绑的凭据是 `data-path`。
-        const p = el.dataset.path || "";
-        if (p) paintLocalRowSel(el, toggleTrackSel(p));
+        // （见 repaintListSelection 的注释）。绑的凭据是 `data-path`。
+        applyRowClick(view, el, ev as MouseEvent);
         break;
       }
       // ── 本地「自定义队列」（2026-10-11 用户口径：多条，列在左栏）──
       case "local-queue": {
-        // 点左栏一条队列 = 选中它（`activeQueueId`），主区切成它的详情（见 renderLocalMain）。
         const qid = el.dataset.qid || "";
         if (!localQueues.some(q => q.id === qid)) break;
-        activeQueueId = qid;
-        persistLocalQueues();
-        // 选中队列会离开媒体库列表 ⇒ 两套编辑态（自定义队列勾选 / 媒体库「修改列表」）都随之退出：
-        // 队列详情页的编辑态要**干净起点**（选中集清空，免得带进另一条队列）。
-        queueEditOn = false;
-        trackSel.clear();
-        queueQuery = "";   // 换队列 = 筛选词也重来（只过滤这一条队列，词不该跨队列）
-        mediaEditMode = false;
-        mediaSel.clear();
-        queueItemDel.clear();
-        if (!localPage) setLocalPage(true);
-        mode = "default";
-        renderMode(view);
+        // 「修改列表」编辑态里，点一行 = 勾选 / 取消勾选（与左栏目录行同一套手势 / 同一份视觉），
+        // **不打开**队列；删除统一走 🗑 暂存 + × 保存（见 stageMediaDelete / saveMediaEdit）。
+        if (mediaEditMode) {
+          if (SELECTIONS.queueList.ids.has(qid)) SELECTIONS.queueList.ids.delete(qid);
+          else SELECTIONS.queueList.ids.add(qid);
+          SELECTIONS.queueList.anchor = qid;
+          renderLocalSide(view);
+          break;
+        }
+        // 点左栏一条队列 = 选中它（`activeQueueId`），主区切成它的详情（见 renderLocalMain）。
+        // 双击 = 直接播放这条队列（不先切详情）；单击 = 延后切换。
+        if (hitSideRow(`local-queue:${qid}`)) {
+          cancelSideClick();
+          playSideQueue(qid);
+          break;
+        }
+        scheduleSideClick(() => switchToLocalQueue(qid));
         break;
       }
       // ── 队列详情页（2026-10-09 用户口径；2026-10-11 由左栏选中驱动）──
       case "queue-track": {
-        // 队列详情页的曲目行：单击 = 选中 / 取消（与本地列表同一条纪律、同一个 `trackSel`）。
-        // **这条链路现在与编辑态无关** —— 单击即选中的常驻模型，不再依赖「先点左栏 ✎ 进编辑态」
-        // （上一轮就卡在这里：编辑态没进去时行仍是「点一下即播」，看起来就是「没勾选框 / 点了没反应」）。
-        const p = el.dataset.path || "";
-        if (p) paintLocalRowSel(el, toggleTrackSel(p));
+        // 队列详情页的曲目行：单击 / Ctrl / Shift = 资源管理器式选择（独立于媒体库那份状态）。
+        // **这条链路与编辑态无关** —— 单击即选中的常驻模型，右键 → 删除所选（只改队列）。
+        applyRowClick(view, el, ev as MouseEvent);
         break;
       }
       // 本地队列**下拉浮层**（`#music-lq-dd`）里的行 = 播放队列（`localQueue`）的一首：
-      // **双击** = 把游标挪到这一首再起播（**不动** `localQueue` 的内容 —— 它本来就是播放队列本身）；
-      // 单击不选中（这个浮层是速览，不参与 `trackSel`）。
-      case "queue-play": {
+      // **单击 = 从这一首起播**（不参与多选；鼠标移上去只是 hover 预选 + 右侧显形 ×）。
+      case "queue-play":
         void playLocalQueueItem(view, Number(el.dataset.i || "0"));
         break;
-      }
-      case "queue-back":
-        // 只切视图、**不停播**（与本地小窗那个 ← 同一条纪律）：清空选中 ⇒ 主区回到媒体库。
-        // 队列详情页的编辑态一并退出（未保存的暂存删除作废 —— 与媒体库编辑态「不按×不落盘」同一条）。
-        activeQueueId = null;
-        mediaEditMode = false;
-        mediaSel.clear();
-        trackSel.clear();
-        queueItemDel.clear();
-        queueQuery = "";
-        if (queueQueryTimer !== undefined) { window.clearTimeout(queueQueryTimer); queueQueryTimer = undefined; }
-        persistLocalQueues();
-        renderMode(view);
+      // 播放队列行右侧的 ×：只从播放队列移除（不删磁盘、不动任何自定义队列）。
+      case "queue-remove":
+        ev.stopPropagation();
+        void removePlayQueueItem(view, Number(el.dataset.i || "0"));
+        break;
+      // 浮层右上角的「一键清除队列」：只清播放队列（不删磁盘、不动任何自定义队列）。
+      // 按钮不是曲目行的一部分 ⇒ 不冒泡、不触发 queue-play；清除后浮层保持打开（显示空态）。
+      case "queue-clear":
+        ev.stopPropagation();
+        void clearPlayQueue(view);
         break;
     }
   };
@@ -7795,17 +8236,9 @@ export async function attachMusicListeners(root: HTMLElement) {
     q<HTMLElement>(sel)?.addEventListener("click", onListClick);
   }
 
-  // ── 左栏双击 = 播放这一项（用户 2026-09-28：行尾那枚播放按钮删掉，功能挪到双击）──
-  // **只挂左栏**：单次点击不会再重建左栏（见 `syncSideSelection`），两次 click 才落在
-  // 同一个 target 上 ⇒ 浏览器才会发 `dblclick`。主区那张卡片点一下就被整个换掉，
-  // 双击根本无从触发（所以那里保留详细页头的「播放全部」）。
-  q<HTMLElement>("#music-side-list")?.addEventListener("dblclick", (ev) => {
-    const el = (ev.target as HTMLElement | null)?.closest<HTMLElement>('[data-act="open"]');
-    if (!el) return;
-    const kind = (el.dataset.kind || "") as MainKind;
-    const id = el.dataset.id || "";
-    if (id) void playWholeItem(view, kind, id);
-  });
+  // 左栏的双击**不再挂浏览器 dblclick**：它在上面 onListClick 里按「同一行 key + 500ms
+  // 时间窗」自己判定（见 SIDE_CLICK_DELAY_MS）。原因：单击延后到期会重画左栏，两次 click
+  // 不一定落在同一个节点上，浏览器 dblclick 靠不住；自判定只依赖稳定的 #music-side-list。
 
   // ── 双击歌曲行 = 播放（2026-10-11 用户第 5 条：取消「按钮态」，单击改选中、双击才播）──
   // 挂 `view`（始终不变的根）上、按 data-act 分派 —— 行的容器会被重画，逐个绑会成孤儿监听。
@@ -7815,30 +8248,25 @@ export async function attachMusicListeners(root: HTMLElement) {
     if (!el) return;
     switch (el.dataset.act) {
       case "local-track": {
-        // 双击前那两次 click 已把它 toggle 了两次（净变化为零）⇒ 这里保证它**选中**再播。
-        const p = el.dataset.path || "";
-        if (p && !trackSel.has(p)) { trackSel.add(p); paintLocalRowSel(el, true); }
+        // 双击前那两次 click 已按选择语义处理过 ⇒ 这里保证它**选中**再播。
+        ensureRowSelected(view, "library", el.dataset.path || "");
         void playLocalTrack(view, Number(el.dataset.i || "0"));
         break;
       }
       case "queue-track": {
         const p = el.dataset.path || "";
-        if (p && !trackSel.has(p)) { trackSel.add(p); paintLocalRowSel(el, true); }
+        ensureRowSelected(view, "queue", p);
         void playQueueTrack(view, p);
         break;
       }
-      case "queue-play":
-        void playLocalQueueItem(view, Number(el.dataset.i || "0"));
-        break;
       case "main-track": {
-        const uri = el.dataset.uri || "";
-        if (uri && !trackSel.has(uri)) { trackSel.add(uri); paintOnlineRowSel(el, true); }
+        ensureRowSelected(view, "onlineMain", el.dataset.uri || "");
         void playMainTrack(view, Number(el.dataset.i || "0"));
         break;
       }
       case "play-uri": {
         const uri = el.dataset.uri || "";
-        if (uri && !trackSel.has(uri)) { trackSel.add(uri); paintOnlineRowSel(el, true); }
+        ensureRowSelected(view, "onlineQueue", uri);
         if (uri) void playUri(view, uri);
         break;
       }
@@ -7852,25 +8280,27 @@ export async function attachMusicListeners(root: HTMLElement) {
     const el = (ev.target as HTMLElement | null)?.closest<HTMLElement>("[data-act]");
     if (!el) return;
     const act = el.dataset.act || "";
-    if (act !== "local-track" && act !== "queue-track" && act !== "main-track"
-      && act !== "play-uri" && act !== "queue-play") return;
+    // 左栏队列条目没有右键菜单：删除走既有「修改列表」编辑态（🗑 暂存 + × 保存）。
+    if (act === "local-queue") return;
+    const list = ACT_LIST[act];
+    if (!list) return;   // 只认行（x 按钮 / 普通按钮不在 ACT_LIST 里，播放队列也不在内）
     ev.preventDefault();
     ev.stopPropagation();
     const i = Number(el.dataset.i || "0");
     const path = el.dataset.path || "";
     const uri = el.dataset.uri || "";
-    const qid = act === "queue-track" ? (activeQueueId ?? "") : "";
-    // 若右键的那行**未被选中**，先把选中切到它（用户口径）；已被选中则保留多选。
-    const local = act === "local-track" || act === "queue-track";
-    const online = act === "main-track" || act === "play-uri";
-    const key = online ? uri : path;
-    if ((local || online) && key && !trackSel.has(key)) {
-      trackSel.clear();
-      trackSel.add(key);
-      if (act === "local-track") renderLocalList(view);
-      else if (act === "queue-track") renderQueuePageList(view);
-      else if (act === "main-track") renderMain(view);
-      else if (act === "play-uri") renderQueue(view);
+    const qid = act === "local-queue"
+      ? (el.dataset.qid || "")
+      : act === "queue-track" ? (activeQueueId ?? "") : "";
+    // 资源管理器行为：右键的那行**未被选中** ⇒ 先把选择切成只选它；
+    // 已被选中 ⇒ 保留多选（这样「先框选一片，再右键删除所选」才成立）。
+    const st = SELECTIONS[list];
+    const key = rowKey(el);
+    if (key && !st.ids.has(key)) {
+      st.ids.clear();
+      st.ids.add(key);
+      st.anchor = key;
+      repaintListSelection(view, list);
     }
     ctxTarget = { act, i, path, uri, qid };
     openCtxMenu(view, ev.clientX, ev.clientY);
@@ -7883,19 +8313,9 @@ export async function attachMusicListeners(root: HTMLElement) {
     const act = btn.dataset.ctx || "";
     const c = ctxTarget;
     if (!c) return;
-    if (act === "add-queue") {
-      // 二级：原地换成「已有队列 + 新建队列…」，位置保持在原菜单出现的地方。
-      const r = q<HTMLElement>("#music-ctx")?.getBoundingClientRect();
-      showQueuePickerMenu(view, r ? r.left : ev.clientX, r ? r.top : ev.clientY);
-      return;   // 不关菜单
-    }
-    if (act.startsWith("pick:")) {
-      addSelectedToQueue(view, act.slice(5));
-      closeCtxMenu(view);
-      return;
-    }
-    if (act === "pick-new") {
-      openQueueDialog(view, selectedLocalTracks().map(tr => tr.path));
+    if (act === "add-play-queue") {
+      // 作用对象是 `SELECTIONS.library`（右键那行未选中时，contextmenu 已先切成只选它）。
+      addSelectedToPlayQueue(view);
       closeCtxMenu(view);
       return;
     }
@@ -7915,15 +8335,9 @@ export async function attachMusicListeners(root: HTMLElement) {
       return;
     }
     if (act === "remove-queue") {
-      // 只从**这条自定义队列**移除（内存 + localStorage），**绝不动磁盘**（安全边界）。
-      const q0 = activeQueue();
-      if (q0 && c.path) {
-        q0.items = q0.items.filter(tr => tr.path !== c.path);
-        trackSel.delete(c.path);
-        persistLocalQueues();
-        renderQueuePageList(view);
-        note(view, t("music.ctx_removed_from_queue"));
-      }
+      // 删除**所选**（不只右键那一行）：只改这条自定义队列的 items（内存 + localStorage），
+      // **绝不动磁盘 / 媒体库**（安全边界，见 removeSelectedFromActiveQueue 的注释）。
+      removeSelectedFromActiveQueue(view);
       closeCtxMenu(view);
       return;
     }
@@ -7932,7 +8346,6 @@ export async function attachMusicListeners(root: HTMLElement) {
       closeCtxMenu(view);
       if (c.act === "main-track") void playMainTrack(view, c.i);
       else if (c.act === "play-uri" && c.uri) void playUri(view, c.uri);
-      else if (c.act === "queue-play") void playLocalQueueItem(view, c.i);
       return;
     }
   });
@@ -7940,6 +8353,37 @@ export async function attachMusicListeners(root: HTMLElement) {
   // Esc 关闭右键菜单（点外部关闭并在下面那段 pointerdown 里）。
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && q<HTMLElement>("#music-ctx")?.classList.contains("open")) closeCtxMenu(view);
+  });
+
+  // ── 键盘选择手势（2026-10-17）──
+  // 「当前聚焦列表」= 最后一次指针 / Tab 落在行上的那个列表；点别处即清空。
+  view.addEventListener("pointerdown", (ev) => {
+    focusedList = listHit(ev.target)?.list ?? null;
+  }, true);
+  view.addEventListener("focusin", (ev) => {
+    focusedList = listHit(ev.target)?.list ?? null;
+  });
+  // Ctrl(⌘)+A = 全选**当前聚焦列表**；Esc = 清空（菜单开着时先关菜单）。
+  // ⚠️ 只挂在 `.music-root` 上 —— 音乐面板没获得焦点时一律不拦；
+  // 输入框 / 文本域里的 Ctrl+A 与 Esc 原样留给文本编辑（见开头的 editable 早退）。
+  view.addEventListener("keydown", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    if (target && (target.closest("input, textarea, select") || target.isContentEditable)) return;
+    if (ev.key === "Escape") {
+      if (q<HTMLElement>("#music-ctx")?.classList.contains("open")) { closeCtxMenu(view); return; }
+      if (focusedList && clearListSelection(focusedList)) {
+        repaintListSelection(view, focusedList);
+        ev.preventDefault();
+      }
+      return;
+    }
+    if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && !ev.shiftKey && ev.key.toLowerCase() === "a") {
+      if (!focusedList) return;
+      // 左栏队列列表只有进了「修改列表」编辑态才支持全选（否则单击是「打开队列」）。
+      if (focusedList === "queueList" && !mediaEditMode) return;
+      ev.preventDefault();
+      selectAllInList(view, focusedList);
+    }
   });
 
   // ── 设备按钮（在底部控制栏右端）──

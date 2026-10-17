@@ -5095,13 +5095,29 @@ input[type="number"]::-webkit-inner-spin-button {
 /* ── 人格预设（2026-10-17 新稿：人格页第一行）────────────────────────
    行结构 = 「预设」标签 + 右侧一排预设按钮（不是列表 / 不另开页）；正在应用的按钮
    高亮（名 + 文本双判）。空态给一行次要文字。颜色全走既有变量。 */
+/* 单行不换行，超出横向滚动（触屏滑动 / 滚轮由 main.ts 转横向）；滚动条走 §界面 6
+   那条唯一全局规则，不在这里另写。装得下时首项 auto margin 把按钮推到右侧；
+   溢出时 auto margin 归零 ⇒ 从第一项开始滚，不会把左端裁到滚不到的地方。 */
 .chat-persona-preset-list {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  flex-wrap: nowrap;
+  justify-content: flex-start;
   align-items: center;
   gap: 4px;
+  flex: 1 1 auto;
   min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+.chat-persona-preset-list > :first-child { margin-left: auto; }
+/* 编辑态给右上角 × 留头部位（负 top 不被滚动容器裁掉）；收起态不留内边距。 */
+.chat-persona-preset-list.editing { padding: 6px 4px 2px; }
+#chat-persona-preset-label { flex: 0 0 auto; }
+.chat-persona-preset-cell {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
 }
 .chat-persona-preset-item {
   max-width: 120px;
@@ -5123,6 +5139,32 @@ input[type="number"]::-webkit-inner-spin-button {
 .chat-persona-preset-item.on {
   background: rgba(var(--other-overlay-rgb), var(--other-overlay-nav-alpha));
   border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
+}
+/* 编辑态：右侧留出 × 的位置，长名字不会压到小按钮下面。 */
+.chat-persona-preset-list.editing .chat-persona-preset-item { padding-right: 15px; }
+/* 删除按钮（仅编辑态由 renderPersonaPresets 渲染）：并列于预设按钮，不与它共用 handler。 */
+.chat-persona-preset-del {
+  position: absolute;
+  top: -5px;
+  right: -3px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 50%;
+  border: 1px solid var(--border-glass);
+  background: var(--surface-glass);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.chat-persona-preset-del:hover {
+  background: rgba(var(--ink-rgb), 0.16);
+  color: var(--text);
 }
 .chat-persona-preset-empty {
   font-size: 0.68rem;
@@ -7589,6 +7631,40 @@ body.music-resizing * { cursor: col-resize !important; }
   white-space: nowrap;
 }
 .music-mt-d { flex: 0 0 auto; font-size: 0.62rem; color: var(--text-muted); }
+/* 播放队列行右侧的 ×（2026-10-17 用户口径）：只在指针移到该行 / 键盘聚焦时显形。
+   行本身是 button，所以 × 必须是它的**兄弟** ⇒ 外面包一层定位盒（.music-mt-wrap）；
+   行尾预留 28px，避免 × 压住时长。触屏 / 键盘：`:focus-within` 让 Tab 到 × 时仍可见。 */
+.music-mt-wrap { position: relative; }
+.music-mt-wrap .music-mt { padding-right: 28px; }
+/* 指针移到 × 上时行本身仍算「悬停预选」（× 是行的兄弟节点，不复用 .music-mt:hover）。 */
+.music-mt-wrap:hover .music-mt { background: rgba(var(--ink-rgb), 0.05); }
+#app button.music-mt-x {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-muted);
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+/* ⚠️ 显形规则必须带 `#app` 前缀：基础规则 `#app button.music-mt-x`（1,1,1）里的
+   `opacity:0 / pointer-events:none` 会压过不带 id 的 `.music-mt-wrap:hover …`（0,3,0），
+   否则 × 永远不出现（2026-10-17 实测根因）。 */
+#app .music-mt-wrap:hover .music-mt-x,
+#app .music-mt-wrap:focus-within .music-mt-x { opacity: 1; pointer-events: auto; }
+#app button.music-mt-x:hover { color: var(--red); background: rgba(var(--ink-rgb), 0.08); }
+#app .music-mt-x:focus-visible { opacity: 1; pointer-events: auto; }
 /* 「自定义队列」编辑态里被勾中的行（2026-10-11 用户口径）。
    **2026-10-11 第三轮收编**：选中框属「选中态」⇒ 与在线 `.music-tr.sel` **同一套语言** ——
    四边 2px 实线走**按钮蒙版**（`rgb(var(--other-overlay-rgb))`，`inset` 的 box-shadow，
@@ -7679,6 +7755,44 @@ body.music-resizing * { cursor: col-resize !important; }
   right: 0;
   width: 360px;
   max-height: 320px;
+}
+/* 播放队列浮层右上角的「一键清除队列」（2026-10-17 用户口径）：**仅图标、无文字**，
+   指针移到浮层上才显形（与行尾 × 同一套 opacity / pointer-events 过渡）。
+   ⚠️ 特异性：基础规则带 `#app #music-lq-dd` 双 id（2,1,0），压过全局
+   `#app button:where(...)`（1,0,1）的常驻底色；显形规则再加 `:hover` 到 (2,2,0)，
+   必然高过基础规则 —— 否则会重演 `#app button.music-mt-x` 压住普通类显形规则那一轮
+   （见上方 .music-mt-x 注释）。非 hover 态 `pointer-events:none` ⇒ 不可点、不误触。 */
+#app #music-lq-dd .music-lq-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 20px;
+  margin: -2px 0 2px;
+}
+#app #music-lq-dd .music-lq-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-muted);
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+#app #music-lq-dd:hover .music-lq-clear,
+#app #music-lq-dd .music-lq-clear:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+#app #music-lq-dd .music-lq-clear:hover {
+  color: var(--red);
+  background: rgba(var(--ink-rgb), 0.08);
 }
 .music-dd-head {
   padding: 4px 8px 6px;

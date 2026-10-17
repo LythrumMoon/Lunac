@@ -133,9 +133,10 @@ pub struct PluginWindowShape {
     /// 进不进任务栏。缺省 `false`（= 进），与历史行为一致。
     #[serde(default)]
     pub skip_taskbar: bool,
-    /// 建窗即置顶。缺省 `true`，与历史行为一致。
-    #[serde(default = "default_true")]
-    pub always_on_top: bool,
+    /// 建窗即置顶。`None` = **未声明** ⇒ 由宿主 `plugin_window::default_always_on_top()`
+    /// 按窗口 id 决定（只有桌宠**模型窗**默认置顶）；写了 `true` / `false` 则**显式覆盖**默认。
+    #[serde(default)]
+    pub always_on_top: Option<bool>,
     /// 带不带宿主那根标题栏（置顶 / 最小化 / 关闭三个按钮）。缺省 `true`。
     /// 桌宠这一类「窗口就是那片画面本身」的插件写 `false`，前端据此收起标题栏。
     #[serde(default = "default_true")]
@@ -2001,8 +2002,20 @@ mod tests {
         assert!(!s.resizable);
         assert!(s.skip_taskbar);
         assert!(!s.chrome);
-        // 缺省：`alwaysOnTop` 没写 ⇒ true（与建窗历史行为一致）
-        assert!(s.always_on_top);
+        // 缺省：`alwaysOnTop` 没写 ⇒ `None`（由宿主 `default_always_on_top` 按窗口 id 决定，
+        // 只有桌宠模型窗默认置顶）
+        assert_eq!(s.always_on_top, None);
+        // 清单显式写值时优先于宿主默认（两个方向都能覆盖）
+        let off = r#"{"id":"pet","entry":"index.js","window":{"alwaysOnTop":false}}"#;
+        assert_eq!(
+            parse_manifest(off).unwrap().window.unwrap().always_on_top,
+            Some(false)
+        );
+        let on = r#"{"id":"memo","entry":"index.js","window":{"alwaysOnTop":true}}"#;
+        assert_eq!(
+            parse_manifest(on).unwrap().window.unwrap().always_on_top,
+            Some(true)
+        );
 
         // `0` = 用宿主缺省那一档，合法（不是错误写法）
         let zero = r#"{"id":"demo","entry":"index.js","window":{"width":0,"height":0}}"#;

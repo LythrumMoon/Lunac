@@ -144,8 +144,10 @@ const TTS_DONE_EVENT = "pet-tts-done";
 /** 最小间隔的可键入范围（分钟）。**下限 1 分钟** —— 用户要求「调小 / 可自定义」，但 0 / 负值无意义。 */
 const PROACTIVE_INTERVAL_MIN = 1;
 const PROACTIVE_INTERVAL_MAX = 1440;
-/** 每日上限的可键入范围（越界回落默认，见 loadConfig）。 */
-const PROACTIVE_CAP_MIN = 1;
+/** 每日上限的可键入范围（越界回落默认，见 loadConfig）。
+ *  **0 = 不限次数** —— 用同一个数字框表达「不限」，不另加开关（少一个状态位；
+ *  老配置里的数值原样保留，迁移时不会把 0 误当成 1）。 */
+const PROACTIVE_CAP_MIN = 0;
 const PROACTIVE_CAP_MAX = 200;
 /** 主动反应的回复到达后，气泡**自动展开**的停留时长（之后自动收起；用户本来开着的不收）。 */
 const PROACTIVE_BOX_MS = 6000;
@@ -153,22 +155,36 @@ const PROACTIVE_BOX_MS = 6000;
  *  时不至于让桌宠永远停在「思考中」、也不再排下一轮。 */
 const PROACTIVE_ROUND_TIMEOUT_MS = 90_000;
 
-/** 合并后的屏幕检测参数（**内部常量，不再暴露为用户输入**）：
- *  · `SCREEN_POLL_SEC` = 指纹轮询间隔，沿用旧「屏幕变化触发」的默认 20s；
- *  · `SCREEN_DIFF` = 16×9 灰度平均绝对差阈值（越大越不敏感），沿用旧默认 12。
- *  旧配置里的 `screenWatchSec` / `screenDiff` 只参与开关迁移，这两个数值不再读取。 */
-const SCREEN_POLL_SEC = 20;
-const SCREEN_DIFF = 12;
+/** **屏幕抓取频次**（秒，`proactive.screenPollSec`）的可键入范围，默认 20（沿用旧默认）。
+ *  · 下限 5s：每次轮询都要调一次 `screenshot_signature`（抓整屏 + 缩成 16×9），再快只会
+ *    白耗 CPU / GPU；且光标闪烁、视频逐帧这类噪声更容易被误判成「屏幕变了」；
+ *  · 上限 600s：再慢只会让变化更晚被发现，没有收益。 */
+const PROACTIVE_POLL_MIN = 5;
+const PROACTIVE_POLL_MAX = 600;
+const PROACTIVE_POLL_DEFAULT = 20;
+/** **屏幕反应灵敏度**（16×9 灰度平均绝对差阈值，`proactive.screenDiff`，越大越不敏感），
+ *  默认 12（沿用旧默认）。
+ *  · 下限 1：再低（含 0）会把光标闪烁 / 视频逐帧都判成「变了」，屏幕轮被噪声打满；
+ *  · 上限 64：平均差要超过 64/255 才算变化，正常桌面操作几乎判不出来（等于关掉屏幕反应）。 */
+const PROACTIVE_DIFF_MIN = 1;
+const PROACTIVE_DIFF_MAX = 64;
+const PROACTIVE_DIFF_DEFAULT = 12;
 
-/** 屏幕反应**专属**的最小间隔（秒，2026-10-16）。此前它复用主动对话的 `intervalMin`
- *  ⇒ 用户把 `intervalMin` 调小以换取更勤的主动说话时，屏幕反应会被一并拖密，高频截屏轮
- *  把真实对话挤出单会话的 12 轮上下文（「上下不连贯」）。
- *  合并后仍保留：无论用户怎么调间隔，屏幕那条都被钉在 ≤1 次/10 分钟。 */
-const SCREEN_MIN_GAP_SEC = 600;
+/** **屏幕反应最小间隔**（秒，`proactive.screenMinGapSec`，2026-10-17 由内部常量放开为可调）。
+ *  此前它复用主动对话的 `intervalMin` ⇒ 用户把 `intervalMin` 调小以换取更勤的主动说话时，
+ *  屏幕反应会被一并拖密，高频截屏轮把真实对话挤出单会话的 12 轮上下文（「上下不连贯」）。
+ *  · 下限 30s：再密会让截屏轮持续烧 token、把真实对话挤出上下文；且合并窗口本身固定 60s，
+ *    更小的值没有实际收益；
+ *  · 上限 3600s：1 小时已足够「偶尔看一眼」，再大等于关掉，不如直接关开关；
+ *  · 默认 600s：沿用放开前的行为，老配置迁移后体感不变。 */
+const PROACTIVE_SCREEN_GAP_MIN = 30;
+const PROACTIVE_SCREEN_GAP_MAX = 3600;
+const PROACTIVE_SCREEN_GAP_DEFAULT = 600;
 /** 屏幕变化的**短合并窗口**（毫秒，2026-10-16）。检测到变化后**先挂起**这么久再发一条；
  *  窗口内画面继续变也只发**到点时最新的一屏**（不逐次叠发、不把多次变化的语义糊在一起）。
- *  取值依据：**60s** ≥ 内部轮询间隔（20s）⇒ 一串连续变化能折进同一条；同时短到不牺牲
- *  「看到就反应」的体感。 */
+ *  取值依据：**60s** ≥ 默认轮询间隔（20s）⇒ 一串连续变化能折进同一条；同时短到不牺牲
+ *  「看到就反应」的体感。⚠️ 轮询间隔（`screenPollSec`）与最小间隔（`screenMinGapSec`）都可调，
+ *  但这个窗口**仍然固定 60s**（本轮只放开最小间隔，不改合并语义）。 */
 const SCREEN_MERGE_MS = 60_000;
 
 /** 桌宠窗的三段布局（逻辑像素）与整体尺寸的**唯一真相源在 `./pet-window-size`**：
@@ -282,8 +298,18 @@ interface ProactiveCfg {
   enabled: boolean;
   /** 两次主动反应之间的**最小间隔**（分钟），范围 `PROACTIVE_INTERVAL_MIN..PROACTIVE_INTERVAL_MAX`。 */
   intervalMin: number;
-  /** 每个自然日最多触发几次（越界回落默认，范围 `PROACTIVE_CAP_MIN..PROACTIVE_CAP_MAX`）。 */
+  /** 每个自然日最多触发几次（越界回落默认，范围 `PROACTIVE_CAP_MIN..PROACTIVE_CAP_MAX`）。
+   *  **0 = 不限次数**（永远不到顶，也不再排跨日自愈）。 */
   dailyCap: number;
+  /** **屏幕指纹轮询间隔**（秒，范围 `PROACTIVE_POLL_MIN..PROACTIVE_POLL_MAX`，默认 20）。
+   *  只影响「多久看一眼屏幕」，不改变屏幕最小间隔与 60s 合并窗口。 */
+  screenPollSec: number;
+  /** **屏幕反应最小间隔**（秒，范围 `PROACTIVE_SCREEN_GAP_MIN..PROACTIVE_SCREEN_GAP_MAX`，
+   *  默认 600）：距上一次屏幕反应不足这么多秒就不触发新的屏幕轮。 */
+  screenMinGapSec: number;
+  /** **屏幕反应灵敏度**（16×9 灰度平均绝对差阈值，范围 `PROACTIVE_DIFF_MIN..PROACTIVE_DIFF_MAX`，
+   *  默认 12）。越小越敏感。 */
+  screenDiff: number;
   /** 「今日已用」计数对应的**自然日**（本地 `YYYY-MM-DD`）。≠ 今天 ⇒ 计数作废（跨日归零）。 */
   date: string;
   /** 今天已触发的主动反应次数。 */
@@ -292,23 +318,30 @@ interface ProactiveCfg {
 
 /** 合并前（2026-10-17 之前）的三个子开关与参数。**只在迁移时读一次**：
  *  任一开关为真 ⇒ 合并后的 `enabled` 为真；`intervalMin` 仍取主间隔（见 loadConfig）。
- *  迁移写回新结构后这些键即消失，重复执行结果不变（幂等）。 */
+ *  迁移写回新结构后这些键即消失，重复执行结果不变（幂等）。
+ *  `screenWatchSec` 是旧轮询秒数，现回填为新配置 `screenPollSec`（旧键名不同，写回后消失）；
+ *  `screenDiff` 与新配置同名，故直接按新字段读取，**不算**迁移遗留键。 */
 interface LegacyProactiveCfg {
   autoShot?: unknown;
   autoShotMin?: unknown;
   screenWatch?: unknown;
   screenWatchSec?: unknown;
-  screenDiff?: unknown;
 }
 
 const DEFAULT_CFG: PetConfig = {
   image: "", model: "", scale: 1, offsetX: 0, offsetY: 0, rotation: 0, clickThrough: false, expressions: {}, params: {}, paramKinds: {}, motionTemplateIncludePhysics: false, idleMotions: {}, hotkeyStates: {},
-  proactive: { enabled: false, intervalMin: 30, dailyCap: 20, date: "", used: 0 },
+  proactive: { enabled: false, intervalMin: 30, dailyCap: 20, screenPollSec: PROACTIVE_POLL_DEFAULT, screenMinGapSec: PROACTIVE_SCREEN_GAP_DEFAULT, screenDiff: PROACTIVE_DIFF_DEFAULT, date: "", used: 0 },
   tts: true,
   speechRate: RATE_DEFAULT,
   winW: WIN_W_DEFAULT,
   winH: WIN_BASE_H,
 };
+
+/** 整数配置的**统一夹取口径**：非数值 / 非有限值 ⇒ `fallback`；否则 `round` 后夹到 `[min, max]`。
+ *  ⚠️ `min = 0` 时必须保留 0（每日上限的「0 = 不限」语义），不能退回 1。 */
+function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.round(v))) : fallback;
+}
 
 function loadConfig(): PetConfig {
   try {
@@ -379,19 +412,28 @@ function loadConfig(): PetConfig {
     const hasLegacyProactive =
       !!pRaw &&
       typeof pRaw === "object" &&
-      ("autoShot" in pRaw || "autoShotMin" in pRaw || "screenWatch" in pRaw || "screenWatchSec" in pRaw || "screenDiff" in pRaw);
+      ("autoShot" in pRaw || "autoShotMin" in pRaw || "screenWatch" in pRaw || "screenWatchSec" in pRaw);
     const proactive: ProactiveCfg =
       pRaw && typeof pRaw === "object"
         ? {
             enabled: pRaw.enabled === true || pRaw.autoShot === true || pRaw.screenWatch === true,
-            intervalMin:
-              typeof pRaw.intervalMin === "number" && Number.isFinite(pRaw.intervalMin)
-                ? Math.min(PROACTIVE_INTERVAL_MAX, Math.max(PROACTIVE_INTERVAL_MIN, Math.round(pRaw.intervalMin)))
-                : pd.intervalMin,
-            dailyCap:
-              typeof pRaw.dailyCap === "number" && Number.isFinite(pRaw.dailyCap)
-                ? Math.min(PROACTIVE_CAP_MAX, Math.max(PROACTIVE_CAP_MIN, Math.round(pRaw.dailyCap)))
-                : pd.dailyCap,
+            intervalMin: clampInt(pRaw.intervalMin, PROACTIVE_INTERVAL_MIN, PROACTIVE_INTERVAL_MAX, pd.intervalMin),
+            dailyCap: clampInt(pRaw.dailyCap, PROACTIVE_CAP_MIN, PROACTIVE_CAP_MAX, pd.dailyCap),
+            // 轮询秒数：新字段优先；老配置里的 `screenWatchSec` 回填一次（随后随迁移写回消失）。
+            screenPollSec: clampInt(
+              pRaw.screenPollSec ?? pRaw.screenWatchSec,
+              PROACTIVE_POLL_MIN,
+              PROACTIVE_POLL_MAX,
+              pd.screenPollSec,
+            ),
+            // 最小间隔：老配置没有这个字段 ⇒ 回落默认 600（与放开前的行为一致）。
+            screenMinGapSec: clampInt(
+              pRaw.screenMinGapSec,
+              PROACTIVE_SCREEN_GAP_MIN,
+              PROACTIVE_SCREEN_GAP_MAX,
+              pd.screenMinGapSec,
+            ),
+            screenDiff: clampInt(pRaw.screenDiff, PROACTIVE_DIFF_MIN, PROACTIVE_DIFF_MAX, pd.screenDiff),
             date: typeof pRaw.date === "string" ? pRaw.date : "",
             used: typeof pRaw.used === "number" && Number.isFinite(pRaw.used) && pRaw.used > 0 ? Math.floor(pRaw.used) : 0,
           }
@@ -468,6 +510,12 @@ function proactiveUsedToday(): number {
   const pr = loadConfig().proactive;
   if (pr.date !== todayStr()) return 0;
   return pr.used > 0 ? pr.used : 0;
+}
+
+/** 每日上限是否已到。`dailyCap = 0` ⇒ **不限次数**（永远不到顶，也不必排跨日自愈）。
+ *  **所有闸（调度 / 轮询 / 合并窗口 / 发送）都只走这一处判断**，别在别处再写一遍比较。 */
+function proactiveCapReached(pr: ProactiveCfg): boolean {
+  return pr.dailyCap > 0 && proactiveUsedToday() >= pr.dailyCap;
 }
 
 /** 「今日已用」+1 并写回（跨日先把计数从 0 起算）。返回新值。 */
@@ -583,8 +631,10 @@ function onOffText(on: boolean): string {
 function proactiveBlock(cfg: PetConfig): string {
   const pr = cfg.proactive;
   const used = proactiveUsedToday();
-  const base = t("pet.proactive_usage", { used: String(used), cap: String(pr.dailyCap) });
-  const usage = used >= pr.dailyCap ? `${base} · ${t("pet.proactive_reached")}` : base;
+  // 上限为 0 ⇒ 回显「不限」，且永不显示「已达上限」。
+  const capText = pr.dailyCap > 0 ? String(pr.dailyCap) : t("pet.proactive_unlimited");
+  const base = t("pet.proactive_usage", { used: String(used), cap: capText });
+  const usage = proactiveCapReached(pr) ? `${base} · ${t("pet.proactive_reached")}` : base;
   return `
   <div class="pet-proactive" id="pet-proactive">
     <div class="pet-debug-title">${t("pet.proactive_title")}</div>
@@ -602,6 +652,23 @@ function proactiveBlock(cfg: PetConfig): string {
       <input type="text" id="pet-proactive-cap" class="pet-param-num" inputmode="numeric" autocomplete="off" spellcheck="false" value="${pr.dailyCap}" aria-label="${esc(t("pet.proactive_cap"))}">
       <span class="pet-val">${t("pet.proactive_cap_unit")}</span>
     </div>
+    <div class="pet-note">${esc(t("pet.proactive_cap_hint"))}</div>
+    <div class="pet-row">
+      <span class="pet-label">${t("pet.proactive_screen_poll")}</span>
+      <input type="text" id="pet-proactive-poll" class="pet-param-num" inputmode="numeric" autocomplete="off" spellcheck="false" value="${pr.screenPollSec}" aria-label="${esc(t("pet.proactive_screen_poll"))}">
+      <span class="pet-val">${t("pet.proactive_second")}</span>
+    </div>
+    <div class="pet-row">
+      <span class="pet-label">${t("pet.proactive_screen_gap")}</span>
+      <input type="text" id="pet-proactive-gap" class="pet-param-num" inputmode="numeric" autocomplete="off" spellcheck="false" value="${pr.screenMinGapSec}" aria-label="${esc(t("pet.proactive_screen_gap"))}">
+      <span class="pet-val">${t("pet.proactive_second")}</span>
+    </div>
+    <div class="pet-note">${esc(t("pet.proactive_gap_hint"))}</div>
+    <div class="pet-row">
+      <span class="pet-label">${t("pet.proactive_screen_diff")}</span>
+      <input type="text" id="pet-proactive-diff" class="pet-param-num" inputmode="numeric" autocomplete="off" spellcheck="false" value="${pr.screenDiff}" aria-label="${esc(t("pet.proactive_screen_diff"))}">
+    </div>
+    <div class="pet-note">${esc(t("pet.proactive_diff_hint"))}</div>
     <div class="pet-note" id="pet-proactive-hint">${esc(t("pet.proactive_shot_hint"))}</div>
     <div class="pet-note" id="pet-proactive-usage">${esc(usage)}</div>
   </div>`;
@@ -1959,7 +2026,8 @@ async function attachSettings(root: HTMLElement): Promise<void> {
   // ── 主动反应（2026-10-09）──────────────────────────────────────
   // 设置窗只做三件事：写配置、把「今日已用」显示出来、把改动**广播**给桌宠窗即时生效。
   // 计时与真正发送在桌宠窗那侧（见 attachPetWindow）。配置与计数**共用 `CFG_KEY` 一份存储**。
-  /** 广播当前主动反应配置（单开关 / 间隔 / 上限）—— 桌宠窗据此重排计时器与屏幕轮询。 */
+  /** 广播当前主动反应配置（开关 / 间隔 / 上限 / 屏幕抓取频次 / 屏幕最小间隔 / 灵敏度）——
+   *  桌宠窗据此重排计时器与屏幕轮询。 */
   const emitProactive = () => {
     const pr = loadConfig().proactive;
     void emit(CTL_EVENT, {
@@ -1967,6 +2035,9 @@ async function attachSettings(root: HTMLElement): Promise<void> {
       enabled: pr.enabled,
       intervalMin: pr.intervalMin,
       dailyCap: pr.dailyCap,
+      screenPollSec: pr.screenPollSec,
+      screenMinGapSec: pr.screenMinGapSec,
+      screenDiff: pr.screenDiff,
     });
   };
 
@@ -1976,20 +2047,23 @@ async function attachSettings(root: HTMLElement): Promise<void> {
     if (!box) return;
     const pr = loadConfig().proactive;
     const used = proactiveUsedToday();
-    const base = t("pet.proactive_usage", { used: String(used), cap: String(pr.dailyCap) });
-    box.textContent = used >= pr.dailyCap ? `${base} · ${t("pet.proactive_reached")}` : base;
+    const capText = pr.dailyCap > 0 ? String(pr.dailyCap) : t("pet.proactive_unlimited");
+    const base = t("pet.proactive_usage", { used: String(used), cap: capText });
+    box.textContent = proactiveCapReached(pr) ? `${base} · ${t("pet.proactive_reached")}` : base;
   };
 
   /** 每日上限数字框提交（Enter / 失焦触发）：夹到 `PROACTIVE_CAP_MIN..PROACTIVE_CAP_MAX` 后回填 + 广播。
+   *  `0` 是合法值（= 不限次数），**不得**被夹成 1。
    *  非数字 / 空 ⇒ 不提交、不发 IPC，把框恢复成当前合法值（同 `commitParamNum` 的口径）。 */
   const commitProactiveCap = (inp: HTMLInputElement) => {
     const c = loadConfig();
     const raw = Number.parseInt(inp.value.trim(), 10);
-    if (!Number.isFinite(raw)) {
+    if (!Number.isFinite(raw) || raw < 0) {
+      // 负数不当成「0 = 不限」：那是放宽成本闸，宁可恢复当前值让用户看清再改。
       inp.value = String(c.proactive.dailyCap);
       return;
     }
-    const v = Math.min(PROACTIVE_CAP_MAX, Math.max(PROACTIVE_CAP_MIN, raw));
+    const v = clampInt(raw, PROACTIVE_CAP_MIN, PROACTIVE_CAP_MAX, c.proactive.dailyCap);
     inp.value = String(v);
     saveConfig({ ...c, proactive: { ...c.proactive, dailyCap: v } });
     emitProactive();
@@ -2006,9 +2080,53 @@ async function attachSettings(root: HTMLElement): Promise<void> {
       inp.value = String(c.proactive.intervalMin);
       return;
     }
-    const v = Math.min(PROACTIVE_INTERVAL_MAX, Math.max(PROACTIVE_INTERVAL_MIN, raw));
+    const v = clampInt(raw, PROACTIVE_INTERVAL_MIN, PROACTIVE_INTERVAL_MAX, c.proactive.intervalMin);
     inp.value = String(v);
     saveConfig({ ...c, proactive: { ...c.proactive, intervalMin: v } });
+    emitProactive();
+  };
+
+  /** 屏幕抓取频次（秒）数字框提交：夹到 `PROACTIVE_POLL_MIN..PROACTIVE_POLL_MAX` 后回填 + 广播
+   *  （桌宠窗据此按新秒数重启指纹轮询）。 */
+  const commitProactivePoll = (inp: HTMLInputElement) => {
+    const c = loadConfig();
+    const raw = Number.parseInt(inp.value.trim(), 10);
+    if (!Number.isFinite(raw)) {
+      inp.value = String(c.proactive.screenPollSec);
+      return;
+    }
+    const v = clampInt(raw, PROACTIVE_POLL_MIN, PROACTIVE_POLL_MAX, c.proactive.screenPollSec);
+    inp.value = String(v);
+    saveConfig({ ...c, proactive: { ...c.proactive, screenPollSec: v } });
+    emitProactive();
+  };
+
+  /** 屏幕反应最小间隔（秒）数字框提交：夹到 `PROACTIVE_SCREEN_GAP_MIN..PROACTIVE_SCREEN_GAP_MAX`
+   *  后回填 + 广播（桌宠窗据此更新冷却判定）。 */
+  const commitProactiveGap = (inp: HTMLInputElement) => {
+    const c = loadConfig();
+    const raw = Number.parseInt(inp.value.trim(), 10);
+    if (!Number.isFinite(raw)) {
+      inp.value = String(c.proactive.screenMinGapSec);
+      return;
+    }
+    const v = clampInt(raw, PROACTIVE_SCREEN_GAP_MIN, PROACTIVE_SCREEN_GAP_MAX, c.proactive.screenMinGapSec);
+    inp.value = String(v);
+    saveConfig({ ...c, proactive: { ...c.proactive, screenMinGapSec: v } });
+    emitProactive();
+  };
+
+  /** 屏幕反应灵敏度数字框提交：夹到 `PROACTIVE_DIFF_MIN..PROACTIVE_DIFF_MAX` 后回填 + 广播。 */
+  const commitProactiveDiff = (inp: HTMLInputElement) => {
+    const c = loadConfig();
+    const raw = Number.parseInt(inp.value.trim(), 10);
+    if (!Number.isFinite(raw)) {
+      inp.value = String(c.proactive.screenDiff);
+      return;
+    }
+    const v = clampInt(raw, PROACTIVE_DIFF_MIN, PROACTIVE_DIFF_MAX, c.proactive.screenDiff);
+    inp.value = String(v);
+    saveConfig({ ...c, proactive: { ...c.proactive, screenDiff: v } });
     emitProactive();
   };
 
@@ -2648,6 +2766,18 @@ async function attachSettings(root: HTMLElement): Promise<void> {
         commitProactiveInterval(t as HTMLInputElement);
         return;
       }
+      if (t.id === "pet-proactive-poll") {
+        commitProactivePoll(t as HTMLInputElement);
+        return;
+      }
+      if (t.id === "pet-proactive-gap") {
+        commitProactiveGap(t as HTMLInputElement);
+        return;
+      }
+      if (t.id === "pet-proactive-diff") {
+        commitProactiveDiff(t as HTMLInputElement);
+        return;
+      }
       // 语音「参考音色」的参考文本：失焦提交（= 用户改完那句原话）。
       if (t.id === "pet-tts-reftext") {
         void commitPetVoiceText((t as HTMLInputElement).value).catch(e => report("保存参考文本失败", e));
@@ -2672,6 +2802,21 @@ async function attachSettings(root: HTMLElement): Promise<void> {
       if (t.id === "pet-proactive-interval") {
         ev.preventDefault();
         commitProactiveInterval(t as HTMLInputElement);
+        return;
+      }
+      if (t.id === "pet-proactive-poll") {
+        ev.preventDefault();
+        commitProactivePoll(t as HTMLInputElement);
+        return;
+      }
+      if (t.id === "pet-proactive-gap") {
+        ev.preventDefault();
+        commitProactiveGap(t as HTMLInputElement);
+        return;
+      }
+      if (t.id === "pet-proactive-diff") {
+        ev.preventDefault();
+        commitProactiveDiff(t as HTMLInputElement);
         return;
       }
       // 参考音色文本按 Enter 也提交（`change` 只在失焦时来）。
@@ -4417,7 +4562,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   //   · 屏幕检测到变化（且能截图）⇒ `pet.watch_prompt`（带当前屏截图）；
   //   · 画面无变化 / 不能截图 ⇒ `pet.proactive_prompt`（纯文字）。
   // 屏幕检测只是这个 intent 的**输入**（内部固定 20s 抓 16×9 指纹，不落盘），不是第二个触发源：
-  //   变化先过 60s 合并窗口，再走同一套闸（可见 / 每日上限 / 单轮互斥）与 10min 屏幕冷却。
+  //   变化先过 60s 合并窗口，再走同一套闸（可见 / 每日上限 / 单轮互斥）与可调的屏幕冷却（默认 10min）。
   // ⚠️ **只落桌宠侧**（裁决依据，防后人误接）：这里管的是「桌宠要不要**自发**说一句 / 看一眼」，
   //    **不是**「某条消息过不过 API」。后者（把本地判定接成「输入门」）**已被用户否决**并回滚 ——
   //    见 `docs/archive/agent-feature-backlog.md` §4.1.7：「『这条消息过不过 API』是**桌宠侧**的
@@ -4454,7 +4599,8 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   let lastSig: number[] | null = null;
   /** 已检测到、但还没被某一轮消费的屏幕变化（合并窗口 / 冷却 / 互斥都靠它串起来）。 */
   let screenChanged = false;
-  /** 上一次「屏幕有变化」那一轮发出的时刻（`Date.now()`）；屏幕反应至少间隔 `SCREEN_MIN_GAP_SEC`。 */
+  /** 上一次「屏幕有变化」那一轮发出的时刻（`Date.now()`）；屏幕反应至少间隔
+   *  `proactive.screenMinGapSec` 秒（默认 600）。 */
   let lastScreenAt = 0;
   /** 屏幕变化的**短合并窗口**计时器：窗口内连续变化合成一条再发（见 `tryStartMerge` / `onMerged`）。 */
   let screenMergeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4509,7 +4655,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     clearSched();
     const pr = loadConfig().proactive;
     if (!pr.enabled || !visible) return;
-    if (proactiveUsedToday() >= pr.dailyCap) {
+    if (proactiveCapReached(pr)) {
       scheduleMidnightRecheck(); // 触顶：停到下一个自然日零点再自动重排（跨日自动恢复）
       return;
     }
@@ -4562,12 +4708,12 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     if (proactiveBusy) return false;
     const pr = loadConfig().proactive;
     if (!visible || !pr.enabled) return false;
-    if (proactiveUsedToday() >= pr.dailyCap) {
+    if (proactiveCapReached(pr)) {
       scheduleMidnightRecheck();
       return false;
     }
     // 屏幕冷却未过 ⇒ 本轮仍可「主动说一句」，但**不消费**这次变化（轮询会在冷却结束后再挂合并窗口）。
-    const wantScreen = screenChanged && Date.now() - lastScreenAt >= SCREEN_MIN_GAP_SEC * 1000;
+    const wantScreen = screenChanged && Date.now() - lastScreenAt >= pr.screenMinGapSec * 1000;
     if (wantScreen) screenChanged = false; // 本次变化由这一轮消费
     let intent = intentFor(wantScreen);
     let ok = await dispatch(intent);
@@ -4591,7 +4737,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   async function onDue() {
     const pr = loadConfig().proactive;
     if (!visible || !pr.enabled) return;
-    if (proactiveUsedToday() >= pr.dailyCap) {
+    if (proactiveCapReached(pr)) {
       scheduleMidnightRecheck(); // 期间上限被调小 ⇒ 转去等下一个自然日再排
       return;
     }
@@ -4622,7 +4768,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   // ── 屏幕变化检测：统一 intent 的**输入**（不是独立触发源）──────────────────────
   // **隐私红线**（预检 #72 ①）：只在用户开启「主动反应」时抓 16×9 指纹（**不落盘**），
   // 桌宠不可见一律停。检测到变化 ⇒ 先挂 60s 合并窗口（窗口内继续变也只发到点最新一屏）
-  // ⇒ 走同一套闸与 10min 冷却。不能截图（图片输入关 / 抓屏失败）⇒ 该轮回落纯文字。
+  // ⇒ 走同一套闸与可调的屏幕冷却（默认 10min）。不能截图（图片输入关 / 抓屏失败）⇒ 该轮回落纯文字。
 
   /** 抓当前显示器整屏 → 作为图片附件送进**现有** AI 链路（同 `lookScreen`，但这里是自动触发）。
    *  vision 关着 ⇒ 图片块会被静默丢弃 —— 直接不发（别白烧 token）。返回是否真的发出。 */
@@ -4663,11 +4809,11 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   function startPoll() {
     if (pollTimer || !visible) return;
     const pr = loadConfig().proactive;
-    if (!pr.enabled || proactiveUsedToday() >= pr.dailyCap) return;
+    if (!pr.enabled || proactiveCapReached(pr)) return;
     pollTimer = setTimeout(() => {
       pollTimer = null;
       void pollDue();
-    }, SCREEN_POLL_SEC * 1000);
+    }, pr.screenPollSec * 1000);
   }
 
   function stopPoll() {
@@ -4682,22 +4828,22 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     if (screenMergeTimer || !screenChanged) return;
     const pr = loadConfig().proactive;
     if (!visible || !pr.enabled || proactiveBusy) return;
-    if (proactiveUsedToday() >= pr.dailyCap) {
+    if (proactiveCapReached(pr)) {
       scheduleMidnightRecheck();
       return;
     }
-    if (Date.now() - lastScreenAt < SCREEN_MIN_GAP_SEC * 1000) return;
+    if (Date.now() - lastScreenAt < pr.screenMinGapSec * 1000) return;
     screenMergeTimer = setTimeout(() => {
       screenMergeTimer = null;
       void onMerged();
     }, SCREEN_MERGE_MS);
   }
 
-  /** 内部轮询：每 `SCREEN_POLL_SEC` 秒比一张 16×9 指纹（不落盘），只标记变化，不发消息。 */
+  /** 内部轮询：每 `screenPollSec` 秒比一张 16×9 指纹（不落盘），只标记变化，不发消息。 */
   async function pollDue() {
     const pr = loadConfig().proactive;
     if (!visible || !pr.enabled) return;
-    if (proactiveUsedToday() >= pr.dailyCap) {
+    if (proactiveCapReached(pr)) {
       scheduleMidnightRecheck(); // 触顶：停到跨日自愈（恢复后由 armSched 重新 startPoll）
       return;
     }
@@ -4709,7 +4855,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
       /* 抓不到指纹就跳过这一轮，不打断节奏 */
     }
     if (sig) {
-      if (lastSig && lastSig.length === sig.length && meanAbsDiff(lastSig, sig) >= SCREEN_DIFF) {
+      if (lastSig && lastSig.length === sig.length && meanAbsDiff(lastSig, sig) >= pr.screenDiff) {
         screenChanged = true;
       }
       lastSig = sig;
@@ -4722,7 +4868,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   async function onMerged() {
     const pr = loadConfig().proactive;
     if (!visible || !pr.enabled) return; // 期间被关 / 不可见 ⇒ 静默（恢复 / 重开时重建基准）
-    if (proactiveUsedToday() >= pr.dailyCap) {
+    if (proactiveCapReached(pr)) {
       scheduleMidnightRecheck();
       return;
     }
@@ -5248,7 +5394,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   // ── 与控制台 / 宿主的通道 ─────────────────────────────────────
   const offCtl = await listen(CTL_EVENT, ev => {
     const p = ev.payload as
-      | { type?: string; value?: unknown; token?: string; id?: string; name?: unknown; ids?: unknown; enabled?: unknown; intervalMin?: unknown; dailyCap?: unknown; action?: unknown; group?: unknown; index?: unknown }
+      | { type?: string; value?: unknown; token?: string; id?: string; name?: unknown; ids?: unknown; enabled?: unknown; intervalMin?: unknown; dailyCap?: unknown; screenPollSec?: unknown; screenMinGapSec?: unknown; screenDiff?: unknown; action?: unknown; group?: unknown; index?: unknown }
       | null;
     if (!p?.type) return;
     // 控制台问「桌宠窗开着吗」—— **只在桌宠窗里应答**（设置窗也是本插件的一份，不该应答）。
@@ -5308,22 +5454,30 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     // 主动反应配置改动（设置窗广播）：落盘 + **立即重排**（开关一开就生效）。
     if (p.type === "set-proactive") {
       const c = loadConfig();
-      const clampNum = (v: unknown, min: number, max: number, fallback: number) =>
-        typeof v === "number" && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.round(v))) : fallback;
       saveConfig({
         ...c,
         proactive: {
           ...c.proactive,
           enabled: p.enabled === true,
-          intervalMin: clampNum(p.intervalMin, PROACTIVE_INTERVAL_MIN, PROACTIVE_INTERVAL_MAX, c.proactive.intervalMin),
-          dailyCap: clampNum(p.dailyCap, PROACTIVE_CAP_MIN, PROACTIVE_CAP_MAX, c.proactive.dailyCap),
+          intervalMin: clampInt(p.intervalMin, PROACTIVE_INTERVAL_MIN, PROACTIVE_INTERVAL_MAX, c.proactive.intervalMin),
+          dailyCap: clampInt(p.dailyCap, PROACTIVE_CAP_MIN, PROACTIVE_CAP_MAX, c.proactive.dailyCap),
+          screenPollSec: clampInt(p.screenPollSec, PROACTIVE_POLL_MIN, PROACTIVE_POLL_MAX, c.proactive.screenPollSec),
+          screenMinGapSec: clampInt(
+            p.screenMinGapSec,
+            PROACTIVE_SCREEN_GAP_MIN,
+            PROACTIVE_SCREEN_GAP_MAX,
+            c.proactive.screenMinGapSec,
+          ),
+          screenDiff: clampInt(p.screenDiff, PROACTIVE_DIFF_MIN, PROACTIVE_DIFF_MAX, c.proactive.screenDiff),
         },
       });
       // 配置变了：作废正在挂起的合并窗口与旧基准，按新配置重排 / 重启轮询。
+      // 先 `stopPoll()` 再 `startPoll()`：否则已在跑的旧定时器会继续按**旧**秒数走完这一格。
       screenChanged = false;
       lastSig = null;
       clearMergeTimer();
       schedule({ reset: true });
+      stopPoll();
       startPoll();
       return;
     }

@@ -350,8 +350,15 @@
 - **涉及文件**：`core-agent/src/main.rs`（`memory_block` / `memory_block_text` / `should_review` / `review_state_path` / `ReviewSetup` / `run_review_fork`）、`core-agent/src/tools.rs`（`remember_tool` / `BRIDGE_TOOLS` / `write_blocked`）、`app/src-tauri/src/mcp_server.rs`（`lunac/memory_read` / `_write`）、`app/src-tauri/src/commands.rs`（`tool_blacklist_args`、spawn env）。
 - **已实现（2026-10-13，P1 折中 + B2）**：
   - **①A 复盘配额折中** —— **选型 (a)**：保留**单一** `temp\review-last` 承载**共享时间闸**，把「每会话 ≤ 1 次」的 `reviewed_this_session` 由单个 bool 拆成**按 scope 的 `[bool; 2]`**（`tools::MemoryScope::index` 取下标，global / pet 各一份）。⇒ `Global` 与 `Pet` 在同一 agent 进程内**各能触发一次**；`last_review_ts` 仍**两侧共享**（任一作用域刚复盘过，另一侧 30 分钟内也不跑，防总成本翻倍）。落点：`should_review` 改签名收 `fired_per_scope: [bool; 2]` + `scope`（**仍纯函数**）；调用点按本轮 `turn_scope` 置对应下标（`main.rs` 提问循环）；`ReviewSetup::spawn` 经 `tctx` 克隆已随本轮作用域，**无需改签名**。触发语义其余不动（每会话每 scope 上限、30 分钟、输入 6000 字、输出 ≤ 3 条、预算 12 万 token、`enabled` 开关链）。
-  - **①B 复盘来源 / 时间标注** —— **本轮只做 B2（块头一行）**：`memory_block_text` 的引导段加**一行固定来源 / 时间说明**（英文，属固定前缀、逐字节稳定、按 scope 措辞：全局段点明「主 AI 保存」、桌宠段点明「桌宠私有」；并交代「未标注日期者视为背景」）。**B1（逐条日期 / 来源）仍待做**，且**需同步改去重语义**（现状去重 = 整条 bullet 完全相等）。
-  - **本轮新增单测**：`review_gate_splits_session_quota_by_scope_and_shares_time_gate`（per-scope 配额 + 共享时间闸）、`memory_block_provenance_line_is_byte_stable_and_precedes_body`（说明行逐字节稳定 + 与正文分离）。
+  - **①B 复盘来源 / 时间标注** —— B2（块头一行，2026-10-13）已做：`memory_block_text` 的引导段加**一行固定来源 / 时间说明**（英文，属固定前缀、逐字节稳定、按 scope 措辞）。**B1（逐条日期 / 来源）已实现（2026-10-17）**，见下一条；去重语义已同步改。
+  - **①B-1 逐条日期 / 来源 + 去重新语义（已实现，2026-10-17）**：
+    - **格式**：写侧唯一落盘口 `mcp_server.rs` 的 `write_memory_at` 给每条 bullet 加行首前缀 `- [YYYY-MM-DD · <scope>] <原内容>`。日期由**宿主**用 Win32 `GetLocalTime` 取**本地日期**（不交给模型；UTC 会跨日），scope 用稳定英文 id（`global` / `pet`，不随界面语言漂移）；多行 bullet 的续行缩进原样保留，前缀只加在首行 `- ` 之后。`MEMORY.md` 仍是扁平 bullet，不分节。成长笔记 / 人格建议复用同一落盘助手但**不盖前缀**（`provenance: None`）。
+    - **去重新语义**：按「去掉行首 `[日期 · scope]` 前缀后的正文」归一比较（折叠所有空白 + 大小写不敏感，与逐条删共用 `normalize_entry`）。命中同正文 ⇒ **不追加**，并把该条日期**刷新为本次写入日期**（语义 = **最后确认时间**，不是初次得知）；正文与 scope 不变。旧的无前缀 bullet 在同正文再次写入时**原地补前缀**（自然迁移，**不批量回填**历史日期 —— 没有可信的旧日期）。
+    - **闸与脱敏**：单条 ≤2000（按最终落盘内容，含 `- ` 与来源前缀）；`mask_secrets` 仍在落盘前执行；`replace: true` 仍整体重写，且所有 bullet 的日期 / scope 由宿主重盖（模型自带的假日期一律覆盖）。
+    - **上限已改动态（2026-10-17）**：正文额度 6000 不占前缀；总长硬顶 9000。正文额度只统计每条去掉 `- ` 与 `[日期 · scope] ` 前缀后的正文（含续行），前缀再多也不挤占正文档位；总长硬顶（含前缀 / 换行 / 续行缩进）防「条目多 + 前缀长」把每轮注入体积顶爆。校验顺序 = 脱敏 → 单条 2000 → 正文合计 6000 → 总长 9000；三种拒绝语义分别为「单条记忆过长」「正文额度已满」「总长度硬顶」，均报错不静默截断，`replace: true` 同样受两口径约束。注入侧 `MEMORY_INJECT_CHARS` 同步取 9000（服务端允许落盘的文件整份注入，不在读侧二次截断）；冻结快照语义不变。
+    - **注入提示**：`memory_block_text` 的 B2 说明行改为描述新格式（`[YYYY-MM-DD · global|pet]`，日期 = 最后确认；无前缀 = 更早的、未记录日期的背景），仍是**逐字节稳定**的固定前缀。
+    - **本轮新增单测（宿主 +5）**：`memory_entries_are_tagged_with_host_date_and_scope`（前缀格式 + 宿主本地日期 + 两 scope 隔离）、`memory_same_body_on_a_new_date_is_refreshed_not_duplicated`（同正文不重复 + 日期刷新）、`memory_legacy_untagged_entry_is_migrated_in_place_on_rewrite`（旧条目原地补前缀）、`memory_multiline_bullets_keep_continuation_indent`（续行缩进）、`memory_caps_still_apply_after_tagging`（单条 2000 含前缀 + 正文额度 6000 / 总长 9000，2026-10-17 已按动态口径更新）；另更新 `memory_masks_secrets_before_persisting` 钉住「前缀不绕过脱敏」。动态上限轮新增：`memory_body_budget_excludes_provenance_prefix`、`memory_body_budget_overflow_is_rejected_with_body_semantics`、`memory_total_hard_cap_rejects_prefix_heavy_file`、`memory_replace_obeys_both_budgets`、`memory_budgets_are_judged_after_masking`（宿主 +5）。
+  - **2026-10-13 轮新增单测**：`review_gate_splits_session_quota_by_scope_and_shares_time_gate`（per-scope 配额 + 共享时间闸）、`memory_block_provenance_line_is_byte_stable_and_precedes_body`（说明行逐字节稳定 + 与正文分离；2026-10-17 断言同步改为新文案）。
 
 ### S0 记忆自动抽取（云侧先行）· 可实施方案（2026-10-11 设计）
 
@@ -581,16 +588,231 @@
 
 #### §待办 3-1d `CronCreate/Delete/List`（定时触发，**本轮未做**——只报告方案与代价）
 
-- **结论**：**本轮不做**（不是没价值，而是代价 / 可测性与既有设计有冲突，见下）。**用户已裁定（2026-10-11）：接受本轮不做**（下述 5 条理由与「若日后要做的最小形态」保留）。已达成的共识：**若日后要做，最小形态 = 会话内 + 进程内定时器**，与「跨进程落盘」分开。
-- **为什么不做（逐条，可复核）**：
-  - **① 触发要有「活着的常驻会话 + 时间推进」，现有 E2E 驱动不了**：`--print` 单发跑完**恰好一轮**即退出；`scripts\agent-e2e.ps1` 的常驻 stdio 路径把 stdin 写成**一个文件**，agent 读完即 EOF ⇒ 主循环 `Disconnected` ⇒ 进程退出（`core-agent/src/main.rs` 主循环）。**脚本没有「stdin 保持打开 N 秒」的模式** ⇒ 无法驱动一次定时触发；要端到端验证就得先给脚本新增 keep-alive 模式。
-  - **② 「触发时怎么跑」的语义未裁定**：定时触发 = 注入一轮 query 吗？那会进 `history` / 前端对话流（**用户没打过的字**），需要一个「来源标记」（= 新协议字段，触「不新造字段」约束）；且这轮里的写类工具仍要走审批（无人在场时无法完成）。
-  - **③ 成本红线**：每次触发 = 一次模型调用，按项目纪律必须**写死频次上限**（最小间隔 / 每会话次数 / job 数上限）；而把最小间隔定得「能让测试跑通」就等于把 E2E 拖成长时间等待（与本任务「别把测试拖长」的要求冲突）。
-  - **④ 落点与既有设计的重叠**：会话内定时器最省的写法是复用主循环的空闲 tick（`MCP_WATCH_TICK = 1s`，不新增线程）；但**跨进程持久化**就与 §待办 4 S2「检查点落盘 / 跨回合续跑」重叠 ⇒ 应**合并设计**，不为 Cron 单独造存储子系统。
-  - **⑤ 无既有描述可依**：**§待办 4 里并没有对 Cron 的既有描述** —— A13 只在 §待办 3-1 的待办清单里列了名字。故「触发时怎么跑」没有现成裁定。
-- **用户口径补记（2026-10-11）**：**e2e / 测试产生的用户消息直接进历史记录是可接受的**（用户是单人开发，自己删即可）—— 这条解除了上条 ②「触发的 query 会以用户消息进 history/UI 需**来源标记**」顾虑的一半（history/UI 侧不再需要来源标记；②中「无人在场时写类工具仍要走审批」那半与其余理由不变）。**但 Cron 本轮仍不做**，别因此改成「已实现」。
-- **若日后要做的最小形态（留作子项）**：进程内 `static Mutex<Vec<CronJob>>` + `CronCreate` / `CronDelete` / `CronList` 三件（无条件注册 ⇒ 工具计数 21 → 24；原记「19 → 22」已随 `EnterWorktree` / `ExitWorktree` 落地作废）；主循环空闲 tick 到点把 prompt 以**带来源标记的 user 消息**注入队列；**硬边界** = 仅会话内、**进程重启即失效**；**硬上限** = 最小间隔 ≥ N 秒、每 job 最多 K 次、全局 job 数上限；端到端验证需先给 `scripts\agent-e2e.ps1` 加 keep-alive 模式。
-- **涉及文件（若做）**：`core-agent/src/tools.rs`、`core-agent/src/main.rs`、`scripts/agent-e2e.ps1`。
+- **结论（2026-10-17 复核后更新）**：仍然**不做自动执行**。旧的「会话内 + 进程内定时器」共识经复核**不成立**——宿主会在新对话 / 中断 / 换档 / MCP 改动 / 退出等路径停掉 `agent.exe`（含 `taskkill /F /T`），进程内定时器随之丢失；宿主不启动时 agent 根本不存在。若日后要做，推荐 **宿主常驻调度 + 到点拉起一次 `agent.exe --print`**（零新增依赖）。本节其余内容只作方案与代价记录，**不构成施工任务、不排期**。
+
+##### 一、已核实的事实（逐条带行号；文末标出与旧描述的差异）
+
+1. **`agent.exe` 是宿主 spawn 的常驻 stdio 进程，且会被宿主主动杀掉。** 宿主以 `--print --input-format stream-json --output-format stream-json` 拉起它（`app/src-tauri/src/commands.rs:381-396`），agent 侧按行读 stdin（`core-agent/src/main.rs:5009-5019`）。`stop_cli` 走 `cli_bridge::kill_and_cleanup()`（`app/src-tauri/src/commands.rs:873-879`），内部先 `taskkill /F /T` 收整棵进程树、再 `child.kill()` 兜底（`app/src-tauri/src/cli_bridge.rs:81-117`、`:126-155`）。实际触发点包括：
+   - 新对话：`app/src/main.ts:3176-3185`；
+   - 用户停止 / 中断：`app/src/main.ts:5030-5054`、`:12130-12131`；
+   - 退出 AI：`app/src/main.ts:5662`；
+   - 换工作区：`app/src/main.ts:3437-3439`；
+   - 回退时正在流式：`app/src/main.ts:2520-2527`；
+   - MCP 配置改动（回合结束或空闲时重启）：`app/src/main.ts:1029-1034`、`:9709-9710`、`:10019-10022`；
+   - 技能 / 工具黑名单 / 人格类「重启 AI」：`app/src/main.ts:12205-12210`、`:12236-12239`；
+   - 换安全档位 / 换思考档：`app/src-tauri/src/commands.rs:1021-1025`、`:2256-2259`；
+   - App 退出：`app/src-tauri/src/main.rs:476-518`。
+   - **与旧描述的差异（1）**：**换模型不会自动 `stop_cli`**。设置面板保存只调 `set_ai_config`（`app/src/plugins/builtin/settings.ts:3243-3267`、`:3500-3511`），宿主只落盘并注入进程 env（`app/src-tauri/src/commands.rs:1302-1356`）；agent 的模型 / 端点 / key 只在 spawn 时读一次（`core-agent/src/main.rs:2997-3027`）。所以新模型要等下一次 spawn（新对话 / 中断 / 改档 / 重启应用等）才生效。
+   - **与旧描述的差异（2）**：「agent 只在有对话时存活」太绝对。agent 是懒启动，但聊天窗关掉后它仍可在跑（`app/src-tauri/src/commands.rs:845-854` 的就绪信号复用路径即为此场景）；它确实会在上面列出的动作和 App 退出时死掉，所以**不能把定时器放在它里面当唯一调度**。
+2. **单发模式已存在。** `--print` / `-p` 的判定 = 带 `--print` 且**未**显式声明 `--input-format stream-json`（`core-agent/src/main.rs:4508-4515`）；query 取 `--print` 后紧跟的非 flag 值，否则从 stdin 读一次（`:4533-4546`）。输出形态 `OutputMode` = `text` / `json` / `stream-json`（`:3062-3072`、`:4551-4560`），`json` 只落一条 `result`、`stream-json` 落完整事件流（`:3138-3155`）。**单发没有审批回包通道**：需审批的工具默认直接拒绝（`ApprovalPolicy::UnattendedDeny`，`:5539-5556`、`:8581-8590`），除非 `--dangerously-skip-permissions`（`:4565-4569`）；只要有工具因该策略被拒，退出码非 0（`:5319-5323`）。契约与实测口径见 `docs/testing.md:160-165`。
+   - **单发确实支持** `--add-dir`、`--disallowedTools`、`--mcp-server`、`--permission-mode`：解析在 `core-agent/src/main.rs:4432-4506`，应用到 `Ctx` / 工具池在 `:4575-4614`、`:4636-4642`。注意 `--disallowedTools` 是 variadic（吃到下一个 `--flag` 为止，`:4489-4497`），cron 拼参数时要么放最后、要么后面紧跟另一个 flag。
+   - **`--mcp-server` 在单发下可用，但不等于 MCP 工具可用**：`mcp__*` 在 plan 档根本不进工具池（`core-agent/src/main.rs:4639-4642`），且全部 MCP 工具一律需要审批（`core-agent/src/main.rs:5530-5536`）⇒ 单发默认拒绝。它真正的用途是接通宿主内部桥方法（`SessionSearch` / `MemorySearch` 等，`core-agent/src/tools.rs:866-884`）。
+3. **`--resume` 未实现，agent 侧也没有会话落盘。** `core-agent/src` 全文对 `--resume` 无命中；`CliArgs` 的字段里也没有它（`core-agent/src/main.rs:4409-4430`），解析分支同样没有（`:4432-4506`）。评估结论见 `docs/todo.md:1557-1558`：history 是进程内 `Vec`，会话 id 由进程内序号生成，都不落盘。**⇒ 每次 cron 都是一次全新会话，没有上下文延续。**
+4. **`PushNotification` / `SendUserFile` 已存在。** schema 在 `core-agent/src/tools.rs:785-805`，实现在 `:3411-3520`；两者都**不需要审批**（`:1132-1140`）。但单发 `--output-format json` 会把非 `result` 事件全部挡掉（`core-agent/src/main.rs:3138-3155`）⇒ 若想拿到 `system/push_notification` / `system/user_file`，cron 必须用 `--output-format stream-json`。另外 `PushNotification` 是**应用内浮层**，不是 OS toast（`app/src/main.ts:9251-9256`）；窗口不可见时用户当场看不到（【推论】，未实测）。
+5. **宿主侧没有通用调度器。** `app/src-tauri/Cargo.toml:10-55` 没有任何 cron / schedule / chrono 依赖；宿主里的 `thread::spawn` 都是索引、播放、窗口、sidecar 等一次性或短周期设施（如 `app/src-tauri/src/file_indexer.rs:210-231`、`app/src-tauri/src/app_indexer.rs:106`），没有「到点执行任务」的循环。agent 侧唯一的定时 tick 是 MCP 配置监听的 `MCP_WATCH_TICK = 1s`（`core-agent/src/main.rs:3179`、`:5076`），不是宿主调度器。
+   - **与旧描述的差异（3）**：没有 `tauri-plugin-autostart`。开机自启是自研 `app/src-tauri/src/auto_start.rs`：优先用 `schtasks /sc onlogon` 建一个名为 `Lunac` 的任务，失败回退 HKCU Run（`auto_start.rs:1-16`、`:25`、`:82-150`），且计划任务创建 / 删除需要管理员（`:178-187`）。它只做「开机拉起 Lunac」，**不是 cron 调度**。
+   - **未查到**：任何宿主侧的 `WM_POWERBROADCAST` / 睡眠唤醒处理；调度只能靠墙钟比较（见 C）。
+6. **数据根与 `ModuleData\tasks\`。** 数据根 = `<exe 根>`：`config\` 是应用配置（ai / hotkey / hooks / pricing / local-model 等），`ModuleData\` 是业务数据（`app/src-tauri/src/storage.rs:3-21`、`:40-43`；`docs/code-standards.md:21-22`）。**当前 `ModuleData\tasks\` 并不存在**：对 `app/src-tauri/target/{debug,release}/ModuleData` 的实际目录列表没有 `tasks\`，Rust 源码里也没有 `tasks` 路径；S2 只是计划「任务队列 + 检查点落 `ModuleData\tasks\`」（`docs/todo.md:1563`），尚未实现。
+   - 时间：项目**不引 `chrono`**（`app/src-tauri/src/log.rs:15`）；宿主已有 Win32 `GetLocalTime` 取本地日期（`app/src-tauri/src/mcp_server.rs:689-693`），`windows` crate 的对应 feature 已在依赖里（`app/src-tauri/Cargo.toml:51-54`）。这决定了下面的「简化 schedule」方案。
+
+##### 二、A. 三条实现路线对比与推荐
+
+| 路线 | 做法 | 优点 | 代价 / 风险 | 与既有约束的冲突 | 新依赖 | 结论 |
+|---|---|---|---|---|---|---|
+| A1 agent 进程内定时器 | 复用主循环 tick（`core-agent/src/main.rs:3179`、`:5076`）+ 进程内 `static Mutex<Vec<CronJob>>` | 改动最小；无需新进程；无落盘 | 新对话 / 中断 / 换档 / MCP 改动 / App 退出都会杀 agent（见事实 1）⇒ 定时器丢；宿主不启动时不存在；跨进程不持久 | 与「换档 / 新对话必须重启 agent」的既定纪律直接冲突；无法兑现「定时」承诺 | 无 | **不成立**（最多做会话内演示，不建议） |
+| A2 宿主调度 + `--print` 单发 | Rust 常驻线程到点 spawn 一次 `agent.exe --print`（独立子进程） | 宿主生命周期长；配置 / 工作区 / 日志 / 用量都在宿主手里；单发审批 fail-closed（默认拒绝）；子进程可超时杀掉；零新依赖；可先做手动触发验证 | 只在宿主运行时有效；每次是新会话（无上下文）；需审批的工具默认被拒；需新增调度线程 / 存储 / UI；工具表变更要让 agent 重启一次 | 必须自己实现并发闸、频次上限、超时、日志脱敏；不能把任务表写进 system（§禁用 45）；不能进 `chat.db`（§禁用 61） | 无 | **推荐** |
+| A3 Windows 计划任务（schtasks） | 每个 job 建一条计划任务，到点直接跑 `agent.exe --print` | 宿主不启动也能跑 | 创建 / 删除需管理员（`auto_start.rs:178-187`）；任务在系统里可见；卸载残留（NSI 无 schtasks 清理，仓库搜索零命中）；每 job 一条任务难维护；无审批 / 无 UI | 撞「卸载 = 完全不存在」的精神（`docs/forbidden.md:72`，§禁用 51）；**致命**：agent 只读 env 凭据（`core-agent/src/main.rs:2997-3010`），计划任务的 `/tr` 里要么带 key（写进任务 XML，违反 §禁用 58 / 53）要么另造注入器 | 无（schtasks 是系统自带） | **不做** |
+
+- **推荐 A2**。理由：它把「定时」放在宿主这个本来就长期存活的进程里，同时把「执行」隔离到一次性子进程；单发没有审批回话通道，天然适合「默认拒绝需审批工具」的无人值守语义（`docs/testing.md:164`、`core-agent/src/main.rs:5539-5556`）。代价是必须诚实承认：**宿主没启动就不会跑；每次都是新会话**。
+- **一个容易忽略的实现前提**：cron 子进程必须拿到与常驻 agent 同一套 env（端点 / key / 模型 / 技能目录 / Modules / hooks / persona / MCP / 日志 / 工作区锁）。当前这套拼装在 `start_cli_process` 内部（`app/src-tauri/src/commands.rs:429-529`），需要抽成**一处**共享构造函数供两条 spawn 路径复用，避免出现第二份 env 逻辑（§禁用 62）。
+
+##### 三、B. 数据模型与落点
+
+- **落点结论：`ModuleData\tasks\cron.json`（job 定义）+ `ModuleData\tasks\cron-state.json`（运行态）。**
+  - 理由 1：job 的 `prompt` 是用户内容、`runCount` / `lastStatus` 是运行产生的业务数据；按 `storage.rs:19-21` 的划分，「业务数据才进 ModuleData」，`config\` 只放应用配置。放进 `config\` 会把「用户内容 + 运行计数」混进配置区。
+  - 理由 2：便携式数据根 = exe 根，卸载即随安装目录清除，天然不留外部残留（与 §禁用 51 的「卸载 = 完全不存在」同一精神）。
+  - 理由 3：**不进 `chat.db`**（§禁用 61）。cron 不是会话消息，也不该被会话清理 / 检索 / 回灌逻辑波及。
+- **为什么要拆成两个文件（单写者原则）**：
+  - `cron.json` 只由 **agent 侧** 的 `CronCreate` / `CronDelete` 写（原子写：同目录 `*.tmp` 后 rename）；
+  - `cron-state.json` 只由 **宿主调度器** 写（last/next/计数/心跳/自动停用）；
+  - 宿主每 tick 重读 `cron.json`（按 mtime 或直接读），**从不写它**；agent 只读 state，**从不写它** ⇒ 避免两个进程对同一 JSON 的读改写丢失。
+  - 路径的**唯一真相源**在宿主 `storage.rs` 的 `cron_dir()`（`module_data_dir().join("tasks")`），并作为 `LUNAC_CRON_DIR` 注入 agent；agent 不硬编码路径（同 `LUNAC_MODULES_DIR` 的既有做法，`core-agent/src/main.rs:4599-4608`）。agent 侧还要把该目录放进 `add_dirs`，否则工作区锁会拒写。
+- **`CronJob` 字段草案**（定义文件 + 运行态的合并视图；存储 JSON 用 camelCase）：
+
+| 字段 | 类型 / 默认 | 归属 | 说明 |
+|---|---|---|---|
+| `id` | string，必填 | 定义 | `cron_<epoch_ms>_<pid>_<seq>`；不引 UUID 依赖 |
+| `schedule` | object，必填 | 定义 | **二选一：简化形式，不用 cron 表达式**。`{"kind":"every","everyMinutes":N}` 或 `{"kind":"daily","at":"HH:MM"}`。理由：零新增依赖、无需解析器；cron 表达式的字段序 / DST / 步进边角多，收益不足以抵消 |
+| `prompt` | string，1–8000 字符 | 定义 | 每次运行喂给单发 agent 的 query；写入前过 `content_safety::analyze`（`core-agent/src/content_safety.rs:167`），命中凭据即拒 |
+| `enabled` | bool，默认 true | 定义 | 用户开关；与自动停用分开（见 `autoDisabled`） |
+| `createdAt` | epoch ms | 定义 | agent 侧 `SystemTime` |
+| `scope` | `global` / `pet`，默认 `global` | 定义 | **阶段 1 只接受 `global`**；`pet` 需单发消息带 `source:"pet"` 才切记忆作用域（`core-agent/src/main.rs:2754-2759`、`:5002-5007`），留到阶段 2 |
+| `workspace` | string，默认 `""` | 定义 | 空 = 运行时用宿主当前有效工作区（`commands.rs:1553-1561`）；**阶段 1 只接受空串或与当前 cwd 相同值**，且要求已配置工作区（见 C） |
+| `notify` | `none` / `toast` / `sound` / `toast_sound`，默认 `toast` | 定义 | 结果投递方式；`sound` 复用 `notify_sound`（`commands.rs:1134-1145`） |
+| `maxRunsPerDay` | int，默认 12，硬上限 48 | 定义 | 按**本地日历日**计数；`daily` 类自然只能 1 |
+| `lastRunAt` | epoch ms / null | 运行态 | 最近一次真正开始的时刻 |
+| `nextRunAt` | epoch ms / null | 运行态 | 下一次应运行的时刻；宿主算 |
+| `nextRunAtLocal` | string / null | 运行态 | 给 `CronList` / UI 显示（`YYYY-MM-DD HH:MM`，本地时间） |
+| `lastStatus` | enum | 运行态 | `never` / `ok` / `error` / `denied_tool` / `timeout` / `skipped_busy` / `skipped_missed` / `skipped_daily_cap` / `skipped_global_cap` / `disabled_after_failures` |
+| `lastSummary` | string | 运行态 | 最终文本前 500 字符（脱敏后），只供列表显示 |
+| `lastError` | string | 运行态 | 最后一条错误（≤500 字符，脱敏） |
+| `runCount` | u64 | 运行态 | 累计成功开始次数 |
+| `failureCount` | u64 | 运行态 | 累计失败次数 |
+| `consecutiveFailures` | u64 | 运行态 | 连续失败次数；成功清零；达 3 置 `autoDisabled` |
+| `autoDisabled` | bool | 运行态 | 自动停用标记；`enabled` 仍保持用户原值，便于 UI 解释与恢复 |
+| `todayDate` / `todayRuns` | string / u64 | 运行态 | 本地日与当日已跑次数 |
+| `heartbeatAt` | epoch ms | 运行态 | 调度器心跳；`CronList` 据此判断宿主调度是否在跑 |
+
+- **执行历史不落 JSON。** 只留计数 / 最后状态 / 最后摘要；每次运行的完整输出、stderr、usage 写 `temp\logs\cron-<id>-<YYYYMMDD-HHMMSS>.log`（`.log` 扩展名可被既有 7 天清理覆盖，`app/src-tauri/src/log.rs:12`、`:204-226`），避免 `ModuleData\tasks\` 无限增长。日志落盘前过 `mask_secrets`（`app/src-tauri/src/log.rs` 的既有脱敏入口；`docs/forbidden.md:85`）。
+- **成本归因**：宿主从 `result.usage` 取 token（不在这里算钱），追加 `ModuleData\usage\usage-YYYY-MM-DD.jsonl`，`source = "cron"`（`UsageRecord.source` 是自由字符串，`app/src-tauri/src/storage.rs:1135-1140`；追加函数 `:1221`）。注意前端成本面板目前只分 `pet` / `chat` 两档（`app/src/usage-cost.ts:150-157`、`:593-602`）⇒ 不改的话 cron 用量会落进「普通聊天」；实现时要同步把 `cron` 加成第三档（含 i18n）。
+
+##### 四、C. 调度语义（逐条定）
+
+1. **时区 / DST**：一律用**本地墙钟**（`GetLocalTime` 已有，`app/src-tauri/src/mcp_server.rs:689-693`；项目不引 chrono，`log.rs:15`）。
+   - `daily`：每个 tick 比较本地 `YYYY-MM-DD` + `HH:MM`，并用「本地日期 + `lastRunEpoch` 单调」去重。
+   - **春季 DST 跳过的本地时刻**（如 02:30 不存在）：当天**跳过并记 `skipped_missed`**，不顺延到 03:00（避免「用户以为 02:30，实际 03:00」）。
+   - **秋季 DST 重复的本地时刻**：同一天只跑第一次，第二次因「本地日期已跑」被去重。
+   - `every N`：按 **UTC epoch 的真实间隔**计算，不受 DST 影响（墙钟跳变不会让它多跑/少跑）。中国无 DST，以上主要对海外时区用户生效。
+2. **错过的运行**（宿主没开 / 电脑睡眠 / 时钟跳变）：**只补最近一次，且仅当延迟 ≤ 10 分钟；否则跳过并记 `skipped_missed`**，然后把 `nextRunAt` 推到下一个未来时刻。
+   - 理由：补跑全部会形成「醒来后一串 API 调用」；补跑很久以前的任务，prompt 往往已经过期（例如「今天早上 9 点的日报」在下午 3 点跑没有意义）。10 分钟宽限覆盖「睡眠刚醒 / 短暂卡顿」。
+   - `every N` 同理：醒来时若已过多个周期，只跑一次（若有宽限内到期），随后从「现在 + N」重新起算，不补一串。
+3. **并发**：**全局同一时刻只允许一个 cron 运行**；若用户正在对话（`isStreaming` 为真）或已有 cron 在跑 ⇒ **`skipped_busy`，不排队**。
+   - 理由：单发子进程虽然技术上可与常驻 agent 并存，但它们共享同一个工作区、同一份配置 / 限流 / 磁盘；排队会导致「用户刚聊完，后台突然连跑三条」且 prompt 过期。跳过并如实记录更可预测。
+   - 建议的忙判据：前端在 `startAgentChat` 置真、收尾置假（`isStreaming` 现有生命周期：`app/src/main.ts:1089`、`:11241`、`:11433`），通过一条新命令 `set_agent_busy` 同步给宿主；宿主再用「最近一次 `send_message` / `result`」做兜底。
+4. **成本上限**：
+   - 最小间隔 **15 分钟**（`everyMinutes >= 15`）；
+   - 每 job `maxRunsPerDay` 默认 **12**、硬上限 **48**；
+   - 全局每日上限 **48 次**（防止 20 个 job 各跑满）；
+   - 连续失败 **3 次** ⇒ `autoDisabled`，不再自动跑，需用户恢复；
+   - 全局 job 数上限 **20**，prompt ≤ 8000 字符，定义文件 ≤ 256 KB；
+   - **单次没有硬性费用上限**：agent 的 `LUNAC_TURN_BUDGET_TOKENS` 默认 500k 且是可续命的软闸（`core-agent/src/main.rs:196-206`、`:663-669`），不构成硬上限；HTTP 请求超时是 1800s（`:108`）。宿主必须自己加**单次运行墙钟 deadline（建议 10 分钟）**并在超时后杀进程树，否则一次卡住会占住整个调度。
+5. **审批（必须诚实）**：单发默认拒绝所有需审批工具（`core-agent/src/main.rs:5539-5556`、`:8581-8590`），包括 `Write` / `Edit` / `NotebookEdit` / `Cmd` / `PowerShell` / `WebSearch` / `WebFetch` / `AskUserQuestion` / `Remember` / `PetGrowth` / `Agent` / `ExitPlanMode` / `ImageGen` / `EnterWorktree` / `ExitWorktree`（`core-agent/src/tools.rs:1081-1130`、`core-agent/src/main.rs:5530-5536`），以及全部 `mcp__*`。
+   - **阶段 1 能给用户的承诺只有**：`Read` / `Glob` / `Grep` / `SessionSearch` / `MemorySearch` / `TodoWrite` / `RepoMap` / `SendUserFile` / `PushNotification` 这类**无需审批**的工具可用；**WebSearch / WebFetch 也会被拒**（它们在 `needs_approval` 里）。
+   - **不要把它说成「无人值守安全」**：它只是「默认拒绝 + 只读白名单」，不是沙箱（§禁用 1.1）。
+   - **`--dangerously-skip-permissions` 不是写类任务的可行解**：① 它在单发下把审批策略改成直接放行（`core-agent/src/main.rs:4565-4569`），`Cmd` / `PowerShell` 的危险命令静态分析只挂在审批请求上（`:3637-3657`），没有人看卡就等于绕过了「危险命令任何档位都要人工确认」（`docs/forbidden.md:14`，§禁用 1.2）；② 它同时把工作区锁关掉（`core-agent/src/main.rs:4613-4614`）。所以「无人值守 + 全放行」既没有边界，也违反硬禁令，**不作为阶段 2 的直接做法**（见 E 的 2A / 2B）。
+6. **结果投递**：**宿主自己的「定时任务」列表 + 应用内浮层 + 可选提示音**为主；agent 的 `PushNotification` / `SendUserFile` 作为可选的**次级**通道。
+   - 单发用 `--output-format stream-json`，宿主解析 `result`（最终文本 / usage）以及可选的 `system/push_notification` / `system/user_file`；若用 `json`，后两种事件会被吞掉（`core-agent/src/main.rs:3138-3155`）。
+   - **不把 cron 结果用 `send_message` 注回常驻 agent**，也不写进主对话 `chatHistory`（否则就是「用户没打过的字」自动进对话，且会把上下文撑大；见 §禁用 45 / §禁用 61）。
+   - **没有 OS 级 toast**：项目当前没有桌面通知设施，`PushNotification` 只是应用内浮层（`app/src/main.ts:9251-9256`）。若应用收在托盘、窗口不可见，用户当场可能看不到（【推论】，未实测）；`notify_sound`（`commands.rs:1134-1145`）是唯一能立刻提醒的既有能力。
+
+##### 五、D. 工具契约
+
+- **`CronCreate`**
+  - 入参（统一 camelCase，与 B 的字段草案同源）：
+    ```
+    schedule: { kind: "every", everyMinutes: 15..1440 }
+            | { kind: "daily", at: "HH:MM" }          // 必填
+    prompt: string (1..8000)                          // 必填
+    enabled?: boolean = true
+    scope?: "global" | "pet" = "global"               // 阶段 1 只接受 global
+    workspace?: string = ""                           // 阶段 1 只接受空或当前 cwd
+    notify?: "none" | "toast" | "sound" | "toast_sound" = "toast"
+    maxRunsPerDay?: integer 1..48 = 12
+    ```
+  - 出参：`{ ok, job: { ...合并视图... }, warning: string }`。`warning` 明确写「宿主未运行时不会执行；每次运行是新会话、无上下文；需审批的工具会被拒绝」。
+  - **必须审批**：它持续产生 API 调用（成本副作用），且会写持久化文件。除 `tools.rs` 的 `needs_approval` 返回真外，还要在前端 `classifyRequest` 里做**硬挡**（即使自动档也弹卡），位置在 `app/src/main.ts:8241-8256` 的 `AskUserQuestion` / `ExitPlanMode` 同款分支——审批的唯一决策点在前端（§禁用 1.4）。
+  - 只读档（plan）下由 `write_blocked` 直接拒（`core-agent/src/tools.rs:324-338`），不是「问了再做」。
+- **`CronDelete`**
+  - 入参：`{ id: string }`；出参：`{ ok, deleted: boolean, alreadyGone?: boolean }`（**幂等**：不存在也返回成功，避免模型重试）。
+  - **免审批**（与 `TodoWrite` 同级），但实现里要调 `write_blocked`：只读档下删定义也算写，直接拒。
+- **`CronList`**
+  - 入参：`{ includeDisabled?: boolean = true }`；出参：`{ schedulerAlive: boolean, jobs: [...] }`，每个 job 带定义 + 运行态合并视图。
+  - **免审批**；`prompt` 只回前 200 字符 + `promptChars`（避免一次 `CronList` 把上下文撑爆；遵守工具结果预算，`docs/code-standards.md:81`、`docs/forbidden.md:95`）。
+  - 若 `LUNAC_CRON_DIR` 未注入（例如 standalone 跑 `agent.exe`），返回明确错误「cron store 未配置」，**不猜路径**。
+- **注册与裁剪**：
+  - 三件都进 `tools::defs()`（`core-agent/src/tools.rs:344` 起），**无条件注册**。当前工具总数 **25**（守门单测 `agent_tool_is_registered_and_filterable`，`core-agent/src/tools.rs:4390-4393`）⇒ 阶段 0 加 `CronList` 为 **26**，阶段 1 加 `CronCreate` / `CronDelete` 为 **28**。必须同步改这个数字与断言，不是删断言。
+  - **是否进固定前缀：是。** 工具表是请求体固定前缀的一部分（`docs/code-standards.md:80`；宿主注释也明确「工具表是每次请求都要发的固定前缀」`app/src-tauri/src/commands.rs:522-525`）⇒ 加工具会让前缀变一次，**必须重启 agent 才生效**；升级后第一次对话 / 手动重启即可。
+  - **`--disallowedTools` 必须能裁**：过滤在 `tools::defs(&cli.disallowed)`（`core-agent/src/tools.rs:342-344`），守门测试已钉住 `Agent` / `MemorySearch` 的裁法（`:4395-4407`）；三件都加同样的断言。前端候选名单加进 `app/src/main.ts:3471-3514` 的 `TOOL_BLACKLIST_CANDIDATES`。
+  - **子代理不接**：三件都加进 `subagent_tool_defs` 的排除列表（`core-agent/src/main.rs:7560-7585`），并同步测试（`:10187-10267`）。理由：子代理是「同批并发、跑完即散」，让它建 / 删定时任务会绕过用户对「持续成本」的确认。
+  - **cron 子进程自己再裁一次**：调度器拉起的单发进程应带 `--disallowedTools CronCreate CronDelete CronList Agent`，防止「定时任务自己再建定时任务」或派子代理扩大成本。
+- **落盘与安全**：
+  - `CronCreate` / `CronDelete` 写 `cron.json` 前调用 `write_blocked`；`CronCreate` 还要对 `prompt` 跑 `content_safety::analyze`（`core-agent/src/content_safety.rs:167`；与写类工具同一套凭据扫描，`core-agent/src/main.rs:3575-3598`），命中即拒。
+  - 原子写：同目录 `cron.json.tmp` → rename；宿主读取失败时保留上一份有效定义并 `warn`，**不删文件、不静默清空**。
+  - `LUNAC_CRON_DIR` 由宿主注入（`app/src-tauri/src/commands.rs:429-529` 的 envs 段），agent 侧加入 `Ctx.add_dirs`（照 `LUNAC_MODULES_DIR` 的写法，`core-agent/src/main.rs:4599-4608`）；只放行 `ModuleData\tasks` 这一个目录，不放宽整个 `ModuleData` / `config`。
+- **协议**：**不新增 stream-json 字段**。`CronCreate/Delete/List` 只是工具；job 元数据不注入 system、不进 history 前缀。将来做 `scope=pet` 时复用已有的 user 消息 `source:"pet"` 字段（`app/src/main.ts:11582-11585`、`core-agent/src/main.rs:2754-2759`），仍不需要新字段。
+
+##### 六、E. 分阶段建议（不排期；每阶段都给改动点 / 验证 / 风险）
+
+**阶段 0：只做 `CronList` + 手动触发（零自动执行）**
+- 改动点：
+  - `core-agent/src/tools.rs`：`defs()` 加 `CronList`，实现读 `LUNAC_CRON_DIR/cron.json` + `cron-state.json` 并合并；工具数 25 → 26（`:4390-4393`）；子代理排除（`core-agent/src/main.rs:7560-7585`）。
+  - `core-agent/src/main.rs`：把 `LUNAC_CRON_DIR` 放进 `add_dirs`（`:4593-4608` 旁）。
+  - `app/src-tauri/src/storage.rs`：新增 `cron_dir()` / `cron_defs_path()` / `cron_state_path()`（建立在 `module_data_dir()` 上，`storage.rs:40-43`）。
+  - `app/src-tauri/src/commands.rs`：在 env 拼装段注入 `LUNAC_CRON_DIR`（`:429-529`）；新增 `cron_list` / `cron_run_now` 两个命令；`cron_run_now` 用 async 薄壳 + `run_blocking`（§规范 5，`commands.rs:22`）。
+  - `app/src-tauri/src/main.rs`：注册命令（`:548` 起）；不需要启动调度线程。
+  - 前端：设置面板新增「定时任务」分区（`app/src/plugins/builtin/settings.ts` 现有分区形态），列表 + 「立即运行」；i18n 进 `app/src/i18n.ts` 的 DICT。阶段 0 的 job 来源可以是手写 `cron.json` 夹具 / UI 表单，不引入 `CronCreate`。
+- 验证：
+  - 单测：`CronList` 能读定义 + state、state 缺失时给 `null`、非法 JSON 报错不崩；`--disallowedTools CronList` 能裁掉它；工具总数 26。
+  - 端到端：在临时数据根手写一条 job，`cron_run_now` 走一次 `agent.exe --print --permission-mode plan`；断言产生 `temp\logs\cron-*.log`、`ModuleData\usage\*.jsonl` 一条 `source:"cron"`、state 更新；断言不产生任何自动后续运行。
+  - 用 `deepseek-flash` 做真实端点验证（`docs/testing.md` §测试 6）。
+- 风险：新增工具让固定前缀变一次（必须重启 agent）；`LUNAC_CRON_DIR` 若忘记加进 `add_dirs`，写 / 读会被工作区锁拒；手写夹具的 job 字段与正式 schema 漂移（阶段 0 就要把 schema 定死）。
+
+**阶段 1：宿主调度 + `--print` + 只读白名单 + 每日上限 + 通知**
+- 改动点：
+  - 新模块 `app/src-tauri/src/cron.rs`：调度线程（建议 30s tick）、定义 / 状态读写、到期判断（纯函数，注入 `now` 便于单测）、单发 runner、超时杀进程树、日志 / usage / 通知。
+  - `app/src-tauri/src/main.rs`：`mod cron;`；`app.manage(cron::CronState::default())` 或 AppState 增字段（`:126-137`、`:445-455`）；启动调度线程；注册 `cron_list` / `cron_run_now` / `cron_set_enabled` / `cron_delete`。
+  - `app/src-tauri/src/commands.rs`：把 `start_cli_process` 的 env 拼装抽成共享函数（`:429-529`），resident 与 cron 两条 spawn 都调用它；cron runner 复用 `spawn_child`（`:250-288`，已带 `child_job::assign`，`:269-272`）；把 `kill_process_tree` 提为 `pub(crate)`（`cli_bridge.rs:93-117`）供超时使用。
+  - `core-agent/src/tools.rs`：加 `CronCreate` / `CronDelete`，`needs_approval` 加 `CronCreate`（`:1081-1130`），工具数 28；`write_blocked` 与 `content_safety` 落地。
+  - `app/src-tauri/src/storage.rs`：`append_usage_log` 的调用方（`:1221`）；`source:"cron"`。
+  - `app/src/usage-cost.ts`：来源分区加 `cron`（`:150-157`、`:593-602`）+ i18n；否则 cron 成本会算进普通聊天。
+  - 前端：`classifyRequest` 对 `CronCreate` 硬挡（`app/src/main.ts:8241-8256`）；忙标记 `set_agent_busy`（在 `startAgentChat` / 收尾处，`app/src/main.ts:11176`、`:11241`、`:11433`）；「定时任务」列表 + 结果浮层 + 可选提示音。
+  - 单发参数（只读档）：`--print --output-format stream-json --permission-mode plan --mcp-server stdio:<lunac.exe> --add-dir <workspace> --disallowedTools <写类 + 外部工具 + 子代理 + Cron*> --disallowedTools` 放最后（variadic 规则，`core-agent/src/main.rs:4489-4497`）。query 用 stdin 写入（`:4533-4546`），避免命令行长度与引号问题。
+- 验证：
+  - 单测：到期计算（daily / every / 错过 / DST 去重）、每日上限、连续失败自动停用、忙跳过、state 损坏回退；用注入的 `now` / 本地日期做纯函数测试，不依赖真实时钟。
+  - 集成：临时数据根 + 一条 1 分钟后到期的 job，起 release 宿主；断言只剩一次运行、日志 / usage / 通知 / state 正确；第二次触发命中每日上限或正常下一次；用一个必失败的配置连跑 3 次，断言 `autoDisabled`。
+  - 审批：写一个会调用 `Write` / `WebSearch` 的 prompt，断言单发拒绝、退出非 0、state `lastStatus=denied_tool`（不是卡死）。
+  - 并发：用户对话进行中命中到期，断言 `skipped_busy` 且不排队。
+  - 目标必须是 release / 安装版（`docs/testing.md` §测试 11）。
+- 风险：共享 env 构造函数改动可能影响常驻 agent（必须回归 `start_cli` / 换档 / 换工作区）；调度线程与 App 退出 / 睡眠的竞态；日志里的输出可能含敏感内容（必须 `mask_secrets`）；单发拒绝外部工具会让任务失败并累计失败（prompt 要明确「只用只读工具」）。
+
+**阶段 2：写类任务（建议只在用户明确坚持时做；先做 2B，不做 2A）**
+- **2A（不推荐，且与硬禁令冲突）**：`--dangerously-skip-permissions` + 去掉 `--permission-mode plan`。它会让 `Cmd` / `PowerShell` 绕过危险命令的人工确认（§禁用 1.2），并关闭工作区锁（`core-agent/src/main.rs:4613-4614`）。即使再用 `--disallowedTools` 移除 shell，写仍可落到 `config\` / 任意盘符，**不能叫「有边界」**。
+- **2B（若必须做写类，建议的唯一形态）**：在 agent 侧新增「无人值守工具白名单」开关（例如 `--unattended-allow Write,Edit,NotebookEdit`），在保持 `read_only=false` 与工作区锁的前提下，只对白名单工具跳过审批；危险命令 / 凭据扫描仍照旧（复用 `bash_safety` / `content_safety` 的既有硬闸）。这是**新代码**，不是零成本。
+  - 改动点：`core-agent/src/main.rs` 的 `ApprovalPolicy` / `needs_approval_with`（`:4551-4569`、`:7588-7608`）；`core-agent/src/tools.rs` 的 `write_blocked` 不拦白名单（但要保留 `read_only` 语义）；`app/src-tauri/src/cron.rs` 的 job 模式字段与红色确认 UI。
+  - 验证：临时工作区写一个 canary 文件；断言 `Cmd` 仍被拒、工作区外写入被拒、白名单外写工具被拒；真机确认红色告警与二次确认。
+- 风险：无人值守的写类任务会把「模型判断」直接变成磁盘副作用；prompt 注入（若允许 `WebFetch`）风险更高；必须默认关闭、逐 job 显式开启、并在 UI 上用语义红写明「无人值守 + 可写」。
+
+##### 七、F. 明确「不做 / 不能做」
+
+- **不做**：
+  - 不引入任何调度库 / cron 解析库 / `chrono`（零新增依赖；时间用既有 `GetLocalTime`）。
+  - 不写 `schtasks`（理由见 A3；包括不建开机任务之外的任何计划任务）。
+  - 不复用 `chat.db` 存 job / 结果（§禁用 61）。
+  - 不把 cron job 列表 / 结果自动注入 system 固定前缀或主对话 history（§禁用 45；结果只进宿主列表 / `temp\logs`）。
+  - 不把 `CronCreate` 做成「自动档静默放行」；不默认开 `--dangerously-skip-permissions`。
+  - 不做「醒后补跑所有错过任务」的突发行为；不做无上限的每 job 历史文件。
+  - 不把进程内定时器当作真正的调度实现（只可能是会话内演示）。
+  - 不让 cron / 子代理再创建 cron（单发进程裁掉三个工具 + `Agent`）。
+  - 不新增 stream-json 字段、不改 `tool_result.content` 语义。
+- **不能做（如实写）**：
+  - **宿主不启动就无法运行**（除非走 A3 的 schtasks，本方案明确不做）。
+  - **每次 cron 都是新会话**：`--resume` 未实现（事实 3），没有对话上下文；job 的 `prompt` 必须自带全部前提。
+  - **单发没有审批回包通道**：需审批的工具只能被拒；不能「先跑，遇到审批再问用户」。
+  - **没有硬性单次费用上限**：`LUNAC_TURN_BUDGET_TOKENS` 是软闸且可续命（`core-agent/src/main.rs:196-206`）；只能靠每日次数上限与超时兜底。
+  - **写类 cron 没有可接受的无人值守边界**：`--dangerously-skip-permissions` 关闭工作区锁且绕过危险命令人工确认；2B 需要新代码，当前版本做不到。
+  - **没有 OS 级通知**：只有应用内浮层（`app/src/main.ts:9251-9256`）与提示音；托盘 / 无窗口时不能保证用户当场看见。
+  - **不能保证精确到秒**：调度 tick + 睡眠 / 唤醒只保证「到期后一个 tick 内尝试」，错过的按 C2 跳过或宽限补一次。
+  - **不能承诺「无人值守安全」**：它是策略级（默认拒绝 + 白名单），不是沙箱（§禁用 1.1）。
+
+##### 八、G. 未查到 / 需拍板
+
+- **未查到**：
+  - 宿主侧通用调度器 / 定时线程（`Cargo.toml:10-55` 无相关依赖；现有 `thread::spawn` 均非 cron）。
+  - `tauri-plugin-autostart`（不存在；开机自启是自研 `auto_start.rs`）。
+  - `ModuleData\tasks\`（目录不存在，无代码路径；S2 只是计划）。
+  - 「换模型会自动 `stop_cli`」（不存在；`set_ai_config` 只落盘 + 注入 env）。
+  - 卸载器对计划任务的清理（`scripts\lunac-installer.nsi` 搜索 `schtasks` 零命中）。
+  - `PushNotification` 在「无可见窗口」时的实际可见性（未实测；代码是 DOM 浮层）。
+- **需拍板**：
+  1. 阶段 1 是否要求「必须先配置工作区」才允许创建 cron（建议：是；否则无人值守读可越出默认 `transStorage`）。
+  2. 最小间隔 / 每 job 每日上限 / 全局每日上限 / 连续失败阈值（本节建议 15 分钟 / 12 / 48 / 3）。
+  3. `CronCreate` 是否在所有运行模式下都强制弹卡（建议：是，即使自动档）。
+  4. 写类 cron 是否永远不做，或只接受 2B 的新 agent 开关（建议：默认不做；2B 另立设计）。
+  5. `scope:"pet"` 何时支持（阶段 1 只 `global`；阶段 2 复用 `source:"pet"`）。
+  6. 手动触发入口放设置面板还是 AI 对话的「更多设置」（建议设置面板，避免与聊天流混）。
+  7. `notify` 默认值（建议 `toast`；托盘场景是否默认加 `sound`）。
+  8. 成本面板是否加 `cron` 来源档（建议加，否则 cron 用量混入普通聊天）。
+- **实现备注（不再改本节以外文档的前提下）**：若日后落地，需同步更新 `docs/todo.md` §待办 5 的 `LUNAC_*` 清单（新增 `LUNAC_CRON_DIR`）与 `docs/testing.md` §测试 10（若给 `agent-e2e.ps1` 加 `-CronDir` 夹具开关）。
 
 #### §待办 3-1e `EnterWorktree` / `ExitWorktree`（git worktree，**已实现**，2026-10-11）
 
@@ -813,7 +1035,12 @@
 - **待解决的墙**：`MEMORY.md` **整文件 6000 字符封顶**（`mcp_server.rs` 硬闸）⇒ 写满后**唯一出口是 `replace:true` 整体重写**（`docs/archive/ai-spec.md` §11 规则 56）⇒ **被迫丢信息**（想加新条就得先删旧条）；且**会话中新写的记忆要重启 agent 才可见**（冻结快照，规则 56 明写「会话中新写的记忆只落盘」）。
 - **三件套（逐项：做什么 / 代价 / 为什么这样切）**：
   - **A 保留快照兜底**（不动）：冻结快照**每轮一定在场**（注在 `history` 开头，规则 56）。**做什么**：什么都不做，仅作为 B / C 的兜底。**代价**：零（现状即它）。**为什么这样切**：稳定、每轮必达、不依赖模型「想起去查」；B 再强也不能假设模型一定会调工具。
-  - **B 加 `MemorySearch`（只读工具）**：**做什么**：新增一个**只读、免审批、可被 `--disallowedTools` 裁**的检索工具（按查询召回记忆条目），**只能模型主动调、绝不自动注入**。**代价**：多一个工具进工具表（固定前缀变一次，需重启 agent 才生效）；每次调用多一次往返；检索质量是**新增问题**。**为什么这样切**：解决**扩展性**（6000 字符封顶的根因）；**范式先例** = `SessionSearch` 就是「只能模型主动调、不得自动注入」（`docs/forbidden.md` §禁用 4 第 46 条 / 规则 53）—— B 完全照它走，**不新造范式**。
+  - **B 加 `MemorySearch`（只读工具）**：**已实现（日期 2026-10-17）**。新增一个**只读、免审批、可被 `--disallowedTools` 裁**的检索工具（按查询召回记忆条目），**只能模型主动调、绝不自动注入**。**代价**：多一个工具进工具表（固定前缀变一次，需重启 agent 才生效）；每次调用多一次往返；检索质量是**新增问题**。**为什么这样切**：解决**扩展性**（6000 字符封顶的根因）；**范式先例** = `SessionSearch` 就是「只能模型主动调、不得自动注入」（`docs/forbidden.md` §禁用 4 第 46 条 / 规则 53）—— B 完全照它走，**不新造范式**。
+    - **实现落点**：`core-agent/src/tools.rs` 的 `defs()`（无条件注册，内置工具 24 → 25）与 `BRIDGE_TOOLS`（走桥 ⇒ 子代理剔除、串行）；`core-agent/src/main.rs` 的 `memory_search()`（读取**复用** `fetch_memory` → 既有 `lunac/memory_read` 桥，不新造读取路径）与 `memory_search_log_args()`；检索内核 `core-agent/src/memory_search.rs`（纯函数 `split_bullets` / `search` / `rank_cmp`）；前端黑名单候选 `app/src/main.ts` 的 `TOOL_BLACKLIST_CANDIDATES`。
+    - **入参 / 输出**：`query`（必填）、`scope`（`global` / `pet` / `all`，缺省 `all` = 两份都查）、`limit`（默认 10、**上限 30**）；返回 `{"results":[{"scope","text","score":{"matched_terms","query_terms","occurrences"},"why"}],"reason"}`。
+    - **检索 / 排序规则**：按空白切词、**任一**命中即候选；中文按**子串**匹配（含整句），英文 / 数字**大小写不敏感**；排序 = 命中词数降序 → 出现次数降序 → 条目字符数升序（跨 scope 复用同一 `rank_cmp`）。**上限 30 的理由**：记忆文件本身 6000 字符封顶、条目数天然有限，30 是防「用户手工把文件改大」时一次检索吃掉上下文的硬闸（与 `SessionSearch` 同口径）。
+    - **验收口径如何满足**：①「记忆超过 6000 字符后仍能取回旧条」—— 单测 `memory_search::tests::entry_beyond_the_6000_char_snapshot_is_still_retrievable` 直接构造「快照截断点之后的旧条」并检索取回；②「同一问题在快照缺失时靠检索仍答对」—— 工具与检索已具备，但**端到端未验证**（`agent-e2e.ps1` 无宿主时只能验到 `reason=bridge-unavailable`；要真验需接宿主桥 + 真实模型）；③「压缩后写的新记忆无需重启即可见」= **C 项，本项不做**。另：纯函数单测覆盖中文子串 / 英文大小写 / 多关键词任一命中 / 排序三级 / limit / 空结果；**未触碰注入**（`memory_block` / `cap_inject` / 冻结快照注入一行未改，无任何自动调用点）；失败一律回**空结果 + reason**（`bridge-unavailable` / `memory-disabled` / `empty-or-missing` / `no-match` / `invalid-scope` / `missing-query`），不 panic、不抛硬错误。
+    - **可观测**：日志一行 `MemorySearch 命中 N 条（scope=…，reason=…，query_len=…，query_hash=…）`；**不记查询全文** —— 查询词可能含用户敏感信息，长度 + FNV 哈希足以归因且不可还原原文。
   - **C 压缩边界刷新快照**：**做什么**：在**压缩事件后**复用**已有**的「压缩后重注入」通道，把记忆快照**重新注入**一次。**代价**：要动注入路径（须仍满足固定前缀不变量）；会**消费**一次注入点。**为什么这样切**：**修掉「重启才可见」**（规则 56 的副作用），且**复用既有机制**（`main.rs` 那套「压缩后重注入结论索引」）、**不新开通道**。
 - **代价与冲突（必须写清）**：
   - ⚠️ **要修订 `docs/archive/ai-spec.md` §11 规则 56**：它**明写**「注入必须是冻结快照……**禁止**『写完记忆就刷新提示词』『每轮重读一次记忆文件』」，并解释「会话中新写的记忆只落盘，下次重启才可见」。C 直接触碰这条 ⇒ **改的是规范不是代码**，**需先拍板**；B 不触碰它（只读工具不改注入）。

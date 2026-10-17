@@ -48,6 +48,10 @@ windows = { version = "0.58", features = [
     # 两者都是**同一个 `windows` crate 的 feature**，不新增任何下载（同 sha2 那条口径）。
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # 长期记忆的来源前缀要**宿主本地日期**（`GetLocalTime`，见 `mcp_server.rs` 的
+    # `local_today`）：项目不引 chrono，UTC 在东八区会跨日错一天。同属既有 `windows`
+    # crate 的 feature，不新增任何下载。
+    "Win32_System_SystemInformation",
 ] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

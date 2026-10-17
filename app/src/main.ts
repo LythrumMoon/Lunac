@@ -3486,6 +3486,9 @@ const TOOL_BLACKLIST_CANDIDATES: BlacklistTool[] = [
   // 往期会话检索（2026-09-19，A2）：只读本机会话库，免审批。列在这里是为了让用户
   // 能主动关掉它 —— 前缀缓存里会带一段「往期会话索引」，不想让模型看到就往这里禁。
   { name: "SessionSearch" },
+  // 长期记忆检索（2026-10-17，§待办 3-9 B 项）：只读本机 `MEMORY.md`，免审批。
+  // 列在这里是给用户一个「别让模型去翻长期记忆」的开关；禁掉不影响主动注入的快照。
+  { name: "MemorySearch" },
   // 子代理（2026-09-20，A1）：默认可用。之所以列出来，是因为它**很花钱** ——
   // 一个子代理能跑 8 轮工具往返、并有自己的 token 预算。不想让模型自作主张派
   // 代理出去的用户，可以在设置里把它禁掉（`--disallowedTools Agent`）。
@@ -3681,11 +3684,14 @@ function personaLineEl(): HTMLElement {
 /** 预设按钮排（新稿第一行：`预设` 标签 + 一排按钮，不是列表）。
  *
  *  按钮点击 = **切换应用**该预设（写文本 → 落盘 → 高亮）；高亮沿用「名 + 文本双判」——
- *  手动改过文本框后，旧预设即使名字仍是活动名也不再高亮。无预设时给一行空态文字。 */
+ *  手动改过文本框后，旧预设即使名字仍是活动名也不再高亮。无预设时给一行空态文字。
+ *  **编辑区展开时**每个按钮右上角多一个 ×（删除该条预设）；收起时重绘即移除（不留占位）。 */
 function renderPersonaPresets() {
   const list = loadPersonaPresets();
   const active = getActivePersonaName();
   const cur = chatPersonaText.value;
+  const editing = !chatPersonaBox.classList.contains("hidden");
+  chatPersonaPresetList.classList.toggle("editing", editing);
   if (!list.length) {
     const empty = doc("span");
     empty.className = "chat-persona-preset-empty";
@@ -3695,6 +3701,10 @@ function renderPersonaPresets() {
   }
   const frag = document.createDocumentFragment();
   list.forEach((p) => {
+    // 按钮外包一层 cell：× 是**并列**按钮（不能把 button 嵌进 button），且必须 stopPropagation
+    // 才能保证「删预设」不会顺带触发「应用该预设」。
+    const cell = doc("span");
+    cell.className = "chat-persona-preset-cell";
     const b = doc("button") as HTMLButtonElement;
     b.type = "button";
     b.className = "chat-persona-preset-item";
@@ -3704,10 +3714,53 @@ function renderPersonaPresets() {
     b.classList.toggle("on", on);
     b.setAttribute("aria-pressed", on ? "true" : "false");
     b.addEventListener("click", () => applyPersonaPreset(p));
-    frag.appendChild(b);
+    cell.appendChild(b);
+    if (editing) {
+      const del = doc("button") as HTMLButtonElement;
+      del.type = "button";
+      del.className = "chat-persona-preset-del";
+      del.textContent = "×";
+      const delLabel = t("settings.persona_preset_delete");
+      del.setAttribute("aria-label", delLabel);
+      del.title = delLabel;
+      del.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        removePersonaPreset(p.name);
+      });
+      cell.appendChild(del);
+    }
+    frag.appendChild(cell);
   });
   chatPersonaPresetList.replaceChildren(frag);
 }
+
+/** 删除一条预设：**只动预设模板**（localStorage 列表 / 活动名）。
+ *
+ *  绝不碰人格文本与 `config\persona.md`；删掉的正是活动名时清空 active ⇒ 按钮不再高亮。
+ *  无确认弹框、可重复操作；删空后 `renderPersonaPresets()` 自然落到既有空态文案。 */
+function removePersonaPreset(name: string) {
+  const list = loadPersonaPresets();
+  const i = list.findIndex((p) => p.name === name);
+  if (i < 0) return;
+  list.splice(i, 1);
+  storePersonaPresets(list);
+  if (getActivePersonaName() === name) setActivePersonaName("");
+  renderPersonaPresets();
+}
+
+/** 预设行是单行横向滚动：纵向滚轮（含触屏滑动）转成横向滚动；到两端时交回页容器。
+ *  浏览器原生的 Shift+滚轮 / 横向滚轮不受影响（deltaX 同样走这里）。 */
+chatPersonaPresetList?.addEventListener("wheel", (e) => {
+  const max = chatPersonaPresetList.scrollWidth - chatPersonaPresetList.clientWidth;
+  if (max <= 0) return;
+  const dx = e.deltaX || e.deltaY;
+  if (!dx) return;
+  if ((chatPersonaPresetList.scrollLeft <= 0 && dx < 0)
+    || (chatPersonaPresetList.scrollLeft >= max - 1 && dx > 0)) return;
+  e.preventDefault();
+  chatPersonaPresetList.scrollLeft += dx;
+}, { passive: false });
 
 /** 应用一条预设：文本写进人格框 → 记活动名 → 走既有 `savePersona()`（落盘 `config\persona.md`）。
  *  保存 ≠ 生效，`savePersona` 会照旧提示「重启 AI 后生效」。 */
@@ -3810,6 +3863,7 @@ chatPersonaEdit?.addEventListener("click", async () => {
   const willOpen = chatPersonaBox.classList.contains("hidden");
   chatPersonaBox.classList.toggle("hidden", !willOpen);
   chatPersonaEdit.classList.toggle("open", willOpen);
+  renderPersonaPresets(); // × 只在编辑态渲染：展开即出现，收起即随重绘移除
   if (willOpen && !personaLoaded) {
     personaLoaded = true;
     await loadPersona();
@@ -5172,7 +5226,8 @@ detachedVscodeBtn.addEventListener("click", () => {
 //
 // 复用插件窗那两条命令 —— `plugin-chat` 也落在 `plugin-*` 通配里，宿主按 label 找
 // **调用方那个窗口**（与 plugin-window.ts 走的是同一条路）。**初值必须问宿主**：
-// 建窗时就是 `always_on_top(true)`，前端自己猜会出现「按钮没亮、实际已置顶」的错位。
+// 建窗默认置顶由宿主 `default_always_on_top()` 决定（聊天独立窗默认关闭），
+// 前端自己猜会出现「按钮没亮、实际已置顶」的错位。
 detachedPinBtn.addEventListener("click", async () => {
   const pinned = detachedPinBtn.dataset.pinned !== "1";
   try {
@@ -13744,8 +13799,8 @@ if (IS_CHAT_WINDOW) {
     // 必须在 startAIChat 之后 —— 那一步才把 `activePluginId` 置成 `ai-agent`，
     // 而标题栏里 VSCode 按钮的显隐正是按它判的（见 setDetached）。
     setDetached(true);
-    // 置顶按钮的初值**问宿主**（建窗时即 `always_on_top(true)`，前端不许自己猜 ——
-    // 同 plugin-window.ts 的做法）。
+    // 置顶按钮的初值**问宿主**（聊天独立窗默认不置顶，见宿主 `default_always_on_top()`，
+    // 前端不许自己猜 —— 同 plugin-window.ts 的做法）。
     void invoke<boolean>("plugin_window_pin_state")
       .then((pinned) => {
         detachedPinBtn.dataset.pinned = pinned ? "1" : "0";

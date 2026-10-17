@@ -94,6 +94,10 @@ mod mcp_oauth;
 // （绝不写 MEMORY.md / 绝不改任何注入）。见 `memory_candidates.rs` 头注释；开关复用
 // `LUNAC_LOCAL_DECIDE`（默认关），摊销口径 = 每 K 轮 + 压缩事件（与 S1 首切片同源）。
 mod memory_candidates;
+// 长期记忆的只读检索内核（§待办 3-9 B 项，2026-10-17）：纯函数切 bullet + 检索排序。
+// 正文仍由 `fetch_memory`（既有 `lunac/memory_read` 桥）读入；本模块不读盘、不写盘、
+// 不做任何注入，也不产生自动调用点。
+mod memory_search;
 mod peers;
 mod skills;
 mod tools;
@@ -2527,7 +2531,8 @@ fn env_block(cwd: &std::path::Path) -> String {
 // 就是这个）。取回侧保留：要回忆往期会话，模型自己调 `SessionSearch`（`lunac/history_search`）。
 //
 // 长期记忆 = 从流水里**提炼出来的少量结论**（用户偏好 / 项目约定 / 踩过的坑），整段注入
-// （服务端上限 6000 字符）。结论是每轮都可能用到的背景（现查既慢又贵），所以注入。
+// （服务端口径：正文额度 6000 字符 + 总长硬顶 9000 字符）。结论是每轮都可能用到的背景
+// （现查既慢又贵），所以注入。
 //
 // 写入侧（`Remember` 工具 + 每 N 轮的后台复盘 fork）见 `main()` 的装配与 `run_review_fork`。
 //
@@ -2548,10 +2553,11 @@ fn memory_enabled() -> bool {
     }
 }
 
-/// 注入侧长度上限。与 MCP 服务端 `MAX_MEMORY_CHARS` 同值（6000 字符 ≈ 1500 token，
-/// 占 128k 预算的 1.2%）—— 服务端管「写」，这里管「发」；用户手工把文件改大时，
-/// 兜底截断仍然由这一层负责。
-const MEMORY_INJECT_CHARS: usize = 6_000;
+/// 注入侧长度上限。与服务端 `MEMORY_TOTAL_HARD_CAP_CHARS` 同值（9000 字符 ≈ 2250 token，
+/// 占 128k 预算的 1.8%）：服务端按「正文额度 6000 + 总长硬顶 9000」管「写」，这里按同一个
+/// **总长硬顶**管「发」⇒ 服务端允许落盘的文件（含前缀最多 9000）能**整份**注入，不会在
+/// 注入时被二次截断；用户手工把文件改大时，兜底截断仍然由这一层负责。
+const MEMORY_INJECT_CHARS: usize = 9_000;
 
 /// 按注入上限截断（**唯一的注入封顶实现**，记忆与成长笔记共用）：超 `MEMORY_INJECT_CHARS`
 /// 就截到头。抽成纯函数是为了可单测（§65：往 history 里塞东西的每条路径都要有硬上限）。
@@ -2657,16 +2663,17 @@ fn memory_block_text(remember_tool_on: bool, body: &str, scope: tools::MemorySco
         tools::MemoryScope::Global => "# Long-term memory",
         tools::MemoryScope::Pet => "# Long-term memory (desktop pet — private notes)",
     };
-    // 来源 / 时间说明行（B2，2026-10-13）：**固定前缀的一部分**（逐字节稳定、随 scope 不同），
-    // 措辞按作用域点明记忆归属，并交代「未标注日期者视为背景」。**不逐条塞日期**（那是 B1，
-    // 会牵动去重语义，本轮不做）；也不动正文与 bullet 格式。
+    // 来源 / 时间说明行（B2 于 2026-10-13 引入；B1 于 2026-10-17 改为描述逐条前缀）：
+    // **固定前缀的一部分**（逐字节稳定、随 scope 不同），说明新格式与日期语义 ——
+    // `- [YYYY-MM-DD · scope]` 的日期 = 该条事实的**最后确认时间**（不是初次得知）；
+    // 无前缀 = 更早的、未记录日期的背景。不掺任何运行时变量（缓存前缀纪律）。
     let provenance = match scope {
-        tools::MemoryScope::Global => "- Source: the main assistant saved these in earlier \
-            sessions with this user. They are not dated, so treat an undated entry as background \
-            you already know, never as the current request.",
-        tools::MemoryScope::Pet => "- Source: this is the desktop pet's own private memory, saved \
-            in its earlier pet sessions. It is not dated, so treat an undated entry as background \
-            you already know, never as the current request.",
+        tools::MemoryScope::Global => "- Entries saved by the main assistant may start with \
+            [YYYY-MM-DD · global]: the date is when the fact was last confirmed, not when it was \
+            first learned. An entry without that prefix is undated background recorded earlier.",
+        tools::MemoryScope::Pet => "- Entries in the desktop pet's own private memory may start \
+            with [YYYY-MM-DD · pet]: the date is when the note was last confirmed, not when it \
+            was first learned. An entry without that prefix is undated background recorded earlier.",
     };
     format!(
         "\n\n{header}\n\
@@ -5561,7 +5568,13 @@ fn run_tool(
     input: &Value,
 ) -> Result<String, String> {
     let started = Instant::now();
-    let args = tools::summarize_args(input);
+    // `MemorySearch` 的**查询词可能含敏感词** ⇒ 日志只留长度 + 哈希（见
+    // `memory_search_log_args` 的理由）；其余工具仍走既有脱敏摘要。
+    let args = if name == "MemorySearch" {
+        memory_search_log_args(input)
+    } else {
+        tools::summarize_args(input)
+    };
     // 单条工具输出预算的唯一出口：超预算落盘全文、只内联头尾（见 tools::apply_budget）。
     // 必须在这里做 —— 只有这一层同时拿到工具名与未经裁剪的完整输出。
     let result = dispatch_tool(tctx, mcp_bridge, skill_list, name, input)
@@ -5611,6 +5624,147 @@ fn session_search(bridge: Option<&mut mcp::McpSet>, input: &Value) -> Result<Str
         return Err("往期会话检索不可用：MCP 桥未接通".into());
     };
     b.history_search(query, limit)
+}
+
+/// `MemorySearch` 单次返回条数的默认值与上限。
+///
+/// 与 `SESSION_SEARCH_*` 分开定义：记忆文件整份封顶 9000 字符（`MEMORY_INJECT_CHARS` 或
+/// 服务端总长硬顶），条目数天然有限；这里仍设 30 的硬上限，是为了防「用户手工把文件改大」时一次检索
+/// 把整段上下文吃掉（与 `SessionSearch` 同一口径，模型只需记一套条数）。
+const MEMORY_SEARCH_DEFAULT_LIMIT: u64 = 10;
+const MEMORY_SEARCH_MAX_LIMIT: u64 = 30;
+
+/// `MemorySearch` 的 scope 日志标签：只认白名单，未知一律 `invalid`。
+///
+/// 日志里不落任意输入（同「查询只记长度 / 哈希」的理由）；这里只输出固定枚举值。
+fn memory_search_scope_label(scope: &str) -> &'static str {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "" | "all" | "both" => "all",
+        "global" => "global",
+        "pet" => "pet",
+        _ => "invalid",
+    }
+}
+
+/// `MemorySearch` 的日志参数摘要：**刻意不落查询全文**。
+///
+/// 理由：查询词可能含用户敏感信息（地址 / 项目名 / 凭据片段）；日志常被用户贴出来求助，
+/// 记全文等于把它们带出门。长度 + FNV 哈希足以做「同一查询重复了几次 / 是不是同一个词」
+/// 的归因，又不可还原原文（与 `log::hash64` 的既有用途同口径）。
+fn memory_search_log_args(input: &Value) -> String {
+    let q = input.get("query").and_then(Value::as_str).unwrap_or("");
+    let scope = input.get("scope").and_then(Value::as_str).unwrap_or("");
+    format!(
+        "query_len={} query_hash={:016x} scope={}",
+        q.chars().count(),
+        log::hash64(q),
+        memory_search_scope_label(scope)
+    )
+}
+
+/// `MemorySearch`：长期记忆的只读检索（§待办 3-9 B 项，2026-10-17）。
+///
+/// **只读**：正文走**既有** `fetch_memory`（`lunac/memory_read` 桥），检索内核是纯函数
+/// `memory_search::search`；不写文件、不调 `Remember`、不改注入路径、不产生自动调用点。
+/// 失败一律回**空结果 + reason**（桥不可用 / 记忆关闭 / 无匹配 / 参数不合法），不 panic、
+/// 不抛硬错误 —— 检索不该阻断任何一轮对话。
+fn memory_search(bridge: Option<&mut mcp::McpSet>, input: &Value) -> String {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(MEMORY_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, MEMORY_SEARCH_MAX_LIMIT) as usize;
+    // scope 缺省 = 两份都查；`all` / `both` 是同一语义的显式写法。
+    let scope_arg = input
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let scope_label = memory_search_scope_label(&scope_arg);
+
+    let (hits, reason): (Vec<(tools::MemoryScope, memory_search::Hit)>, &str) = if query.is_empty()
+    {
+        (Vec::new(), "missing-query")
+    } else if !memory_enabled() {
+        (Vec::new(), "memory-disabled")
+    } else {
+        let scopes: Option<Vec<tools::MemoryScope>> = match scope_arg.as_str() {
+            "" | "all" | "both" => Some(vec![tools::MemoryScope::Global, tools::MemoryScope::Pet]),
+            "global" => Some(vec![tools::MemoryScope::Global]),
+            "pet" => Some(vec![tools::MemoryScope::Pet]),
+            // 未知 scope 不猜：回空结果 + 明确原因，模型可自行改成合法值重试。
+            _ => None,
+        };
+        match scopes {
+            None => (Vec::new(), "invalid-scope"),
+            Some(scopes) => match bridge {
+                None => (Vec::new(), "bridge-unavailable"),
+                Some(b) => {
+                    let mut hits: Vec<(tools::MemoryScope, memory_search::Hit)> = Vec::new();
+                    let mut had_text = false;
+                    for scope in scopes {
+                        // 复用既有读取函数（错误 / 空记忆都折成 None，与注入侧同口径）。
+                        if let Some(raw) = fetch_memory(Some(&mut *b), scope) {
+                            had_text = true;
+                            for hit in memory_search::search(
+                                &memory_search::split_bullets(&raw),
+                                query,
+                                limit,
+                            ) {
+                                hits.push((scope, hit));
+                            }
+                        }
+                    }
+                    // 跨 scope 用**同一把**排序尺子（`rank_cmp`），再统一截到 limit。
+                    hits.sort_by(|a, b| memory_search::rank_cmp(&a.1, &b.1));
+                    hits.truncate(limit);
+                    let reason = if hits.is_empty() {
+                        if had_text {
+                            "no-match"
+                        } else {
+                            "empty-or-missing"
+                        }
+                    } else {
+                        "ok"
+                    };
+                    (hits, reason)
+                }
+            },
+        }
+    };
+
+    // 只记条数 / scope / 原因 / 查询长度与哈希 —— **绝不记查询全文**（理由见上）。
+    log::info(format!(
+        "MemorySearch 命中 {} 条（scope={scope_label}，reason={reason}，query_len={}，query_hash={:016x}）",
+        hits.len(),
+        query.chars().count(),
+        log::hash64(query)
+    ));
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|(scope, hit)| {
+            json!({
+                "scope": scope.as_str(),
+                "text": hit.text,
+                "score": {
+                    "matched_terms": hit.matched_terms,
+                    "query_terms": hit.query_terms,
+                    "occurrences": hit.occurrences,
+                },
+                "why": format!(
+                    "matched {}/{} terms, {} occurrence(s)",
+                    hit.matched_terms, hit.query_terms, hit.occurrences
+                ),
+            })
+        })
+        .collect();
+    json!({ "results": results, "reason": reason }).to_string()
 }
 
 /// 一次 fork 的形态。
@@ -7049,6 +7203,13 @@ fn dispatch_tool(
     // （它不带 `mcp__` 前缀，也不会被 `needs_approval` 判成需审批）。
     if name == "SessionSearch" {
         return session_search(mcp_bridge, input);
+    }
+    // 长期记忆的只读检索（§待办 3-9 B 项）：同样走桥的自定义方法（`lunac/memory_read`），
+    // 因此也要在 `is_mcp` 之前处理。**失败回空结果而不是硬错误**（桥不可用 / 记忆为空 /
+    // 无匹配都带 reason）—— 与 `SessionSearch` 的「没桥就如实报错」不同，检索是锦上添花，
+    // 不该为一条查不到的记忆把工具结果标成 is_error。
+    if name == "MemorySearch" {
+        return Ok(memory_search(mcp_bridge, input));
     }
     // 走桥的工具（A3/A4）：同样走自定义方法 / 标准方法，所以也要在 `is_mcp` 之前处理。
     // **读类在 plan（只读）档放行** —— 与 `SessionSearch` 同理：只读本机自己的数据
@@ -10331,13 +10492,16 @@ mod tests {
         assert!(a.starts_with(&empty), "正文必须拼在说明行之后");
         assert!(a.ends_with("- prefers tabs"), "正文仍在最末，bullet 格式未变");
         // 全局段点明「主 AI 保存」；桌宠段点明「桌宠私有」；两段说明行不同。
-        assert!(a.contains("main assistant saved"), "全局段要说明来源：{a}");
+        assert!(a.contains("main assistant"), "全局段要说明来源：{a}");
         assert!(!a.contains("desktop pet"), "全局段不得混入桌宠措辞");
         let p = memory_block_text(true, "- prefers tabs", MemoryScope::Pet);
         assert!(p.contains("desktop pet's own private memory"), "桌宠段要点明私有：{p}");
         assert_ne!(a, p, "两侧说明行不同");
-        // 说明行交代「未标注日期者视为背景」。
-        assert!(a.contains("undated"), "要交代未标注日期者视为背景");
+        // 说明行描述 B1 的新格式（日期 = 最后确认）并交代「无前缀 = 更早的背景」。
+        assert!(a.contains("[YYYY-MM-DD · global]"), "全局段要写清前缀格式：{a}");
+        assert!(p.contains("[YYYY-MM-DD · pet]"), "桌宠段要写清前缀 scope：{p}");
+        assert!(a.contains("last confirmed"), "要交代日期 = 最后确认时间");
+        assert!(a.contains("undated"), "要交代无前缀者视为更早的背景");
     }
 
     /// 复盘快照（A4）：只认三类块、工具结果有上限、超预算时**从最早处**丢。

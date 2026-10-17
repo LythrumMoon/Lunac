@@ -512,9 +512,15 @@ fn prompt_get_result(prompts: &[PromptDef], name: &str, arguments: &Value) -> Re
 const MEMORY_FILE: &str = "MEMORY.md";
 /// 单条记忆上限（一条通常只有一两句；超过这个量级说明该拆成多条或先提炼）
 const MAX_MEMORY_ENTRY_CHARS: usize = 2_000;
-/// 记忆文件上限 ≈ 1500 token（占 128k 预算的 1.2%）。注入侧同口径 —— 文件整段注入
-/// （agent 侧按作用域注入到 history 开头，见 `core-agent` 的 `context_block_message`）。
-const MAX_MEMORY_CHARS: usize = 6_000;
+/// **正文额度**：只统计每条去掉行首 `- ` 与 `[YYYY-MM-DD · scope] ` 前缀后的正文
+/// （含续行）。⇒ 前缀再长也不挤占正文档位，文件总长随条目数 / 前缀长度浮动。
+/// 约 1500 token（占 128k 预算的 1.2%），与注入侧口径一致（整段注入，见 `core-agent`
+/// 的 `context_block_message`）。
+const MEMORY_BODY_BUDGET_CHARS: usize = 6_000;
+/// **总长度硬顶**（含前缀 / 换行 / 续行缩进）：该文件每轮都进上下文，需防「条目多 +
+/// 前缀长」把注入体积顶爆。按 50 条 × 24 字符前缀 + 6000 正文字额 ≈ 7200，取 9000
+/// 留约 25% 余量。
+const MEMORY_TOTAL_HARD_CAP_CHARS: usize = 9_000;
 
 /// 记忆作用域（2026-10-13）：主 AI 的**全局**长期记忆 vs **桌宠私有**的成长笔记。
 ///
@@ -535,6 +541,14 @@ impl MemoryScope {
             None | Some("") | Some("global") => Ok(MemoryScope::Global),
             Some("pet") => Ok(MemoryScope::Pet),
             Some(other) => Err(format!("未知记忆作用域: {other}")),
+        }
+    }
+
+    /// 落盘标注用的稳定英文 id（**不随界面语言漂移**）。
+    fn id(self) -> &'static str {
+        match self {
+            MemoryScope::Global => "global",
+            MemoryScope::Pet => "pet",
         }
     }
 }
@@ -568,10 +582,114 @@ fn read_memory(scope: MemoryScope) -> Result<String, String> {
     read_memory_at(&memory_path_for(scope))
 }
 
-/// 条目归一（**去重与逐条删共用同一个判据**）：折叠所有空白、去首尾、统一小写。
-/// 只用于「判断两条是不是同一条」—— 落盘 / 注入的正文仍是用户看到的原文。
+/// 行首来源前缀（B1，2026-10-17）的严格形状：`[YYYY-MM-DD · global|pet] `。
+///
+/// 只认宿主自己生成的那一种（日期 = 10 位 ISO、scope = 两个稳定英文 id）；不匹配
+/// （老的无前缀条目 / 正文恰好以 `[` 开头）原样返回。返回 `(前缀含方括号, 前缀后的正文)`。
+fn split_provenance_prefix(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix('[')?;
+    let (inner, after) = rest.split_once("] ")?;
+    let (date, scope) = inner.split_once(" · ")?;
+    let date_ok = date.len() == 10
+        && date.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        });
+    if date_ok && matches!(scope, "global" | "pet") {
+        Some((&text[..inner.len() + 2], after))
+    } else {
+        None
+    }
+}
+
+/// 去掉行首来源前缀；没有前缀（旧数据 / 非宿主生成）⇒ 原样返回。
+fn strip_provenance_prefix(text: &str) -> &str {
+    split_provenance_prefix(text).map(|(_, body)| body).unwrap_or(text)
+}
+
+/// 本次写入要盖的来源前缀（不含行首 `- `，也不含其后的空格）。
+fn provenance_prefix(scope: MemoryScope, date: &str) -> String {
+    format!("[{date} · {}]", scope.id())
+}
+
+/// 条目归一（**去重与逐条删共用同一个判据**）：先去掉行首的 `[日期 · scope]` 前缀，
+/// 再折叠所有空白、去首尾、统一小写。
+///
+/// 去前缀是 B1（2026-10-17）的**去重语义变化**：同一条事实不同日期写入时必须视为同一条
+/// （否则日期一换就重复堆积）；日期只作「最后确认时间」，不参与正文比较。
 fn normalize_entry(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    strip_provenance_prefix(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// 把一条原始条目（从 `- ` 起头、可能含续行）的首行前缀换成本次写入的前缀。
+///
+/// 旧的无前缀条目也走这里就地补前缀（**只迁移被再次写入的那条**，不做全量回填 ——
+/// 历史条目没有可信的旧日期）。续行（含缩进与 CRLF）原样保留。
+fn retag_entry_first_line(raw: &str, prefix: &str) -> String {
+    let (first, rest) = match raw.split_once('\n') {
+        Some((f, r)) => (f, Some(r)),
+        None => (raw, None),
+    };
+    let (first, cr) = match first.strip_suffix('\r') {
+        Some(f) => (f, "\r"),
+        None => (first, ""),
+    };
+    let body = first.strip_prefix("- ").unwrap_or(first);
+    let body = strip_provenance_prefix(body);
+    let mut out = format!("- {prefix} {body}");
+    out.push_str(cr);
+    if let Some(rest) = rest {
+        out.push('\n');
+        out.push_str(rest);
+    }
+    out
+}
+
+/// 给整段记忆文本里的每条 bullet 重盖行首前缀（replace 模式用）。
+///
+/// **日期一律以宿主为准**：模型若在内容里自带 `[日期 · scope]`（哪怕看起来合法）也先剥掉，
+/// 再由宿主盖上本次日期 —— 不允许模型生成 / 伪造日期。已有前缀的条目被整体重写，等价于
+/// 「本次重写即一次确认」；非 bullet 行（含续行缩进）原样保留。
+fn tag_bullet_lines(text: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let (line, cr) = match line.strip_suffix('\r') {
+            Some(l) => (l, "\r"),
+            None => (line, ""),
+        };
+        if line == "-" {
+            out.push_str("- ");
+            out.push_str(prefix);
+        } else if let Some(body) = line.strip_prefix("- ") {
+            out.push_str("- ");
+            out.push_str(prefix);
+            let body = strip_provenance_prefix(body);
+            if !body.is_empty() {
+                out.push(' ');
+                out.push_str(body);
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push_str(cr);
+    }
+    out
+}
+
+/// 宿主本地日期（`YYYY-MM-DD`）。
+///
+/// 日期必须由宿主取：模型生成的日期不可信；UTC 在东八区会跨日错一天（项目不引 chrono，
+/// 见 `log.rs` 顶注），这里直接调 Win32 `GetLocalTime`（`windows` 已是既有依赖）。
+fn local_today() -> String {
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
 }
 
 /// 把记忆正文按行切成 `(行首字节偏移, 行内容)`（不丢字节：偏移用于按内容删除时精确定位）。
@@ -617,11 +735,54 @@ fn split_entries(text: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// 列出某作用域的全部记忆条目（正文，不含 `- ` 前缀）；文件不存在 ⇒ 空列表。
+/// 统计记忆文本的**正文字数**（动态上限口径）。
+///
+/// 每个 bullet 去掉行首 `- ` 与 `[YYYY-MM-DD · scope] ` 前缀后计正文；续行 / 非 bullet
+/// 行按 trim 后的内容计。换行与续行缩进不计 ⇒ 前缀不占正文额度（前缀再多也不挤占 6000）。
+fn memory_body_chars(text: &str) -> usize {
+    let mut total = 0;
+    for (_, line) in line_offsets(text) {
+        let body = if line == "-" {
+            ""
+        } else {
+            line.strip_prefix("- ").unwrap_or(line)
+        };
+        let body = strip_provenance_prefix(body).trim();
+        if !body.is_empty() {
+            total += body.chars().count();
+        }
+    }
+    total
+}
+
+/// 落盘前的两口径校验（调用方先做单条上限）：**正文额度 → 总长度硬顶**，顺序固定。
+///
+/// 两个拒绝语义必须能区分（便于提示与排查）：正文超出报「正文额度已满」，
+/// 总量超出报「总长度硬顶」。输入按**最终落盘内容**传入（已脱敏、含前缀与结尾换行）。
+fn check_memory_budgets(text: &str) -> Result<(), String> {
+    let body = memory_body_chars(text);
+    if body > MEMORY_BODY_BUDGET_CHARS {
+        return Err(format!(
+            "长期记忆正文额度已满（{body} 字符 > 正文额度 {MEMORY_BODY_BUDGET_CHARS}）：先用 Remember 的 replace 模式整理合并，再追加新条目"
+        ));
+    }
+    let total = text.chars().count();
+    if total > MEMORY_TOTAL_HARD_CAP_CHARS {
+        return Err(format!(
+            "长期记忆总长度硬顶（{total} 字符 > 硬顶 {MEMORY_TOTAL_HARD_CAP_CHARS}）：条目或前缀过多，请用 replace 模式精简"
+        ));
+    }
+    Ok(())
+}
+
+/// 列出某作用域的全部记忆条目（正文，不含 `- ` 与 `[日期 · scope]` 前缀）；文件不存在 ⇒ 空列表。
+///
+/// 列表是给用户看的（桌宠设置窗），来源前缀属于注入 / 落盘元数据，不在这里回显；
+/// 逐条删按内容匹配时两边都会经 `normalize_entry` 去前缀，故「列出来的那条一定删得掉」。
 fn list_memory_entries_at(path: &std::path::Path) -> Result<Vec<String>, String> {
     Ok(split_entries(&read_memory_at(path)?)
         .into_iter()
-        .map(|(_, _, body)| body)
+        .map(|(_, _, body)| strip_provenance_prefix(&body).to_string())
         .collect())
 }
 
@@ -650,16 +811,30 @@ fn delete_memory_entry_at(path: &std::path::Path, needle: &str) -> Result<String
     Ok(format!("已删除一条记忆（剩 {} 条）", split_entries(&next).len()))
 }
 
+/// 写入层的来源标注（B1，2026-10-17）：`None` = 不加前缀（成长笔记 / 人格建议复用同一落盘助手）。
+///
+/// 日期由宿主取（`local_today()` 的本地日期），scope 用稳定英文 id —— 两者都不交给模型。
+#[derive(Clone, Copy)]
+struct MemoryProvenance<'a> {
+    scope: MemoryScope,
+    date: &'a str,
+}
+
 /// 追加（或整体替换）一条记忆。
 ///
-/// 去重按**归一后的整条条目**比对（折叠空白 + 大小写不敏感）：复盘 fork 每 10 轮跑一次，
-/// 很容易把同一条事实反复写进来（常只差一个空格或大小写），精确匹配挡不住它 —— 而重复
-/// 条目既占上限又稀释提示词。归一判据与 [`delete_memory_entry_at`] 共用，保证「列出来的
-/// 那条一定删得掉」。
+/// **逐条来源标注（B1）**：带 `provenance` 时给首行加 `- [YYYY-MM-DD · scope] ` 前缀；
+/// 日期 = 本次写入的**最后确认时间**（不是初次得知时间），多行续行缩进原样保留。
+///
+/// 去重按**去掉来源前缀后的归一正文**比对（折叠空白 + 大小写不敏感）：复盘 fork 很容易把
+/// 同一条事实隔天再写一次，若把日期算进比较就会重复堆积。命中时**不追加**，只把该条的
+/// 日期刷新为本次写入日期；旧的无前缀条目也在这里**原地补前缀**（只迁移被再次写入的那条，
+/// 不批量回填 —— 历史条目没有可信的旧日期）。归一判据与 [`delete_memory_entry_at`] 共用，
+/// 保证「列出来的那条一定删得掉」。
 fn write_memory_at(
     path: &std::path::Path,
     content: &str,
     replace: bool,
+    provenance: Option<MemoryProvenance<'_>>,
 ) -> Result<String, String> {
     // 凭据兜底（2026-10-11，与 A17 / M2-8 同类）：复盘 fork 可能把对话里出现的 API key /
     // 私钥原样写进来，而 MEMORY.md 会被注入以后每一次对话 ⇒ 落盘前统一过 mask_secrets。
@@ -672,43 +847,80 @@ fn write_memory_at(
     if text.is_empty() {
         return Err("缺少 content 参数：要记的内容不能为空".into());
     }
-    let len = text.chars().count();
+    let prefix = provenance.map(|p| provenance_prefix(p.scope, p.date));
     let existing = read_memory_at(path).unwrap_or_default();
 
     let next = if replace {
-        if len > MAX_MEMORY_CHARS {
-            return Err(format!(
-                "替换内容过长（{len} 字符 > 上限 {MAX_MEMORY_CHARS}）：先精简再写"
-            ));
-        }
-        format!("{text}\n")
+        // 整体重写：所有 bullet 的日期 / scope 由宿主重盖（模型自带的假日期一律覆盖）。
+        let body = match &prefix {
+            Some(p) => tag_bullet_lines(text, p),
+            None => text.to_string(),
+        };
+        // 按**最终落盘内容**（含结尾换行）校验两口径：正文额度 → 总长度硬顶。
+        let next = format!("{body}\n");
+        check_memory_budgets(&next)?;
+        next
     } else {
+        // 防止模型自带前缀 ⇒ 先剥掉再统一由宿主盖（日期永远以宿主为准）。
+        // 无来源标注的调用方（成长笔记 / 人格建议）保持原样，不碰正文。
+        let body = match &prefix {
+            Some(_) => strip_provenance_prefix(text),
+            None => text,
+        };
+        let tagged = match &prefix {
+            Some(p) => format!("{p} {body}"),
+            None => body.to_string(),
+        };
+        // 多行条目缩进成一条 bullet，保证「一行 = 一条」这个形状不被破坏；
+        // 前缀只加在首行 `- ` 之后，续行缩进保持原样。
+        let bullet = format!("- {}", tagged.replace('\n', "\n  "));
+        // 单条上限按**最终落盘内容**（含 `- ` 与来源前缀）校验。
+        let len = bullet.chars().count();
         if len > MAX_MEMORY_ENTRY_CHARS {
             return Err(format!(
                 "单条记忆过长（{len} 字符 > 上限 {MAX_MEMORY_ENTRY_CHARS}）：请拆成多条，或先提炼成结论"
             ));
         }
-        // 多行条目缩进成一条 bullet，保证「一行 = 一条」这个形状不被破坏
-        let bullet = format!("- {}", text.replace('\n', "\n  "));
-        // 归一后比对（折叠空白 + 大小写不敏感）：与 delete_memory_entry_at 同判据。
-        let n = normalize_entry(text);
-        if split_entries(&existing)
-            .iter()
-            .any(|(_, _, body)| normalize_entry(body) == n)
+        // 归一后比对（去来源前缀 + 折叠空白 + 大小写不敏感）：与 delete_memory_entry_at 同判据。
+        let n = normalize_entry(body);
+        if let Some((start, end, _)) = split_entries(&existing)
+            .into_iter()
+            .find(|(_, _, body)| normalize_entry(body) == n)
         {
-            return Ok("(already remembered — nothing changed)".into());
+            // 命中同一条 ⇒ 不追加；把日期刷新为本次写入日期（旧无前缀条目则就地补前缀）。
+            let refreshed = match &prefix {
+                Some(p) => retag_entry_first_line(&existing[start..end], p),
+                None => existing[start..end].to_string(),
+            };
+            let updated = if refreshed == existing[start..end] {
+                existing.clone()
+            } else {
+                let mut u = String::with_capacity(existing.len());
+                u.push_str(&existing[..start]);
+                u.push_str(&refreshed);
+                u.push_str(&existing[end..]);
+                u
+            };
+            check_memory_budgets(&updated)?;
+            if updated != existing {
+                if let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir).map_err(|e| format!("建记忆目录失败 {e}"))?;
+                }
+                fs::write(path, updated.as_bytes()).map_err(|e| format!("写入记忆失败：{e}"))?;
+            }
+            return Ok(if prefix.is_some() {
+                "(already remembered — date refreshed)"
+            } else {
+                "(already remembered — nothing changed)"
+            }
+            .into());
         }
         let mut head = existing.clone();
         if !head.is_empty() && !head.ends_with('\n') {
             head.push('\n');
         }
         let merged = format!("{head}{bullet}\n");
-        if merged.chars().count() > MAX_MEMORY_CHARS {
-            return Err(format!(
-                "长期记忆已满（{} 字符上限）：先用 `Remember` 的 `replace` 模式整理合并，再追加新条目",
-                MAX_MEMORY_CHARS
-            ));
-        }
+        check_memory_budgets(&merged)?;
         merged
     };
 
@@ -724,7 +936,13 @@ fn write_memory_at(
 }
 
 fn write_memory_entry(scope: MemoryScope, content: &str, replace: bool) -> Result<String, String> {
-    write_memory_at(&memory_path_for(scope), content, replace)
+    let date = local_today();
+    write_memory_at(
+        &memory_path_for(scope),
+        content,
+        replace,
+        Some(MemoryProvenance { scope, date: &date }),
+    )
 }
 
 /// 把记忆文件截断为空（**文件不存在 ⇒ 幂等空操作**）。
@@ -761,11 +979,12 @@ pub fn memory_delete_entry(scope: MemoryScope, needle: &str) -> Result<String, S
 
 /// 某作用域记忆的设置窗载荷：条目列表 + 两条上限。上限**以宿主常量为唯一真相源**
 /// （前端只回显，不另立一份，见 `docs/ui-style.md` §界面 3 的 `maxChars` 纪律）。
+/// `maxTotalChars` 回显的是**正文档位**（前缀不计入），与写侧同一口径。
 pub fn memory_scope_payload(scope: MemoryScope) -> Result<Value, String> {
     Ok(serde_json::json!({
         "entries": memory_entries(scope)?,
         "maxEntryChars": MAX_MEMORY_ENTRY_CHARS,
-        "maxTotalChars": MAX_MEMORY_CHARS,
+        "maxTotalChars": MEMORY_BODY_BUDGET_CHARS,
     }))
 }
 
@@ -812,8 +1031,8 @@ fn handle_memory_method(method: &str, params: Option<&Value>) -> Result<String, 
 //
 // 与长期记忆同款纪律（**复用同一批助手，不另造第二套**）：
 //   · **只追加**（AI 侧唯一写入形态）；逐条删 / 清空只经宿主命令（用户 UI 下轮接）；
-//   · 上限**复用既有记忆口径**（`MAX_MEMORY_ENTRY_CHARS` / `MAX_MEMORY_CHARS` —— §62 不得新增
-//     第三份常量），超限**报错不静默截断**；
+//   · 上限**复用既有记忆口径**（`MAX_MEMORY_ENTRY_CHARS` / `MEMORY_BODY_BUDGET_CHARS` /
+//     `MEMORY_TOTAL_HARD_CAP_CHARS` —— §62 不得新增第三份常量），超限**报错不静默截断**；
 //   · 落盘前过 `mask_secrets`（体现在复用的 `write_memory_at` 里）；
 //   · 去重 / 逐条删共用 `normalize_entry` 归一判据（列出来的按内容删得掉）；
 //   · 格式 = 与记忆一致的扁平 bullet（`- ` 起头），故 `split_entries` / `delete_memory_entry_at`
@@ -860,7 +1079,8 @@ pub fn pet_growth_clear() -> Result<(), String> {
 
 /// **追加**一条成长笔记（无 replace：AI 侧只能追加，改删历史只由用户逐条做）。
 pub fn pet_growth_append(content: &str) -> Result<String, String> {
-    write_memory_at(&pet_growth_path(), content, false)
+    // 成长笔记不是用户事实记忆：不盖 `[日期 · scope]` 前缀（格式保持原样）。
+    write_memory_at(&pet_growth_path(), content, false, None)
 }
 
 /// 成长笔记的设置窗载荷：条目列表 + 两条上限（上限以宿主常量为唯一真相源）。
@@ -868,7 +1088,7 @@ pub fn pet_growth_payload() -> Result<Value, String> {
     Ok(serde_json::json!({
         "entries": pet_growth_entries()?,
         "maxEntryChars": MAX_MEMORY_ENTRY_CHARS,
-        "maxTotalChars": MAX_MEMORY_CHARS,
+        "maxTotalChars": MEMORY_BODY_BUDGET_CHARS,
     }))
 }
 
@@ -886,7 +1106,8 @@ pub fn persona_suggestion_delete(needle: &str) -> Result<String, String> {
 
 /// **追加**一条人格修订建议（AI 侧唯一写入形态；不接受任何「直接改人格」的语义）。
 pub fn persona_suggestion_append(content: &str) -> Result<String, String> {
-    write_memory_at(&persona_suggestions_path(), content, false)
+    // 人格建议同样是待办清单，不是用户事实记忆：不盖来源前缀。
+    write_memory_at(&persona_suggestions_path(), content, false, None)
 }
 
 /// 清空全部人格修订建议（把 `PERSONA_SUGGESTIONS.md` 截断为空；文件不存在 ⇒ 幂等空操作）。
@@ -902,7 +1123,7 @@ pub fn persona_suggestions_payload() -> Result<Value, String> {
     Ok(serde_json::json!({
         "entries": persona_suggestions_list()?,
         "maxEntryChars": MAX_MEMORY_ENTRY_CHARS,
-        "maxTotalChars": MAX_MEMORY_CHARS,
+        "maxTotalChars": MEMORY_BODY_BUDGET_CHARS,
     }))
 }
 
@@ -1891,6 +2112,13 @@ pub fn run_stdio() {
 mod tests {
     use super::*;
 
+    /// 测试用固定日期（B1）：日期由宿主盖，写侧单测不依赖真实时钟。
+    const TEST_DATE: &str = "2026-10-17";
+
+    fn tagged(scope: MemoryScope, date: &str) -> Option<MemoryProvenance<'_>> {
+        Some(MemoryProvenance { scope, date })
+    }
+
     /// `resources/read` 的**安全边界**（A3，2026-09-20）。`uri` 是模型给的，而模型会被
     /// 读到的文件内容提示注入 ⇒ 「只能读 tools 目录内的 .json」这条必须由单测钉死，
     /// 否则一次改动就可能把任意文件读取能力悄悄放出去。
@@ -1961,21 +2189,38 @@ mod tests {
         // ① 文件不存在 ⇒ 读到空串（全新安装的正常情况，不是错误）
         assert_eq!(read_memory_at(&file).unwrap(), "");
 
-        // ② 追加两条 ⇒ 逐条成行，先写的在前
-        assert!(write_memory_at(&file, "用户偏好中文", false).is_ok());
-        assert!(write_memory_at(&file, "项目用 Rust", false).is_ok());
+        // ② 追加两条 ⇒ 逐条成行，先写的在前，每条都带宿主来源前缀（B1）
+        assert!(write_memory_at(&file, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(&file, "项目用 Rust", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
         let text = read_memory_at(&file).unwrap();
-        assert_eq!(text, "- 用户偏好中文\n- 项目用 Rust\n");
+        assert_eq!(
+            text,
+            "- [2026-10-17 · global] 用户偏好中文\n- [2026-10-17 · global] 项目用 Rust\n"
+        );
 
-        // ③ 同一条重写 ⇒ 不改文件（去重）
+        // ③ 同一条重写 ⇒ 不改文件（去重；同日期刷新是 no-op）
         let before = text.clone();
-        assert!(write_memory_at(&file, "用户偏好中文", false).unwrap().contains("already"));
+        assert!(write_memory_at(&file, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE))
+            .unwrap()
+            .contains("already"));
         assert_eq!(read_memory_at(&file).unwrap(), before, "重复条目不得写进去");
 
-        // ④ 空条目 / 超长单条 / 超长替换 ⇒ 拒绝（**不许静默截断**）
-        assert!(write_memory_at(&file, "   ", false).is_err());
-        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false).is_err());
-        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_CHARS + 1), true).is_err());
+        // ④ 空条目 / 超长单条 / 超正文额度替换 ⇒ 拒绝（**不许静默截断**）
+        assert!(write_memory_at(&file, "   ", false, tagged(MemoryScope::Global, TEST_DATE)).is_err());
+        assert!(write_memory_at(
+            &file,
+            &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1),
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_err());
+        assert!(write_memory_at(
+            &file,
+            &"x".repeat(MEMORY_BODY_BUDGET_CHARS + 1),
+            true,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_err());
 
         // ⑤ 写满再追加 ⇒ 报错（而不是悄悄丢掉旧条目）
         // 每条都不同 —— 相同的条目会被去重挡掉（③），那样这条测试就变成测去重了。
@@ -1983,7 +2228,7 @@ mod tests {
         let mut wrote = 0;
         loop {
             let entry = format!("{filler}{wrote}");
-            if write_memory_at(&file, &entry, false).is_err() {
+            if write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_err() {
                 break;
             }
             wrote += 1;
@@ -1991,12 +2236,38 @@ mod tests {
                 panic!("上限没有生效：一直写得进去");
             }
         }
-        assert!(read_memory_at(&file).unwrap().chars().count() <= MAX_MEMORY_CHARS);
+        let full = read_memory_at(&file).unwrap();
+        assert!(
+            memory_body_chars(&full) <= MEMORY_BODY_BUDGET_CHARS,
+            "正文必须 ≤ {MEMORY_BODY_BUDGET_CHARS}，实际 {}",
+            memory_body_chars(&full)
+        );
+        assert!(full.chars().count() <= MEMORY_TOTAL_HARD_CAP_CHARS);
         assert!(wrote > 0, "上限之前应当还能写进去几条");
 
-        // ⑥ replace 模式：整体替换，旧内容不再保留
-        assert!(write_memory_at(&file, "- 只剩这一条", true).is_ok());
-        assert_eq!(read_memory_at(&file).unwrap(), "- 只剩这一条\n");
+        // ⑥ replace 模式：整体替换，旧内容不再保留；无前缀 bullet 由宿主补前缀
+        assert!(write_memory_at(
+            &file,
+            "- 只剩这一条",
+            true,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert_eq!(read_memory_at(&file).unwrap(), "- [2026-10-17 · global] 只剩这一条\n");
+
+        // 模型自带的「假日期 / 假 scope」一律被宿主覆盖（日期只信宿主）。
+        assert!(write_memory_at(
+            &file,
+            "- [1999-01-01 · pet] 伪造日期",
+            true,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-17 · global] 伪造日期\n",
+            "replace 也由宿主重盖前缀"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2017,18 +2288,39 @@ mod tests {
         ));
         let file = dir.join("MEMORY.md");
 
-        // 裸 key 与键值对两条路径都要打码；多行那条还要保住「- 起头 + 续行缩进」的 bullet 形状
-        assert!(write_memory_at(&file, "用户提到 key sk-live-99887766", false).is_ok());
-        assert!(write_memory_at(&file, "偏好中文\n第二行：token=abcdef123456", false).is_ok());
+        // 裸 key 与键值对两条路径都要打码；多行那条还要保住「- 起头 + 续行缩进」的 bullet 形状。
+        // 前缀是落盘前才盖的 ⇒ 这里同时钉住「前缀不会绕过脱敏」。
+        assert!(write_memory_at(
+            &file,
+            "用户提到 key sk-live-99887766",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(write_memory_at(
+            &file,
+            "偏好中文\n第二行：token=abcdef123456",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
         let text = read_memory_at(&file).unwrap();
         assert!(!text.contains("99887766"), "裸 key 泄露：{text}");
         assert!(!text.contains("abcdef123456"), "键值对凭据泄露：{text}");
-        assert!(text.starts_with("- "), "首条仍须是 bullet：{text}");
+        assert!(text.starts_with("- [2026-10-17 · global] "), "首条仍须是带前缀的 bullet：{text}");
         assert!(text.contains("\n  "), "多行续行缩进被破坏了：{text}");
 
         // 普通内容逐字不变（不能被脱敏误伤）
-        assert!(write_memory_at(&file, "项目用 Rust 构建", false).is_ok());
-        assert!(read_memory_at(&file).unwrap().contains("- 项目用 Rust 构建"));
+        assert!(write_memory_at(
+            &file,
+            "项目用 Rust 构建",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(read_memory_at(&file)
+            .unwrap()
+            .contains("- [2026-10-17 · global] 项目用 Rust 构建"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2048,7 +2340,7 @@ mod tests {
         let file = dir.join("MEMORY.md");
 
         // 先写一条 ⇒ 再清空 ⇒ 读到空串（截断而非删除文件，路径保持不变）
-        assert!(write_memory_at(&file, "用户偏好中文", false).is_ok());
+        assert!(write_memory_at(&file, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
         assert!(!read_memory_at(&file).unwrap().is_empty());
         assert!(clear_memory_at(&file).is_ok());
         assert_eq!(read_memory_at(&file).unwrap(), "");
@@ -2088,13 +2380,13 @@ mod tests {
         let dir = tmp_memory_dir("memscope");
         let gfile = dir.join("MEMORY.md");
         let pfile = dir.join("pet").join("MEMORY.md");
-        assert!(write_memory_at(&gfile, "全局约定", false).is_ok());
-        assert!(write_memory_at(&pfile, "桌宠笔记", false).is_ok());
-        assert_eq!(read_memory_at(&gfile).unwrap(), "- 全局约定\n");
-        assert_eq!(read_memory_at(&pfile).unwrap(), "- 桌宠笔记\n");
+        assert!(write_memory_at(&gfile, "全局约定", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(&pfile, "桌宠笔记", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
+        assert_eq!(read_memory_at(&gfile).unwrap(), "- [2026-10-17 · global] 全局约定\n");
+        assert_eq!(read_memory_at(&pfile).unwrap(), "- [2026-10-17 · pet] 桌宠笔记\n");
 
         let g_before = read_memory_at(&gfile).unwrap();
-        assert!(write_memory_at(&pfile, "桌宠第二条", false).is_ok());
+        assert!(write_memory_at(&pfile, "桌宠第二条", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
         assert_eq!(read_memory_at(&gfile).unwrap(), g_before, "写桌宠私有不得影响全局注入");
         assert_eq!(list_memory_entries_at(&pfile).unwrap().len(), 2);
 
@@ -2112,23 +2404,390 @@ mod tests {
         assert!(MemoryScope::parse(Some("other")).is_err());
     }
 
+    /// B1（2026-10-17）：写入层给每条 bullet 盖 `- [YYYY-MM-DD · scope]` 前缀，日期取宿主本地
+    /// 日期；两个作用域各写各的文件、前缀里的 scope id 正确（互不串）。
+    #[test]
+    fn memory_entries_are_tagged_with_host_date_and_scope() {
+        let dir = tmp_memory_dir("memtag");
+        let gfile = dir.join("MEMORY.md");
+        let pfile = dir.join("pet").join("MEMORY.md");
+        assert!(write_memory_at(&gfile, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(&pfile, "桌宠喜欢被摸头", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
+        assert_eq!(read_memory_at(&gfile).unwrap(), "- [2026-10-17 · global] 用户偏好中文\n");
+        assert_eq!(read_memory_at(&pfile).unwrap(), "- [2026-10-17 · pet] 桌宠喜欢被摸头\n");
+        assert!(!read_memory_at(&gfile).unwrap().contains("摸头"), "全局文件不得混入桌宠条目");
+        assert!(!read_memory_at(&pfile).unwrap().contains("用户偏好"), "桌宠文件不得混入全局条目");
+
+        // 日期来自宿主本地时钟（Win32 GetLocalTime），必须是 10 位 ISO 形状。
+        let today = local_today();
+        let b = today.as_bytes();
+        assert_eq!(today.len(), 10, "日期必须 YYYY-MM-DD：{today}");
+        assert!(b[4] == b'-' && b[7] == b'-', "分隔符位置错：{today}");
+        assert!(
+            b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()),
+            "非法日期：{today}"
+        );
+        assert_eq!(
+            split_provenance_prefix(&format!("[{} · global] x", today)).map(|(_, body)| body),
+            Some("x")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B1 去重新语义：去掉 `[日期 · scope]` 后同正文 ⇒ **不追加**，只把该条日期刷新为本次
+    /// 写入日期（语义 = 最后确认时间），正文与条目数不变。
+    #[test]
+    fn memory_same_body_on_a_new_date_is_refreshed_not_duplicated() {
+        let dir = tmp_memory_dir("memrefresh");
+        let file = dir.join("MEMORY.md");
+        assert!(write_memory_at(
+            &file,
+            "User prefers TABS",
+            false,
+            tagged(MemoryScope::Global, "2026-10-16")
+        )
+        .is_ok());
+        let msg = write_memory_at(
+            &file,
+            "user prefers   tabs",
+            false,
+            tagged(MemoryScope::Global, "2026-10-17"),
+        )
+        .unwrap();
+        assert!(msg.contains("already"), "{msg}");
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-17 · global] User prefers TABS\n",
+            "只刷新日期：正文保持首次落盘的原文，条目数不变"
+        );
+        assert_eq!(list_memory_entries_at(&file).unwrap(), vec!["User prefers TABS".to_string()]);
+
+        // 再以更早的日期写入同一条 ⇒ 同样只刷新（最后确认时间可以变早，由写入顺序决定）。
+        assert!(write_memory_at(
+            &file,
+            "USER PREFERS TABS",
+            false,
+            tagged(MemoryScope::Global, "2026-10-15")
+        )
+        .unwrap()
+        .contains("already"));
+        assert_eq!(read_memory_at(&file).unwrap(), "- [2026-10-15 · global] User prefers TABS\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B1 老数据兼容：文件里已有的无前缀旧 bullet 照常可读；同正文再次写入时**原地补前缀**
+    /// （不是新增第二条），且**不批量回填**其他历史条目（它们没有可信的旧日期）。
+    #[test]
+    fn memory_legacy_untagged_entry_is_migrated_in_place_on_rewrite() {
+        let dir = tmp_memory_dir("memlegacy");
+        let file = dir.join("MEMORY.md");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, "- 用户偏好中文\n- 项目用 Rust\n").unwrap();
+
+        let msg = write_memory_at(
+            &file,
+            "  用户偏好中文 ",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap();
+        assert!(msg.contains("already"), "{msg}");
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-17 · global] 用户偏好中文\n- 项目用 Rust\n",
+            "只给被再次写入的那条补前缀：不新增、不批量回填"
+        );
+        assert_eq!(
+            list_memory_entries_at(&file).unwrap(),
+            vec!["用户偏好中文".to_string(), "项目用 Rust".to_string()],
+            "旧条目照常可读（列表不展示来源前缀）"
+        );
+
+        // 另一条老条目再次写入 ⇒ 同样原地补，文件里仍只有两条 bullet。
+        write_memory_at(
+            &file,
+            "项目用 Rust",
+            false,
+            tagged(MemoryScope::Global, "2026-10-18"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-17 · global] 用户偏好中文\n- [2026-10-18 · global] 项目用 Rust\n"
+        );
+        assert_eq!(split_entries(&read_memory_at(&file).unwrap()).len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B1：多行 bullet 的前缀只加在首行 `- ` 之后，续行缩进原样保留（新写入与旧条目迁移都是）。
+    #[test]
+    fn memory_multiline_bullets_keep_continuation_indent() {
+        let dir = tmp_memory_dir("memmulti");
+        let file = dir.join("MEMORY.md");
+        assert!(write_memory_at(
+            &file,
+            "第一行\n第二行\n第三行",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-17 · global] 第一行\n  第二行\n  第三行\n"
+        );
+
+        // 旧的无前缀多行条目 + 同正文写入 ⇒ 补前缀，续行缩进不动。
+        let legacy = dir.join("LEGACY.md");
+        fs::write(&legacy, "- 多行第一条\n  续行内容\n").unwrap();
+        assert!(write_memory_at(
+            &legacy,
+            "多行第一条\n续行内容",
+            false,
+            tagged(MemoryScope::Global, "2026-10-18")
+        )
+        .unwrap()
+        .contains("already"));
+        assert_eq!(
+            read_memory_at(&legacy).unwrap(),
+            "- [2026-10-18 · global] 多行第一条\n  续行内容\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B1：加前缀后各条硬闸仍按**最终落盘内容**生效（单条 2000 含前缀 / 正文额度 6000 /
+    /// 总长硬顶 9000），超限报错、不静默截断、不落盘。
+    ///
+    /// 2026-10-17 动态上限口径：整文件闸从「文件总长 6000」改为「正文合计 6000」
+    /// （前缀不计入，另受总长 9000 硬顶约束）⇒ 本测试的整文件断言同步改口径。
+    #[test]
+    fn memory_caps_still_apply_after_tagging() {
+        let dir = tmp_memory_dir("memcap");
+        let file = dir.join("MEMORY.md");
+        let prefix = provenance_prefix(MemoryScope::Global, TEST_DATE);
+        let overhead = "- ".chars().count() + prefix.chars().count() + 1;
+        let fit = "a".repeat(MAX_MEMORY_ENTRY_CHARS - overhead);
+        assert!(
+            write_memory_at(&file, &fit, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok(),
+            "恰好 2000 字符（含前缀）应写进去"
+        );
+        assert_eq!(
+            read_memory_at(&file).unwrap().trim_end().chars().count(),
+            MAX_MEMORY_ENTRY_CHARS,
+            "单条上限必须按最终落盘内容（含 - 与来源前缀）计算"
+        );
+
+        let over = "b".repeat(MAX_MEMORY_ENTRY_CHARS - overhead + 1);
+        assert!(
+            write_memory_at(&file, &over, false, tagged(MemoryScope::Global, TEST_DATE)).is_err(),
+            "加前缀后超 2000 必须拒绝"
+        );
+
+        // 正文额度：清空后反复追加，正文合计绝不越过 6000；越线那次报错且不落盘。
+        assert!(clear_memory_at(&file).is_ok());
+        let big = "c".repeat(400);
+        let mut i = 0;
+        loop {
+            let entry = format!("{big}{i}");
+            if let Err(e) = write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)) {
+                assert!(e.contains("正文额度"), "400 字条目应先撞正文额度：{e}");
+                break;
+            }
+            i += 1;
+            assert!(i < 100, "总量上限没生效：一直写得进去");
+        }
+        let full = read_memory_at(&file).unwrap();
+        assert!(
+            memory_body_chars(&full) <= MEMORY_BODY_BUDGET_CHARS,
+            "正文合计必须 ≤ {MEMORY_BODY_BUDGET_CHARS}，实际 {}",
+            memory_body_chars(&full)
+        );
+        assert!(
+            full.chars().count() <= MEMORY_TOTAL_HARD_CAP_CHARS,
+            "文件总长必须 ≤ {MEMORY_TOTAL_HARD_CAP_CHARS}，实际 {}",
+            full.chars().count()
+        );
+        assert!(
+            write_memory_at(&file, &format!("{big}{i}"), false, tagged(MemoryScope::Global, TEST_DATE)).is_err()
+        );
+        assert_eq!(read_memory_at(&file).unwrap(), full, "超限不得落盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ① 动态上限的正面语义：正文合计 6000（前缀不计入）⇒ 允许写入，哪怕文件总长已超 6000。
+    #[test]
+    fn memory_body_budget_excludes_provenance_prefix() {
+        let dir = tmp_memory_dir("membudget");
+        let file = dir.join("MEMORY.md");
+        // 50 条 × 120 字 = 6000 正文；每条前缀 + "- " + 换行约 25 字 ⇒ 总长 7000+。
+        for i in 0..50 {
+            let entry = format!("{i:03}{}", "a".repeat(117));
+            assert_eq!(entry.chars().count(), 120);
+            assert!(
+                write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok(),
+                "正文未超额（第 {i} 条）不应因前缀被拒"
+            );
+        }
+        let full = read_memory_at(&file).unwrap();
+        assert_eq!(memory_body_chars(&full), MEMORY_BODY_BUDGET_CHARS);
+        assert!(
+            full.chars().count() > MEMORY_BODY_BUDGET_CHARS && full.chars().count() > 7_000,
+            "前缀不计入正文，文件总长应超过 7000：实际 {}",
+            full.chars().count()
+        );
+        assert!(full.chars().count() <= MEMORY_TOTAL_HARD_CAP_CHARS);
+        assert_eq!(list_memory_entries_at(&file).unwrap().len(), 50);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ② 正文额度超 1 字符 ⇒ 拒，且错误语义 = 正文额度（不是总长硬顶）。
+    #[test]
+    fn memory_body_budget_overflow_is_rejected_with_body_semantics() {
+        let dir = tmp_memory_dir("membodyover");
+        let file = dir.join("MEMORY.md");
+        // 3 × 1900 = 5700；再来一条 301 ⇒ 正文 6001（单条均未超 2000）。
+        for i in 0..3 {
+            let entry = format!("{i}{}", "d".repeat(1899));
+            assert!(write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        }
+        let before = read_memory_at(&file).unwrap();
+        let err = write_memory_at(
+            &file,
+            &format!("{}e", "d".repeat(300)),
+            false,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap_err();
+        assert!(err.contains("正文额度"), "应报正文额度：{err}");
+        assert!(!err.contains("总长度硬顶"), "正文先超时不应报总长：{err}");
+        assert_eq!(read_memory_at(&file).unwrap(), before, "超正文额度不得落盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ③ 正文未满 6000，但条目极多导致前缀把文件顶过 9000 ⇒ 拒，语义 = 总长度硬顶。
+    #[test]
+    fn memory_total_hard_cap_rejects_prefix_heavy_file() {
+        let dir = tmp_memory_dir("memtotalcap");
+        let file = dir.join("MEMORY.md");
+        // 每条正文 20 字、落盘一行 45 字（前缀 21 + "- " 2 + 空格 1 + 换行 1）。
+        // 200 条 ⇒ 总长恰 9000；第 201 条把总量顶到 9045（正文仍只有 4020）。
+        let mut wrote = 0usize;
+        loop {
+            let entry = format!("t{wrote:019}");
+            assert_eq!(entry.chars().count(), 20);
+            match write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)) {
+                Ok(_) => {
+                    wrote += 1;
+                    assert!(wrote <= 200, "9000 硬顶没生效：第 {wrote} 条仍写进去了");
+                }
+                Err(e) => {
+                    assert!(e.contains("总长度硬顶"), "应报总长度硬顶：{e}");
+                    assert!(!e.contains("正文额度"), "正文未满时不应报正文额度：{e}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(wrote, 200);
+        let full = read_memory_at(&file).unwrap();
+        assert_eq!(full.chars().count(), MEMORY_TOTAL_HARD_CAP_CHARS);
+        assert!(memory_body_chars(&full) < MEMORY_BODY_BUDGET_CHARS, "正文应仍有余量");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ④ `replace: true` 同样受两口径约束：正文超额先报正文额度；条目前缀把总长顶过 9000
+    /// 则报总长度硬顶（正文未满也不放行）。
+    #[test]
+    fn memory_replace_obeys_both_budgets() {
+        let dir = tmp_memory_dir("memreplace");
+        let file = dir.join("MEMORY.md");
+
+        // 正文超额：4 × 2000 = 8000 正文，总长约 8100（未过 9000）⇒ 必须报正文额度。
+        let body_over: Vec<String> = (0..4).map(|i| format!("- {i}{}", "r".repeat(1999))).collect();
+        let err = write_memory_at(
+            &file,
+            &body_over.join("\n"),
+            true,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap_err();
+        assert!(err.contains("正文额度"), "replace 正文超额应报正文额度：{err}");
+        assert!(!file.exists(), "拒绝时不得落盘");
+
+        // 总长超额：300 条 × 11 字正文 = 3300 正文；落盘每行 36 字 ⇒ 总长 10800 ⇒ 报总长硬顶。
+        let too_many: Vec<String> = (0..300).map(|i| format!("- e{i:03}{}", "x".repeat(7))).collect();
+        let err = write_memory_at(
+            &file,
+            &too_many.join("\n"),
+            true,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap_err();
+        assert!(err.contains("总长度硬顶"), "replace 前缀过多应报总长硬顶：{err}");
+        assert!(!err.contains("正文额度"), "正文未满时不应报正文额度：{err}");
+        assert!(!file.exists(), "拒绝时不得落盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ⑤ 两口径按 **mask_secrets 之后**的内容判定（不是入参原文）。
+    /// · 脱敏变短：原文正文 6100+ 会超额，脱敏后只剩十几个字 ⇒ 应允许写入；
+    /// · 脱敏变长：原文正文恰 6000，脱敏后 6001 ⇒ 应报正文额度（按原文判会误放行）。
+    #[test]
+    fn memory_budgets_are_judged_after_masking() {
+        let dir = tmp_memory_dir("memmaskbudget");
+
+        // 变短：裸 key 的整段值被打成 sk-***。
+        let shrink_file = dir.join("SHRINK.md");
+        let long_secret = format!("偏好中文 sk-{}", "z".repeat(6_100));
+        assert!(
+            write_memory_at(&shrink_file, &long_secret, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok(),
+            "脱敏后已低于正文额度，不得按原文拒绝"
+        );
+        let shrunk = read_memory_at(&shrink_file).unwrap();
+        assert!(shrunk.contains("sk-***"), "脱敏未生效：{shrunk}");
+        assert!(memory_body_chars(&shrunk) < MEMORY_BODY_BUDGET_CHARS);
+
+        // 变长：3 × 1900 + (296 + sk-a) = 6000；sk-a → sk-*** 后为 6001。
+        let grow_file = dir.join("GROW.md");
+        for i in 0..3 {
+            let entry = format!("{i}{}", "g".repeat(1899));
+            assert!(write_memory_at(&grow_file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        }
+        assert_eq!(memory_body_chars(&read_memory_at(&grow_file).unwrap()), 5700);
+        let before = read_memory_at(&grow_file).unwrap();
+        let tail = format!("{}sk-a", "g".repeat(296));
+        assert_eq!(tail.chars().count(), 300);
+        let err = write_memory_at(&grow_file, &tail, false, tagged(MemoryScope::Global, TEST_DATE)).unwrap_err();
+        assert!(err.contains("正文额度"), "脱敏后正文 6001 应报正文额度：{err}");
+        assert_eq!(read_memory_at(&grow_file).unwrap(), before, "超限不得落盘");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 去重按**归一**判据（折叠空白 + 大小写不敏感）：只差空格 / 大小写的同一条不得重复落盘。
     /// 归一判据与逐条删共用 ⇒ 「列出来的那条一定删得掉」。
     #[test]
     fn memory_dedupes_on_normalized_entry() {
         let dir = tmp_memory_dir("memnorm");
         let file = dir.join("MEMORY.md");
-        assert!(write_memory_at(&file, "User prefers   TABS", false).is_ok());
+        assert!(write_memory_at(&file, "User prefers   TABS", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
         // 只差内部多余空格 ⇒ 视为同一条
-        assert!(write_memory_at(&file, "User prefers TABS", false)
+        assert!(write_memory_at(&file, "User prefers TABS", false, tagged(MemoryScope::Global, TEST_DATE))
             .unwrap()
             .contains("already"));
         // 只差大小写 ⇒ 视为同一条
-        assert!(write_memory_at(&file, "user prefers tabs", false)
+        assert!(write_memory_at(&file, "user prefers tabs", false, tagged(MemoryScope::Global, TEST_DATE))
             .unwrap()
             .contains("already"));
         // 内容确实不同 ⇒ 不是重复，要落盘
-        assert!(!write_memory_at(&file, "User prefers spaces", false)
+        assert!(!write_memory_at(&file, "User prefers spaces", false, tagged(MemoryScope::Global, TEST_DATE))
             .unwrap()
             .contains("already"));
         assert_eq!(list_memory_entries_at(&file).unwrap().len(), 2);
@@ -2142,9 +2801,9 @@ mod tests {
     fn memory_delete_removes_one_entry_only() {
         let dir = tmp_memory_dir("memdel");
         let file = dir.join("MEMORY.md");
-        assert!(write_memory_at(&file, "条目A", false).is_ok());
-        assert!(write_memory_at(&file, "条目B", false).is_ok());
-        assert!(write_memory_at(&file, "多行第一条\n续行内容", false).is_ok());
+        assert!(write_memory_at(&file, "条目A", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(&file, "条目B", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(&file, "多行第一条\n续行内容", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
         assert_eq!(list_memory_entries_at(&file).unwrap().len(), 3);
 
         // 删 A（归一匹配：大小写差异也认）—— B 与多行条目必须原样在
@@ -2155,7 +2814,7 @@ mod tests {
             "只该删掉 A"
         );
         let text = read_memory_at(&file).unwrap();
-        assert!(text.contains("- 条目B"));
+        assert!(text.contains("] 条目B"), "文件里条目 B 应带前缀：{text}");
         assert!(!text.contains("条目A"));
 
         // 找不到 / 空 needle ⇒ 报错，不谎报成功
@@ -2206,22 +2865,22 @@ mod tests {
         let file = dir.join("GROWTH.md");
 
         // ① 只追加：先写一条，再写另一条 —— 前一条必须原样在（不覆盖）
-        assert!(write_memory_at(&file, "说话可以更简短一点", false).is_ok());
-        assert!(write_memory_at(&file, "被夸时轻轻晃一下就好", false).is_ok());
+        assert!(write_memory_at(&file, "说话可以更简短一点", false, None).is_ok());
+        assert!(write_memory_at(&file, "被夸时轻轻晃一下就好", false, None).is_ok());
         assert_eq!(
             list_memory_entries_at(&file).unwrap(),
             vec!["说话可以更简短一点".to_string(), "被夸时轻轻晃一下就好".to_string()]
         );
 
         // ② 归一去重：只差空白 / 大小写视为同一条，不重复落盘
-        assert!(write_memory_at(&file, "  说话可以更简短一点  ", false)
+        assert!(write_memory_at(&file, "  说话可以更简短一点  ", false, None)
             .unwrap()
             .contains("already"));
         assert_eq!(list_memory_entries_at(&file).unwrap().len(), 2);
 
         // ③ 单条超限 ⇒ 报错、不落盘（不静默截断）
         let before = read_memory_at(&file).unwrap();
-        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false).is_err());
+        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false, None).is_err());
         assert_eq!(read_memory_at(&file).unwrap(), before, "超限不得落盘");
 
         // ④ 逐条删：删 A 不动 B
@@ -2234,13 +2893,14 @@ mod tests {
         // ⑤ 总量超限 ⇒ 报错、不落盘（把文件顶到接近上限再追加）
         let big = "y".repeat(1_900);
         let mut i = 0;
-        while write_memory_at(&file, &format!("{big}{i}"), false).is_ok() {
+        while write_memory_at(&file, &format!("{big}{i}"), false, None).is_ok() {
             i += 1;
             assert!(i < 20, "总量上限没生效：一直写得进去");
         }
         let full = read_memory_at(&file).unwrap();
-        assert!(full.chars().count() <= MAX_MEMORY_CHARS);
-        assert!(write_memory_at(&file, &format!("{big}{i}"), false).is_err(), "总量超限必须报错");
+        assert!(memory_body_chars(&full) <= MEMORY_BODY_BUDGET_CHARS);
+        assert!(full.chars().count() <= MEMORY_TOTAL_HARD_CAP_CHARS);
+        assert!(write_memory_at(&file, &format!("{big}{i}"), false, None).is_err(), "总量超限必须报错");
         assert_eq!(read_memory_at(&file).unwrap(), full, "总量超限不得落盘");
 
         let _ = fs::remove_dir_all(&dir);
@@ -2281,8 +2941,8 @@ mod tests {
         assert!(merge_persona_suggestion_at("凭空一段", &persona, &sug).is_err());
 
         // 在册建议 ⇒ 合并成功：人格追加该段、建议从建议区摘掉
-        assert!(write_memory_at(&persona, "你是桌面宠物。", true).is_ok());
-        assert!(write_memory_at(&sug, "说话时可以偶尔用一点点俏皮话", false).is_ok());
+        assert!(write_memory_at(&persona, "你是桌面宠物。", true, None).is_ok());
+        assert!(write_memory_at(&sug, "说话时可以偶尔用一点点俏皮话", false, None).is_ok());
         assert!(merge_persona_suggestion_at("说话时可以偶尔用一点点俏皮话", &persona, &sug).is_ok());
         let p = read_memory_at(&persona).unwrap();
         assert!(p.contains("你是桌面宠物。") && p.contains("说话时可以偶尔用一点点俏皮话"));
@@ -2291,7 +2951,7 @@ mod tests {
         // 长度上限：合并后超 `MAX_PERSONA_CHARS` ⇒ 报错，**人格与建议区都不动**（先校验后写）
         fs::create_dir_all(&dir).unwrap();
         fs::write(&persona, "x".repeat(crate::storage::MAX_PERSONA_CHARS)).unwrap();
-        assert!(write_memory_at(&sug, "再补一句俏皮话", false).is_ok());
+        assert!(write_memory_at(&sug, "再补一句俏皮话", false, None).is_ok());
         let before = read_memory_at(&persona).unwrap();
         let err = merge_persona_suggestion_at("再补一句俏皮话", &persona, &sug).unwrap_err();
         assert!(err.contains("上限") || err.contains("过长"), "应报长度上限：{err}");
@@ -2316,11 +2976,11 @@ mod tests {
         let sug = dir.join("PERSONA_SUGGESTIONS.md");
 
         // 四份都先有内容
-        assert!(write_memory_at(&persona, "你是桌面宠物。", true).is_ok());
-        assert!(write_memory_at(&mem, "用户喜欢简洁", false).is_ok());
-        assert!(write_memory_at(&growth, "说话可以更简短一点", false).is_ok());
-        assert!(write_memory_at(&sug, "可以偶尔用点俏皮话", false).is_ok());
-        assert!(write_memory_at(&sug, "被夸时轻轻晃一下", false).is_ok());
+        assert!(write_memory_at(&persona, "你是桌面宠物。", true, None).is_ok());
+        assert!(write_memory_at(&mem, "用户喜欢简洁", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
+        assert!(write_memory_at(&growth, "说话可以更简短一点", false, None).is_ok());
+        assert!(write_memory_at(&sug, "可以偶尔用点俏皮话", false, None).is_ok());
+        assert!(write_memory_at(&sug, "被夸时轻轻晃一下", false, None).is_ok());
         assert_eq!(list_memory_entries_at(&sug).unwrap().len(), 2);
 
         let persona_before = read_memory_at(&persona).unwrap();

@@ -339,7 +339,7 @@ pub fn write_blocked(ctx: &Ctx, what: &str) -> Option<String> {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 二十四个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 二十五个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -625,6 +625,36 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "MemorySearch",
+            "description": "Search the user's OWN long-term memory (a small local file of durable \
+                facts: stated preferences, project conventions, environment setup, decisions) and \
+                return matching entries with their scope and match score. Use it when the user \
+                refers to something you should already know, or when the long-term memory shown \
+                in your context may be incomplete (it is only a capped snapshot). Only the \
+                entries you search for are returned — nothing is added to your context \
+                automatically. Read-only and local: it never writes memory and never touches \
+                the network.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to look for. Chinese substrings work; English is case-insensitive. Multiple space-separated words match ANY of them and rank by how many matched."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "pet", "all"],
+                        "description": "Which memory to search: global = the user's long-term memory; pet = the desktop pet's private notes; all (default) = both."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum matching entries to return (default 10, max 30)"
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
             "name": "Agent",
             "description": "Launch a subagent: an isolated assistant instance with its OWN \
                 context window that works on ONE self-contained task using the same tools, \
@@ -824,17 +854,19 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 
 /// **必须走 MCP 桥**才能跑的工具名（A3/A4，2026-09-20）。
 ///
-/// 四件里只有 `SessionSearch` 在 `defs()` 恒返回的那张表里（内置一等公民，桥没接通时
-/// 调用会**如实报错**而不是编造结果）；另外三件都由 `main.rs` **条件注册** ——
-/// resources 读侧要「桥真的接上了用户工具」才追加，`Remember` 要「桥接通了」才追加。
+/// 四件里只有 `SessionSearch` / `MemorySearch` 在 `defs()` 恒返回的那张表里（内置一等公民，
+/// 桥没接通时调用会**如实报错 / 回空结果**而不是编造结果）；另外三件都由 `main.rs`
+/// **条件注册** —— resources 读侧要「桥真的接上了用户工具」才追加，`Remember` 要「桥接通了」才追加。
 ///
 /// 集中在一处是为了三件事**不会各写各的**：
 ///   ① `dispatch_tool` 的「无桥就早退」（给模型的错误文案要一致）；
 ///   ② `subagent_tool_defs()` 要把它们剔掉（子代理不接桥 ⇒ 留着就是保证失败）；
 ///   ③ 启动时的条件注册。
 /// **新增这类工具只改这个数组**，别在三处分别硬编码字符串。
-pub const BRIDGE_TOOLS: [&str; 8] = [
+pub const BRIDGE_TOOLS: [&str; 9] = [
     "SessionSearch",
+    // 长期记忆的只读检索（§待办 3-9 B 项，2026-10-17）：走 `lunac/memory_read`，只读。
+    "MemorySearch",
     "ListMcpResourcesTool",
     "ReadMcpResourceTool",
     "ListMcpPromptsTool",
@@ -1041,9 +1073,9 @@ pub fn get_prompt_tool() -> Value {
 /// `TodoWrite` **不问**：它只改前端那块待办面板，不碰本机任何东西。
 /// `PetControl` **不问**（2026-10-10）：它只让桌宠形象动一下（前端收到 `tool_use` 后广播给
 /// 桌宠窗），agent 侧无任何本机副作用 —— 与 `TodoWrite` 同一条判据。
-/// 走桥的只读工具（`SessionSearch` / resources 读侧 / prompts 读侧）**也不问** —— 它们只读
-/// 本机自己的数据（会话库 / 用户写的工具定义与提示词模板），与 `Read`/`Grep` 同级；
-/// **不构成先例**：判据仍是「执行会不会改变本机或把数据带出」。
+/// 走桥的只读工具（`SessionSearch` / `MemorySearch` / resources 读侧 / prompts 读侧）**也不问**
+/// —— 它们只读本机自己的数据（会话库 / 长期记忆 / 用户写的工具定义与提示词模板），
+/// 与 `Read`/`Grep` 同级；**不构成先例**：判据仍是「执行会不会改变本机或把数据带出」。
 ///
 /// `plan` 档下的例外见 [`gated_in_read_only`]。
 pub fn needs_approval(name: &str) -> bool {
@@ -1146,7 +1178,8 @@ pub fn gated_in_read_only(name: &str) -> bool {
 ///   · MCP 工具 —— 副作用未知，且共用一条 stdio JSON-RPC 通道
 ///   · `SessionSearch` —— **只读，但同样串行**：它也走那条 stdio 通道
 ///     （`Bridge::request` 是单线程「发一条、按 id 等一条」，并发只会互相排队甚至错配）。
-///     同理还有 resources / prompts 读侧的 `ListMcpResourcesTool` / `ReadMcpResourceTool`
+///     同理还有 `MemorySearch`（长期记忆检索）与 resources / prompts 读侧的
+///     `ListMcpResourcesTool` / `ReadMcpResourceTool`
 ///     / `ListMcpPromptsTool` / `GetMcpPromptTool` 与写入侧的 `Remember`
 ///     —— **判据是「要不要走桥」，不是「是不是只读」**（见 [`BRIDGE_TOOLS`]）。
 ///   · `AskUserQuestion` —— 要等人回答，并发弹问没有意义
@@ -4350,15 +4383,26 @@ mod tests {
                 && names(&all).contains(&"PushNotification".to_string()),
             "SendUserFile / PushNotification（agent→用户呈递，2026-10-11）必须在内置工具表里"
         );
+        assert!(
+            names(&all).contains(&"MemorySearch".to_string()),
+            "MemorySearch（长期记忆只读检索，2026-10-17）必须在内置工具表里"
+        );
         assert_eq!(
-            total, 24,
-            "内置工具应为 24 件（23 件 + RepoMap，2026-10-14）"
+            total, 25,
+            "内置工具应为 25 件（24 件 + MemorySearch，2026-10-17）"
         );
 
         let cut = defs(&["Agent".to_string()]);
         assert!(
             !names(&cut).contains(&"Agent".to_string()),
             "disallowed 必须能裁掉 Agent"
+        );
+        assert_eq!(cut.len(), total - 1);
+        // MemorySearch 也走同一条过滤（§待办 3-9 B 项：必须可被 --disallowedTools 裁掉）。
+        let cut = defs(&["MemorySearch".to_string()]);
+        assert!(
+            !names(&cut).contains(&"MemorySearch".to_string()),
+            "disallowed 必须能裁掉 MemorySearch"
         );
         assert_eq!(cut.len(), total - 1);
     }
@@ -5119,9 +5163,14 @@ mod tests {
             assert!(t.get("description").and_then(Value::as_str).is_some(), "缺 description");
             assert!(t.get("input_schema").map_or(false, Value::is_object), "缺 input_schema");
         }
-        // `SessionSearch` 是「走桥但在 defs() 里」的那一个 —— 两边都要成立
+        // `SessionSearch` / `MemorySearch` 是「走桥但在 defs() 里」的两个 —— 两边都要成立
         assert!(names(&all).contains(&"SessionSearch".to_string()));
         assert!(needs_bridge("SessionSearch"));
+        assert!(names(&all).contains(&"MemorySearch".to_string()));
+        assert!(needs_bridge("MemorySearch"));
+        assert!(!needs_approval("MemorySearch"), "MemorySearch 只读长期记忆，与 Read 同级");
+        assert!(!gated_in_read_only("MemorySearch"), "只读档放行（同 SessionSearch）");
+        assert!(!parallel_safe("MemorySearch"), "走单线程 stdio 桥，必须串行");
         // 反向：普通内置工具不得被误判成走桥
         assert!(!needs_bridge("Read") && !needs_bridge("Agent"));
     }
@@ -5198,6 +5247,7 @@ mod tests {
             BRIDGE_TOOLS,
             [
                 "SessionSearch",
+                "MemorySearch",
                 "ListMcpResourcesTool",
                 "ReadMcpResourceTool",
                 "ListMcpPromptsTool",

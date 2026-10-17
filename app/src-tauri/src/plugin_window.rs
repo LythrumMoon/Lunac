@@ -169,6 +169,25 @@ const MUSIC_H: f64 = 720.0;
 const CHAT_WINDOW_ID: &str = "chat";
 const CHAT_W: f64 = 1280.0;
 const CHAT_H: f64 = 720.0;
+
+/// 桌宠**模型窗**的窗口 id（`plugin-pet`）。桌宠**设置窗**是带 key 的附属窗
+/// （`plugin-pet-settings`）—— 两者只差一个后缀，见 `default_always_on_top()`。
+const PET_WINDOW_ID: &str = "pet";
+
+/// **独立窗口默认是否置顶的唯一真相源**（`docs/forbidden.md` §禁用 62）。
+///
+/// 只有桌宠**模型窗**（`pet`）默认置顶：那扇窗里就是桌面形象本身，沉到别的窗口后面
+/// 等于「点不到地消失」。其余独立窗 —— 插件窗、聊天独立窗（`chat`）、桌宠**设置窗**
+/// （`pet-settings`）、音乐曲线窗（`music-curve`）等 —— 默认**不置顶**。
+///
+/// 入参是 `open()` 里的**合成 id**（`<插件 id>` 或 `<插件 id>-<key>`）：桌宠设置窗
+/// 正是靠 `pet` / `pet-settings` 这一字之差与模型窗区分开的。
+///
+/// 清单 `window.alwaysOnTop` 显式写值时**优先于它**（见 `open()`）；这里只管「没写」。
+fn default_always_on_top(win_id: &str) -> bool {
+    win_id == PET_WINDOW_ID
+}
+
 /// 聊天下限。比通用那档（300×200）高得多：这条界面有输入栏 + 历史抽屉 + 工具卡，
 /// 缩到 300 宽会直接散架（同 settings 不进可悬浮清单的理由）。
 const CHAT_MIN_W: f64 = 720.0;
@@ -462,9 +481,15 @@ pub fn open(
         .transparent(true)
         .shadow(false)
         // 下面三项**可被清单的 `window` 段覆盖**（桌宠要：禁缩放 + 不进任务栏）。
-        // 括号里的值是「没声明时」的历史行为 —— 别随手改。
+        // 括号里的值是「没声明时」的缺省 —— 别随手改。置顶的缺省**不在这里写死**：
+        // 统一问 `default_always_on_top()`（只有桌宠模型窗默认置顶）。
         .resizable(shape.as_ref().map_or(true, |s| s.resizable))
-        .always_on_top(shape.as_ref().map_or(true, |s| s.always_on_top))
+        .always_on_top(
+            shape
+                .as_ref()
+                .and_then(|s| s.always_on_top)
+                .unwrap_or_else(|| default_always_on_top(&win_id)),
+        )
         .skip_taskbar(shape.as_ref().is_some_and(|s| s.skip_taskbar))
         .visible(!hidden)
         .build()
@@ -602,8 +627,8 @@ pub fn plugin_window_minimize(window: WebviewWindow) -> Result<(), String> {
     window.minimize().map_err(|e| format!("最小化插件窗口失败：{e}"))
 }
 
-/// 当前置顶状态。前端拿它初始化按钮的按下态 —— 建窗时就是 `always_on_top(true)`，
-/// 所以按钮初始必须是「已置顶」，不能靠前端猜。
+/// 当前置顶状态。前端拿它初始化按钮的按下态 —— 建窗时的初值由
+/// `default_always_on_top()`（或清单显式值）决定，前端不许自己猜。
 #[tauri::command]
 pub fn plugin_window_pin_state(window: WebviewWindow) -> Result<bool, String> {
     window
@@ -852,7 +877,7 @@ mod tests {
             min_height: 160.0,
             resizable: false,
             skip_taskbar: true,
-            always_on_top: true,
+            always_on_top: None,
             chrome: false,
         }
     }
@@ -997,5 +1022,38 @@ mod tests {
             let bottom_after = f64::from(moved) + new * s;
             assert!((bottom_before - bottom_after).abs() < 1.0, "下沿必须不动：{bottom_before} vs {bottom_after}");
         }
+    }
+
+    /// 默认置顶的唯一真相源（2026-10-17）：**只有桌宠模型窗**默认置顶。
+    #[test]
+    fn only_the_pet_model_window_is_always_on_top_by_default() {
+        // 桌宠模型窗（label `plugin-pet`，合成 id `pet`）—— 唯一例外
+        assert!(default_always_on_top("pet"));
+        // 桌宠**设置窗**（label `plugin-pet-settings`，合成 id `pet-settings`）：默认关闭
+        assert!(!default_always_on_top("pet-settings"));
+        // 其它独立窗一律默认关闭
+        for id in [
+            "chat",
+            "music",
+            "music-curve",
+            "memo",
+            "clipboard-history",
+            "ocr",
+            "convert",
+        ] {
+            assert!(!default_always_on_top(id), "{id} 默认必须不置顶");
+        }
+    }
+
+    /// 清单显式 `alwaysOnTop` 优先于默认；未声明 ⇒ `None`（交给 `default_always_on_top`）。
+    #[test]
+    fn manifest_always_on_top_overrides_the_default() {
+        // 未声明（`pet_shape()` 就是桌宠那份清单的写法，没写 alwaysOnTop）
+        assert_eq!(pet_shape().always_on_top, None);
+        // 只覆盖置顶这一项，其余形态不动
+        let off = PluginWindowShape { always_on_top: Some(false), ..pet_shape() };
+        assert_eq!(off.always_on_top, Some(false));
+        let on = PluginWindowShape { always_on_top: Some(true), ..pet_shape() };
+        assert_eq!(on.always_on_top, Some(true));
     }
 }
