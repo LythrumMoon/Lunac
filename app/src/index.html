@@ -415,21 +415,15 @@
               </div>
                 </div>
                 <div class="chat-more-page" data-more-page="persona" hidden>
-              <!-- 人格预设（2026-10-16）：按钮在人格编辑区**上方**；点开在**本页内联**展开预设列表
-                   （不新开页面 / 不新开 tab）。列表存 localStorage（lunac-persona-presets），
-                   点某条 = 切换（把该预设文本写进人格框，走既有 savePersona 生效链路）。 -->
+              <!-- 人格（2026-10-17 按新稿重做）：三行结构 = 预设 / 人格 / 编辑区。
+                   ① 预设行：标签 + 预设按钮排（点按钮 = 切换应用该预设，正在应用的按钮高亮）；
+                   ② 人格行：标签 + 「编辑」按钮（开合下方编辑区）；
+                   ③ 编辑区：textarea（#chat-persona-text）+ 保存 / 恢复内置 / 重启。
+                   「保存」→ 弹框输入人格名，确认后**一次**完成「写 persona.md + 存为该预设」。
+                   预设存 localStorage（lunac-persona-presets / lunac-persona-active）。 -->
               <div class="chat-more-row">
-                <div class="chat-more-actions">
-                  <button id="chat-persona-preset-toggle" type="button"></button>
-                </div>
-              </div>
-              <div id="chat-persona-preset-panel" class="chat-persona-preset-panel hidden">
+                <span class="chat-more-label" id="chat-persona-preset-label"></span>
                 <div id="chat-persona-preset-list" class="chat-persona-preset-list"></div>
-                <div class="chat-more-actions">
-                  <button id="chat-persona-preset-add" type="button"></button>
-                </div>
-                <!-- 预设的可见反馈（保存成功 / 切换后「重启 AI 后生效」）：复用 .chat-persona-msg 的次要文字样式 -->
-                <span id="chat-persona-preset-msg" class="chat-persona-msg"></span>
               </div>
               <!-- 人格 / 自定义提示词（L2，2026-09-21 从设置面板搬进「更多设置」）：
                    进阶用户才会改的一段固定文本，不占设置面板；描述压成一句。 -->

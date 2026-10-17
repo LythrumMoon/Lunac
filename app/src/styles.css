@@ -5092,29 +5092,26 @@ input[type="number"]::-webkit-inner-spin-button {
   color: var(--text-dim);
 }
 
-/* ── 人格预设（2026-10-16，内嵌在「更多设置」人格页）────────────────
-   按钮在人格编辑区上方；点开在本页内联展开列表（不新开页 / tab）。列表底 / 描边 / 圆角
-   与同页小按钮同源，颜色全走既有变量（不自造色值）。滚动走 §界面 6 那条唯一全局规则。 */
-.chat-persona-preset-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 6px;
-}
+/* ── 人格预设（2026-10-17 新稿：人格页第一行）────────────────────────
+   行结构 = 「预设」标签 + 右侧一排预设按钮（不是列表 / 不另开页）；正在应用的按钮
+   高亮（名 + 文本双判）。空态给一行次要文字。颜色全走既有变量。 */
 .chat-persona-preset-list {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  max-height: 160px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
 }
 .chat-persona-preset-item {
-  text-align: left;
-  padding: 4px 8px;
-  font-size: 0.7rem;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 9px;
+  font-size: 0.68rem;
   border-radius: 6px;
-  border: 1px solid transparent;
+  border: 1px solid var(--border-glass);
   background: rgba(var(--ink-rgb), 0.06);
   color: var(--text);
   cursor: pointer;
@@ -5128,7 +5125,6 @@ input[type="number"]::-webkit-inner-spin-button {
   border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
 .chat-persona-preset-empty {
-  padding: 4px 8px;
   font-size: 0.68rem;
   color: var(--text-dim);
 }
@@ -5184,7 +5180,7 @@ input[type="number"]::-webkit-inner-spin-button {
 .chat-modal-input:focus {
   border-color: rgba(var(--btn-line-rgb), var(--btn-line-alpha));
 }
-/* 弹框内的校验提示（空名 / 重名）：与语义红同源 */
+/* 弹框内的校验提示（空名 / 超长）：与语义红同源 */
 .chat-modal-msg {
   min-height: 0.9em;
   font-size: 0.68rem;

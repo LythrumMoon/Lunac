@@ -219,13 +219,9 @@ const chatPersonaRestart = el("chat-persona-restart") as HTMLButtonElement;
 const chatDebugPhaseLabel = el("chat-debugphase-label");
 const chatDebugPhaseSeg = el("chat-debugphase-seg");
 const chatPersonaMsg = el("chat-persona-msg");
-/** 人格预设（2026-10-16）：人格页内联的预设按钮 / 列表 / 命名弹框。 */
-const chatPersonaPresetToggle = el("chat-persona-preset-toggle") as HTMLButtonElement;
-const chatPersonaPresetPanel = el("chat-persona-preset-panel");
+// 人格预设（2026-10-17 新稿）：预设行的标签 + 按钮排；命名弹框沿用自绘 modal。
+const chatPersonaPresetLabel = el("chat-persona-preset-label");
 const chatPersonaPresetList = el("chat-persona-preset-list");
-const chatPersonaPresetAdd = el("chat-persona-preset-add") as HTMLButtonElement;
-/** 预设的可见反馈（保存成功 / 切换后「重启 AI 后生效」）。 */
-const chatPersonaPresetMsg = el("chat-persona-preset-msg");
 const chatPersonaPresetModal = el("chat-persona-preset-modal");
 const chatPersonaPresetModalTitle = el("chat-persona-preset-modal-title");
 const chatPersonaPresetName = el("chat-persona-preset-name") as HTMLInputElement;
@@ -721,9 +717,11 @@ function refreshSearchResults() {
  *  用户原话：「用户明明没有添加，也会添加进去」—— 旧实现「按可见位次 / 数量自动注册前 N 个」
  *  正是这个 bug 的变体（用户没添加也被注册），已整体删除。
  *
- *  注册的**唯一入口** = 用户在「自定义启动」插件面板里点「添加启动项」
- *  （`plugins/builtin/quick-launch.ts` 的 `.ql-add-btn` → 宿主 `add_custom_app`）。
- *  本函数**没有任何注册分支**，全仓也不得再有第二条自动注册路径。
+ *  注册发生在**用户打开「自定义启动」插件那一刻**（`executePlugin` 里的
+ *  `plugin.id === "quick-launch"` 分支 → 宿主 `add_custom_app`）：粘进搜索栏 ≠ 要进启动项，
+ *  「点开这个插件」才是用户的意图。另外面板里的「添加启动项」按钮仍是合法入口
+ *  （`plugins/builtin/quick-launch.ts` 的 `.ql-add-btn`）。本函数**没有任何注册分支**，
+ *  粘贴 / 拖放路径上也不得有。
  *
  *  去重口径：与宿主 `app_indexer.rs::add_custom_app` 对齐 —— 那边用 `eq_ignore_ascii_case`
  *  （大小写不敏感）⇒ 这里也**大小写不敏感**（同一路径的不同大小写只算一条，§禁用 62）。
@@ -3680,22 +3678,16 @@ function personaLineEl(): HTMLElement {
   return d;
 }
 
-/** 若「活动预设」已与当前人格文本脱钩（手改过文本 / 预设被删），清掉活动名 ——
- *  免得人格名继续显示旧预设名、列表也一直亮着（双判高亮见 `renderPersonaPresets`）。 */
-function dropStaleActivePersona() {
-  const name = getActivePersonaName();
-  if (!name) return;
-  const p = loadPersonaPresets().find((x) => x.name === name);
-  if (!p || p.text !== chatPersonaText.value) setActivePersonaName("");
-}
-
-/** 预设列表（**直接内联在人格分页**，不另起一页）。 */
+/** 预设按钮排（新稿第一行：`预设` 标签 + 一排按钮，不是列表）。
+ *
+ *  按钮点击 = **切换应用**该预设（写文本 → 落盘 → 高亮）；高亮沿用「名 + 文本双判」——
+ *  手动改过文本框后，旧预设即使名字仍是活动名也不再高亮。无预设时给一行空态文字。 */
 function renderPersonaPresets() {
   const list = loadPersonaPresets();
   const active = getActivePersonaName();
   const cur = chatPersonaText.value;
   if (!list.length) {
-    const empty = doc("div");
+    const empty = doc("span");
     empty.className = "chat-persona-preset-empty";
     empty.textContent = t("settings.persona_preset_empty");
     chatPersonaPresetList.replaceChildren(empty);
@@ -3723,14 +3715,15 @@ function applyPersonaPreset(p: PersonaPreset) {
   chatPersonaText.value = p.text;
   setActivePersonaName(p.name);
   renderPersonaPresets();
-  // 可见反馈（列表就在旁边）：应用后同样「保存 ≠ 生效」，提示重启 AI（复用既有键）。
-  chatPersonaPresetMsg.textContent = t("settings.persona_saved") + t("settings.persona_takes_effect");
   void savePersona(p.text, t("settings.persona_saved"));
 }
 
-/** 命名弹框（自绘，复用玻璃面板 + 动作按钮族；绝不用 `window.prompt` —— WebView2 不支持）。 */
+/** 命名弹框（自绘，复用玻璃面板 + 动作按钮族；绝不用 `window.prompt` —— WebView2 不支持）。
+ *  预填「当前正在应用且文本未被手改」的预设名，方便同名覆盖；否则留空。 */
 function openPersonaPresetModal() {
-  chatPersonaPresetName.value = "";
+  const active = getActivePersonaName();
+  const applied = loadPersonaPresets().find((p) => p.name === active);
+  chatPersonaPresetName.value = applied && applied.text === chatPersonaText.value ? applied.name : "";
   chatPersonaPresetModalMsg.textContent = "";
   chatPersonaPresetModal.classList.remove("hidden");
   chatPersonaPresetName.focus();
@@ -3739,59 +3732,51 @@ function closePersonaPresetModal() {
   chatPersonaPresetModal.classList.add("hidden");
 }
 
-/** 保存命名弹框：把**当前人格文本** + 名称存成一条预设（边界：空名 / 重名 / 超长）。 */
-function savePersonaPreset() {
+/** 保存弹框：**一次动作**完成「写 config\persona.md + 把名字与文本存为该预设」。
+ *
+ *  旧实现是「先点保存写文本，再另点新建预设存一次名字」的两遍保存，用户明确要求去掉。
+ *  边界：空名 ⇒ 拒绝并提示；重名 ⇒ **覆盖**（这是唯一保存路径，拒绝重名会让预设永远
+ *  改不了名）；超长 ⇒ 按宿主上限 `personaMax`（`MAX_PERSONA_CHARS` = 8000）拒绝。
+ *  **取消 ⇒ 什么都不写**（不保存文本、也不建预设）。 */
+function savePersonaWithName() {
   const name = chatPersonaPresetName.value.trim();
   if (!name) { chatPersonaPresetModalMsg.textContent = t("settings.persona_preset_name_empty"); return; }
-  const list = loadPersonaPresets();
-  if (list.some((p) => p.name === name)) {
-    chatPersonaPresetModalMsg.textContent = t("settings.persona_preset_name_dup");
-    return;
-  }
   const text = chatPersonaText.value;
   if (text.length > personaMax) {
     chatPersonaPresetModalMsg.textContent = t("settings.persona_preset_too_long", { n: String(personaMax) });
     return;
   }
-  list.push({ name, text });
+  const list = loadPersonaPresets();
+  const i = list.findIndex((p) => p.name === name);
+  if (i >= 0) list[i] = { name, text }; // 同名覆盖
+  else list.push({ name, text });
   storePersonaPresets(list);
+  setActivePersonaName(name);
   closePersonaPresetModal();
-  chatPersonaPresetMsg.textContent = t("settings.persona_saved"); // 保存成功给可见提示
   renderPersonaPresets();
+  void savePersona(text, t("settings.persona_saved"));
 }
 
-// 入口「预设」按钮：内联展开 / 收起预设列表（不新开页 / tab）。
-chatPersonaPresetToggle?.addEventListener("click", () => {
-  const willOpen = chatPersonaPresetPanel.classList.contains("hidden");
-  chatPersonaPresetPanel.classList.toggle("hidden", !willOpen);
-  chatPersonaPresetToggle.setAttribute("aria-pressed", willOpen ? "true" : "false");
-  if (!willOpen) return;
-  // 双判高亮要用当前人格文本：还没装载就先装载（loadPersona 收尾会重画列表）。
-  if (!personaLoaded) { personaLoaded = true; void loadPersona(); }
-  else renderPersonaPresets();
-});
-chatPersonaPresetAdd?.addEventListener("click", openPersonaPresetModal);
-chatPersonaPresetModalSave?.addEventListener("click", savePersonaPreset);
+chatPersonaPresetModalSave?.addEventListener("click", savePersonaWithName);
 chatPersonaPresetModalCancel?.addEventListener("click", closePersonaPresetModal);
 chatPersonaPresetName?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); savePersonaPreset(); }
+  if (e.key === "Enter") { e.preventDefault(); savePersonaWithName(); }
 });
 // 弹框在 .chat-more-wrap 内 ⇒ ⋯ 菜单的 outside-click（只关「wrap 之外」的点击）不会误关菜单；
-// 这里再挡一道 stopPropagation，并支持点遮罩（非面板）关闭。
+// 这里再挡一道 stopPropagation，并支持点遮罩（非面板）关闭（= 取消，什么都不写）。
 chatPersonaPresetModal?.addEventListener("click", (e) => {
   e.stopPropagation();
   if (e.target === chatPersonaPresetModal) closePersonaPresetModal();
 });
 
 function renderPersonaLabels() {
+  chatPersonaPresetLabel.textContent = t("settings.persona_preset");
   chatPersonaLabel.textContent = t("settings.persona_title");
   chatPersonaEdit.textContent = t("settings.persona_edit");
   chatPersonaSave.textContent = t("settings.persona_save");
   chatPersonaReset.textContent = t("settings.persona_reset");
   chatPersonaRestart.textContent = t("settings.persona_restart");
-  // 人格预设：入口按钮 / 新建按钮 / 命名弹框（标题 = 人格名称）
-  chatPersonaPresetToggle.textContent = t("settings.persona_preset");
-  chatPersonaPresetAdd.textContent = t("settings.persona_preset_new");
+  // 命名弹框：标题 = 人格名称；按钮复用「保存 / 取消」
   chatPersonaPresetModalTitle.textContent = t("settings.persona_name");
   chatPersonaPresetModalSave.textContent = t("settings.persona_save");
   chatPersonaPresetModalCancel.textContent = t("settings.cancel");
@@ -3830,11 +3815,7 @@ chatPersonaEdit?.addEventListener("click", async () => {
     await loadPersona();
   }
 });
-chatPersonaSave?.addEventListener("click", () => {
-  // 手动保存 = 自定义文本：若已与活动预设脱钩则清掉活动名（人格名随之回落内置名）。
-  dropStaleActivePersona();
-  void savePersona(chatPersonaText.value, t("settings.persona_saved"));
-});
+chatPersonaSave?.addEventListener("click", openPersonaPresetModal);
 chatPersonaReset?.addEventListener("click", async () => {
   chatPersonaText.value = "";
   setActivePersonaName(""); // 恢复内置人格 ⇒ 不再应用任何预设
@@ -10681,6 +10662,41 @@ async function openPluginWindow(pluginId: string) {
   }
 }
 
+/** 打开「自定义启动」插件时，把搜索栏里的**本次附件**正式写进注册表。
+ *
+ *  **为什么注册发生在这里**：粘贴 / 拖放只是「把文件放进搜索栏」这个动作，不等于用户
+ *  想把它们加进启动项（旧 bug：粘 6 个文件就直接注册了 6 个）。只有用户**点开搜索结果区
+ *  的「自定义启动」插件**，才是明确的「我要管理 / 使用这些文件」的意图 —— 于是把当前
+ *  附件逐个 `add_custom_app`。本函数由 `executePlugin` 里唯一的 `quick-launch` 分支调用，
+ *  **不得**挂到粘贴 / 拖放 / 其它插件的打开路径上。
+ *
+ *  边界：① 附件为空 ⇒ 直接返回（只打开面板）；② 已注册的按路径**大小写不敏感**跳过，
+ *  只补未注册的；③ 任一失败 ⇒ 返回一句用户可读的提示（原始错误不进界面），面板照常打开。
+ *  已注册项与附件在面板里按同一路径合并，`persistent` 优先 ⇒ 注册后显示为「已注册」，
+ *  不会出现同一文件两处。 */
+async function registerAttachedFilesForQuickLaunch(): Promise<string> {
+  if (attachedFiles.length === 0) return "";
+  let registered: Array<{ path: string }>;
+  try {
+    registered = await invoke<Array<{ path: string }>>("list_custom_apps");
+  } catch {
+    return t("quicklaunch.register_failed", { names: attachedFiles.join("、") });
+  }
+  const known = new Set(registered.map((r) => (r.path || "").toLowerCase()).filter(Boolean));
+  const failed: string[] = [];
+  for (const p of attachedFiles) {
+    const key = p.toLowerCase();
+    if (known.has(key)) continue; // 已注册（大小写不同也算同一条）
+    try {
+      await invoke("add_custom_app", { name: "", path: p });
+      known.add(key);
+    } catch {
+      failed.push(p.split(/[\\/]/).pop() || p);
+    }
+  }
+  return failed.length ? t("quicklaunch.register_failed", { names: failed.join("、") }) : "";
+}
+
 async function executePlugin(plugin: Plugin) {
   // 拓展插件必须**盘上有可用的一份**才能打开（2026-09-29 用户要求：没装 = 完全不存在于本应用）。
   // 基础插件随安装包走，永远可用。判据取本机事实（`hasDiskPlugin`），不看 registry 里有没有 ——
@@ -10718,6 +10734,11 @@ async function executePlugin(plugin: Plugin) {
   if (_execGuard) return;
   _execGuard = true;
   setTimeout(() => { _execGuard = false; }, 500); // longer: plugin execute can take time
+  // 点击搜索结果里的「自定义启动」= 用户确认把当前附件正式注册（详见上方 helper）。
+  // 没有附件时这里什么都不做（只是打开面板）；其它插件一律不注册。
+  const registerError = plugin.id === "quick-launch"
+    ? await registerAttachedFilesForQuickLaunch()
+    : "";
   const q = searchInput.value.trim();
   searchInput.disabled = true;
   statusText.textContent = t("status.running_plugin", { name: pluginName(plugin.id) });
@@ -10811,6 +10832,8 @@ async function executePlugin(plugin: Plugin) {
     }
     statusText.textContent = "";
     recordRecency("plugin://" + plugin.id);
+    // 注册失败只在面板打开后提示（不静默）；成功时保持状态行空白
+    if (registerError) statusText.textContent = registerError;
   } catch (err: any) {
     resultsList.innerHTML = `
       <div class="plugin-result">

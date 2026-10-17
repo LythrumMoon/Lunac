@@ -976,6 +976,21 @@
 
 > 表中「新增（待设计）」= 当前没有对应的插件能力名 / 通用入口，只有宿主内部实现或完全没有；施工前必须先立项，**不能假定已存在**。
 
+##### C.4.1 挂载锚点（**2026-10-17 用户已拍板：新增两个**）
+
+现有 3 个（`index.html:223`、`plugin.html:54`、`plugin-window.ts:40`）：`results`（`#results-list`）、`document`（`document.body`）、`window`（插件窗 `#results-list`）。
+
+**本轮定稿 = 再新增 2 个**（用户选择「新增锚点」）：
+
+| 槽位 id | 宿主位置 | 用途 | 施工注意 |
+|---|---|---|---|
+| `chat-sidebar` | 聊天区侧栏（主对话 / 独立聊天窗共用） | 常驻小面板（状态、快捷操作） | 必须与 `#results-list` 同源重绘机制解耦；窄窗需可折叠，否则挤占对话宽度 |
+| `settings-section` | 设置面板内一个分组容器 | 插件自己的配置界面 | 分页机制沿用 `settings.ts` 的 `data-cat` ↔ `data-pane`（`:2659-2681`），**不要**再引第三套分页；分组需可被插件声明隐藏 |
+
+- ⚠️ **只加这两个**；再加锚点需**重新拍板**（每加一个都扩大宿主 DOM 契约与回归面）。
+- ⚠️ 两个新锚点都必须满足：**卸载 = 完全不存在**（删目录后宿主不得残留占位/空白分组）；无插件时**不占位、不留空容器**。
+- ⚠️ 新的槽位名要进 `mount` 的 `slot` 枚举（见 C.5）与清单校验，**不是**自由字符串。
+
 ##### C.5 消息清单（传输与接收）
 
 **宿主 → 插件（传输）**
@@ -983,7 +998,7 @@
 | method | 类型 | payload | 说明 |
 |---|---|---|---|
 | `hello` | event | `{channelVersions, apiVersion, pluginId, caps, themeMode, locale}` | 握手起点 |
-| `mount` | req | `{input, slot, size}` | 挂载；`slot` ∈ `results` / `document` / `window` |
+| `mount` | req | `{input, slot, size}` | 挂载；`slot` ∈ `results` / `document` / `window` / **`chat-sidebar`** / **`settings-section`**（后两个为 2026-10-17 新增，见 C.4.1） |
 | `execute` | req | `{input}` | 重新执行（等价现有 `execute(input)`） |
 | `theme.changed` | event | `{mode, tokens?}` | `inherit` 带 token；`custom` 默认只带 `mode` |
 | `locale.changed` | event | `{locale}` | 语言切换 |
@@ -1050,7 +1065,8 @@ Modules\<id>\
 - **依赖**：运行时资产继续走 `dependencies[]`，复用 4 GiB / 1 GiB / 32 条 / 32 MiB / 192 MiB / 4000 条闸（`plugin_market.rs:49-53`、`:60-66`）。
 - **校验**：
   - 依赖与 sidecar 已有 `sha256` 口径（`plugin_market.rs:283-286`、`:344`、`:1066-1094`、`:1123-1146`）。
-  - **插件包本体目前没有 sha256**：市场索引 `PluginIndexEntry` 无该字段（`plugin_market.rs:717-735`），安装路径只校验 https 与体积（`commands.rs:2894-2944`）。芯片封装**必须补** `index.json` 的 `sha256` + 安装前校验；这是新增缺口，不是现状。
+  - **插件包本体目前没有 sha256**：市场索引 `PluginIndexEntry` 无该字段（`plugin_market.rs:717-735`），安装路径只校验 https 与体积（`commands.rs:2894-2944`）。
+    **✅ 2026-10-17 用户已拍板：强制** —— 索引新增 `sha256` 字段 + 安装前校验；**旧包（无哈希）迁移期只 warn、不拒装**，迁移期结束后转强制。芯片封装以此为前提。
   - 构建元数据（buildId、文件哈希）放**包外**的 `SHA256SUMS` / 索引条目，**不放进插件目录当运行时真相**，避免第二份清单（禁用 62）。
 
 ##### D.2 「独立芯片」的含义边界
@@ -1102,11 +1118,17 @@ Modules\<id>\
 
 ##### E.2 阶段 2：信道协议 + iframe opt-in（先落 vitest）
 
+> **前置实验（2026-10-17 已拍板「先实测再定」，必须先做，约半天）**：用一个最小 iframe（`sandbox` 不透明源）去加载 `convertFileSrc()` 产出的 `asset.localhost` URL，验证 **ESM `import()` / `<script>` / fetch 资源**在**跨源**下是否被放行。
+> - **通过** ⇒ 定稿源模型 = 不透明源（`sandbox`）。
+> - **不通过** ⇒ 改用**自定义 scheme**（如 `lunac-plugin://<id>/`）并补 `CSP frame-src`，再定稿。
+> - 结论必须落回本文（把「未查到」改成实测结论），**不能跳过实验直接施工**。
+
 - **改动点（施工时）**：
   - 新增 `app/src/plugins/channel/protocol.ts`（纯类型 + 校验 + 版本协商 + 错误码）与 `host.ts` / `client.ts`【待建】；测试同目录 `*.test.ts`。
   - `plugin_market.rs:190-244` 加 `render.engine` / `render.appearance` 的解析与校验；`InstalledPlugin`（`:525-566`）下发。
   - `main.ts:10783-10805` 按 `render.engine` 分支：`dom` 走现状；`iframe` 建 iframe、发 `mount`；`plugin-window.ts:74-104` 同步。
-  - `tauri.conf.json:35` 的 CSP 需增加 `frame-src`（当前没有）；是否新增自定义 scheme 见 H.4。
+  - `tauri.conf.json:35` 的 CSP 需增加 `frame-src`（当前没有）；是否新增自定义 scheme 取决于上面的**前置实验**（H.4）。
+  - **新增两个锚点**（H.3 已拍板，见 C.4.1）：`chat-sidebar`（聊天区侧栏）与 `settings-section`（设置面板分组）——两者都要在 `mount` 的 `slot` 枚举与清单校验里登记，并满足「无插件不占位 / 卸载不残留」。
   - 主题注入复用 `main.ts:13247-13252` / `plugin-window.ts:57-70`。
 - **兼容**：默认 `dom`；旧插件零变化；iframe 插件必须带 `index.js` 占位（D.3）。
 - **测试**：vitest：`channel_handshake_negotiates_lowest_common_version`、`channel_rejects_unknown_version_with_E_VERSION`、`channel_unknown_method_returns_E_UNSUPPORTED`、`channel_request_times_out_with_E_TIMEOUT`、`channel_requires_cap_for_net_fetch`、`channel_resize_events_are_coalesced`、`channel_rejects_cross_origin_source`。Rust：`manifest_accepts_iframe_engine_with_entry_html`、`manifest_rejects_iframe_engine_without_entry_html`、`manifest_engine_defaults_to_dom`。
@@ -1220,17 +1242,17 @@ Modules\<id>\
 
 | # | 事项 | 我的建议 | 为什么必须拍板 |
 |---|---|---|---|
-| 1 | **工具链装在哪** | `<插件目录>\.toolchain\`；不做宿主共享 / 用户目录 / 全局 | 直接决定「卸载 = 完全不存在」能否成立；共享缓存需要引用计数与 GC，是另一套工程 |
+| 1 | ~~工具链装在哪~~ **✅ 已拍板（2026-10-17）** | **`<插件目录>\.toolchain\<profile>\`**；不做宿主共享 / 用户目录 / 全局 | 已定稿：卸载删目录即回收，守住「卸载 = 完全不存在」 |
 | 2 | **iframe 内如何注入主题 token** | 握手后由宿主 `postMessage` 发快照；`inherit` 全量、`custom` 只发 `mode`（可选 token） | iframe 读不到宿主 CSSOM；发多了会把宿主 token 变成插件契约，发少了 `inherit` 失效 |
-| 3 | **是否新增挂载锚点** | **不新增**，继续只有 `results` / `document` / `window` 三个（`index.html:223`、`plugin.html:54`、`plugin-window.ts:40`） | 新增聊天侧栏 / 设置分组会扩大宿主 DOM 契约与回归面；产品侧未提需求 |
-| 4 | **iframe 的源模型** | 目标 = `sandbox`（不透明源）；同源 iframe 只能叫「样式隔离」，不算边界 | 不透明源下 `asset.localhost` 的跨源加载 / CORS **未查到**结论；可能需要自定义 scheme，属实现前必须验证的技术风险 |
+| 3 | ~~是否新增挂载锚点~~ **✅ 已拍板（2026-10-17）** | **新增 2 个**：`chat-sidebar`、`settings-section`（定义见 **C.4.1**）；**只加这两个**，再加需重新拍板 | 用户已选择「新增锚点」；缺口 = 宿主 DOM 契约与回归面变大，已在 C.4.1 写明施工注意（窄窗可折叠 / 无插件不占位 / 卸载不残留） |
+| 4 | ~~iframe 的源模型~~ **✅ 已拍板（2026-10-17）** | **先实测再定**：先做一次小实验验证不透明源下 `asset.localhost` 的跨源加载；不可用则改**自定义 scheme**，再定最终源模型 | 不透明源是「真边界」的前提（同源只能叫样式隔离）；但实验结论**未查到**，不能拍脑袋定 |
 | 5 | **工具链 profile / 版本白名单** | 先只做「单文件构建器」与「Node LTS + 包管理器」两档；版本与哈希写死 | 决定攻击面、磁盘占用与可复现性；无白名单等于允许任意 npm 包 |
 | 6 | **工具链联网策略** | 构建期联网走宿主代理 + registry 白名单；不允许插件脚本自行直连 | 与 `forbidden.md` §禁用 10 的「HTTP 一律宿主代请求」对齐；否则工具链成为绕过口 |
 | 7 | **市场插件是否允许 `dev` 段** | 允许声明，但**默认永不授权**；只对本地 / 用户自建插件提供「申请授权」 | 防止「装个市场插件顺带索要开发环境」；供应链风险显著高于本地自建 |
 | 8 | **`reuse` 在 iframe 不可用** | 接受；`reuse` 只保留给 DOM 引擎，文档写明 | 它依赖与宿主同 DOM；强行支持等于给 iframe 开宿主 DOM 口子 |
 | 9 | **`custom` 的可见提示放哪** | 插件市场详情 + 设置页插件条目；首次打开给一次轻提示；不放进结果区 | 放结果区会占布局 / 破坏视觉一致性；只放设置又可能不够可见 |
 | 10 | **Job Object 缺省限额** | 内存与进程数都可配，缺省值需按 4B 模型 sidecar 实测后定 | 定小了会杀本地模型；定大了等于没闸 |
-| 11 | **插件包 `sha256` 是否强制** | 新增字段并**强制**（芯片封装必须）；旧包给迁移期 warn | 现在插件包本体无哈希（`PluginIndexEntry` `:717-735`、`commands.rs:2894-2944`），无法证明交付物未被替换 |
+| 11 | ~~插件包 `sha256` 是否强制~~ **✅ 已拍板（2026-10-17）** | **强制**（索引新增字段 + 安装前校验）；**旧包迁移期只 warn、不拒装**，迁移期结束后转强制 | 现在插件包本体无哈希（`PluginIndexEntry` `:717-735`、`commands.rs:2894-2944`），无法证明交付物未被替换 |
 | 12 | **CDP 夹具现状** | `temp/pet-e2e.mjs` 当前检出**未查到**（gitignore）；`scripts/agent-e2e.ps1` 存在 | 若后续要用 CDP 做端到端验收，需要先确认夹具是否仍在 |
 
 ### §待办 3-11 插件面板「图片化 / 可视化设计 ↔ 代码」可行性（2026-10-17 只读调研，未施工）

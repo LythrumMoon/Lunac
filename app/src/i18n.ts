@@ -2412,48 +2412,15 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "Daily cap reached — stopped automatically",
   },
   // 2026-10-10 用户口径：原来那段「注意：主动反应会持续消耗 token…」的整段说明**删除**；
-  // 下面这条只保留一句**隐私/成本**提示（两个抓屏子开关可见的告知，隐私红线要求可见）。
-  "pet.proactive_autoshot": {
-    "zh-CN": "自动抓屏",
-    "zh-TW": "自動截圖",
-    "ja": "自動スクリーンショット",
-    "ko": "자동 화면 캡처",
-    "en": "Auto screenshot",
-  },
-  "pet.proactive_screenwatch": {
-    "zh-CN": "屏幕变化触发",
-    "zh-TW": "畫面變化觸發",
-    "ja": "画面の変化で発動",
-    "ko": "화면 변화 시 트리거",
-    "en": "Trigger on screen change",
-  },
-  "pet.proactive_second": {
-    "zh-CN": "秒",
-    "zh-TW": "秒",
-    "ja": "秒",
-    "ko": "초",
-    "en": "sec",
-  },
-  "pet.proactive_sensitivity": {
-    "zh-CN": "灵敏度",
-    "zh-TW": "靈敏度",
-    "ja": "感度",
-    "ko": "감도",
-    "en": "Sensitivity",
-  },
+  // 下面这条只保留一句**隐私/成本**提示（抓屏行为可见的告知，隐私红线要求可见）。
+  // 2026-10-17：三个主动反应合并为一个开关 ⇒ 原「自动抓屏 / 屏幕变化触发 / 秒 / 灵敏度」四个键
+  // 与 `pet.autoshot_prompt` 已无任何引用，一并删除（死键清理）。
   "pet.proactive_shot_hint": {
-    "zh-CN": "「自动抓屏 / 屏幕变化触发」只在开启后才会抓屏，桌宠隐藏或最小化时立即停止。",
-    "zh-TW": "「自動截圖 / 畫面變化觸發」只在開啟後才會截圖，桌寵隱藏或最小化時立即停止。",
-    "ja": "「自動スクリーンショット / 画面の変化で発動」はオンにしたときだけ画面を取得し、ペットが非表示・最小化のときは即座に停止します。",
-    "ko": "「자동 화면 캡처 / 화면 변화 시 트리거」는 켠 경우에만 화면을 캡처하며, 펫이 숨겨지거나 최소화되면 즉시 중지됩니다.",
-    "en": "\"Auto screenshot / Trigger on screen change\" only captures the screen when enabled, and stops immediately while the pet is hidden or minimized.",
-  },
-  "pet.autoshot_prompt": {
-    "zh-CN": "（桌宠）看一眼我的屏幕，主动跟我说句话",
-    "zh-TW": "（桌寵）看一眼我的螢幕，主動跟我說句話",
-    "ja": "（ペット）私の画面をちょっと見て、自分から一言かけて",
-    "ko": "(펫) 내 화면을 한번 보고 먼저 말을 걸어줘",
-    "en": "(pet) Take a look at my screen and say something to me",
+    "zh-CN": "开启后，桌宠会在可见时偶尔查看屏幕：画面有变化就带截图回应，否则主动说一句；隐藏或最小化时立即停止。",
+    "zh-TW": "開啟後，桌寵會在可見時偶爾查看螢幕：畫面有變化就帶截圖回應，否則主動說一句；隱藏或最小化時立即停止。",
+    "ja": "オンにすると、ペットは表示中にときどき画面を確認します。画面が変わっていればスクリーンショット付きで反応し、そうでなければ一言話しかけます。非表示・最小化中は即座に停止します。",
+    "ko": "켜면 펫이 보이는 동안 가끔 화면을 확인합니다. 화면이 바뀌면 스크린샷과 함께 반응하고, 그렇지 않으면 먼저 한마디 건넵니다. 숨김 또는 최소화 상태에서는 즉시 중지됩니다.",
+    "en": "When enabled, the pet occasionally checks the screen while visible: it replies with a screenshot when the screen changed, otherwise it says something on its own. Stops immediately while hidden or minimized.",
   },
   "pet.watch_prompt": {
     "zh-CN": "（桌宠）我的屏幕有变化，看一眼说说你的想法",
@@ -7176,27 +7143,20 @@ const DICT: Record<string, Record<LangTag, string>> = {
   // 「人格名」（2026-10-16）：现作**人格预设命名弹框的标题**（命名 ≠ AI 配置，
   // 只落 localStorage、不进 prompt）。
   "settings.persona_name": {
-    "zh-CN": "人格名",
-    "zh-TW": "人格名",
+    "zh-CN": "人格名称",
+    "zh-TW": "人格名稱",
     "ja": "ペルソナ名",
     "ko": "페르소나 이름",
     "en": "Persona name",
   },
-  // 人格预设（2026-10-16）：列表内联在人格分页；「预设」= 入口按钮文案，「新建预设」=
-  // 列表下方的新建按钮（点开命名弹框）。存储键 lunac-persona-presets / lunac-persona-active。
+  // 人格预设（2026-10-17 新稿）：人格页第一行的标签「预设」；右侧预设按钮由预设名渲染。
+  // 存储键 lunac-persona-presets / lunac-persona-active。空名 / 超长仍复用下面两条提示。
   "settings.persona_preset": {
     "zh-CN": "预设",
     "zh-TW": "預設",
     "ja": "プリセット",
     "ko": "프리셋",
     "en": "Preset",
-  },
-  "settings.persona_preset_new": {
-    "zh-CN": "新建预设",
-    "zh-TW": "新增預設",
-    "ja": "プリセットを新規作成",
-    "ko": "프리셋 새로 만들기",
-    "en": "New preset",
   },
   "settings.persona_preset_empty": {
     "zh-CN": "暂无预设",
@@ -7211,13 +7171,6 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "ja": "名前を入力してください",
     "ko": "이름을 입력하세요",
     "en": "Enter a name",
-  },
-  "settings.persona_preset_name_dup": {
-    "zh-CN": "该名称已存在",
-    "zh-TW": "此名稱已存在",
-    "ja": "その名前は既に存在します",
-    "ko": "이미 있는 이름입니다",
-    "en": "That name already exists",
   },
   "settings.persona_preset_too_long": {
     "zh-CN": "人格内容超出上限（{n} 字），无法保存为预设",
@@ -9218,11 +9171,19 @@ const DICT: Record<string, Record<LangTag, string>> = {
     "en": "This session",
   },
   "quicklaunch.empty": {
-    "zh-CN": "还没有自定义启动项：点上方“添加启动项”选择文件/文件夹，或直接把文件拖入搜索栏注册。已添加的项会固定显示在此，重启不丢失。",
-    "zh-TW": "還沒有自訂啟動項：點上方「新增啟動項」選擇檔案/資料夾，或直接把檔案拖入搜尋列註冊。已新增的項目會固定顯示在此，重啟不遺失。",
-    "ja": "カスタム起動項目がまだありません：「起動項目を追加」でファイル/フォルダを選ぶか、検索バーにファイルをドラッグして登録してください。追加した項目はここに固定表示され、再起動後も残ります。",
-    "ko": "사용자 정의 실행 항목이 아직 없습니다: 위의 “실행 항목 추가”로 파일/폴더를 선택하거나 검색창에 파일을 끌어 등록하세요. 추가한 항목은 여기에 고정 표시되며 재시작 후에도 유지됩니다.",
-    "en": "No custom launch items yet: tap “Add launch item” above to pick files/folders, or drop files into the search bar to register them. Added items stay here and survive restarts.",
+    "zh-CN": "还没有自定义启动项：点上方“添加启动项”选择文件/文件夹；粘贴或拖入搜索栏的文件，在点开本插件时才会注册。已注册的项会固定显示在此，重启不丢失。",
+    "zh-TW": "還沒有自訂啟動項：點上方「新增啟動項」選擇檔案/資料夾；貼上或拖入搜尋列的檔案，在點開本外掛時才會註冊。已註冊的項目會固定顯示在此，重啟不遺失。",
+    "ja": "カスタム起動項目がまだありません：上の「起動項目を追加」でファイル/フォルダを選ぶか、検索バーに貼り付け・ドロップしたファイルはこのプラグインを開いたときに登録されます。登録済みの項目はここに固定表示され、再起動後も残ります。",
+    "ko": "사용자 정의 실행 항목이 아직 없습니다: 위의 “실행 항목 추가”로 파일/폴더를 선택하세요. 검색창에 붙여넣거나 끌어 놓은 파일은 이 플러그인을 열 때 등록됩니다. 등록된 항목은 여기에 고정 표시되며 재시작 후에도 유지됩니다.",
+    "en": "No custom launch items yet: use “Add launch item” above to pick files/folders. Files pasted or dropped into the search bar are registered when you open this plugin. Registered items stay here and survive restarts.",
+  },
+  // 打开「自定义启动」时批量注册附件失败的提示（只给文件名，不贴原始错误）
+  "quicklaunch.register_failed": {
+    "zh-CN": "部分文件未能加入启动项：{names}（请确认文件仍存在）",
+    "zh-TW": "部分檔案未能加入啟動項：{names}（請確認檔案仍存在）",
+    "ja": "一部のファイルを起動項目に追加できませんでした：{names}（ファイルが存在するか確認してください）",
+    "ko": "일부 파일을 실행 항목에 추가하지 못했습니다: {names} (파일이 있는지 확인하세요)",
+    "en": "Some files could not be added to launch items: {names} (make sure they still exist)",
   },
 
   // ── Web search ──────────────────────────────────────────────
