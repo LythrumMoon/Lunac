@@ -98,7 +98,13 @@ extern "system" {
     fn UnhookWindowsHookEx(hhk: isize) -> i32;
     fn CallNextHookEx(hhk: isize, n_code: i32, w_param: usize, l_param: isize) -> isize;
     fn GetMessageW(msg: *mut Msg, hwnd: isize, filter_min: u32, filter_max: u32) -> i32;
-    fn PeekMessageW(msg: *mut Msg, hwnd: isize, filter_min: u32, filter_max: u32, remove: u32) -> i32;
+    fn PeekMessageW(
+        msg: *mut Msg,
+        hwnd: isize,
+        filter_min: u32,
+        filter_max: u32,
+        remove: u32,
+    ) -> i32;
     fn PostThreadMessageW(thread_id: u32, msg: u32, w_param: usize, l_param: isize) -> i32;
     fn GetAsyncKeyState(vk: i32) -> i16;
 }

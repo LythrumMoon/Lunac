@@ -463,6 +463,7 @@ export const memoPlugin: Plugin = {
   description: "本地自动保存备忘录 (Local auto-save memo)",
   icon: "📝",
   badge: "memo",
+  provides: ["notes.memo"],
 
   async execute(input: string): Promise<PluginResult> {
     await loadEntries();

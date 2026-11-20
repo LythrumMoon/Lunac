@@ -391,6 +391,10 @@ export interface Live2DHandle {
   /** 播一个**动作**：按 `model3.json` 的 `FileReferences.Motions[组名]` + 组内序号。
    *  `index` 缺省 0（该组第一条）。组名不存在 / 该组为空时静默忽略。 */
   playMotion(group: string, index?: number): void;
+  /** **热更新「循环播放」列表**（2026-10-22）：传**动作文件绝对路径**（`list_motion_files`
+   *  返回的那种），引擎按挂载时建立的「路径 → 注入组下标」映射就地换算；找不到的文件忽略。
+   *  空数组 = 停止轮播（不清模型）。**不重挂模型** —— 勾 / 取消循环时用它，别走 `reload`。 */
+  setIdleMotions(files: string[]): void;
   /** **播放一条动作链**（2026-10-10，backlog ㉝②）。`steps` 由桌宠窗折算好：
    *  `index` = 注入组里的动作下标、`ms` = 本步循环播放时长、`hardMs` = 硬停上限（`0` = 不限）。
    *  引擎按时间线逐步播放（本步动作提前结束就重播，凑满 `ms` 再走；到 `hardMs` 强制切）。

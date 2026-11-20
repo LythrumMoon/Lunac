@@ -46,9 +46,15 @@
 //   因此本模块的解析口径固定为：AccentColor → BGR、ColorizationColor → RGB。单测
 //   `accent_dword_byte_order_matches_measured_evidence` 把本机实测值钉死，改错立刻红。
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use serde::{Deserialize, Serialize};
+
+/// 内置默认主题的**编译期内嵌副本**（2026-10-24）。
+///
+/// 唯一真相源仍是 `themes/default/theme.json`；`include_str!` 保证二进制与源码永远同一份，
+/// 不会被安装目录里残留的旧版本覆盖（见 `scan_themes_in` 的注释）。
+const DEFAULT_THEME_JSON: &str = include_str!("../themes/default/theme.json");
 
 // ── 系统主题 ─────────────────────────────────────────────────────
 
@@ -192,8 +198,7 @@ pub fn get_system_theme() -> SystemTheme {
 #[cfg(target_os = "windows")]
 fn windows_system_theme() -> SystemTheme {
     const DWM_KEY: &str = r"Software\Microsoft\Windows\DWM";
-    const PERSONALIZE_KEY: &str =
-        r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
     // 读不到 `AppsUseLightTheme` 时按深色 —— 本应用当前只有深色 UI，
     // 未知环境下选一个「不会闪白」的默认值比猜浅色安全。
@@ -336,14 +341,26 @@ fn scan_themes_in(root: &Path) -> Vec<ThemeInfo> {
         if !json_path.exists() {
             continue;
         }
-        let text = match std::fs::read_to_string(&json_path) {
-            Ok(t) => t,
-            Err(e) => {
-                crate::log::warn(format!(
-                    "[appearance] 读取主题文件失败，已跳过 {}：{e}",
-                    json_path.display()
-                ));
-                continue;
+        // **内置默认主题以「编译进二进制的这一份」为准**（2026-10-24）。
+        // 原因：`themes\default\theme.json` 随安装包落在 exe 旁边，升级时**不会覆盖**
+        // 已存在的文件（它是「用户可拿记事本改」的类型）⇒ 老安装里那份会一直停在旧
+        // 版本，于是同样的源码在 dev（target\debug\themes 是新的）与 release（安装目录
+        // 里是旧的）呈现两套默认配色。`builtin` 标记文件就是「这份由我们维护」的约定，
+        // 所以这里直接读 `include_str!` 的那份，磁盘内容只用于资产路径解析。
+        let is_builtin_default = dir.file_name().map(|n| n == "default").unwrap_or(false)
+            && dir.join("builtin").exists();
+        let text = if is_builtin_default {
+            DEFAULT_THEME_JSON.to_string()
+        } else {
+            match std::fs::read_to_string(&json_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    crate::log::warn(format!(
+                        "[appearance] 读取主题文件失败，已跳过 {}：{e}",
+                        json_path.display()
+                    ));
+                    continue;
+                }
             }
         };
         let manifest: ThemeManifest = match serde_json::from_str(&text) {
@@ -382,8 +399,7 @@ fn resolve_assets(theme_dir: &Path, assets: &ThemeAssets) -> ResolvedAssets {
             .icons
             .iter()
             .filter_map(|(plugin, rel)| {
-                resolve_asset(theme_dir, Some(rel), "icons")
-                    .map(|abs| (plugin.clone(), abs))
+                resolve_asset(theme_dir, Some(rel), "icons").map(|abs| (plugin.clone(), abs))
             })
             .collect(),
     }
@@ -566,7 +582,10 @@ mod tests {
                 assert!(dir.join(rel).is_file(), "{id} 的花纹不存在：{rel}");
             }
             for (pid, rel) in &t.manifest.assets.icons {
-                assert!(dir.join(rel).is_file(), "{id} 的插件图标 {pid} 不存在：{rel}");
+                assert!(
+                    dir.join(rel).is_file(),
+                    "{id} 的插件图标 {pid} 不存在：{rel}"
+                );
             }
             assert_eq!(
                 t.resolved.icons.len(),

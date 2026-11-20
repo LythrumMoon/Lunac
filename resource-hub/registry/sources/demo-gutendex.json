@@ -1,0 +1,59 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "demo.gutendex",
+    "name": "Project Gutenberg（演示）",
+    "version": "1.0.0",
+    "kind": ["novel"],
+    "engine": "declarative",
+    "entry": "rule.json",
+    "baseUrl": "https://gutendex.com",
+    "homepage": "https://gutendex.com",
+    "license": "Public Domain (Project Gutenberg)",
+    "attribution": "数据来自 Gutendex / Project Gutenberg；仅使用公版作品摘要",
+    "capabilities": ["search", "chapters", "content"],
+    "rateLimit": { "rps": 2, "burst": 3 }
+  },
+  "rule": {
+    "search": {
+      "request": {
+        "method": "GET",
+        "url": "/books/",
+        "query": { "search": "@keyword", "page": "@page" }
+      },
+      "list": { "jsonPath": "$.results[*]" },
+      "fields": {
+        "id": {
+          "selector": { "jsonPath": "id" },
+          "template": "https://gutendex.com/books/@value/"
+        },
+        "title": { "selector": { "jsonPath": "title" } },
+        "author": { "selector": { "jsonPath": "authors[0].name" } },
+        "cover": { "selector": { "jsonPath": "formats['image/jpeg']" } },
+        "description": { "selector": { "jsonPath": "summaries[0]" } },
+        "tags": { "selector": { "jsonPath": "subjects[0]" } }
+      }
+    },
+    "chapters": {
+      "request": { "method": "GET", "url": "@workUrl" },
+      "list": { "jsonPath": "$" },
+      "fields": {
+        "id": {
+          "selector": { "jsonPath": "id" },
+          "template": "https://gutendex.com/books/@value/"
+        },
+        "title": {
+          "selector": { "jsonPath": "title" },
+          "template": "作品摘要 · @value"
+        }
+      }
+    },
+    "content": {
+      "request": { "method": "GET", "url": "@chapterUrl" },
+      "list": { "jsonPath": "$" },
+      "fields": {
+        "content": { "selector": { "jsonPath": "summaries[0]" } }
+      }
+    }
+  }
+}

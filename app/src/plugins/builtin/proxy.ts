@@ -1,40 +1,29 @@
-// ── 代理插件（Modules\proxy，2026-10-02）─────────────────────────────
+// ── 代理插件（Modules\proxy，2026-11-01 三段式重构）───────────────────
 //
-// **它管两件不同的事，别混**（这是本插件最容易讲错的一句话）：
+// 布局（独立窗 1280×720，见 `lunac-plugin.json` 的 `window`）：
 //
-//   ① **系统代理**（Windows 的 WinINet 设置，注册表 `HKCU\…\Internet Settings`）
-//      —— 影响浏览器 / 商店应用 / 一部分走 WinINet 的程序。宿主那半边
-//      （`system_proxy.rs`）2026-10-01 就写好了，但**一直没有界面**（死代码到本轮）。
-//   ② **本机播放（librespot）的代理** —— 它**根本不读系统代理**，必须用启动参数
-//      `-x <http-proxy>` 单独告诉它（见 music.rs 的 `librespot_set_proxy`）。
-//      librespot 与 Spotify 的长连接跨境时会被周期性掐断（M2-9：约 27–36 分钟一次，
-//      重连后 `active device` 变空 ⇒ 控制条条 `404 NO_ACTIVE_DEVICE`），走代理是根治。
+//   ┌ 工具区（一行按钮，点开下拉菜单，再点开界面内独立面板）──────────────┐
+//   │ 服务器导入 / 服务器订阅更新 / 设置                                  │
+//   ├ 中间区（左侧抽屉 + 中央大字按钮 + 速度 / 地区 / 模式 / TUN）────────┤
+//   ├ 日志区（可拖拽调整高度；每行是「目标域名 + 走向」）──────────────────┤
+//   └──────────────────────────────────────────────────────────────┘
 //
-// 所以界面上那条「联动」开关不是顺手加的：**只开系统代理，本机播放一点都没变** ——
-// 一个用户最容易误解、而且误解之后完全看不出哪里错了的点。
+// **只有自研引擎**（2026-11-01，§待办 3-26 K3/K4）：界面上不再出现 mihomo 字样 /
+// 下载内核入口；引擎编进宿主，随安装包分发，插件 `dependencies` 为空。
 //
-// **样式纪律**：控件一律走 `styles.css` 里 `.proxy-*` 那一段，颜色只用主题变量
-// （`--text` / `--text-dim` / `--accent*` / `--red`），不写死颜色。
+// **TUN**：引擎还没有 TUN（需要 wintun + 用户态 TCP/IP 栈）。开关**可见但会如实
+// 报错并回弹** —— 不假装切换成功（`docs/forbidden.md` §禁用 1）。
 //
-// **磁盘插件契约**（同 ocr.ts）：默认导出带 `execute` 的对象 + 具名导出 `attach(root)`；
-// 它是**接管型**（`permissions: ["layout.takeover"]`），所以 `attach` 收到的 root 是
-// **文档根**（`document.body`），控件 id 全局唯一、直接用 `document` 取即可。
-//
-// ⚠️ 本文件的字符串里**不许出现反引号注释**（预检 #15 / #39 ⑩ 踩过 5 次）——
-// 但本文件**不是**模板字符串，正常用反引号拼 HTML 是可以的；只是别在注释里写。
+// 样式一律走 `styles.css` 的 `.px-*` 段；颜色只用主题变量。
 
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import type { Plugin, PluginResult } from "../registry";
 import { t } from "../../i18n.js";
 
-/** 宿主 `system_proxy.rs` 的 `SystemProxy`：**当前系统的真实现状**（不从我们的配置推断）。 */
-interface SystemProxy {
-  enabled: boolean;
-  server: string;
-  bypass: string;
-}
+/** 服务（系统代理）开/关变化 —— 搜索区状态栏的「代理:开/关」泡泡框据此更新。 */
+const PROXY_STATE_EVENT = "proxy-service-state";
 
-/** 宿主 `ProxyEntry`。 */
 interface ProxyEntry {
   id: string;
   label: string;
@@ -42,12 +31,26 @@ interface ProxyEntry {
   bypass: string;
 }
 
-/** 宿主 `ProxyConfig`（`config\proxy.json`）。`backup` 不往界面上带（那是宿主的兜底）。
- *
- *  `mihomo`（2026-10-03）**可选**：旧配置里没有这个键；而列表类操作（增删条目）走的是
- *  `proxy_config_set`，那个命令在宿主侧会**整体继承**磁盘上的 `mihomo` —— 这里不必回传，
- *  也就不必为它构造对象（见 system_proxy.rs 的 `proxy_config_set`）。
- */
+interface MihomoSubscription {
+  name: string;
+  url: string;
+}
+
+/** 宿主 `MihomoConfig`（`config\proxy.json` 的 `mihomo` 段）。 */
+interface MihomoConfig {
+  enabled: boolean;
+  mixed_port: number;
+  controller_port: number;
+  mode: string;
+  subscriptions: MihomoSubscription[];
+  tun: boolean;
+  engine: string;
+  /** 规则名单语义：`blacklist`（名单直连）/ `whitelist`（名单强制代理）。 */
+  rule_mode?: string;
+  /** 规则名单域名（一行一个）。 */
+  rule_domains?: string[];
+}
+
 interface ProxyConfig {
   entries: ProxyEntry[];
   active: string;
@@ -55,60 +58,84 @@ interface ProxyConfig {
   mihomo?: MihomoConfig;
 }
 
-/** 宿主 `MihomoConfig`。`secret` / `links` **刻意不在界面类型里** ——
- *  前者是本机控制口的凭据（前端不该看到），后者本轮未支持（见 mihomo.rs 模块头）。 */
-interface MihomoSubscription {
-  name: string;
-  url: string;
-}
-interface MihomoConfig {
-  enabled: boolean;
-  mixed_port: number;
-  controller_port: number;
-  mode: string;
-  subscriptions: MihomoSubscription[];
-  release_base: string;
-  tun: boolean;
-}
-
-/** 宿主 `MihomoStatus`。 */
+/** 宿主 `MihomoStatus`（2026-11-01 起带流量 / 连接 / 选中项）。 */
 interface MihomoStatus {
   installed: boolean;
+  /** **引擎**是否在跑（打开面板就会静默拉起，测延迟靠它）。 */
   running: boolean;
+  /** **服务**（系统代理）是否开启 —— 开关与状态泡泡框看这个。 */
+  enabled: boolean;
   version: string;
   mixed_port: number;
   controller_port: number;
   config_path: string;
   log_path: string;
   subscriptions: number;
+  nodes: { index: number; name: string; kind: string }[];
+  engine: string;
+  mode: string;
+  tun: boolean;
+  bytes_up: number;
+  bytes_down: number;
+  connections: number;
+  active: number;
+  selected: string;
 }
 
-/** 宿主 `mihomo_proxies()` 的一项（节点或组）。 */
-interface MihomoProxy {
+/** 宿主 `native_proxy::ServerView`。 */
+interface ServerView {
+  index: number;
   name: string;
-  type: string;
-  is_group: boolean;
-  now: string;
-  all: string[];
-  history: { time: string; delay: number }[];
+  kind: string;
+  server: string;
+  port: number;
+  transport: string;
+  source: string;
+  selected: boolean;
+}
+
+/** 宿主 `native_proxy::RequestView`。 */
+interface RequestView {
+  ts: string;
+  host: string;
+  port: number;
+  via: string;
+  node: string;
+}
+
+interface ExitInfo {
+  ok: boolean;
+  ip: string;
+  country: string;
+  region: string;
+  city: string;
+  error: string;
 }
 
 // ── 模块级状态 ────────────────────────────────────────────────────
-// 这份状态**只服务一个面板实例**（接管型面板同时只有一个），所以模块级足够，
-// 不必再套一层闭包。`detach` 时清掉，下次打开就是干净的。
+// 接管型面板同时只有一个实例，模块级足够；`detach()` 清空。
 
 let cfg: ProxyConfig | null = null;
-let sys: SystemProxy | null = null;
-/** 内核状态（安装 / 运行 / 端口）。`null` = 还没问到。 */
-let mstatus: MihomoStatus | null = null;
-/** 内核里的节点与组（只在运行时可取；没跑就是空表）。 */
-let mproxies: MihomoProxy[] = [];
-/** 内核区块自己的防重入（与列表的 `busy` 分开：两者可以并存，互不阻塞）。 */
-let mbusy = false;
-/** 防重入：一次「启用/停用」里有两次 IPC（系统代理 + 联动），期间按钮要禁用。 */
+let st: MihomoStatus | null = null;
+let servers: ServerView[] = [];
+let requests: RequestView[] = [];
+let exitInfo: ExitInfo | null = null;
 let busy = false;
-/** 头像一次性提示。**它不是状态** —— `renderPanel` 不读它，只负责按时抹掉。 */
 let msgTimer: number | undefined;
+let statusTimer: number | undefined;
+let logTimer: number | undefined;
+let exitTimer: number | undefined;
+let lastSample: { t: number; up: number; down: number } | null = null;
+let drawerOpen = false;
+let activePanel = "";
+let logHeight = 190;
+const KINDS = ["ss", "trojan", "vless", "vmess", "anytls", "hysteria2"] as const;
+const CIPHERS = ["aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305"] as const;
+let kindPick = "ss";
+let cipherPick = "aes-256-gcm";
+/** 节点名 → 延迟（毫秒）；`NaN` = 测试中，`-1` = 失败，缺省 = 还没测。 */
+let delays = new Map<string, number>();
+let delayBusy = false;
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -118,39 +145,42 @@ function q<T extends HTMLElement>(sel: string): T | null {
   return document.querySelector<T>(sel);
 }
 
-/** 一条一次性提示（面板底部那行小字），3 秒后自己抹掉。 */
-function note(text: string) {
-  const el = q<HTMLElement>("#proxy-msg");
+function note(text: string): void {
+  const el = q<HTMLElement>("#px-msg");
   if (!el) return;
   el.textContent = text;
   if (msgTimer !== undefined) window.clearTimeout(msgTimer);
   msgTimer = window.setTimeout(() => {
-    const cur = q<HTMLElement>("#proxy-msg");
+    const cur = q<HTMLElement>("#px-msg");
     if (cur) cur.textContent = "";
     msgTimer = undefined;
-  }, 3000);
+  }, 4000);
 }
 
-function newId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+function fmtBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
 
-/** 前端这一层的**即时反馈**校验；**权威判据仍在宿主**（`validate_server` / `proxy_enable`）。
- *  这里做一遍只是「别让用户敲完等一个来回才被告知少了个端口」—— 两层都要有，不是重复。 */
-function validateServer(server: string): string | null {
-  // 判的是 **trim 之后**的值（提交时也会 trim）：首尾空白是手抖，不是非法
-  const s = server.trim();
-  if (!s) return t("proxy.err_empty");
-  if (/\s/.test(s)) return t("proxy.err_space");
-  if (!s.includes(":")) return t("proxy.err_port");
-  return null;
+function fmtSpeed(bps: number): string {
+  return `${fmtBytes(bps)}/s`;
 }
 
-/** `http(s)://` 才算「能给 librespot 用」的那一类（见 music.rs 的 `validate_librespot_proxy`）。
- *  界面据此在行内标一句提示 —— 否则用户会开一个 socks5 的联动、然后对着「没反应」发愁。 */
-function isHttpProxy(server: string): boolean {
-  const s = server.trim().toLowerCase();
-  return s.startsWith("http://") || s.startsWith("https://");
+function hhmmss(ts: string): string {
+  // 宿主写的是 UTC；面板显示**本地时间**（用户看日志时不换算时区）。
+  const d = new Date(ts);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleTimeString([], { hour12: false });
+  }
+  const m = ts.match(/T(\d{2}:\d{2}:\d{2})/);
+  return m ? m[1] : ts.replace("T", " ").replace("Z", "");
 }
 
 // ── 取数 ──────────────────────────────────────────────────────────
@@ -158,558 +188,808 @@ function isHttpProxy(server: string): boolean {
 async function refresh(): Promise<void> {
   try {
     cfg = await invoke<ProxyConfig>("proxy_config_get");
+    st = await invoke<MihomoStatus>("mihomo_status");
+    servers = await invoke<ServerView[]>("mihomo_servers").catch(() => []);
   } catch (e) {
     note(String(e));
     return;
   }
-  try {
-    // 真实现状：用户可能刚在「Internet 选项」里改过，所以**不能**从 cfg.active 推
-    sys = await invoke<SystemProxy>("proxy_system_get");
-  } catch {
-    sys = null;
+  if (st?.running) {
+    void refreshExit();
+    startPolling();
+  } else {
+    stopPolling();
+    exitInfo = null;
+    lastSample = null;
   }
-  await refreshMihomo();
-  renderPanel();
+  render();
+  broadcastServiceState();
 }
 
-/** 内核那半边取数。**节点列表只在运行时才问** —— 没跑就去问 Clash API 必然失败，
- *  而那个失败没有任何信息量（只是「内核没起来」的另一种说法）。 */
-async function refreshMihomo(): Promise<void> {
+/** 把「服务开/关」广播给主窗状态栏（泡泡框）。失败无所谓：状态栏自己也会在启动时读一次。 */
+function broadcastServiceState(): void {
+  void emit(PROXY_STATE_EVENT, { enabled: !!st?.enabled }).catch(() => {});
+}
+
+async function refreshExit(): Promise<void> {
   try {
-    mstatus = await invoke<MihomoStatus>("mihomo_status");
+    exitInfo = await invoke<ExitInfo>("mihomo_exit_info");
   } catch {
-    mstatus = null;
+    exitInfo = null;
   }
-  if (mstatus?.running) {
-    try {
-      mproxies = await invoke<MihomoProxy[]>("mihomo_proxies");
-    } catch {
-      mproxies = [];
+  renderRegion();
+}
+
+function startPolling(): void {
+  if (statusTimer === undefined) {
+    statusTimer = window.setInterval(() => void pollStatus(), 1000);
+    logTimer = window.setInterval(() => void pollLog(), 2000);
+    exitTimer = window.setInterval(() => void refreshExit(), 60000);
+  }
+}
+
+function stopPolling(): void {
+  if (statusTimer !== undefined) window.clearInterval(statusTimer);
+  if (logTimer !== undefined) window.clearInterval(logTimer);
+  if (exitTimer !== undefined) window.clearInterval(exitTimer);
+  statusTimer = undefined;
+  logTimer = undefined;
+  exitTimer = undefined;
+}
+
+/** 每秒取一次状态：算速率、刷新连接数、引擎被外部停掉时同步界面。 */
+async function pollStatus(): Promise<void> {
+  try {
+    st = await invoke<MihomoStatus>("mihomo_status");
+  } catch {
+    return;
+  }
+  if (!st.running) {
+    stopPolling();
+    exitInfo = null;
+    lastSample = null;
+    render();
+    return;
+  }
+  const now = performance.now();
+  if (lastSample) {
+    const dt = (now - lastSample.t) / 1000;
+    if (dt > 0.2) {
+      const up = Math.max(0, st.bytes_up - lastSample.up) / dt;
+      const down = Math.max(0, st.bytes_down - lastSample.down) / dt;
+      setText("#px-up", fmtSpeed(up));
+      setText("#px-down", fmtSpeed(down));
     }
-  } else {
-    mproxies = [];
   }
+  lastSample = { t: now, up: st.bytes_up, down: st.bytes_down };
+  renderState();
+}
+
+/** 每两秒取一次请求日志（宿主只保留最近 500 条）。 */
+async function pollLog(): Promise<void> {
+  try {
+    requests = await invoke<RequestView[]>("mihomo_requests", { limit: 200 });
+  } catch {
+    return;
+  }
+  renderLog();
+}
+
+function setText(sel: string, text: string): void {
+  const el = q<HTMLElement>(sel);
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 // ── 渲染 ──────────────────────────────────────────────────────────
 
-function renderPanel(): void {
+function render(): void {
   renderState();
-  renderMihomo();
-  renderList();
-  const link = q<HTMLInputElement>("#proxy-link");
-  if (link && document.activeElement !== link) link.checked = !!cfg?.link_librespot;
+  renderOrb();
+  renderMode();
+  renderTun();
+  renderServers();
+  renderLog();
+  renderRegion();
+  const portEl = q<HTMLInputElement>("#px-set-port");
+  if (portEl && document.activeElement !== portEl) {
+    portEl.value = String(cfg?.mihomo?.mixed_port ?? st?.mixed_port ?? 0);
+  }
+  setText("#px-set-engine", st?.engine === "mihomo" ? "mihomo" : "native");
+  setText("#px-set-log", st?.log_path || "—");
+  // 规则配置文件：黑/白名单开关 + 域名清单（输入中不覆写，避免打断光标）。
+  const white = (cfg?.mihomo?.rule_mode ?? "blacklist") === "whitelist";
+  const modeTgl = q<HTMLInputElement>("#px-rule-mode");
+  if (modeTgl) modeTgl.checked = white;
+  const modeLabel = q<HTMLElement>("#px-rule-mode-label");
+  if (modeLabel) {
+    modeLabel.textContent = white ? t("proxy.px_rule_whitelist") : t("proxy.px_rule_blacklist");
+  }
+  const list = q<HTMLTextAreaElement>("#px-rule-domains");
+  if (list && document.activeElement !== list) {
+    list.value = (cfg?.mihomo?.rule_domains ?? []).join("\n");
+  }
 }
 
-// ── 内核区块（mihomo，2026-10-03）──────────────────────────────────
-//
-// 这一块与下面那张「手动代理列表」是**两种互斥的用法**：要么用内核托管（订阅/测速/规则），
-// 要么手填一条现成的代理地址。界面把内核放在上面（它是主推路径），但**不强行隐藏**列表 ——
-// 「只想指向本机已有的 7890」是最常见的轻量用法，藏起来反而逼人去看一堆用不上的设置。
-
-function renderMihomo(): void {
-  const m = cfg?.mihomo;
-  const st = mstatus;
-
-  // 静态输入框回填：**只在没聚焦时**（同 `#proxy-link` 的纪律，否则用户打字打字被覆盖）
-  const backfill = (sel: string, val: string) => {
-    const el = q<HTMLInputElement>(sel);
-    if (el && document.activeElement !== el && !el.value) el.value = val;
-  };
-  if (m) {
-    backfill("#mihomo-port", String(m.mixed_port));
-    backfill("#mihomo-ctrl", String(m.controller_port));
-    backfill("#mihomo-release", m.release_base);
-  }
-
-  const stateEl = q<HTMLElement>("#mihomo-state");
-  if (stateEl) {
-    if (!st) {
-      stateEl.textContent = "";
-    } else if (!st.installed) {
-      stateEl.textContent = t("proxy.m_need_core");
-    } else if (st.running) {
-      stateEl.textContent = t("proxy.m_running", { ver: st.version, port: String(st.mixed_port) });
-    } else {
-      stateEl.textContent = t("proxy.m_stopped", { ver: st.version });
-    }
-    stateEl.classList.toggle("warn", !!st?.installed && !st?.running);
-  }
-
-  // 主按钮：未装 → 下载；已装未跑 → 启动；在跑 → 停止
-  const actEl = q<HTMLElement>("#mihomo-actions");
-  if (actEl) {
-    const dis = mbusy ? " disabled" : "";
-    if (!st?.installed) {
-      actEl.innerHTML = `<button type="button" class="proxy-btn primary" id="mihomo-install"${dis}>${esc(t("proxy.m_install"))}</button>`;
-    } else if (st.running) {
-      actEl.innerHTML = `<button type="button" class="proxy-btn danger" id="mihomo-stop"${dis}>${esc(t("proxy.m_stop"))}</button>`;
-    } else {
-      actEl.innerHTML = `<button type="button" class="proxy-btn primary" id="mihomo-start"${dis}>${esc(t("proxy.m_start"))}</button>`;
-    }
-    if (mbusy) {
-      const busy = document.createElement("span");
-      busy.className = "proxy-row-note";
-      busy.textContent = t("proxy.m_working");
-      actEl.appendChild(busy);
-    }
-  }
-
-  // 模式分段：把当前 mode 那一格点亮（2026-10-06 由原生 `<select>` 改成自制分段控件，
-  // 与输入栏「思考开关」同一形态 —— 项目不用原生下拉，见 agent-ui-spec §5.3）
-  const modeBox = q<HTMLElement>("#mihomo-mode");
-  if (modeBox && m) {
-    modeBox.querySelectorAll<HTMLElement>("[data-mode]").forEach((b) => {
-      b.classList.toggle("on", b.dataset.mode === m.mode);
-    });
-  }
-
-  renderMihomoSubs(m);
-  renderMihomoNodes();
-}
-
-/** 订阅列表（含删除）。空表要明说「所以节点列表会是空的」—— 否则用户会以为坏了。 */
-function renderMihomoSubs(m: MihomoConfig | undefined): void {
-  const box = q<HTMLElement>("#mihomo-subs");
-  if (!box) return;
-  const subs = m?.subscriptions ?? [];
-  if (subs.length === 0) {
-    box.innerHTML = `<div class="proxy-empty">${esc(t("proxy.m_no_subs"))}</div>`;
-    return;
-  }
-  box.innerHTML = subs
-    .map(
-      (s, i) => `<div class="proxy-row" data-sub="${i}">
-      <div class="proxy-row-main">
-        <div class="proxy-row-label">${esc(s.name || t("proxy.m_unnamed"))}</div>
-        <div class="proxy-row-server">${esc(s.url)}</div>
-      </div>
-      <button type="button" class="proxy-btn danger" data-mact="sub-del"${mbusy ? " disabled" : ""}>${esc(t("proxy.del"))}</button>
-    </div>`,
-    )
-    .join("");
-}
-
-/** 节点 / 组列表（运行时才非空）。组可切换成员，节点可测速。 */
-function renderMihomoNodes(): void {
-  const box = q<HTMLElement>("#mihomo-nodes");
-  if (!box) return;
-  if (!mstatus?.running) {
-    box.innerHTML = "";
-    return;
-  }
-  if (mproxies.length === 0) {
-    box.innerHTML = `<div class="proxy-empty">${esc(t("proxy.m_no_nodes"))}</div>`;
-    return;
-  }
-  box.innerHTML = mproxies
-    .map((p) => {
-      const delay = latestDelay(p);
-      const dcls = delay === null ? "dim" : delay > 800 ? "bad" : "ok";
-      const dTxt = delay === null ? "—" : `${delay} ms`;
-      if (p.is_group) {
-        // 组的成员是**分段按钮**（不是原生下拉，2026-10-06）：候选少、点一下即切，比下拉快。
-        // 每次重绘整批换掉 ⇒ 点击仍走 `#mihomo-nodes` 上的委托（同本文件其它列表）。
-        const picks = [...p.all]
-          .map(
-            (n) =>
-              `<button type="button" class="proxy-seg-btn${n === p.now ? " on" : ""}" data-group-pick="${esc(n)}"${mbusy ? " disabled" : ""}>${esc(n)}</button>`,
-          )
-          .join("");
-        return `<div class="proxy-row proxy-row-group" data-group="${esc(p.name)}">
-          <div class="proxy-row-main">
-            <div class="proxy-row-label">${esc(p.name)}<span class="proxy-tag">${esc(p.type)}</span></div>
-            <div class="proxy-seg proxy-seg-wrap">${picks}</div>
-          </div>
-        </div>`;
-      }
-      return `<div class="proxy-row" data-node="${esc(p.name)}">
-        <div class="proxy-row-main">
-          <div class="proxy-row-label">${esc(p.name)}<span class="proxy-tag">${esc(p.type)}</span></div>
-        </div>
-        <span class="proxy-delay ${dcls}">${esc(dTxt)}</span>
-        <button type="button" class="proxy-btn" data-mact="delay" data-name="${esc(p.name)}"${mbusy ? " disabled" : ""}>${esc(t("proxy.m_test"))}</button>
-      </div>`;
-    })
-    .join("");
-}
-
-/** 最近一次测速结果（Clash 的 history 最后一项）；没有就是 null。 */
-function latestDelay(p: MihomoProxy): number | null {
-  const h = p.history;
-  if (!Array.isArray(h) || h.length === 0) return null;
-  const last = h[h.length - 1];
-  const d = Number(last?.delay);
-  return Number.isFinite(d) && d > 0 ? d : null;
-}
-
-/** 顶部那行「系统里到底是什么样」。**差异要如实说出来** —— 「配置里启用了、系统里没生效」
- *  正是组策略把我们的写入压回去时的样子，瞒着它比报错更糟。 */
 function renderState(): void {
-  const el = q<HTMLElement>("#proxy-state");
+  const el = q<HTMLElement>("#px-state");
   if (!el) return;
-  if (!sys) {
+  if (!st) {
     el.textContent = "";
     return;
   }
-  const activeEntry = cfg?.entries.find((e) => e.id === cfg?.active);
-  if (!sys.enabled) {
-    el.textContent = t("proxy.state_off");
-  } else {
-    el.textContent = t("proxy.state_on", { server: sys.server });
-  }
-  el.classList.toggle("warn", !sys.enabled && !!activeEntry);
-  if (!sys.enabled && activeEntry) {
-    const name = activeEntry.label || activeEntry.server;
-    el.textContent += "  " + t("proxy.state_mismatch", { label: name });
-  }
-}
-
-function renderList(): void {
-  const box = q<HTMLElement>("#proxy-list");
-  if (!box) return;
-  const entries = cfg?.entries ?? [];
-  if (entries.length === 0) {
-    box.innerHTML = `<div class="proxy-empty">${esc(t("proxy.empty"))}</div>`;
+  const legacy = st.engine === "mihomo";
+  // 「引擎在跑」不再等于「服务开着」：打开面板会静默拉起引擎（测延迟用），
+  // 系统代理仍可以是关的（2026-11-03）。
+  const on = !!st.enabled;
+  el.classList.toggle("warn", legacy || !st.running);
+  if (legacy) {
+    el.textContent = t("proxy.m_legacy_engine");
     return;
   }
-  box.innerHTML = entries
-    .map((e) => {
-      const active = cfg?.active === e.id;
-      const socks = !isHttpProxy(e.server);
-      return `<div class="proxy-row${active ? " on" : ""}" data-id="${esc(e.id)}">
-        <div class="proxy-row-main">
-          <div class="proxy-row-label">${esc(e.label || e.server)}${active ? `<span class="proxy-tag">${esc(t("proxy.in_use"))}</span>` : ""}</div>
-          <div class="proxy-row-server">${esc(e.server)}${socks ? `<span class="proxy-row-note">${esc(t("proxy.socks_note"))}</span>` : ""}</div>
-        </div>
-        <button type="button" class="proxy-btn${active ? "" : " primary"}" data-act="${active ? "disable" : "enable"}"${busy ? " disabled" : ""}>${esc(active ? t("proxy.disable") : t("proxy.enable"))}</button>
-        <button type="button" class="proxy-btn danger" data-act="del"${busy ? " disabled" : ""}>${esc(t("proxy.del"))}</button>
+  el.textContent = !st.running
+    ? t("proxy.px_state_stopped")
+    : on
+      ? t("proxy.px_state_running", { port: String(st.mixed_port) })
+      : t("proxy.px_state_ready", { port: String(st.mixed_port) });
+}
+
+function renderOrb(): void {
+  const orb = q<HTMLButtonElement>("#px-orb");
+  if (!orb) return;
+  const legacy = st?.engine === "mihomo";
+  // 大字按钮 = **服务**开关（系统代理），不是引擎开关：引擎由面板静默拉起。
+  const on = !!st?.enabled;
+  orb.disabled = busy || !st || legacy;
+  orb.textContent = busy
+    ? t("proxy.m_working")
+    : on
+      ? t("proxy.px_orb_stop")
+      : t("proxy.px_orb_start");
+  orb.dataset.state = on ? "running" : "stopped";
+  orb.classList.toggle("legacy", legacy);
+}
+
+function renderMode(): void {
+  const label = q<HTMLElement>("#px-mode-label");
+  if (!label) return;
+  // 面板只给两档（2026-11-02 用户口径）：规则模式 / 全局代理。
+  // 旧配置里的 `direct` 不再有入口，按规则模式展示（引擎仍按配置执行）。
+  const mode = (cfg?.mihomo?.mode ?? st?.mode ?? "rule") === "global" ? "global" : "rule";
+  label.textContent = mode === "global" ? t("proxy.px_mode_global") : t("proxy.px_mode_rule");
+  document.querySelectorAll<HTMLElement>("#px-mode-menu [data-mode]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.mode === mode);
+  });
+}
+
+function renderTun(): void {
+  const tgl = q<HTMLInputElement>("#px-tun");
+  if (tgl) tgl.checked = !!st?.tun;
+}
+
+function renderRegion(): void {
+  const el = q<HTMLElement>("#px-region");
+  if (!el) return;
+  const node = st?.selected || "";
+  const src = servers.find((s) => s.name === node)?.source || "";
+  if (!st?.running) {
+    el.textContent = t("proxy.px_region_idle");
+    return;
+  }
+  const where = exitInfo?.ok
+    ? [exitInfo.country, exitInfo.region, exitInfo.city, exitInfo.ip].filter(Boolean).join(" · ")
+    : t("proxy.px_region_unknown");
+  el.textContent = [where, node ? `${src ? `${src} / ` : ""}${node}` : ""]
+    .filter(Boolean)
+    .join("　");
+}
+
+function renderServers(): void {
+  const box = q<HTMLElement>("#px-servers");
+  if (!box) return;
+  if (servers.length === 0) {
+    box.innerHTML = `<div class="px-empty">${esc(t("proxy.px_server_empty"))}</div>`;
+    return;
+  }
+  const running = !!st?.running;
+  box.innerHTML = servers
+    .map((s) => {
+      const ms = delays.get(s.name);
+      const delay =
+        ms === undefined
+          ? ""
+          : Number.isNaN(ms)
+            ? `<span class="px-delay pending">…</span>`
+            : ms < 0
+              ? `<span class="px-delay bad" title="${esc(t("proxy.px_delay_failed"))}">×</span>`
+              : `<span class="px-delay${ms <= 150 ? " fast" : ms >= 400 ? " slow" : ""}">${Math.round(ms)} ms</span>`;
+      return `<button type="button" class="px-server${s.selected ? " on" : ""}" data-server="${esc(s.name)}"${running ? "" : " disabled"}>
+        <span class="px-server-main">
+          <span class="px-server-name">${esc(s.name || t("proxy.m_unnamed"))}</span>
+          <span class="px-server-sub">${esc(s.server)}:${s.port}　${esc(s.transport)}</span>
+        </span>
+        <span class="px-server-side">
+          ${delay}
+          <span class="px-tag">${esc(s.kind)}</span>
+          <span class="px-server-src">${esc(s.source || t("proxy.px_manual"))}</span>
+        </span>
+      </button>`;
+    })
+    .join("");
+}
+
+function renderLog(): void {
+  const box = q<HTMLElement>("#px-log-list");
+  if (!box) return;
+  if (requests.length === 0) {
+    box.innerHTML = `<div class="px-empty">${esc(t("proxy.px_log_empty"))}</div>`;
+    return;
+  }
+  const srcOf = new Map(servers.map((s) => [s.name, s.source]));
+  box.innerHTML = [...requests]
+    .reverse()
+    .map((r) => {
+      const src = r.node ? srcOf.get(r.node) || "" : "";
+      const via =
+        r.via === "proxy"
+          ? [src, r.node].filter(Boolean).join(" / ")
+          : r.via === "direct"
+            ? t("proxy.px_via_direct")
+            : t("proxy.px_via_reject");
+      return `<div class="px-log-row" data-via="${esc(r.via)}">
+        <span class="px-log-ts">${esc(hhmmss(r.ts))}</span>
+        <span class="px-log-host" title="${esc(`${r.host}:${r.port}`)}">${esc(r.host)}<span class="px-log-port">:${r.port}</span></span>
+        <span class="px-log-via">${esc(via)}</span>
       </div>`;
     })
     .join("");
+}
+
+// ── 抽屉 / 面板 ────────────────────────────────────────────────────
+
+function setDrawer(open: boolean): void {
+  drawerOpen = open;
+  const drawer = q<HTMLElement>("#px-drawer");
+  drawer?.classList.toggle("open", open);
+  const rail = q<HTMLElement>("#px-rail");
+  rail?.classList.toggle("hidden", open);
+  // 拉回拉手只在抽屉展开时出现（与「服务器」拉手互斥，位置相同）。
+  q<HTMLElement>("#px-drawer-close")?.classList.toggle("hidden", !open);
+}
+
+function openPanel(name: string): void {
+  activePanel = name;
+  const layer = q<HTMLElement>("#px-layer");
+  layer?.classList.remove("hidden");
+  document.querySelectorAll<HTMLElement>(".px-panel").forEach((p) => {
+    p.classList.toggle("hidden", p.dataset.panel !== name);
+  });
+}
+
+function closePanel(): void {
+  activePanel = "";
+  q<HTMLElement>("#px-layer")?.classList.add("hidden");
+}
+
+function closeMenus(): void {
+  document.querySelectorAll<HTMLElement>("#px-tools .px-tool").forEach((el) => el.classList.remove("open"));
 }
 
 // ── 动作 ──────────────────────────────────────────────────────────
 
-/** 把「这条 server」同步给本机播放（联动开着时才调）。**空串 = 回直连**。 */
-async function syncLibrespot(server: string): Promise<void> {
-  try {
-    await invoke("librespot_set_proxy", { proxy: server });
-  } catch (e) {
-    // 失败要说出来：宿主那条命令会挡住 socks5 / 缺 scheme 这类值，
-    // 而「系统代理开了、本机播放其实没走」是最难被发现的一种半生效。
-    note(t("proxy.err_librespot", { err: String(e) }));
-  }
-}
-
-async function doEnable(id: string): Promise<void> {
-  const entry = cfg?.entries.find((e) => e.id === id);
-  if (!entry || busy) return;
-  busy = true;
-  renderList();
-  try {
-    sys = await invoke<SystemProxy>("proxy_enable", { id });
-  } catch (e) {
-    busy = false;
-    note(String(e));
-    renderList();
-    return;
-  }
-  busy = false;
-  if (cfg?.link_librespot) await syncLibrespot(entry.server);
-  if (!sys.enabled) note(t("proxy.err_not_applied"));
-  await refresh();
-}
-
-async function doDisable(): Promise<void> {
+async function act(fn: () => Promise<void>): Promise<void> {
   if (busy) return;
   busy = true;
-  renderList();
-  try {
-    sys = await invoke<SystemProxy>("proxy_disable");
-  } catch (e) {
-    busy = false;
-    note(String(e));
-    renderList();
-    return;
-  }
-  busy = false;
-  // 联动开着：关闭代理 = 本机播放也回直连（这是那个开关的字面意思，界面文案里写了）
-  if (cfg?.link_librespot) await syncLibrespot("");
-  await refresh();
-}
-
-async function doDelete(id: string): Promise<void> {
-  if (!cfg || busy) return;
-  // 删的正好是启用中的那条：**先停代理再删** —— 不然系统里会留着一条指向已删条目的
-  // 代理，而界面上再也找不到「停用」那个按钮（只能去系统设置里关）。
-  if (cfg.active === id) {
-    await doDisable();
-    if (!cfg) return;
-  }
-  const next: ProxyConfig = {
-    entries: cfg.entries.filter((e) => e.id !== id),
-    active: cfg.active === id ? "" : cfg.active,
-    link_librespot: cfg.link_librespot,
-  };
-  try {
-    cfg = await invoke<ProxyConfig>("proxy_config_set", { config: next });
-    note(t("proxy.removed"));
-  } catch (e) {
-    note(String(e));
-  }
-  await refresh();
-}
-
-async function doAdd(): Promise<void> {
-  if (!cfg) return;
-  const labelEl = q<HTMLInputElement>("#proxy-label");
-  const serverEl = q<HTMLInputElement>("#proxy-server");
-  const server = (serverEl?.value ?? "").trim();
-  const err = validateServer(server);
-  if (err) {
-    note(err);
-    return;
-  }
-  if (cfg.entries.some((e) => e.server.trim() === server)) {
-    note(t("proxy.err_dup"));
-    return;
-  }
-  const next: ProxyConfig = {
-    entries: [...cfg.entries, { id: newId(), label: (labelEl?.value ?? "").trim(), server, bypass: "" }],
-    active: cfg.active,
-    link_librespot: cfg.link_librespot,
-  };
-  try {
-    cfg = await invoke<ProxyConfig>("proxy_config_set", { config: next });
-    if (labelEl) labelEl.value = "";
-    if (serverEl) serverEl.value = "";
-    note(t("proxy.added"));
-  } catch (e) {
-    note(String(e));
-  }
-  await refresh();
-}
-
-/** 联动开关。**打开时立刻同步一次**（如果已有启用中的那条）—— 否则用户会以为
- *  「我开了开关，怎么本机播放还是直连」，还得再去点一次启用。 */
-async function doToggleLink(on: boolean): Promise<void> {
-  if (!cfg) return;
-  const next: ProxyConfig = { entries: cfg.entries, active: cfg.active, link_librespot: on };
-  try {
-    cfg = await invoke<ProxyConfig>("proxy_config_set", { config: next });
-  } catch (e) {
-    note(String(e));
-    await refresh();
-    return;
-  }
-  const activeEntry = cfg.entries.find((e) => e.id === cfg?.active);
-  if (on && activeEntry) await syncLibrespot(activeEntry.server);
-  if (!on) note(t("proxy.saved"));
-  renderPanel();
-}
-
-// ── 内核动作（mihomo）─────────────────────────────────────────────
-
-/** 统一收口：置忙 → 跑 → 记一条失败 → 复位 → 重取数。
- *  每个动作都走它，避免「某个动作忘了复位 mbusy 导致按钮永久禁用」这类漏。 */
-async function mihomoAct(fn: () => Promise<void>): Promise<void> {
-  if (mbusy) return;
-  mbusy = true;
-  renderMihomo();
+  renderOrb();
   try {
     await fn();
   } catch (e) {
     note(String(e));
   }
-  mbusy = false;
+  busy = false;
   await refresh();
 }
 
-/** 保存内核设置（订阅 / 端口 / 下载源）。**不动 secret / links** —— 宿主会续上旧值。 */
-async function saveMihomo(m: MihomoConfig, okKey: string): Promise<void> {
-  mstatus = await invoke<MihomoStatus>("mihomo_config_set", { cfg: m });
-  note(t(okKey));
-}
-
-async function doMihomoInstall(): Promise<void> {
-  await mihomoAct(async () => {
-    const msg = await invoke<string>("mihomo_install_core");
-    note(msg);
+async function doOrb(): Promise<void> {
+  if (!st) return;
+  await act(async () => {
+    // 只看「服务」开关：引擎可能已经为测延迟静默跑着（2026-11-03）。
+    if (st?.enabled) {
+      await invoke("mihomo_stop");
+    } else {
+      await invoke("mihomo_start");
+    }
   });
-}
-
-async function doMihomoStart(): Promise<void> {
-  await mihomoAct(async () => {
-    mstatus = await invoke<MihomoStatus>("mihomo_start");
-    // 联动开着 ⇒ 本机播放也要指到内核的混合端口（与手动启用那条同一语义）。
-    if (cfg?.link_librespot) await syncLibrespot(`http://127.0.0.1:${mstatus.mixed_port}`);
-  });
-}
-
-async function doMihomoStop(): Promise<void> {
-  await mihomoAct(async () => {
-    mstatus = await invoke<MihomoStatus>("mihomo_stop");
-    if (cfg?.link_librespot) await syncLibrespot("");
-  });
-}
-
-async function doMihomoSave(): Promise<void> {
-  const m = cfg?.mihomo;
-  if (!m) return;
-  const port = Number((q<HTMLInputElement>("#mihomo-port")?.value ?? "").trim()) || m.mixed_port;
-  const ctrl = Number((q<HTMLInputElement>("#mihomo-ctrl")?.value ?? "").trim()) || m.controller_port;
-  if (port === ctrl) {
-    note(t("proxy.m_err_same_port"));
-    return;
-  }
-  const release = (q<HTMLInputElement>("#mihomo-release")?.value ?? "").trim();
-  await mihomoAct(() =>
-    saveMihomo({ ...m, mixed_port: port, controller_port: ctrl, release_base: release }, "proxy.m_saved"),
-  );
-}
-
-async function doSubAdd(): Promise<void> {
-  const m = cfg?.mihomo;
-  if (!m || mbusy) return;
-  const nameEl = q<HTMLInputElement>("#mihomo-sub-name");
-  const urlEl = q<HTMLInputElement>("#mihomo-sub-url");
-  const url = (urlEl?.value ?? "").trim();
-  if (!/^https?:\/\//i.test(url)) {
-    note(t("proxy.m_err_url"));
-    return;
-  }
-  const name = (nameEl?.value ?? "").trim() || `sub_${m.subscriptions.length}`;
-  if (m.subscriptions.some((s) => s.url === url)) {
-    note(t("proxy.err_dup"));
-    return;
-  }
-  if (nameEl) nameEl.value = "";
-  if (urlEl) urlEl.value = "";
-  await mihomoAct(() => saveMihomo({ ...m, subscriptions: [...m.subscriptions, { name, url }] }, "proxy.m_saved"));
-}
-
-async function doSubDel(idx: number): Promise<void> {
-  const m = cfg?.mihomo;
-  if (!m) return;
-  await mihomoAct(() =>
-    saveMihomo({ ...m, subscriptions: m.subscriptions.filter((_, i) => i !== idx) }, "proxy.m_saved"),
-  );
 }
 
 async function doMode(mode: string): Promise<void> {
-  await mihomoAct(async () => {
-    mstatus = await invoke<MihomoStatus>("mihomo_set_mode", { mode });
+  // 模式在引擎启动时展开：服务开着 ⇒ 必须先关服务；服务关着但引擎为测延迟跑着 ⇒
+  // 这里静默停一下引擎、改完再拉起来（用户不需要知道引擎的存在，2026-11-03）。
+  if (st?.enabled) {
+    note(t("proxy.px_mode_running"));
+    return;
+  }
+  const wasRunning = !!st?.running;
+  try {
+    if (wasRunning) await invoke("mihomo_engine_stop");
+    try {
+      await invoke("mihomo_set_mode", { mode });
+      note(t("proxy.px_mode_saved"));
+    } catch (e) {
+      note(String(e));
+    }
+  } finally {
+    // 改失败也要把引擎拉回来，否则测延迟会莫名其妙失效。
+    if (wasRunning) await invoke("mihomo_engine_start").catch(() => {});
+  }
+  await refresh();
+}
+
+async function doTun(on: boolean): Promise<void> {
+  try {
+    const next = await invoke<MihomoStatus>("mihomo_set_tun", { enabled: on });
+    st = next;
+    note(on ? t("proxy.px_tun_on") : t("proxy.px_tun_off"));
+  } catch (e) {
+    // 宿主如实拒绝：回弹开关并把原因显示出来（不假装已开启）。
+    note(String(e));
+  }
+  const tgl = q<HTMLInputElement>("#px-tun");
+  if (tgl) tgl.checked = !!st?.tun;
+  renderTun();
+}
+
+/** TUN 的管理员闸门：先问宿主当前是否已提权；未提权就弹独立警告框，
+ *  **同意之前不改配置**（开关回弹）。 */
+async function requestTun(on: boolean): Promise<void> {
+  const tgl = q<HTMLInputElement>("#px-tun");
+  if (!on) {
+    await doTun(false);
+    return;
+  }
+  const elevated = await invoke<boolean>("mihomo_is_elevated").catch(() => false);
+  if (elevated) {
+    await doTun(true);
+    return;
+  }
+  // 未提权：dev 与 release 的处置不同 —— dev 不能自动重启（会丢 vite），只给手动步骤。
+  if (tgl) tgl.checked = false;
+  const dev = await invoke<boolean>("mihomo_is_dev_build").catch(() => false);
+  const title = q<HTMLElement>("#px-tun-title");
+  const body = q<HTMLElement>("#px-tun-body");
+  const ok = q<HTMLButtonElement>("#px-tun-ok");
+  const cancel = q<HTMLButtonElement>("#px-tun-cancel");
+  if (title) title.textContent = dev ? t("proxy.px_tun_dev_title") : t("proxy.px_tun_warn_title");
+  if (body) body.textContent = dev ? t("proxy.px_tun_dev_body") : t("proxy.px_tun_warn_body");
+  ok?.classList.toggle("hidden", dev);
+  if (cancel) cancel.textContent = dev ? t("proxy.px_tun_dev_ok") : t("proxy.px_cancel");
+  q<HTMLElement>("#px-tun-modal")?.classList.remove("hidden");
+}
+
+async function doSelect(name: string): Promise<void> {
+  if (!st?.running) {
+    note(t("proxy.px_select_hint"));
+    return;
+  }
+  try {
+    await invoke("mihomo_select", { group: "", node: name });
+    note(t("proxy.px_selected", { name }));
+    servers = await invoke<ServerView[]>("mihomo_servers").catch(() => servers);
+    renderServers();
+    void refreshExit();
+  } catch (e) {
+    note(String(e));
+  }
+}
+
+async function doRefreshSubs(): Promise<void> {
+  try {
+    const n = await invoke<number>("mihomo_refresh_subs");
+    note(t("proxy.px_subs_updated", { n: String(n) }));
+  } catch (e) {
+    note(String(e));
+  }
+  await refresh();
+}
+
+/** 测试连通性：逐个 **经节点** 发 HTTP 探针（宿主 `mihomo_delay`），结果写进抽屉列表。 */
+async function doTestDelays(): Promise<void> {
+  if (delayBusy) return;
+  // 测延迟只需要**引擎**（本机监听口），不需要开启服务。打开面板时已经在后台静默
+  // 拉起；若还没就绪（刚打开的一瞬间 / 启动失败）这里再补一次（2026-11-03）。
+  if (!st?.running) {
+    try {
+      st = await invoke<MihomoStatus>("mihomo_engine_start");
+      servers = await invoke<ServerView[]>("mihomo_servers").catch(() => servers);
+      renderServers();
+    } catch {
+      note(t("proxy.px_delay_need_running"));
+      return;
+    }
+  }
+  const names = servers.map((s) => s.name).filter(Boolean);
+  if (names.length === 0) {
+    note(t("proxy.px_delay_no_nodes"));
+    return;
+  }
+  delayBusy = true;
+  delays = new Map(names.map((name) => [name, Number.NaN]));
+  renderDelayButton();
+  renderServers();
+  let ok = 0;
+  for (const name of names) {
+    try {
+      const ms = await invoke<number>("mihomo_delay", { name });
+      delays.set(name, ms);
+      ok++;
+    } catch {
+      delays.set(name, -1);
+    }
+    renderServers();
+  }
+  delayBusy = false;
+  renderDelayButton();
+  note(t("proxy.px_delay_done", { ok: String(ok), n: String(names.length) }));
+}
+
+/** 工具区按钮在测速期间置灰并换文案。 */
+function renderDelayButton(): void {
+  const btn = q<HTMLButtonElement>("#px-delay-btn");
+  if (!btn) return;
+  btn.disabled = delayBusy;
+  btn.textContent = delayBusy ? t("proxy.px_delay_testing") : t("proxy.px_tool_delay");
+}
+
+/** 打开面板时**静默拉起引擎**（只开本机监听口，不碰系统代理、不改服务开关）。
+ *  这样用户不必先「开启服务」就能测节点延迟（2026-11-03）。失败不打扰用户 ——
+ *  面板照常显示，测延迟点下去会按节点如实报错。 */
+async function ensureEngine(): Promise<void> {
+  try {
+    await invoke<MihomoStatus>("mihomo_engine_start");
+    // 引擎起来后节点清单才完整（订阅在启动时拉平），轮询也才有意义。
+    await refresh();
+  } catch (e) {
+    console.warn("[proxy] engine auto-start failed:", e);
+  }
+}
+
+/** 保存「规则配置文件」：名单语义（黑 / 白）+ 域名清单，落到 `config\proxy.json`
+ *  的 mihomo 段。`rule` 模式下引擎把它插在订阅规则之前（见 `native_proxy::clash::build`）：
+ *  黑名单 = 名单内直连，白名单 = 名单内强制走代理。 */
+async function doSaveDomains(): Promise<void> {
+  if (!cfg?.mihomo) return;
+  const domains = (q<HTMLTextAreaElement>("#px-rule-domains")?.value ?? "")
+    .split(/\r?\n/)
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s && !s.startsWith("#") && !s.startsWith("//"));
+  const next = {
+    ...cfg.mihomo,
+    // 0 = 由宿主在启动时挑一个空闲端口（原语义保留）。
+    mixed_port: Math.max(0, Math.min(65535, Number(q<HTMLInputElement>("#px-set-port")?.value ?? "0") || 0)),
+    rule_mode: q<HTMLInputElement>("#px-rule-mode")?.checked ? "whitelist" : "blacklist",
+    rule_domains: domains,
+  };
+  try {
+    st = await invoke<MihomoStatus>("mihomo_config_set", { cfg: next });
+    note(t("proxy.px_set_saved"));
+    await refresh();
+  } catch (e) {
+    note(String(e));
+  }
+}
+
+async function doCustomAdd(): Promise<void> {
+  const name = (q<HTMLInputElement>("#px-c-name")?.value ?? "").trim();
+  const server = (q<HTMLInputElement>("#px-c-server")?.value ?? "").trim();
+  const port = Number(q<HTMLInputElement>("#px-c-port")?.value ?? "0");
+  const credential = (q<HTMLInputElement>("#px-c-cred")?.value ?? "").trim();
+  if (!server || !port || !credential) {
+    note(t("proxy.px_custom_required"));
+    return;
+  }
+  try {
+    st = await invoke<MihomoStatus>("mihomo_node_add_custom", {
+      name,
+      server,
+      port,
+      kind: kindPick,
+      credential,
+      cipher: kindPick === "ss" ? cipherPick : null,
+    });
+    note(t("proxy.m_node_added"));
+    closePanel();
+    // 重建服务器缓存（引擎在跑时宿主会拒绝，属预期：新节点随下次启动生效）。
+    await invoke("mihomo_refresh_subs").catch(() => {});
+    await refresh();
+  } catch (e) {
+    note(String(e));
+  }
+}
+
+async function readClipboard(): Promise<string> {
+  const { readText } = await import("@tauri-apps/plugin-clipboard-manager");
+  const text = await readText();
+  return text ?? "";
+}
+
+async function doPasteRead(): Promise<void> {
+  try {
+    const text = await readClipboard();
+    const area = q<HTMLTextAreaElement>("#px-paste-text");
+    if (area) area.value = text;
+    if (!text.trim()) note(t("proxy.px_paste_empty"));
+  } catch (e) {
+    note(String(e));
+  }
+}
+
+async function doPasteImport(): Promise<void> {
+  const text = q<HTMLTextAreaElement>("#px-paste-text")?.value ?? "";
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  if (lines.length === 0) {
+    note(t("proxy.px_paste_empty"));
+    return;
+  }
+  let ok = 0;
+  let fail = 0;
+  for (const link of lines) {
+    try {
+      await invoke("mihomo_node_add", { link });
+      ok++;
+    } catch {
+      fail++;
+    }
+  }
+  note(t("proxy.px_paste_done", { ok: String(ok), fail: String(fail) }));
+  if (ok > 0) closePanel();
+  if (ok > 0) await invoke("mihomo_refresh_subs").catch(() => {});
+  await refresh();
+}
+
+// ── 日志区高度（拖拽 + 折叠，持久化）────────────────────────────────
+
+function applyLogHeight(): void {
+  const root = q<HTMLElement>(".proxy-panel");
+  if (!root) return;
+  root.style.setProperty("--px-log-h", `${logHeight}px`);
+}
+
+function loadLogPrefs(): void {
+  try {
+    const h = Number(localStorage.getItem("lunac.proxy.logHeight"));
+    if (Number.isFinite(h) && h >= 80 && h <= 480) logHeight = h;
+  } catch {
+    /* localStorage 不可用时用默认值 */
+  }
+}
+
+function saveLogPrefs(): void {
+  try {
+    localStorage.setItem("lunac.proxy.logHeight", String(Math.round(logHeight)));
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function wireLogResize(): void {
+  const handle = q<HTMLElement>("#px-log-handle");
+  const panel = q<HTMLElement>(".proxy-panel");
+  if (!handle || !panel) return;
+  let startY = 0;
+  let startH = 0;
+  let dragging = false;
+  // 上限按**面板总高**算，并给中间区留 220px（168px 大按钮 + 速度 / 地区 / 底部控件）。
+  // 不能用 `stage.clientHeight`：拖到一半 stage 变小会把上限一起拉低（越拖越拖不动）；
+  // 也不能留 360px —— 小窗口下上限直接跌到下限，表现为「拉不动」。
+  const maxLogHeight = (): number => {
+    const top = q<HTMLElement>(".px-top")?.offsetHeight ?? 50;
+    const msg = q<HTMLElement>("#px-msg")?.offsetHeight ?? 0;
+    return Math.max(96, panel.clientHeight - top - msg - 220 - 24);
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", stop);
+    window.removeEventListener("blur", stop);
+    saveLogPrefs();
+  };
+  const onMove = (ev: MouseEvent) => {
+    if (!dragging) return;
+    // 按键已经松开（鼠标在窗口外抬起时收不到 mouseup）：就地收尾，下一次还能拖。
+    if ((ev.buttons & 1) === 0) {
+      stop();
+      return;
+    }
+    logHeight = Math.min(maxLogHeight(), Math.max(80, startH + (startY - ev.clientY)));
+    applyLogHeight();
+    ev.preventDefault();
+  };
+  // **只用 mouse 事件**（2026-11-02 第三次修复）：WebView2 在 pointerdown 之后可能因原生
+  // 选择 / 拖拽发出 `pointercancel`，把同一段拖动提前结束 —— 表现正是「指针变成 ns-resize
+  // 但高度不跟」。鼠标输入在 Chromium 里一定有兼容 mouse 事件，这条链路不经过 pointer 流。
+  handle.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    startY = ev.clientY;
+    startH = logHeight;
+    dragging = true;
+    // 先移除再挂：上一轮若在窗口外松开（收不到 mouseup），这里立刻恢复。
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", stop);
+    window.removeEventListener("blur", stop);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", stop);
+    window.addEventListener("blur", stop);
   });
-}
-
-async function doDelay(name: string): Promise<void> {
-  if (mbusy) return;
-  mbusy = true;
-  renderMihomoNodes();
-  try {
-    const ms = await invoke<number>("mihomo_delay", { name });
-    note(t("proxy.m_delay_ok", { name, ms: String(ms) }));
-  } catch (e) {
-    note(String(e));
-  }
-  mbusy = false;
-  await refreshMihomo();
-  renderMihomoNodes();
-}
-
-async function doSelect(group: string, node: string): Promise<void> {
-  if (mbusy) return;
-  mbusy = true;
-  try {
-    await invoke("mihomo_select", { group, node });
-  } catch (e) {
-    note(String(e));
-  }
-  mbusy = false;
-  await refreshMihomo();
-  renderMihomoNodes();
-}
-
-async function doMihomoLog(): Promise<void> {
-  try {
-    const text = await invoke<string>("mihomo_log");
-    const pre = q<HTMLElement>("#mihomo-log");
-    if (pre) pre.textContent = text || t("proxy.m_log_empty");
-  } catch (e) {
-    note(String(e));
-  }
 }
 
 // ── 面板 HTML ─────────────────────────────────────────────────────
 
+function kindsHtml(): string {
+  return KINDS.map(
+    (k) => `<button type="button" class="px-chip${k === kindPick ? " on" : ""}" data-kind="${k}">${k}</button>`,
+  ).join("");
+}
+
+function ciphersHtml(): string {
+  return CIPHERS.map(
+    (c) => `<button type="button" class="px-chip${c === cipherPick ? " on" : ""}" data-cipher="${c}">${c}</button>`,
+  ).join("");
+}
+
 function panelHtml(): string {
   return `<div class="plugin-result proxy-panel">
-  <div class="proxy-head">
-    <div class="proxy-title">${esc(t("proxy.title"))}</div>
-    <div class="proxy-state" id="proxy-state"></div>
+  <header class="px-top">
+    <div class="px-brand">${esc(t("proxy.title"))}</div>
+    <nav class="px-tools" id="px-tools">
+      <div class="px-tool-group">
+        <div class="px-tool">
+          <button type="button" class="px-tool-btn" data-tool="import">${esc(t("proxy.px_tool_import"))}<span class="px-caret">▾</span></button>
+          <div class="px-menu">
+            <button type="button" data-open="custom">${esc(t("proxy.px_import_custom"))}</button>
+            <button type="button" data-open="paste">${esc(t("proxy.px_import_paste"))}</button>
+          </div>
+        </div>
+        <div class="px-tool">
+          <button type="button" class="px-tool-btn" data-action="refresh-subs">${esc(t("proxy.px_tool_subs"))}</button>
+        </div>
+        <div class="px-tool">
+          <button type="button" class="px-tool-btn" id="px-delay-btn" data-action="delay">${esc(t("proxy.px_tool_delay"))}</button>
+        </div>
+        <div class="px-tool">
+          <button type="button" class="px-tool-btn" data-open="settings">${esc(t("proxy.px_tool_settings"))}</button>
+        </div>
+      </div>
+    </nav>
+    <div class="px-state" id="px-state"></div>
+  </header>
+
+  <section class="px-stage" id="px-stage">
+    <div class="px-center">
+      <button type="button" class="px-orb" id="px-orb" data-state="stopped">${esc(t("proxy.px_orb_start"))}</button>
+      <div class="px-speeds">
+        <span class="px-speed"><span class="px-speed-label">↑</span><b id="px-up">0 B/s</b></span>
+        <span class="px-speed"><span class="px-speed-label">↓</span><b id="px-down">0 B/s</b></span>
+      </div>
+      <div class="px-region" id="px-region"></div>
+      <div class="px-controls">
+        <div class="px-tool px-mode">
+          <button type="button" class="px-tool-btn" id="px-mode-btn">
+            <span id="px-mode-label">${esc(t("proxy.px_mode_rule"))}</span><span class="px-caret">▾</span>
+          </button>
+          <div class="px-menu up" id="px-mode-menu">
+            <button type="button" data-mode="rule">${esc(t("proxy.px_mode_rule"))}</button>
+            <button type="button" data-mode="global">${esc(t("proxy.px_mode_global"))}</button>
+          </div>
+        </div>
+        <label class="px-tun" title="${esc(t("proxy.px_tun_hint"))}">
+          <span>${esc(t("proxy.px_tun"))}</span>
+          <input type="checkbox" id="px-tun" />
+          <i class="px-switch"></i>
+        </label>
+      </div>
+    </div>
+
+    <button type="button" class="px-rail" id="px-rail" title="${esc(t("proxy.px_drawer_open"))}">${esc(t("proxy.px_drawer_open"))}</button>
+    <aside class="px-drawer" id="px-drawer">
+      <div class="px-drawer-head">
+        <b>${esc(t("proxy.px_drawer_title"))}</b>
+      </div>
+      <div class="px-drawer-list" id="px-servers"></div>
+    </aside>
+    <!-- 拉回：与左侧「服务器」拉手同一形状（竖向贴在左缘），只是高度 60 且用 < 图标 -->
+    <button type="button" class="px-rail px-rail-close hidden" id="px-drawer-close" title="${esc(t("proxy.px_drawer_close"))}" aria-label="${esc(t("proxy.px_drawer_close"))}">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+    </button>
+  </section>
+
+  <section class="px-log" id="px-log">
+    <div class="px-log-handle" id="px-log-handle" title="${esc(t("proxy.px_log_resize"))}"></div>
+    <div class="px-log-head">
+      <b>${esc(t("proxy.px_log_title"))}</b>
+      <span class="px-log-hint">${esc(t("proxy.px_log_hint"))}</span>
+    </div>
+    <div class="px-log-list" id="px-log-list"></div>
+  </section>
+
+  <div class="px-msg" id="px-msg"></div>
+
+  <!-- TUN 的管理员闸门：独立警告框，同意后才请求提权重启。 -->
+  <div class="px-modal hidden" id="px-tun-modal">
+    <div class="px-modal-card">
+      <b id="px-tun-title">${esc(t("proxy.px_tun_warn_title"))}</b>
+      <p id="px-tun-body">${esc(t("proxy.px_tun_warn_body"))}</p>
+      <div class="px-modal-btns">
+        <button type="button" class="px-btn" id="px-tun-cancel">${esc(t("proxy.px_cancel"))}</button>
+        <button type="button" class="px-btn primary" id="px-tun-ok">${esc(t("proxy.px_tun_elevate"))}</button>
+      </div>
+    </div>
   </div>
 
-  <div class="proxy-body">
-    <nav class="proxy-nav" id="proxy-nav">
-      <button type="button" class="proxy-nav-btn on" data-page="proxies">${esc(t("proxy.nav_proxies"))}</button>
-      <button type="button" class="proxy-nav-btn" data-page="subs">${esc(t("proxy.nav_subs"))}</button>
-      <button type="button" class="proxy-nav-btn" data-page="log">${esc(t("proxy.nav_log"))}</button>
-      <button type="button" class="proxy-nav-btn" data-page="settings">${esc(t("proxy.nav_settings"))}</button>
-    </nav>
+  <div class="px-layer hidden" id="px-layer">
+    <section class="px-panel hidden" data-panel="custom">
+      <div class="px-panel-head">
+        <b>${esc(t("proxy.px_import_custom"))}</b>
+        <button type="button" class="px-btn" data-close>${esc(t("proxy.px_close"))}</button>
+      </div>
+      <div class="px-form">
+        <label class="px-field"><span>${esc(t("proxy.px_field_name"))}</span>
+          <input id="px-c-name" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.m_sub_name_ph"))}" /></label>
+        <label class="px-field"><span>${esc(t("proxy.px_field_server"))}</span>
+          <input id="px-c-server" type="text" autocomplete="off" spellcheck="false" placeholder="example.com" /></label>
+        <label class="px-field small"><span>${esc(t("proxy.px_field_port"))}</span>
+          <input id="px-c-port" type="number" min="1" max="65535" placeholder="443" /></label>
+        <label class="px-field"><span>${esc(t("proxy.px_field_cred"))}</span>
+          <input id="px-c-cred" type="password" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.px_cred_ph"))}" /></label>
+        <div class="px-field wide"><span>${esc(t("proxy.px_field_kind"))}</span>
+          <div class="px-chips" id="px-kind">${kindsHtml()}</div></div>
+        <div class="px-field wide" id="px-cipher-wrap"><span>${esc(t("proxy.px_field_cipher"))}</span>
+          <div class="px-chips" id="px-cipher">${ciphersHtml()}</div></div>
+      </div>
+      <div class="px-panel-foot">
+        <button type="button" class="px-btn primary" id="px-c-add">${esc(t("proxy.px_add"))}</button>
+      </div>
+    </section>
 
-    <div class="proxy-pages">
-      <section class="proxy-page on" data-page="proxies">
-        <div class="proxy-sec-title">${esc(t("proxy.m_title"))}</div>
-        <div class="proxy-state" id="mihomo-state" title="${esc(t("proxy.m_hint"))}"></div>
-        <div class="proxy-actions" id="mihomo-actions"></div>
-        <div class="proxy-seg" id="mihomo-mode">
-          <button type="button" class="proxy-seg-btn" data-mode="rule">rule</button>
-          <button type="button" class="proxy-seg-btn" data-mode="global">global</button>
-          <button type="button" class="proxy-seg-btn" data-mode="direct">direct</button>
-        </div>
-        <div class="proxy-list" id="mihomo-nodes"></div>
-      </section>
+    <section class="px-panel hidden" data-panel="paste">
+      <div class="px-panel-head">
+        <b>${esc(t("proxy.px_import_paste"))}</b>
+        <button type="button" class="px-btn" data-close>${esc(t("proxy.px_close"))}</button>
+      </div>
+      <p class="px-note">${esc(t("proxy.px_paste_hint"))}</p>
+      <textarea id="px-paste-text" spellcheck="false" placeholder="${esc(t("proxy.px_paste_ph"))}"></textarea>
+      <div class="px-panel-foot">
+        <button type="button" class="px-btn" id="px-paste-read">${esc(t("proxy.px_paste_read"))}</button>
+        <button type="button" class="px-btn primary" id="px-paste-import">${esc(t("proxy.px_paste_import"))}</button>
+      </div>
+    </section>
 
-      <section class="proxy-page" data-page="subs">
-        <div class="proxy-list" id="mihomo-subs"></div>
-        <div class="proxy-form">
-          <input id="mihomo-sub-name" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.m_sub_name_ph"))}" />
-          <input id="mihomo-sub-url" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.m_sub_url_ph"))}" />
-          <button type="button" class="proxy-btn primary" id="mihomo-sub-add">${esc(t("proxy.m_sub_add"))}</button>
-        </div>
-      </section>
-
-      <section class="proxy-page" data-page="log">
-        <div class="proxy-form">
-          <button type="button" class="proxy-btn" id="mihomo-log-btn">${esc(t("proxy.m_log"))}</button>
-        </div>
-        <pre class="proxy-log" id="mihomo-log"></pre>
-      </section>
-
-      <section class="proxy-page" data-page="settings">
-        <div class="proxy-form">
-          <input id="mihomo-port" type="number" min="1" max="65535" autocomplete="off" placeholder="${esc(t("proxy.m_port_ph"))}" />
-          <input id="mihomo-ctrl" type="number" min="1" max="65535" autocomplete="off" placeholder="${esc(t("proxy.m_ctrl_ph"))}" />
-          <button type="button" class="proxy-btn" id="mihomo-save">${esc(t("proxy.m_save"))}</button>
-        </div>
-        <div class="proxy-form">
-          <input id="mihomo-release" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.m_release_ph"))}" />
-        </div>
-        <div class="proxy-sec-title" title="${esc(t("proxy.hint"))}">${esc(t("proxy.manual_title"))}</div>
-        <div class="proxy-list" id="proxy-list"></div>
-        <div class="proxy-form">
-          <input id="proxy-label" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.label_ph"))}" />
-          <input id="proxy-server" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(t("proxy.server_ph"))}" />
-          <button type="button" class="proxy-btn primary" id="proxy-add">${esc(t("proxy.add"))}</button>
-        </div>
-        <label class="proxy-link" title="${esc(t("proxy.link_hint"))}">
-          <input type="checkbox" id="proxy-link" />
-          <span>${esc(t("proxy.link"))}</span>
-        </label>
-        <div class="proxy-msg" id="proxy-msg"></div>
-      </section>
-    </div>
+    <section class="px-panel hidden" data-panel="settings">
+      <div class="px-panel-head">
+        <b>${esc(t("proxy.px_tool_settings"))}</b>
+        <button type="button" class="px-btn" data-close>${esc(t("proxy.px_close"))}</button>
+      </div>
+      <div class="px-setrow plain"><span><b>${esc(t("proxy.px_set_port"))}</b></span>
+        <input id="px-set-port" class="px-num" type="number" min="0" max="65535" placeholder="0" /></div>
+      <div class="px-setrow plain"><span><b>${esc(t("proxy.px_set_engine"))}</b></span><span id="px-set-engine">native</span></div>
+      <div class="px-setrow plain"><span><b>${esc(t("proxy.px_set_log"))}</b></span><span id="px-set-log" class="px-wrap">—</span></div>
+      <div class="px-setrow plain"><span><b>${esc(t("proxy.px_set_rule_profile"))}</b></span>
+        <span class="px-rule-mode">
+          <em id="px-rule-mode-label">${esc(t("proxy.px_rule_blacklist"))}</em>
+          <label class="px-tun"><input type="checkbox" id="px-rule-mode" /><i class="px-switch"></i></label>
+        </span>
+      </div>
+      <div class="px-field wide">
+        <span>${esc(t("proxy.px_rule_domains"))}</span>
+        <textarea id="px-rule-domains" rows="6" spellcheck="false"></textarea>
+      </div>
+      <div class="px-panel-foot">
+        <button type="button" class="px-btn primary" id="px-dom-save">${esc(t("proxy.px_set_save"))}</button>
+      </div>
+    </section>
   </div>
 </div>`;
 }
@@ -717,114 +997,166 @@ function panelHtml(): string {
 export const proxyPlugin: Plugin = {
   id: "proxy",
   name: "Proxy",
-  keywords: ["proxy", "代理", "系统代理", "梯子", "vpn", "socks5", "http proxy", "clash", "mihomo", "订阅", "节点"],
-  description: "系统代理管理 + mihomo 内核托管（订阅 / 测速 / 规则）+ 本机播放走代理",
+  keywords: ["proxy", "代理", "系统代理", "梯子", "vpn", "socks5", "http proxy", "订阅", "节点"],
+  description: "系统代理 + 自研代理内核（订阅 / 服务器 / 规则 / 请求日志）",
   icon: "🌐",
   badge: "Network",
-  // 接管型：面板 HTML 写进结果区、切成 detached（与 OCR 同一条路，见 attach.ts）
-  permissions: ["layout.takeover"],
+  permissions: ["layout.takeover", "window.float"],
   execute: async (): Promise<PluginResult> => ({ type: "html", content: panelHtml() }),
 };
 
-/** 磁盘插件契约：面板打开后由宿主调起（root = 文档根，见文件头）。 */
-export async function attach(): Promise<void> {
-  // ── 左侧导航（2026-10-06 多页重构）──────────────────────────────
-  // 纯前端切页：`display` 切换，**不重取数据**（各页数据仍由 `refresh()` 统一刷）。
-  // ⚠️ 本插件是 `layout.takeover` 型 ⇒ `document` 上可能同时存在别的面板，
-  // 选择器一律从 `.proxy-panel` 往下找，不用全局 `querySelectorAll`。
-  const panel = q<HTMLElement>(".proxy-panel");
-  panel?.querySelector<HTMLElement>("#proxy-nav")?.addEventListener("click", (ev) => {
-    const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-page]");
-    const page = btn?.dataset.page;
-    if (!panel || !page || btn?.classList.contains("on")) return;
-    panel.querySelectorAll<HTMLElement>("#proxy-nav [data-page]").forEach((b) => {
-      b.classList.toggle("on", b.dataset.page === page);
-    });
-    panel.querySelectorAll<HTMLElement>(".proxy-page").forEach((s) => {
-      s.classList.toggle("on", s.dataset.page === page);
-    });
-    // 进日志页顺手拉一次 —— 否则用户看到的是一张空页面，还得自己去找「获取日志」
-    if (page === "log") void doMihomoLog();
-  });
+// ── 装配 ──────────────────────────────────────────────────────────
 
-  // 用**委托**而不是逐个绑定：列表每次重绘都会换掉整批按钮（同 ai-spec 规则 76 那条
-  // 「重绘处不该重新绑监听」的教训）。
-  q<HTMLElement>("#proxy-list")?.addEventListener("click", (ev) => {
-    const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-act]");
-    const row = btn?.closest<HTMLElement>(".proxy-row");
-    const id = row?.dataset.id;
-    if (!btn || !id) return;
-    const act = btn.dataset.act;
-    if (act === "enable") void doEnable(id);
-    else if (act === "disable") void doDisable();
-    else if (act === "del") void doDelete(id);
-  });
-  q<HTMLElement>("#proxy-add")?.addEventListener("click", () => void doAdd());
-  // ── 内核区块（mihomo）───────────────────────────────────────────
-  // 主按钮由 `renderMihomo` 动态重画 ⇒ 同样用委托绑，不在重绘处重新绑监听。
-  q<HTMLElement>("#mihomo-actions")?.addEventListener("click", (ev) => {
-    const id = (ev.target as HTMLElement).id;
-    if (id === "mihomo-install") void doMihomoInstall();
-    else if (id === "mihomo-start") void doMihomoStart();
-    else if (id === "mihomo-stop") void doMihomoStop();
-  });
-  q<HTMLElement>("#mihomo-subs")?.addEventListener("click", (ev) => {
-    const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-mact='sub-del']");
-    const row = btn?.closest<HTMLElement>("[data-sub]");
-    const idx = row?.dataset.sub;
-    if (btn && idx !== undefined) void doSubDel(Number(idx));
-  });
-  // 节点列表：一个 click 委托吃两种动作 —— 组的分段按钮（切换成员）与节点的测速按钮。
-  q<HTMLElement>("#mihomo-nodes")?.addEventListener("click", (ev) => {
-    const el = ev.target as HTMLElement;
-    const pick = el.closest<HTMLElement>("[data-group-pick]");
-    if (pick?.dataset.groupPick !== undefined) {
-      const row = pick.closest<HTMLElement>("[data-group]");
-      if (row?.dataset.group) void doSelect(row.dataset.group, pick.dataset.groupPick);
+export async function attach(): Promise<void> {
+  const panel = q<HTMLElement>(".proxy-panel");
+  if (!panel) return;
+  loadLogPrefs();
+  applyLogHeight();
+  wireLogResize();
+
+  // 工具区：下拉菜单 + 打开面板 + 订阅更新（直接刷新服务器，不开面板）。
+  q<HTMLElement>("#px-tools")?.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement;
+    const openBtn = target.closest<HTMLElement>("[data-open]");
+    if (openBtn?.dataset.open) {
+      closeMenus();
+      openPanel(openBtn.dataset.open);
       return;
     }
-    const btn = el.closest<HTMLElement>("[data-mact='delay']");
-    const name = btn?.dataset.name;
-    if (btn && name) void doDelay(name);
+    if (target.closest("[data-action='refresh-subs']")) {
+      closeMenus();
+      void doRefreshSubs();
+      return;
+    }
+    if (target.closest("[data-action='delay']")) {
+      closeMenus();
+      void doTestDelays();
+      return;
+    }
+    const toolBtn = target.closest<HTMLElement>("[data-tool]");
+    if (toolBtn) {
+      const tool = toolBtn.parentElement;
+      const wasOpen = tool?.classList.contains("open");
+      closeMenus();
+      if (tool && !wasOpen) tool.classList.add("open");
+    }
   });
-  q<HTMLElement>("#mihomo-save")?.addEventListener("click", () => void doMihomoSave());
-  q<HTMLElement>("#mihomo-sub-add")?.addEventListener("click", () => void doSubAdd());
-  for (const sel of ["#mihomo-sub-name", "#mihomo-sub-url"]) {
-    q<HTMLInputElement>(sel)?.addEventListener("keydown", (ev) => {
-      if ((ev as KeyboardEvent).key === "Enter") void doSubAdd();
-    });
-  }
-  // 模式：分段按钮（原为原生 `<select>`，2026-10-06 换掉）
-  q<HTMLElement>("#mihomo-mode")?.addEventListener("click", (ev) => {
+
+  // 模式菜单（在中央区，单独挂）。
+  q<HTMLElement>("#px-mode-btn")?.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    q<HTMLElement>("#px-mode-btn")?.parentElement?.classList.toggle("open");
+  });
+  q<HTMLElement>("#px-mode-menu")?.addEventListener("click", (ev) => {
     const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-mode]");
+    q<HTMLElement>("#px-mode-btn")?.parentElement?.classList.remove("open");
     if (btn?.dataset.mode) void doMode(btn.dataset.mode);
   });
-  q<HTMLElement>("#mihomo-log-btn")?.addEventListener("click", () => void doMihomoLog());
-  // 两个输入框上按回车 = 添加（用户敲完地址最自然的动作）
-  for (const sel of ["#proxy-label", "#proxy-server"]) {
-    q<HTMLInputElement>(sel)?.addEventListener("keydown", (ev) => {
-      if ((ev as KeyboardEvent).key === "Enter") void doAdd();
-    });
-  }
-  q<HTMLInputElement>("#proxy-link")?.addEventListener("change", (ev) => {
-    void doToggleLink((ev.target as HTMLInputElement).checked);
+
+  // 抽屉
+  q<HTMLElement>("#px-rail")?.addEventListener("click", () => setDrawer(true));
+  q<HTMLElement>("#px-drawer-close")?.addEventListener("click", () => setDrawer(false));
+  q<HTMLElement>("#px-servers")?.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-server]");
+    if (btn?.dataset.server) void doSelect(btn.dataset.server);
   });
+
+  // 中央
+  q<HTMLElement>("#px-orb")?.addEventListener("click", () => void doOrb());
+  q<HTMLInputElement>("#px-tun")?.addEventListener("change", (ev) => {
+    void requestTun((ev.target as HTMLInputElement).checked);
+  });
+  // TUN 警告框：同意 ⇒ 提权重启；取消 ⇒ 关框并保持关闭。
+  q<HTMLElement>("#px-tun-cancel")?.addEventListener("click", () => {
+    q<HTMLElement>("#px-tun-modal")?.classList.add("hidden");
+    const tgl = q<HTMLInputElement>("#px-tun");
+    if (tgl) tgl.checked = !!st?.tun;
+  });
+  q<HTMLElement>("#px-tun-ok")?.addEventListener("click", () => {
+    q<HTMLElement>("#px-tun-modal")?.classList.add("hidden");
+    void invoke("mihomo_relaunch_elevated").catch((e) => note(String(e)));
+  });
+
+  // 面板：关闭 / 协议与加密选择
+  q<HTMLElement>("#px-layer")?.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement;
+    if (target.closest("[data-close]")) {
+      closePanel();
+      return;
+    }
+    const kind = target.closest<HTMLElement>("[data-kind]");
+    if (kind?.dataset.kind) {
+      kindPick = kind.dataset.kind;
+      panel.querySelectorAll<HTMLElement>("#px-kind [data-kind]").forEach((b) => {
+        b.classList.toggle("on", b.dataset.kind === kindPick);
+      });
+      const wrap = q<HTMLElement>("#px-cipher-wrap");
+      wrap?.classList.toggle("hidden", kindPick !== "ss");
+    }
+    const cipher = target.closest<HTMLElement>("[data-cipher]");
+    if (cipher?.dataset.cipher) {
+      cipherPick = cipher.dataset.cipher;
+      panel.querySelectorAll<HTMLElement>("#px-cipher [data-cipher]").forEach((b) => {
+        b.classList.toggle("on", b.dataset.cipher === cipherPick);
+      });
+    }
+  });
+
+  q<HTMLElement>("#px-c-add")?.addEventListener("click", () => void doCustomAdd());
+  q<HTMLElement>("#px-paste-read")?.addEventListener("click", () => void doPasteRead());
+  q<HTMLElement>("#px-paste-import")?.addEventListener("click", () => void doPasteImport());
+  // 黑 / 白名单滑轨：只改文案，保存仍走「保存」按钮（避免半途改动落盘）。
+  q<HTMLInputElement>("#px-rule-mode")?.addEventListener("change", (ev) => {
+    const white = (ev.target as HTMLInputElement).checked;
+    const label = q<HTMLElement>("#px-rule-mode-label");
+    if (label) label.textContent = white ? t("proxy.px_rule_whitelist") : t("proxy.px_rule_blacklist");
+  });
+  q<HTMLButtonElement>("#px-dom-save")?.addEventListener("click", () => void doSaveDomains());
+
+  // 点到菜单外就收起（只在面板内监听：接管型面板可能和别的面板共存）。
+  panel.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement;
+    if (!target.closest(".px-tool")) closeMenus();
+    if (!target.closest(".px-mode")) {
+      q<HTMLElement>("#px-mode-btn")?.parentElement?.classList.remove("open");
+    }
+  });
+
   await refresh();
+  if (st?.running) void pollLog();
+  // 静默拉起引擎（不挡首屏）：这是「不开启服务也能测延迟」的前提（2026-11-03）。
+  // 引擎启动时会把订阅拉平（`clash::build`），所以不再另跑一次「只拉订阅」——
+  // 那两条路并发会互相把对方判成「已在运行 / 先停用」。
+  void ensureEngine();
 }
 
-/** 面板关闭时收尾。没有定时器要停（`msgTimer` 自己会超时），只清状态 ——
- *  下次打开重新问一遍宿主，别把上一次的列表留在内存里当真相。 */
+/** 面板关闭时收尾：停掉轮询，清空状态（下次打开重新问一遍宿主）。 */
 export function detach(): void {
-  if (msgTimer !== undefined) {
-    window.clearTimeout(msgTimer);
-    msgTimer = undefined;
+  // 引擎的收尾规则（2026-11-03）：
+  //   · 服务开着 ⇒ 引擎留在后台继续跑（用户此刻正在用代理，关面板不能断网）；
+  //   · 服务没开 ⇒ 关掉引擎（它只是为了测延迟临时拉起的）。
+  const engineRunning = !!st?.running;
+  const serviceOn = !!st?.enabled;
+  if (msgTimer !== undefined) window.clearTimeout(msgTimer);
+  msgTimer = undefined;
+  stopPolling();
+  closeMenus();
+  closePanel();
+  if (engineRunning && !serviceOn) {
+    void invoke("mihomo_engine_stop").catch(() => {});
   }
+  broadcastServiceState();
   cfg = null;
-  sys = null;
-  mstatus = null;
-  mproxies = [];
+  st = null;
+  servers = [];
+  requests = [];
+  exitInfo = null;
+  lastSample = null;
   busy = false;
-  mbusy = false;
+  drawerOpen = false;
+  activePanel = "";
+  delays = new Map<string, number>();
+  delayBusy = false;
 }
 
 export default proxyPlugin;

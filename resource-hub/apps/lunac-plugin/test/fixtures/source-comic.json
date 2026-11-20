@@ -1,0 +1,16 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "harness.comic",
+    "name": "Harness Comic",
+    "version": "1.0.0",
+    "kind": ["comic"],
+    "engine": "js",
+    "entry": "source.js",
+    "baseUrl": "http://localhost:8123",
+    "capabilities": ["search", "explore", "chapters", "pages"]
+  },
+  "rule": {},
+  "script": "class HarnessComic extends ComicSource {\n  name = \"Harness Comic\";\n  key = \"harness_comic\";\n  version = \"1.0.0\";\n  url = \"http://localhost:8123\";\n\n  settings = {\n    domains: { title: \"主域名\", type: \"select\", default: \"localhost:8123\", options: [{ value: \"localhost:8123\" }] },\n  };\n\n  explore = [\n    {\n      title: \"推荐\",\n      type: \"singlePageWithMultiPart\",\n      load: async () => {\n        const res = await Network.get(this.url + \"/test/fixtures/comic-search.html\");\n        const doc = new HtmlDocument(res.body);\n        const comics = doc.querySelectorAll(\"div#main > div.comic-card\").map((card) => ({\n          id: card.querySelector(\"a\").attributes[\"href\"],\n          title: card.querySelector(\"h3\").text,\n          cover: card.querySelector(\"img\").attributes[\"src\"],\n          subTitle: card.querySelector(\"span.author\").text,\n          description: card.querySelector(\"span.desc\").text,\n          tags: card.querySelector(\"span.tags\").text.split(\",\"),\n        }));\n        return { \"推荐\": comics };\n      },\n    },\n  ];\n\n  search = {\n    load: async (keyword, options, page) => {\n      const res = await Network.get(this.url + \"/test/fixtures/comic-search.html?q=\" + encodeURIComponent(keyword));\n      const doc = new HtmlDocument(res.body);\n      const comics = doc.querySelectorAll(\"div#main > div.comic-card\").map((card) => ({\n        id: card.querySelector(\"a\").attributes[\"href\"],\n        title: card.querySelector(\"h3\").text,\n        cover: card.querySelector(\"img\").attributes[\"src\"],\n        subTitle: card.querySelector(\"span.author\").text,\n          description: card.querySelector(\"span.desc\").text,\n          tags: card.querySelector(\"span.tags\").text.split(\",\"),\n        }));\n        return { comics, maxPage: 1 };\n    },\n  };\n\n  comic = {\n    loadInfo: async (id) => {\n      const res = await Network.get(this.url + id);\n      const doc = new HtmlDocument(res.body);\n      const chapters = new Map();\n      doc.querySelectorAll(\"ul.chapters > li > a\").forEach((node) => {\n        chapters.set(node.attributes[\"data-id\"], node.text);\n      });\n      return new ComicDetails({ title: \"星海 & 山海\", chapters });\n    },\n    loadEp: async (comicId, epId) => {\n      const res = await Network.get(this.url + \"/test/fixtures/comic-pages.html\");\n      const doc = new HtmlDocument(res.body);\n      return {\n        images: doc.querySelectorAll(\"div.reader img\").map((img) => img.attributes[\"data-src\"]),\n      };\n    },\n  };\n}\n",
+  "warnings": []
+}

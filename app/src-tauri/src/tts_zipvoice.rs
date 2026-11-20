@@ -367,7 +367,9 @@ impl Default for PetVoiceConfig {
 }
 
 fn config_path() -> PathBuf {
-    crate::storage::lunac_root_dir().join("config").join("pet-voice.json")
+    crate::storage::lunac_root_dir()
+        .join("config")
+        .join("pet-voice.json")
 }
 
 pub fn load_config() -> PetVoiceConfig {
@@ -388,7 +390,9 @@ pub fn save_config(cfg: &PetVoiceConfig) -> Result<(), String> {
 
 /// ZipVoice 运行库 + 模型所在的目录（**桌宠插件目录下**）。
 fn zipvoice_dir() -> PathBuf {
-    crate::plugin_market::plugins_dir().join("pet").join("zipvoice")
+    crate::plugin_market::plugins_dir()
+        .join("pet")
+        .join("zipvoice")
 }
 
 /// 读文件**前 `n` 字节**（不整读大文件 —— decoder 有 124 MB）。读不满 / 打不开返回 `None`。
@@ -414,7 +418,9 @@ const ASSET_MIN_BYTES: u64 = 1024;
 
 /// 文件体积过下限（拦空 / 近空残file）。`is_pe` / `is_onnx` 共用这一个判据。
 fn size_at_least(p: &Path, min: u64) -> bool {
-    std::fs::metadata(p).map(|m| m.len() >= min).unwrap_or(false)
+    std::fs::metadata(p)
+        .map(|m| m.len() >= min)
+        .unwrap_or(false)
 }
 
 /// 是不是可加载的 **PE**（DLL）：以 `MZ`（`4D 5A`）开头且体积过下限。
@@ -425,7 +431,8 @@ fn is_pe(p: &Path) -> bool {
 /// 是不是 **ONNX** 模型：`ModelProto` 首字段是 `ir_version`（field 1, varint）⇒ 首字节恒为 **0x08**；
 /// 再要体积过下限，排除空 / 截断残file。
 fn is_onnx(p: &Path) -> bool {
-    size_at_least(p, ASSET_MIN_BYTES) && matches!(read_head(p, 1), Some(b) if b.first() == Some(&0x08u8))
+    size_at_least(p, ASSET_MIN_BYTES)
+        && matches!(read_head(p, 1), Some(b) if b.first() == Some(&0x08u8))
 }
 
 /// 指定目录下的 ZipVoice 资产是否**可用**（两个 DLL 是 PE、三个 onnx 是 ONNX，且都非近空）。
@@ -520,7 +527,9 @@ fn ref_exceeds_scale(n_samples: usize) -> bool {
 /// 是规整后的缓存（那是按导入规则生成的）⇒ 判超规格、要求重新导入。
 fn ref_file_exceeds_scale(path: &Path) -> bool {
     const MAX_BYTES: u64 = (MAX_REF_SAMPLES as u64) * 2 + 4096;
-    std::fs::metadata(path).map(|m| m.len() > MAX_BYTES).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false)
 }
 
 /// 这条通路此刻**能不能用**（给命令 / 前端看的完整判据）。
@@ -577,7 +586,10 @@ fn ensure_session(cfg: &PetVoiceConfig) -> Result<(), String> {
     let fp_slot = TTS_FINGERPRINT.get_or_init(|| Mutex::new(String::new()));
     {
         let guard = tts_slot().lock().map_err(|_| "TTS 锁中毒".to_string())?;
-        let cur = fp_slot.lock().map_err(|_| "TTS 锁中毒".to_string())?.clone();
+        let cur = fp_slot
+            .lock()
+            .map_err(|_| "TTS 锁中毒".to_string())?
+            .clone();
         if guard.is_some() && cur == fp {
             return Ok(());
         }
@@ -730,8 +742,7 @@ pub fn speak(app: &tauri::AppHandle, text: &str) -> Result<(), String> {
         return Err("ref_out_of_spec".into());
     }
     let ref_text_c = Some(
-        CString::new(cfg.reference_text.as_bytes())
-            .map_err(|e| format!("参考文本含 NUL：{e}"))?,
+        CString::new(cfg.reference_text.as_bytes()).map_err(|e| format!("参考文本含 NUL：{e}"))?,
     );
     ensure_session(&cfg)?;
 
@@ -818,10 +829,17 @@ fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, i32), String> {
     } else if format == 3 && bits == 32 {
         for i in 0..(data.len() / (4 * ch)) {
             let o = i * 4 * ch;
-            out.push(f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]));
+            out.push(f32::from_le_bytes([
+                data[o],
+                data[o + 1],
+                data[o + 2],
+                data[o + 3],
+            ]));
         }
     } else {
-        return Err(format!("不支持的 WAV 格式（fmt={format} bits={bits}）—— 请用 16bit PCM WAV"));
+        return Err(format!(
+            "不支持的 WAV 格式（fmt={format} bits={bits}）—— 请用 16bit PCM WAV"
+        ));
     }
     if out.is_empty() {
         return Err("参考音频是空的".into());
@@ -902,8 +920,8 @@ fn resample_linear_mono(samples: &[f32], src_sr: i32, dst_sr: i32) -> Vec<f32> {
 /// 往往是 mp3 / m4a。**解不出来必须报错，绝不静默成功**（错误文案对用户可读，原始错误不进界面）。
 fn decode_audio_mono(path: &Path) -> Result<(Vec<f32>, i32), String> {
     use rodio::Source;
-    let file =
-        std::fs::File::open(path).map_err(|_| "打不开这个音频文件（可能已被移动或删除）".to_string())?;
+    let file = std::fs::File::open(path)
+        .map_err(|_| "打不开这个音频文件（可能已被移动或删除）".to_string())?;
     let decoder = rodio::Decoder::try_from(file)
         .map_err(|_| "这个文件不是可识别的音频（支持 wav / mp3 / flac / ogg / m4a）".to_string())?;
     let channels = decoder.channels().get() as usize;
@@ -942,7 +960,10 @@ fn prune_voice_cache(dir: &Path, keep: &Path) {
         if p == *keep {
             continue;
         }
-        if p.extension().map(|x| x.eq_ignore_ascii_case("wav")).unwrap_or(false) {
+        if p.extension()
+            .map(|x| x.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false)
+        {
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -1048,7 +1069,8 @@ mod tests {
 
     /// 测试夹具目录：**建在系统 temp（仓库之外）**，用完删掉（绝不落本仓库）。
     fn temp_root(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("lunac-voice-import-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("lunac-voice-import-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1155,7 +1177,10 @@ mod tests {
         write("model/encoder.int8.onnx", &onnx);
         write("model/decoder.int8.onnx", &onnx);
         // ② vocos 被 HTML 落地页污染（真实事故形状）⇒ 必须判未就绪
-        write("vocos_24khz.onnx", b"<!DOCTYPE html><html lang=\"en\"><head>...");
+        write(
+            "vocos_24khz.onnx",
+            b"<!DOCTYPE html><html lang=\"en\"><head>...",
+        );
         assert!(!dir_assets_ready(&dir), "被 HTML 污染的 onnx 必须判未就绪");
         // ③ 换成头字节合法的 vocos ⇒ 就绪（证明②拦的是内容、不是文件名）
         write("vocos_24khz.onnx", &onnx);
@@ -1244,9 +1269,16 @@ mod tests {
         let (s, sr) = read_wav_mono(&cached).unwrap();
         assert_eq!(sr, REF_TARGET_SR, "落缓存应为模型原生率 24 kHz");
         let secs = s.len() as f64 / sr as f64;
-        assert!((secs - 4.0).abs() / 4.0 < 0.01, "时长应保持 ±1%：secs={secs}");
+        assert!(
+            (secs - 4.0).abs() / 4.0 < 0.01,
+            "时长应保持 ±1%：secs={secs}"
+        );
         let expect = REF_TARGET_SR as i64 * 4;
-        assert!((s.len() as i64 - expect).abs() <= 2, "样本数应≈目标率×秒数：{}", s.len());
+        assert!(
+            (s.len() as i64 - expect).abs() <= 2,
+            "样本数应≈目标率×秒数：{}",
+            s.len()
+        );
         assert!(s.iter().any(|&v| v.abs() > 0.1), "不应出现整段静音");
         // 纯函数直测：48k→24k 为 2:1 整数下采样，样本数应精确半减、无长度错位
         let ramp: Vec<f32> = (0..48000).map(|i| (i % 2) as f32).collect();
@@ -1265,7 +1297,10 @@ mod tests {
             REF_TARGET_SR as usize * REF_MAX_SECS as usize,
             "MAX_REF_SAMPLES 应与 目标率 × 上限秒数 一致"
         );
-        assert!(ref_exceeds_scale(5_613_276), "旧缓存样本数（192kHz×29.2s）应判超规格");
+        assert!(
+            ref_exceeds_scale(5_613_276),
+            "旧缓存样本数（192kHz×29.2s）应判超规格"
+        );
         assert!(!ref_exceeds_scale(MAX_REF_SAMPLES), "上限样本本身不超");
         assert!(ref_exceeds_scale(MAX_REF_SAMPLES + 1), "刚超上限即判超规格");
     }
@@ -1306,11 +1341,18 @@ mod tests {
         assert!(da.is_file());
         assert!(da.starts_with(&cache), "副本应落缓存目录：{}", da.display());
         let name = da.file_name().unwrap().to_string_lossy().to_string();
-        assert!(name.starts_with("voice-") && name.ends_with(".wav"), "name={name}");
+        assert!(
+            name.starts_with("voice-") && name.ends_with(".wav"),
+            "name={name}"
+        );
         // 缓存的是**可读回的 PCM16 WAV**，已被规整到 24 kHz，时长≈4s
         let (s, sr) = read_wav_mono(&da).unwrap();
         assert_eq!(sr, REF_TARGET_SR);
-        assert!((s.len() as f64 / sr as f64 - 4.0).abs() < 0.05, "len={}", s.len());
+        assert!(
+            (s.len() as f64 / sr as f64 - 4.0).abs() < 0.05,
+            "len={}",
+            s.len()
+        );
         // 同一段再导 ⇒ 内容哈希同 ⇒ 落同一文件（幂等、不新增长）
         let da2 = import_voice_file(&a, &cache).unwrap();
         assert_eq!(da, da2);
@@ -1334,14 +1376,26 @@ mod tests {
         let cfg: PetVoiceConfig = serde_json::from_str(old_json).unwrap();
         assert_eq!(cfg.volume, 1.0, "老配置缺 volume 应回落 1.0");
         // 音量夹取边界
-        let v = |x: f32| PetVoiceConfig { volume: x, ..Default::default() }.clamped_volume();
+        let v = |x: f32| {
+            PetVoiceConfig {
+                volume: x,
+                ..Default::default()
+            }
+            .clamped_volume()
+        };
         assert_eq!(v(-1.0), VOLUME_MIN);
         assert_eq!(v(0.0), 0.0);
         assert_eq!(v(0.5), 0.5);
         assert_eq!(v(1.0), 1.0);
         assert_eq!(v(5.0), VOLUME_MAX);
         // 语速夹取边界
-        let s = |x: f32| PetVoiceConfig { speed: x, ..Default::default() }.clamped_speed();
+        let s = |x: f32| {
+            PetVoiceConfig {
+                speed: x,
+                ..Default::default()
+            }
+            .clamped_speed()
+        };
         assert_eq!(s(0.1), SPEED_MIN);
         assert_eq!(s(0.5), 0.5);
         assert_eq!(s(1.0), 1.0);
@@ -1349,4 +1403,3 @@ mod tests {
         assert_eq!(s(9.0), SPEED_MAX);
     }
 }
-

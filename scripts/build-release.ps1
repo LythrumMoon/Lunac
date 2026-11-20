@@ -93,7 +93,14 @@ $PluginSrcRoots = @(
   "$Root\app\src\plugins",        # 每个插件的源码 + 共用的 host / kinds / registry 等
   "$Root\app\src\i18n.ts",        # 会被内联进每个 index.js
   "$Root\app\src\styles.css",     # 同上
-  "$Root\app\vite.plugins.config.ts"
+  "$Root\app\vite.plugins.config.ts",
+  # 资源库是**外部工程**（2026-11-01 起纳入正式插件包）：它的产物由 resource-hub 的
+  # `npm run build` 生成，同样要参与「暂存是否比源码旧」的判据 —— 否则改了阅读器源码、
+  # 忘了重跑 build-plugins.ps1 时，安装包里会静默打进上一版。
+  "$Root\resource-hub\apps\lunac-plugin\src",
+  "$Root\resource-hub\apps\lunac-plugin\public",
+  "$Root\resource-hub\packages\rh-source-sdk\src",
+  "$Root\resource-hub\packages\rh-reader\src"
 )
 $PluginSources = @()
 foreach ($sr in $PluginSrcRoots) {
@@ -104,6 +111,10 @@ foreach ($sr in $PluginSrcRoots) {
     $PluginSources += @(Get-Item $sr)
   }
 }
+# 资源库的清单（version / permissions / window）是产物的一部分，也必须参与新鲜度判据；
+# 上面的 `-Include` 只收 ts/tsx/css，所以单独补这一份 json。
+$RhManifest = "$Root\resource-hub\apps\lunac-plugin\public\lunac-plugin.json"
+if (Test-Path $RhManifest) { $PluginSources += @(Get-Item $RhManifest) }
 $StagedManifests = @()
 if (Test-Path $StagePlugins) {
   $StagedManifests = @(Get-ChildItem -Path $StagePlugins -Filter "lunac-plugin.json" -Recurse -File -ErrorAction SilentlyContinue)

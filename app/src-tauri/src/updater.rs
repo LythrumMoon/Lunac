@@ -106,7 +106,9 @@ pub struct UpdateProgress {
 // 与 `ai.json` / `music.json` 同级、同口径：**应用配置**落 `config\`，业务数据才进 `ModuleData`。
 
 fn config_path() -> PathBuf {
-    crate::storage::lunac_root_dir().join("config").join("update.json")
+    crate::storage::lunac_root_dir()
+        .join("config")
+        .join("update.json")
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -124,7 +126,10 @@ pub struct UpdateConfig {
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        Self { check_on_startup: true, auto_install: true }
+        Self {
+            check_on_startup: true,
+            auto_install: true,
+        }
     }
 }
 
@@ -230,7 +235,10 @@ fn parse_json_lossy<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, ser
 
 fn fetch_manifest() -> Result<UpdateManifest, String> {
     let client = http(CHECK_TIMEOUT)?;
-    let resp = client.get(MANIFEST_URL).send().map_err(|e| net_hint("检查更新", &e))?;
+    let resp = client
+        .get(MANIFEST_URL)
+        .send()
+        .map_err(|e| net_hint("检查更新", &e))?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         // 仓库还没发过 Release（或最新那个是预发布）。这不是故障，如实说。
@@ -241,7 +249,10 @@ fn fetch_manifest() -> Result<UpdateManifest, String> {
         log::warn(format!("updater: manifest HTTP {}", resp.status()));
         return Err("获取更新信息失败 —— 请稍后重试".to_string());
     }
-    if resp.content_length().is_some_and(|len| len > MAX_MANIFEST_BYTES) {
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_MANIFEST_BYTES)
+    {
         log::warn("updater: manifest too large");
         return Err("更新信息异常 —— 请到 GitHub 手动下载".to_string());
     }
@@ -310,7 +321,11 @@ fn installer_path(version: &str) -> PathBuf {
 fn emit_progress(app: &AppHandle, phase: &str, downloaded: u64, total: u64) {
     let _ = app.emit(
         UPDATE_EVENT,
-        UpdateProgress { phase: phase.to_string(), downloaded, total },
+        UpdateProgress {
+            phase: phase.to_string(),
+            downloaded,
+            total,
+        },
     );
 }
 
@@ -332,7 +347,10 @@ fn download(app: &AppHandle, m: &UpdateManifest) -> Result<PathBuf, String> {
 
     let dest = installer_path(&m.version);
     let client = http_stream()?;
-    let mut resp = client.get(&m.url).send().map_err(|e| net_hint("下载安装包", &e))?;
+    let mut resp = client
+        .get(&m.url)
+        .send()
+        .map_err(|e| net_hint("下载安装包", &e))?;
     if !resp.status().is_success() {
         log::warn(format!("updater: installer HTTP {}", resp.status()));
         return Err("安装包暂时取不到 —— 请稍后重试，或到 GitHub 手动下载".to_string());
@@ -355,7 +373,9 @@ fn download(app: &AppHandle, m: &UpdateManifest) -> Result<PathBuf, String> {
 
     loop {
         let n = resp.read(&mut buf).map_err(|e| {
-            log::warn(format!("updater: download read failed at {done} bytes: {e}"));
+            log::warn(format!(
+                "updater: download read failed at {done} bytes: {e}"
+            ));
             let _ = fs::remove_file(&dest);
             "下载中断 —— 请检查网络后重试".to_string()
         })?;
@@ -364,7 +384,9 @@ fn download(app: &AppHandle, m: &UpdateManifest) -> Result<PathBuf, String> {
         }
         hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(|e| {
-            log::warn(format!("updater: download write failed at {done} bytes: {e}"));
+            log::warn(format!(
+                "updater: download write failed at {done} bytes: {e}"
+            ));
             let _ = fs::remove_file(&dest);
             "写入安装包失败 —— 请检查磁盘空间与权限".to_string()
         })?;
@@ -388,13 +410,24 @@ fn download(app: &AppHandle, m: &UpdateManifest) -> Result<PathBuf, String> {
     }
 
     emit_progress(app, "verifying", done, total);
-    let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let got: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if !got.eq_ignore_ascii_case(&m.sha256) {
-        log::warn(format!("updater: sha256 mismatch got={got} want={}", m.sha256));
+        log::warn(format!(
+            "updater: sha256 mismatch got={got} want={}",
+            m.sha256
+        ));
         let _ = fs::remove_file(&dest);
         return Err("安装包校验失败 —— 文件可能不完整，请重试".to_string());
     }
-    log::info(format!("updater: downloaded {} ({} bytes)", dest.display(), done));
+    log::info(format!(
+        "updater: downloaded {} ({} bytes)",
+        dest.display(),
+        done
+    ));
     Ok(dest)
 }
 

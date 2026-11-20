@@ -1,96 +1,46 @@
 // src/mihomo.rs
-//! **mihomo 内核托管**（2026-10-03，代理插件的第二条腿）。
+//! **代理配置 + 自研内核的生命周期**（2026-10-03 建立；2026-11-01 收口为 native-only）。
 //!
-//! 它补上的是 `system_proxy.rs` 一直缺的那半件事：**写完注册表，背后没有任何东西在
-//! 监听** —— 系统代理指向哪个端口，得真有一个代理进程在那儿。本模块就是那个进程。
+//! ## 现在这里还管什么
+//!
+//! * `config\proxy.json` 的 `mihomo` 段：订阅 / 手填分享链接 / 模式 / 端口 / `engine`。
+//! * 内核的启停、状态、系统代理的指向与还原（备份 / 还原纪律全在 `system_proxy.rs`）。
+//! * 节点列表 / 测速 / 切换 —— 全部转发给 `native_proxy`。
+//!
+//! ## 不再管什么（2026-11-01，§待办 3-26 K3/K4）
+//!
+//! mihomo 子进程、它的 `config.yaml`、Clash REST 控制口、以及「下载内核」这条路**已全部删除**：
+//!
+//! * 缺省内核 = `native`（编进宿主，见 `src/native_proxy/`），新安装不需要任何外部文件；
+//! * 旧配置里**显式**写着 `engine: "mihomo"` 时，启动 / 切换都会返回一句可操作的错误
+//!   （[`LEGACY_MIHOMO`]），**不静默降级**，也不假装还能跑；
+//! * 面板上不再有「下载内核」入口，日志页读的是**宿主日志**（自研引擎的日志就在那里）。
 //!
 //! ## 与 `system_proxy.rs` 的分工（别混）
 //!
 //! * `system_proxy.rs`：**Windows 的代理设置**（注册表三值 + 通知 + 备份 / 还原）。
-//! * 本模块：**代理能力本身**（内核进程 + 配置 + 节点 + 规则）。
+//! * 本模块：**代理能力本身**（内核进程 + 配置 + 节点）。
 //!
 //! 两者只在「启用」这一个动作上握手：内核起来 ⇒ 把系统代理指向 `127.0.0.1:<mixed-port>`；
-//! 内核停 ⇒ 还原系统代理。**备份 / 还原的纪律全部留在 `system_proxy.rs`**（那里已有
-//! 经过验证的「只备份一次」实现），本模块不另写一份。
-//!
-//! ## 内核从哪来：**按需下载，不随安装包分发**（2026-10-03 用户裁决）
-//!
-//! mihomo 是 **GPL-3.0**。把它打进我们的安装包属于 GPL 传染性分发场景；按需从官方
-//! Release 下载则只是「用户自己获取了一个独立程序」，我们不分发它。代价是首次启用要联网。
-//!
-//! ## 为什么订阅走 `proxy-providers` 而不是自己解析 YAML
-//!
-//! mihomo **原生支持**订阅：给它一个 `proxy-providers` 的 http url，它自己拉、自己解析、
-//! 自己按 interval 更新（这正是 Clash Verge 那类 GUI 的做法）。我们只要在界面上把
-//! 节点列表**读出来**（走 Clash REST API 的 `/proxies`）即可 —— 自己写一个 Clash YAML
-//! 解析器，等于把 mihomo 已经做对的事重写一遍，还必然落后于它的新协议。
-//!
-//! ⚠️ 代价要说清：**分享链接（`vmess://` / `ss://` 这类）mihomo 不认** —— 那需要
-//! 「链接 → YAML 节点」的转换，本轮**未做**（见 `links` 字段的注释与 backlog）。
-//!
-//! ## 本轮边界
-//!
-//! * **系统代理模式**已通；**TUN 未做**（需管理员 + wintun 驱动，2026-10-03 用户裁决后置）。
-//! * 配置为**生成式**：`cores\mihomo\config.yaml` 每次启动前整体重写（用户的订阅 / 设置
-//!   才是真相源，手改那个文件会在下次启动时丢失 —— 这是刻意的，避免两处各执一词）。
+//! 内核停 ⇒ 还原系统代理。
 
-use std::fs;
-use std::io::Cursor;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-/// 固定的 mihomo 版本与资产名。**不动态查「最新版」** —— GitHub API 在国内常不可达，
-/// 而「哪一版能跑」是明确的：升版本 = 改这一处常量（用户可在设置里覆盖下载地址）。
-const MIHOMO_VERSION: &str = "v1.19.29";
-const ASSET: &str = "mihomo-windows-amd64";
-/// 官方 Release 下载前缀；用户可在设置里改成镜像（国内直连 GitHub 常失败）。
-const DEFAULT_RELEASE_BASE: &str = "https://github.com/MetaCubeX/mihomo/releases/download";
-
-/// 默认端口。**刻意与 mihomo 官方的 7890 一致**（用户从别处迁过来时不用改端口）。
+/// 默认混合端口。**刻意与 mihomo 的 7890 一致**（用户从别处迁过来时不用改端口）。
+///
+/// 端口不由用户配置：`native_proxy::start` 在这个默认值被占用时会自动挑一个空闲端口并
+/// 写回配置 —— 面板只展示实际端口，不给输入框。
 const DEFAULT_MIXED_PORT: u16 = 7890;
+
+/// 保留字段的缺省值（Clash 控制口已随 mihomo 退场，仅用于配置格式兼容）。
 const DEFAULT_CONTROLLER_PORT: u16 = 9090;
 
-/// Clash API 的探测地址（连通性检查用）。
-const HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
-
-// ── 进程状态 ────────────────────────────────────────────────────────
-
-/// 内核子进程。**进程内全局唯一** —— 一个 Lunac 只托管一个内核（同时跑两个会抢端口）。
-static CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-
-fn child_slot() -> &'static Mutex<Option<Child>> {
-    CHILD.get_or_init(|| Mutex::new(None))
-}
-
-// ── 路径 ────────────────────────────────────────────────────────────
-
-/// 内核工作目录：`<exe 根>\cores\mihomo`。
-pub fn core_dir() -> PathBuf {
-    crate::storage::lunac_root_dir().join("cores").join("mihomo")
-}
-fn core_exe() -> PathBuf {
-    core_dir().join("mihomo.exe")
-}
-/// mihomo 的 `-d`（工作目录），它会往里写 geo 数据、provider 缓存。
-fn data_dir() -> PathBuf {
-    core_dir().join("data")
-}
-fn gen_config_path() -> PathBuf {
-    core_dir().join("config.yaml")
-}
-fn log_path() -> PathBuf {
-    core_dir().join("mihomo.log")
-}
-
-pub fn is_installed() -> bool {
-    core_exe().is_file()
-}
+/// 旧配置显式写了 `engine: "mihomo"` 时的唯一提示。**启动 / 切换两条路都用它**，
+/// 免得两处文案漂移。
+const LEGACY_MIHOMO: &str = "当前版本已不再内置 mihomo 内核：请把 config\\proxy.json 的 engine 改成 native（或删掉该字段）后重启";
 
 // ── 配置（`config\proxy.json` 的 `mihomo` 字段）──────────────────────
 
@@ -108,26 +58,37 @@ pub struct MihomoConfig {
     pub enabled: bool,
     #[serde(default = "default_mixed_port")]
     pub mixed_port: u16,
+    /// Clash 控制口端口。**已不再使用**（K3 删掉了控制口），保留是为了老配置能原样读回。
     #[serde(default = "default_controller_port")]
     pub controller_port: u16,
-    /// Clash API 的 secret。首启用时随机生成 —— 本机另一个进程不该能白用我们的控制口。
+    /// Clash API secret。**已不再使用**，同样只为老配置兼容。
     #[serde(default)]
     pub secret: String,
-    /// `rule` / `global` / `direct`（mihomo 的三档）。
+    /// `rule` / `global` / `direct`：自研引擎用它决定规则回退（启动时展开，运行中不可热切）。
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
-    /// 订阅下载地址前缀（可换镜像）。空 = 官方 GitHub。
-    #[serde(default)]
-    pub release_base: String,
-    /// 分享链接（`vmess://` …）。**本轮不解析**，留着是为了让配置格式先定下来 ——
-    /// 界面上不作为可用功能暴露（写了也只记一行「本轮未支持」）。
+    /// 分享链接（`ss://` / `trojan://` / `vless://` / `vmess://` / `anytls://` / `hysteria2://`）。
+    /// **解析只走 `native_proxy::clash::parse_link`**（单一真相源，与真正联网的是同一套）。
     #[serde(default)]
     pub links: Vec<String>,
-    /// TUN 开关（**本轮固定 false**：需管理员 + wintun，已裁决后置）。
+    /// 规则模式下的**名单语义**：`blacklist`（名单内直连）/ `whitelist`（名单内强制代理）。
+    /// 只在 `mode = rule` 时生效；订阅规则与本机网段规则仍在两侧生效。
+    #[serde(default = "default_rule_mode")]
+    pub rule_mode: String,
+    /// 规则名单域名（一行一个，`DOMAIN-SUFFIX` 匹配）。默认给一份常见国内站点清单。
+    #[serde(default = "default_rule_domains")]
+    pub rule_domains: Vec<String>,
+    /// TUN 开关（**固定 false**：需管理员 + wintun，已裁决后置）。
     #[serde(default)]
     pub tun: bool,
+    /// 用哪个内核：`native`（缺省，自研） / `mihomo`（**已不再内置**，显式写死时启动即报错）。
+    ///
+    /// 空串 = 沿用磁盘上的旧值（前端没有这个控件时不该把它改回缺省）；
+    /// 新配置落盘时按缺省 = `native` 处理（见 `engine_name`）。
+    #[serde(default)]
+    pub engine: String,
 }
 
 fn default_mixed_port() -> u16 {
@@ -139,6 +100,106 @@ fn default_controller_port() -> u16 {
 fn default_mode() -> String {
     "rule".to_string()
 }
+fn default_rule_mode() -> String {
+    "blacklist".to_string()
+}
+
+/// 默认名单 = 常见国内站点（**黑名单**语义：这些域名直连，其余按订阅规则走代理）。
+///
+/// 刻意只放「按域名能判断」的条目，不引 GEOIP 数据库（自研引擎第一版不引）。
+/// `cn` 用后缀规则覆盖所有 `.cn`；其余是主要站点及其 CDN 域名。
+fn default_rule_domains() -> Vec<String> {
+    const LIST: &[&str] = &[
+        "cn",
+        "baidu.com",
+        "bdstatic.com",
+        "bdimg.com",
+        "qq.com",
+        "gtimg.com",
+        "qpic.cn",
+        "tencent.com",
+        "weixin.qq.com",
+        "weixin.com",
+        "wechat.com",
+        "qcloud.com",
+        "myqcloud.com",
+        "qcloudimg.com",
+        "tenpay.com",
+        "bilibili.com",
+        "biliapi.net",
+        "hdslb.com",
+        "bilivideo.com",
+        "taobao.com",
+        "tmall.com",
+        "alicdn.com",
+        "alipay.com",
+        "alipayobjects.com",
+        "alibaba.com",
+        "aliyun.com",
+        "aliyuncs.com",
+        "jd.com",
+        "jd.hk",
+        "360buyimg.com",
+        "sina.com.cn",
+        "sina.cn",
+        "weibo.com",
+        "weibo.cn",
+        "sohu.com",
+        "163.com",
+        "126.com",
+        "126.net",
+        "netease.com",
+        "yeah.net",
+        "youku.com",
+        "iqiyi.com",
+        "qiyi.com",
+        "douyin.com",
+        "iesdouyin.com",
+        "bytedance.com",
+        "toutiao.com",
+        "snssdk.com",
+        "pstatp.com",
+        "kuaishou.com",
+        "gifshow.com",
+        "xiaohongshu.com",
+        "xhscdn.com",
+        "zhihu.com",
+        "zhimg.com",
+        "douban.com",
+        "doubanio.com",
+        "meituan.com",
+        "meituan.net",
+        "dianping.com",
+        "ctrip.com",
+        "qunar.com",
+        "12306.cn",
+        "xiaomi.com",
+        "mi.com",
+        "miui.com",
+        "huawei.com",
+        "hicloud.com",
+        "oppo.com",
+        "vivo.com",
+        "lenovo.com.cn",
+        "pinduoduo.com",
+        "yangkeduo.com",
+        "suning.com",
+        "ele.me",
+        "amap.com",
+        "autonavi.com",
+        "kugou.com",
+        "kuwo.cn",
+        "ximalaya.com",
+        "csdn.net",
+        "cnblogs.com",
+        "gitee.com",
+        "oschina.net",
+        "yuque.com",
+        "wps.cn",
+        "kingsoft.com",
+    ];
+    LIST.iter().map(|s| (*s).to_string()).collect()
+}
 
 impl Default for MihomoConfig {
     fn default() -> Self {
@@ -149,230 +210,27 @@ impl Default for MihomoConfig {
             secret: String::new(),
             mode: default_mode(),
             subscriptions: Vec::new(),
-            release_base: String::new(),
             links: Vec::new(),
+            rule_mode: default_rule_mode(),
+            rule_domains: default_rule_domains(),
             tun: false,
+            engine: "native".to_string(),
         }
     }
 }
 
-// ── 内核下载 ────────────────────────────────────────────────────────
-
-/// 下载地址前缀（用户配的镜像优先，否则官方 GitHub）。
-fn release_base(cfg: &MihomoConfig) -> String {
-    let b = cfg.release_base.trim().trim_end_matches('/');
-    if b.is_empty() {
-        DEFAULT_RELEASE_BASE.to_string()
-    } else {
-        b.to_string()
+/// 归一化后的内核名（对外只有 `mihomo` / `native` 两个值）。
+///
+/// **缺省 = `native`**（§待办 3-26 K1）：新配置 / 旧配置里没有这个字段时都走自研。
+/// 只有**显式**写了 `mihomo` 的配置会拿到 `mihomo` —— 那条路现在只剩「如实报错」。
+pub fn engine_name(cfg: &MihomoConfig) -> &'static str {
+    match cfg.engine.trim().to_ascii_lowercase().as_str() {
+        "mihomo" => "mihomo",
+        _ => "native",
     }
 }
 
-fn asset_name() -> String {
-    format!("{ASSET}-{MIHOMO_VERSION}.zip")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    hex(&h.finalize())
-}
-
-/// 下载并安装内核。返回一段**如实**的结果说明（含「校验做了没有」）。
-pub fn install_core(cfg: &MihomoConfig) -> Result<String, String> {
-    fs::create_dir_all(core_dir()).map_err(|e| format!("建 cores 目录失败：{e}"))?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(180))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-
-    let base = release_base(cfg);
-    let zip_url = format!("{base}/{MIHOMO_VERSION}/{}", asset_name());
-    crate::log::info(format!("mihomo：开始下载内核 {zip_url}"));
-    let bytes = http_get(&client, &zip_url)?;
-
-    // 校验：优先拿官方校验文件。**拿不到就明说「未校验」**，不假装校验过 ——
-    // 这正是本模块所有「如实说」的地方里最要紧的一处。
-    let verified = match fetch_checksum(&client, &base) {
-        Some(expected) => {
-            let got = sha256_hex(&bytes);
-            if got != expected {
-                return Err(format!(
-                    "内核校验失败：期望 {expected}，实测 {got}（下载可能被篡改或损坏，已中止）"
-                ));
-            }
-            true
-        }
-        None => false,
-    };
-    if !verified {
-        crate::log::warn("mihomo：官方未提供可用的 sha256 校验文件，本次未校验（已记录实测哈希）");
-    }
-    crate::log::info(format!("mihomo：内核字节 sha256={}", sha256_hex(&bytes)));
-
-    // 解压：从 zip 里找出 mihomo 可执行文件（资产内文件名随版本带后缀），写成 mihomo.exe。
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("解压失败：{e}"))?;
-    let mut found = false;
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| format!("读压缩包条目失败：{e}"))?;
-        let name = f.name().to_string();
-        if !name.to_ascii_lowercase().ends_with(".exe") {
-            continue;
-        }
-        let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut f, &mut out).map_err(|e| format!("读 {name} 失败：{e}"))?;
-        fs::write(core_exe(), &out).map_err(|e| format!("写 mihomo.exe 失败：{e}"))?;
-        found = true;
-        crate::log::info(format!("mihomo：已安装内核（来自 {name}，{} 字节）", out.len()));
-        break;
-    }
-    if !found {
-        return Err("压缩包里没有找到 .exe（资产格式变了？）".into());
-    }
-    Ok(if verified {
-        format!("已安装 mihomo {MIHOMO_VERSION}（sha256 校验通过）")
-    } else {
-        format!("已安装 mihomo {MIHOMO_VERSION}（**未校验**：官方未提供校验文件）")
-    })
-}
-
-/// 尝试取发布页的校验文件。**取不到不算错误**（返回 None 让调用方如实说明）。
-fn fetch_checksum(client: &reqwest::blocking::Client, base: &str) -> Option<String> {
-    let asset = asset_name();
-    // 官方发布同时带 `sha256sum.txt`（含所有资产）与部分资产级 `.sha256`；两个都试。
-    let candidates = [
-        format!("{base}/{MIHOMO_VERSION}/sha256sum.txt"),
-        format!("{base}/{MIHOMO_VERSION}/{asset}.sha256"),
-    ];
-    for url in candidates {
-        let Ok(resp) = client.get(&url).send() else { continue };
-        if !resp.status().is_success() {
-            continue;
-        }
-        let Ok(text) = resp.text() else { continue };
-        // 两种格式：`<hash>  <name>` 多行，或单行 `<hash>`。
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            let hash = parts[0].trim_start_matches('*');
-            if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            // 有文件名就要求它匹配我们的资产；单行（无文件名）直接采信。
-            if parts.len() == 1 || parts[1..].iter().any(|p| p.trim_start_matches('*') == asset.as_str()) {
-                return Some(hash.to_ascii_lowercase());
-            }
-        }
-    }
-    None
-}
-
-fn http_get(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
-    let resp = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, concat!("Lunac/", env!("CARGO_PKG_VERSION")))
-        .send()
-        .map_err(|e| format!("下载失败（{url}）：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载失败（{url}）：HTTP {}", resp.status()));
-    }
-    resp.bytes().map(|b| b.to_vec()).map_err(|e| format!("读取下载内容失败：{e}"))
-}
-
-// ── 配置生成 ────────────────────────────────────────────────────────
-
-/// YAML 标量：一律**双引号**转义。节点名/订阅名是用户输入，含 `:` `#` `"` 都可能
-/// 把整份配置搞坏（mihomo 启动即失败，报错还很难读懂）。
-fn yaml_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// 生成 `config.yaml`。**每次启动前整体重写**（见模块头：订阅与设置才是真相源）。
-fn render_config(cfg: &MihomoConfig, secret: &str) -> String {
-    let mut s = String::new();
-    s.push_str("# 由 Lunac 生成 —— 手改会在下次启动时被覆盖（见 src/mihomo.rs 顶部）\n");
-    s.push_str("mixed-port: ");
-    s.push_str(&cfg.mixed_port.to_string());
-    s.push('\n');
-    s.push_str("allow-lan: false\n");
-    s.push_str("bind-address: 127.0.0.1\n");
-    s.push_str(&format!("mode: {}\n", sanitize_mode(&cfg.mode)));
-    s.push_str("log-level: info\n");
-    s.push_str(&format!("external-controller: 127.0.0.1:{}\n", cfg.controller_port));
-    s.push_str(&format!("secret: {}\n", yaml_str(secret)));
-    // DNS：fake-ip 是 Clash 生态的默认选择（分流按域名而不是 IP，规则命中率更高）。
-    s.push_str("dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n");
-    s.push_str("  nameserver:\n    - 223.5.5.5\n    - 119.29.29.29\n");
-
-    // 订阅 ⇒ proxy-providers（mihomo 自己拉、自己按 interval 更新）。
-    if !cfg.subscriptions.is_empty() {
-        s.push_str("proxy-providers:\n");
-        for (i, sub) in cfg.subscriptions.iter().enumerate() {
-            let name = if sub.name.trim().is_empty() {
-                format!("sub_{i}")
-            } else {
-                sub.name.trim().to_string()
-            };
-            s.push_str(&format!("  {}:\n", yaml_str(&name)));
-            s.push_str("    type: http\n");
-            s.push_str(&format!("    url: {}\n", yaml_str(sub.url.trim())));
-            s.push_str("    interval: 86400\n");
-            s.push_str(&format!("    path: {}\n", yaml_str(&format!("providers/{name}.yaml"))));
-            s.push_str("    health-check:\n      enable: true\n");
-            s.push_str(&format!("      url: {}\n", yaml_str(HEALTH_URL)));
-            s.push_str("      interval: 300\n");
-        }
-    }
-
-    // 代理组：一个 select（用户手动挑），下面挂所有 provider 的节点。
-    s.push_str("proxy-groups:\n");
-    s.push_str("  - name: \"PROXY\"\n    type: select\n");
-    s.push_str("    proxies:\n      - \"DIRECT\"\n      - \"REJECT\"\n");
-    if !cfg.subscriptions.is_empty() {
-        s.push_str("    use:\n");
-        for (i, sub) in cfg.subscriptions.iter().enumerate() {
-            let name = if sub.name.trim().is_empty() {
-                format!("sub_{i}")
-            } else {
-                sub.name.trim().to_string()
-            };
-            s.push_str(&format!("      - {}\n", yaml_str(&name)));
-        }
-    }
-
-    // 规则：国内直连、其余走 PROXY。**GEOIP 需要 geo 数据库** —— mihomo 首次启动会自动
-    // 下载到 `-d` 目录（data_dir），所以这里直接用即可。
-    s.push_str("rules:\n");
-    s.push_str("  - GEOIP,LAN,DIRECT,no-resolve\n");
-    s.push_str("  - GEOIP,CN,DIRECT\n");
-    s.push_str("  - MATCH,PROXY\n");
-    s
-}
-
+/// 模式归一化（面板只给三档；手改配置文件写了别的值就回落到 `rule`）。
 fn sanitize_mode(mode: &str) -> &'static str {
     match mode.trim().to_ascii_lowercase().as_str() {
         "global" => "global",
@@ -381,30 +239,24 @@ fn sanitize_mode(mode: &str) -> &'static str {
     }
 }
 
-/// 确保 secret 存在（首次启用时生成）。返回（可能更新过的）配置。
-pub fn ensure_secret(cfg: &mut MihomoConfig) -> String {
-    if cfg.secret.trim().len() >= 16 {
-        return cfg.secret.trim().to_string();
-    }
-    // 不引 rand：用时间 + 进程 id 的 SHA-256（不是密码学强度的需求 —— 它只是本机
-    // 控制口的一道门槛，防止同机其它进程随手改我们的节点选择）。
-    let seed = format!(
-        "{}-{}-{:?}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
-        core_dir()
-    );
-    cfg.secret = sha256_hex(seed.as_bytes())[..32].to_string();
-    cfg.secret.clone()
+// ── 状态 ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct NodeView {
+    pub index: usize,
+    pub name: String,
+    pub kind: String,
 }
 
-// ── 进程生命周期 ────────────────────────────────────────────────────
-
-/// 内核的运行时状态（给界面看的）。
 #[derive(Serialize)]
 pub struct MihomoStatus {
+    /// 自研内核编进宿主 ⇒ 对 native 恒为 true；显式 mihomo 配置为 false（它已不存在）。
     pub installed: bool,
+    /// **引擎**（本机监听口）是否在跑。打开代理面板就会静默拉起它，用于测延迟；
+    /// 它与下面的 `enabled`（服务 / 系统代理）是两件事（2026-11-03 拆开）。
     pub running: bool,
+    /// **服务**（系统代理）是否开启。面板的开关与搜索区状态泡泡框都看这个值。
+    pub enabled: bool,
     pub version: String,
     pub mixed_port: u16,
     pub controller_port: u16,
@@ -412,131 +264,112 @@ pub struct MihomoStatus {
     pub log_path: String,
     /// 配置里订阅数（界面据此提示「还没订阅，节点列表会是空的」）。
     pub subscriptions: usize,
+    /// 手填节点（分享链接）。顺序与 `links` 一致。
+    pub nodes: Vec<NodeView>,
+    /// 当前生效的内核：`native` / `mihomo`（后者只会在旧配置上出现）。
+    pub engine: String,
+    /// 当前模式（配置值；运行中改不了）。
+    pub mode: String,
+    /// 配置里的 TUN 开关（引擎未支持 TUN，恒为 false）。
+    pub tun: bool,
+    /// 运行中的累计流量与连接数（界面用它算速率）。
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub connections: u64,
+    pub active: u64,
+    /// 当前选中的节点名（没跑时为空）。
+    pub selected: String,
 }
 
 pub fn status(cfg: &MihomoConfig) -> MihomoStatus {
-    let running = is_running();
+    let engine = engine_name(cfg);
+    let st = crate::native_proxy::status();
     MihomoStatus {
-        installed: is_installed(),
-        running,
-        version: if is_installed() { MIHOMO_VERSION.to_string() } else { String::new() },
+        // native 不需要安装；mihomo 已不再内置 —— 两者都不能让界面出现「下载内核」。
+        installed: engine == "native",
+        running: is_running(),
+        enabled: cfg.enabled,
+        version: if engine == "native" {
+            "native".to_string()
+        } else {
+            String::new()
+        },
         mixed_port: cfg.mixed_port,
         controller_port: cfg.controller_port,
-        config_path: gen_config_path().display().to_string(),
-        log_path: log_path().display().to_string(),
+        // 不再生成 config.yaml（K3）；留空而不是给一个不存在的路径。
+        config_path: String::new(),
+        log_path: latest_host_log()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
         subscriptions: cfg.subscriptions.len(),
+        nodes: manual_nodes(cfg),
+        engine: engine.to_string(),
+        mode: cfg.mode.clone(),
+        tun: false,
+        bytes_up: st.bytes_up,
+        bytes_down: st.bytes_down,
+        connections: st.connections,
+        active: st.active,
+        selected: st.selected,
     }
 }
 
-/// 子进程是否还活着。`try_wait` 会顺带回收已退出的进程（不留僵尸）。
-fn is_running() -> bool {
-    let mut slot = child_slot().lock().unwrap();
-    match slot.as_mut() {
-        Some(child) => match child.try_wait() {
-            Ok(Some(_)) => {
-                *slot = None;
-                false
-            }
-            Ok(None) => true,
-            Err(_) => false,
-        },
-        None => false,
-    }
+/// 当前内核是否在跑（只有自研引擎这一种可能）。
+pub fn is_running() -> bool {
+    crate::native_proxy::is_running()
 }
 
-/// 启动内核。**调用方负责把配置存盘**（本函数只做「写盘 → 起进程 → 等它就绪」）。
-pub fn start(cfg: &mut MihomoConfig) -> Result<String, String> {
-    if !is_installed() {
-        return Err("内核还没安装：先在面板上点「下载内核」".into());
-    }
-    if is_running() {
-        return Err("内核已经在运行".into());
-    }
-    if cfg.mixed_port == cfg.controller_port {
-        return Err("混合代理端口与控制端口不能相同".into());
-    }
-    let secret = ensure_secret(cfg);
-    fs::create_dir_all(data_dir()).map_err(|e| format!("建内核数据目录失败：{e}"))?;
-    let yaml = render_config(cfg, &secret);
-    fs::write(gen_config_path(), yaml).map_err(|e| format!("写 config.yaml 失败：{e}"))?;
+/// 把 `links` 里的每条分享链接解析成可渲染的节点。**顺序与 `links` 一一对应**
+/// （界面按这个下标删除）；解析失败的那条以 `kind = "invalid"` 占位，让用户能在界面上删掉它。
+fn manual_nodes(cfg: &MihomoConfig) -> Vec<NodeView> {
+    cfg.links
+        .iter()
+        .enumerate()
+        .map(|(index, link)| match crate::native_proxy::clash::parse_link(link) {
+            Ok(node) => NodeView {
+                index,
+                name: node.name,
+                kind: node.kind.label().to_string(),
+            },
+            Err(_) => NodeView {
+                index,
+                name: String::new(),
+                kind: "invalid".to_string(),
+            },
+        })
+        .collect()
+}
 
-    // 日志：每次启动**截断重写**（不是追加）—— 否则日志会跨会话无限增长，而用户
-    // 看日志的场景永远是「刚才那次为什么没起来」。
-    let log = fs::File::create(log_path()).map_err(|e| format!("建日志文件失败：{e}"))?;
-    let log2 = log.try_clone().map_err(|e| format!("复制日志句柄失败：{e}"))?;
+// ── 日志（读宿主日志；自研引擎的日志就在那里）─────────────────────────
 
-    let mut cmd = Command::new(core_exe());
-    cmd.arg("-f")
-        .arg(gen_config_path())
-        .arg("-d")
-        .arg(data_dir())
-        .current_dir(core_dir())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：不弹控制台黑框（与我们起其它后台进程同一条纪律）
-        cmd.creation_flags(0x0800_0000);
-    }
-    let child = cmd.spawn().map_err(|e| format!("启动 mihomo 失败：{e}"))?;
-    *child_slot().lock().unwrap() = Some(child);
-    crate::log::info(format!(
-        "mihomo：已启动 mixed-port={} controller=127.0.0.1:{} 日志={}",
-        cfg.mixed_port,
-        cfg.controller_port,
-        log_path().display()
-    ));
-
-    // 等它就绪：起进程 ≠ 起来了（配置错、端口被占都会立刻退出）。轮询 Clash API，
-    // 同时把「进程已经死了」当作尽早失败的判据 —— 否则用户要等满超时才被告知。
-    let deadline = std::time::Instant::now() + Duration::from_secs(12);
-    loop {
-        if controller_alive(cfg) {
-            return Ok("内核已启动".into());
+/// 最新一份宿主日志（`temp\logs\*.log`，按修改时间取最新的那份）。
+fn latest_host_log() -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(crate::log::log_dir()).ok()?.flatten() {
+        let path = entry.path();
+        let is_log = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("log"));
+        if !is_log {
+            continue;
         }
-        if !is_running() {
-            return Err(format!(
-                "内核启动后立刻退出，多半是配置或端口问题。日志：{}",
-                log_path().display()
-            ));
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, path));
         }
-        if std::time::Instant::now() > deadline {
-            return Err(format!(
-                "内核 12 秒内没有就绪。日志：{}",
-                log_path().display()
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(300));
     }
+    best.map(|(_, p)| p)
 }
 
-/// 停止内核（幂等）。**不碰系统代理** —— 那一步由调用方显式做（见命令层）。
-pub fn stop() -> Result<String, String> {
-    let mut slot = child_slot().lock().unwrap();
-    match slot.as_mut() {
-        Some(child) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            *slot = None;
-            crate::log::info("mihomo：已停止内核");
-            Ok("内核已停止".into())
-        }
-        None => Ok("内核本来就没在运行".into()),
-    }
-}
-
-/// 退出路径调用：把内核带走（否则 Lunac 关了、代理还开着，用户以为网络坏了）。
-pub fn shutdown_on_exit() {
-    if let Err(e) = stop() {
-        crate::log::warn(format!("退出：停止 mihomo 失败：{e}"));
-    }
-}
-
-/// 读内核日志尾部（界面上「日志」那一块）。
+/// 宿主日志尾部（代理插件「日志」页）。
 pub fn read_log(max_lines: usize) -> String {
-    let Ok(text) = fs::read_to_string(log_path()) else {
+    let Some(path) = latest_host_log() else {
+        return String::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
         return String::new();
     };
     let lines: Vec<&str> = text.lines().collect();
@@ -544,151 +377,45 @@ pub fn read_log(max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
-// ── Clash REST API ──────────────────────────────────────────────────
+// ── 启停 ────────────────────────────────────────────────────────────
 
-fn controller_url(cfg: &MihomoConfig, path: &str) -> String {
-    format!("http://127.0.0.1:{}{path}", cfg.controller_port)
-}
-
-fn api_get(cfg: &MihomoConfig, path: &str) -> Result<Value, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let resp = client
-        .get(controller_url(cfg, path))
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", cfg.secret.trim()))
-        .send()
-        .map_err(|e| format!("连不上内核控制口：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("内核控制口返回 HTTP {}", resp.status()));
-    }
-    resp.json::<Value>().map_err(|e| format!("解析内核响应失败：{e}"))
-}
-
-fn controller_alive(cfg: &MihomoConfig) -> bool {
-    api_get(cfg, "/version").is_ok()
-}
-
-/// 节点 / 代理组列表（Clash API 的 `/proxies`）。
+/// 启动内核。**调用方负责把配置存盘**。
 ///
-/// **只挑出「节点」与「组」**，把 `DIRECT` / `REJECT` / `GLOBAL` 这些内置项按类型排掉：
-/// 界面上列一堆用户没建过的伪节点只会让人困惑。
-pub fn proxies(cfg: &MihomoConfig) -> Result<Value, String> {
-    let raw = api_get(cfg, "/proxies")?;
-    let mut out = Vec::new();
-    if let Some(map) = raw.get("proxies").and_then(Value::as_object) {
-        for (name, v) in map {
-            let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-            // Selector/URLTest/Fallback/LoadBalance 是组；其它是节点。
-            let is_group = matches!(ty, "Selector" | "URLTest" | "Fallback" | "LoadBalance" | "Relay");
-            let is_builtin = matches!(name.as_str(), "DIRECT" | "REJECT" | "REJECT-DROP" | "GLOBAL" | "PASS" | "COMPATIBLE");
-            if is_builtin {
-                continue;
-            }
-            out.push(serde_json::json!({
-                "name": name,
-                "type": ty,
-                "is_group": is_group,
-                "now": v.get("now").and_then(Value::as_str).unwrap_or(""),
-                "history": v.get("history").cloned().unwrap_or(Value::Array(vec![])),
-                "all": v.get("all").cloned().unwrap_or(Value::Array(vec![])),
-            }));
-        }
+/// 显式 `engine: "mihomo"` ⇒ 直接返回 [`LEGACY_MIHOMO`]（K4：不静默降级）；
+/// 其余一律走自研引擎（`native_proxy::start`）。
+pub fn start(cfg: &mut MihomoConfig) -> Result<String, String> {
+    if engine_name(cfg) == "mihomo" {
+        return Err(LEGACY_MIHOMO.to_string());
     }
-    Ok(Value::Array(out))
+    crate::native_proxy::start(cfg)
 }
 
-/// 单节点测速（Clash API 的 `/proxies/{name}/delay`）。返回毫秒。
-pub fn delay(cfg: &MihomoConfig, name: &str) -> Result<u64, String> {
-    let path = format!(
-        "/proxies/{}/delay?timeout=5000&url={}",
-        urlencode(name),
-        urlencode(HEALTH_URL)
-    );
-    let v = api_get(cfg, &path)?;
-    v.get("delay")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| v.get("message").and_then(Value::as_str).unwrap_or("测速失败").to_string())
+/// 停止内核（幂等）。**不碰系统代理** —— 那一步由命令层显式做。
+pub fn stop() -> Result<String, String> {
+    crate::native_proxy::stop()
 }
 
-/// 切换某个组当前选中的节点（Clash API 的 `PUT /proxies/{group}`）。
-pub fn select(cfg: &MihomoConfig, group: &str, node: &str) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let resp = client
-        .put(controller_url(cfg, &format!("/proxies/{}", urlencode(group))))
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", cfg.secret.trim()))
-        .json(&serde_json::json!({ "name": node }))
-        .send()
-        .map_err(|e| format!("连不上内核控制口：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("切换节点失败：HTTP {}", resp.status()));
+/// 退出路径调用：把内核带走（否则 Lunac 关了、代理还开着，用户以为网络坏了）。
+pub fn shutdown_on_exit() {
+    if let Err(e) = stop() {
+        crate::log::warn(format!("退出：停止内核失败：{e}"));
     }
-    Ok(())
-}
-
-/// 切换模式（`rule` / `global` / `direct`），并写回配置。
-pub fn set_mode(cfg: &mut MihomoConfig, mode: &str) -> Result<(), String> {
-    cfg.mode = sanitize_mode(mode).to_string();
-    if !is_running() {
-        return Ok(()); // 没在跑就只改配置，下次启动生效
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let resp = client
-        .patch(controller_url(cfg, "/configs"))
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", cfg.secret.trim()))
-        .json(&serde_json::json!({ "mode": cfg.mode }))
-        .send()
-        .map_err(|e| format!("连不上内核控制口：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("切换模式失败：HTTP {}", resp.status()));
-    }
-    Ok(())
-}
-
-/// 极简 URL 编码（只编非 unreserved 字符）——节点名/URL 作为路径或查询串时要它。
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 // ── tauri 命令 ──────────────────────────────────────────────────────
 
-/// 当前内核状态（安装 / 运行 / 端口 / 订阅数）。
+/// 当前内核状态（安装 / 运行 / 端口 / 订阅数 / 节点）。
 #[tauri::command]
 pub async fn mihomo_status() -> Result<MihomoStatus, String> {
-    crate::commands::run_blocking(|| {
-        Ok(status(&crate::system_proxy::load_config().mihomo))
-    })
-    .await
+    crate::commands::run_blocking(|| Ok(status(&crate::system_proxy::load_config().mihomo))).await
 }
 
-/// 下载并安装内核（按需，见模块头）。
-#[tauri::command]
-pub async fn mihomo_install_core() -> Result<String, String> {
-    crate::commands::run_blocking(|| {
-        let cfg = crate::system_proxy::load_config().mihomo;
-        install_core(&cfg)
-    })
-    .await
-}
-
-/// 保存内核设置（订阅 / 端口 / 模式 / 下载源）。
+/// 保存内核设置（订阅 / 模式）。端口不再由用户配置：
+/// 前端传 `0`，宿主保留旧值（端口最终由 `native_proxy::start` 决定）。
 ///
-/// `secret` 与 `links` **不接受前端回传**：前者是本机控制口的凭据（前端根本不该看到），
-/// 后者本轮未支持 —— 都从磁盘上的旧值续上，避免「面板保存一次就丢」。
+/// `secret` 与 `links` **不接受前端回传**：前者是旧控制口的凭据（前端根本不该看到），
+/// 后者由 `mihomo_node_add` / `mihomo_node_del` 单独管理 —— 都从磁盘上的旧值续上，
+/// 避免「保存订阅一次就把手填节点清空」。
 #[tauri::command]
 pub async fn mihomo_config_set(cfg: MihomoConfig) -> Result<MihomoStatus, String> {
     crate::commands::run_blocking(move || {
@@ -700,7 +427,16 @@ pub async fn mihomo_config_set(cfg: MihomoConfig) -> Result<MihomoStatus, String
         if incoming.links.is_empty() {
             incoming.links = pc.mihomo.links.clone();
         }
-        // 端口 0 是非法值（前端漏传时会出现）→ 保留旧值而不是让内核起不来
+        // 显式传 mihomo = 旧客户端 / 手改配置：本版本不再支持，直接拒绝，
+        // **不要**静默改写成 native（用户会以为自己的配置被吃了）。
+        if incoming.engine.trim().eq_ignore_ascii_case("mihomo") {
+            return Err(LEGACY_MIHOMO.to_string());
+        }
+        // 前端没有内核选择控件时 `engine` 是空串 ⇒ 沿用旧值。
+        if incoming.engine.trim().is_empty() {
+            incoming.engine = pc.mihomo.engine.clone();
+        }
+        // 端口 0 = 「由宿主决定」→ 保留旧值；真正挑空闲端口发生在启动时。
         if incoming.mixed_port == 0 {
             incoming.mixed_port = pc.mihomo.mixed_port;
         }
@@ -714,16 +450,116 @@ pub async fn mihomo_config_set(cfg: MihomoConfig) -> Result<MihomoStatus, String
     .await
 }
 
+/// 添加一个手填节点（分享链接）。先解析校验，不合法**一个字都不写**。
+///
+/// 校验器 = `native_proxy::clash::parse_link` —— 与真正联网用的是同一套解析，
+/// 避免「界面说能加、引擎却连不上」这种两套真相源。
+#[tauri::command]
+pub async fn mihomo_node_add(link: String) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let link = link.trim().to_string();
+        crate::native_proxy::clash::parse_link(&link)?;
+        let mut pc = crate::system_proxy::load_config();
+        if pc.mihomo.links.iter().any(|l| l.trim() == link) {
+            return Err("这条节点已经在列表里了".into());
+        }
+        pc.mihomo.links.push(link);
+        crate::system_proxy::save_config(&pc)?;
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
+/// 自定义服务器（2026-11-01 代理面板）：表单 → 分享链接 → 与手填节点同一条存储路径。
+///
+/// 凭据对 ss / trojan / anytls / hysteria2 是密码，对 vless / vmess 是 UUID；
+/// ss 另可选加密方式（缺省 `aes-256-gcm`）。拼完由 `build_custom_link` 自证可解析。
+#[tauri::command]
+pub async fn mihomo_node_add_custom(
+    name: String,
+    server: String,
+    port: u16,
+    kind: String,
+    credential: String,
+    cipher: Option<String>,
+) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let link = crate::native_proxy::clash::build_custom_link(
+            &name,
+            &server,
+            port,
+            &kind,
+            &credential,
+            cipher.as_deref().unwrap_or(""),
+        )?;
+        let mut pc = crate::system_proxy::load_config();
+        if pc.mihomo.links.iter().any(|l| l.trim() == link) {
+            return Err("这条节点已经在列表里了".into());
+        }
+        pc.mihomo.links.push(link);
+        crate::system_proxy::save_config(&pc)?;
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
+/// 删除一个手填节点（按 `status().nodes[].index`）。
+#[tauri::command]
+pub async fn mihomo_node_del(index: usize) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let mut pc = crate::system_proxy::load_config();
+        if index >= pc.mihomo.links.len() {
+            return Err("这个节点已经不在列表里了".into());
+        }
+        pc.mihomo.links.remove(index);
+        crate::system_proxy::save_config(&pc)?;
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
+/// 单独开关**系统代理**（内核保持运行）。
+///
+/// `mihomo_start` 会把系统代理一并指向内核（首次启用最自然的动作）；这个命令让用户
+/// 在不停止内核的前提下把系统代理关掉 / 再打开 —— 面板上那两个开关因此互相独立。
+#[tauri::command]
+pub async fn mihomo_system_proxy_set(enabled: bool) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let mut pc = crate::system_proxy::load_config();
+        if enabled {
+            if !is_running() {
+                return Err("内核还没运行：先启用内核".into());
+            }
+            if pc.mihomo.mixed_port == 0 {
+                return Err("内核端口还没分配：重启一次内核".into());
+            }
+            let server = format!("http://127.0.0.1:{}", pc.mihomo.mixed_port);
+            // 内置默认绕过表（含 `<local>`）—— 不传 bypass 让它走 DEFAULT_BYPASS，
+            // 否则 Lunac 自己（127.0.0.1:8788/8789）会被送去代理，自己把自己绕死。
+            crate::system_proxy::enable_system_proxy(&mut pc, &server, "")?;
+        } else {
+            crate::system_proxy::restore_system_proxy(&mut pc)?;
+        }
+        crate::system_proxy::save_config(&pc)?;
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
 /// 启动内核，并把**系统代理**指向它。备份 / 还原纪律在 `system_proxy.rs` 里。
 #[tauri::command]
 pub async fn mihomo_start() -> Result<MihomoStatus, String> {
     crate::commands::run_blocking(move || {
         let mut pc = crate::system_proxy::load_config();
-        let msg = start(&mut pc.mihomo)?;
-        crate::log::info(msg);
+        // 打开面板时会静默拉起引擎（2026-11-03）⇒ 这里必须容忍「已经跑着」，
+        // 否则用户点「开启服务」会报「引擎已经在运行」，服务永远开不起来。
+        if is_running() {
+            crate::log::info("代理：引擎已就绪，直接开启服务");
+        } else {
+            let msg = start(&mut pc.mihomo)?;
+            crate::log::info(msg);
+        }
         let server = format!("http://127.0.0.1:{}", pc.mihomo.mixed_port);
-        // 内置默认绕过表（含 `<local>`）—— 不传 bypass 让它走 DEFAULT_BYPASS，
-        // 否则 Lunac 自己（127.0.0.1:8788/8789）会被送去代理，自己把自己绕死。
         crate::system_proxy::enable_system_proxy(&mut pc, &server, "")?;
         pc.mihomo.enabled = true;
         crate::system_proxy::save_config(&pc)?;
@@ -732,19 +568,18 @@ pub async fn mihomo_start() -> Result<MihomoStatus, String> {
     .await
 }
 
-/// 停止内核并还原系统代理（幂等）。
+/// **关闭服务**（还原系统代理）但**保留引擎**（幂等）。
+///
+/// 2026-11-03 拆开「引擎」与「服务」：面板开着时要能继续测节点延迟，所以关掉服务
+/// 不再顺手杀引擎；引擎的真正收尾点是「面板关闭且服务未开」（`mihomo_engine_stop`）
+/// 与 App 退出（`shutdown_on_exit`）。
 #[tauri::command]
 pub async fn mihomo_stop() -> Result<MihomoStatus, String> {
     crate::commands::run_blocking(move || {
         let mut pc = crate::system_proxy::load_config();
-        // **只有它本来在跑**才去还原系统代理 —— 否则会把用户用手填列表启用的那条
-        // 也一并没有了（两者是并列的两种用法，不能互相踩）。
-        let was_running = is_running();
-        stop()?;
-        if was_running {
-            crate::system_proxy::restore_system_proxy(&mut pc)?;
-            pc.active.clear();
-        }
+        // 没有备份时它是空操作（不会抹掉用户自己的代理设置），所以无需先判是否在跑。
+        crate::system_proxy::restore_system_proxy(&mut pc)?;
+        pc.active.clear();
         pc.mihomo.enabled = false;
         crate::system_proxy::save_config(&pc)?;
         Ok(status(&pc.mihomo))
@@ -752,49 +587,348 @@ pub async fn mihomo_stop() -> Result<MihomoStatus, String> {
     .await
 }
 
-/// 节点 / 代理组列表（走内核的 Clash API）。
+/// **静默启动引擎**：只开本机监听口，不动系统代理、不改「服务开关」。
+///
+/// 用途 = 打开代理面板时先拉起它，这样「测试连通性」不必先开启服务。
+/// 已在跑 ⇒ 直接返回当前状态（幂等）。
 #[tauri::command]
-pub async fn mihomo_proxies() -> Result<Value, String> {
-    crate::commands::run_blocking(|| {
-        let cfg = crate::system_proxy::load_config().mihomo;
-        proxies(&cfg)
-    })
-    .await
-}
-
-/// 单节点测速（毫秒）。
-#[tauri::command]
-pub async fn mihomo_delay(name: String) -> Result<u64, String> {
-    crate::commands::run_blocking(move || {
-        let cfg = crate::system_proxy::load_config().mihomo;
-        delay(&cfg, &name)
-    })
-    .await
-}
-
-/// 在某个组里切换选中的节点。
-#[tauri::command]
-pub async fn mihomo_select(group: String, node: String) -> Result<(), String> {
-    crate::commands::run_blocking(move || {
-        let cfg = crate::system_proxy::load_config().mihomo;
-        select(&cfg, &group, &node)
-    })
-    .await
-}
-
-/// 切换模式（rule / global / direct）：内核在跑就热切，没跑就只改配置。
-#[tauri::command]
-pub async fn mihomo_set_mode(mode: String) -> Result<MihomoStatus, String> {
+pub async fn mihomo_engine_start() -> Result<MihomoStatus, String> {
     crate::commands::run_blocking(move || {
         let mut pc = crate::system_proxy::load_config();
-        set_mode(&mut pc.mihomo, &mode)?;
+        if !is_running() {
+            let msg = start(&mut pc.mihomo)?;
+            crate::log::info(msg);
+            // `start` 会回填实际监听端口（0 = 由宿主挑）⇒ 必须落盘，
+            // 否则下一次 `status` 报的还是旧端口。
+            crate::system_proxy::save_config(&pc)?;
+        }
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
+/// **只停止引擎**（幂等）。调用方保证此时服务已关（否则等于偷偷断网）。
+#[tauri::command]
+pub async fn mihomo_engine_stop() -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        if is_running() {
+            stop()?;
+        }
+        Ok(status(&crate::system_proxy::load_config().mihomo))
+    })
+    .await
+}
+
+/// 切换内核。**必须先停用**。
+///
+/// 只有 `native` 能切过去；`mihomo` 已不再内置 ⇒ 返回 [`LEGACY_MIHOMO`]
+/// （给旧配置一条明确的出路：改成 native 后重启）。
+#[tauri::command]
+pub async fn mihomo_set_engine(engine: String) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let wanted = engine.trim().to_ascii_lowercase();
+        if wanted != "native" {
+            return Err(if wanted == "mihomo" {
+                LEGACY_MIHOMO.to_string()
+            } else {
+                format!("不认识的内核：{wanted}")
+            });
+        }
+        if is_running() {
+            return Err("先停用当前内核，再切换".into());
+        }
+        let mut pc = crate::system_proxy::load_config();
+        pc.mihomo.engine = "native".to_string();
+        crate::system_proxy::save_config(&pc)?;
+        crate::log::info("proxy：内核切换为 native");
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
+/// 节点列表（自研引擎：节点即订阅 / 手填链接展开后的结果）。
+#[tauri::command]
+pub async fn mihomo_proxies() -> Result<Value, String> {
+    crate::commands::run_blocking(|| Ok(crate::native_proxy::proxies_json())).await
+}
+
+/// 各订阅的节点数。自研引擎没有 provider 概念（订阅在启动时一次性拉平），恒为空表。
+#[derive(Serialize)]
+pub struct ProviderStat {
+    pub name: String,
+    pub nodes: usize,
+}
+
+#[tauri::command]
+pub async fn mihomo_providers() -> Result<Vec<ProviderStat>, String> {
+    crate::commands::run_blocking(|| Ok(Vec::new())).await
+}
+
+/// 订阅里的服务器清单（含协议 / 地址 / 端口 / 传输 / 来源订阅）。
+///
+/// 引擎没跑时返回最近一次「订阅更新」的缓存；缓存为空时**至少列出手填节点**
+/// （它们只依赖 `config\proxy.json`，不需要联网更新）。
+#[tauri::command]
+pub async fn mihomo_servers() -> Result<Vec<crate::native_proxy::ServerView>, String> {
+    crate::commands::run_blocking(|| {
+        let cached = crate::native_proxy::servers();
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+        let pc = crate::system_proxy::load_config();
+        Ok(manual_server_views(&pc.mihomo))
+    })
+    .await
+}
+
+/// 手填链接 → 抽屉行（来源标「手动」= 空串）。解析失败的那条跳过（`manual_nodes` 仍会
+/// 在旧状态里以 `invalid` 占位，但抽屉不给一个点了必定失败的入口）。
+fn manual_server_views(cfg: &MihomoConfig) -> Vec<crate::native_proxy::ServerView> {
+    cfg.links
+        .iter()
+        .enumerate()
+        .filter_map(|(index, link)| {
+            let node = crate::native_proxy::clash::parse_link(link).ok()?;
+            Some(crate::native_proxy::ServerView {
+                index,
+                name: node.name.clone(),
+                kind: node.kind.label().to_string(),
+                server: node.server.clone(),
+                port: node.port,
+                transport: crate::native_proxy::transport_label(&node),
+                source: String::new(),
+                selected: false,
+            })
+        })
+        .collect()
+}
+
+/// 「服务器订阅更新」：拉订阅并解析，不改系统代理。返回节点数。
+///
+/// 2026-11-03：打开面板会静默拉起引擎，而 `native_proxy::refresh` 要求引擎停着 ——
+/// 所以这里**临时**停一下引擎、拉完立刻拉回去。服务开着时不碰引擎（那等于断网），
+/// 如实让用户先关闭服务。
+#[tauri::command]
+pub async fn mihomo_refresh_subs() -> Result<usize, String> {
+    crate::commands::run_blocking(|| {
+        let mut pc = crate::system_proxy::load_config();
+        let was_running = is_running();
+        if was_running {
+            if pc.mihomo.enabled {
+                return Err("服务开着：先关闭服务，再更新订阅".into());
+            }
+            stop()?;
+        }
+        let result = crate::native_proxy::refresh(&pc.mihomo);
+        if was_running {
+            // 无论拉取成功与否都要把引擎恢复，否则测延迟会静默失效。
+            match start(&mut pc.mihomo) {
+                Ok(msg) => {
+                    crate::log::info(msg);
+                    if let Err(e) = crate::system_proxy::save_config(&pc) {
+                        crate::log::warn(format!("订阅更新后保存端口失败：{e}"));
+                    }
+                }
+                Err(e) => crate::log::warn(format!("订阅更新后重启引擎失败：{e}")),
+            }
+        }
+        result
+    })
+    .await
+}
+
+/// 最近的入站请求（界面日志用；含目标域名与走向）。
+#[tauri::command]
+pub async fn mihomo_requests(limit: Option<usize>) -> Result<Vec<crate::native_proxy::RequestView>, String> {
+    let limit = limit.unwrap_or(200).clamp(1, 500);
+    crate::commands::run_blocking(move || Ok(crate::native_proxy::requests(limit))).await
+}
+
+/// 当前出口信息（国家 / 地区 / 城市 / IP），经引擎代理请求，失败如实返回 `ok=false`。
+#[derive(Serialize)]
+pub struct ExitInfo {
+    pub ok: bool,
+    pub ip: String,
+    pub country: String,
+    pub region: String,
+    pub city: String,
+    pub error: String,
+}
+
+#[tauri::command]
+pub async fn mihomo_exit_info() -> Result<ExitInfo, String> {
+    crate::commands::run_blocking(|| {
+        if !is_running() {
+            return Ok(ExitInfo {
+                ok: false,
+                ip: String::new(),
+                country: String::new(),
+                region: String::new(),
+                city: String::new(),
+                error: "引擎未运行".into(),
+            });
+        }
+        let pc = crate::system_proxy::load_config();
+        let port = pc.mihomo.mixed_port;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|e| e.to_string())?)
+            .build()
+            .map_err(|e| format!("build http client: {e}"))?;
+        let value: Value = match client
+            .get("https://ipinfo.io/json")
+            .header(reqwest::header::USER_AGENT, "lunac-proxy")
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(ExitInfo {
+                    ok: false,
+                    ip: String::new(),
+                    country: String::new(),
+                    region: String::new(),
+                    city: String::new(),
+                    error: e.to_string(),
+                })
+            }
+        };
+        Ok(ExitInfo {
+            ok: true,
+            ip: text_field(&value, "ip"),
+            country: text_field(&value, "country"),
+            region: text_field(&value, "region"),
+            city: text_field(&value, "city"),
+            error: String::new(),
+        })
+    })
+    .await
+}
+
+fn text_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// TUN 开关。**当前引擎没有 TUN**（需要 wintun 驱动 + 用户态 TCP/IP 栈）——
+/// 打开时如实报错，绝不假装切换成功（`forbidden.md` §禁用 1）。
+#[tauri::command]
+pub async fn mihomo_set_tun(enabled: bool) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let mut pc = crate::system_proxy::load_config();
+        if enabled {
+            pc.mihomo.tun = false;
+            crate::system_proxy::save_config(&pc)?;
+            return Err(
+                "TUN 模式需要 wintun 驱动与用户态 TCP/IP 栈，当前自研引擎尚未支持；请使用系统代理（全局 / 规则）"
+                    .into(),
+            );
+        }
+        pc.mihomo.tun = false;
         crate::system_proxy::save_config(&pc)?;
         Ok(status(&pc.mihomo))
     })
     .await
 }
 
-/// 内核日志尾部（界面上「日志」那块）。
+/// 当前进程是否已提权（TUN 的管理员闸门）。
+#[tauri::command]
+pub fn mihomo_is_elevated() -> bool {
+    process_is_elevated()
+}
+
+#[cfg(target_os = "windows")]
+fn process_is_elevated() -> bool {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn IsUserAnAdmin() -> i32;
+    }
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_is_elevated() -> bool {
+    false
+}
+
+/// 以管理员身份重启 Lunac（TUN 警告框点「同意」后调用）。
+///
+/// 顺序：先起一个隐藏 PowerShell，**等当前 PID 退出**再 `Start-Process -Verb RunAs`
+/// —— 直接先提权会撞上单实例守卫（旧进程还在，新进程立刻退出）。
+///
+/// **dev（debug）不自动重启**（2026-11-02，用户实测「退出后拉不起来」）：
+/// dev 的界面来自 `devUrl = http://localhost:5173` 的 vite，而 vite 是
+/// `npm run tauri:dev` 的子进程 —— 旧 app 退出后整条管线被收掉；再从提权进程里另起
+/// 一套 `npm run tauri:dev` 会撞端口 / 构建锁，实测无法可靠拉起。而 debug 构建是
+/// console 子系统，直接重启 exe 还会弹一个命令行窗口。
+/// 所以 dev 只返回**可操作提示**、不退出进程；release 仍自动重启自身 exe。
+#[tauri::command]
+pub async fn mihomo_relaunch_elevated(app: tauri::AppHandle) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Err(
+            "开发版不支持自动提权重启（会丢掉 npm run tauri:dev 的 vite 服务且无法自动恢复）。\
+             请关闭 Lunac，用【以管理员身份运行】的终端重新执行 npm run tauri:dev，再打开 TUN。"
+                .into(),
+        );
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("读取自身路径失败：{e}"))?;
+    let pid = std::process::id();
+    let script = format!(
+        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Process -FilePath '{}' -Verb RunAs -WindowStyle Hidden",
+        exe.display()
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .spawn()
+        .map_err(|e| format!("启动提权进程失败：{e}"))?;
+    crate::log::info("proxy：用户同意后以管理员身份重启（TUN 闸门）");
+    app.exit(0);
+    Ok(())
+}
+
+/// 当前是否是开发版（debug 构建）。前端据此决定 TUN 警告框的文案：
+/// dev 不给「同意并重启」（见 [`mihomo_relaunch_elevated`] 的说明），只提示手动操作。
+#[tauri::command]
+pub fn mihomo_is_dev_build() -> bool {
+    cfg!(debug_assertions)
+}
+
+/// 单节点测速（毫秒）：**经节点**发一次 HTTP 探针，量到第一个响应字节的耗时。
+#[tauri::command]
+pub async fn mihomo_delay(name: String) -> Result<u64, String> {
+    crate::commands::run_blocking(move || crate::native_proxy::delay(&name)).await
+}
+
+/// 切换当前节点（自研引擎没有「组」的概念，`group` 参数只为前端兼容保留）。
+#[tauri::command]
+pub async fn mihomo_select(group: String, node: String) -> Result<(), String> {
+    crate::commands::run_blocking(move || {
+        let _ = group;
+        crate::native_proxy::select(&node)
+    })
+    .await
+}
+
+/// 切换模式（rule / global / direct）。自研引擎的模式在启动时展开，运行中**不能热切**。
+#[tauri::command]
+pub async fn mihomo_set_mode(mode: String) -> Result<MihomoStatus, String> {
+    crate::commands::run_blocking(move || {
+        let mut pc = crate::system_proxy::load_config();
+        if is_running() {
+            return Err("自研引擎的模式在启动时确定：先停用、改模式、再启用".into());
+        }
+        pc.mihomo.mode = sanitize_mode(&mode).to_string();
+        crate::system_proxy::save_config(&pc)?;
+        Ok(status(&pc.mihomo))
+    })
+    .await
+}
+
+/// 宿主日志尾部（代理插件「日志」页；自研引擎的日志就在宿主日志里）。
 #[tauri::command]
 pub async fn mihomo_log() -> Result<String, String> {
     crate::commands::run_blocking(|| Ok(read_log(200))).await
@@ -805,14 +939,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn yaml_scalars_are_always_quoted_and_escaped() {
-        // 节点名里带冒号/井号是最常见的「配置被写坏」来源
-        assert_eq!(yaml_str("a:b"), "\"a:b\"");
-        assert_eq!(yaml_str("a\"b"), "\"a\\\"b\"");
-        assert_eq!(yaml_str("a\\b"), "\"a\\\\b\"");
-    }
-
-    #[test]
     fn mode_falls_back_to_rule_on_garbage() {
         assert_eq!(sanitize_mode("global"), "global");
         assert_eq!(sanitize_mode("DIRECT"), "direct");
@@ -821,27 +947,60 @@ mod tests {
     }
 
     #[test]
-    fn config_contains_ports_and_providers() {
-        let mut cfg = MihomoConfig::default();
-        cfg.subscriptions.push(Subscription {
-            name: "机场A".into(),
-            url: "https://example.com/sub?token=1".into(),
-        });
-        let yaml = render_config(&cfg, "s3cret");
-        assert!(yaml.contains("mixed-port: 7890"));
-        assert!(yaml.contains("external-controller: 127.0.0.1:9090"));
-        assert!(yaml.contains("secret: \"s3cret\""));
-        // 订阅名是中文 ⇒ 必须被引号包住，否则 YAML 解析会炸
-        assert!(yaml.contains("\"机场A\":"));
-        assert!(yaml.contains("MATCH,PROXY"));
+    fn default_engine_is_native() {
+        // §待办 3-26 K1：新配置一律自研，不再依赖 mihomo.exe
+        assert_eq!(MihomoConfig::default().engine, "native");
+        assert_eq!(engine_name(&MihomoConfig::default()), "native");
     }
 
     #[test]
-    fn secret_is_generated_once_and_stable() {
-        let mut cfg = MihomoConfig::default();
-        let a = ensure_secret(&mut cfg);
-        let b = ensure_secret(&mut cfg);
-        assert_eq!(a, b, "已有 secret 时不得重生成");
-        assert_eq!(a.len(), 32);
+    fn blank_engine_means_native_but_explicit_mihomo_survives() {
+        // 旧配置里没有 engine 字段 ⇒ serde 给空串 ⇒ 走缺省 native
+        let blank = MihomoConfig {
+            engine: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(engine_name(&blank), "native");
+        // 显式写 mihomo 的旧配置仍被识别出来（随后启动会如实报错，见下一条）
+        let legacy = MihomoConfig {
+            engine: "  MiHoMo ".into(),
+            ..Default::default()
+        };
+        assert_eq!(engine_name(&legacy), "mihomo");
+        // 大小写 / 前后空白不影响 native
+        let native = MihomoConfig {
+            engine: " NATIVE ".into(),
+            ..Default::default()
+        };
+        assert_eq!(engine_name(&native), "native");
+    }
+
+    #[test]
+    fn legacy_mihomo_engine_is_rejected_with_actionable_message() {
+        // K4：不静默降级，错误里必须给出可操作的那一步（改成 native / 删字段）
+        let mut cfg = MihomoConfig {
+            engine: "mihomo".into(),
+            ..Default::default()
+        };
+        let err = start(&mut cfg).expect_err("mihomo 已不再内置，必须报错");
+        assert!(err.contains("native"), "错误文案要告诉用户改用 native：{err}");
+        assert_eq!(err, LEGACY_MIHOMO);
+    }
+
+    #[test]
+    fn manual_nodes_keep_index_alignment_and_mark_invalid() {
+        let cfg = MihomoConfig {
+            links: vec![
+                "trojan://pw@a.example.com:443#A".to_string(),
+                "not-a-link".to_string(),
+            ],
+            ..Default::default()
+        };
+        let nodes = manual_nodes(&cfg);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].index, 0);
+        assert_eq!(nodes[0].kind, "trojan");
+        assert_eq!(nodes[1].index, 1);
+        assert_eq!(nodes[1].kind, "invalid");
     }
 }

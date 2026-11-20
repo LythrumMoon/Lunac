@@ -19,7 +19,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "0.9.38"
+!define PRODUCT_VERSION "0.9.45"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
 ; 升级 / 重装时自动定位**上一版的安装目录**（2026-09-30）：从卸载注册表的
@@ -176,7 +176,7 @@ Section "Install" SecCore
 SectionEnd
 
 ; ── 拓展插件（勾选才装，2026-09-29 用户要求）───────────────────────
-; 规则：拓展插件**不随安装包默认安装**，但安装包里要有勾选项。下面五段都带 `/o`
+; 规则：拓展插件**不随安装包默认安装**，但安装包里要有勾选项。下面各段都带 `/o`
 ; （unselected）⇒ 默认全不装；勾了的会在 `$INSTDIR\Modules\<id>\` 落一份**完整插件**
 ; （index.js + lunac-plugin.json），形状与「从市场装过一遍」完全一致 —— 启动后
 ; `refreshMarketPlugins()` 扫盘即认，用户不必再点一次下载。
@@ -246,10 +246,21 @@ SectionEnd
 
 ; 代理（2026-10-02 补）：无依赖。它管系统代理与本机播放（librespot）的代理 —— 代理软件
 ; 本身由用户自备，插件只是把系统 / librespot 指过去（契约见 ai-spec §4.11）。
-Section /o "Proxy (system + librespot)" SecExtProxy
+Section "Proxy (system + librespot)" SecExtProxy
   !if /FileExists "ext-plugins\proxy\lunac-plugin.json"
     SetOutPath "$INSTDIR\Modules\proxy"
     File /r "ext-plugins\proxy\*"
+    SetOutPath "$INSTDIR"
+  !endif
+SectionEnd
+
+; 资源库（2026-11-01）：漫画 / 小说 / 番剧 / 电视剧的聚合阅读器，单文件 ESM、无本机依赖。
+; 清单与产物由 `resource-hub` 工程自己构建（`build-plugins.ps1` 的外部工程分支），
+; 来源规则不随包：用户装完在插件里导入公开索引（默认 lunac-rules）即可。
+Section /o "Reading (resource hub)" SecExtResourceHub
+  !if /FileExists "ext-plugins\resource-hub\lunac-plugin.json"
+    SetOutPath "$INSTDIR\Modules\resource-hub"
+    File /r "ext-plugins\resource-hub\*"
     SetOutPath "$INSTDIR"
   !endif
 SectionEnd

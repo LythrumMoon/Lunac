@@ -38,7 +38,7 @@ const WM_KEYUP: usize = 0x0101;
 const WM_SYSKEYDOWN: usize = 0x0104;
 const WM_SYSKEYUP: usize = 0x0105;
 const VK_SPACE: u32 = 0x20;
-const VK_MENU: u32 = 0x12;   // 通用 Alt（GetAsyncKeyState 用）
+const VK_MENU: u32 = 0x12; // 通用 Alt（GetAsyncKeyState 用）
 const VK_ESCAPE: u32 = 0x1B;
 const LLKHF_ALTDOWN: u32 = 0x0020;
 const PM_NOREMOVE: u32 = 0x0000;
@@ -47,7 +47,7 @@ const KEYEVENTF_KEYUP: u32 = 0x0002;
 const VK_DUMMY: u16 = 0xFF; // 保留键值，仅用于打断 Alt 单按序列
 const WM_SYSCOMMAND: u32 = 0x0112;
 const SC_KEYMENU: usize = 0xF100; // Alt+Space / Alt 激活系统菜单
-// 双击标题栏（HTCAPTION 命中）→ 禁用铺满全屏（最大化）
+                                  // 双击标题栏（HTCAPTION 命中）→ 禁用铺满全屏（最大化）
 const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
 const HTCAPTION: usize = 2; // 命中测试：标题栏区域
 
@@ -93,7 +93,7 @@ pub static RECORDING: AtomicBool = AtomicBool::new(false);
 /// 为什么用**单一枚举**而不是「每个界面一个 AtomicBool」：后者每加一个界面都要
 /// 改这里的 Esc 分支，且前端变量与 Rust 原子量是两个真相源、漏同步一处行为就漂。
 /// 现在新增界面 = 加一个常量 + 前端加一支处理，Rust 分支数不变。
-pub const UI_MODE_MAIN: u8 = 0;   // 简洁搜索（唯一的「按内容判空」层）
+pub const UI_MODE_MAIN: u8 = 0; // 简洁搜索（唯一的「按内容判空」层）
 pub const UI_MODE_PLUGIN: u8 = 1; // 插件 / AI 对话大界面
 pub const UI_MODE_DETAIL: u8 = 2; // 详细搜索大界面（双击搜索栏进入）
 pub static UI_MODE: AtomicU8 = AtomicU8::new(UI_MODE_MAIN);
@@ -136,7 +136,10 @@ struct Kbdllhookstruct {
 
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
-struct Point { x: i32, y: i32 }
+struct Point {
+    x: i32,
+    y: i32,
+}
 
 // `pub(crate)` + 放开 `message` / `l_param`：`mouse_hook.rs` 的 WH_MOUSE_LL 消息泵
 // 复用它（两者都要声明 `GetMessageW` / `PeekMessageW`，而「同一 Win32 符号在一个 crate
@@ -177,7 +180,13 @@ extern "system" {
     fn UnhookWindowsHookEx(hhk: isize) -> i32;
     fn CallNextHookEx(hhk: isize, n_code: i32, w_param: usize, l_param: isize) -> isize;
     fn GetMessageW(msg: *mut Msg, hwnd: isize, filter_min: u32, filter_max: u32) -> i32;
-    fn PeekMessageW(msg: *mut Msg, hwnd: isize, filter_min: u32, filter_max: u32, remove: u32) -> i32;
+    fn PeekMessageW(
+        msg: *mut Msg,
+        hwnd: isize,
+        filter_min: u32,
+        filter_max: u32,
+        remove: u32,
+    ) -> i32;
     fn PostThreadMessageW(thread_id: u32, msg: u32, w_param: usize, l_param: isize) -> i32;
     fn GetAsyncKeyState(vk: i32) -> i16;
     fn SendInput(n: u32, inputs: *const Input, size: i32) -> u32;
@@ -281,11 +290,16 @@ unsafe extern "system" fn main_window_subclass(
                 // Chromium swallows Space in its internal menu mode, so JS keydown
                 // never fires for Alt+Space. Capture directly from WndProc.
                 RECORDING.store(false, Ordering::SeqCst);
-                let _ = APP.get().map(|a| a.emit("lunac-hotkey-recorded", serde_json::json!({
-                    "vk": VK_SPACE,
-                    "modifiers": MOD_ALT,
-                    "combo": "Alt+Space",
-                })));
+                let _ = APP.get().map(|a| {
+                    a.emit(
+                        "lunac-hotkey-recorded",
+                        serde_json::json!({
+                            "vk": VK_SPACE,
+                            "modifiers": MOD_ALT,
+                            "combo": "Alt+Space",
+                        }),
+                    )
+                });
             }
         }
         return 0; // Always swallow SC_KEYMENU to prevent system menu
@@ -374,7 +388,9 @@ fn key_name_to_vk(name: &str) -> Option<u32> {
             } else {
                 // F1-F12
                 if name.starts_with('F') && name.len() >= 2 {
-                    name[1..].parse::<u32>().ok()
+                    name[1..]
+                        .parse::<u32>()
+                        .ok()
                         .filter(|&n| (1..=12).contains(&n))
                         .map(|n| 0x6F + n)
                 } else {
@@ -447,8 +463,8 @@ fn load_hotkey_config() -> Option<String> {
 /// 应用热键配置：解析组合字符串 → 更新原子变量 → 持久化 → 重装热键后端
 /// （优先 RegisterHotKey，失败才装 LL 钩子 —— 因此支持任意改键组合）。
 pub fn parse_and_set_hotkey(combo: &str) -> Result<(), String> {
-    let (mods, vk) = parse_hotkey_combo(combo)
-        .ok_or_else(|| format!("Invalid hotkey combo: {}", combo))?;
+    let (mods, vk) =
+        parse_hotkey_combo(combo).ok_or_else(|| format!("Invalid hotkey combo: {}", combo))?;
     HOTKEY_MODIFIERS.store(mods, Ordering::SeqCst);
     HOTKEY_VK.store(vk, Ordering::SeqCst);
     if let Ok(mut s) = HOTKEY_COMBO.lock() {
@@ -466,7 +482,10 @@ pub fn parse_and_set_hotkey(combo: &str) -> Result<(), String> {
 
 /// 获取当前热键组合字符串（供前端查询）
 pub fn get_current_hotkey_string() -> String {
-    HOTKEY_COMBO.lock().map(|s| s.clone()).unwrap_or_else(|_| DEFAULT_HOTKEY.to_string())
+    HOTKEY_COMBO
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| DEFAULT_HOTKEY.to_string())
 }
 
 /// 注入 dummy key (0xFF down+up)，打断前台窗口眼中的"孤立 Alt"序列，
@@ -475,12 +494,24 @@ unsafe fn send_dummy_key() {
     let inputs = [
         Input {
             r#type: INPUT_KEYBOARD,
-            ki: KeybdInput { vk: VK_DUMMY, scan: 0, flags: 0, time: 0, extra: 0 },
+            ki: KeybdInput {
+                vk: VK_DUMMY,
+                scan: 0,
+                flags: 0,
+                time: 0,
+                extra: 0,
+            },
             _pad: [0; 8],
         },
         Input {
             r#type: INPUT_KEYBOARD,
-            ki: KeybdInput { vk: VK_DUMMY, scan: 0, flags: KEYEVENTF_KEYUP, time: 0, extra: 0 },
+            ki: KeybdInput {
+                vk: VK_DUMMY,
+                scan: 0,
+                flags: KEYEVENTF_KEYUP,
+                time: 0,
+                extra: 0,
+            },
             _pad: [0; 8],
         },
     ];
@@ -508,12 +539,7 @@ unsafe extern "system" fn keyboard_hook(n_code: i32, w_param: usize, l_param: is
                     LAST_TOGGLE_TICK.store(now, Ordering::SeqCst);
                     TOGGLE_COUNT_LL.fetch_add(1, Ordering::Relaxed);
                     send_dummy_key();
-                    PostThreadMessageW(
-                        HOOK_THREAD_ID.load(Ordering::SeqCst),
-                        WM_APP_TOGGLE,
-                        0,
-                        0,
-                    );
+                    PostThreadMessageW(HOOK_THREAD_ID.load(Ordering::SeqCst), WM_APP_TOGGLE, 0, 0);
                 }
                 return 1; // 吞掉按键，抑制系统菜单
             }
@@ -700,7 +726,9 @@ fn notify_window_shown() {
         // 本闭包就是 `run_on_main_thread` 投递的，满足这个前提。
         let files = unsafe { read_clipboard_files() };
         for path in &files {
-            if !payload.is_empty() { payload.push('\n'); }
+            if !payload.is_empty() {
+                payload.push('\n');
+            }
             payload.push_str(path);
         }
 
@@ -824,7 +852,10 @@ fn register_system_hotkey() -> bool {
     unsafe {
         let ok = RegisterHotKey(hwnd, HOTKEY_ID as i32, mods | MOD_NOREPEAT, vk);
         if ok != 0 {
-            eprintln!("[lunac::hotkey] RegisterHotKey OK (mods={:#x}, vk={:#x}) — 无钩子模式", mods, vk);
+            eprintln!(
+                "[lunac::hotkey] RegisterHotKey OK (mods={:#x}, vk={:#x}) — 无钩子模式",
+                mods, vk
+            );
             true
         } else {
             eprintln!(
@@ -905,7 +936,10 @@ fn install_hook_thread() {
             HOOK_MODE.store(true, Ordering::SeqCst);
             hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard_hook, 0, 0);
             if hook == 0 {
-                eprintln!("[lunac::hotkey] SetWindowsHookEx FAILED err={}", GetLastError());
+                eprintln!(
+                    "[lunac::hotkey] SetWindowsHookEx FAILED err={}",
+                    GetLastError()
+                );
                 crate::log::warn(format!(
                     "hotkey: backend=LL-hook 安装失败 err={} combo={combo}",
                     GetLastError()
@@ -915,9 +949,15 @@ fn install_hook_thread() {
                 return;
             }
             if restart > 0 {
-                eprintln!("[lunac::hotkey] Hook reinstalled (restart #{}) ({})", restart, combo);
+                eprintln!(
+                    "[lunac::hotkey] Hook reinstalled (restart #{}) ({})",
+                    restart, combo
+                );
             } else {
-                eprintln!("[lunac::hotkey] Hotkey ready via LL hook fallback ({})", combo);
+                eprintln!(
+                    "[lunac::hotkey] Hotkey ready via LL hook fallback ({})",
+                    combo
+                );
             }
             crate::log::warn(format!(
                 "hotkey: backend=LL-hook (fallback) combo={combo} restart={restart} \
@@ -947,24 +987,26 @@ fn install_hook_thread() {
                     let ok = APP
                         .get()
                         .map(|a| a.emit("lunac-esc-cancel-rec", ()).is_ok());
-                    eprintln!("[lunac::hotkey] Esc({src}): recording -> cancel ok={:?}", ok);
+                    eprintln!(
+                        "[lunac::hotkey] Esc({src}): recording -> cancel ok={:?}",
+                        ok
+                    );
                 } else if UI_MODE.load(Ordering::SeqCst) != UI_MODE_MAIN {
                     // 处在插件 / 详细搜索等「大界面层」：层还没退完，一律交给前端逐级退出。
                     // **不看 query/chips 是否空**——详细搜索把内容放在自己的输入框里，
                     // 简洁搜索栏本来就是空的，按内容判空会在详情态误隐藏整个窗口。
                     let mode = UI_MODE.load(Ordering::SeqCst);
-                    let ok = APP
-                        .get()
-                        .map(|a| a.emit("lunac-esc-clear", ()).is_ok());
+                    let ok = APP.get().map(|a| a.emit("lunac-esc-clear", ()).is_ok());
                     eprintln!("[lunac::hotkey] Esc({src}): ui_mode={mode} (non-main) -> emit clear ok={:?}", ok);
                 } else if QUERY_EMPTY.load(Ordering::SeqCst) && CHIPS_EMPTY.load(Ordering::SeqCst) {
                     eprintln!("[lunac::hotkey] Esc({src}): all empty -> hide");
                     hide_window();
                 } else {
-                    let ok = APP
-                        .get()
-                        .map(|a| a.emit("lunac-esc-clear", ()).is_ok());
-                    eprintln!("[lunac::hotkey] Esc({src}): chips/query -> emit clear ok={:?}", ok);
+                    let ok = APP.get().map(|a| a.emit("lunac-esc-clear", ()).is_ok());
+                    eprintln!(
+                        "[lunac::hotkey] Esc({src}): chips/query -> emit clear ok={:?}",
+                        ok
+                    );
                 }
                 let _ = io::stderr().flush();
             }
@@ -1099,8 +1141,7 @@ pub fn start_hotkey(app: AppHandle) {
             // 前景换成别的程序（浏览器 / 资源管理器…）⇒ 照常隐藏。
             // 这同时覆盖了原注释担心的事（「插件窗与搜索窗同时存在」被守卫自己推翻）：
             // 用户点插件窗时前景就是那个插件窗 ⇒ 本进程 ⇒ 不隐藏。
-            if !DETACHED.load(Ordering::SeqCst)
-                && UI_MODE.load(Ordering::SeqCst) != UI_MODE_PLUGIN
+            if !DETACHED.load(Ordering::SeqCst) && UI_MODE.load(Ordering::SeqCst) != UI_MODE_PLUGIN
             {
                 let fg = GetForegroundWindow();
                 let mut fg_pid = 0u32;
@@ -1112,9 +1153,9 @@ pub fn start_hotkey(app: AppHandle) {
                     let now = GetTickCount();
                     let last_toggle = LAST_TOGGLE_TICK.load(Ordering::SeqCst);
                     // Allow more time for force_foreground + clipboard read to finish.
-            // LAST_TOGGLE_TICK is now set AFTER force_foreground completes,
-            // so the window is actually ready. 2s is generous for any IPC.
-            if now.wrapping_sub(last_toggle) >= 2000 {
+                    // LAST_TOGGLE_TICK is now set AFTER force_foreground completes,
+                    // so the window is actually ready. 2s is generous for any IPC.
+                    if now.wrapping_sub(last_toggle) >= 2000 {
                         eprintln!("[lunac::hotkey] auto-hide: visible but not foreground");
                         let _ = io::stderr().flush();
                         hide_window();

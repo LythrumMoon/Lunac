@@ -35,11 +35,17 @@ pub struct SnapshotFileDto {
 pub fn snapshot_read_text(path: String) -> Result<SnapshotFileDto, String> {
     let p = Path::new(&path);
     if !p.is_file() {
-        return Ok(SnapshotFileDto { existed: false, content: None });
+        return Ok(SnapshotFileDto {
+            existed: false,
+            content: None,
+        });
     }
     let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX);
     if len > MAX_SNAPSHOT_BYTES {
-        return Ok(SnapshotFileDto { existed: true, content: None });
+        return Ok(SnapshotFileDto {
+            existed: true,
+            content: None,
+        });
     }
     match std::fs::read(p) {
         Ok(bytes) => Ok(SnapshotFileDto {
@@ -120,7 +126,9 @@ pub struct FrameDto {
 }
 
 fn frames_root() -> std::path::PathBuf {
-    crate::storage::module_data_dir().join("history").join("frames")
+    crate::storage::module_data_dir()
+        .join("history")
+        .join("frames")
 }
 
 /// 校验 session id：只允许 `[A-Za-z0-9_-]`、长度 1..=64。
@@ -204,7 +212,8 @@ mod tests {
 
     /// 每个用例一个独立临时目录（同进程并行跑也不会互相踩）。
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("lunac-snap-test-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lunac-snap-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
@@ -265,7 +274,8 @@ mod tests {
         assert!(dto.existed);
         assert_eq!(dto.content.as_deref(), Some(original));
         std::fs::write(&p, "被 agent 改过的内容").unwrap();
-        snapshot_restore_text(p.to_string_lossy().into_owned(), dto.content, true).expect("restore ok");
+        snapshot_restore_text(p.to_string_lossy().into_owned(), dto.content, true)
+            .expect("restore ok");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
     }
 

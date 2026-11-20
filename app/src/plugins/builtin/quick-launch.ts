@@ -46,6 +46,8 @@ export const quickLaunchPlugin: Plugin = {
   description: "Launch custom files, apps, or paths — 启动/运行自定义文件与程序",
   icon: "📌",
   badge: "Launch",
+  // 能力身份（E.1，2026-10-18）：其它插件 / 宿主可按能力定位，不必写死 id。
+  provides: ["launcher.apps"],
 
   async execute(_input: string) {
     // 收集已注册项 + 会话附加文件（合并，按路径去重）

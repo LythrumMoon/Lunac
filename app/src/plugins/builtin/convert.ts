@@ -1,37 +1,38 @@
-// ── 文件转换插件（图片 / 音频 / 视频）────────────────────────────
-// 2026-09-27。用户选定范围：图片格式互转 + 音频格式互转 + 视频格式互转。
+// ── 文件转换插件（2026-10-24 重构：独立窗口 / 四类转换 / 多文件队列）─────
 //
-// 引擎 = 本机 ffmpeg（`src-tauri/src/convert.rs`）。**转换必须由宿主做**：前端插件
-// 没有执行外部进程的能力（与「联网必须走宿主」同一条纪律，code-rules 预检 #36）。
+// 引擎：本机 ffmpeg（视频 / 音频 / 动图）+ 本机 LibreOffice（PDF → Word/PPT/Excel/图片）。
+// 都在宿主 `src-tauri/src/convert.rs` 里跑 —— 前端没有执行外部进程的能力。
 //
-// 界面（内嵌插件视图 360px 高）：
-//   [引擎状态：ffmpeg 8.1.1]                    [选择文件]
-//   [源文件：名.mp4 · 视频 · 3.0s · 17.0 KB]
-//   转换为  [mp4][mkv][webm][avi][mov][gif][mp3][wav]…
-//   [开始转换]  [━━━━━━━━──────] 62%
-//   完成：out.webm · 19.0 KB    [打开文件] [打开所在目录]
+// 界面：左侧「转换类型」竖排 4 页签 → 输入框（300×250）→ 中间图标/进度 → 输出框（300×250）。
+//   · 输入框：点击整块弹文件选择；也支持把文件拖进窗口（只收当前页签允许的类型）。
+//   · 多个文件用泡泡框列出：点泡泡打开文件、× 取消/移除；输入框右上角一键清空。
+//   · 转换中：中间图标换成条形进度 + 上方百分比。
+//   · 右上角：保存目录 + 设置按钮；输出泡泡点击用系统默认程序打开。
 //
-// 纪律：
-//   · 进度走 `convert-progress` 事件（宿主每 ~0.5s 推一次）；`percent < 0` = 时长
-//     未知（图片没有时长）⇒ 进度条切成不确定态，**不显示假百分比**。
-//   · 事件监听模块级去重（重开面板不能叠监听器，code-rules §3.3）；
-//     `main.ts` 的 closePluginView 会调 `window.__lunac_convert_stop` 收尾。
+// 纪律：进度事件 `convert-progress` 只反映**当前这一个**文件（队列串行）；
+//       面板关闭时 `detach()` 撤销监听，避免叠加。
 
 import type { Plugin, PluginResult } from "../registry";
 import { t } from "../../i18n.js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+
+type TabKey = "pdf" | "video" | "extract" | "audio";
+type ItemStatus = "queued" | "running" | "done" | "error";
 
 interface EngineDto {
   found: boolean;
   path: string;
   version: string;
+  pdf_found: boolean;
+  pdf_version: string;
 }
 interface MediaDto {
   path: string;
   name: string;
-  kind: "image" | "audio" | "video" | "unknown";
+  kind: "image" | "audio" | "video" | "pdf" | "unknown";
   ext: string;
   size: number;
   duration: number;
@@ -42,313 +43,423 @@ interface ConvertResult {
   size: number;
   elapsed_ms: number;
 }
+interface Item {
+  id: string;
+  path: string;
+  name: string;
+  status: ItemStatus;
+  /** 入队时所在的分页 —— 队列跑起来时**不跟着当前页签变**（否则切页签会把 PDF 条目送进 ffmpeg）。 */
+  tab: TabKey;
+  /** 入队时选定的目标格式。 */
+  target: string;
+  output?: string;
+  err?: string;
+}
+
+const VIDEO_EXTS = ["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "ts", "3gp", "rmvb"];
+const AUDIO_EXTS = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "ape", "amr"];
+
+const TABS: { key: TabKey; label: string; accept: string[]; targets: string[] }[] = [
+  { key: "pdf", label: "convert.tab_pdf", accept: ["pdf"], targets: ["docx", "pptx", "xlsx", "png"] },
+  { key: "video", label: "convert.tab_video", accept: VIDEO_EXTS, targets: ["mp4", "mkv", "webm", "avi", "mov", "gif"] },
+  { key: "extract", label: "convert.tab_extract", accept: VIDEO_EXTS, targets: ["mp3", "wav", "flac", "m4a", "aac", "ogg"] },
+  { key: "audio", label: "convert.tab_audio", accept: AUDIO_EXTS, targets: ["mp3", "wav", "flac", "m4a", "aac", "ogg"] },
+];
 
 const SVG = {
-  file: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`,
-  play: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20 6 4"/></svg>`,
+  file: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`,
   folder: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
+  swap: `<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h13"/><polyline points="14 4 17 7 14 10"/><path d="M20 17H7"/><polyline points="10 14 7 17 10 20"/></svg>`,
+  x: `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>`,
 };
 
 // ── 状态 ──────────────────────────────────────────────────────────
 let engine: EngineDto | null = null;
-let media: MediaDto | null = null;
-let target = "";
-let converting = false;
-let result: ConvertResult | null = null;
-let progress = 0;
+let tab: TabKey = "video";
+let targetByTab: Record<TabKey, string> = { pdf: "docx", video: "mp4", extract: "mp3", audio: "mp3" };
+let items: Item[] = [];
+let outDir = "";
+let running = false;
+let progress = -1;
 
-let unlistenProgress: (() => void) | null = null;
-let currentView: HTMLElement | null = null;
+let view: HTMLElement | null = null;
 let gen = 0;
+let unlistenProgress: (() => void) | null = null;
+let unDragDrop: (() => void) | null = null;
+let clearArmed = false;
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-
-function formatSize(n: number): string {
-  if (!isFinite(n) || n <= 0) return "0 B";
-  if (n < 1024) return `${n} B`;
-  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
-  return `${(n / 1073741824).toFixed(2)} GB`;
+function extOf(path: string): string {
+  const m = path.match(/\.([a-zA-Z0-9]+)$/);
+  return m ? m[1].toLowerCase() : "";
 }
-
-function formatDuration(sec: number): string {
-  if (!isFinite(sec) || sec <= 0) return "";
-  const total = Math.round(sec);
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return m > 0 ? `${m}:${String(s).padStart(2, "0")}` : `${s}s`;
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
 }
-
-function kindLabel(kind: string): string {
-  switch (kind) {
-    case "image": return t("convert.kind_image");
-    case "audio": return t("convert.kind_audio");
-    case "video": return t("convert.kind_video");
-    default: return t("convert.kind_unknown");
-  }
+function tabDef(): (typeof TABS)[number] {
+  return TABS.find((x) => x.key === tab) ?? TABS[0];
 }
-
 function errText(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
   if (raw.includes("ERR_NO_FILE")) return t("convert.err_no_file");
   if (raw.includes("ERR_NO_ENGINE")) return t("convert.err_no_engine");
+  if (raw.includes("ERR_NO_PDF_ENGINE")) return t("convert.err_no_pdf_engine");
+  if (raw.includes("ERR_OUT_DIR")) return t("convert.err_out_dir");
   return raw;
+}
+function setMsg(s: string) {
+  const el = view?.querySelector<HTMLElement>("#convert-msg");
+  if (el && el.textContent !== s) el.textContent = s;
 }
 
 // ── 视图 ──────────────────────────────────────────────────────────
-
 function shellHtml(): string {
+  const tabs = TABS.map(
+    (x) => `<button type="button" class="convert-tab" data-tab="${x.key}">${esc(t(x.label))}</button>`,
+  ).join("");
   return `
-  <div class="convert-root">
-    <div class="convert-head">
+  <div class="convert-win">
+    <div class="convert-top">
       <span class="convert-engine" id="convert-engine">${t("convert.engine_checking")}</span>
-      <button class="convert-btn" id="convert-pick">${SVG.file} ${t("convert.pick")}</button>
+      <span class="convert-outdir" id="convert-outdir"></span>
+      <button type="button" class="convert-icon-btn" id="convert-outdir-btn" title="${esc(t("convert.set_out_dir"))}">${SVG.folder}</button>
     </div>
-
-    <div class="convert-source" id="convert-source">${t("convert.pick_hint")}</div>
-
-    <div class="convert-target-wrap hidden" id="convert-target-wrap">
-      <div class="convert-label">${t("convert.target")}</div>
-      <div class="convert-targets" id="convert-targets"></div>
-    </div>
-
-    <div class="convert-actions">
-      <button class="convert-btn convert-primary" id="convert-start" disabled>${t("convert.start")}</button>
-      <span class="convert-status" id="convert-status"></span>
-    </div>
-
-    <div class="convert-progress hidden" id="convert-progress-wrap">
-      <div class="convert-progress-bar"><div class="convert-progress-fill" id="convert-progress-fill"></div></div>
-      <span class="convert-percent" id="convert-percent"></span>
-    </div>
-
-    <div class="convert-done hidden" id="convert-done">
-      <div class="convert-out" id="convert-out"></div>
-      <div class="convert-done-actions">
-        <button class="convert-btn" id="convert-open-file">${SVG.play} ${t("convert.open_file")}</button>
-        <button class="convert-btn" id="convert-reveal">${SVG.folder} ${t("convert.reveal")}</button>
+    <div class="convert-main">
+      <div class="convert-tabs" id="convert-tabs">${tabs}</div>
+      <div class="convert-col">
+        <div class="convert-targets" id="convert-targets"></div>
+        <div class="convert-drop" id="convert-drop">
+          <div class="convert-drop-hint" id="convert-drop-hint"></div>
+          <button type="button" class="convert-clear" id="convert-clear" title="${esc(t("convert.clear"))}">${esc(t("convert.clear"))}</button>
+        </div>
+        <div class="convert-bubbles" id="convert-in"></div>
+      </div>
+      <div class="convert-mid">
+        <div class="convert-pct" id="convert-pct"></div>
+        <div class="convert-swap" id="convert-swap">${SVG.swap}</div>
+        <div class="convert-bar"><div class="convert-bar-fill" id="convert-bar-fill"></div></div>
+      </div>
+      <div class="convert-col">
+        <div class="convert-targets convert-targets-ghost"></div>
+        <div class="convert-drop convert-drop-out" id="convert-out-drop">
+          <div class="convert-drop-hint"></div>
+        </div>
+        <div class="convert-bubbles" id="convert-out"></div>
       </div>
     </div>
+    <div class="convert-msg" id="convert-msg"></div>
   </div>`;
 }
 
-function setText(el: HTMLElement | null, text: string) {
-  if (el && el.textContent !== text) el.textContent = text;
-}
-function setHtml(el: HTMLElement | null, html: string) {
-  if (el && el.innerHTML !== html) el.innerHTML = html;
-}
-function show(el: HTMLElement | null, on: boolean) {
-  el?.classList.toggle("hidden", !on);
+function render() {
+  if (!view) return;
+  const d = tabDef();
+  // 页签
+  view.querySelectorAll<HTMLElement>(".convert-tab").forEach((b) => {
+    const k = b.dataset.tab as TabKey;
+    b.classList.toggle("on", k === tab);
+    b.textContent = t(TABS.find((x) => x.key === k)!.label);
+  });
+  // 目标格式
+  const targets = view.querySelector<HTMLElement>("#convert-targets");
+  if (targets) {
+    const disabled = tab === "pdf" && !engine?.pdf_found;
+    targets.innerHTML = d.targets
+      .map((tg) => `<button type="button" class="convert-chip${tg === targetByTab[tab] ? " on" : ""}" data-target="${tg}"${disabled ? " disabled" : ""}>${tg}</button>`)
+      .join("");
+  }
+  // 引擎 / 保存目录
+  const eng = view.querySelector<HTMLElement>("#convert-engine");
+  if (eng) {
+    // 顶栏只报**当前分页真正要用的那台引擎**：PDF 走 LibreOffice，其余走 ffmpeg。
+    const missing = tab === "pdf" ? engine && !engine.pdf_found : engine && !engine.found;
+    if (!engine) eng.textContent = t("convert.engine_checking");
+    else if (tab === "pdf") {
+      eng.textContent = engine.pdf_found
+        ? (engine.pdf_version || "LibreOffice")
+        : t("convert.err_no_pdf_engine");
+    } else if (!engine.found) {
+      eng.textContent = t("convert.engine_missing");
+    } else {
+      eng.textContent = `${t("convert.engine")} ${engine.version || ""}`.trim();
+    }
+    eng.classList.toggle("warn", !!missing);
+  }
+  const od = view.querySelector<HTMLElement>("#convert-outdir");
+  if (od) od.textContent = outDir || t("convert.out_dir_default");
+  // 输入提示（右侧输出框刻意留空 —— 用户明确要求不写提示文本）
+  const hint = view.querySelector<HTMLElement>("#convert-drop-hint");
+  if (hint) {
+    if (!engine) hint.textContent = t("convert.engine_checking");
+    else if (tab === "pdf" && !engine.pdf_found) hint.textContent = t("convert.pdf_missing_hint");
+    else if (tab !== "pdf" && !engine.found) hint.textContent = t("convert.engine_missing_hint");
+    else hint.textContent = t("convert.drop_hint");
+  }
+  renderBubbles();
+  // 列表空时「清空」没有意义，收起来（否则一个空框右上角挂着按钮很奇怪）
+  const clearBtn = view.querySelector<HTMLElement>("#convert-clear");
+  if (clearBtn) clearBtn.classList.toggle("hidden", items.length === 0);
+  renderProgress();
 }
 
-function renderEngine(view: HTMLElement) {
-  const el = view.querySelector<HTMLElement>("#convert-engine");
-  if (!engine) return;
-  if (!engine.found) {
-    setText(el, t("convert.engine_missing"));
-    el?.classList.add("convert-warn");
-    // 引擎缺失时把装法写在下面（坏状态必须可见 + 可自救，与 OCR 引擎缺失同一条纪律）
-    const src = view.querySelector<HTMLElement>("#convert-source");
-    if (src) src.innerHTML = `<span class="convert-warn">${t("convert.engine_missing_hint")}</span>`;
-    view.querySelector<HTMLButtonElement>("#convert-pick")?.setAttribute("disabled", "true");
-  } else {
-    setText(el, engine.version ? `${t("convert.engine")} ${engine.version}` : t("convert.engine"));
+function bubbleHtml(it: Item, side: "in" | "out"): string {
+  const name = side === "in" ? it.name : baseName(it.output || "");
+  const title = it.err ? `${name}\n${it.err}` : (side === "in" ? it.path : it.output || "");
+  const cls = `convert-bubble ${it.status}`;
+  const del = side === "in"
+    ? `<button type="button" class="convert-bubble-x" data-del="${esc(it.id)}" title="${esc(t("convert.remove"))}">${SVG.x}</button>`
+    : "";
+  return `<span class="${cls}" data-open="${esc(side === "in" ? it.path : it.output || "")}" title="${esc(title)}"><span class="convert-bubble-name">${esc(name)}</span>${del}</span>`;
+}
+
+function renderBubbles() {
+  const inputBox = view?.querySelector<HTMLElement>("#convert-in");
+  const outBox = view?.querySelector<HTMLElement>("#convert-out");
+  if (inputBox) inputBox.innerHTML = items.map((it) => bubbleHtml(it, "in")).join("");
+  if (outBox) {
+    outBox.innerHTML = items
+      .filter((it) => it.status === "done")
+      .map((it) => bubbleHtml(it, "out"))
+      .join("");
   }
 }
 
-function renderSource(view: HTMLElement) {
-  const box = view.querySelector<HTMLElement>("#convert-source");
-  const wrap = view.querySelector<HTMLElement>("#convert-target-wrap");
-  const start = view.querySelector<HTMLButtonElement>("#convert-start");
-  if (!box || !wrap || !start) return;
-
-  if (!media) {
-    setHtml(box, t("convert.pick_hint"));
-    show(wrap, false);
-    start.disabled = true;
+function renderProgress() {
+  if (!view) return;
+  const swap = view.querySelector<HTMLElement>("#convert-swap");
+  const bar = view.querySelector<HTMLElement>("#convert-bar-fill");
+  const pct = view.querySelector<HTMLElement>("#convert-pct");
+  const on = running || progress >= 0;
+  swap?.classList.toggle("hidden", on);
+  view.querySelector<HTMLElement>(".convert-bar")?.classList.toggle("hidden", !on);
+  if (!on) {
+    if (pct) pct.textContent = "";
+    if (bar) bar.style.width = "0%";
     return;
   }
+  const p = progress < 0 ? 0 : Math.min(100, progress);
+  if (bar) {
+    bar.classList.toggle("indeterminate", progress < 0);
+    bar.style.width = progress < 0 ? "40%" : `${p}%`;
+  }
+  if (pct) pct.textContent = progress < 0 ? "" : `${Math.round(p)}%`;
+}
 
-  const bits = [kindLabel(media.kind), formatSize(media.size)];
-  const dur = formatDuration(media.duration);
-  if (dur) bits.push(dur);
-  if (media.kind === "unknown" || media.targets.length === 0) {
-    setHtml(
-      box,
-      `<div class="convert-file">${esc(media.name)}</div><div class="convert-sub convert-warn">${t("convert.unsupported")}</div>`,
-    );
-    show(wrap, false);
-    start.disabled = true;
+// ── 队列 ──────────────────────────────────────────────────────────
+
+async function addPaths(paths: string[]) {
+  if (!paths.length) return;
+  const d = tabDef();
+  const accepted: string[] = [];
+  for (const p of paths) {
+    const ext = extOf(p);
+    if (!d.accept.includes(ext)) {
+      setMsg(t("convert.err_type", { ext: ext || "?", tab: t(d.label) }));
+      continue;
+    }
+    if (items.some((it) => it.path === p)) continue;
+    accepted.push(p);
+  }
+  if (!accepted.length) return;
+  setMsg("");
+  for (const p of accepted) {
+    items.push({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      path: p,
+      name: baseName(p),
+      status: "queued",
+      tab,
+      target: targetByTab[tab],
+    });
+  }
+  render();
+  void runQueue();
+}
+
+async function runQueue() {
+  if (running) return;
+  const next = items.find((it) => it.status === "queued");
+  if (!next) {
+    running = false;
+    progress = -1;
+    renderProgress();
     return;
   }
-  setHtml(
-    box,
-    `<div class="convert-file">${esc(media.name)}</div><div class="convert-sub">${esc(bits.join(" · "))}</div>`,
-  );
-
-  // 目标胶囊：只在该换的时候重建（重建会丢 hover/焦点）
-  setHtml(
-    view.querySelector("#convert-targets"),
-    media.targets
-      .map(tg => `<button class="convert-chip${tg === target ? " active" : ""}" data-ext="${esc(tg)}">${esc(tg)}</button>`)
-      .join(""),
-  );
-  show(wrap, true);
-  start.disabled = converting || !target;
-}
-
-function renderProgress(view: HTMLElement) {
-  const wrap = view.querySelector<HTMLElement>("#convert-progress-wrap");
-  const fill = view.querySelector<HTMLElement>("#convert-progress-fill");
-  const pct = view.querySelector<HTMLElement>("#convert-percent");
-  show(wrap, converting || progress > 0);
-  if (!converting && progress <= 0) return;
-  if (progress < 0) {
-    // 时长未知（图片 / ffprobe 探不到）⇒ 不确定态，不编一个百分比给用户
-    fill?.classList.add("indeterminate");
-    if (fill) fill.style.width = "";
-    setText(pct, "");
-  } else {
-    fill?.classList.remove("indeterminate");
-    if (fill) fill.style.width = `${Math.min(100, progress)}%`;
-    setText(pct, `${Math.round(progress)}%`);
+  // 每一条按**入队时**的分页与目标格式跑：切页签不会改变已在队列里的事。
+  if (next.tab === "pdf" && !engine?.pdf_found) {
+    next.status = "error";
+    next.err = t("convert.err_no_pdf_engine");
+    render();
+    void runQueue();
+    return;
   }
-}
-
-function renderDone(view: HTMLElement) {
-  const box = view.querySelector<HTMLElement>("#convert-done");
-  const out = view.querySelector<HTMLElement>("#convert-out");
-  show(box, !!result);
-  if (!result || !out) return;
-  const name = result.output.split(/[\\/]/).pop() || result.output;
-  setHtml(out, `${esc(name)} · ${formatSize(result.size)} · ${(result.elapsed_ms / 1000).toFixed(1)}s`);
-}
-
-// ── 交互 ──────────────────────────────────────────────────────────
-
-async function pickFile(view: HTMLElement, path: string) {
-  result = null;
+  if (next.tab !== "pdf" && !engine?.found) {
+    next.status = "error";
+    next.err = t("convert.err_no_engine");
+    render();
+    void runQueue();
+    return;
+  }
+  running = true;
   progress = 0;
-  renderDone(view);
-  renderProgress(view);
-  setText(view.querySelector("#convert-status"), "");
+  next.status = "running";
+  render();
   try {
-    const info = await invoke<MediaDto>("convert_probe", { path });
-    media = info;
-    target = info.targets[0] ?? "";
-    renderSource(view);
+    const r = await invoke<ConvertResult>("convert_run", {
+      input: next.path,
+      target: next.target,
+      outputDir: outDir || null,
+    });
+    next.status = "done";
+    next.output = r.output;
+    progress = 100;
   } catch (e) {
-    media = null;
-    target = "";
-    renderSource(view);
-    setText(view.querySelector("#convert-status"), errText(e));
+    next.status = "error";
+    next.err = errText(e);
+    progress = -1;
+    setMsg(next.err);
   }
+  running = false;
+  render();
+  void runQueue();
 }
+
+// ── 挂载 ──────────────────────────────────────────────────────────
 
 export async function attachConvertListeners(root: HTMLElement) {
-  const view = root.querySelector<HTMLElement>(".convert-root");
-  if (!view) return;
-  currentView = view;
+  const v = root.querySelector<HTMLElement>(".convert-win");
+  if (!v) return;
+  view = v;
   const myGen = ++gen;
-  const q = <T extends HTMLElement>(sel: string) => view.querySelector<T>(sel);
-  const status = (s: string) => setText(q("#convert-status"), s);
+  clearArmed = false;
+  try {
+    outDir = localStorage.getItem("lunac-convert-outdir") || "";
+  } catch {
+    outDir = "";
+  }
 
-  // 进度监听：先撤旧的（重开面板不能叠加，code-rules §3.3）
   if (unlistenProgress) { unlistenProgress(); unlistenProgress = null; }
-  unlistenProgress = await listen<{ percent: number; total_ms: number }>("convert-progress", (ev) => {
-    if (myGen !== gen || !view.isConnected) return;
-    progress = ev.payload.percent;
-    renderProgress(view);
+  unlistenProgress = await listen<{ percent: number }>("convert-progress", (ev) => {
+    if (myGen !== gen || !v.isConnected) return;
+    progress = Number(ev.payload?.percent ?? -1);
+    renderProgress();
   });
+  // 拖放：Tauri 的窗口级事件（前端拿不到 File.path）。只收当前页签允许的类型。
+  if (unDragDrop) { unDragDrop(); unDragDrop = null; }
+  try {
+    unDragDrop = await getCurrentWebview().onDragDropEvent((ev) => {
+      if (myGen !== gen || !v.isConnected) return;
+      if (ev.payload.type === "drop") void addPaths(ev.payload.paths);
+    });
+  } catch { /* 拖放不可用不该挡住其它功能 */ }
 
-  // 引擎状态（缺失时把选择按钮也禁掉，别让用户白点）
   try {
     engine = await invoke<EngineDto>("convert_engine_status");
   } catch {
-    engine = { found: false, path: "", version: "" };
+    engine = { found: false, path: "", version: "", pdf_found: false, pdf_version: "" };
   }
   if (myGen !== gen) return;
-  renderEngine(view);
+  render();
 
-  // ① 从搜索结果/附件进来的文件（main.ts 会预置这个全局）
+  // 预设文件（从搜索结果 / 附件进来）
   const preset = (window as any).__lunac_convert_file as string | undefined;
   if (preset) {
     delete (window as any).__lunac_convert_file;
-    await pickFile(view, preset);
+    await addPaths([preset]);
   }
 
-  q<HTMLElement>("#convert-pick")?.addEventListener("click", async () => {
+  // 页签
+  v.querySelector<HTMLElement>("#convert-tabs")?.addEventListener("click", (ev) => {
+    const b = (ev.target as HTMLElement).closest<HTMLElement>("[data-tab]");
+    const k = b?.dataset.tab as TabKey | undefined;
+    if (!k || k === tab) return;
+    tab = k;
+    setMsg("");
+    render();
+    void runQueue();
+  });
+  // 目标格式
+  v.querySelector<HTMLElement>("#convert-targets")?.addEventListener("click", (ev) => {
+    const b = (ev.target as HTMLElement).closest<HTMLElement>("[data-target]");
+    const tg = b?.dataset.target;
+    if (!tg) return;
+    targetByTab[tab] = tg;
+    // 还没开跑的同页签条目跟着改目标 —— 用户换格式的意图就是「都按这个转」。
+    for (const it of items) {
+      if (it.status === "queued" && it.tab === tab && it.target !== tg) it.target = tg;
+    }
+    render();
+  });
+  // 输入框：点击整块 = 选文件
+  v.querySelector<HTMLElement>("#convert-drop")?.addEventListener("click", async () => {
     try {
-      const picked = await openDialog({
-        multiple: false,
-        directory: false,
-        title: t("convert.pick"),
-      });
-      const path = Array.isArray(picked) ? picked[0] : picked;
-      if (typeof path === "string" && path) await pickFile(view, path);
+      const picked = await openDialog({ multiple: true, directory: false, title: t("convert.pick") });
+      const list = Array.isArray(picked) ? picked : picked ? [picked] : [];
+      await addPaths(list as string[]);
     } catch (e) {
-      status(errText(e));
+      setMsg(errText(e));
     }
   });
-
-  // 目标格式：事件委托（胶囊每次重建都会换节点）
-  q<HTMLElement>("#convert-targets")?.addEventListener("click", (ev) => {
-    const chip = (ev.target as HTMLElement).closest<HTMLElement>(".convert-chip");
-    if (!chip) return;
-    target = chip.dataset.ext || "";
-    renderSource(view);
+  // 一键清空（转换中的那一条先取消）
+  v.querySelector<HTMLElement>("#convert-clear")?.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    if (!clearArmed) {
+      clearArmed = true;
+      setMsg(t("convert.clear_confirm"));
+      return;
+    }
+    clearArmed = false;
+    if (items.some((it) => it.status === "running")) {
+      await invoke("convert_cancel").catch(() => {});
+    }
+    items = [];
+    running = false;
+    progress = -1;
+    render();
+    setMsg("");
   });
-
-  q<HTMLElement>("#convert-start")?.addEventListener("click", async () => {
-    if (!media || !target || converting) return;
-    converting = true;
-    result = null;
-    progress = 0;
-    renderDone(view);
-    renderSource(view);
-    status(t("convert.converting"));
-    renderProgress(view);
+  // 泡泡：点击打开；× 取消/移除
+  v.querySelector<HTMLElement>(".convert-main")?.addEventListener("click", async (ev) => {
+    const del = (ev.target as HTMLElement).closest<HTMLElement>("[data-del]");
+    if (del) {
+      ev.stopPropagation();
+      const id = del.dataset.del!;
+      const it = items.find((x) => x.id === id);
+      if (it?.status === "running") await invoke("convert_cancel").catch(() => {});
+      items = items.filter((x) => x.id !== id);
+      render();
+      return;
+    }
+    const b = (ev.target as HTMLElement).closest<HTMLElement>("[data-open]");
+    const p = b?.dataset.open;
+    if (p) void invoke("open_path", { path: p }).catch(() => {});
+  });
+  // 保存目录
+  v.querySelector<HTMLElement>("#convert-outdir-btn")?.addEventListener("click", async () => {
     try {
-      const r = await invoke<ConvertResult>("convert_run", { input: media.path, target });
-      if (myGen !== gen) return;
-      result = r;
-      progress = 100;
-      status(t("convert.done"));
-      renderDone(view);
-      renderProgress(view);
+      const picked = await openDialog({ directory: true, multiple: false, title: t("convert.set_out_dir") });
+      if (typeof picked === "string" && picked) {
+        outDir = picked;
+        try { localStorage.setItem("lunac-convert-outdir", picked); } catch { /* ignore */ }
+        render();
+      }
     } catch (e) {
-      if (myGen !== gen) return;
-      progress = 0;
-      status(errText(e));
-      renderProgress(view);
-    } finally {
-      converting = false;
-      if (myGen === gen) renderSource(view);
+      setMsg(errText(e));
     }
   });
-
-  q<HTMLElement>("#convert-open-file")?.addEventListener("click", () => {
-    if (result) void invoke("open_path", { path: result.output }).catch(() => {});
-  });
-  q<HTMLElement>("#convert-reveal")?.addEventListener("click", () => {
-    if (result) void invoke("reveal_in_explorer", { path: result.output }).catch(() => {});
-  });
-
-  renderSource(view);
-  renderProgress(view);
-  renderDone(view);
 }
 
 /** 供 main.ts 的 closePluginView 调用；另有 `isConnected` 判断兜底。 */
 export function stopConvertWatch() {
   gen++;
   if (unlistenProgress) { unlistenProgress(); unlistenProgress = null; }
+  if (unDragDrop) { unDragDrop(); unDragDrop = null; }
+  view = null;
+  running = false;
+  progress = -1;
 }
-
-// 懒加载钩子（与 music 同一套：没打开过插件时 main.ts 用 `?.()` 调不到，也不会报错）
 (window as any).__lunac_convert_stop = stopConvertWatch;
 
 // ── Plugin 定义 ───────────────────────────────────────────────────
@@ -356,13 +467,14 @@ export function stopConvertWatch() {
 export const convertPlugin: Plugin = {
   id: "convert",
   name: "文件转换",
-  keywords: ["转换", "格式转换", "转格式", "convert", "格式", "转码", "提取音频", "图片转换", "视频转换", "音频转换"],
-  description: "图片 / 音频 / 视频格式互转 (Image / Audio / Video converter · ffmpeg)",
+  keywords: ["转换", "格式转换", "转格式", "convert", "格式", "转码", "提取音频", "图片转换", "视频转换", "音频转换", "pdf"],
+  description: "PDF / 视频 / 音频格式转换（ffmpeg + 本机 LibreOffice）",
   icon: "🔄",
   badge: "convert",
+  // 独立窗口（2026-10-24 用户口径）；主窗口打开时直接开插件窗，不留内嵌面板。
+  permissions: ["window.float"],
 
   async execute(input: string): Promise<PluginResult> {
-    // 搜索框里直接是一个存在的绝对路径时，直接预置为源文件
     const trimmed = input.trim();
     if (/^[a-zA-Z]:[\\/]/.test(trimmed)) {
       try {
@@ -375,9 +487,5 @@ export const convertPlugin: Plugin = {
   },
 };
 
-// ── 磁盘插件契约（2026-09-29）────────────────────────────────────────
-// 文件转换已归入**拓展插件**：不再随安装包默认安装，改为从市场装进 `Modules\convert\`。
-// 独立打包的入口必须**默认导出**带 `execute` 的对象，并具名导出 `attach(root)` / `detach()`
-// —— 与 music 同一套（见 ai-spec §3.5「插件契约」、`vite.plugins.config.ts`、预检 #32 ⑨）。
 export { attachConvertListeners as attach, stopConvertWatch as detach };
 export default convertPlugin;

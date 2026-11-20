@@ -1,0 +1,41 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "harness.video",
+    "name": "Harness Video",
+    "version": "1.0.0",
+    "kind": ["anime"],
+    "engine": "declarative",
+    "entry": "rule.json",
+    "baseUrl": "http://localhost:8123",
+    "capabilities": ["search", "chapters", "play"]
+  },
+  "rule": {
+    "search": {
+      "request": { "method": "GET", "url": "/test/fixtures/demo-search.json" },
+      "list": { "jsonPath": "$.data[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } },
+        "author": { "selector": { "jsonPath": "author" } },
+        "tags": { "selector": { "jsonPath": "tags" } }
+      }
+    },
+    "chapters": {
+      "request": { "method": "GET", "url": "@workUrl" },
+      "list": { "jsonPath": "$.chapters[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } }
+      }
+    },
+    "play": {
+      "request": { "method": "GET", "url": "/test/fixtures/video-play.json" },
+      "list": { "jsonPath": "$.lines[*]" },
+      "fields": {
+        "url": { "selector": { "jsonPath": "url" } },
+        "type": { "selector": { "jsonPath": "type" } }
+      }
+    }
+  }
+}

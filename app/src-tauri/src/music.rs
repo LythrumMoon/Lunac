@@ -374,7 +374,9 @@ pub async fn spotify_resume() -> SpotifyApiStateDto {
 // 令牌与 client_id 一起放在这里（本机文件，删除本文件即等于「忘记账号」）。
 
 fn music_config_path() -> PathBuf {
-    crate::storage::lunac_root_dir().join("config").join("music.json")
+    crate::storage::lunac_root_dir()
+        .join("config")
+        .join("music.json")
 }
 
 fn default_port() -> u16 {
@@ -569,7 +571,9 @@ fn random_verifier() -> String {
     static CTR: AtomicU64 = AtomicU64::new(0);
 
     let mut out = String::with_capacity(64);
-    let mut n = CTR.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut n = CTR
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
     while out.len() < 64 {
         let mut h = RandomState::new().build_hasher();
         h.write_u64(n);
@@ -649,10 +653,13 @@ fn ensure_access_token(cfg: &mut MusicConfig) -> Result<String, String> {
         cfg.refresh_token.clear();
         cfg.expires_at = 0;
         let _ = save_config(cfg);
-        crate::log::warn(&format!("spotify: 刷新令牌被拒（{status}）⇒ 已清空本地令牌"));
+        crate::log::warn(&format!(
+            "spotify: 刷新令牌被拒（{status}）⇒ 已清空本地令牌"
+        ));
         return Err("ERR_NOT_CONNECTED".into());
     }
-    let t: TokenResponse = serde_json::from_str(&text).map_err(|e| format!("令牌响应解析失败：{e}"))?;
+    let t: TokenResponse =
+        serde_json::from_str(&text).map_err(|e| format!("令牌响应解析失败：{e}"))?;
     if t.access_token.is_empty() {
         return Err("ERR_NOT_CONNECTED".into());
     }
@@ -700,7 +707,9 @@ fn query_param(target: &str, key: &str) -> Option<String> {
             None => continue,
         };
         if k == key {
-            let decoded = percent_encoding::percent_decode_str(v).decode_utf8_lossy().to_string();
+            let decoded = percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .to_string();
             return Some(decoded);
         }
     }
@@ -756,14 +765,19 @@ fn run_callback_server(app: AppHandle, listener: TcpListener, cfg: MusicConfig, 
                         err = Some(e);
                     }
                     // state 校验：不是我们发出去的那个就丢弃（防跨站伪造回调）。
-                    state_ok = query_param(target, "state").as_deref() == Some(cfg_state(&verifier).as_str());
+                    state_ok = query_param(target, "state").as_deref()
+                        == Some(cfg_state(&verifier).as_str());
                 }
                 if err.is_none() && code.is_some() && !state_ok {
                     err = Some("state_mismatch".into());
                 }
                 match (&code, &err) {
                     (_, Some(e)) => respond(&mut stream, "授权失败", &format!("Spotify 返回：{e}")),
-                    (Some(_), None) => respond(&mut stream, "授权成功", "可以关闭这个页面，回到 Lunac 继续。"),
+                    (Some(_), None) => respond(
+                        &mut stream,
+                        "授权成功",
+                        "可以关闭这个页面，回到 Lunac 继续。",
+                    ),
                     (None, None) => respond(&mut stream, "回调异常", "没有收到授权码。"),
                 }
                 (code, err)
@@ -780,7 +794,11 @@ fn run_callback_server(app: AppHandle, listener: TcpListener, cfg: MusicConfig, 
                     crate::log::info(&format!(
                         "spotify: 已授权（redirect={}，账号={}）",
                         redirect,
-                        if saved.display_name.is_empty() { "未知" } else { saved.display_name.as_str() }
+                        if saved.display_name.is_empty() {
+                            "未知"
+                        } else {
+                            saved.display_name.as_str()
+                        }
                     ));
                     String::new()
                 }
@@ -825,9 +843,13 @@ fn exchange_code(cfg: &MusicConfig, code: &str, verifier: &str) -> Result<MusicC
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("换取令牌被拒（{status}）：{}", text.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "换取令牌被拒（{status}）：{}",
+            text.chars().take(200).collect::<String>()
+        ));
     }
-    let t: TokenResponse = serde_json::from_str(&text).map_err(|e| format!("令牌响应解析失败：{e}"))?;
+    let t: TokenResponse =
+        serde_json::from_str(&text).map_err(|e| format!("令牌响应解析失败：{e}"))?;
     if t.access_token.is_empty() {
         return Err("令牌响应里没有 access_token".into());
     }
@@ -926,7 +948,11 @@ pub async fn music_config_set(
         save_config(&cfg)?;
         crate::log::info(&format!(
             "music: 配置已保存（client_id={}，redirect={}）",
-            if cfg.client_id.is_empty() { "空" } else { "已填" },
+            if cfg.client_id.is_empty() {
+                "空"
+            } else {
+                "已填"
+            },
             cfg.redirect_uri()
         ));
         Ok(config_dto(&cfg))
@@ -963,7 +989,9 @@ pub async fn spotify_connect(app: AppHandle) -> Result<String, String> {
         challenge,
     );
 
-    crate::log::info(&format!("spotify: 已起环回监听 127.0.0.1:{port}，等待浏览器回调"));
+    crate::log::info(&format!(
+        "spotify: 已起环回监听 127.0.0.1:{port}，等待浏览器回调"
+    ));
     run_callback_server(app, listener, cfg, verifier);
     Ok(url)
 }
@@ -1072,9 +1100,21 @@ fn track_from_json(i: &serde_json::Value) -> TrackDto {
             .to_string()
     };
     TrackDto {
-        id: i.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-        uri: i.get("uri").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-        name: i.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        id: i
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        uri: i
+            .get("uri")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        name: i
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
         artists,
         album,
         cover,
@@ -1104,7 +1144,12 @@ pub async fn spotify_status() -> Result<PlayerDto, String> {
             // 的 429 **在日志里一个字都没有** ——「1Hz 轮询把 app 配额顶爆」这个真因
             // 因此一直查不出来，看起来像「只有 devices 端点有问题」。现在它和别的端点
             // 一样留痕（有了 429 硬闸之后最多也就这一两行，不会刷屏）。
-            log_api_reject("读播放状态", &format!("{SPOTIFY_API}/me/player"), code, &body);
+            log_api_reject(
+                "读播放状态",
+                &format!("{SPOTIFY_API}/me/player"),
+                code,
+                &body,
+            );
             return Err(format!(
                 "读播放状态被拒（{code}）：{}",
                 body.chars().take(200).collect::<String>()
@@ -1117,7 +1162,10 @@ pub async fn spotify_status() -> Result<PlayerDto, String> {
         Ok(PlayerDto {
             connected: true,
             active: track.is_some(),
-            playing: v.get("is_playing").and_then(|x| x.as_bool()).unwrap_or(false),
+            playing: v
+                .get("is_playing")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             progress_ms: v.get("progress_ms").and_then(|x| x.as_i64()).unwrap_or(0),
             volume_percent: v
                 .pointer("/device/volume_percent")
@@ -1131,7 +1179,10 @@ pub async fn spotify_status() -> Result<PlayerDto, String> {
             track,
             // 这两个字段**一直读**：控制条上的三态按钮靠它们回显真实状态，
             // 不自己记「我上次设成了什么」（用户在 Spotify 里改了就会漂移）。
-            shuffle: v.get("shuffle_state").and_then(|x| x.as_bool()).unwrap_or(false),
+            shuffle: v
+                .get("shuffle_state")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             repeat: v
                 .get("repeat_state")
                 .and_then(|x| x.as_str())
@@ -1352,8 +1403,16 @@ fn playlist_from_json(p: &serde_json::Value) -> Option<PlaylistDto> {
     let id = p.get("id").and_then(|x| x.as_str())?;
     Some(PlaylistDto {
         id: id.to_string(),
-        uri: p.get("uri").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-        name: p.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        uri: p
+            .get("uri")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        name: p
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
         cover: images_first(p),
         // 曲目数：**2026-09-27 实测 Spotify 已把它从 `tracks.total`
         // 改名成 `items.total`**（新版 playlist 对象里 `tracks` 整个没了）。
@@ -1385,7 +1444,11 @@ pub async fn spotify_playlists() -> Result<Vec<PlaylistDto>, String> {
         let v = api_get_json(&mut cfg, &format!("{SPOTIFY_API}/me/playlists?limit=50"))?;
         Ok(v.get("items")
             .and_then(|x| x.as_array())
-            .map(|arr| arr.iter().filter_map(playlist_from_json).collect::<Vec<_>>())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(playlist_from_json)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default())
     })
     .await
@@ -1409,7 +1472,10 @@ pub async fn spotify_playlist_tracks(playlist_id: String) -> Result<Vec<TrackDto
         let mut cfg = load_config();
         let v = api_get_json(
             &mut cfg,
-            &format!("{SPOTIFY_API}/playlists/{}/items?limit=100", playlist_id.trim()),
+            &format!(
+                "{SPOTIFY_API}/playlists/{}/items?limit=100",
+                playlist_id.trim()
+            ),
         )?;
         let out = v
             .get("items")
@@ -1478,7 +1544,10 @@ pub async fn spotify_play_context(
         }
         let mut cfg = load_config();
         let mut body = serde_json::json!({ "context_uri": uri });
-        if let Some(u) = offset_uri.map(|u| u.trim().to_string()).filter(|u| is_safe_track_uri(u)) {
+        if let Some(u) = offset_uri
+            .map(|u| u.trim().to_string())
+            .filter(|u| is_safe_track_uri(u))
+        {
             body["offset"] = serde_json::json!({ "uri": u });
         }
         let dev = resolve_play_device(&mut cfg, device_id.as_deref());
@@ -1569,7 +1638,10 @@ pub async fn spotify_liked() -> Result<LikedDto, String> {
         if !cfg.has_token() {
             return Err("ERR_NOT_CONNECTED".into());
         }
-        let v = api_get_json(&mut cfg, &format!("{SPOTIFY_API}/me/tracks?limit={LIKED_LIMIT}"))?;
+        let v = api_get_json(
+            &mut cfg,
+            &format!("{SPOTIFY_API}/me/tracks?limit={LIKED_LIMIT}"),
+        )?;
         let items = v
             .get("items")
             .and_then(|x| x.as_array())
@@ -1584,7 +1656,10 @@ pub async fn spotify_liked() -> Result<LikedDto, String> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let total = v.get("total").and_then(|x| x.as_i64()).unwrap_or(items.len() as i64);
+        let total = v
+            .get("total")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(items.len() as i64);
         Ok(LikedDto { total, items })
     })
     .await
@@ -1669,7 +1744,12 @@ pub async fn spotify_search(query: String) -> Result<SearchDto, String> {
         let playlists = v
             .pointer("/playlists/items")
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter(|p| !p.is_null()).filter_map(playlist_from_json).collect::<Vec<_>>())
+            .map(|a| {
+                a.iter()
+                    .filter(|p| !p.is_null())
+                    .filter_map(playlist_from_json)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         Ok(SearchDto {
             tracks,
@@ -1786,14 +1866,23 @@ fn library_items(v: &serde_json::Value, pointer: &str, kind: &str) -> Vec<Librar
                 _ => (
                     // show：故意留空（不可作 context_uri）
                     String::new(),
-                    o.get("publisher").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-                    o.get("total_episodes").and_then(|x| x.as_i64()).unwrap_or(0),
+                    o.get("publisher")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    o.get("total_episodes")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0),
                 ),
             };
             Some(LibraryItemDto {
                 id: id.to_string(),
                 uri,
-                name: o.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                name: o
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 cover: images_first(o),
                 subtitle,
                 total,
@@ -1977,10 +2066,24 @@ fn fetch_devices(cfg: &mut MusicConfig) -> Result<Vec<DeviceDto>, String> {
                     }
                     Some(DeviceDto {
                         id: id.to_string(),
-                        name: d.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-                        kind: d.get("type").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-                        active: d.get("is_active").and_then(|x| x.as_bool()).unwrap_or(false),
-                        volume_percent: d.get("volume_percent").and_then(|x| x.as_i64()).unwrap_or(0),
+                        name: d
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        kind: d
+                            .get("type")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        active: d
+                            .get("is_active")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        volume_percent: d
+                            .get("volume_percent")
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -2241,7 +2344,12 @@ fn find_librespot(cfg: &MusicConfig) -> Option<PathBuf> {
 
     // `cargo install librespot` 的标准落点（开发机上最省事的一条）
     if let Some(home) = std::env::var_os("USERPROFILE") {
-        cands.push(PathBuf::from(home).join(".cargo").join("bin").join("librespot.exe"));
+        cands.push(
+            PathBuf::from(home)
+                .join(".cargo")
+                .join("bin")
+                .join("librespot.exe"),
+        );
     }
     cands.into_iter().find(|p| p.is_file())
 }
@@ -2435,14 +2543,20 @@ fn librespot_start_inner(cfg: &MusicConfig, with_login: bool) -> Result<Librespo
     }
     if let Some(o) = child.stdout.take() {
         if let Err(err) = crate::live_audio::start(o) {
-            crate::log::warn(format!("librespot: 在线音频链没接上（{err}）—— 这一轮不做调音"));
+            crate::log::warn(format!(
+                "librespot: 在线音频链没接上（{err}）—— 这一轮不做调音"
+            ));
         }
     }
     *LIBRESPOT.lock().map_err(|e| e.to_string())? = Some(child);
     crate::log::info(&format!(
         "librespot: 已启动本机播放（{}）{}",
         exe.display(),
-        if with_login { "，等待浏览器里的授权（-j）" } else { "" }
+        if with_login {
+            "，等待浏览器里的授权（-j）"
+        } else {
+            ""
+        }
     ));
     Ok(librespot_dto(cfg))
 }
@@ -2452,7 +2566,12 @@ fn librespot_stop_inner(cfg: &MusicConfig) -> LibrespotDto {
     // 暂停失败不算错：可能本来就没在播，或者令牌刚过期。
     if cfg.has_token() {
         let mut c = cfg.clone();
-        let _ = api_send(&mut c, "PUT", &format!("{SPOTIFY_API}/me/player/pause"), None);
+        let _ = api_send(
+            &mut c,
+            "PUT",
+            &format!("{SPOTIFY_API}/me/player/pause"),
+            None,
+        );
     }
     if let Ok(mut slot) = LIBRESPOT.lock() {
         if let Some(mut child) = slot.take() {
@@ -2667,7 +2786,12 @@ pub async fn music_autoconfigure(allow_local: Option<bool>) -> Result<Autoconfig
         // 「明明在跑却选不了歌」。如实回报 `needs_login`，让面板给出那个一次性的登录入口。
         if !librespot_credentials_path().is_file() {
             return Ok(AutoconfigDto {
-                source: if librespot_dto(&cfg).available { "needs_login" } else { "none" }.into(),
+                source: if librespot_dto(&cfg).available {
+                    "needs_login"
+                } else {
+                    "none"
+                }
+                .into(),
                 desktop_running: false,
                 ..Default::default()
             });
@@ -2786,7 +2910,9 @@ pub fn on_plugin_window_destroyed(app: &tauri::AppHandle, label: &str) {
     // （下面两条）—— 一扇只能显示陈旧曲线的窗，比没有更糟。
     let closed = crate::plugin_window::close_keyed(app, MUSIC_PLUGIN_ID);
     if !closed.is_empty() {
-        crate::log::info(&format!("music: 音乐插件窗已关闭 ⇒ 一并关掉附属窗 {closed:?}"));
+        crate::log::info(&format!(
+            "music: 音乐插件窗已关闭 ⇒ 一并关掉附属窗 {closed:?}"
+        ));
     }
     // **同一扇窗关掉两样东西**：本机播放（librespot，Spotify）与本地文件播放
     // （`player.rs`，rodio）。两者生命周期完全相同（界面没了就该一起收），
@@ -2823,10 +2949,18 @@ pub struct LyricsDto {
 }
 
 fn lyrics_from_json(v: &serde_json::Value) -> LyricsDto {
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
     LyricsDto {
         found: true,
-        instrumental: v.get("instrumental").and_then(|x| x.as_bool()).unwrap_or(false),
+        instrumental: v
+            .get("instrumental")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         track: s("trackName"),
         artist: s("artistName"),
         album: s("albumName"),
@@ -2904,7 +3038,11 @@ pub async fn lyrics_get(
             return Err("ERR_NO_QUERY".into());
         }
 
-        let mut url = format!("{LRCLIB}/get?track_name={}&artist_name={}", enc(title), enc(artist));
+        let mut url = format!(
+            "{LRCLIB}/get?track_name={}&artist_name={}",
+            enc(title),
+            enc(artist)
+        );
         if let Some(a) = album.as_deref().filter(|a| !a.trim().is_empty()) {
             url.push_str(&format!("&album_name={}", enc(a)));
         }
@@ -2928,7 +3066,11 @@ pub async fn lyrics_get(
         }
 
         // 2) LRCLIB 搜索回落
-        let s_url = format!("{LRCLIB}/search?track_name={}&artist_name={}", enc(title), enc(artist));
+        let s_url = format!(
+            "{LRCLIB}/search?track_name={}&artist_name={}",
+            enc(title),
+            enc(artist)
+        );
         let (s_status, s_text) = lrclib_get(&s_url)?;
         if !s_status.is_success() {
             // LRCLIB 整条链路不可用时也要给兜底源一次机会 —— 兜底的意义正在于此。
@@ -3010,7 +3152,10 @@ fn netease_artist_matches(song: &serde_json::Value, artist: &str) -> bool {
 }
 
 /// 网易云的 GET（带 Referer / UA）→ JSON。
-fn netease_get_json(client: &reqwest::blocking::Client, url: &str) -> Result<serde_json::Value, String> {
+fn netease_get_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<serde_json::Value, String> {
     let resp = client
         .get(url)
         .header("Referer", NETEASE_REFERER)
@@ -3048,9 +3193,9 @@ fn netease_lyrics(title: &str, artist: &str) -> Option<LyricsDto> {
             norm_title(n) == want && netease_artist_matches(s, artist)
         })
         .or_else(|| {
-            songs.iter().find(|s| {
-                norm_title(s.get("name").and_then(|x| x.as_str()).unwrap_or("")) == want
-            })
+            songs
+                .iter()
+                .find(|s| norm_title(s.get("name").and_then(|x| x.as_str()).unwrap_or("")) == want)
         })
         .or_else(|| songs.first())?;
     let id = pick.get("id").and_then(|x| x.as_i64())?;
@@ -3148,7 +3293,10 @@ pub fn spotify_desktop_running() -> bool {
 /// `clashing_extern_declarations`。
 #[cfg(target_os = "windows")]
 fn process_names() -> Vec<String> {
-    crate::win_proc::list().into_iter().map(|e| e.name).collect()
+    crate::win_proc::list()
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
 }
 
 // ── 单元测试 ──────────────────────────────────────────────────────
@@ -3327,7 +3475,10 @@ mod tests {
         let e = validate_librespot_proxy("socks5://127.0.0.1:7891").unwrap_err();
         assert!(e.contains("HTTP 代理"), "错误要说清只认 HTTP 代理：{e}");
         assert!(e.contains("socks5"), "要把他填的那个值念出来：{e}");
-        assert!(validate_librespot_proxy("127.0.0.1:7890").is_err(), "缺 scheme");
+        assert!(
+            validate_librespot_proxy("127.0.0.1:7890").is_err(),
+            "缺 scheme"
+        );
         assert!(validate_librespot_proxy("http://a b:1").is_err(), "带空格");
     }
 
@@ -3338,7 +3489,9 @@ mod tests {
     #[test]
     fn only_the_music_window_label_stops_local_playback() {
         // 两半各钉一次：左边走常量拼接（改 id 会被逮到），右边写死字面量（改前缀会被逮到）
-        assert!(is_music_window_label(&crate::plugin_window::label_for(MUSIC_PLUGIN_ID)));
+        assert!(is_music_window_label(&crate::plugin_window::label_for(
+            MUSIC_PLUGIN_ID
+        )));
         assert!(is_music_window_label("plugin-music"));
         // `plugin-music-curve` = **频响曲线窗**（2026-10-03 的附属窗）：它必须是**另一个**
         // 判定 —— 关掉曲线窗不该把 librespot / 本地播放一起杀掉（那是主窗的事）。
@@ -3430,7 +3583,9 @@ mod tests {
         assert!(!is_safe_spotify_id("../me/player"));
         assert!(!is_safe_spotify_id(&"a".repeat(65)));
 
-        assert!(is_safe_context_uri("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"));
+        assert!(is_safe_context_uri(
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"
+        ));
         assert!(is_safe_context_uri("spotify:collection:tracks"));
         // 不在白名单的上下文类型：那是「随便塞一个 uri」的入口
         assert!(!is_safe_context_uri("spotify:user:someone"));
@@ -3481,7 +3636,10 @@ mod tests {
 
     #[test]
     fn zero_port_falls_back_to_default() {
-        let cfg = MusicConfig { port: 0, ..Default::default() };
+        let cfg = MusicConfig {
+            port: 0,
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_port(), DEFAULT_PORT);
     }
 
@@ -3490,7 +3648,9 @@ mod tests {
         let v = random_verifier();
         assert_eq!(v.len(), 64);
         assert!(v.len() >= 43 && v.len() <= 128);
-        assert!(v.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
+        assert!(v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
         // 两次必须不同（否则等于没有熵）
         assert_ne!(v, random_verifier());
     }
@@ -3499,7 +3659,10 @@ mod tests {
     fn challenge_is_s256_base64url_no_pad() {
         // RFC 7636 附录 B 的官方样例
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        assert_eq!(code_challenge(verifier), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            code_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
         // base64url 不带填充
         assert!(!code_challenge(verifier).contains('='));
     }

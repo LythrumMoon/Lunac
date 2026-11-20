@@ -105,61 +105,71 @@ impl SseEmitter {
         self.text_started = true;
 
         let mut out = String::new();
-        out.push_str(&sse("message_start", &serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": self.message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": self.model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
+        out.push_str(&sse(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
                 },
-            },
-        })));
-        out.push_str(&sse("content_block_start", &serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": { "type": "text", "text": "" },
-        })));
+            }),
+        ));
+        out.push_str(&sse(
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "text", "text": "" },
+            }),
+        ));
         out
     }
 
     fn text_delta(&self, text: &str) -> String {
-        sse("content_block_delta", &serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "text_delta", "text": text },
-        }))
+        sse(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": text },
+            }),
+        )
     }
 
-    fn finish(
-        &self,
-        stop_reason: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) -> String {
+    fn finish(&self, stop_reason: &str, input_tokens: u64, output_tokens: u64) -> String {
         let mut out = String::new();
         if self.text_started {
-            out.push_str(&sse("content_block_stop", &serde_json::json!({
-                "type": "content_block_stop",
-                "index": 0,
-            })));
+            out.push_str(&sse(
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": 0,
+                }),
+            ));
         }
-        out.push_str(&sse("message_delta", &serde_json::json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": stop_reason },
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-            },
-        })));
+        out.push_str(&sse(
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": stop_reason },
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            }),
+        ));
         out.push_str(&format!(
             "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         ));
@@ -217,7 +227,10 @@ fn translate_messages(req: &AnthRequest) -> Vec<OaiMsg> {
     if let Some(ref system) = req.system {
         let sys_text = extract_content(system);
         if !sys_text.is_empty() {
-            out.push(OaiMsg { role: "system".into(), content: sys_text });
+            out.push(OaiMsg {
+                role: "system".into(),
+                content: sys_text,
+            });
         }
     }
 
@@ -225,7 +238,10 @@ fn translate_messages(req: &AnthRequest) -> Vec<OaiMsg> {
     for msg in &req.messages {
         let text = extract_content(&msg.content);
         if !text.is_empty() {
-            out.push(OaiMsg { role: msg.role.clone(), content: text });
+            out.push(OaiMsg {
+                role: msg.role.clone(),
+                content: text,
+            });
         }
     }
 
@@ -237,7 +253,9 @@ fn translate_messages(req: &AnthRequest) -> Vec<OaiMsg> {
 fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| e.to_string())?;
 
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
     if parts.len() < 2 {
@@ -285,7 +303,9 @@ fn write_http_response(
         body.len(),
         body,
     );
-    stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -349,7 +369,8 @@ fn handle_messages_request(
     let mut raw = stream.try_clone().map_err(|e| e.to_string())?;
     // Send HTTP headers first (chunked for streaming)
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
-    raw.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
+    raw.write_all(headers.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut sse = SseEmitter::new(model);
     let mut input_tokens: u64 = 0;
@@ -424,13 +445,15 @@ fn handle_messages_request(
 
 fn write_chunk(stream: &mut TcpStream, data: &str) -> Result<(), String> {
     if data.is_empty() {
-        stream
-            .write_all(b"0\r\n\r\n")
-            .map_err(|e| e.to_string())?;
+        stream.write_all(b"0\r\n\r\n").map_err(|e| e.to_string())?;
     } else {
         let hex_len = format!("{:X}\r\n", data.len());
-        stream.write_all(hex_len.as_bytes()).map_err(|e| e.to_string())?;
-        stream.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+        stream
+            .write_all(hex_len.as_bytes())
+            .map_err(|e| e.to_string())?;
+        stream
+            .write_all(data.as_bytes())
+            .map_err(|e| e.to_string())?;
         stream.write_all(b"\r\n").map_err(|e| e.to_string())?;
     }
     stream.flush().map_err(|e| e.to_string())?;
@@ -439,36 +462,27 @@ fn write_chunk(stream: &mut TcpStream, data: &str) -> Result<(), String> {
 
 // ── Connection handler ────────────────────────────────────────────
 
-fn handle_connection(
-    mut stream: TcpStream,
-    api_url: String,
-    api_key: String,
-    model: String,
-) {
+fn handle_connection(mut stream: TcpStream, api_url: String, api_key: String, model: String) {
     let result = (|| -> Result<(), String> {
         let (req_line, body) = read_http_request(&mut stream)?;
 
         // Health check
         if req_line.starts_with("GET /health") {
-            return write_http_response(
-                &mut stream,
-                200,
-                "application/json",
-                r#"{"status":"ok"}"#,
-            );
+            return write_http_response(&mut stream, 200, "application/json", r#"{"status":"ok"}"#);
         }
 
         // CORS preflight
         if req_line.starts_with("OPTIONS") {
             let headers = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n";
-            stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
+            stream
+                .write_all(headers.as_bytes())
+                .map_err(|e| e.to_string())?;
             return Ok(());
         }
 
         // Anthropic API
         if req_line.starts_with("POST /v1/messages") {
-            if let Err(e) =
-                handle_messages_request(&mut stream, &body, &api_url, &api_key, &model)
+            if let Err(e) = handle_messages_request(&mut stream, &body, &api_url, &api_key, &model)
             {
                 let error_body = serde_json::json!({
                     "type": "error",
@@ -500,20 +514,25 @@ fn handle_connection(
             let resp_body = resp.text().unwrap_or_default();
 
             let status_code = status.as_u16();
-            return write_http_response(
-                &mut stream,
-                status_code,
-                "application/json",
-                &resp_body,
-            );
+            return write_http_response(&mut stream, status_code, "application/json", &resp_body);
         }
 
         // 404
-        write_http_response(&mut stream, 404, "application/json", r#"{"error":"not found"}"#)
+        write_http_response(
+            &mut stream,
+            404,
+            "application/json",
+            r#"{"error":"not found"}"#,
+        )
     })();
 
     if let Err(e) = result {
-        let _ = write_http_response(&mut stream, 500, "application/json", &format!(r#"{{"error":"{}"}}"#, e));
+        let _ = write_http_response(
+            &mut stream,
+            500,
+            "application/json",
+            &format!(r#"{{"error":"{}"}}"#, e),
+        );
     }
 }
 
@@ -529,9 +548,7 @@ pub fn start(api_url: String, api_key: String, model: String) -> Result<(), Stri
 
     let listener =
         TcpListener::bind("127.0.0.1:8788").map_err(|e| format!("Proxy bind error: {}", e))?;
-    listener
-        .set_nonblocking(false)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(false).map_err(|e| e.to_string())?;
 
     thread::spawn(move || {
         for stream in listener.incoming() {

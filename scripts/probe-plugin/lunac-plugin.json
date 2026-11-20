@@ -1,0 +1,14 @@
+{
+  "id": "probe",
+  "name": "信道探针",
+  "description": "开发自检用：iframe 引擎 + 两个常驻锚点 + 单信道握手 / 主题 / mount / execute（不入市场）",
+  "keywords": ["probe", "dev", "iframe", "channel"],
+  "icon": "🧪",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "render": {
+    "engine": "iframe",
+    "appearance": "inherit",
+    "slots": ["chat-sidebar", "settings-section"]
+  }
+}

@@ -13,6 +13,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n.js";
+import { customSelectHtml } from "./plugins/builtin/custom-select.js";
+import type { CustomSelectOption } from "./plugins/builtin/custom-select.js";
 
 /** 汇总区间（天）。日志按天分片，这里是 30 个文件、一次 IPC 读完（`read_usage_range`）。 */
 export const COST_RANGE_DAYS = 30;
@@ -148,13 +150,14 @@ export function parseUsageRangeValue(v: string): UsageRange {
  *  多模型混用（换过模型 / 用过子代理）时它才是一个可选项，单一模型时只把名字显示出来。 */
 export type UsageModelFilter = string | null;
 
-/** 面板里「当前统计的来源」（来源归因分区）：`null` = 全部；`"pet"` = 桌宠发起；`"chat"` = 普通聊天。
- *  与「模型」正交 —— 两个筛选各切一刀，金额仍走同一套算法（只是先按来源裁一次模型桶）。 */
-export type UsageSourceFilter = "pet" | "chat" | null;
+/** 面板里「当前统计的来源」（来源归因分区）：`null` = 全部；`"pet"` = 桌宠发起；
+ *  `"chat"` = 普通聊天；`"cron"` = 定时任务手动触发。与「模型」正交 —— 两个筛选各切一刀，
+ *  金额仍走同一套算法（只是先按来源裁一次模型桶）。 */
+export type UsageSourceFilter = "pet" | "chat" | "cron" | null;
 
-/** 记录里的来源 → 面板分区键：只有 `"pet"` 单列一档，其余（含空串）都算普通聊天。 */
-function sourcePartition(source: string | undefined): "pet" | "chat" {
-  return source === "pet" ? "pet" : "chat";
+/** 记录里的来源 → 面板分区键：`"pet"` / `"cron"` 各单列一档，其余（含空串）都算普通聊天。 */
+function sourcePartition(source: string | undefined): "pet" | "chat" | "cron" {
+  return source === "pet" ? "pet" : source === "cron" ? "cron" : "chat";
 }
 
 /** 分区键 ↔ 下拉 value（一进一出成对写在一处，别两头各拼一套，同 `usageRangeValue`）。 */
@@ -162,7 +165,7 @@ export function usageSourceValue(f: UsageSourceFilter): string {
   return f === null ? "all" : f;
 }
 export function parseUsageSourceValue(v: string): UsageSourceFilter {
-  return v === "pet" ? "pet" : v === "chat" ? "chat" : null;
+  return v === "pet" ? "pet" : v === "chat" ? "chat" : v === "cron" ? "cron" : null;
 }
 
 /** 这批数据里出现过的模型名（去重、升序）。**取自未裁剪的那份** ——
@@ -450,6 +453,10 @@ const COL_KEYS = [
   "settings.cost_col_write",
   "settings.cost_col_output",
   "settings.cost_col_amount",
+  // 派生列（2026-10-27，§待办 3-16 P2-8）：三个能直接下判断的数
+  "settings.cost_col_miss_per_req",
+  "settings.cost_col_out_per_req",
+  "settings.cost_col_share",
 ];
 
 /** 表格的一行（按天或按小时，形状一样）。 */
@@ -527,12 +534,27 @@ function hourRows(day: UsageDay, pricing: PricingFile | null): CostRow[] {
   return [...byHour.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function rowsHtml(rows: CostRow[], hasPrices: boolean): string {
+/** 派生列：每请求的未命中 / 输出（请求数为 0 时给 `—`，不是 0）。 */
+function perRequestText(total: number, requests: number): string {
+  if (!(requests > 0)) return "—";
+  return fmtTokenCount(Math.round(total / requests));
+}
+
+/** 派生列：这一行金额占本次统计总额的比例。没定价 / 总额为 0 时 `—`（不编 0%）。 */
+function shareText(hasPrices: boolean, amount: number, totalAmount: number): string {
+  if (!hasPrices || !(totalAmount > 0)) return "—";
+  return `${((amount / totalAmount) * 100).toFixed(1)}%`;
+}
+
+function rowsHtml(rows: CostRow[], hasPrices: boolean, totalAmount: number): string {
   return rows.map((r) =>
     `<tr><td>${esc(r.label)}</td><td>${r.requests}</td>` +
     `<td>${fmtTokenCount(r.hit)}</td><td>${fmtTokenCount(r.miss)}</td>` +
     `<td>${fmtTokenCount(r.write)}</td><td>${fmtTokenCount(r.output)}</td>` +
-    `<td>${amountText(hasPrices, r.amount, r.exact)}</td></tr>`
+    `<td>${amountText(hasPrices, r.amount, r.exact)}</td>` +
+    `<td>${perRequestText(r.miss, r.requests)}</td>` +
+    `<td>${perRequestText(r.output, r.requests)}</td>` +
+    `<td>${shareText(hasPrices, r.amount, totalAmount)}</td></tr>`
   ).join("");
 }
 
@@ -564,43 +586,52 @@ export function renderUsageCostTable(d: UsageCostData, range: UsageRange): strin
   const totalRow = `<tr class="cost-total-row"><td>${t("settings.cost_total")}</td><td>${tot.requests}</td>` +
     `<td>${fmtTokenCount(tot.hit)}</td><td>${fmtTokenCount(tot.input)}</td>` +
     `<td>${fmtTokenCount(tot.write)}</td><td>${fmtTokenCount(tot.output)}</td>` +
-    `<td>${amountText(hasPrices, tot.amount, tot.exact)}</td></tr>`;
-  return `<table class="cost-table"><thead>${head}</thead><tbody>${rowsHtml(rows, hasPrices)}</tbody><tfoot>${totalRow}</tfoot></table>`;
+    `<td>${amountText(hasPrices, tot.amount, tot.exact)}</td>` +
+    // 合计行的派生列：每请求的两个均值用总量重算；占比恒为 100%（自己占自己）
+    `<td>${perRequestText(tot.input, tot.requests)}</td>` +
+    `<td>${perRequestText(tot.output, tot.requests)}</td>` +
+    `<td>${shareText(hasPrices, tot.amount, tot.amount)}</td></tr>`;
+  return `<table class="cost-table"><thead>${head}</thead><tbody>${rowsHtml(rows, hasPrices, tot.amount)}</tbody><tfoot>${totalRow}</tfoot></table>`;
 }
 
-/** 右上角的时间范围下拉框：今天 / 近 7 天 / 近 30 天 ＋「具体日期」一组（只列**有量**的那几天）。 */
+/** 右上角的时间范围下拉框：今天 / 近 7 天 / 近 30 天 ＋「具体日期」一组（只列**有量**的那几天）。
+ *  2026-10-23：原生 `<select>` 全部换成本项目的自绘 `.custom-select`（透明窗里原生弹层
+ *  不可样式化，四类颜色无从接管；见 `plugins/builtin/custom-select.ts`）。 */
 function rangeSelectHtml(d: UsageCostData, range: UsageRange): string {
   const cur = usageRangeValue(range);
-  const opt = (v: string, label: string) =>
-    `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label)}</option>`;
-  const parts = [
-    opt("today", t("settings.cost_range_today")),
-    opt("days:7", t("settings.cost_range_7d")),
-    opt("days:30", t("settings.cost_range_30d")),
+  const options: CustomSelectOption[] = [
+    { value: "today", label: t("settings.cost_range_today"), selected: cur === "today" },
+    { value: "days:7", label: t("settings.cost_range_7d"), selected: cur === "days:7" },
+    { value: "days:30", label: t("settings.cost_range_30d"), selected: cur === "days:30" },
   ];
   // 日期取**未裁剪**的那份（`d.days`），否则选了某一天之后就再也切不回别的日期
   const dates = d.days.map((x) => x.date).slice().reverse();
-  if (dates.length > 0) {
-    parts.push(`<optgroup label="${esc(t("settings.cost_range_dates"))}">`);
-    for (const dt of dates) parts.push(opt(`date:${dt}`, dt));
-    parts.push("</optgroup>");
+  for (const dt of dates) {
+    options.push({ value: `date:${dt}`, label: dt, selected: cur === `date:${dt}` });
   }
-  return `<select class="cost-range-select" id="cost-range-select" aria-label="${esc(t("settings.cost_col_time"))}">${parts.join("")}</select>`;
+  return customSelectHtml(
+    "cost-range-select",
+    options,
+    `aria-label="${esc(t("settings.cost_col_time"))}"`,
+  );
 }
 
-/** 右上角「来源」下拉框（来源归因分区）：全部 / 桌宠 / 普通聊天。与「日期」下拉**同一形态**
- *  （`.cost-range-select`）、**同一容器**（`.cost-range`，用既有的 `.cost-kv` 给出间距）。
+/** 右上角「来源」下拉框（来源归因分区）：全部 / 桌宠 / 普通聊天 / 定时任务。与「日期」下拉
+ *  **同一形态**（自绘 `.custom-select`）、**同一容器**（`.cost-range`，用既有的 `.cost-kv` 给出间距）。
  *  切换后由 `scopedUsageData` 按来源裁模型桶 —— 逐日表格与合计都跟着变，金额仍走 `dayCost`。 */
 function sourceSelectHtml(source: UsageSourceFilter): string {
   const cur = usageSourceValue(source);
-  const opt = (v: string, label: string) =>
-    `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label)}</option>`;
-  const parts = [
-    opt("all", t("settings.cost_source_all")),
-    opt("pet", t("settings.cost_source_pet")),
-    opt("chat", t("settings.cost_source_chat")),
+  const options: CustomSelectOption[] = [
+    { value: "all", label: t("settings.cost_source_all"), selected: cur === "all" },
+    { value: "pet", label: t("settings.cost_source_pet"), selected: cur === "pet" },
+    { value: "chat", label: t("settings.cost_source_chat"), selected: cur === "chat" },
+    { value: "cron", label: t("settings.cost_source_cron"), selected: cur === "cron" },
   ];
-  return `<select class="cost-range-select" id="cost-source-select" aria-label="${esc(t("settings.cost_k_source"))}">${parts.join("")}</select>`;
+  return customSelectHtml(
+    "cost-source-select",
+    options,
+    `aria-label="${esc(t("settings.cost_k_source"))}"`,
+  );
 }
 
 /** 左上角「当前统计的模型」那一格（2026-10-06 用户定）：
@@ -615,14 +646,13 @@ function modelChipHtml(d: UsageCostData, model: UsageModelFilter): string {
   if (models.length === 1) {
     return `<span class="cost-kv">${k}<span class="cost-v">${esc(modelLabel(models[0]))}</span></span>`;
   }
-  const opt = (v: string, label: string, sel: boolean) =>
-    `<option value="${esc(v)}"${sel ? " selected" : ""}>${esc(label)}</option>`;
-  const options = [
-    opt("", t("settings.cost_model_all"), model === null),
-    ...models.map((m) => opt(m, modelLabel(m), m === model)),
+  const options: CustomSelectOption[] = [
+    { value: "", label: t("settings.cost_model_all"), selected: model === null },
+    ...models.map((m) => ({ value: m, label: modelLabel(m), selected: m === model })),
   ];
   return `<span class="cost-kv">${k}` +
-    `<select class="cost-range-select" id="cost-model-select" aria-label="${esc(t("settings.cost_k_model"))}">${options.join("")}</select></span>`;
+    customSelectHtml("cost-model-select", options, `aria-label="${esc(t("settings.cost_k_model"))}"`) +
+    `</span>`;
 }
 
 /** 表盘展开面板的正文：**只有数据，没有说明文字**（用户 2026-09-29 定：

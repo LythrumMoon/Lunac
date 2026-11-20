@@ -112,12 +112,7 @@ impl Ring {
 ///    4 字节才吐一个样本 —— 直接 `read_exact` 一个 f32 会在边界处丢样本。
 /// ② **水位到了就不读**（`RING_TARGET`）：读光了 librespot 就会一直解码、一直往管道里
 ///    灌，延迟会涨到「ring 满 + 管道满」；不读才是我们控制延迟的手段（写方阻塞 = 背压）。
-fn reader_loop(
-    mut r: impl Read,
-    ring: Arc<Ring>,
-    stop: Arc<AtomicBool>,
-    label: &'static str,
-) {
+fn reader_loop(mut r: impl Read, ring: Arc<Ring>, stop: Arc<AtomicBool>, label: &'static str) {
     let mut chunk = [0u8; 16 * 1024];
     // 攒字节用的缓冲 + 游标（用游标而不是 `drain(..4)`：后者每吐一个样本都要搬一次内存）。
     let mut pending: Vec<u8> = Vec::with_capacity(32 * 1024);

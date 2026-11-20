@@ -60,12 +60,13 @@ $DistDir = "$Root\app\plugin-dist"
 # ── 分类表（2026-10-13）：插件 id → packages\<分类>\ 的目录名 ──────────────
 # 只影响**包里放哪、url 长什么样、README 里怎么归类**，不改变安装 / 升级语义
 # （宿主只认 index.json 里那条完整 url）。**新增插件必须在这里登记**，否则落到 other\。
-# 现有的 7 个官方插件（music / clipboard-history / ocr / convert / proxy / pet / local-model）
-# 全覆盖；与 lunac-plugins 仓库 README 的「分类」一节保持一致。
+# 现有的 8 个官方插件（music / clipboard-history / ocr / convert / proxy / pet / local-model /
+# resource-hub）全覆盖；与 lunac-plugins 仓库 README 的「分类」一节保持一致。
 $Categories = @{
   "convert"           = "productivity"   # 文件转换
   "clipboard-history" = "productivity"   # 剪贴板历史
   "music"             = "media"          # 音乐
+  "resource-hub"      = "reading"        # 资源库（漫画 / 小说 / 番剧 / 电视剧）
   "ocr"               = "ocr"            # 文字识别
   "pet"               = "pet"            # 桌宠
   "local-model"       = "ai"             # 本地决策模型
@@ -152,7 +153,7 @@ foreach ($o in $orphans) {
 }
 
 # ── 3. 生成 index.json ─────────────────────────────────────────────
-# 条目字段与 Rust 侧 `PluginIndexEntry` 对齐（id/name/description/version/url/keywords/icon/homepage）。
+# 条目字段与 Rust 侧 `PluginIndexEntry` 对齐（id/name/description/version/url/sha256/keywords/icon/homepage）。
 # **只描述「去哪下」**：真正的元数据（permissions / dependencies）在包自己的 lunac-plugin.json 里，
 # 装完以包内清单为准 —— 索引过期也不会导致装出别的东西。
 Write-Host "[3/4] 生成市场索引..." -ForegroundColor Yellow
@@ -167,12 +168,15 @@ foreach ($z in $zips) {
     throw "找不到 $manifestPath —— 插件包与构建产物不一致，先重跑 build-plugins.ps1"
   }
   $m = [IO.File]::ReadAllText($manifestPath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json
+  # 包本体哈希（2026-10-18）：宿主安装前校验；发布端每次重发都会重算 —— 索引与包永远同步
+  $sha = (Get-FileHash -LiteralPath $z.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
   $entries += [ordered]@{
     id          = $m.id
     name        = $m.name
     description = $m.description
     version     = $m.version
     url         = "$RawBase/$cat/$($z.Name)"
+    sha256      = $sha
     keywords    = $m.keywords
     icon        = $m.icon
     homepage    = $m.homepage

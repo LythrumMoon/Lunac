@@ -35,6 +35,9 @@ mod imp {
     use std::sync::OnceLock;
 
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
+    const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
+    const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
 
     #[repr(C)]
@@ -83,6 +86,7 @@ mod imp {
             len: u32,
         ) -> i32;
         fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
     }
 
     static JOB: OnceLock<isize> = OnceLock::new();
@@ -119,6 +123,62 @@ mod imp {
             }
         }
     }
+
+    /// **每个 sidecar 自己的 job**（E.6，2026-10-18）：与全局 job 不同，这里可以带
+    /// 内存 / 进程数上限。句柄由调用方持有 —— `Drop` 关闭即触发 `KILL_ON_JOB_CLOSE`。
+    pub struct Job {
+        handle: isize,
+    }
+
+    impl Job {
+        /// 按限额建 job；`0` 表示该维度不限制。
+        pub fn create(limits: super::JobLimits) -> Option<Job> {
+            let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if job == 0 {
+                crate::log::warn("child_job：CreateJobObject 失败，限额未生效");
+                return None;
+            }
+            let mut info = ExtendedLimits::default();
+            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if limits.process_memory_limit > 0 {
+                info.basic.limit_flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.process_memory_limit = limits.process_memory_limit;
+            }
+            if limits.job_memory_limit > 0 {
+                info.basic.limit_flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+                info.job_memory_limit = limits.job_memory_limit;
+            }
+            if limits.active_process_limit > 0 {
+                info.basic.limit_flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                info.basic.active_process_limit = limits.active_process_limit;
+            }
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    &info as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<ExtendedLimits>() as u32,
+                )
+            };
+            if ok == 0 {
+                crate::log::warn("child_job：SetInformationJobObject 失败，限额未生效");
+                unsafe { CloseHandle(job) };
+                return None;
+            }
+            Some(Job { handle: job })
+        }
+
+        pub fn assign(&self, child: &std::process::Child) -> bool {
+            unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as isize) != 0 }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // 关闭句柄 ⇒ KILL_ON_JOB_CLOSE：正常 stop 时也顺带收掉残留子进程。
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
 }
 
 /// 把子进程绑到 lunac.exe 的生命周期上（**非 Windows 上是空操作**）。
@@ -129,4 +189,38 @@ pub fn assign(child: &std::process::Child) {
     imp::assign(child);
     #[cfg(not(target_os = "windows"))]
     let _ = child;
+}
+
+/// 每个进程的**独立 job 限额**（E.6，2026-10-18）。`0` = 该维度不限制。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JobLimits {
+    /// 单进程内存上限（字节）
+    pub process_memory_limit: usize,
+    /// 整个 job 的内存上限（字节）
+    pub job_memory_limit: usize,
+    /// job 内最大进程数
+    pub active_process_limit: u32,
+}
+
+impl JobLimits {
+    pub fn is_set(&self) -> bool {
+        self.process_memory_limit > 0 || self.job_memory_limit > 0 || self.active_process_limit > 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use imp::Job;
+
+/// 非 Windows：没有 Job Object（限额是**资源闸**，不是隔离；不支持时静默降级）。
+#[cfg(not(target_os = "windows"))]
+pub struct Job;
+
+#[cfg(not(target_os = "windows"))]
+impl Job {
+    pub fn create(_limits: JobLimits) -> Option<Job> {
+        None
+    }
+    pub fn assign(&self, _child: &std::process::Child) -> bool {
+        false
+    }
 }

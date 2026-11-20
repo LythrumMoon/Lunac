@@ -34,11 +34,14 @@
 // 插件是用户自己选择安装的可执行代码，装上就等同于本机权限（与 tools\ 的 shell handler 同族）。
 // 界面上必须把「来源 + 这是可执行代码」显著写出来，别让用户以为它只是个配置。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,7 +58,7 @@ pub const MAX_ENTRIES: usize = 4000;
 /// 依赖里的引擎 / 模型比插件包本身大得多（PaddleOCR 模型、librespot 二进制都在几十 MB 量级），
 /// **2026-10-09 本地决策模型换成 3B 级后单体到 2.5 GiB** ⇒ 512 MB 的旧闸会直接把它拒掉。
 /// 4 GiB 覆盖 3B–4B 的 Q4_K_M（约 2–3 GiB）并留余量；仍能拦住「几十 GB 的怪物」。
-/// ⚠️ 这个闸只对 `file` 形态生效；大文件走的是 **流式落盘**（见 `download_to_file_with_progress`），
+/// ⚠️ 这个闸只对 `file` 形态生效；大文件走的是 **流式落盘**（见 `fetch_resumable`），
 /// 不再把整包读进内存 —— 否则 2.5 GiB 的分配会直接把安装过程顶爆。
 pub const MAX_DEP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// 依赖条目数上限（防清单里写一万条把安装拖死）。
@@ -78,6 +81,16 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "process.spawn",
     "window.resize",
     "window.float",
+    // 2026-10-18：宿主代请求（见 plugin_net.rs）。插件不得直连网络。
+    "net.fetch",
+    // 2026-10-18：图片 / 视频经宿主本地代理（见 plugin_media.rs）。
+    "media.proxy",
+    // 2026-10-18：插件脚本沙箱（见 plugin_engine.rs）。
+    "engine.eval",
+    // 2026-10-18：插件 KV 存储（见 plugin_kv.rs）。
+    "storage.plugin",
+    // 2026-10-21：隐藏 WebView 嗅探番剧 m3u8 / mp4（见 plugin_sniff.rs）。
+    "webview.sniff",
 ];
 /// id 长度上限（同时是目录名长度上限）。
 const MAX_ID_CHARS: usize = 48;
@@ -146,6 +159,54 @@ pub struct PluginWindowShape {
 fn default_true() -> bool {
     true
 }
+
+/// 清单里的 `render` 段（2026-10-18，插件框架重构 E.3）。
+///
+/// `engine` 决定挂载方式：`dom` 是现状的 light-DOM；`iframe` 是 opt-in 的作用域边界。
+/// `appearance` 决定是否继承宿主 token：`inherit` 遵守 `ui-style.md`，`custom` 才允许自绘。
+/// `slots` 声明**常驻挂载锚点**（2026-10-18）：目前只有 `chat-sidebar` / `settings-section`；
+/// 只对 iframe 引擎开放（DOM 插件没有独立文档，宿主无法把它的样式限制在槽位内）。
+/// 三个字段都有缺省值 ⇒ 老插件零变化。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "lowercase")]
+pub struct PluginRenderSpec {
+    #[serde(default)]
+    pub engine: RenderEngine,
+    #[serde(default)]
+    pub appearance: RenderAppearance,
+    #[serde(default)]
+    pub slots: Vec<RenderSlot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderEngine {
+    #[default]
+    Dom,
+    Iframe,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderAppearance {
+    #[default]
+    Inherit,
+    Custom,
+}
+
+/// 常驻挂载锚点（2026-10-17 用户拍板新增两个；2026-10-18 施工）。
+///
+/// **是枚举不是自由字符串**：每加一个锚点都会扩大宿主 DOM 契约，必须重新拍板
+/// （见 `docs/todo.md` C.4.1）。
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum RenderSlot {
+    ChatSidebar,
+    SettingsSection,
+}
+
+/// `provides` 条数上限（能力身份，几个就够）。
+pub const MAX_PROVIDES: usize = 8;
 
 /// 窗口尺寸的合法区间（逻辑像素）。下限挡住「误写到 0.5」，上限挡住「把窗口顶出屏幕
 /// 且用户抓不回来」—— 与 `plugin_window::plugin_window_resize` 的 clamp 口径同源。
@@ -230,6 +291,13 @@ pub struct PluginManifest {
     /// 宿主代码里没有一行按某个磁盘插件的 id 分支；卸载它照样什么也不留。
     #[serde(default)]
     pub reuse: Vec<String>,
+    /// 能力身份（2026-10-18，插件框架重构 E.1）：供宿主按能力定位插件。
+    /// **不改变「id = 目录名」硬契约**；多个插件声明同一 `provides` 只 warn 并取 id 最小者。
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// 渲染方式与外观级别（2026-10-18，E.3）。缺省 = `dom` + `inherit`。
+    #[serde(default)]
+    pub render: PluginRenderSpec,
     /// 悬浮窗形态（2026-09-29，见 `PluginWindowShape`）。不写这一段 = 宿主缺省形态。
     ///
     /// 由**宿主**在建窗时读（`plugin_window::declared_shape()`），不进前端契约 ——
@@ -242,6 +310,12 @@ pub struct PluginManifest {
     /// （`config\plugin-trusted.json`）。这一段由宿主在 `plugin_sidecar` 模块里读并执行。
     #[serde(default)]
     pub sidecar: Option<SidecarSpec>,
+    /// 开发工具链（轨道 H，2026-10-18，见 `PluginDevSpec`）。不写 = 无开发环境。
+    ///
+    /// **永不随安装自动执行**：装工具链 / 跑构建都由用户在设置页显式授权
+    /// （`config\plugin-toolchain.json` 是按指纹的授权账本）。
+    #[serde(default)]
+    pub dev: Option<PluginDevSpec>,
 }
 
 fn default_entry() -> String {
@@ -356,6 +430,13 @@ pub struct SidecarSpec {
     /// 大模型冷启要几十秒 ⇒ 清单里写大些（如 180），否则会被误判成失败并杀掉进程。
     #[serde(default = "default_ready_timeout_sec")]
     pub ready_timeout_sec: u64,
+    /// **单进程内存上限（MiB，0 = 不限制）**：E.6（2026-10-18）为每个 sidecar 建独立
+    /// Job Object 时使用。只约束该插件自己的进程树，不影响宿主 / agent 的全局 job。
+    #[serde(default, rename = "memoryLimitMiB")]
+    pub memory_limit_mib: u32,
+    /// **job 内最大进程数（0 = 不限制）**：同上，防止 sidecar 无限 fork。
+    #[serde(default)]
+    pub process_limit: u32,
 }
 
 /// `sidecar.readyTimeoutSec` 的缺省值（秒）—— 与旧行为一致。
@@ -370,6 +451,222 @@ const MAX_SIDECAR_READY_TIMEOUT_SEC: u64 = 3600;
 const MAX_SIDECAR_ENV: usize = 32;
 /// sidecar.allowLocalPorts 条数上限。
 const MAX_SIDECAR_ALLOW_PORTS: usize = 16;
+
+/// sidecar 内存上限的合法区间（MiB）：0 = 不限制；非 0 至少 32 MiB
+/// （再小会把最简单的运行时也杀掉），最大 32 GiB。
+const MIN_SIDECAR_MEMORY_MIB: u32 = 32;
+const MAX_SIDECAR_MEMORY_MIB: u32 = 32768;
+/// sidecar job 内进程数上限（0 = 不限制；非 0 最多 64 —— 正常插件不会开这么多）。
+const MAX_SIDECAR_PROCESS_LIMIT: u32 = 64;
+
+// ── 开发工具链（轨道 H，2026-10-18）───────────────────────────────────────
+//
+// 这一段**永不随安装自动执行**：工具链要用户逐次授权（按指纹），构建命令要用户点「运行」。
+// 落点固定在 `<插件目录>\.toolchain\<profile>\` ⇒ 卸载删目录即回收，守住「卸载 = 完全不存在」。
+// **不是沙箱**：装工具链 = 本机可执行代码 + 构建期脚本执行，授权只是策略级边界。
+
+/// 工具链 profile 上限（H.5：先只做「单文件构建器」与「Node + 包管理器」两档）。
+pub const MAX_TOOLCHAINS: usize = 2;
+
+/// `dev.build.args` 上限。
+const MAX_BUILD_ARGS: usize = 32;
+
+/// 允许的裸命令名（只能来自工具链 binDir；宿主不读全局 PATH 里的任意程序）。
+const DEV_COMMAND_ALLOWLIST: &[&str] = &[
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "deno",
+    "cargo",
+    "rustc",
+    "python",
+    "python3",
+    "pip",
+    "pwsh",
+    "powershell",
+    "makensis",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDevSpec {
+    #[serde(default)]
+    pub toolchains: Vec<ToolchainProfile>,
+    #[serde(default)]
+    pub build: Option<PluginBuildSpec>,
+}
+
+/// 一个可安装的工具链 profile。`url` 必须 https；`sha256` **必填**。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolchainProfile {
+    /// profile 标识（同时是 `.toolchain\<id>\` 的目录名）
+    pub id: String,
+    /// https 直链
+    pub url: String,
+    /// 压缩包 / 文件本体的 sha256（64 位十六进制，必填）
+    #[serde(default)]
+    pub sha256: String,
+    /// 相对插件目录的落点：`file` = 文件路径；`archive` = 解压目标目录
+    #[serde(default)]
+    pub dest: String,
+    /// `file` / `archive`（缺省 `file`）
+    #[serde(default)]
+    pub kind: String,
+    /// 版本号（只用于展示与授权指纹）
+    #[serde(default)]
+    pub version: String,
+    /// 装完后加入 PATH 的目录（相对插件目录；archive 通常是解压根）
+    #[serde(default)]
+    pub bin_dir: String,
+}
+
+/// 构建命令：在插件目录内执行，**永不自动运行**。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginBuildSpec {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 工作目录（相对插件目录；空 = 插件目录）
+    #[serde(default)]
+    pub cwd: String,
+}
+
+/// 开发段的授权指纹：`id + profile(id/version/sha256/url/dest/kind/binDir) + build`。
+/// 任一处变化 ⇒ 旧授权作废、必须重新授权。
+pub fn dev_fingerprint(plugin_id: &str, dev: &PluginDevSpec) -> String {
+    let mut s = String::new();
+    s.push_str(plugin_id.trim());
+    for p in &dev.toolchains {
+        s.push('\x1f');
+        s.push_str(&format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            p.id.trim(),
+            p.version.trim(),
+            p.sha256.trim().to_ascii_lowercase(),
+            p.url.trim(),
+            p.dest.trim(),
+            p.kind.trim(),
+            p.bin_dir.trim()
+        ));
+    }
+    if let Some(b) = &dev.build {
+        s.push('\x1e');
+        s.push_str(b.command.trim());
+        for a in &b.args {
+            s.push('\x1f');
+            s.push_str(a);
+        }
+        s.push('\x1f');
+        s.push_str(b.cwd.trim());
+    }
+    hex_sha256(s.as_bytes())
+}
+
+/// 相对路径是否落在 `.toolchain\` 下（`/` 与 `\` 两种写法都认）。
+fn under_toolchain_dir(rel: &str) -> bool {
+    let norm = rel.trim().replace('\\', "/");
+    norm.starts_with(".toolchain/")
+}
+
+/// 校验 `dev` 段。能静态判定的一律拒绝整包（同清单其它字段）。
+fn validate_dev(dev: &PluginDevSpec) -> Result<(), String> {
+    if dev.toolchains.len() > MAX_TOOLCHAINS {
+        return Err(format!(
+            "dev.toolchains 过多（{} 条，上限 {MAX_TOOLCHAINS}）",
+            dev.toolchains.len()
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for p in &dev.toolchains {
+        if !is_safe_id(p.id.trim()) {
+            return Err(format!("dev.toolchains[].id 非法：{}", p.id));
+        }
+        if !ids.insert(p.id.trim()) {
+            return Err(format!("dev.toolchains[].id 重复：{}", p.id));
+        }
+        if !p.url.trim().starts_with("https://") {
+            return Err(format!(
+                "dev.toolchains[{}].url 必须是 https：{}",
+                p.id, p.url
+            ));
+        }
+        // 工具链是**可执行代码**：没有哈希就不发。迁移期例外不适用于开发环境。
+        if !is_sha256_hex(&p.sha256) {
+            return Err(format!(
+                "dev.toolchains[{}].sha256 必须是 64 位十六进制（工具链必须钉死哈希）",
+                p.id
+            ));
+        }
+        let kind = p.kind.trim();
+        if !matches!(kind, "" | "file" | "archive") {
+            return Err(format!(
+                "dev.toolchains[{}].kind 只支持 file / archive，收到：{kind}",
+                p.id
+            ));
+        }
+        if p.dest.trim().is_empty() || safe_join(Path::new("."), p.dest.trim()).is_none() {
+            return Err(format!(
+                "dev.toolchains[{}].dest 必须是插件目录内的相对路径",
+                p.id
+            ));
+        }
+        // 落点必须在 `.toolchain\` 下：卸载删插件目录即回收，不留宿主级残留。
+        if !under_toolchain_dir(p.dest.trim()) {
+            return Err(format!(
+                "dev.toolchains[{}].dest 必须在 .toolchain\\ 下：{}",
+                p.id, p.dest
+            ));
+        }
+        if !p.bin_dir.trim().is_empty()
+            && (safe_join(Path::new("."), p.bin_dir.trim()).is_none()
+                || !under_toolchain_dir(p.bin_dir.trim()))
+        {
+            return Err(format!(
+                "dev.toolchains[{}].binDir 必须在插件目录的 .toolchain\\ 下",
+                p.id
+            ));
+        }
+    }
+    if let Some(b) = &dev.build {
+        let cmd = b.command.trim();
+        if cmd.is_empty() || cmd.contains('\0') {
+            return Err("dev.build.command 不能为空".into());
+        }
+        let looks_like_path = cmd.contains('/') || cmd.contains('\\') || cmd.starts_with('.');
+        if looks_like_path {
+            if safe_join(Path::new("."), cmd).is_none() {
+                return Err(format!("dev.build.command 越界：{cmd}"));
+            }
+        } else {
+            let lower = cmd.to_ascii_lowercase();
+            if !DEV_COMMAND_ALLOWLIST.contains(&lower.as_str()) {
+                return Err(format!(
+                    "dev.build.command 只允许包内相对路径或常见构建器名（node/npm/…），收到：{cmd}"
+                ));
+            }
+        }
+        if b.args.len() > MAX_BUILD_ARGS {
+            return Err(format!(
+                "dev.build.args 过多（{} 条，上限 {MAX_BUILD_ARGS}）",
+                b.args.len()
+            ));
+        }
+        for a in &b.args {
+            if a.contains('\0') || a.chars().count() > 1024 {
+                return Err("dev.build.args 含非法参数".into());
+            }
+        }
+        if !b.cwd.trim().is_empty() && safe_join(Path::new("."), b.cwd.trim()).is_none() {
+            return Err(format!("dev.build.cwd 越界：{}", b.cwd));
+        }
+    }
+    Ok(())
+}
 
 /// 校验 `sidecar` 段。**能静态判定的一律拒绝整包**（同清单其它字段的口径）。
 ///
@@ -391,7 +688,9 @@ fn validate_sidecar(spec: &SidecarSpec, permissions: &[String]) -> Result<(), St
     // 3) transport / protocol / restart 枚举
     let t = spec.transport.trim();
     if !matches!(t, "" | "stdio" | "http" | "both") {
-        return Err(format!("sidecar.transport 只支持 stdio / http / both，收到：{t}"));
+        return Err(format!(
+            "sidecar.transport 只支持 stdio / http / both，收到：{t}"
+        ));
     }
     let p = spec.protocol.trim();
     if !matches!(p, "" | "ndjson") {
@@ -399,13 +698,30 @@ fn validate_sidecar(spec: &SidecarSpec, permissions: &[String]) -> Result<(), St
     }
     let r = spec.restart.trim();
     if !matches!(r, "" | "never" | "on-failure") {
-        return Err(format!("sidecar.restart 只支持 never / on-failure，收到：{r}"));
+        return Err(format!(
+            "sidecar.restart 只支持 never / on-failure，收到：{r}"
+        ));
     }
     // 3.1) 就绪超时：只接受 1..=3600（0 会被解释成「立刻超时」，明显是笔误）
     if spec.ready_timeout_sec == 0 || spec.ready_timeout_sec > MAX_SIDECAR_READY_TIMEOUT_SEC {
         return Err(format!(
             "sidecar.readyTimeoutSec 需在 1..={MAX_SIDECAR_READY_TIMEOUT_SEC} 秒之间，收到：{}",
             spec.ready_timeout_sec
+        ));
+    }
+    // 3.2) 资源闸（E.6）：0 = 不限制；非 0 必须在合理区间内
+    if spec.memory_limit_mib != 0
+        && !(MIN_SIDECAR_MEMORY_MIB..=MAX_SIDECAR_MEMORY_MIB).contains(&spec.memory_limit_mib)
+    {
+        return Err(format!(
+            "sidecar.memoryLimitMiB 需为 0 或 {MIN_SIDECAR_MEMORY_MIB}..={MAX_SIDECAR_MEMORY_MIB}，收到：{}",
+            spec.memory_limit_mib
+        ));
+    }
+    if spec.process_limit > MAX_SIDECAR_PROCESS_LIMIT {
+        return Err(format!(
+            "sidecar.processLimit 需为 0..={MAX_SIDECAR_PROCESS_LIMIT}，收到：{}",
+            spec.process_limit
         ));
     }
     // 4) cwd：不写 = 插件目录；写了就必须在插件目录内
@@ -560,10 +876,20 @@ pub struct InstalledPlugin {
     /// 前端 `attach.ts` 会逐个调基础插件那套 `attachXxxListeners(root)`。
     #[serde(default)]
     pub reuse: Vec<String>,
+    /// 能力身份（2026-10-18）：宿主按它定位插件；`id` 仍是目录名。
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// 渲染方式与外观级别（2026-10-18）。
+    #[serde(default)]
+    pub render: PluginRenderSpec,
     /// 这个插件声明的 sidecar（2026-10-06）。界面上如实列出「它要起哪个进程」
     /// （信任卡里还会再列一遍 command / args / sha256）。
     #[serde(default)]
     pub sidecar: Option<SidecarSpec>,
+    /// 这个插件声明的开发工具链（2026-10-18）。设置页据此显示「开发工具链」分区；
+    /// **未授权时不能装、不能构建**（账本在 `config\plugin-toolchain.json`）。
+    #[serde(default)]
+    pub dev: Option<PluginDevSpec>,
 }
 
 /// 插件根目录：`<exe 根>\Modules`（2026-09-28 由 `plugins` 改名而来；与 skills / tools 同级）。
@@ -609,11 +935,16 @@ pub fn migrate_legacy_plugins_dir(root: &Path) -> usize {
         }
     }
     // 只剩空目录（或本来就没有子目录）才删掉旧的；还有东西就留着，别动用户的文件
-    if fs::read_dir(&old).map(|mut it| it.next().is_none()).unwrap_or(false) {
+    if fs::read_dir(&old)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
+    {
         let _ = fs::remove_dir(&old);
     }
     if moved > 0 {
-        crate::log::info(format!("旧 plugins\\ 目录已迁移 {moved} 个插件到 Modules\\"));
+        crate::log::info(format!(
+            "旧 plugins\\ 目录已迁移 {moved} 个插件到 Modules\\"
+        ));
     }
     moved
 }
@@ -704,9 +1035,36 @@ pub fn parse_manifest(text: &str) -> Result<PluginManifest, String> {
             return Err(format!("reuse 里的 id 非法（只允许 [a-z0-9._-]）：{r}"));
         }
     }
+    // provides（2026-10-18）：形状与条数校验；跨插件冲突由宿主 warn（E.1）。
+    if m.provides.len() > MAX_PROVIDES {
+        return Err(format!(
+            "provides 条目过多（{} 条，上限 {MAX_PROVIDES}）",
+            m.provides.len()
+        ));
+    }
+    for p in &m.provides {
+        if !is_safe_id(p.trim()) {
+            return Err(format!("provides 里的身份非法（只允许 [a-z0-9._-]）：{p}"));
+        }
+    }
+    // render.slots（2026-10-18）：常驻锚点只对 iframe 引擎开放 —— DOM 插件没有独立文档，
+    // 宿主无法把它的样式 / 脚本限制在某个槽位内。重复声明按错误处理（不做去重，避免静默）。
+    if !m.render.slots.is_empty() && m.render.engine != RenderEngine::Iframe {
+        return Err("render.slots 只支持 render.engine=iframe".into());
+    }
+    let mut seen_slots = std::collections::HashSet::new();
+    for slot in &m.render.slots {
+        if !seen_slots.insert(*slot) {
+            return Err(format!("render.slots 重复声明：{slot:?}"));
+        }
+    }
     // sidecar（2026-10-06）：声明了就必须同时有 process.spawn，且 command/cwd 不得越界
     if let Some(spec) = &m.sidecar {
         validate_sidecar(spec, &m.permissions)?;
+    }
+    // dev（2026-10-18，轨道 H）：工具链必须 https + 钉死 sha256；构建命令不得越界。
+    if let Some(dev) = &m.dev {
+        validate_dev(dev)?;
     }
     Ok(m)
 }
@@ -733,6 +1091,12 @@ pub struct PluginIndexEntry {
     pub icon: String,
     #[serde(default)]
     pub homepage: String,
+    /// 插件 zip 的 sha256（64 位十六进制，大小写不敏感）。
+    ///
+    /// 2026-10-18 起由 `publish-plugins.ps1` 生成；**迁移期**：缺省仍可安装但 warn 留痕，
+    /// 写了就必须对上（供应链完整性，见 H.11 / E.5）。
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// 解析并**逐条校验**市场索引（顶层是一个数组）。
@@ -762,6 +1126,15 @@ pub fn parse_index(text: &str) -> Result<Vec<PluginIndexEntry>, String> {
         }
         if e.name.trim().is_empty() {
             crate::log::warn(format!("插件索引里的 {} 没有名字，已跳过", e.id));
+            continue;
+        }
+        // sha256 可以不写（迁移期），写了就必须是 64 位十六进制 —— 写错的哈希等于没有哈希，
+        // 继续放行只会让「校验过」变成一句假话。
+        if !e.sha256.trim().is_empty() && !is_sha256_hex(&e.sha256) {
+            crate::log::warn(format!(
+                "插件索引里的 {} 的 sha256 不是 64 位十六进制，已跳过",
+                e.id
+            ));
             continue;
         }
         if out.iter().any(|o| o.id == e.id) {
@@ -811,8 +1184,7 @@ pub fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
 /// `max_total` 是解压总量上限 —— 抽成参数只为让单测能用极小的上限造 zip bomb 场景，
 /// 生产调用一律用 `MAX_TOTAL_BYTES`。
 pub fn extract_zip<R: Read + Seek>(reader: R, dest: &Path, max_total: u64) -> Result<(), String> {
-    let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| format!("不是合法的 zip：{e}"))?;
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("不是合法的 zip：{e}"))?;
     if archive.len() > MAX_ENTRIES {
         return Err(format!("包内条目过多（{} 个）", archive.len()));
     }
@@ -916,8 +1288,7 @@ pub fn install_from_bytes_with_progress(
     let prepared = (|| -> Result<(PluginManifest, PathBuf), String> {
         extract_zip(std::io::Cursor::new(bytes), &staging, MAX_TOTAL_BYTES)?;
         let manifest_path = find_manifest(&staging)?;
-        let text = fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("读清单失败：{e}"))?;
+        let text = fs::read_to_string(&manifest_path).map_err(|e| format!("读清单失败：{e}"))?;
         let manifest = parse_manifest(&text)?;
         let plugin_root = manifest_path
             .parent()
@@ -926,10 +1297,7 @@ pub fn install_from_bytes_with_progress(
         let entry_path = safe_join(&plugin_root, &manifest.entry)
             .ok_or_else(|| format!("entry 越界：{}", manifest.entry))?;
         if !entry_path.is_file() {
-            return Err(format!(
-                "清单里写的入口不存在：{}",
-                manifest.entry
-            ));
+            return Err(format!("清单里写的入口不存在：{}", manifest.entry));
         }
         Ok((manifest, plugin_root))
     })();
@@ -976,9 +1344,12 @@ pub fn install_from_bytes_with_progress(
     }
 
     // ── 第四步：装依赖。失败 = 整次安装失败（把新版本删掉、旧版本搬回来）──
-    if let Err(e) =
-        install_dependencies_with_progress(&target, &manifest.id, &manifest.dependencies, on_dep_progress)
-    {
+    if let Err(e) = install_dependencies_with_progress(
+        &target,
+        &manifest.id,
+        &manifest.dependencies,
+        on_dep_progress,
+    ) {
         let _ = fs::remove_dir_all(&target);
         if had_old {
             let _ = fs::rename(&backup, &target);
@@ -1008,6 +1379,48 @@ fn dep_install_cancelled() -> bool {
     CANCEL_DEP_INSTALL.load(Ordering::Relaxed)
 }
 
+// ── 安装单飞闸（2026-10-27）─────────────────────────────────────────
+//
+// 为什么必须有：**暂停**的实现是「宿主线程原地等」，所以「暂停之后又点一次下载 / 继续」
+// 会**再起一个**下载线程 —— 两个线程写同一个 `.part`、各自算 offset，界面上就出现
+// 「一快一慢两种进度」（快的是后起的那个），而且谁先读完谁把半截文件改名走 ⇒
+// 「秒更新完毕但其实没装完」。这道闸把它们挡在入口。
+//
+// 粒度 = **一次安装**（插件包本体 + 它自己的依赖算同一次）；依赖补齐 / 工具链安装各算一次。
+static INSTALL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// 安装闸的持有凭证；`drop` 时释放。
+#[derive(Debug)]
+pub struct InstallBusyGuard(());
+
+impl Drop for InstallBusyGuard {
+    fn drop(&mut self) {
+        INSTALL_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 占用安装闸；已有一次在进行时返回 Err（**原样报给界面**，由调用方决定文案）。
+///
+/// 注意：**暂停中的那次仍然占着闸** —— 恢复要走 `plugin_install_pause(false)`，
+/// 不能再发一次安装（那正是「两种进度」的成因）。
+pub fn try_begin_install(what: &str) -> Result<InstallBusyGuard, String> {
+    if INSTALL_BUSY.swap(true, Ordering::SeqCst) {
+        let st = install_state();
+        let hint = if st.active && st.paused {
+            "那一次已暂停：到对应那一行点「继续」接着下"
+        } else {
+            "等它结束，或先取消"
+        };
+        return Err(format!("已有一次安装在进行（{what}）—— {hint}"));
+    }
+    Ok(InstallBusyGuard(()))
+}
+
+/// 当前是否有安装占着闸（测试 / 诊断用）。
+pub fn install_busy() -> bool {
+    INSTALL_BUSY.load(Ordering::SeqCst)
+}
+
 /// 逐条安装清单里的依赖（`dependencies[]`）。**任意一条失败即中止**，由调用方决定是否回滚。
 ///
 /// 顺序执行、不并发：依赖条数是个位数，并发带来的收益抵不过「并发失败时哪一半落了盘」的复杂度。
@@ -1029,7 +1442,11 @@ pub fn install_dependencies_with_progress(
     }
     for (i, d) in deps.iter().enumerate() {
         let what = if d.is_npm() {
-            let pkg = if d.package.trim().is_empty() { d.url.trim() } else { d.package.trim() };
+            let pkg = if d.package.trim().is_empty() {
+                d.url.trim()
+            } else {
+                d.package.trim()
+            };
             format!("npm:{pkg}")
         } else {
             d.url.clone()
@@ -1039,6 +1456,8 @@ pub fn install_dependencies_with_progress(
         validate_dependency(d).map_err(|e| format!("第 {} 条依赖（{what}）非法：{e}", i + 1))?;
         let index = i + 1;
         let count = deps.len();
+        // 界面的「本次安装」快照按**当前文件**记 —— 切页签 / 关面板回来时据此把进度挂回那一行
+        begin_install_state("deps", plugin_id, &d.url);
         let mut report = |phase: &str, downloaded: u64, total: u64| {
             on_progress(DependencyProgress {
                 id: plugin_id.to_string(),
@@ -1056,8 +1475,12 @@ pub fn install_dependencies_with_progress(
         } else {
             install_file_dependency(plugin_dir, d, &mut report)
         };
-        r.map_err(|e| format!("第 {} 条依赖（{what}）安装失败：{e}", i + 1))?;
+        if let Err(e) = r {
+            finish_install_state();
+            return Err(format!("第 {} 条依赖（{what}）安装失败：{e}", i + 1));
+        }
     }
+    finish_install_state();
     Ok(())
 }
 
@@ -1074,30 +1497,38 @@ fn install_file_dependency(
     d: &PluginDependency,
     report: &mut dyn FnMut(&str, u64, u64),
 ) -> Result<(), String> {
-    let dest = safe_join(plugin_dir, &d.dest)
-        .ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
+    let dest =
+        safe_join(plugin_dir, &d.dest).ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("建依赖目录失败：{e}"))?;
     }
-    let mut tmp = dest.clone().into_os_string();
-    tmp.push(".part");
-    let tmp = PathBuf::from(tmp);
-
-    let got = download_to_file_with_progress(&d.url, MAX_DEP_BYTES, &tmp, report)?;
     let want = d.sha256.trim();
+    // 2026-10-27：改走**可续传**下载（半截文件放 `temp\downloads\`）——
+    // 关面板 / 切页签 / 退出应用后重来都能接着下；旧实现直接写 `dest.part`，
+    // 插件目录一旦被升级流程整体替换，断点就跟着没了。
+    let part = part_path_for(&d.url, want);
+    fetch_resumable(&d.url, &part, MAX_DEP_BYTES, want, report)?;
     if want.is_empty() {
         crate::log::warn(format!(
             "依赖 {} 没有 sha256，已按「只校验 https」安装 —— 作者最好补上校验和",
             d.url
         ));
-    } else if !got.eq_ignore_ascii_case(want) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
+    } else {
+        let got = sha256_file(&part)?;
+        if !got.eq_ignore_ascii_case(want) {
+            remove_part(&part);
+            return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
+        }
     }
-    fs::rename(&tmp, &dest).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("落盘依赖失败：{e}")
-    })?;
+    if let Err(e) = fs::rename(&part, &dest) {
+        // 跨卷时 `rename` 会失败（用户可能把插件目录指到别的盘）⇒ 退化成复制
+        fs::copy(&part, &dest).map_err(|e2| {
+            remove_part(&part);
+            format!("落盘依赖失败：{e}（复制也失败：{e2}）")
+        })?;
+        let _ = fs::remove_file(&part);
+    }
+    let _ = fs::remove_file(part_meta_path(&part));
     Ok(())
 }
 
@@ -1132,21 +1563,29 @@ fn install_archive_dependency(
     d: &PluginDependency,
     report: &mut dyn FnMut(&str, u64, u64),
 ) -> Result<(), String> {
-    let dest = safe_join(plugin_dir, &d.dest)
-        .ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
-    let bytes = download_bytes_with_progress(&d.url, MAX_DEP_BYTES, report)?;
+    let dest =
+        safe_join(plugin_dir, &d.dest).ok_or_else(|| format!("dest 越界，已拒绝：{}", d.dest))?;
     let want = d.sha256.trim();
+    // 2026-10-27：与 `file` 形态同一条可续传下载（压缩包 149 MB 量级，断点最值钱）
+    let part = part_path_for(&d.url, want);
+    fetch_resumable(&d.url, &part, MAX_DEP_BYTES, want, report)?;
     if want.is_empty() {
         crate::log::warn(format!(
             "压缩包依赖 {} 没有 sha256，已按「只校验 https」安装 —— 作者最好补上校验和",
             d.url
         ));
     } else {
-        let got = hex_sha256(&bytes);
+        let got = sha256_file(&part)?;
         if !got.eq_ignore_ascii_case(want) {
+            remove_part(&part);
             return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
         }
     }
+    let bytes = fs::read(&part).map_err(|e| {
+        remove_part(&part);
+        format!("读下载文件失败：{e}")
+    })?;
+    remove_part(&part);
     let format = detect_archive_format(&bytes)?;
 
     let stamp = std::time::SystemTime::now()
@@ -1347,114 +1786,488 @@ fn install_npm_dependency(plugin_dir: &Path, d: &PluginDependency) -> Result<(),
             .rev()
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(format!("npm 退出码 {}：{tail}", out.status.code().unwrap_or(-1)));
+        return Err(format!(
+            "npm 退出码 {}：{tail}",
+            out.status.code().unwrap_or(-1)
+        ));
     }
     Ok(())
 }
 
-/// 从 https 拉一段字节（有体积上限）。仅给依赖下载用 —— 插件包本体那条路在 commands.rs 里，
-/// 因为它还要兼顾 Content-Length 与错误上报的口径。
+// ── 可续传下载 + 暂停（2026-10-27）─────────────────────────────────
+//
+// 用户诉求（2026-10-27）：① 下载中可以**暂停 / 继续**；② 关掉设置面板、切到别的分页、
+// 甚至**强制退出 Lunac**，再回来都要从**断点**接着下，而不是从 0 重来。
+//
+// 做法：所有下载都落到 `temp\downloads\<url+sha256 的 sha256 前 16 位>.part`，旁边放一份
+// `.part.json`（url / etag / total / offset / sha256）。重新开始时按 `.part` 的**实际长度**
+// 发 `Range: bytes=<offset>-`：
+//   · 206 ⇒ 追加写；200（服务端不认 Range，或 `If-Range` 不匹配）⇒ 丢断点从头来；
+//   · 416 ⇒ 断点比远端还大，丢掉重来；
+//   · **暂停** = 关掉这条连接、原地等（不读流，也就不占着 socket），继续时重新发 Range；
+//   · **取消** = 删 `.part` + `.part.json`（与旧语义一致）。
+// sha256 只能在**全部下完**后整份重算（增量哈希没法跨进程接上），代价是一次本地顺序读。
+
+/// 下载暂存目录：`<exe 根>\temp\downloads`。
 ///
-/// **没有总超时**（2026-09-30 用户要求）：`archive` 依赖是 88MB 量级的引擎包，套一个「整条请求
-/// 多少秒内必须结束」的上限，在慢链路上等于把安装判死刑（而且越大的包越吃亏）。
-///
-/// 唯一剩下的时间闸是**建连超时**（30s）—— 它管的是「连不上」，与「传了多少」无关。
-/// **诚实说清代价**：传输中途若对端彻底不出声，这里不会主动掐断（`reqwest::blocking` 的
-/// `ClientBuilder` 没有 `read_timeout`，0.12 只给异步那份；要自己实现得改成分块 + 手动计时，
-/// 那是另一个量级的复杂度）。真碰上时靠 Windows 的 TCP keepalive 兜底 —— 用户选的就是
-/// 「宁可等，也不要下到一半被判超时」。
-///
-/// 每读一块回传 `(阶段, 已下, 总)`（`总 = 0` 表示服务端没给长度）。
-fn download_bytes_with_progress(
-    url: &str,
-    limit: u64,
-    report: &mut dyn FnMut(&str, u64, u64),
-) -> Result<Vec<u8>, String> {
-    let mut resp = open_https_stream(url)?;
-    let over = || format!("依赖文件超过上限（{} MB）", limit / 1024 / 1024);
-    if let Some(len) = resp.content_length() {
-        if len > limit {
-            return Err(over());
-        }
-    }
-    let total = resp.content_length().unwrap_or(0);
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = resp.read(&mut buf).map_err(|e| format!("读取出错：{e}"))?;
-        if n == 0 {
-            break;
-        }
-        if dep_install_cancelled() {
-            return Err("已取消依赖下载".into());
-        }
-        if bytes.len() as u64 + n as u64 > limit {
-            return Err(over());
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        report("download", bytes.len() as u64, total);
-    }
-    Ok(bytes)
+/// 放 `temp\` 而不是插件目录，两个理由：① 插件目录在「安装 / 升级」时会被整体替换，
+/// 半截文件不该跟着搬；② 断点要在**插件还没装好**时也活着（强制退出后重来）。
+pub fn downloads_dir() -> PathBuf {
+    crate::storage::lunac_root_dir()
+        .join("temp")
+        .join("downloads")
 }
 
-/// **流式**下载到文件并**边写边算 sha256**（2026-10-09，大依赖专用）。
+/// 一个下载断点的元数据（与 `.part` 同目录、同名 + `.json`）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PartMeta {
+    url: String,
+    /// 归属的插件 id（包本体阶段为空）。重启后界面靠它把「继续下载」挂回对应的行。
+    #[serde(default)]
+    id: String,
+    /// 服务端 ETag（可能为空）。有它就带 `If-Range`，避免「远端换了文件还往后拼」。
+    #[serde(default)]
+    etag: String,
+    /// 服务端声明的总字节；0 = 不知道。
+    #[serde(default)]
+    total: u64,
+    /// 已写入 `.part` 的字节数。
+    #[serde(default)]
+    offset: u64,
+    /// 清单里的 sha256（空 = 清单没写）。换版本 / 换文件时旧断点据此作废。
+    #[serde(default)]
+    sha256: String,
+}
+
+/// 界面上的「本次安装」进度快照（离屏 / 切页签 / 重开面板后用它重新挂回）。
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallState {
+    pub active: bool,
+    /// `package`（插件包本体）/ `deps`（补依赖）
+    pub kind: String,
+    /// 插件 id（插件包本体那段还没解析出清单，给空串）
+    pub id: String,
+    /// 当前正在下的那个文件 —— 前端按它把进度挂回**对应的那一行**
+    pub url: String,
+    pub phase: String,
+    pub downloaded: u64,
+    pub total: u64,
+    pub paused: bool,
+    /// 磁盘上有可续传的半截文件（下次点「安装 / 继续」会接着下）
+    pub resumable: bool,
+}
+
+/// 磁盘上还剩的断点（强制退出后重开应用时，界面仍能显示「继续下载」）。
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingDownload {
+    pub url: String,
+    /// 归属的插件 id（包本体阶段为空）
+    pub id: String,
+    pub downloaded: u64,
+    pub total: u64,
+}
+
+static INSTALL_STATE: Mutex<Option<InstallState>> = Mutex::new(None);
+static INSTALL_PAUSED: AtomicBool = AtomicBool::new(false);
+
+fn mutate_state(f: impl FnOnce(&mut InstallState)) {
+    if let Ok(mut g) = INSTALL_STATE.lock() {
+        f(g.get_or_insert_with(InstallState::default));
+    }
+}
+
+/// 暂停 / 继续当前这次下载。没有活动下载时也安全（只置标志）。
+pub fn set_install_paused(paused: bool) {
+    INSTALL_PAUSED.store(paused, Ordering::Relaxed);
+    mutate_state(|s| s.paused = paused);
+}
+
+/// 当前安装状态（没有活动下载时 `active = false`）。
+pub fn install_state() -> InstallState {
+    INSTALL_STATE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// 磁盘上还剩哪些断点。`downloaded` 取 `.part` 的**实际长度**（不信 json 里的旧值）。
+pub fn pending_downloads() -> Vec<PendingDownload> {
+    let Ok(entries) = fs::read_dir(downloads_dir()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PendingDownload> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                return None;
+            }
+            let meta = read_part_meta(&p)?;
+            let part = p.with_extension("");
+            let n = fs::metadata(&part).ok()?.len();
+            (n > 0).then_some(PendingDownload {
+                url: meta.url,
+                id: meta.id,
+                downloaded: n,
+                total: meta.total,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.url.cmp(&b.url));
+    out
+}
+
+fn begin_install_state(kind: &str, id: &str, url: &str) {
+    INSTALL_PAUSED.store(false, Ordering::Relaxed);
+    if let Ok(mut g) = INSTALL_STATE.lock() {
+        *g = Some(InstallState {
+            active: true,
+            kind: kind.to_string(),
+            id: id.to_string(),
+            url: url.to_string(),
+            phase: "download".into(),
+            ..Default::default()
+        });
+    }
+}
+
+fn finish_install_state() {
+    INSTALL_PAUSED.store(false, Ordering::Relaxed);
+    mutate_state(|s| {
+        s.active = false;
+        s.paused = false;
+        s.resumable = false;
+    });
+}
+
+/// 插件包本体开始下载（`commands.rs` 用；前端凭 `kind = "package"` + `url` 把进度挂回市场那一行）。
+pub fn begin_package_install(url: &str) {
+    begin_install_state("package", "", url);
+}
+
+/// 插件包本体这一段结束（成功 / 失败都要调，否则界面会一直停在「安装中」）。
+pub fn finish_package_install() {
+    finish_install_state();
+}
+
+/// 暂停时**关掉连接、原地等**。返回 Err = 等的时候被取消。
+fn wait_while_paused() -> Result<(), String> {
+    while INSTALL_PAUSED.load(Ordering::Relaxed) {
+        if dep_install_cancelled() {
+            INSTALL_PAUSED.store(false, Ordering::Relaxed);
+            return Err("已取消下载".into());
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    Ok(())
+}
+
+fn part_meta_path(part: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.json", part.display()))
+}
+
+fn read_part_meta(p: &Path) -> Option<PartMeta> {
+    serde_json::from_str(&fs::read_to_string(p).ok()?).ok()
+}
+
+fn write_part_meta(p: &Path, m: &PartMeta) {
+    if let Ok(s) = serde_json::to_string(m) {
+        let _ = fs::write(p, s);
+    }
+}
+
+fn remove_part(part: &Path) {
+    let _ = fs::remove_file(part);
+    let _ = fs::remove_file(part_meta_path(part));
+}
+
+/// 断点文件名：`temp\downloads\<sha256(url + 清单 sha256) 前 16 位>.part`。
 ///
-/// 与 `download_bytes_with_progress` 的分工：那个把整包读进内存（`archive` 依赖要用字节做
-/// 魔数识别 + 解压，包都不大）；**`file` 形态的模型动辄 2–3 GiB，必须落盘流式** —— 否则
-/// 一次 GB 级分配会把安装过程顶爆。返回 sha256 十六进制小写，调用方据此与清单比对。
+/// 把清单里的 sha256 也算进去：作者换版本时（url 不变、哈希变）旧断点自动作废，
+/// 不会把上一版的前半段和这一版的后半段拼在一起。
+fn part_path_for(url: &str, sha256_want: &str) -> PathBuf {
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    h.update(b"\n");
+    h.update(sha256_want.trim().to_ascii_lowercase().as_bytes());
+    let tag = hex_digest(h.finalize().as_slice());
+    downloads_dir().join(format!("{}.part", &tag[..16]))
+}
+
+/// `Content-Range: bytes 100-999/1000` → `1000`（取不到就给 None）。
+fn content_range_total(resp: &reqwest::blocking::Response) -> Option<u64> {
+    let v = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    v.rsplit('/').next()?.trim().parse().ok()
+}
+
+/// 发一个 https GET（`offset > 0` 时带 `Range` + 可选 `If-Range`）。
 ///
-/// 闸与超时口径完全一致：只 https（`open_https_stream` 内判）、体积上限、无总超时（只有建连 30s）。
-/// **任何失败都尽力删掉半截文件** —— 半截文件绝不能被当成装好的。
-fn download_to_file_with_progress(
+/// 与 `open_https_stream` 的区别只在这里：**416 单独给一个可识别的错误**，
+/// 好让调用方丢掉断点重来，而不是把整个安装判死。
+fn open_https_range(
     url: &str,
-    limit: u64,
-    dest: &Path,
-    report: &mut dyn FnMut(&str, u64, u64),
-) -> Result<String, String> {
-    let mut resp = open_https_stream(url)?;
-    let over = || format!("依赖文件超过上限（{} MB）", limit / 1024 / 1024);
-    if let Some(len) = resp.content_length() {
-        if len > limit {
-            return Err(over());
+    offset: u64,
+    etag: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    if !url.starts_with("https://") {
+        return Err("只允许 https 的地址".into());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Client error: {e}"))?;
+    let mut req = client.get(url);
+    if offset > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+        if !etag.is_empty() {
+            req = req.header(reqwest::header::IF_RANGE, etag);
         }
     }
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = fs::File::create(dest).map_err(|e| format!("建临时文件失败：{e}"))?;
+    let resp = req.send().map_err(|e| format!("下载失败：{e}"))?;
+    let st = resp.status();
+    if st.is_success() {
+        return Ok(resp);
+    }
+    if st == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        return Err("HTTP 416：断点无效".into());
+    }
+    Err(format!("HTTP {}：下载失败", st.as_u16()))
+}
+
+/// 整个文件的 sha256（小写十六进制）。**不能增量算**：断点续传跨进程，没有可接的哈希状态。
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("读下载文件失败：{e}"))?;
     let mut hasher = Sha256::new();
-    let mut written: u64 = 0;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = match resp.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = fs::remove_file(dest);
-                return Err(format!("读取出错：{e}"));
-            }
-        };
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("读下载文件失败：{e}"))?;
         if n == 0 {
             break;
         }
-        if dep_install_cancelled() {
-            let _ = fs::remove_file(dest);
-            return Err("已取消依赖下载".into());
-        }
-        written += n as u64;
-        if written > limit {
-            let _ = fs::remove_file(dest);
-            return Err(over());
-        }
         hasher.update(&buf[..n]);
-        if let Err(e) = file.write_all(&buf[..n]) {
-            let _ = fs::remove_file(dest);
-            return Err(format!("写依赖文件失败：{e}"));
-        }
-        report("download", written, total);
-    }
-    if let Err(e) = file.flush() {
-        let _ = fs::remove_file(dest);
-        return Err(format!("写依赖文件失败：{e}"));
     }
     Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+/// 把一个 https 文件下到 `part`（可续传、可暂停），成功后**保留** `part` 交给调用方处置。
+///
+/// 调用方负责：校验 sha256（`sha256_file`）、搬到自己要的位置、`remove_part(part)`。
+fn fetch_resumable(
+    url: &str,
+    part: &Path,
+    limit: u64,
+    sha256_want: &str,
+    report: &mut dyn FnMut(&str, u64, u64),
+) -> Result<(), String> {
+    if let Some(parent) = part.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("建下载目录失败：{e}"))?;
+    }
+    let meta_path = part_meta_path(part);
+    let want = sha256_want.trim().to_ascii_lowercase();
+    // 归属（供重启后把「继续下载」挂回市场里对应的那一行）：包本体阶段为空
+    let owner = install_state().id;
+    let mut meta =
+        read_part_meta(&meta_path).filter(|m| m.url == url && m.sha256.eq_ignore_ascii_case(&want));
+    let mut offset = match &meta {
+        Some(m) if m.offset > 0 => fs::metadata(part).map(|x| x.len()).unwrap_or(0),
+        _ => 0,
+    };
+    if offset == 0 {
+        remove_part(part);
+        meta = None;
+    }
+    let over = || format!("超过上限（{} MB）", limit / 1024 / 1024);
+    let mut retried = false;
+    // 「连接提前结束」的重试次数（防死循环：对端一直只给前面一截时不能无限续）
+    let mut short_reads = 0u32;
+
+    loop {
+        wait_while_paused()?;
+        if dep_install_cancelled() {
+            remove_part(part);
+            return Err("已取消下载".into());
+        }
+        let etag = meta.as_ref().map(|m| m.etag.clone()).unwrap_or_default();
+        let mut resp = match open_https_range(url, offset, &etag) {
+            Ok(r) => r,
+            Err(e) if e.contains("416") && !retried => {
+                retried = true;
+                offset = 0;
+                remove_part(part);
+                meta = None;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut total = meta.as_ref().map(|m| m.total).unwrap_or(0);
+        if offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            if let Some(t) = content_range_total(&resp) {
+                total = t;
+            }
+        } else if offset > 0 {
+            // 服务端不认 Range / If-Range 不匹配 ⇒ 从头来（不能往后拼，否则文件是坏的）
+            offset = 0;
+            remove_part(part);
+            meta = None;
+            total = resp.content_length().unwrap_or(0);
+        } else {
+            total = resp.content_length().unwrap_or(0);
+        }
+        if total > limit {
+            remove_part(part);
+            return Err(over());
+        }
+        let etag_now = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        write_part_meta(
+            &meta_path,
+            &PartMeta {
+                url: url.to_string(),
+                id: owner.clone(),
+                etag: etag_now,
+                total,
+                offset,
+                sha256: want.clone(),
+            },
+        );
+        mutate_state(|s| {
+            s.phase = "download".into();
+            s.downloaded = offset;
+            s.total = total;
+            s.resumable = offset > 0;
+            s.paused = false;
+        });
+
+        let mut file = if offset > 0 {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(part)
+                .map_err(|e| format!("打开断点文件失败：{e}"))?
+        } else {
+            fs::File::create(part).map_err(|e| format!("建临时文件失败：{e}"))?
+        };
+        let mut buf = [0u8; 64 * 1024];
+        let mut paused = false;
+        loop {
+            if dep_install_cancelled() {
+                drop(file);
+                remove_part(part);
+                return Err("已取消下载".into());
+            }
+            // 暂停 = **断开这条连接**（不读流），外层重新发 Range 接上
+            if INSTALL_PAUSED.load(Ordering::Relaxed) {
+                paused = true;
+                break;
+            }
+            let n = match resp.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    drop(file);
+                    // 连接断了：断点留着，下次（或用户点继续）从 offset 接
+                    write_part_meta(
+                        &meta_path,
+                        &PartMeta {
+                            url: url.to_string(),
+                            id: owner.clone(),
+                            etag: String::new(),
+                            total,
+                            offset,
+                            sha256: want.clone(),
+                        },
+                    );
+                    return Err(format!("读取出错：{e}"));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            offset += n as u64;
+            if offset > limit {
+                drop(file);
+                remove_part(part);
+                return Err(over());
+            }
+            if let Err(e) = file.write_all(&buf[..n]) {
+                drop(file);
+                remove_part(part);
+                return Err(format!("写下载文件失败：{e}"));
+            }
+            report("download", offset, total);
+            mutate_state(|s| {
+                s.downloaded = offset;
+                s.total = total;
+                s.resumable = offset > 0;
+            });
+        }
+        if let Err(e) = file.flush() {
+            remove_part(part);
+            return Err(format!("写下载文件失败：{e}"));
+        }
+        drop(file);
+        write_part_meta(
+            &meta_path,
+            &PartMeta {
+                url: url.to_string(),
+                id: owner.clone(),
+                etag: meta.as_ref().map(|m| m.etag.clone()).unwrap_or_default(),
+                total,
+                offset,
+                sha256: want.clone(),
+            },
+        );
+        mutate_state(|s| s.resumable = offset > 0);
+        if paused {
+            mutate_state(|s| s.paused = true);
+            continue;
+        }
+        // 正常读完：total 未知时以「读到 EOF」为准；**已知总数就必须一字节不差**
+        //（少一截绝不能当成功 —— 那会表现为「秒更新完毕、其实没下完」）
+        if total == 0 || offset == total {
+            return Ok(());
+        }
+        if offset > total {
+            remove_part(part);
+            return Err(format!(
+                "下载出现多余字节（{offset} / {total}），已丢弃断点重来"
+            ));
+        }
+        // total 有值却没读够（连接被提前关）⇒ 续一次；连续 5 次仍不够就如实失败
+        short_reads += 1;
+        if short_reads > 5 {
+            remove_part(part);
+            return Err(format!(
+                "下载反复中断（已重试 5 次，只拿到 {offset} / {total} 字节）"
+            ));
+        }
+    }
+}
+
+/// 下载插件包本体到内存（可续传、可暂停）。上限沿用 `MAX_ARCHIVE_BYTES`。
+pub fn fetch_package_bytes(
+    url: &str,
+    limit: u64,
+    sha256_want: &str,
+    on_progress: &mut dyn FnMut(&str, u64, u64),
+) -> Result<Vec<u8>, String> {
+    let part = part_path_for(url, sha256_want);
+    fetch_resumable(url, &part, limit, sha256_want, on_progress)?;
+    let bytes = fs::read(&part).map_err(|e| format!("读下载文件失败：{e}"))?;
+    remove_part(&part);
+    Ok(bytes)
 }
 
 /// 发一个 https GET 并返回响应流（非 2xx 直接报错）。超时口径见 `download_bytes` 的注释。
@@ -1469,7 +2282,10 @@ pub fn open_https_stream(url: &str) -> Result<reqwest::blocking::Response, Strin
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Client error: {e}"))?;
-    let resp = client.get(url).send().map_err(|e| format!("下载失败：{e}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("下载失败：{e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}：下载失败", resp.status().as_u16()));
     }
@@ -1477,8 +2293,31 @@ pub fn open_https_stream(url: &str) -> Result<reqwest::blocking::Response, Strin
 }
 
 /// sha256 的十六进制小写表示（用于依赖校验和比对）。
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes).as_slice())
+}
+
+/// 是不是一个合法的 sha256 十六进制串（64 位、只含 0-9a-fA-F）。
+pub fn is_sha256_hex(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 校验下载到的插件包。`expected` 为空 = 迁移期不校验（`Ok(false)`，调用方负责 warn）；
+/// 非空就必须对上，否则整包拒绝（不落盘、不覆盖旧版本）。
+pub fn verify_package_sha256(bytes: &[u8], expected: &str) -> Result<bool, String> {
+    let want = expected.trim();
+    if want.is_empty() {
+        return Ok(false);
+    }
+    if !is_sha256_hex(want) {
+        return Err(format!("sha256 必须是 64 位十六进制：{want}"));
+    }
+    let got = hex_sha256(bytes);
+    if !got.eq_ignore_ascii_case(want) {
+        return Err(format!("sha256 不匹配（期望 {want}，实得 {got}）"));
+    }
+    Ok(true)
 }
 
 /// 把一段摘要字节转成十六进制小写（`Sha256::finalize()` / `Sha256::digest()` 的结果）。
@@ -1543,7 +2382,10 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
             dependencies: Vec::new(),
             permissions: Vec::new(),
             reuse: Vec::new(),
+            provides: Vec::new(),
+            render: PluginRenderSpec::default(),
             sidecar: None,
+            dev: None,
         };
         match fs::read_to_string(dir.join(MANIFEST_FILE)) {
             Ok(text) => match parse_manifest(&text) {
@@ -1563,13 +2405,24 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
                     item.dependencies = m.dependencies.clone();
                     item.permissions = m.permissions.clone();
                     item.reuse = m.reuse.clone();
+                    item.provides = m.provides.clone();
+                    item.render = m.render.clone();
                     item.sidecar = m.sidecar.clone();
+                    item.dev = m.dev.clone();
                     match safe_join(&dir, &m.entry) {
                         Some(p) if p.is_file() => {
                             item.entry_path = p.to_string_lossy().to_string();
-                            item.valid = true;
-                            // 依赖就位判定（2026-10-15）：见 `plugin_ready`
-                            item.ready = plugin_ready(&dir, m.sidecar.as_ref());
+                            // iframe 引擎额外要求 `ui/index.html`（D.1）；缺了就是坏包，
+                            // 不能让用户看到「装上了但一片空白」。
+                            if m.render.engine == RenderEngine::Iframe
+                                && !dir.join("ui").join("index.html").is_file()
+                            {
+                                item.error = "render.engine=iframe 但缺少 ui/index.html".into();
+                            } else {
+                                item.valid = true;
+                                // 依赖就位判定（2026-10-15）：见 `plugin_ready`
+                                item.ready = plugin_ready(&dir, m.sidecar.as_ref());
+                            }
                         }
                         _ => item.error = format!("入口文件不存在：{}", m.entry),
                     }
@@ -1582,7 +2435,48 @@ pub fn list_installed(plugins_root: &Path) -> Vec<InstalledPlugin> {
     }
     // 顺序稳定（目录名升序）：面板每次重绘的顺序不该随 read_dir 抖动
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    // `provides` 冲突：只 warn，不拒装；按 id 升序第一个作为解析结果（E.1）。
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for item in &out {
+        for key in &item.provides {
+            match owners.get(key) {
+                None => {
+                    owners.insert(key.clone(), item.id.clone());
+                }
+                Some(first) if first != &item.id => {
+                    crate::log::warn(format!(
+                        "插件 {} 与 {} 都声明 provides:{key}，按 id 升序取 {}",
+                        item.id, first, first
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     out
+}
+
+/// 按能力身份解析插件目录（E.1）：**精确 id / 目录优先，再按 `provides` 扫**。
+///
+/// `id = 目录名` 仍是硬契约；这里只解决「按能力找插件」，不改变落点。
+pub fn resolve_plugin_dir(root: &Path, key: &str) -> Option<PathBuf> {
+    if !is_safe_id(key) {
+        return None;
+    }
+    let exact = root.join(key);
+    if exact.is_dir() {
+        if let Ok(text) = fs::read_to_string(exact.join(MANIFEST_FILE)) {
+            if let Ok(m) = parse_manifest(&text) {
+                if m.id == key {
+                    return Some(exact);
+                }
+            }
+        }
+    }
+    list_installed(root)
+        .into_iter()
+        .find(|item| item.valid && item.provides.iter().any(|p| p == key))
+        .map(|item| PathBuf::from(item.dir))
 }
 
 /// 卸载：**只删 `<plugins_root>\<id>`**，且 id 必须安全、目录必须真的在插件根下（防穿越）。
@@ -1598,7 +2492,9 @@ pub fn uninstall(id: &str, plugins_root: &Path) -> Result<(), String> {
     let real_root = plugins_root
         .canonicalize()
         .map_err(|e| format!("插件目录不可用：{e}"))?;
-    let real_dir = dir.canonicalize().map_err(|e| format!("插件目录不可用：{e}"))?;
+    let real_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("插件目录不可用：{e}"))?;
     if !real_dir.starts_with(&real_root) {
         return Err("插件目录不在插件根内，已拒绝删除".into());
     }
@@ -1612,10 +2508,8 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     fn tmp_root(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "lunac-test-plugins-{tag}-{}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("lunac-test-plugins-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -1624,7 +2518,8 @@ mod tests {
     /// 造一个 zip：`files` 是 (包内路径, 内容)
     fn zip_bytes(files: &[(&str, &str)]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, body) in files {
             w.start_file(*name, opts).unwrap();
             w.write_all(body.as_bytes()).unwrap();
@@ -1688,13 +2583,23 @@ mod tests {
             "sidecar":{"command":"bin/tool.exe","transport":"both","port":0,
             "restart":"on-failure","sha256":"SHA"}}"#;
         // sha256 必须是 64 位十六进制
-        assert!(parse_manifest(&base.replace("SHA", "ab")).is_err(), "sha256 位数不对必须拒");
+        assert!(
+            parse_manifest(&base.replace("SHA", "ab")).is_err(),
+            "sha256 位数不对必须拒"
+        );
         let ok = base.replace("SHA", &"a".repeat(64));
-        assert!(parse_manifest(&ok).is_ok(), "合法 sidecar 应通过：{:?}", parse_manifest(&ok).err());
+        assert!(
+            parse_manifest(&ok).is_ok(),
+            "合法 sidecar 应通过：{:?}",
+            parse_manifest(&ok).err()
+        );
 
         // 缺 process.spawn ⇒ 拒装（不能靠「声明即生效」）
         let no_perm = ok.replace(r#""permissions":["process.spawn"],"#, "");
-        assert!(parse_manifest(&no_perm).is_err(), "sidecar 缺 process.spawn 必须拒装");
+        assert!(
+            parse_manifest(&no_perm).is_err(),
+            "sidecar 缺 process.spawn 必须拒装"
+        );
 
         // command 越界 / 绝对路径 ⇒ 拒
         for bad in ["../evil.exe", "C:/Windows/System32/cmd.exe", "/bin/sh"] {
@@ -1702,11 +2607,50 @@ mod tests {
             assert!(parse_manifest(&t).is_err(), "command 越界应拒：{bad}");
         }
         // cwd 越界 ⇒ 拒
-        let bad_cwd = ok.replace(r#""transport":"both""#, r#""cwd":"../..","transport":"both""#);
+        let bad_cwd = ok.replace(
+            r#""transport":"both""#,
+            r#""cwd":"../..","transport":"both""#,
+        );
         assert!(parse_manifest(&bad_cwd).is_err(), "cwd 越界应拒");
         // transport / restart 枚举
-        assert!(parse_manifest(&ok.replace(r#""transport":"both""#, r#""transport":"tcp""#)).is_err());
-        assert!(parse_manifest(&ok.replace(r#""restart":"on-failure""#, r#""restart":"always""#)).is_err());
+        assert!(
+            parse_manifest(&ok.replace(r#""transport":"both""#, r#""transport":"tcp""#)).is_err()
+        );
+        assert!(
+            parse_manifest(&ok.replace(r#""restart":"on-failure""#, r#""restart":"always""#))
+                .is_err()
+        );
+    }
+
+    /// 资源闸（2026-10-18，E.6）：`memoryLimitMiB` / `processLimit` 的 0 = 不限制，
+    /// 非 0 必须落在合理区间（过小会误杀、过大等于没闸）。
+    #[test]
+    fn sidecar_job_limits_are_positive() {
+        let base = r#"{"id":"s","entry":"index.js","permissions":["process.spawn"],
+            "sidecar":{"command":"bin/tool.exe","memoryLimitMiB":256,"processLimit":4}}"#;
+        let m = parse_manifest(base).unwrap();
+        let s = m.sidecar.unwrap();
+        assert_eq!(s.memory_limit_mib, 256);
+        assert_eq!(s.process_limit, 4);
+        // 0 = 不限制（合法，保持旧行为）
+        let unlimited = base
+            .replace(r#""memoryLimitMiB":256"#, r#""memoryLimitMiB":0"#)
+            .replace(r#""processLimit":4"#, r#""processLimit":0"#);
+        let s = parse_manifest(&unlimited).unwrap().sidecar.unwrap();
+        assert_eq!(s.memory_limit_mib, 0);
+        assert_eq!(s.process_limit, 0);
+        // 过小 / 过大 / 进程数过多
+        for bad in [
+            (r#""memoryLimitMiB":256"#, r#""memoryLimitMiB":8"#),
+            (r#""memoryLimitMiB":256"#, r#""memoryLimitMiB":65536"#),
+            (r#""processLimit":4"#, r#""processLimit":65"#),
+        ] {
+            assert!(
+                parse_manifest(&base.replace(bad.0, bad.1)).is_err(),
+                "应被拒：{}",
+                bad.1
+            );
+        }
     }
 
     #[test]
@@ -1738,9 +2682,7 @@ mod tests {
         assert!(parse_manifest(&good_manifest("")).is_err());
         // entry：绝对路径 / 穿越 / 不是 js
         for bad in ["/index.js", "../index.js", "index.ts", "index"] {
-            let text = format!(
-                r#"{{"id":"demo","entry":"{bad}"}}"#
-            );
+            let text = format!(r#"{{"id":"demo","entry":"{bad}"}}"#);
             assert!(parse_manifest(&text).is_err(), "entry={bad} 应被拒");
         }
         // 缺 entry ⇒ 用默认 index.js
@@ -1766,7 +2708,10 @@ mod tests {
     fn extract_zip_stops_when_unpacked_size_exceeds_the_cap() {
         let root = tmp_root("bomb");
         let big = "x".repeat(200 * 1024);
-        let bytes = zip_bytes(&[("lunac-plugin.json", &good_manifest("demo")), ("index.js", &big)]);
+        let bytes = zip_bytes(&[
+            ("lunac-plugin.json", &good_manifest("demo")),
+            ("index.js", &big),
+        ]);
         // 上限设成 1KB ⇒ 第二个文件写到一半就该被拦下
         let err = extract_zip(std::io::Cursor::new(&bytes), &root, 1024).unwrap_err();
         assert!(err.contains("超过上限"), "{err}");
@@ -1835,7 +2780,11 @@ mod tests {
     fn list_reports_a_broken_package_instead_of_hiding_it() {
         let root = tmp_root("broken");
         fs::create_dir_all(root.join("half-installed")).unwrap();
-        fs::write(root.join("half-installed").join(MANIFEST_FILE), "{ not json").unwrap();
+        fs::write(
+            root.join("half-installed").join(MANIFEST_FILE),
+            "{ not json",
+        )
+        .unwrap();
         // 内部目录（以 . 开头）不进清单
         fs::create_dir_all(root.join(".staging-1")).unwrap();
         let list = list_installed(&root);
@@ -1867,9 +2816,39 @@ mod tests {
         assert!(parse_index("{ not json").is_err());
         assert!(parse_index("\u{feff}[]").unwrap().is_empty());
         // 缺省字段（只有 id + url）也要能用 —— 名字退回 id（前端行为），这里只要求不报错
-        let out = parse_index(r#"[{"id":"solo","name":"Solo","url":"https://e.com/a.zip"}]"#).unwrap();
+        let out =
+            parse_index(r#"[{"id":"solo","name":"Solo","url":"https://e.com/a.zip"}]"#).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].description.is_empty() && out[0].version.is_empty());
+    }
+
+    /// 插件包 sha256（2026-10-18，E.5）：索引里的哈希要么合法、要么整条丢掉；
+    /// 安装前校验必须真的逐字节比对（大小写不敏感），空期望 = 迁移期不校验。
+    #[test]
+    fn index_sha256_is_validated_and_packages_are_verified() {
+        let good = "a".repeat(64);
+        let entry = format!(
+            r#"[{{"id":"solo","name":"Solo","url":"https://e.com/a.zip","sha256":"{good}"}}]"#
+        );
+        assert_eq!(parse_index(&entry).unwrap().len(), 1);
+        // 写错长度 / 非十六进制 ⇒ 这条不进入市场（不把「校验过」变成假话）
+        let bad = r#"[{"id":"solo","name":"Solo","url":"https://e.com/a.zip","sha256":"abc"}]"#;
+        assert!(parse_index(bad).unwrap().is_empty());
+        let bad_char = format!(
+            r#"[{{"id":"solo","name":"Solo","url":"https://e.com/a.zip","sha256":"{}"}}]"#,
+            "z".repeat(64)
+        );
+        assert!(parse_index(&bad_char).unwrap().is_empty());
+
+        // 空期望 = 迁移期：不校验（调用方 warn），不是「校验失败」
+        assert!(!verify_package_sha256(b"abc", "").unwrap());
+        // 实算一致（大小写不敏感）；差一个字节就拒
+        let h = hex_sha256(b"abc");
+        assert!(verify_package_sha256(b"abc", &h).unwrap());
+        assert!(verify_package_sha256(b"abc", &h.to_uppercase()).unwrap());
+        assert!(verify_package_sha256(b"abd", &h).is_err());
+        // 期望值本身写错 ⇒ 明确报格式错误，而不是伪装成「不匹配」
+        assert!(verify_package_sha256(b"abc", "not-a-hash").is_err());
     }
 
     /// 依赖字段（2026-09-28）：好条目过、坏条目整包拒。
@@ -1953,18 +2932,27 @@ mod tests {
     /// 声明的宿主能力（2026-09-28）：合法的过、格式非法的整包拒、**不认识的只 warn 不拒**。
     #[test]
     fn manifest_validates_permissions() {
-        let ok = r#"{"id":"ocr","entry":"index.js","permissions":["layout.takeover","window.resize"]}"#;
+        let ok =
+            r#"{"id":"ocr","entry":"index.js","permissions":["layout.takeover","window.resize"]}"#;
         let m = parse_manifest(ok).unwrap();
         assert_eq!(m.permissions.len(), 2);
         // 不认识的名字（更新版宿主的能力）**不影响安装**
         let fwd = r#"{"id":"demo","entry":"index.js","permissions":["some.future.cap"]}"#;
         assert!(parse_manifest(fwd).is_ok());
         // 格式非法 / 写不下：整包拒
-        for bad in [r#"[""]"#, r#"["UPPER"]"#, r#"["has space"]"#, r#"["bad/slash"]"#] {
+        for bad in [
+            r#"[""]"#,
+            r#"["UPPER"]"#,
+            r#"["has space"]"#,
+            r#"["bad/slash"]"#,
+        ] {
             let text = format!(r#"{{"id":"demo","entry":"index.js","permissions":{bad}}}"#);
             assert!(parse_manifest(&text).is_err(), "应被拒：{bad}");
         }
-        let many = (0..(MAX_PERMISSIONS + 1)).map(|i| format!("\"cap{i}\"")).collect::<Vec<_>>().join(",");
+        let many = (0..(MAX_PERMISSIONS + 1))
+            .map(|i| format!("\"cap{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
         let text = format!(r#"{{"id":"demo","entry":"index.js","permissions":[{many}]}}"#);
         assert!(parse_manifest(&text).is_err());
     }
@@ -1974,17 +2962,202 @@ mod tests {
     fn manifest_validates_reuse() {
         let ok = r#"{"id":"demo","entry":"index.js","reuse":["settings","quick-launch"]}"#;
         let m = parse_manifest(ok).unwrap();
-        assert_eq!(m.reuse, vec!["settings".to_string(), "quick-launch".to_string()]);
+        assert_eq!(
+            m.reuse,
+            vec!["settings".to_string(), "quick-launch".to_string()]
+        );
         // 不写这一段 = 不复用（合法）
-        assert!(parse_manifest(r#"{"id":"demo","entry":"index.js"}"#).unwrap().reuse.is_empty());
+        assert!(parse_manifest(r#"{"id":"demo","entry":"index.js"}"#)
+            .unwrap()
+            .reuse
+            .is_empty());
         // 形状非法：整包拒
         for bad in [r#"["UPPER"]"#, r#"["has space"]"#, r#"["bad/slash"]"#] {
             let text = format!(r#"{{"id":"demo","entry":"index.js","reuse":{bad}}}"#);
             assert!(parse_manifest(&text).is_err(), "应被拒：{bad}");
         }
-        let many = (0..(MAX_REUSE + 1)).map(|i| format!("\"p{i}\"")).collect::<Vec<_>>().join(",");
+        let many = (0..(MAX_REUSE + 1))
+            .map(|i| format!("\"p{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
         let text = format!(r#"{{"id":"demo","entry":"index.js","reuse":[{many}]}}"#);
         assert!(parse_manifest(&text).is_err());
+    }
+
+    /// `provides` 与 `render`（2026-10-18，插件框架重构 E.1 / E.3）：
+    /// 缺省 = 空身份 + dom/inherit；形状非法 / 未知枚举整包拒。
+    #[test]
+    fn manifest_validates_provides_and_render() {
+        let base = parse_manifest(r#"{"id":"demo","entry":"index.js"}"#).unwrap();
+        assert!(base.provides.is_empty());
+        assert_eq!(base.render.engine, RenderEngine::Dom);
+        assert_eq!(base.render.appearance, RenderAppearance::Inherit);
+
+        let ok = r#"{"id":"demo","entry":"index.js","provides":["comic.reader","novel.reader"],
+            "render":{"engine":"iframe","appearance":"custom"}}"#;
+        let m = parse_manifest(ok).unwrap();
+        assert_eq!(m.provides.len(), 2);
+        assert_eq!(m.render.engine, RenderEngine::Iframe);
+        assert_eq!(m.render.appearance, RenderAppearance::Custom);
+
+        for bad in [r#"["UPPER"]"#, r#"["has space"]"#, r#"["bad/slash"]"#] {
+            let text = format!(r#"{{"id":"demo","entry":"index.js","provides":{bad}}}"#);
+            assert!(parse_manifest(&text).is_err(), "应被拒：{bad}");
+        }
+        let many = (0..(MAX_PROVIDES + 1))
+            .map(|i| format!("\"p{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!(r#"{{"id":"demo","entry":"index.js","provides":[{many}]}}"#);
+        assert!(parse_manifest(&text).is_err());
+
+        assert!(
+            parse_manifest(r#"{"id":"demo","entry":"index.js","render":{"engine":"native"}}"#)
+                .is_err()
+        );
+        assert!(parse_manifest(
+            r#"{"id":"demo","entry":"index.js","render":{"appearance":"fancy"}}"#
+        )
+        .is_err());
+    }
+
+    /// 常驻锚点（2026-10-18，C.4.1）：`render.slots` 只支持 iframe 引擎；
+    /// 槽位名是枚举（未知值直接拒），重复声明也拒。
+    #[test]
+    fn manifest_validates_render_slots() {
+        let m = parse_manifest(
+            r#"{"id":"demo","entry":"index.js",
+                "render":{"engine":"iframe","slots":["chat-sidebar","settings-section"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.render.slots,
+            vec![RenderSlot::ChatSidebar, RenderSlot::SettingsSection]
+        );
+        // 缺省 = 不挂常驻锚点
+        let base =
+            parse_manifest(r#"{"id":"demo","entry":"index.js","render":{"engine":"iframe"}}"#)
+                .unwrap();
+        assert!(base.render.slots.is_empty());
+        // DOM 引擎无法把插件限制在槽位内 ⇒ 整包拒
+        assert!(parse_manifest(
+            r#"{"id":"demo","entry":"index.js","render":{"slots":["chat-sidebar"]}}"#
+        )
+        .is_err());
+        // 未知槽位 / 重复声明
+        assert!(parse_manifest(
+            r#"{"id":"demo","entry":"index.js","render":{"engine":"iframe","slots":["left-panel"]}}"#
+        )
+        .is_err());
+        assert!(parse_manifest(
+            r#"{"id":"demo","entry":"index.js","render":{"engine":"iframe","slots":["chat-sidebar","chat-sidebar"]}}"#
+        )
+        .is_err());
+    }
+
+    /// 开发工具链（2026-10-18，E.4）：https + 必填 sha256 + 落点不越界；
+    /// 指纹对 profile / build 的任一变化都敏感。
+    #[test]
+    fn manifest_validates_dev_toolchain_and_build() {
+        let hash = "a".repeat(64);
+        let ok = format!(
+            r#"{{"id":"demo","entry":"index.js","dev":{{
+                "toolchains":[{{"id":"node","url":"https://e.com/node.zip","sha256":"{hash}",
+                    "dest":".toolchain/node","kind":"archive","version":"20.11.1","binDir":".toolchain/node"}}],
+                "build":{{"command":"npm","args":["run","build"],"cwd":""}}}}}}"#
+        );
+        let m = parse_manifest(&ok).unwrap();
+        let dev = m.dev.expect("dev 段应被解析");
+        assert_eq!(dev.toolchains.len(), 1);
+        assert_eq!(dev.toolchains[0].version, "20.11.1");
+        let fp = dev_fingerprint("demo", &dev);
+        assert_eq!(fp.len(), 64);
+        // 任一字段变化 ⇒ 指纹变化（旧授权自动失效）
+        let mut changed = dev.clone();
+        changed.toolchains[0].version = "20.12.0".into();
+        assert_ne!(fp, dev_fingerprint("demo", &changed));
+        let mut changed_build = dev.clone();
+        changed_build
+            .build
+            .as_mut()
+            .unwrap()
+            .args
+            .push("--release".into());
+        assert_ne!(fp, dev_fingerprint("demo", &changed_build));
+
+        for bad in [
+            // 缺哈希
+            r#"{"id":"demo","entry":"index.js","dev":{"toolchains":[{"id":"n","url":"https://e.com/n.zip","dest":"n"}]}}"#.to_string(),
+            // 明文 http
+            format!(r#"{{"id":"demo","entry":"index.js","dev":{{"toolchains":[{{"id":"n","url":"http://e.com/n.zip","sha256":"{hash}","dest":"n"}}]}}}}"#),
+            // dest 越界
+            format!(r#"{{"id":"demo","entry":"index.js","dev":{{"toolchains":[{{"id":"n","url":"https://e.com/n.zip","sha256":"{hash}","dest":"../n"}}]}}}}"#),
+            // dest 不在 .toolchain\ 下（否则卸载无法回收）
+            format!(r#"{{"id":"demo","entry":"index.js","dev":{{"toolchains":[{{"id":"n","url":"https://e.com/n.zip","sha256":"{hash}","dest":"bin/n"}}]}}}}"#),
+            // 构建命令越界
+            format!(r#"{{"id":"demo","entry":"index.js","dev":{{"build":{{"command":"../../evil.exe"}}}}}}"#),
+            // 不在白名单的裸命令
+            format!(r#"{{"id":"demo","entry":"index.js","dev":{{"build":{{"command":"calc"}}}}}}"#),
+        ] {
+            assert!(parse_manifest(&bad).is_err(), "应被拒：{bad}");
+        }
+    }
+
+    /// iframe 引擎必须有 `ui/index.html`（D.1）；缺了就是坏包，不能放行。
+    #[test]
+    fn iframe_engine_requires_ui_entry() {
+        let root = tmp_root("iframe-entry");
+        let dir = root.join("demo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            r#"{"id":"demo","entry":"index.js","render":{"engine":"iframe"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("index.js"), "export default {}").unwrap();
+
+        let before = list_installed(&root);
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].valid);
+        assert!(
+            before[0].error.contains("ui/index.html"),
+            "{}",
+            before[0].error
+        );
+
+        fs::create_dir_all(dir.join("ui")).unwrap();
+        fs::write(dir.join("ui").join("index.html"), "<!doctype html>").unwrap();
+        let after = list_installed(&root);
+        assert!(after[0].valid, "{}", after[0].error);
+        assert_eq!(after[0].render.engine, RenderEngine::Iframe);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `provides` 能力定位（E.1）：精确 id 优先；否则按 id 升序取第一个声明者。
+    #[test]
+    fn resolve_plugin_dir_prefers_id_then_provides() {
+        let root = tmp_root("provides-resolve");
+        for (id, provides) in [("demo-a", "comic.reader"), ("demo-b", "comic.reader")] {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(MANIFEST_FILE),
+                format!(r#"{{"id":"{id}","entry":"index.js","provides":["{provides}"]}}"#),
+            )
+            .unwrap();
+            fs::write(dir.join("index.js"), "export default {}").unwrap();
+        }
+        assert_eq!(
+            resolve_plugin_dir(&root, "comic.reader"),
+            Some(root.join("demo-a"))
+        );
+        assert_eq!(
+            resolve_plugin_dir(&root, "demo-b"),
+            Some(root.join("demo-b"))
+        );
+        assert_eq!(resolve_plugin_dir(&root, "../escape"), None);
+        assert_eq!(resolve_plugin_dir(&root, "missing.key"), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// 窗口形态（2026-09-29，为桌宠 L1）：合法写法照收，**静态能判定的矛盾整包拒**。
@@ -2069,10 +3242,92 @@ mod tests {
             dest: "../escape.exe".into(),
             ..Default::default()
         };
-        let err = install_dependencies_with_progress(&plugin, "demo", &[dep], &mut |_| {})
-            .unwrap_err();
+        let err =
+            install_dependencies_with_progress(&plugin, "demo", &[dep], &mut |_| {}).unwrap_err();
         assert!(err.contains("越界"), "{err}");
         assert!(!root.join("escape.exe").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 安装单飞闸（2026-10-27）：同一时刻只允许一次安装；drop 后必须能再次占用。
+    /// 这条闸是「两种进度 / 秒完成但没装完」的根因修复 —— 没有它，暂停后再点一次安装
+    /// 会起第二个下载线程，两个线程写同一个 `.part`。
+    #[test]
+    fn install_gate_is_exclusive_and_released_on_drop() {
+        assert!(!install_busy(), "测试开始前闸应是空的");
+        let guard = try_begin_install("测试").expect("第一次应能占用");
+        let err = try_begin_install("测试").expect_err("第二次应被拒");
+        assert!(err.contains("已有一次安装在进行"), "{err}");
+        drop(guard);
+        assert!(!install_busy(), "drop 后必须释放");
+    }
+
+    /// 探针插件（`scripts/probe-plugin/`，§待办 3-10 的 dev 自检件）必须**始终符合清单规范**：
+    /// 它是 iframe / 两个常驻锚点的验收夹具，规范一变（引擎枚举 / 槽位名 / iframe 必须有
+    /// `ui/index.html`）这里先红，避免「夹具过时 ⇒ 验收结论不可信」。
+    #[test]
+    fn probe_plugin_fixture_matches_the_manifest_rules() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/probe-plugin");
+        let text = fs::read_to_string(root.join(MANIFEST_FILE))
+            .expect("读不到 scripts/probe-plugin/lunac-plugin.json");
+        let m = parse_manifest(&text).expect("探针清单应通过校验");
+        assert_eq!(m.id, "probe");
+        assert_eq!(m.render.engine, RenderEngine::Iframe);
+        assert_eq!(
+            m.render.slots,
+            vec![RenderSlot::ChatSidebar, RenderSlot::SettingsSection]
+        );
+        assert!(root.join(&m.entry).is_file(), "清单声明的入口必须存在");
+        assert!(
+            root.join("ui").join("index.html").is_file(),
+            "iframe 引擎必须有 ui/index.html"
+        );
+    }
+
+    /// 断点文件名（2026-10-27，可续传）：同 url + 同清单哈希 ⇒ 恒定；
+    /// 清单哈希变了 ⇒ 换名字（旧断点自动作废，不会被拼进新版本）。
+    #[test]
+    fn part_path_is_stable_per_url_and_manifest_hash() {
+        let a = part_path_for("https://example.com/a.zip", "AA");
+        let b = part_path_for("https://example.com/a.zip", "aa");
+        let c = part_path_for("https://example.com/a.zip", "BB");
+        let d = part_path_for("https://example.com/b.zip", "AA");
+        assert_eq!(a, b, "大小写不同的同一哈希应指向同一断点");
+        assert_ne!(a, c, "清单哈希变了 ⇒ 旧断点不能接着用");
+        assert_ne!(a, d, "url 变了 ⇒ 另一个断点");
+        assert!(a.to_string_lossy().ends_with(".part"));
+        assert!(a.parent().unwrap().ends_with("downloads"));
+    }
+
+    /// 断点元数据落盘 / 读回（2026-10-27）：重启后靠它知道「这个 .part 属于谁、下到哪」；
+    /// 老文件没有 `id` 字段也必须能读（`#[serde(default)]`）。
+    #[test]
+    fn part_meta_roundtrips_and_tolerates_old_files() {
+        let root = tmp_root("part-meta");
+        let p = root.join("x.part.json");
+        write_part_meta(
+            &p,
+            &PartMeta {
+                url: "https://e/x".into(),
+                id: "pet".into(),
+                etag: "W/\"1\"".into(),
+                total: 10,
+                offset: 4,
+                sha256: "AB".into(),
+            },
+        );
+        let m = read_part_meta(&p).expect("应能读回");
+        assert_eq!(
+            (m.url.as_str(), m.id.as_str(), m.total, m.offset),
+            ("https://e/x", "pet", 10, 4)
+        );
+        fs::write(
+            &p,
+            r#"{"url":"https://e/y","etag":"","total":0,"offset":0,"sha256":""}"#,
+        )
+        .unwrap();
+        let old = read_part_meta(&p).expect("老断点也要能读");
+        assert_eq!(old.id, "");
         let _ = fs::remove_dir_all(&root);
     }
 }

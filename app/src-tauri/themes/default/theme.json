@@ -1,16 +1,16 @@
 {
   "id": "default",
   "name": "Lunac Default",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "Lunac",
   "tokens": {
-    "accent": "#c0a0a0",
-    "text": "#eae2da",
-    "text_dim": "#b2a9a3",
-    "text_muted": "#837a78",
-    "border_glass": "rgba(232, 216, 202, 0.10)",
-    "radius_search": "14px",
-    "radius_results": "14px",
+    "accent": "#cfc8bb",
+    "surface": "#16181b",
+    "text": "#f2f1ee",
+    "text_dim": "#c2c3c4",
+    "text_muted": "#8b8e92",
+    "radius_search": "8px",
+    "radius_results": "8px",
     "pattern_opacity": 0.18
   },
   "assets": {}

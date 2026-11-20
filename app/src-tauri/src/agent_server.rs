@@ -24,7 +24,9 @@ static SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| e.to_string())?;
 
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
     if parts.len() < 2 {
@@ -38,7 +40,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), String>
         let mut line = String::new();
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
         let line = line.trim().to_string();
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         if let Some(val) = line.to_lowercase().strip_prefix("content-length:") {
             content_length = val.trim().parse().unwrap_or(0);
         }
@@ -68,14 +72,18 @@ fn write_json(stream: &mut TcpStream, code: u16, body: &str) -> Result<(), Strin
         "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
         status, body.len(), body,
     );
-    stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(resp.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 fn cors_preflight(stream: &mut TcpStream) -> Result<(), String> {
     let headers = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n";
-    stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -84,7 +92,9 @@ fn cors_preflight(stream: &mut TcpStream) -> Result<(), String> {
 fn stream_sse(stream: &mut TcpStream) -> Result<(), String> {
     // Send SSE headers
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
-    stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
     // Subscribe to CLI output
@@ -122,17 +132,26 @@ fn handle_connection(mut stream: TcpStream) {
 
         // Health check
         if req_line.starts_with("GET /health") {
-            let status = if cli_bridge::is_running() { "agent_ready" } else { "idle" };
+            let status = if cli_bridge::is_running() {
+                "agent_ready"
+            } else {
+                "idle"
+            };
             return write_json(&mut stream, 200, &format!(r#"{{"status":"{}"}}"#, status));
         }
 
         // POST /agent/start
         if req_line.starts_with("POST /agent/start") {
+            crate::wake::note(crate::wake::WakeSource::IdeRequest, "POST /agent/start");
             if cli_bridge::is_running() {
                 return write_json(&mut stream, 200, r#"{"status":"already_running"}"#);
             }
             match commands::start_agent_http() {
-                Ok(msg) => write_json(&mut stream, 200, &format!(r#"{{"status":"started","message":"{}"}}"#, msg))?,
+                Ok(msg) => write_json(
+                    &mut stream,
+                    200,
+                    &format!(r#"{{"status":"started","message":"{}"}}"#, msg),
+                )?,
                 Err(e) => write_json(&mut stream, 500, &format!(r#"{{"error":"{}"}}"#, e))?,
             }
             return Ok(());
@@ -140,8 +159,13 @@ fn handle_connection(mut stream: TcpStream) {
 
         // POST /agent/message
         if req_line.starts_with("POST /agent/message") {
+            crate::wake::note(crate::wake::WakeSource::IdeRequest, "POST /agent/message");
             if !cli_bridge::is_running() {
-                return write_json(&mut stream, 400, r#"{"error":"CLI not running. POST /agent/start first."}"#);
+                return write_json(
+                    &mut stream,
+                    400,
+                    r#"{"error":"CLI not running. POST /agent/start first."}"#,
+                );
             }
             match cli_bridge::write_to_cli(&body) {
                 Ok(()) => write_json(&mut stream, 200, r#"{"status":"sent"}"#)?,
@@ -153,7 +177,11 @@ fn handle_connection(mut stream: TcpStream) {
         // GET /agent/stream
         if req_line.starts_with("GET /agent/stream") {
             if !cli_bridge::is_running() {
-                return write_json(&mut stream, 400, r#"{"error":"CLI not running. POST /agent/start first."}"#);
+                return write_json(
+                    &mut stream,
+                    400,
+                    r#"{"error":"CLI not running. POST /agent/start first."}"#,
+                );
             }
             return stream_sse(&mut stream);
         }
@@ -176,8 +204,8 @@ pub fn start() -> Result<(), String> {
         return Ok(());
     }
 
-    let listener =
-        TcpListener::bind("127.0.0.1:8789").map_err(|e| format!("Agent server bind error: {}", e))?;
+    let listener = TcpListener::bind("127.0.0.1:8789")
+        .map_err(|e| format!("Agent server bind error: {}", e))?;
     listener.set_nonblocking(false).map_err(|e| e.to_string())?;
 
     thread::spawn(move || {

@@ -1,0 +1,2174 @@
+{
+  "rsp": 1,
+  "generatedAt": "2026-10-21T11:02:05.789Z",
+  "entries": [
+    {
+      "id": "comic.mh4399",
+      "name": "4399漫画网",
+      "upstream": "comic",
+      "upstreamId": "mh4399",
+      "version": "1.0.3",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.manga51",
+      "name": "51漫画",
+      "upstream": "comic",
+      "upstreamId": "manga51",
+      "version": "1.2.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.7sefun",
+      "name": "7sefun",
+      "upstream": "manga",
+      "upstreamId": "7sefun",
+      "version": "1.3",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "comic.ikmmh_v2",
+      "name": "爱看漫",
+      "upstream": "comic",
+      "upstreamId": "ikmmh_v2",
+      "version": "3.0.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "cms.baidu",
+      "name": "百度采集",
+      "upstream": "manual",
+      "upstreamId": "https://api.apibdzy.com/api.php/provide/vod",
+      "version": "1.0.0",
+      "kind": [
+        "tv"
+      ],
+      "engine": "declarative",
+      "homepage": "https://api.apibdzy.com",
+      "attribution": "公开 TVBox / LibreTV 配置聚合",
+      "warnings": [
+        "自建声明式 CMS 规则：只调用公开采集接口，不保存内容",
+        "接口地址与可用性随上游变化，失效时在来源管理中移除"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "cms.baidu",
+          "name": "百度采集",
+          "version": "1.0.0",
+          "kind": [
+            "tv"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://api.apibdzy.com",
+          "homepage": "https://api.apibdzy.com",
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          },
+          "capabilities": [
+            "search",
+            "explore",
+            "chapters",
+            "play"
+          ]
+        },
+        "rule": {
+          "cms": {
+            "api": "https://api.apibdzy.com/api.php/provide/vod"
+          }
+        }
+      }
+    },
+    {
+      "id": "comic.baihehui",
+      "name": "百合会",
+      "upstream": "comic",
+      "upstreamId": "baihehui",
+      "version": "1.0.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.baozi",
+      "name": "包子漫画",
+      "upstream": "comic",
+      "upstreamId": "baozi",
+      "version": "1.1.6",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "cms.baofeng",
+      "name": "暴风采集",
+      "upstream": "manual",
+      "upstreamId": "https://bfzyapi.com/api.php/provide/vod",
+      "version": "1.0.0",
+      "kind": [
+        "tv"
+      ],
+      "engine": "declarative",
+      "homepage": "https://bfzyapi.com",
+      "attribution": "公开 TVBox / LibreTV 配置聚合",
+      "warnings": [
+        "自建声明式 CMS 规则：只调用公开采集接口，不保存内容",
+        "接口地址与可用性随上游变化，失效时在来源管理中移除"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "cms.baofeng",
+          "name": "暴风采集",
+          "version": "1.0.0",
+          "kind": [
+            "tv"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://bfzyapi.com",
+          "homepage": "https://bfzyapi.com",
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          },
+          "capabilities": [
+            "search",
+            "explore",
+            "chapters",
+            "play"
+          ]
+        },
+        "rule": {
+          "cms": {
+            "api": "https://bfzyapi.com/api.php/provide/vod"
+          }
+        }
+      }
+    },
+    {
+      "id": "comic.bilimanga",
+      "name": "嗶哩漫畫",
+      "upstream": "comic",
+      "upstreamId": "bilimanga",
+      "version": "1.1.7",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.dongmanmanhua",
+      "name": "咚漫",
+      "upstream": "comic",
+      "upstreamId": "dongmanmanhua",
+      "version": "1.0.6",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.dongman_la",
+      "name": "动漫啦",
+      "upstream": "comic",
+      "upstreamId": "dongman_la",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.dm5",
+      "name": "动漫屋",
+      "upstream": "comic",
+      "upstreamId": "dm5",
+      "version": "7.0.3",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.ffppt",
+      "name": "飞翔漫画",
+      "upstream": "comic",
+      "upstreamId": "ffppt",
+      "version": "1.0.3",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "cms.feifan",
+      "name": "非凡采集",
+      "upstream": "manual",
+      "upstreamId": "https://api.ffzyapi.com/api.php/provide/vod",
+      "version": "1.0.0",
+      "kind": [
+        "tv"
+      ],
+      "engine": "declarative",
+      "homepage": "https://api.ffzyapi.com",
+      "attribution": "公开 TVBox / LibreTV 配置聚合",
+      "warnings": [
+        "自建声明式 CMS 规则：只调用公开采集接口，不保存内容",
+        "接口地址与可用性随上游变化，失效时在来源管理中移除"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "cms.feifan",
+          "name": "非凡采集",
+          "version": "1.0.0",
+          "kind": [
+            "tv"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://api.ffzyapi.com",
+          "homepage": "https://api.ffzyapi.com",
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          },
+          "capabilities": [
+            "search",
+            "explore",
+            "chapters",
+            "play"
+          ]
+        },
+        "rule": {
+          "cms": {
+            "api": "https://api.ffzyapi.com/api.php/provide/vod"
+          }
+        }
+      }
+    },
+    {
+      "id": "comic.gfmhapp",
+      "name": "古风漫画",
+      "upstream": "comic",
+      "upstreamId": "GfmhApp",
+      "version": "1.3.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.guazimanhua",
+      "name": "瓜子漫画",
+      "upstream": "comic",
+      "upstreamId": "guazimanhua",
+      "version": "1.0.4",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "cms.huya",
+      "name": "虎牙采集",
+      "upstream": "manual",
+      "upstreamId": "https://www.huyaapi.com/api.php/provide/vod/from/hym3u8",
+      "version": "1.0.0",
+      "kind": [
+        "tv"
+      ],
+      "engine": "declarative",
+      "homepage": "https://www.huyaapi.com",
+      "attribution": "公开 TVBox / LibreTV 配置聚合",
+      "warnings": [
+        "自建声明式 CMS 规则：只调用公开采集接口，不保存内容",
+        "接口地址与可用性随上游变化，失效时在来源管理中移除"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "cms.huya",
+          "name": "虎牙采集",
+          "version": "1.0.0",
+          "kind": [
+            "tv"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://www.huyaapi.com",
+          "homepage": "https://www.huyaapi.com",
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          },
+          "capabilities": [
+            "search",
+            "explore",
+            "chapters",
+            "play"
+          ]
+        },
+        "rule": {
+          "cms": {
+            "api": "https://www.huyaapi.com/api.php/provide/vod/from/hym3u8"
+          }
+        }
+      }
+    },
+    {
+      "id": "cms.huohu",
+      "name": "火狐采集",
+      "upstream": "manual",
+      "upstreamId": "https://hhzyapi.com/api.php/provide/vod",
+      "version": "1.0.0",
+      "kind": [
+        "tv"
+      ],
+      "engine": "declarative",
+      "homepage": "https://hhzyapi.com",
+      "attribution": "公开 TVBox / LibreTV 配置聚合",
+      "warnings": [
+        "自建声明式 CMS 规则：只调用公开采集接口，不保存内容",
+        "接口地址与可用性随上游变化，失效时在来源管理中移除"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "cms.huohu",
+          "name": "火狐采集",
+          "version": "1.0.0",
+          "kind": [
+            "tv"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://hhzyapi.com",
+          "homepage": "https://hhzyapi.com",
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          },
+          "capabilities": [
+            "search",
+            "explore",
+            "chapters",
+            "play"
+          ]
+        },
+        "rule": {
+          "cms": {
+            "api": "https://hhzyapi.com/api.php/provide/vod"
+          }
+        }
+      }
+    },
+    {
+      "id": "comic.copy_manga",
+      "name": "拷贝漫画",
+      "upstream": "comic",
+      "upstreamId": "copy_manga",
+      "version": "1.6.6",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.laimanhua_split",
+      "name": "来漫画（分流）",
+      "upstream": "comic",
+      "upstreamId": "laimanhua_split",
+      "version": "1.2.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "cms.liangzi",
+      "name": "量子采集",
+      "upstream": "manual",
+      "upstreamId": "https://cj.lziapi.com/api.php/provide/vod",
+      "version": "1.0.0",
+      "kind": [
+        "tv"
+      ],
+      "engine": "declarative",
+      "homepage": "https://cj.lziapi.com",
+      "attribution": "公开 TVBox / LibreTV 配置聚合",
+      "warnings": [
+        "自建声明式 CMS 规则：只调用公开采集接口，不保存内容",
+        "接口地址与可用性随上游变化，失效时在来源管理中移除"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "cms.liangzi",
+          "name": "量子采集",
+          "version": "1.0.0",
+          "kind": [
+            "tv"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://cj.lziapi.com",
+          "homepage": "https://cj.lziapi.com",
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+          },
+          "capabilities": [
+            "search",
+            "explore",
+            "chapters",
+            "play"
+          ]
+        },
+        "rule": {
+          "cms": {
+            "api": "https://cj.lziapi.com/api.php/provide/vod"
+          }
+        }
+      }
+    },
+    {
+      "id": "comic.manhuagui",
+      "name": "漫画柜",
+      "upstream": "comic",
+      "upstreamId": "ManHuaGui",
+      "version": "1.2.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.manhuaren",
+      "name": "漫画人",
+      "upstream": "comic",
+      "upstreamId": "manhuaren",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.manwaba",
+      "name": "漫蛙吧",
+      "upstream": "comic",
+      "upstreamId": "manwaba",
+      "version": "1.1.3",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.manwang",
+      "name": "漫网",
+      "upstream": "comic",
+      "upstreamId": "manwang",
+      "version": "1.2.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.rumanhua_fixed_v15",
+      "name": "如漫画",
+      "upstream": "comic",
+      "upstreamId": "rumanhua_fixed_v15",
+      "version": "1.2.8",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.shonen_jump_plus",
+      "name": "少年ジャンプ＋",
+      "upstream": "comic",
+      "upstreamId": "shonen_jump_plus",
+      "version": "1.1.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.qq_comic_official_v1",
+      "name": "腾讯动漫（正版）",
+      "upstream": "comic",
+      "upstreamId": "qq_comic_official_v1",
+      "version": "1.0.3",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.tuku_cc",
+      "name": "图库漫画",
+      "upstream": "comic",
+      "upstreamId": "tuku_cc",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.hipmh",
+      "name": "嬉皮漫畫",
+      "upstream": "comic",
+      "upstreamId": "hipmh",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.manhuauo_banana_v2",
+      "name": "香蕉漫画",
+      "upstream": "comic",
+      "upstreamId": "manhuauo_banana_v2",
+      "version": "1.0.3",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.ykmh",
+      "name": "优酷漫画 (修复版)",
+      "upstream": "comic",
+      "upstreamId": "ykmh",
+      "version": "1.0.7",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.zaimanhua",
+      "name": "再漫画",
+      "upstream": "comic",
+      "upstreamId": "zaimanhua",
+      "version": "1.0.2",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.aafun",
+      "name": "aafun",
+      "upstream": "manga",
+      "upstreamId": "aafun",
+      "version": "1.2",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.age",
+      "name": "AGE",
+      "upstream": "manga",
+      "upstreamId": "AGE",
+      "version": "1.5",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.akianime",
+      "name": "akianime",
+      "upstream": "manga",
+      "upstreamId": "akianime",
+      "version": "1.4",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.baimao",
+      "name": "baimao",
+      "upstream": "manga",
+      "upstreamId": "baimao",
+      "version": "1.0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "video.cai_cmsuser",
+      "name": "Cai_cmsUser",
+      "upstream": "video",
+      "upstreamId": "Cai_cmsUser",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Cai_cmsUser.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "comic.ccc",
+      "name": "CCC追漫台",
+      "upstream": "comic",
+      "upstreamId": "ccc",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.comick",
+      "name": "comick",
+      "upstream": "comic",
+      "upstreamId": "comick",
+      "version": "1.2.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.dalvdm",
+      "name": "dalvdm",
+      "upstream": "manga",
+      "upstreamId": "dalvdm",
+      "version": "1.2",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.dm84",
+      "name": "DM84",
+      "upstream": "manga",
+      "upstreamId": "DM84",
+      "version": "1.4",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.ezdmw",
+      "name": "ezdmw",
+      "upstream": "manga",
+      "upstreamId": "ezdmw",
+      "version": "1.2",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.girigirilove",
+      "name": "giriGiriLove",
+      "upstream": "manga",
+      "upstreamId": "giriGiriLove",
+      "version": "2.5",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "comic.goda",
+      "name": "GoDa漫画",
+      "upstream": "comic",
+      "upstreamId": "goda",
+      "version": "1.2.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "video.jie_cms",
+      "name": "Jie_cms",
+      "upstream": "video",
+      "upstreamId": "Jie_cms",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jie_cms.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jie_cms2",
+      "name": "Jie_cms2",
+      "upstream": "video",
+      "upstreamId": "Jie_cms2",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jie_cms2.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jin_91jav",
+      "name": "Jin_91jav",
+      "upstream": "video",
+      "upstreamId": "Jin_91jav",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jin_91jav.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jin_hkdoll",
+      "name": "Jin_hkdoll",
+      "upstream": "video",
+      "upstreamId": "Jin_hkdoll",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jin_hkdoll.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jin_jable",
+      "name": "Jin_jable",
+      "upstream": "video",
+      "upstreamId": "Jin_jable",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jin_jable.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jin_madou",
+      "name": "Jin_madou",
+      "upstream": "video",
+      "upstreamId": "Jin_madou",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jin_madou.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jin_missav",
+      "name": "Jin_missav",
+      "upstream": "video",
+      "upstreamId": "Jin_missav",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jin_missav.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.jin_netflav",
+      "name": "Jin_netflav",
+      "upstream": "video",
+      "upstreamId": "Jin_netflav",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Jin_netflav.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "comic.komiic",
+      "name": "Komiic",
+      "upstream": "comic",
+      "upstreamId": "Komiic",
+      "version": "1.0.8",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.webtoons_zh_hant",
+      "name": "LINE WEBTOON",
+      "upstream": "comic",
+      "upstreamId": "webtoons_zh_hant",
+      "version": "1.0.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.lmm",
+      "name": "LMM",
+      "upstream": "manga",
+      "upstreamId": "LMM",
+      "version": "2.3",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "comic.mangabz",
+      "name": "Mangabz",
+      "upstream": "comic",
+      "upstreamId": "mangabz",
+      "version": "1.0.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.manga_dex",
+      "name": "MangaDex",
+      "upstream": "comic",
+      "upstreamId": "manga_dex",
+      "version": "1.1.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.mgnacg",
+      "name": "mgnacg",
+      "upstream": "manga",
+      "upstreamId": "mgnacg",
+      "version": "1.2",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "comic.mojoin_v2",
+      "name": "MOJOIN",
+      "upstream": "comic",
+      "upstreamId": "mojoin_v2",
+      "version": "1.0.7",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.moonci",
+      "name": "moonci",
+      "upstream": "manga",
+      "upstreamId": "moonci",
+      "version": "1.0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.mutefun",
+      "name": "mutefun",
+      "upstream": "manga",
+      "upstreamId": "mutefun",
+      "version": "1.4",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.mxdm",
+      "name": "MXdm",
+      "upstream": "manga",
+      "upstreamId": "MXdm",
+      "version": "2.4",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "comic.mycomic",
+      "name": "MYCOMIC",
+      "upstream": "comic",
+      "upstreamId": "mycomic",
+      "version": "1.1.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.noymanga",
+      "name": "NoyManga",
+      "upstream": "comic",
+      "upstreamId": "noymanga",
+      "version": "1.1.5",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "video.pan_319yingshe",
+      "name": "Pan_319yingshe",
+      "upstream": "video",
+      "upstreamId": "Pan_319yingshe",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_319yingshe.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_4ktop",
+      "name": "Pan_4KTop",
+      "upstream": "video",
+      "upstreamId": "Pan_4KTop",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_4KTop.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_duoduo",
+      "name": "Pan_duoduo",
+      "upstream": "video",
+      "upstreamId": "Pan_duoduo",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_duoduo.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_erxiao",
+      "name": "Pan_erxiao",
+      "upstream": "video",
+      "upstreamId": "Pan_erxiao",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_erxiao.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_huban",
+      "name": "Pan_huban",
+      "upstream": "video",
+      "upstreamId": "Pan_huban",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_huban.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_labipan",
+      "name": "Pan_labipan",
+      "upstream": "video",
+      "upstreamId": "Pan_labipan",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_labipan.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_libvio",
+      "name": "Pan_libvio",
+      "upstream": "video",
+      "upstreamId": "Pan_libvio",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_libvio.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_mogg",
+      "name": "Pan_mogg",
+      "upstream": "video",
+      "upstreamId": "Pan_mogg",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_mogg.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_nanfdj",
+      "name": "Pan_nanfdj",
+      "upstream": "video",
+      "upstreamId": "Pan_nanfdj",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_nanfdj.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_ouge",
+      "name": "Pan_ouge",
+      "upstream": "video",
+      "upstreamId": "Pan_ouge",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_ouge.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_qingying",
+      "name": "Pan_qingying",
+      "upstream": "video",
+      "upstreamId": "Pan_qingying",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_qingying.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_renren",
+      "name": "Pan_renren",
+      "upstream": "video",
+      "upstreamId": "Pan_renren",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_renren.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_shandian",
+      "name": "Pan_shandian",
+      "upstream": "video",
+      "upstreamId": "Pan_shandian",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_shandian.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_tgs",
+      "name": "Pan_tgs",
+      "upstream": "video",
+      "upstreamId": "Pan_tgs",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_tgs.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_tgs_api",
+      "name": "Pan_tgs_api",
+      "upstream": "video",
+      "upstreamId": "Pan_tgs_api",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_tgs_api.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_wogg",
+      "name": "Pan_wogg",
+      "upstream": "video",
+      "upstreamId": "Pan_wogg",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_wogg.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_yishou",
+      "name": "Pan_yishou",
+      "upstream": "video",
+      "upstreamId": "Pan_yishou",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_yishou.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.pan_zhizhen",
+      "name": "Pan_zhizhen",
+      "upstream": "video",
+      "upstreamId": "Pan_zhizhen",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Pan_zhizhen.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "demo.gutendex",
+      "name": "Project Gutenberg（演示）",
+      "upstream": "manual",
+      "upstreamId": "demo.gutendex",
+      "version": "1.0.0",
+      "kind": [
+        "novel"
+      ],
+      "engine": "declarative",
+      "homepage": "https://gutendex.com",
+      "license": "Public Domain (Project Gutenberg)",
+      "attribution": "数据来自 Gutendex / Project Gutenberg；仅使用公版作品摘要",
+      "warnings": [
+        "本仓库自建演示来源；规则内嵌，可直接安装"
+      ],
+      "source": {
+        "manifest": {
+          "rsp": 1,
+          "id": "demo.gutendex",
+          "name": "Project Gutenberg（演示）",
+          "version": "1.0.0",
+          "kind": [
+            "novel"
+          ],
+          "engine": "declarative",
+          "entry": "rule.json",
+          "baseUrl": "https://gutendex.com",
+          "homepage": "https://gutendex.com",
+          "license": "Public Domain (Project Gutenberg)",
+          "attribution": "数据来自 Gutendex / Project Gutenberg；仅使用公版作品摘要",
+          "capabilities": [
+            "search",
+            "chapters",
+            "content"
+          ],
+          "rateLimit": {
+            "rps": 2,
+            "burst": 3
+          }
+        },
+        "rule": {
+          "search": {
+            "request": {
+              "method": "GET",
+              "url": "/books/",
+              "query": {
+                "search": "@keyword",
+                "page": "@page"
+              }
+            },
+            "list": {
+              "jsonPath": "$.results[*]"
+            },
+            "fields": {
+              "id": {
+                "selector": {
+                  "jsonPath": "id"
+                },
+                "template": "https://gutendex.com/books/@value/"
+              },
+              "title": {
+                "selector": {
+                  "jsonPath": "title"
+                }
+              },
+              "author": {
+                "selector": {
+                  "jsonPath": "authors[0].name"
+                }
+              },
+              "cover": {
+                "selector": {
+                  "jsonPath": "formats['image/jpeg']"
+                }
+              },
+              "description": {
+                "selector": {
+                  "jsonPath": "summaries[0]"
+                }
+              },
+              "tags": {
+                "selector": {
+                  "jsonPath": "subjects[0]"
+                }
+              }
+            }
+          },
+          "chapters": {
+            "request": {
+              "method": "GET",
+              "url": "@workUrl"
+            },
+            "list": {
+              "jsonPath": "$"
+            },
+            "fields": {
+              "id": {
+                "selector": {
+                  "jsonPath": "id"
+                },
+                "template": "https://gutendex.com/books/@value/"
+              },
+              "title": {
+                "selector": {
+                  "jsonPath": "title"
+                },
+                "template": "作品摘要 · @value"
+              }
+            }
+          },
+          "content": {
+            "request": {
+              "method": "GET",
+              "url": "@chapterUrl"
+            },
+            "list": {
+              "jsonPath": "$"
+            },
+            "fields": {
+              "content": {
+                "selector": {
+                  "jsonPath": "summaries[0]"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "comic.rawkuma",
+      "name": "Rawkuma",
+      "upstream": "comic",
+      "upstreamId": "rawkuma",
+      "version": "1.1.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "comic.sfacg_manhua",
+      "name": "SF漫画",
+      "upstream": "comic",
+      "upstreamId": "sfacg_manhua",
+      "version": "1.0.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.sorani",
+      "name": "sorani",
+      "upstream": "manga",
+      "upstreamId": "sorani",
+      "version": "1.0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "comic.wmanhua",
+      "name": "W漫画",
+      "upstream": "comic",
+      "upstreamId": "wmanhua",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "manga.xfdmneo",
+      "name": "xfdmneo",
+      "upstream": "manga",
+      "upstreamId": "xfdmneo",
+      "version": "1.1",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "manga.xfdmnext",
+      "name": "xfdmnext",
+      "upstream": "manga",
+      "upstreamId": "xfdmnext",
+      "version": "1.1",
+      "kind": [
+        "anime"
+      ],
+      "engine": "declarative",
+      "homepage": "",
+      "license": "MIT",
+      "attribution": "KazumiRules (MIT)",
+      "warnings": []
+    },
+    {
+      "id": "video.xiu_bhys",
+      "name": "Xiu_bhys",
+      "upstream": "video",
+      "upstreamId": "Xiu_bhys",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_bhys.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_eacg",
+      "name": "Xiu_eacg",
+      "upstream": "video",
+      "upstreamId": "Xiu_eacg",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_eacg.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_eacg2",
+      "name": "Xiu_eacg2",
+      "upstream": "video",
+      "upstreamId": "Xiu_eacg2",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_eacg2.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_fcdm",
+      "name": "Xiu_fcdm",
+      "upstream": "video",
+      "upstreamId": "Xiu_fcdm",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_fcdm.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_girigirilove",
+      "name": "Xiu_girigirilove",
+      "upstream": "video",
+      "upstreamId": "Xiu_girigirilove",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_girigirilove.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_libvio",
+      "name": "Xiu_libvio",
+      "upstream": "video",
+      "upstreamId": "Xiu_libvio",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_libvio.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_lmm",
+      "name": "Xiu_lmm",
+      "upstream": "video",
+      "upstreamId": "Xiu_lmm",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_lmm.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_mutefun",
+      "name": "Xiu_MuteFun",
+      "upstream": "video",
+      "upstreamId": "Xiu_MuteFun",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_MuteFun.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_mxdm",
+      "name": "Xiu_mxdm",
+      "upstream": "video",
+      "upstreamId": "Xiu_mxdm",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_mxdm.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_ntdm",
+      "name": "Xiu_ntdm",
+      "upstream": "video",
+      "upstreamId": "Xiu_ntdm",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_ntdm.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.xiu_yhdm",
+      "name": "Xiu_yhdm",
+      "upstream": "video",
+      "upstreamId": "Xiu_yhdm",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Xiu_yhdm.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "comic.zerobyw33",
+      "name": "zero搬运网",
+      "upstream": "comic",
+      "upstreamId": "zerobyw33",
+      "version": "1.2.0",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    },
+    {
+      "id": "video.zhi_4kav",
+      "name": "Zhi_4kav",
+      "upstream": "video",
+      "upstreamId": "Zhi_4kav",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_4kav.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.zhi_biliys",
+      "name": "Zhi_biliys",
+      "upstream": "video",
+      "upstreamId": "Zhi_biliys",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_biliys.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.zhi_bttwoo",
+      "name": "Zhi_bttwoo",
+      "upstream": "video",
+      "upstreamId": "Zhi_bttwoo",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_bttwoo.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.zhi_hjkk",
+      "name": "Zhi_hjkk",
+      "upstream": "video",
+      "upstreamId": "Zhi_hjkk",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_hjkk.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.zhi_olevod",
+      "name": "Zhi_olevod",
+      "upstream": "video",
+      "upstreamId": "Zhi_olevod",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_olevod.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.zhi_qiyou",
+      "name": "Zhi_qiyou",
+      "upstream": "video",
+      "upstreamId": "Zhi_qiyou",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_qiyou.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "video.zhi_wooyun",
+      "name": "Zhi_wooyun",
+      "upstream": "video",
+      "upstreamId": "Zhi_wooyun",
+      "version": "0",
+      "kind": [
+        "anime"
+      ],
+      "engine": "js",
+      "sourceUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/vod/js/Zhi_wooyun.js",
+      "homepage": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+      "attribution": "uzVideo extensions",
+      "warnings": [
+        "安装时从上游地址读取 uzVideo 脚本",
+        "上游未见 LICENSE；使用前请自行确认授权"
+      ]
+    },
+    {
+      "id": "comic.comic_walker",
+      "name": "カドコミ",
+      "upstream": "comic",
+      "upstreamId": "comic_walker",
+      "version": "1.0.1",
+      "kind": [
+        "comic"
+      ],
+      "engine": "js",
+      "homepage": "",
+      "attribution": "Venera comic sources",
+      "warnings": [
+        "安装时从上游地址读取 Venera 脚本",
+        "单个源脚本的许可以上游文件为准"
+      ]
+    }
+  ]
+}

@@ -115,7 +115,9 @@ export async function mountLive2D(host: HTMLElement, opts: MountOptions): Promis
   //   某个文件「永远不结束」时强制切下一个。
   // 这里只把「文件路径 → 合成组里的下标」对上（前端传的是路径，下标按 `list_motion_files` 序）。
   const idxOfMotionFile = new Map(extraMotions.map((m, i) => [m.file, i]));
-  const idleList = (opts.idleMotions ?? [])
+  // **可变**（2026-10-22）：设置窗勾 / 取消「循环」时**不该重挂整个模型**（重挂 = 拆纹理 +
+  // 重新加载，画面会空一大截，连点几次还会叠出多张画布）⇒ 只热更新这份列表。
+  let idleList = (opts.idleMotions ?? [])
     .map(m => ({ index: m && m.file ? idxOfMotionFile.get(m.file) ?? -1 : -1, file: m?.file ?? "" }))
     .filter(m => m.index >= 0 && m.file);
 
@@ -240,75 +242,77 @@ export async function mountLive2D(host: HTMLElement, opts: MountOptions): Promis
     state?: { currentGroup?: string; currentIndex?: number };
   };
 
-  if (idleList.length) {
-    let cursor = 0;
-    let lastIndex = -1; // 上一次由**我们**播的循环动作（`Lunac` 组里的下标）
-    let startedAt = 0;
-    let expectMs = 0;
-    let lastTry = 0;
-    let lastIssue = 0;
-    let driveErrs = 0;
-    app.ticker.add(() => {
-      // ⚠️ **本回调绝不允许抛**（2026-10-10 用户复现「一开循环就卡死」）：`@pixi/ticker` 的 `_tick`
-      // 在 `update()` 抛异常后**就不再申请下一帧**（见 ㉕ 的根因分析）⇒ 整条渲染链永久停住。
-      // 我们只给 `internalModel.update` 包了 try/catch，**够不着这里** —— 而库的 `model.motion()`
-      // 在「组 / 序号不存在」「优先级与预约状态互相顶掉」等情况下是**同步抛**（不是 reject），
-      // 那一下正好把 rAF 链掐断。整段兜住 + 记日志（最多 5 条）。
-      try {
-        const now = performance.now();
-        if (!chainActive && now - lastTry >= 100) {
-          lastTry = now;
-          // 刚发过一条就歇 400ms：否则 `isFinished()` 若因「其实没开播」一直为 true，
-          // 会退化成每 100ms 抢一次状态机（那正是把预约状态顶乱的来源）。
-          if (now - lastIssue >= 400) {
-            let idle = false;
-            try {
-              idle = mm.isFinished();
-            } catch {
-              idle = false;
-            }
-            // 「卡住」的判据必须**只在播的是我们那条循环动作**时成立 —— 否则用户自己播一条长动作
-            // 会被我们误判成卡住、强行抢掉。`state.currentGroup/currentIndex` 是库的公开字段。
-            const st = mm.state;
-            const ours = !!st && st.currentGroup === MOTION_EXTRA_GROUP && st.currentIndex === lastIndex;
-            const stuck = ours && startedAt > 0 && now - startedAt > expectMs + 1500;
-            if (idle || stuck) {
-              const k = cursor++ % idleList.length;
-              lastIndex = idleList[k].index;
-              startedAt = now;
-              lastIssue = now;
-              expectMs = durMs[lastIndex] ?? 3000;
-              markStart(lastIndex);
-              // 队列空 ⇒ NORMAL(2)，让用户自己播的动作优先；卡住 ⇒ FORCE(3) 抢过来切下一个。
-              void model
-                .motion(MOTION_EXTRA_GROUP, lastIndex, idle ? 2 : 3)
-                .then(ok => {
-                  if (!ok) {
-                    startedAt = 0;
-                    lastIndex = -1;
-                  }
-                })
-                .catch(() => {
-                  startedAt = 0;
-                  lastIndex = -1;
-                });
-            }
+  // **驱动常驻**（2026-10-22）：即使挂载时一个「循环」都没勾也要装上 —— 否则设置窗后来勾上
+  // 第一个动作时只能靠「重挂整个模型」生效（重挂 = 拆纹理 + 重新加载，画面会空一大截；
+  // 连点几次还会叠出多张画布 ⇒ 用户看到的就是「模型不见了」）。列表为空时每拍直接返回。
+  let idleCursor = 0;
+  let idleLastIndex = -1; // 上一次由**我们**播的循环动作（`Lunac` 组里的下标）
+  let idleStartedAt = 0;
+  let idleExpectMs = 0;
+  let idleLastTry = 0;
+  let idleLastIssue = 0;
+  let idleDriveErrs = 0;
+  app.ticker.add(() => {
+    // ⚠️ **本回调绝不允许抛**（2026-10-10 用户复现「一开循环就卡死」）：`@pixi/ticker` 的 `_tick`
+    // 在 `update()` 抛异常后**就不再申请下一帧**（见 ㉕ 的根因分析）⇒ 整条渲染链永久停住。
+    // 我们只给 `internalModel.update` 包了 try/catch，**够不着这里** —— 而库的 `model.motion()`
+    // 在「组 / 序号不存在」「优先级与预约状态互相顶掉」等情况下是**同步抛**（不是 reject），
+    // 那一下正好把 rAF 链掐断。整段兜住 + 记日志（最多 5 条）。
+    try {
+      if (!idleList.length) return;
+      const now = performance.now();
+      if (!chainActive && now - idleLastTry >= 100) {
+        idleLastTry = now;
+        // 刚发过一条就歇 400ms：否则 `isFinished()` 若因「其实没开播」一直为 true，
+        // 会退化成每 100ms 抢一次状态机（那正是把预约状态顶乱的来源）。
+        if (now - idleLastIssue >= 400) {
+          let idle = false;
+          try {
+            idle = mm.isFinished();
+          } catch {
+            idle = false;
+          }
+          // 「卡住」的判据必须**只在播的是我们那条循环动作**时成立 —— 否则用户自己播一条长动作
+          // 会被我们误判成卡住、强行抢掉。`state.currentGroup/currentIndex` 是库的公开字段。
+          const st = mm.state;
+          const ours = !!st && st.currentGroup === MOTION_EXTRA_GROUP && st.currentIndex === idleLastIndex;
+          const stuck = ours && idleStartedAt > 0 && now - idleStartedAt > idleExpectMs + 1500;
+          if (idle || stuck) {
+            const k = idleCursor++ % idleList.length;
+            idleLastIndex = idleList[k].index;
+            idleStartedAt = now;
+            idleLastIssue = now;
+            idleExpectMs = durMs[idleLastIndex] ?? 3000;
+            markStart(idleLastIndex);
+            // 队列空 ⇒ NORMAL(2)，让用户自己播的动作优先；卡住 ⇒ FORCE(3) 抢过来切下一个。
+            void model
+              .motion(MOTION_EXTRA_GROUP, idleLastIndex, idle ? 2 : 3)
+              .then(ok => {
+                if (!ok) {
+                  idleStartedAt = 0;
+                  idleLastIndex = -1;
+                }
+              })
+              .catch(() => {
+                idleStartedAt = 0;
+                idleLastIndex = -1;
+              });
           }
         }
-      } catch (e) {
-        if (driveErrs < 5) {
-          driveErrs++;
-          void invoke("log_frontend", {
-            level: "error",
-            message: `[pet engine] motion-cycle driver threw: ${e instanceof Error ? e.message : String(e)}`,
-          }).catch(() => {});
-        }
-        // 出错就把「卡住」判据复位，下一拍重新试 —— 绝不在同一个判断上原地打死。
-        startedAt = 0;
-        lastIndex = -1;
       }
-    });
-  }
+    } catch (e) {
+      if (idleDriveErrs < 5) {
+        idleDriveErrs++;
+        void invoke("log_frontend", {
+          level: "error",
+          message: `[pet engine] motion-cycle driver threw: ${e instanceof Error ? e.message : String(e)}`,
+        }).catch(() => {});
+      }
+      // 出错就把「卡住」判据复位，下一拍重新试 —— 绝不在同一个判断上原地打死。
+      idleStartedAt = 0;
+      idleLastIndex = -1;
+    }
+  });
 
   // ── 动作链播放（2026-10-10，backlog ㉝②）──────────────────────────
   // 把 `steps`（已折算成「注入组下标 + 本步时长 + 硬停上限」）排在一条时间线上：
@@ -706,6 +710,16 @@ export async function mountLive2D(host: HTMLElement, opts: MountOptions): Promis
       mouthOpen = v === null || !Number.isFinite(v) ? null : Math.max(0, Math.min(1, v));
     },
     // ── 热键能力（2026-10-10）────────────────────────────────────
+    setIdleMotions(files: string[]) {
+      idleList = (files ?? [])
+        .map(file => ({ index: idxOfMotionFile.get(file) ?? -1, file }))
+        .filter(m => m.index >= 0 && m.file);
+      // 列表换了 ⇒ 从第一条重新开始；旧动作若还在播，由下一拍的 `isFinished()` 自然接管。
+      idleCursor = 0;
+      idleLastIndex = -1;
+      idleStartedAt = 0;
+      idleLastIssue = 0;
+    },
     playMotion(group: string, index?: number) {
       if (!group) return;
       // 库的 `Live2DModel.motion()` 按 `Motions[组名][序号]` 取；组不存在 / 越界由它自己兜住。

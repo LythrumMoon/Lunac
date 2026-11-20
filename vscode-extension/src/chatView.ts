@@ -21,12 +21,33 @@ import { resolveConfig } from "./providers";
 
 export function registerChatView(context: vscode.ExtensionContext) {
   const provider = new ChatViewProvider(context);
+  activeProvider = provider;
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("lunac.chatView", provider, {
       webviewOptions: { retainContextWhenHidden: true },
     })
   );
 }
+
+/**
+ * 「在编辑器 / 资源管理器里选文件提问」的入口（§待办 3-23 分片 1）。
+ *
+ * **不新增消息类型**：会话已跑起来时，它走的是与输入框完全相同的
+ * `{type:"user", message:{…}}` 形态；宿主只额外把同一条文本回显到面板
+ * （`{type:"user"}` 是 webview 早就在处理的一条入站消息）。
+ * 会话没跑时先按面板里「启动」按钮同一条路径 `start()`，不另开启动逻辑。
+ */
+export function askInChat(text: string): { ok: boolean; error?: string } {
+  if (!activeProvider) {
+    return {
+      ok: false,
+      error: "Lunac 侧边栏还没加载 —— 先在活动栏打开一次 AI Chat，再试。",
+    };
+  }
+  return activeProvider.ask(text);
+}
+
+let activeProvider: ChatViewProvider | undefined;
 
 // ── CLI process session ──────────────────────────────────────────
 
@@ -180,12 +201,48 @@ class CliAgentSession {
 
 class ChatViewProvider implements vscode.WebviewViewProvider {
   private session = new CliAgentSession();
+  private view?: vscode.WebviewView;
+  /** 面板还没打开时发起的提问：等 webview 挂上来再回显，否则用户只看到回答看不到问题。 */
+  private pendingEcho: string[] = [];
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
+  /**
+   * 主对话之外的一次提问（来自右键菜单 / 命令面板，见 [askInChat]）。
+   *
+   * 与输入框**同一条路径**：`start()` → 回显 → `send()`；区别只在文本是谁拼的。
+   * 会话没跑就顺手启动（否则命令面板点了没反应，用户还得先找侧边栏）。
+   */
+  ask(text: string): { ok: boolean; error?: string } {
+    const trimmed = text.trim();
+    if (!trimmed) return { ok: false, error: "没有可发送的内容" };
+    if (!this.session.running) {
+      const res = this.session.start(this.context, (ev) => this.view?.webview.postMessage(ev));
+      if (!res.ok) return res;
+    }
+    const line = { type: "user", message: { role: "user", content: trimmed } };
+    if (!this.session.send(line)) {
+      return { ok: false, error: "Agent 未在运行（启动失败时看输出面板的 [lunac cli] 日志）" };
+    }
+    // 回显用的是 webview 已在处理的入站消息（`case "user"`），不新增类型。
+    if (this.view) {
+      this.view.webview.postMessage({ type: "user", message: { content: trimmed } });
+    } else {
+      this.pendingEcho.push(trimmed);
+    }
+    return { ok: true };
+  }
+
   resolveWebviewView(webviewView: vscode.WebviewView) {
+    this.view = webviewView;
+    webviewView.onDidDispose(() => {
+      if (this.view === webviewView) this.view = undefined;
+    });
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = getChatHtml();
+    for (const text of this.pendingEcho.splice(0)) {
+      webviewView.webview.postMessage({ type: "user", message: { content: text } });
+    }
 
     const post = (obj: unknown) => webviewView.webview.postMessage(obj);
 

@@ -25,6 +25,8 @@
 
 - **agent 侧**：启动 / 退出；`ready`（工具清单 / 审批档 / 技能与 MCP 数量）；`cfg`（端点与模型，token 只记 set/empty）；**每次工具调用**（`run_tool` 是唯一入口：名称 + 参数摘要 + 成功或 `FAILED` 文案 + 耗时，覆盖内置 / Skill / MCP）；`run_shell` 的**退出码 / 是否超时 / 输出规模 / stderr 原文**；panic。
 - **宿主侧**：启动与退出；`stop_cli`；**agent 的每一行 stderr 原样落盘**（agent 自身没机会写日志时的兜底）；前端经 `log_frontend` 命令上报的未捕获 JS 错误（`window.onerror` / `unhandledrejection`，按内容去重）。
+- **代理引擎（2026-11-01）**：每次入站请求记一行 `native_proxy：<host>:<port> → proxy（节点）/ direct / reject`，**只记域名 / 端口 / 走向，不记 URL 路径与正文**；同一份数据进内存环形缓冲（最近 500 条）供代理面板日志区展示（`mihomo_requests`）。这条是「代理到底连了哪个域名」的唯一事实来源，别降级成 debug。
+- **预算闸的「计点」不是账面 token（2026-11-02）**：`成本预算撞顶（… 计点；上下文 …%，已压缩/跳过压缩）` 与 `成本预算用尽（…）` 必须保留 —— 它是判断「这次该不该压」的唯一现场证据。计点口径 = `in + create + out` 全额、`read` 按 10% 折算（`budget_points`）；排查时**不要**拿计点直接和 `请求用量` 的 token 总量对账。
 - **明令要求保留、任何时候都不得降级的日志行**（散落在多条规则里）：`请求前缀 #n`（含 system / tools / history 三个前缀哈希与字数）、`摘要压缩：…`、`上下文压缩：…`、`api retry`、`tool X ok` / `tool X FAILED`、`输出超预算（… 全文已落盘）`、`只读工具并行批 N 条`、WebView2 profile 与 browser args 两条、`AI 配置来源` / `agent 凭据`（只留 key_tail）、`auto_start`、`[frontend]`、`shell[...] exit=`、`文件索引已重建`、`launch_elevated`。
 - **保留在 stderr 不得顺手删的低频项**：`忽略输入类型`（判据：正在跑的 agent.exe 是旧的）、`忽略非法 JSON 输入行`、`MCP 桥未接通`、`用户输入过长`、`端点不接受 thinking`、`端点回报上下文超限`、`工具轮次达上限`、`用户要求中断本轮`、启动横幅。
 

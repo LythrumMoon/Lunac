@@ -12,11 +12,12 @@
 
 ## §规范 1 分层与目录
 
-- 五类源码根，各司其职，**跨层不要互写**：
+- 六类源码根，各司其职，**跨层不要互写**：
   - `app/src/`：前端（TS + `styles.css` + `index.html`）+ 内置插件 `plugins/builtin/`；
   - `app/src-tauri/src/`：宿主 Rust（窗口 / 托盘 / 子进程生命周期 / IPC / 存储）；
   - `core-agent/src/`：自研 agent 内核（`agent.exe`，独立 crate）；
   - `tuning-engine/`：DSP 引擎（独立 crate，宿主以**路径库依赖**链它）；
+  - `app/media-proxy/`：媒体代理 helper（独立 crate，`lunac-media-proxy.exe`，宿主以子进程启动，只跑 `127.0.0.1`）；
   - `scripts/`、`agent-templates/`：构建发布脚本与随包预置（技能 / 工具模板）。
 - **数据根 = `<exe 根>`（便携式，无独立 HOME）**：`config\` / `ModuleData\` / `temp\` / `skills\` / `tools\`。所有落盘模块统一走 `storage::lunac_root_dir()`，**禁止各自硬编码路径**。
 - `temp\` 放缓存类（`webview-data` / `*-index-cache.json` / `logs` / `tool-outputs` / `transStorage`）；`ModuleData\` 放业务数据（`history\chat.db` / `usage-*.jsonl` / `memory` / `custom`）。
@@ -39,6 +40,7 @@
 | 滤波 / 预设 / 工具名单 | 引擎或宿主的那张表（后端回传，前端照它画，**不另抄一份**） |
 | 工具名 | `tools.rs` 的 `defs()`，PascalCase 稳定（前端对 `Cmd` / `PowerShell` 有特判） |
 | 插件名 / 描述 | `pluginName()` / `pluginDesc()`（禁止硬编码英文常量） |
+| AI 技能正文 | `agent-templates/skills/<key>/SKILL.md`（随包铺到 `<exe 根>\skills\`；模板才用 `.example`，禁止在别处再放第二份） |
 
 - **判据**：改某一处后，所有消费点必须同步变；出现第二份实现即为回归。
 
@@ -78,9 +80,11 @@
 - **`invoke()` 参数必须与 Rust `#[tauri::command] fn` 签名逐一对齐**（每个参数是顶层 key）；返回类型也要对上。
 - **改 `stream-json` 协议要走登记流程**：优先从现有字段推导；确需新字段时，在契约表登记字段名与语义、**保持 `tool_result.content` 文本不变**、前端**兼容缺字段**（无字段回落文本解析）。
 - **前缀缓存不变量**（DeepSeek 等端点按最长公共前缀命中）：`history` 一律以 user 文本消息开头；系统提示词固定、技能清单按 `key` 排序、工具数组按名排序；**往已有 `tool_result` 里追加内容只能拼进它的文本内部**，不得新增消息或内容块。
+- **长期记忆快照只在「压缩边界」刷新**（2026-10-23，`todo.md` §待办 3-9 C）：记忆块注在 `history` 开头、进程内**冻结**——禁止每轮重读、禁止 `Remember` 写成功后就刷新（见 `forbidden.md` §禁用 45）。唯一例外 = `compact_history` **真压动过**的那一次：压缩本就把前缀作废，此刻重读一次记忆并**原地替换**开头那条块（消息条数不变 ⇒ 回滚锚点不动）不额外损失缓存，却让「会话中途写的记忆」不必重启 agent 就能被看见。刷新结果必须**写回主循环持有的那份快照**，否则下一轮会退回旧块；没压动则**不刷新**（前缀逐字节未变时重读 = 白废缓存）。读不到新内容（记忆被清空 / 桥临时不可用）时**保留旧块**，不删、不造新块。
 - **往 `history` 写内容的每条路径都要过预算/有硬上限**（工具结果、后台命令回流、附件、注入块）——漏一条就是「每轮都 miss」。
 - **`result.usage` 是每次提问的绝对值**，前端禁止对它做差；用量口径与对账详见 archive 的 `ai-spec.md` §3.5。
 - **「agent 就绪」信号必须能被新窗口重新获得**：前端 `cliReady` 的唯一置位源是宿主事件 `cli-status:stdout`。因此宿主里那条「确保 agent 就绪」的命令（`start_cli`）在 agent **已在跑**时也必须**重播**一次该事件 —— 否则一个**新建**的聊天窗（旧窗关掉后 `agent.exe` 仍在）将永远等不到就绪信号、其挂起的问句永不冲刷（2026-10-11 桌宠轮报障即此；见 `todo.md` §待办 1-4 补）。
+- **无人值守可写 = 只放行写文件三件**（2026-10-27，`todo.md` §待办 3-1d 阶段 2B）：宿主 `cron.rs::WRITE_ACCESS_ALLOW` 与 agent `main.rs::UNATTENDED_WRITE_TOOLS` 各持一份 `Write` / `Edit` / `NotebookEdit`（跨进程共享不了常量）⇒ **改动必须两处同步**，任一侧多一个名字就是放宽边界。命令类 / 外部出口 / 派生任务 / 全部 `mcp__*` **永不**进白名单；白名单只让单发的 `UnattendedDeny` 跳过「没有回包通道」这一层，**不豁免**凭据扫描（`hook_allow_needs_card`）、危险命令分析、工作区锁与 hook 的 deny。`writeAccess` 只能由用户在任务列表里逐 job 打开（宿主 `cron_set_write_access` + 二次确认），`CronCreate` 恒写 `false`。
 
 ## §规范 7 WebView2 与 CSS
 
@@ -107,6 +111,7 @@
 - **幂等 / 可验证**：任何「写盘前先瘦身」的管线要加体量断言（`pruneContext` 曾因数组别名让库每轮 ×12 膨胀）。
 - **`.ps1` / `.nsi` 含中文必须 UTF-8 with BOM**（恰一份），改完跑 `npm run verify`——见 [`testing.md`](./testing.md) §测试 3。
 - **仓库页面（README / `docs/**` / `agent-templates/**/README.md`）一律不插装饰性 emoji**，清单表格标题用纯文字。
+- **改完插件源码必须重跑 `scripts\build-plugins.ps1`**（盘上生效的是 `Modules\<id>\index.js`，不是源码）。反过来，**任何覆盖 `Modules\` 的动作**（从市场装 / 更新插件、手动解包、重装 dev 实例）都会让 dev 里那份回到**发布版**——之后要再跑一次本脚本才回到「源码即产物」。探针插件同理：`scripts\install-probe-plugin.ps1` 要重铺，且 `ui\index.html` 缺一不可（缺了表现为 iframe 握手超时，见 `todo.md` §待办 3-10 的 2026-10-27 记录）。
 
 ---
 

@@ -1,0 +1,8 @@
+[package]
+name = "lunac-media-proxy"
+version = "0.9.38"
+edition = "2021"
+description = "Lunac media proxy helper (isolated process for plugin media fetches)"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["blocking"] }

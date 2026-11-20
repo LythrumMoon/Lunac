@@ -105,6 +105,41 @@ Lunac 的搜索结果里，除了内置功能，还能出现**插件**。
 | `reuse` | | **复用哪个内置（基础）插件的挂载监听**，见下面「复用内置插件监听」一段。没有就写 `[]` 或省略 |
 | `window` | | **悬浮窗形态参数**（宽高 / 能不能缩放 / 进不进任务栏 / 要不要标题栏），见下面「窗口形态」一段。没有就省略 |
 | `sidecar` | | **插件自带的本机进程**（可执行文件 / 参数 / 通道），见下面「自带本机程序」一段。**必须同时声明 `permissions: ["process.spawn"]`**。没有就省略 |
+| `provides` | | **能力身份**（2026-10-18）：宿主按它定位插件。元素只允许 `[a-z0-9._-]`、≤ 32 字符、最多 8 条。**不改变 `id = 目录名` 硬契约**，不能靠它任意改目录名 |
+| `render` | | **渲染方式与外观级别**（2026-10-18）：`{ "engine": "dom" \| "iframe", "appearance": "inherit" \| "custom", "slots": ["chat-sidebar" \| "settings-section"] }`，缺省 `dom` + `inherit` + 空 `slots` |
+| `dev` | | **开发工具链声明**（2026-10-18，轨道 H）：`{ "toolchains": [...], "build": {...} }`。**永不随安装自动安装 / 自动执行**，必须由用户在「设置 → 插件 → 开发工具链」显式授权。见下面「开发工具链」一段。没有就省略 |
+
+> `render.engine = "iframe"` 时必须有 `ui/index.html`，同时保留 `index.js` 作为旧宿主降级占位；
+> iframe 不是默认值，也不支持 `reuse`。`render.appearance = "custom"` 只允许自绘外观，
+> 仍须满足 Esc 归宿主、键盘可达、主题不崩、无横向滚动等最低要求。
+
+### iframe 引擎（opt-in，2026-10-18）
+
+```text
+Modules\<id>\
+  lunac-plugin.json        # render.engine = "iframe"
+  index.js                 # 旧宿主降级占位（必需）
+  ui\index.html            # iframe 入口（必需）
+  ui\...                   # 前端资源
+  assets\...               # 图片 / 字体等静态资源
+```
+
+- 宿主加载 `ui/index.html`：**Windows 上是 `http://lunac-plugin.localhost/<id>/ui/index.html`**，
+  macOS / Linux 上是 `lunac-plugin://localhost/<id>/ui/index.html`（由宿主的 `pluginFrameUrl()`
+  按平台生成）。协议只暴露 `ui/` 与 `assets/`。
+- 宿主与插件只走 `postMessage`：`hello` → `ready` → `mount`；之后是 `execute`、
+  `theme.changed`、`locale.changed`、`lifecycle` 与插件请求。
+- 插件常用方法：`net.fetch`（需 `permissions: ["net.fetch"]`）、`ui.resize`、`ui.status`、
+  `log`、`bye`。协议与客户端源码在 `app/src/plugins/channel/`，复制 `protocol.ts` +
+  `client.ts` 到 `ui/` 后调用 `connectPluginChannel({ onMount, onExecute, onTheme })`。
+- iframe 文档的 CSP 禁止 `connect-src`：**联网必须走 `net.fetch`**，不得自己 `fetch()`。
+- `theme.changed` 的 token 快照会由宿主在握手后整份发来；`inherit` 外观直接用 `var(--...)`。
+- **常驻锚点 `render.slots`**（2026-10-18）：可选值 `chat-sidebar`（聊天侧栏）与
+  `settings-section`（设置面板里的插件分组）。**只支持 iframe 引擎**；声明后宿主会在对应
+  位置自动挂载并发送 `mount { slot }`。无此类插件时宿主**不占位**，卸载 / 面板关闭即回收。
+  DOM 插件无法声明（宿主没法把它的样式限制在槽位内）。
+
+
 
 ### 宿主能力：`permissions`
 
@@ -121,6 +156,52 @@ Lunac 的搜索结果里，除了内置功能，还能出现**插件**。
 | `layout.takeover` | **接管整个窗口**：结果 HTML 直接铺满并切成 detached 模式，`attach(root)` 拿到的 `root` 是文档根（此时节点 id 要在整篇文档里唯一，用 `document.getElementById` 找即可） |
 | `window.resize` | 允许插件请求宿主改变窗口尺寸 |
 | `process.spawn` | **允许插件起一个自带的本机进程**（配合清单 `sidecar` 段，见下面「自带本机程序」）。**与其它能力不同：这一条必须过信任卡**（默认拒绝）—— 能 spawn 任意二进制的插件能力无上界，不能靠「声明即生效」 |
+| `net.fetch` | **允许插件通过宿主代请求外网**（2026-10-18）。插件自己 `fetch()` 会被 CSP 拦掉；宿主会拒绝本机 / 私网地址，并为响应体设上限 |
+| `media.proxy` | **允许插件用 `lunac-media` 代理图片 / 视频**（2026-10-18，A2）。用于需要 Referer / UA 的防盗链；只代理公网 http(s)，并原样转发 `Range`（视频可拖动）。未声明时宿主回 403 |
+| `storage.plugin` | **允许插件使用宿主 KV**（2026-10-18，A3）：按插件 id 命名空间、有配额、卸载即清除。未声明时 `__lunac_host.storage` 的读写会回 `E_DENIED` |
+| `engine.eval` | **允许插件把脚本交给宿主 QuickJS 执行**（2026-10-18，A4）。无文件 / 网络 / 进程绑定，默认 3s、上限 30s，内存 32 MiB；它是**脚本执行边界，不是 OS 沙箱** |
+| `webview.sniff` | **允许插件让宿主开一个隐藏 WebView 打开剧集页并拦截媒体请求**（2026-10-21）：只回传 m3u8 / mp4 地址，不读页面内容、不注入脚本；窗口不可见、不进任务栏，拿到首个地址或超时后立即关闭。未声明时 `plugin_sniff_media` 回 `E_DENIED` |
+
+> `media.proxy` 的用法：
+>
+> ```js
+> const src = globalThis.__lunac_host?.media?.proxy(pageUrl, {
+>   referer: "https://example.com/",   // 可选
+>   userAgent: "Mozilla/5.0 …",        // 可选
+> }) ?? pageUrl;
+> // 然后 <img src={src}> / <video src={src}>
+> ```
+>
+> 它返回的是宿主协议 URL（Windows 上是 `http://lunac-media.localhost/...`），
+> **不是**让你自己 `fetch()` 的地址。宿主只回媒体字节，不执行、不解析。
+> 当前通过**插件悬浮窗**的 `__lunac_host.media` 暴露（`apiVersion >= 3`）；
+> 主窗内嵌桥仍是 v2，iframe 信道暂未开放该 method。
+
+> `storage.plugin` 的边界（A3）：
+>
+> - 落盘在 `<exe 根>\ModuleData\plugin-data\<插件 id>\kv.json`，**同一插件的所有面板共享**；
+> - 配额：键 ≤ 128 字符、单值 ≤ 256 KiB、总量 ≤ 2 MiB、最多 500 个键；
+> - **卸载插件即删数据**；它不是沙箱，**不要存放密码 / token**。
+>
+> ```js
+> const kv = globalThis.__lunac_host?.storage;
+> await kv?.set("lastQuery", "abc");
+> const last = await kv?.get("lastQuery");
+> ```
+
+> `engine.eval` 的边界（A4）：
+>
+> - 每次调用新建一个 QuickJS 运行时，**不跨调用保留状态**；
+> - 脚本只能计算：没有 `fetch` / `require` / 文件 / 进程绑定；
+> - 默认 3s、上限 10s；内存 32 MiB、栈 1 MiB；源码与结果各 ≤ 1 MiB；
+> - 失败错误码：`E_DENIED`（未声明能力）、`E_TIMEOUT`、`E_LIMIT`、`E_SCRIPT`。
+>
+> ```js
+> const result = await globalThis.__lunac_host?.engine?.eval(
+>   "args.items.map((x) => x.title)",
+>   { timeoutMs: 2000, args: { items: [{ title: "A" }] } },
+> );
+> ```
 
 > 诚实说明：这一层是**声明 + 告知**，不是沙箱 —— 插件是本机可执行代码。
 > 没有声明的能力不会生效（而且是静默不生效），所以**要什么就写什么**。
@@ -244,8 +325,14 @@ WebView 里做不了的事（跑 `ffmpeg` / `aria2` / `llama.cpp`、开串口 / 
 | `readyTimeoutSec` | **就绪超时（秒，缺省 10，上限 3600）**：起进程后等「就绪信号」的上限。大模型 / 慢启动服务写大些（如 180），否则会被误判成失败并**杀掉进程** |
 | `sha256` | 可执行文件校验和（64 位十六进制，**建议写**；写了就必须对上） |
 | `allowLocalPorts` / `allowLocalAny` | **额外授权**访问的本机端口，见下 |
+| `memoryLimitMiB` | **单进程内存上限（MiB，`0` = 不限，缺省 0）**：非 0 时必须在 `32..=32768`。宿主为该 sidecar 建独立 Job Object 执行，触顶由内核终止进程（**资源闸，不是隔离**） |
+| `processLimit` | **该 sidecar 进程树的最大进程数（`0` = 不限，缺省 0）**：上限 `64`。防止 sidecar 无限 fork |
 
 > **同一段 `sidecar` 里没有 `permissions: ["process.spawn"]` 会被直接拒装** —— 两者必须同时出现。
+>
+> **资源闸的边界（必须如实理解）**：`memoryLimitMiB` / `processLimit` 只约束**这个插件的进程树**，
+> 不影响宿主与 agent 的全局 Job Object；超限时进程会被内核结束，宿主会收到退出事件。
+> 这是**容量保护**，**不是沙箱 / 不是隔离** —— 它不限制文件、网络、设备访问。
 
 **信任门（硬）**：第一次 `start()` 会弹一张卡，如实列出 `command` / `args` / `sha256` /
 可访问端口，由**用户**裁决（仅本次 / 始终信任 / 拒绝）。**默认拒绝** —— 没批准绝不起进程。
@@ -281,6 +368,69 @@ await sc.stop();                                // 收进程（面板关闭时�
    所以别在 `execute()` 里同步起进程 —— 先画面板，在 `attach(root)` 里再 `start()`。
 2. **收尾归你**：进程是**完整本机程序**，不是沙箱。声明什么才有什么，别声明用不到的。
 3. **进程要自己退**：宿主会 `kill`，但你的子进程如果又派了孙子进程，得自己在退出路径上收干净。
+
+**插件存储（sidecar → 宿主，2026-11-15）**：sidecar 可以在**自己的 stdout** 上发请求行，
+宿主的读线程会就地答（写回你的 stdin）。**作用域锁死在当前插件 id** —— 拿不到别的插件的键。
+
+```jsonc
+// 你发：{"id":1,"method":"kv.set","params":{"key":"theme","value":{"dark":true}}}
+// 宿主回：{"id":1,"result":{"bytes":42}}
+{"id":2,"method":"kv.get","params":{"key":"theme"}}     // → {"found":true,"value":{"dark":true}}
+{"id":3,"method":"kv.delete","params":{"key":"theme"}}  // → {"removed":true}
+{"id":4,"method":"kv.list"}                             // → {"entries":[{"key":"theme","bytes":42}],"bytes":…}
+{"id":5,"method":"kv.clear"}                            // → {"bytes":0}
+```
+
+- 失败一律回 `{"id":N,"error":{"message":"…人话…"}}`；未知方法会列出支持的那五个。
+- **不要自己去读写 `kv.json`**：宿主的写入走全局互斥 + 原子替换，插件进程直接改文件会与它打架。
+- 配额与界面一致（单插件 256 KiB / 单值 64 KiB / 键数 256）；超限会被拒，**不会**截断或丢旧键。
+
+### 开发工具链：`dev`（进阶，2026-10-18）
+
+插件可以声明「编译 / 打包自己需要什么」。宿主**永远不会**因为安装插件就下载工具链或执行构建，
+所有动作都必须由用户在「设置 → 插件 → 开发工具链」里**显式授权**。
+
+```json
+{
+  "dev": {
+    "toolchains": [
+      {
+        "id": "node",
+        "version": "22.14.0",
+        "url": "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip",
+        "sha256": "…64 位十六进制…",
+        "kind": "archive",
+        "dest": ".toolchain/node",
+        "binDir": ".toolchain/node/node-v22.14.0-win-x64"
+      }
+    ],
+    "build": { "command": "npm", "args": ["run", "build"], "cwd": "." }
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `toolchains[]` | 最多 **2** 条。每条 = 一个可下载的 profile |
+| `toolchains[].id` | 同时是 `.toolchain\<id>\` 的目录名；合法字符同插件 id，不许重复 |
+| `toolchains[].url` | **必须 https** |
+| `toolchains[].sha256` | **必填**（64 位十六进制）。工具链是可执行代码，没有哈希就不发 |
+| `toolchains[].kind` | `file`（单个文件，缺省）/ `archive`（解压到 `dest`） |
+| `toolchains[].dest` | 相对插件目录的落点，**必须在 `.toolchain\` 下** |
+| `toolchains[].binDir` | 装完后加进构建 `PATH` 的目录（相对插件目录，**也必须在 `.toolchain\` 下**） |
+| `build.command` | **包内相对路径**（含 `/` / `\` / 以 `.` 开头）或**缺省白名单**里的裸命令（`node` / `npm` / `npx` / `pnpm` / `yarn` / `bun` / `deno` / `cargo` / `rustc` / `python` / `python3` / `pip` / `pwsh` / `powershell` / `makensis`） |
+| `build.args` | 参数数组（不经 shell），最多 32 条、单条 ≤ 1024 字符 |
+| `build.cwd` | 工作目录（相对插件目录，不得越界；空 = 插件目录） |
+
+**授权与失效（硬）**：
+
+- 授权键 = `(插件 id, dev 段指纹)`。指纹覆盖 profile 的 `id/version/sha256/url/dest/kind/binDir`
+  与 `build` 的 `command/args/cwd` —— **改任何一个字段，旧授权立即失效**，必须重新授权。
+- 授权记录落在 `<exe 根>\config\plugin-toolchain.json`（按插件 id + 指纹），**不随插件目录走**。
+- 撤销授权会**立刻杀掉**该插件的构建进程；可选择同时删除 `.toolchain\`。
+- **永不自动化**：安装插件 = 只登记声明；跑构建 = 用户点「构建」；都不在安装管线里。
+- **裸命令只从工具链 `binDir` 解析**，不回落系统 `PATH` —— 声明了工具链就只用声明的那份。
+- **不是沙箱**：构建进程能读写用户有权访问的一切。工具链与资源闸都只是「可撤销 + 可限额」。
 
 ## 3. 入口契约：`index.js`
 
@@ -367,7 +517,20 @@ t("music.play");   // → 宿主当前语言的翻译
 | 桥字段 | 说明 |
 |---|---|
 | `t(key, params?)` | 宿主 i18n 的翻译函数（与内置插件共用同一份语言状态） |
-| `apiVersion` | 桥的协议版本，当前 `2`。可据此做兼容分支（`sidecar` 等新能力要 `>= 2`） |
+| `apiVersion` | 桥的协议版本，当前 `3`（插件悬浮窗）。可据此做兼容分支：`sidecar` 要 `>= 2`，`net` / `storage` / `media` / `engine` 要 `>= 3` |
+| `net.request(req)` | 宿主代请求（`apiVersion >= 3`，且清单声明 `permissions: ["net.fetch"]`）。参数 `{ url, method?, headers?, body?, timeoutMs?, maxBytes? }`，返回 `{ url, status, headers, body }` |
+| `storage` | 插件 KV（按插件 id 命名空间）：`get` / `set` / `remove` / `keys`。需声明 `permissions: ["storage.plugin"]`，否则回 `E_DENIED` |
+| `media.proxy(url, opts?)` | 媒体代理（`apiVersion >= 3`，需 `permissions: ["media.proxy"]`）：返回可给 `<img>` / `<video>` 的 URL；`opts = { referer?, userAgent? }`，宿主转发 `Range` |
+| `engine.eval(code, opts?)` | 宿主 QuickJS 沙箱（`apiVersion >= 3`，需 `permissions: ["engine.eval"]`）：`opts = { timeoutMs?, args? }`；脚本内可用全局 `args`，完成值按 JSON 回传（`undefined` → `null`） |
+| `sniff.media(url, opts?)` | WebView 嗅探（`apiVersion = 3` 的增补字段，2026-10-21，需 `permissions: ["webview.sniff"]`）：开隐藏 WebView 打开 `url`，返回拦截到的 m3u8 / mp4 地址数组；`opts = { timeoutMs? }`，缺省等 15s |
+
+```js
+const host = globalThis.__lunac_host;
+if (host?.apiVersion >= 3 && host.net) {
+  const res = await host.net.request({ url: "https://api.example.com/search?q=hi" });
+}
+```
+
 
 > 桥是**可选**的：插件完全可以用自己写死的文案（多语言插件再自己判断 `navigator.language`）。
 > **发现 `undefined` 时务必给兜底**（`??`），否则在旧版宿主上会整个插件报错。
@@ -523,8 +686,13 @@ const engine = new URL("bin/librespot.exe", dir).pathname;
 ```json
 { "id": "pomodoro", "name": "番茄钟", "description": "25 分钟专注计时器",
   "version": "1.0.0", "url": "https://example.com/pomodoro-1.0.0.zip",
+  "sha256": "0f1e2d…（64 位十六进制，zip 本体的校验和）",
   "keywords": ["pomodoro", "番茄"], "icon": "🍅", "homepage": "https://example.com" }
 ```
+
+> **`sha256`（2026-10-18）**：装包前由宿主逐字节校验，对不上**整包拒绝**（旧版本不动）。
+> 迁移期允许缺省（宿主 warn 留痕、仍安装），但新发布的包都应带上；
+> `scripts\publish-plugins.ps1` 会自动算好写进索引。
 
 > **市场索引的当前形态**：`index.json` 顶层是数组、**没有 `category` 字段**；包按分类放在插件仓库的
 > **`packages/<分类>/<id>-<版本>.zip`**，条目里的 `url` 写**整条**直链（如

@@ -51,12 +51,17 @@ export const webSearchPlugin: Plugin = {
   description: "Search the web with your default browser",
   icon: "🌐",
   badge: "Web",
+  provides: ["web.search"],
 
   async execute(input: string) {
     const engine = getSearchEngine();
     const url = buildSearchUrl(input, engine);
 
     try {
+      // 执行搜索结果时先播退场动画（宿主提供；非主窗搜索态返回 0，直接隐藏）
+      const wait = (window as any).__lunac_play_exit?.() ?? 0;
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+
       // Hide window first
       const win = getCurrentWindow();
       await win.hide();

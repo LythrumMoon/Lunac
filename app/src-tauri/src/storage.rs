@@ -22,10 +22,10 @@
 // 旧版本数据曾放在 %LOCALAPPDATA%\Lunac(-dev)，首次启动由
 // migrate_legacy_localappdata() 整体搬移后删除。
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 /// 应用数据根目录 = 可执行文件所在目录（exe 安装根）。
 ///   release → 安装目录；dev → target\debug。dev/release 数据因此天然隔离。
@@ -40,6 +40,52 @@ pub fn lunac_root_dir() -> PathBuf {
 /// 业务数据根目录：<exe_dir>\ModuleData
 pub fn module_data_dir() -> PathBuf {
     lunac_root_dir().join("ModuleData")
+}
+
+// ── 定时任务（<exe_dir>\ModuleData\tasks\，2026-10-17 阶段 0 / 1）──────
+//
+// **路径的唯一真相源**：宿主命令 / 调度器 / `LUNAC_CRON_DIR` 注入 / agent 侧读取都只认这里。
+//   · `cron.json`       = job 定义，**只由 agent 侧的 CronCreate / CronDelete 写**；
+//   · `cron-state.json` = 运行态，**只由宿主调度器写**（`cron.rs`）；
+//   · `cron.lock`       = 两个写者共用的跨进程锁（create_new + 超时重试 + 释放即删）。
+// 两文件拆开是为了避免两个进程对同一份 JSON 做读改写而互相丢更新；锁进一步保护
+// 「读 → 改 → 原子替换」这段临界区。
+
+/// 定时任务目录：<exe_dir>\ModuleData\tasks
+pub fn cron_dir() -> PathBuf {
+    module_data_dir().join("tasks")
+}
+
+/// job 定义文件：<exe_dir>\ModuleData\tasks\cron.json
+pub fn cron_defs_path() -> PathBuf {
+    cron_dir().join("cron.json")
+}
+
+/// 运行态文件：<exe_dir>\ModuleData\tasks\cron-state.json
+pub fn cron_state_path() -> PathBuf {
+    cron_dir().join("cron-state.json")
+}
+
+/// 通用后台任务队列：<exe_dir>\ModuleData\tasks\queue.json（2026-10-22，S2）。
+///
+/// 与 cron 共用 `tasks\` 目录，但**文件与锁都独立**：`queue.json` 由 agent 侧的
+/// TaskEnqueue / TaskCancel 写、宿主 worker 读写运行态，`queue.lock` 保护读改写。
+pub fn task_queue_path() -> PathBuf {
+    cron_dir().join("queue.json")
+}
+
+/// 跨进程锁文件：<exe_dir>\ModuleData\tasks\cron.lock
+/// （agent 侧的 CronCreate / CronDelete 与宿主调度器共用同一把锁）。
+/// `dir` 由调用方给出（生产 = [`cron_dir`]，单测 = 临时目录）。
+pub fn cron_lock_path_in(dir: &Path) -> PathBuf {
+    dir.join("cron.lock")
+}
+
+/// 确保定时任务目录存在（启动时调一次；手工夹具也要先把文件放进这个目录）。
+pub fn ensure_cron_dir() -> Result<PathBuf, String> {
+    let dir = cron_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
 }
 
 // ── AI 配置（<exe_dir>\config\ai.json）───────────────────────────
@@ -125,10 +171,30 @@ pub fn save_ai_config(cfg: &AiConfig) -> Result<(), String> {
 // 没装 / 没开开关时，agent 就不该拿到本机端点（见 commands.rs 的 local_model_env）。
 
 /// 本地模型决策开关。字段级 `#[serde(default)]`：旧文件或手工编辑缺字段也能读。
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LocalModelConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// **本地决策层是否真的参与**（2026-10-24）。
+    ///
+    /// 默认 `true` —— 开关打开 = 「起模型 + 开决策」两件事一起开（C 组实验踩过的坑：
+    /// 界面显示「已就绪」但 agent 侧 `decide=0`，零判定行）。只有排障时才把这个字段
+    /// 手工写成 `false`（只探活、不决策），不额外做界面开关。
+    #[serde(default = "default_decide")]
+    pub decide: bool,
+}
+
+fn default_decide() -> bool {
+    true
+}
+
+impl Default for LocalModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            decide: true,
+        }
+    }
 }
 
 pub fn local_model_config_path() -> PathBuf {
@@ -508,7 +574,9 @@ pub fn ensure_pricing_file() -> Result<PathBuf, String> {
 /// 判据是**键在不在**，不是「值空不空」：用户若故意写成 `"holidays": []`（明确声明无节假日），
 /// 键已存在 ⇒ 不会再补。
 fn backfill_pricing_holidays(path: &Path) {
-    let Ok(text) = fs::read_to_string(path) else { return };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
     else {
         return; // 坏 JSON 交给面板如实报错，别在这里猜
@@ -525,7 +593,9 @@ fn backfill_pricing_holidays(path: &Path) {
         return;
     };
     obj.insert("holidays".into(), holidays);
-    let Ok(out) = serde_json::to_string_pretty(&v) else { return };
+    let Ok(out) = serde_json::to_string_pretty(&v) else {
+        return;
+    };
     // 写回前先校验：宁可不补，也不要留一份面板读不动的半坏表
     if validate_pricing_text(&out).is_err() {
         return;
@@ -660,7 +730,9 @@ pub fn validate_pricing_text(text: &str) -> Result<(), String> {
             .ok_or_else(|| format!("模型 `{name}` 的 `time_windows` 必须是一个数组"))?;
         for (i, w) in arr.iter().enumerate() {
             let what = format!("模型 `{name}` 的 `time_windows[{i}]`");
-            let w = w.as_object().ok_or_else(|| format!("{what} 必须是一个对象"))?;
+            let w = w
+                .as_object()
+                .ok_or_else(|| format!("{what} 必须是一个对象"))?;
             validate_price_fields(&what, w)?;
             let from = w
                 .get("from")
@@ -723,7 +795,6 @@ pub fn commit_pricing_pending(workdir: &Path, today: &str) -> Result<PathBuf, St
     clear_pricing_pending(workdir)?;
     Ok(pricing_config_path())
 }
-
 
 // ── 旧数据整体迁移（%LOCALAPPDATA%\Lunac(-dev) → exe 根）──────────────
 // 迁移后会删除旧目录（用户决策）。幂等：仅当目标 ModuleData 尚未存在时才复制；
@@ -902,6 +973,14 @@ pub struct SessionProcess {
     /// 「输出挂到错误消息下」）。**旧记录没有该字段 ⇒ `None` 按「有消息」处理**（旧行为）。
     #[serde(rename = "hasMsg", default, skip_serializing_if = "Option::is_none")]
     pub has_msg: Option<bool>,
+    /// 本回合墙钟耗时（毫秒）。回合信息条（人格名下方）在历史回放里要显示「耗时」，
+    /// 而 `items` 里没有时间信息 ⇒ 前端随快照一起落盘。**旧记录没有该字段**。
+    #[serde(
+        rename = "durationMs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub duration_ms: Option<u64>,
     #[serde(default)]
     pub items: Vec<SessionStep>,
 }
@@ -932,6 +1011,14 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
     #[serde(rename = "createdAt")]
     pub created_at: u64,
+    /// 最后一次**内容变化**的时间（毫秒）。由后端在保存时维护，前端不需要传；
+    /// 历史列表按它排序，跨天继续的会话因此会排到前面（2026-11-05）。
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: u64,
+    /// 会话状态：`""`（未知）/ `"running"` / `"interrupted"` / `"done"`。
+    /// 后端只在内容变化且前端没给值时装 `"done"`；中间态由前端显式上报（2026-11-05）。
+    #[serde(default)]
+    pub status: String,
     /// token 用量（表盘口径）——历史回顾时前端读回表盘
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SessionUsage>,
@@ -941,6 +1028,11 @@ pub struct ChatSession {
     /// 待办清单时间线 —— 回退 / 切会话后重建任务抽屉（见 `SessionTodo`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todos: Option<Vec<SessionTodo>>,
+    /// 生成这段对话时的**人格展示名**（2026-10-24）。历史回放必须用它，而不是
+    /// 「当前应用的人格名」—— 否则改一次预设名，之前所有会话的署名都会跟着变。
+    /// 旧记录没有该列 / 空串 ⇒ 前端回落到当前名（无法追溯，只能按现状显示）。
+    #[serde(default)]
+    pub persona: String,
     /// 会话来源（2026-10-10）：`""` / 缺省 = 普通聊天（前端 `activeThread="chat"`）；
     /// `"pet"` = 桌宠发起的对话。两条线程各自独立成会话、分开落库（同一 chat.db，
     /// 用这一列区分即可），前端历史 UI 据此分「对话 / 桌宠」两页。
@@ -970,9 +1062,7 @@ pub fn save_chat_sessions(sessions: Vec<ChatSession>) -> Result<(), String> {
     // 放在这里而不是前端的删除路径：这是**唯一**知道「现在还剩哪些会话」的地方；
     // 散在前端迟早漏一处 —— 表现是「历史删了，可用户文件副本还躺在盘上」。
     // 不返回错误：清理失败不该让会话保存失败。
-    crate::snapshots::prune_frames(
-        &sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
-    );
+    crate::snapshots::prune_frames(&sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>());
     Ok(())
 }
 
@@ -1012,7 +1102,9 @@ pub struct ClipEntry {
     pub time: u64,
 }
 
-fn default_clip_type() -> String { "text".to_string() }
+fn default_clip_type() -> String {
+    "text".to_string()
+}
 
 const CLIP_FILE: &str = "clipboard-history.json";
 
@@ -1075,9 +1167,17 @@ pub fn append_clipboard_entry(text: String) -> Result<(), String> {
     entries.insert(
         0,
         ClipEntry {
-            clip_type: if is_file { "file".into() } else { "text".into() },
+            clip_type: if is_file {
+                "file".into()
+            } else {
+                "text".into()
+            },
             text: trimmed.to_string(),
-            file_paths: if is_file { vec![trimmed.to_string()] } else { vec![] },
+            file_paths: if is_file {
+                vec![trimmed.to_string()]
+            } else {
+                vec![]
+            },
             time: now,
         },
     );
@@ -1130,7 +1230,11 @@ pub struct UsageRecord {
     /// 唯一用途是**归因** —— 让这条用量记录、stdout 的消息、agent 落盘日志三者能对上
     /// 「哪些东西属于同一次运行」；对账口径本身仍按 `ts` + `model` 走。
     /// 旧记录没有该字段，读时按空串（`serde(default)`），空值也不写回日志。
-    #[serde(rename = "sessionId", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "sessionId",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub session_id: String,
     /// 这条用量的**来源归因**（2026-10-09）：`"pet"` = 桌宠发起的那一轮，空串 = 普通聊天。
     /// 与 `session_id` 同为归因字段（不影响金额口径本身）；成本面板的「来源」下拉据此过滤
@@ -1166,6 +1270,13 @@ pub struct UsageRecord {
     /// 旧记录没有该字段，读时按 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<UsageSubagent>,
+    /// 上面四类总量里**来自后台复盘 fork** 的部分（2026-10-27，`docs/todo.md` §待办 3-16 P2-8）。
+    ///
+    /// 与 `subagent` 同口径、同样是**其中的一部分**（不得再加一次）。拆开的理由：
+    /// 复盘是无人值守的收口成本，子代理是用户看得见的探索成本 —— 混在一起就无法判断
+    /// 「钱花在探索还是收口上」。旧记录没有该字段，读时按 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<UsageSubagent>,
     /// 这条记录是**中断收尾的兜底值**（2026-10-06）：回合被取消 / agent 被强杀，拿不到
     /// 收尾的 `result.usage`，只能用 agent 逐请求上报的 `usage_delta` 累计值落账。
     ///
@@ -1202,9 +1313,13 @@ fn validate_iso_date(date: &str) -> Result<(), String> {
     let ok = b.len() == 10
         && b[4] == b'-'
         && b[7] == b'-'
-        && b.iter()
-            .enumerate()
-            .all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() });
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        });
     if !ok {
         return Err(format!("invalid date: {date}"));
     }
@@ -1365,11 +1480,13 @@ pub fn read_usage_range(
             day.cache_read += r.cache_read;
             day.cache_create += r.cache_create;
             let key = (r.source.clone(), r.model.clone());
-            let m = by_model.entry(key.clone()).or_insert_with(|| UsageModelTotals {
-                model: r.model.clone(),
-                source: r.source.clone(),
-                ..Default::default()
-            });
+            let m = by_model
+                .entry(key.clone())
+                .or_insert_with(|| UsageModelTotals {
+                    model: r.model.clone(),
+                    source: r.source.clone(),
+                    ..Default::default()
+                });
             m.turns += 1;
             m.requests += reqs;
             m.input += r.input;
@@ -1471,11 +1588,8 @@ pub fn memo_save_image(id: String, index: usize, data_url: String) -> Result<Str
         .split(',')
         .nth(1)
         .ok_or("Invalid data URL format")?;
-    let bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        b64,
-    )
-    .map_err(|e| format!("Base64 decode failed: {e}"))?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+        .map_err(|e| format!("Base64 decode failed: {e}"))?;
 
     let dir = memo_images_dir(&id);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1542,6 +1656,7 @@ mod tests {
             dropped: 0,
             requests: vec![],
             subagent: None,
+            review: None,
             partial: false,
         }
     }
@@ -1549,7 +1664,14 @@ mod tests {
     /// 文件名来自前端 —— 必须挡住跨目录拼串与非 `YYYY-MM-DD` 形态
     #[test]
     fn usage_log_path_only_accepts_iso_date() {
-        for bad in ["", "2026-9-1", "2026/09/12", "../2026-09-12", "2026-09-12x", "2026-09-1"] {
+        for bad in [
+            "",
+            "2026-9-1",
+            "2026/09/12",
+            "../2026-09-12",
+            "2026-09-12x",
+            "2026-09-1",
+        ] {
             assert!(usage_log_path(bad).is_err(), "should reject `{bad}`");
         }
         assert!(usage_log_path("2026-09-12").is_ok());
@@ -1562,10 +1684,10 @@ mod tests {
     fn plan_path_only_accepts_a_local_timestamp() {
         for bad in [
             "",
-            "2026-09-20",              // 缺时刻 ⇒ 同一天批准两次会互相覆盖
-            "2026-09-20_14301",        // 秒不足两位
-            "2026-09-20_143012.md",    // 扩展名由后端拼，前端不许带
-            "2026-09-20 143012",       // 空格（前端顺手用 toLocaleString 就会长这样）
+            "2026-09-20",           // 缺时刻 ⇒ 同一天批准两次会互相覆盖
+            "2026-09-20_14301",     // 秒不足两位
+            "2026-09-20_143012.md", // 扩展名由后端拼，前端不许带
+            "2026-09-20 143012",    // 空格（前端顺手用 toLocaleString 就会长这样）
             "20260920_143012",
             "../escape",
             "2026-09-20_143012/../x",
@@ -1574,7 +1696,10 @@ mod tests {
         }
         let p = plan_path("2026-09-20_143012").unwrap();
         assert_eq!(p.file_name().unwrap(), "2026-09-20_143012.md");
-        assert!(p.parent().unwrap().ends_with("plans"), "落点必须是 plans\\ 下");
+        assert!(
+            p.parent().unwrap().ends_with("plans"),
+            "落点必须是 plans\\ 下"
+        );
     }
 
     /// 字段名是前端 `read_usage_log` 的消费契约（cacheRead/cacheCreate 驼峰；
@@ -1593,18 +1718,23 @@ mod tests {
     #[test]
     fn usage_record_session_id_is_backward_compatible() {
         let old = r#"{"ts":1,"model":"m","input":1,"output":1,"cacheRead":0,"cacheCreate":0}"#;
-        assert_eq!(serde_json::from_str::<UsageRecord>(old).unwrap().session_id, "");
+        assert_eq!(
+            serde_json::from_str::<UsageRecord>(old).unwrap().session_id,
+            ""
+        );
         let mut r = rec(0);
         r.session_id = String::new();
         assert!(!serde_json::to_string(&r).unwrap().contains("sessionId"));
     }
 
-    /// 子代理 / 复盘的归因字段（2026-09-29）：它是**总量的一部分**，只作归因 ——
-    /// 旧记录没有该键（读成 `None`），`None` 也不写回日志（不给旧格式添噪音）。
+    /// 子代理 / 复盘的归因字段（2026-09-29；2026-10-27 拆成两份）：它是**总量的一部分**，
+    /// 只作归因 —— 旧记录没有这些键（读成 `None`），`None` 也不写回日志（不给旧格式添噪音）。
     #[test]
     fn usage_record_subagent_attribution_is_optional() {
         let old = r#"{"ts":1,"model":"m","input":1,"output":1,"cacheRead":0,"cacheCreate":0}"#;
-        assert!(serde_json::from_str::<UsageRecord>(old).unwrap().subagent.is_none());
+        let parsed = serde_json::from_str::<UsageRecord>(old).unwrap();
+        assert!(parsed.subagent.is_none());
+        assert!(parsed.review.is_none(), "旧记录没有 review 键 ⇒ None");
 
         let mut r = rec(0);
         r.subagent = Some(UsageSubagent {
@@ -1614,12 +1744,25 @@ mod tests {
             cache_creation_input_tokens: 0,
             requests: 2,
         });
+        r.review = Some(UsageSubagent {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 0,
+            requests: 1,
+        });
         let line = serde_json::to_string(&r).unwrap();
         assert!(
             line.contains(
                 r#""subagent":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":0,"requests":2}"#
             ),
             "{line}"
+        );
+        assert!(
+            line.contains(
+                r#""review":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":0,"requests":1}"#
+            ),
+            "复盘必须单独成段（§待办 3-16 P2-8）：{line}"
         );
     }
 
@@ -1628,11 +1771,24 @@ mod tests {
     fn usage_record_serializes_per_request_rows() {
         let mut r = rec(1536);
         r.requests = vec![
-            UsageRequest { input: 700, read: 0, create: 0, out: 12 },
-            UsageRequest { input: 20, read: 680, create: 0, out: 8 },
+            UsageRequest {
+                input: 700,
+                read: 0,
+                create: 0,
+                out: 12,
+            },
+            UsageRequest {
+                input: 20,
+                read: 680,
+                create: 0,
+                out: 8,
+            },
         ];
         let line = serde_json::to_string(&r).unwrap();
-        assert!(line.contains(r#""requests":[{"in":700,"read":0,"create":0,"out":12}"#), "{line}");
+        assert!(
+            line.contains(r#""requests":[{"in":700,"read":0,"create":0,"out":12}"#),
+            "{line}"
+        );
         assert_eq!(
             serde_json::from_str::<UsageRecord>(&line).unwrap().requests[1].read,
             680
@@ -1681,11 +1837,7 @@ mod tests {
         append_usage_log(d2.into(), rec(7000)).unwrap();
 
         // 中间夹一天没记录 → 不返回（面板不显示全零行）
-        let days = read_usage_range(
-            vec![d1.into(), "1970-01-05".into(), d2.into()],
-            0,
-        )
-        .unwrap();
+        let days = read_usage_range(vec![d1.into(), "1970-01-05".into(), d2.into()], 0).unwrap();
         assert_eq!(days.len(), 2, "空天必须被跳过：{days:?}");
 
         let day1 = &days[0];
@@ -1756,7 +1908,11 @@ mod tests {
             .iter()
             .map(|h| (h.hour, h.input))
             .collect();
-        assert_eq!(hours, vec![(20, 100), (21, 200)], "东八区桶（偏移参与换算）");
+        assert_eq!(
+            hours,
+            vec![(20, 100), (21, 200)],
+            "东八区桶（偏移参与换算）"
+        );
 
         // 桶与总量是**同一批 token 再切一刀**，不是两批
         assert_eq!(cn.models[0].input, 300);
@@ -1780,7 +1936,11 @@ mod tests {
         assert_eq!(m["input"].as_f64(), Some(1.0), "基础价 = 谷价");
         assert_eq!(m["output"].as_f64(), Some(4.0), "基础价 = 谷价");
         let windows = m["time_windows"].as_array().expect("必须有峰时窗口");
-        assert_eq!(windows.len(), 2, "官方峰时是两段：09:00-12:00 与 14:00-18:00");
+        assert_eq!(
+            windows.len(),
+            2,
+            "官方峰时是两段：09:00-12:00 与 14:00-18:00"
+        );
         assert_eq!(windows[0]["from"].as_str(), Some("09:00"));
         assert_eq!(windows[0]["to"].as_str(), Some("12:00"));
         assert_eq!(windows[1]["from"].as_str(), Some("14:00"));

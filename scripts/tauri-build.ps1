@@ -17,7 +17,8 @@ $releaseDir = Join-Path $PSScriptRoot "..\app\src-tauri\target\release"
 $stale = @(
   (Join-Path $releaseDir "bundle"),     # 上一次的安装包输出目录（nsis/msi）
   (Join-Path $releaseDir "lunac.exe"),  # 上一次的可执行文件
-  (Join-Path $releaseDir "agent.exe")   # 平铺副本，构建时重拷
+  (Join-Path $releaseDir "agent.exe"),  # 平铺副本，构建时重拷
+  (Join-Path $releaseDir "lunac-media-proxy.exe")  # bundle.resources 平铺副本，构建时重拷
 )
 foreach ($p in $stale) {
   if (-not (Test-Path -LiteralPath $p)) { continue }

@@ -1,9 +1,9 @@
 // Keep track of the last active settings category across open/close cycles
 let activeSettingsCategory = "general";
-// 四组「自定义」拉条的展开状态：跨「关掉设置再打开」保留（否则每次进来都要再点一次
+// 三组「自定义」拉条的展开状态：跨「关掉设置再打开」保留（否则每次进来都要再点一次
 // 「自定义」才看得到滑块，用户会以为设置在跳）。
 let bgSlidersOpen = false;
-/** 底色 / 按钮 / 文字（2026-09-20 新增的后两组，形态与背景那组一致）
+/** 底色 / 按钮（2026-09-20 新增的后两组，形态与背景那组一致）
  *  + 其他颜色（2026-09-21）。 */
 let basePanelOpen = false;
 let btnPanelOpen = false;
@@ -69,16 +69,16 @@ function ensureUpdateProgressListener(): void {
 
 import type { Plugin } from "../registry";
 import { pluginRegistry } from "../registry";
-import { refreshMarketPlugins, fetchPluginIndex, hasDiskPlugin, diskPluginReady, type MarketPluginInfo, type MarketIndexEntry } from "../market";
+import { refreshMarketPlugins, fetchPluginIndex, type MarketPluginInfo, type MarketIndexEntry } from "../market";
 import { isBasePlugin, showsInMarket, basePluginOrder, isHeadlessPlugin } from "../kinds";
 import { detachPluginListeners } from "../attach";
-import { startPluginSidecarTrusted, stopPluginSidecar } from "../sidecar";
+import { anchorPlugins, mountAnchorPlugins, type AnchorMountHandle } from "../anchor-slots";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { t, setLanguage, resetToSystemLanguage, pluginName, pluginDesc } from "../../i18n.js";
 // 下载进度（小圆圈 + 中间数字 + 实时速度）。**零依赖的公共件** —— OCR 插件那份单独打包的
 // ESM 也要用（见 download-progress.ts 顶部说明）。
-import { DownloadMeter, formatSpeed, ringHtml, updateRing } from "../../download-progress.js";
+import { DownloadMeter, InstallOverall, formatBytes, formatSpeed, ringHtml, updateRing } from "../../download-progress.js";
 // 用量与成本的数据层 / 渲染层（2026-09-29 起与主界面表盘的展开面板共用一份，
 // 逐日表格与价格表数据都搬到了那个面板里，见 usage-cost.ts 顶部注释）。
 import {
@@ -253,7 +253,8 @@ interface AppearanceConfig {
   /** 界面上的「底色透明度」（原「界面玻璃透明度」）。2026-09-20 从背景区迁进「底色自定义」。 */
   surfaceAlpha: number;
   /** **「恢复默认主题」**。**默认 false**（开 = 底色 / 按钮线条 / 按钮背景的颜色
-   *  全部不生效，回到默认主题配色；三个透明度与文字明度仍可调且生效）。字段名沿用 `tintBase`。 */
+   *  回到默认值；四种透明度在开启时被**写回默认值**，但不锁定、之后仍可调）。
+   *  字段名沿用 `tintBase`。 */
   tintBase: boolean;
   /** 空串 = 还没动过底色 ⇒ 仍按主题自动派生（取色器显示派生出来的那个色）。 */
   baseColor: string;
@@ -263,7 +264,7 @@ interface AppearanceConfig {
   /** 按钮背景色。空串 = 跟随主题色（默认）。2026-09-20 新增，不再跟底色。 */
   btnBgColor: string;
   btnBgAlpha: number;
-  /** 文字明度偏移 ±100（0 = 派生原值）。 */
+  /** 文字明度偏移 ±100（0 = 不偏移）。2026-10-18 恢复；不受「恢复默认主题」管辖。 */
   textLight: number;
   /** ── 「其他颜色」的统一浮层（2026-09-21 新增 → 同日定稿为一组）──────────
    *  初版拆成六项（结果项浮层 / 设置选中项 / 运行端文字 / 对话背景 / 设置面板背景 /
@@ -313,7 +314,7 @@ function appearanceBridge(): AppearanceBridge | null {
 
 /** 取色器的 HTML。`id` 是前缀，便于在同一页挂多个实例（底色 / 按钮线条 / 按钮背景）。 */
 function colorPickerHtml(id: string, hex: string): string {
-  const presets = ["#c0a0a0", "#3a7bd5", "#5b9a68", "#c9a227", "#c05555", "#8e6fc0", "#3f9a9a", "#d07aa0"];
+  const presets = ["#cfc8bb", "#3a7bd5", "#5b9a68", "#c9a227", "#c05555", "#8e6fc0", "#3f9a9a", "#d07aa0"];
   return `
     <div class="ap-picker" id="${id}">
       <div class="ap-picker-head">
@@ -532,7 +533,7 @@ function colorAxisRow(labelKey: string, colorSlot: string, axis: "sat" | "val", 
 function formatAppearanceValue(field: string, v: number): string {
   if (field === "bgBlur") return `${Math.round(v)}px`;
   if (field === "bgSaturate") return `${Math.round(v)}%`;
-  // 文字明度是「偏移格数」：带正负号比 -12.00 好读
+  // 文字明暗度是「偏移格数」：带正负号比 -12.00 好读
   if (field === "textLight") return (v > 0 ? "+" : "") + Math.round(v);
   return v.toFixed(2);
 }
@@ -556,9 +557,9 @@ async function buildAppearancePane(): Promise<string> {
   const ap = appearanceBridge();
   const cfg: AppearanceConfig = ap?.get() ?? {
     bgImage: null, bgBlur: 4, bgSaturate: 92, bgOpacity: 0.5,
-    sheen: 0, surfaceAlpha: 0.88, tintBase: false,
-    baseColor: "", btnLineColor: "", btnLineAlpha: 0.32,
-    btnBgColor: "", btnBgAlpha: 0.14, textLight: 0,
+    sheen: 0, surfaceAlpha: 1, tintBase: false,
+    baseColor: "", btnLineColor: "", btnLineAlpha: 1,
+    btnBgColor: "", btnBgAlpha: 0.09, textLight: 0,
     overlayColor: "", overlayAlpha: 0.1,
     themeId: "default",
   };
@@ -567,7 +568,7 @@ async function buildAppearancePane(): Promise<string> {
   // 取色器在「跟随态」（对应字段是空串）下显示什么色，由 main.ts 算好给过来 ——
   // 面板不复制那份派生逻辑（复制必然漂移）。见 AppearanceBridge.resolvedSwatches。
   const sw = ap?.resolvedSwatches() ?? {
-    base: "#c0a0a0", btnLine: "#c0a0a0", btnBg: "#c0a0a0", overlay: "#c0a0a0",
+    base: "#16181b", btnLine: "#cfc8bb", btnBg: "#cfc8bb", overlay: "#cfc8bb",
   };
   const shown = {
     base: cfg.baseColor || sw.base,
@@ -645,9 +646,8 @@ async function buildAppearancePane(): Promise<string> {
            语义 = 回到**一开始保存的那套默认主题配色**（themes/default + DEFAULT_ACCENT
            派生的底色、:root 里的按钮配方）：底色 / 按钮线条 / 按钮背景的**颜色**
            全部不生效，走主题自己的值。
-           例外（留在锁外、且值仍然生效）= **三个透明度**（底色 / 按钮线条 / 按钮背景）
-           + **文字明度**：用户先要求「开恢复默认主题时除透明度以外的选项都不可调」，
-           随后又明确「文字明度不锁定」。
+           2026-10-18 用户裁定：透明度**不是不可调** —— 打开开关时把四种透明度一次性
+           写回默认值，滑块本身不锁、之后照常可调可生效（只有配色被锁）。
            原名「主题色代替底色」，本轮改名并调整失效范围（见 ai-spec 规则 45/46）。
            注意：这段是**模板字符串内部**，注释里写不得反引号（见 code-rules 预检 #15）。 -->
       <div class="settings-row">
@@ -691,7 +691,7 @@ async function buildAppearancePane(): Promise<string> {
            （2026-09-21 起由 styles.css 末尾那条 #app button:where(...) 规则统一施加，
            连原本 background:none 的纯图标按钮也含在内 —— 用户要求「包含所有按钮」）。
            **按钮背景不再跟底色**（用户要求）—— 它自己一条 --btn-bg-*，与上方底色无关。
-           两组各自「取色器 + 透明度 + 饱和度/明度」，其中**两个透明度滑块留在锁外**。 -->
+           两组各自「取色器 + 透明度 + 饱和度/明度」，其中**两个透明度滑块均不锁**。 -->
       <div class="settings-row">
         <span class="settings-label">${t("settings.appearance_btn_label")}</span>
         <div class="settings-bg-actions">
@@ -723,10 +723,10 @@ async function buildAppearancePane(): Promise<string> {
         </div>
       </div>
 
-      <!-- ── ④ 文字自定义（2026-09-20）：**只调三档文字的明度**（主 / 次 / 弱一起挪）。
-           它是「偏移量」而不是绝对值 —— 0 = 主题派生原值（逐像素不变）。
-           **不在「恢复默认主题」的锁定范围内**（2026-09-20 四次定稿，用户明确要求
-           「文字明度不锁定」）：它是明度偏移、不是配色本身，开着开关也照常可调可生效。 -->
+      <!-- ── ④ 文字自定义（2026-09-20 新增；2026-10-18 恢复）：
+           **只调三档文字的明度**（主 / 次 / 弱一起挪）。它是「偏移量」而不是绝对值 ——
+           0 = 现有文字原值（:root 固定值或主题包 token ⇒ 逐像素不变）。
+           **不在「恢复默认主题」的锁定范围内**：明度偏移不是配色，开关开着也照常可调可生效。 -->
       <div class="settings-row">
         <span class="settings-label">${t("settings.appearance_text_label")}</span>
         <div class="settings-bg-actions">
@@ -744,7 +744,7 @@ async function buildAppearancePane(): Promise<string> {
              · 余下三处（结果项浮层 / 设置选中项 / 分类标题背景）+ **顶栏图标按钮的
                hover 浮层**（进入设置 / 退出设置 / 退出插件）合并成**一个**取色器 +
                **一条**透明度（取色器自带饱和度-明度框，所以不再重复给轴滑块）。
-           取色器受「恢复默认主题」管辖（data-tint-lock），透明度滑块留在锁外 ——
+           取色器受「恢复默认主题」管辖（data-tint-lock），透明度滑块不受管辖 ——
            与上面三组同一口径（见 ai-spec 规则 45）。 -->
       <div class="settings-row">
         <span class="settings-label">${t("settings.appearance_other_label")}</span>
@@ -773,6 +773,13 @@ async function buildAppearancePane(): Promise<string> {
       </div>
     </div>`;
 }
+
+/** 透明度默认值（2026-10-18 用户手工调整后定稿）：
+ *  底色 1 / 按钮线条 1 / 按钮背景 0.09 / 蒙版 0.1。
+ *  打开「恢复默认主题」时把四项写回这里（一次性），滑块不锁、之后仍可调。 */
+const APPEARANCE_ALPHA_DEFAULTS = {
+  surfaceAlpha: 1, btnLineAlpha: 1, btnBgAlpha: 0.09, overlayAlpha: 0.1,
+} as const;
 
 /** 「风格」分区的事件绑定。独立成函数（不塞进 attachSettingsListeners）是为了
  *  让外观这块的改动范围收敛在一个地方。 */
@@ -872,12 +879,11 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
     });
   });
 
-  /** 「恢复默认主题」开着 ⇒ **锁住三组配色，放开三个透明度 + 文字明度**（2026-09-20 四次定稿）。
+  /** 「恢复默认主题」开着 ⇒ **锁住三组配色，并把四种透明度一次性写回默认值**。
    *
-   *  锁住的是：三个取色器 + 三对「饱和度 / 明度」滑块；**留在锁外**的是
-   *  底色透明度 / 按钮线条透明度 / 按钮背景透明度（用户要求「除透明度外都不可调」）
-   *  以及**文字明度**（用户随后明确「文字明度不锁定」）。
-   *  锚点统一是 `data-tint-lock`（见 `tl()`），所以加新项只要标一下属性，不会漏。
+   *  锁住的是：三个取色器 + 三对「饱和度 / 明度」滑块（`data-tint-lock` 锚点）。
+   *  **透明度四项不锁**（2026-10-18 用户裁定：不是不可调）—— 写回默认值后同步刷新
+   *  滑块与读数，用户仍可继续拖动。
    *  用 `.locked`（遮点击 + 降透明度，同「主题锁」那套）而不是 `disabled`：
    *  自绘取色器不认 disabled（ai-spec 规则 46 已登记过这条教训）。 */
   const syncTintLock = (on: boolean) => {
@@ -887,11 +893,22 @@ function attachAppearanceControls(container: HTMLElement, ap: AppearanceBridge):
   };
   const tintToggle = pick<HTMLInputElement>("#ap-tint-base");
   tintToggle?.addEventListener("change", () => {
-    ap.set({ tintBase: !!tintToggle.checked });
-    syncTintLock(!!tintToggle.checked);
+    const on = !!tintToggle.checked;
+    if (on) {
+      ap.set({ tintBase: true, ...APPEARANCE_ALPHA_DEFAULTS });
+      for (const [field, v] of Object.entries(APPEARANCE_ALPHA_DEFAULTS)) {
+        const input = container.querySelector<HTMLInputElement>(`input[type="range"][data-ap="${field}"]`);
+        if (input) input.value = String(v);
+        const out = container.querySelector<HTMLElement>(`[data-ap-val="${field}"]`);
+        if (out) out.textContent = formatAppearanceValue(field, v);
+      }
+    } else {
+      ap.set({ tintBase: false });
+    }
+    syncTintLock(on);
   });
 
-  // ── 四组「自定义」的展开与收起（形态同背景那组）──
+  // ── 三组「自定义」的展开与收起（形态同背景那组）──
   const bindPanel = (
     btnSel: string, panelSel: string, caretSel: string,
     get: () => boolean, set: (v: boolean) => void,
@@ -1217,11 +1234,8 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         <span class="settings-label">${t("settings.api_key")}</span>
         <input type="password" id="settings-apikey" class="settings-input" autocomplete="off" value="${esc(apiKey)}" placeholder="${masked || 'sk-...'}">
       </div>
-      <div class="settings-row" style="justify-content: flex-end;">
-        <button type="button" id="settings-add-curl-btn" class="settings-install-btn">${t("settings.curl_btn")}</button>
-      </div>
-      <!-- 一键添加配置（粘贴 curl）：默认隐藏，点上面那枚按钮展开。
-           本段在模板字符串里，注释里不能出现反引号。 -->
+      <!-- 一键添加配置（粘贴 curl）：按钮与「测试联通 / 保存」同一行、同一档样式。
+           展开的小框仍留在下面。本段在模板字符串里，注释里不能出现反引号。 -->
       <div class="settings-curl hidden" id="settings-curl-box">
         <div class="settings-curl-title">${t("settings.curl_title")}</div>
         <textarea id="settings-curl-input" spellcheck="false" autocomplete="off" placeholder="${esc(t("settings.curl_ph"))}"></textarea>
@@ -1236,6 +1250,7 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
         <div class="settings-curl-msg" id="settings-curl-msg"></div>
       </div>
       <div class="settings-row" style="justify-content: flex-end;">
+        <button type="button" id="settings-add-curl-btn" class="settings-install-btn">${t("settings.curl_btn")}</button>
         <button id="settings-test-ai-btn" class="settings-install-btn">${t("settings.test_conn")}</button>
         <button id="settings-save-ai-btn" class="settings-save-btn">${t("settings.save")}</button>
         <span id="settings-save-msg" class="settings-save-msg"></span>
@@ -1248,66 +1263,23 @@ function buildAIModelSection(provider: string, baseUrl: string, model: string, a
  *  两个分块 —— 它们是给进阶用户看的入口，对 AI 零基础用户只会造成「这个该怎么用」的
  *  困扰。skill / 工具改为**由 AI 在运行时按需查找或生成**（动手前提醒用户），不再在设置里
  *  暴露入口。人格（L2）2026-09-21 已搬出本面板 → 输入栏「更多设置」的 ⋯ 菜单（见 main.ts）。 */
-/** 「本地模型决策」开关（2026-10-09）。
+/** 「本地模型决策」开关已迁出（2026-10-24）。
  *
- *  本地决策模型（插件 `local-model`）不再是可搜索 / 可打开的工具插件 —— 它的开关归到这里：
- *  开 = 宿主拉起 `llama-server` 子进程并把端点下发给 agent（`LUNAC_LOCAL_MODEL_URL`），
- *  由本地小模型判断「桌宠消息 / 对话输入」要不要发给云模型（省钱）；关 = 收进程、不下发端点。
- *  插件本身仍留在「插件」市场可下载 / 卸载（见 kinds.ts 的 `isHeadlessPlugin`）。
+ *  迁移原因：它属于「AI 运行时」而不是「应用设置」，且原来的位置只能看到开关状态，
+ *  看不到「模型到底能不能用」。现在放在输入栏「更多设置 → 其他」页，与 agent 的
+ *  实际操作位置在一起，并附带宿主真实探活（见 `app/src/local-model.ts` 与
+ *  `local_model_probe` 命令）。
  *
- *  `ready`（2026-10-15）：依赖是否就位。**装的是不含依赖的插件包时 `ready=false`** ——
- *  界面这时要显示「未就绪 / 待下载」并给一个下载入口，而不是放行后让底层报「可执行文件不存在」。 */
-function buildLocalModelSection(enabled: boolean, installed: boolean, ready: boolean): string {
-  const hint = !installed
-    ? t("settings.local_model_missing")
-    : !ready
-      ? t("settings.local_model_deps_missing")
-      : t("settings.local_model_hint");
-  // 「未就绪」时的显式下载入口（同时就是失败后的重试入口）：点了走既有的依赖安装，
-  // 带进度、可取消（见 attachSettingsListeners 里的 installDeps）。
-  const depsRow = installed && !ready
-    ? `
-      <div class="settings-hint" id="settings-local-model-deps" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">
-        <div class="dl-inline hidden" id="settings-local-model-progress"></div>
-        <button class="settings-install-btn" id="settings-local-model-download">${t("settings.local_model_download_deps")}</button>
-      </div>`
-    : "";
-  return `
-      <div class="settings-row">
-        <span class="settings-label">${t("settings.local_model")}</span>
-        <label class="settings-toggle">
-          <input type="checkbox" id="settings-local-model"${enabled ? " checked" : ""}${installed ? "" : " disabled"}>
-          <span class="settings-toggle-slider"></span>
-        </label>
-      </div>
-      <div class="settings-hint" id="settings-local-model-hint" style="font-size:0.7rem;color:var(--text-dim);margin:2px 0 6px;">${hint}</div>
-      ${depsRow}
-      <!-- 开启前的内联警告（**不用信任卡**：那卡片渲染在 #results-list 里会被设置布局裁掉 / 吞掉，
-           2026-10-09 用户要求改为面板内可见的警告 + 确认）-->
-      <div class="settings-hint hidden" id="settings-local-model-warn" style="font-size:0.72rem;color:var(--yellow);margin:2px 0 6px;line-height:1.6;">
-        ${t("settings.local_model_warn")}
-        <div style="display:flex;gap:8px;margin-top:6px;">
-          <button class="settings-install-btn" id="settings-local-model-ok">${t("settings.local_model_confirm")}</button>
-          <button class="settings-skill-del-installed" id="settings-local-model-cancel">${t("settings.local_model_cancel")}</button>
-        </div>
-      </div>`;
-}
+ *  本文件**不再渲染也不绑定**这一块；插件市场里的 `local-model` 仍保持 headless。
+ */
 
 async function buildAIPane(provider: string, baseUrl: string, model: string, apiKey: string): Promise<string> {
   const costHtml = await buildUsageCostSection();
-  // 本地模型决策：开关状态来自宿主（config\local_model.json）；「装了没」按本机事实判
-  //（`hasDiskPlugin` = 盘上有且清单可用），未装就禁用开关并提示去市场下。
-  let lmEnabled = false;
-  try { lmEnabled = await invoke<boolean>("local_model_config_get"); } catch { /* 读不到按关处理 */ }
-  const lmInstalled = hasDiskPlugin("local-model");
-  const lmReady = diskPluginReady("local-model");
   return `
     <div class="settings-pane" data-pane="ai" id="sp-ai">
       <div class="settings-pane-title">${t("settings.sidebar_ai")}</div>
       <div class="settings-group-title">${t("settings.ai_model")}</div>
       ${buildAIModelSection(provider, baseUrl, model, apiKey)}
-      <div class="settings-group-title">${t("settings.local_model_group")}</div>
-      ${buildLocalModelSection(lmEnabled, lmInstalled, lmReady)}
       <div class="settings-group-title">${t("settings.cost_title")}</div>
       ${costHtml}
     </div>`;
@@ -1546,6 +1518,16 @@ function buildPluginsPane(): string {
       <div class="settings-hint" id="settings-plugin-err"></div>
       <div class="settings-hint" id="settings-plugin-msg"></div>
       <div class="settings-hint" id="settings-plugin-dir-path"></div>
+      <!-- 常驻锚点：插件自己的设置分组（2026-10-18，C.4.1）。
+           由 syncSettingsSections() 按清单 render.slots 挂载；无插件时整块 hidden。 -->
+      <div id="settings-plugin-sections"></div>
+      <!-- 开发工具链（轨道 H，2026-10-18）：只列声明了 dev 的插件；无插件时整块 hidden。 -->
+      <div id="settings-toolchain-block" class="hidden">
+        <div class="settings-group-title">${t("settings.plugins_toolchain_title")}</div>
+        <div class="settings-hint">${esc(t("settings.plugins_toolchain_hint"))}</div>
+        <div id="settings-toolchain-list"></div>
+        <div class="settings-hint" id="settings-toolchain-msg"></div>
+      </div>
     </div>`;
 }
 
@@ -1560,12 +1542,16 @@ interface MarketRow {
   version: string;
   /** 远程索引里的 https zip 地址；空串 = 索引里没有这条（只可能「打开」或「卸载」） */
   url: string;
+  /** 索引给的插件包 sha256；空串 = 旧索引（迁移期宿主只 warn，仍会安装） */
+  sha256: string;
   /** `url` 非空且装的版本比索引旧 ⇒ 这个按钮写「更新」而不是「下载」（同一条命令） */
   update: boolean;
   /** 依赖条数（清单里声明的；宿主在装的时候已一并拉好，这里只是提前告知） */
   deps: number;
   /** 声明的宿主能力（清单里的 permissions，原样显示 —— 读者是用户，不翻译） */
   perms: string[];
+  /** 渲染方式与外观级别（2026-10-18） */
+  render: { engine: string; appearance: string; slots: string[] };
   /** 来源（作者给的 homepage，没有就退回 zip 地址）—— 挂在行的 title 上：装谁 = 信任谁的代码，
    *  来源必须能查，但不必铺在界面上。 */
   source: string;
@@ -1606,10 +1592,12 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       icon: (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "",
       version: l?.version || lAny?.version || "",
       url: hasNewer ? e!.url : "",
+      sha256: hasNewer ? (e!.sha256 || "") : "",
       // 只有「盘上已有一份、且版本不同」才叫更新；盘上没有那次安装仍是「下载」
       update: hasNewer && !!l,
       deps: (l ?? lAny)?.dependencies?.length || 0,
       perms: (l ?? lAny)?.permissions || [],
+      render: (l ?? lAny)?.render ?? { engine: "dom", appearance: "inherit", slots: [] },
       source: (l ?? lAny)?.homepage || "",
       installed,
       local: !!lAny,
@@ -1625,12 +1613,15 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       id: p.id,
       name: pluginName(p.id, p.name || p.id),
       description: pluginDesc(p.id, p.description),
-      icon: p.icon || "",
+      // AI 生成的插件清单里 `icon` 常为空：统一走宿主图标汇聚点，拿到兜底 SVG。
+      icon: (window as any).__lunac_plugin_icon?.(p.id) || p.icon || "",
       version: p.version,
       url: "",
+      sha256: "",
       update: false,
       deps: p.dependencies?.length || 0,
       perms: p.permissions || [],
+      render: p.render ?? { engine: "dom", appearance: "inherit", slots: [] },
       source: p.homepage,
       installed: false,
       local: true,
@@ -1645,12 +1636,14 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
       id: e.id,
       name: pluginName(e.id, e.name || e.id),
       description: pluginDesc(e.id, e.description),
-      icon: e.icon || "",
+      icon: (window as any).__lunac_plugin_icon?.(e.id) || e.icon || "",
       version: e.version,
       url: e.url,
+      sha256: e.sha256 || "",
       update: false,
       deps: 0,
       perms: [],
+      render: { engine: "dom", appearance: "inherit", slots: [] },
       source: e.homepage || e.url,
       installed: false,
       local: false,
@@ -1671,6 +1664,143 @@ function mergeMarketRows(index: MarketIndexEntry[], local: MarketPluginInfo[]): 
     .map(x => x.r);
 }
 
+// ── 安装进度常驻 + 暂停 / 继续（2026-10-27）──────────────────────────
+// 下载是**宿主侧**的阻塞任务：关掉设置面板、切到别的分页、重开面板它都还在跑。
+// 所以进度不能挂在「点击那一刻的 DOM」上 —— 这里留一份模块级快照 + **一个**全局监听，
+// 重绘后由 `mountMarketInstall()` 把进度环与暂停按钮**重新挂回对应的那一行**。
+//
+// 断点（强制退出后接着下）：宿主把半截文件放 `temp\downloads\*.part`，
+// `plugin_pending_downloads` 报回来 ⇒ 行上的按钮文案变成「继续下载 (37%)」。
+interface LiveInstall {
+  /** 市场里这一条插件包的 url（包本体阶段按它认行） */
+  url: string;
+  /** 插件 id（依赖阶段的进度只能按 id 认行） */
+  id: string;
+  overall: InstallOverall;
+  percent: number;
+  speed: number;
+  extracting: boolean;
+  paused: boolean;
+}
+let liveInstall: LiveInstall | null = null;
+let pendingParts: Array<{ url: string; id: string; downloaded: number; total: number }> = [];
+let liveListenerReady = false;
+
+function liveMatches(r: MarketRow): boolean {
+  if (!liveInstall) return false;
+  if (liveInstall.url && liveInstall.url === r.url) return true;
+  return !!liveInstall.id && liveInstall.id === r.id;
+}
+
+function pendingFor(r: MarketRow) {
+  return pendingParts.find(p => (!!p.url && p.url === r.url) || (!!p.id && p.id === r.id));
+}
+
+/** 把模块级快照画到**已经在页面上的**那一行（重绘后由 mount 重新挂）。 */
+function paintLiveInstall() {
+  if (!liveInstall) return;
+  const box = document.querySelector<HTMLElement>(
+    "#settings-plugin-market [data-install-progress]",
+  );
+  if (!box) return;
+  updateRing(box, liveInstall.percent);
+  const phaseEl = box.querySelector<HTMLElement>(".dl-phase");
+  const speedEl = box.querySelector<HTMLElement>(".dl-speed");
+  const pauseEl = box.querySelector<HTMLButtonElement>("[data-install-pause]");
+  if (phaseEl) {
+    phaseEl.textContent = liveInstall.extracting
+      ? t("settings.plugins_market_extracting")
+      : liveInstall.paused
+        ? t("settings.plugins_market_paused")
+        : t("settings.plugins_market_downloading");
+  }
+  if (speedEl) {
+    speedEl.textContent = liveInstall.extracting || liveInstall.paused ? "—" : formatSpeed(liveInstall.speed);
+  }
+  if (pauseEl) {
+    pauseEl.textContent = liveInstall.paused
+      ? t("settings.plugins_market_resume")
+      : t("settings.plugins_market_pause");
+    pauseEl.dataset.paused = liveInstall.paused ? "1" : "";
+  }
+}
+
+/** 在某个容器（整张表或单独一行）里找到占位节点并画上环 + 阶段 + 暂停按钮。 */
+function mountMarketInstall(root: HTMLElement) {
+  if (!liveInstall) return;
+  const box = root.querySelector<HTMLElement>("[data-install-progress]");
+  if (!box) return;
+  box.innerHTML =
+    ringHtml(liveInstall.percent) +
+    `<span class="dl-meta">
+       <span class="dl-phase">${t("settings.plugins_market_downloading")}</span>
+       <span class="dl-speed">—</span>
+     </span>
+     <button class="settings-install-btn" data-install-pause="1">${t("settings.plugins_market_pause")}</button>`;
+  paintLiveInstall();
+}
+
+/** 全局只挂**一次**监听：事件属于「这次安装」，不属于某一次点击。 */
+async function ensureLiveListener() {
+  if (liveListenerReady) return;
+  liveListenerReady = true;
+  try {
+    await listen("plugin-install-progress", (ev) => {
+      if (!liveInstall) return;
+      const p = ev.payload as {
+        phase: string;
+        downloaded: number;
+        total: number;
+        index: number;
+        count: number;
+      };
+      const s = liveInstall.overall.push(p);
+      liveInstall.percent = s.percent;
+      liveInstall.speed = s.speed;
+      liveInstall.extracting = s.extracting;
+      paintLiveInstall();
+    });
+  } catch {
+    liveListenerReady = false; // 挂不上就下次再试（不该拦住安装本身）
+  }
+}
+
+/** 面板重绘前对一次账：宿主是否有活动安装 / 磁盘上还有哪些断点。 */
+async function syncInstallFromHost() {
+  try {
+    const st = await invoke<{
+      active: boolean;
+      id: string;
+      url: string;
+      phase: string;
+      paused: boolean;
+    }>("plugin_install_state");
+    if (st.active && !liveInstall) {
+      liveInstall = {
+        url: st.url,
+        id: st.id,
+        overall: new InstallOverall(),
+        percent: -1,
+        speed: 0,
+        extracting: false,
+        paused: st.paused,
+      };
+      await ensureLiveListener();
+    } else if (liveInstall && st.active) {
+      liveInstall.paused = st.paused;
+    }
+  } catch {
+    /* 老宿主没有这条命令：退化为「只在本次会话内记进度」 */
+  }
+  try {
+    pendingParts = await invoke<Array<{ url: string; id: string; downloaded: number; total: number }>>(
+      "plugin_pending_downloads",
+    );
+  } catch {
+    pendingParts = [];
+  }
+}
+
 /** 一行 HTML：名称（带版本）+ 描述（坏包换成原因）+ 该状态下的按钮。 */
 function marketRowHtml(r: MarketRow): string {
   const name = r.version ? `${r.name} · v${r.version}` : r.name;
@@ -1682,29 +1812,51 @@ function marketRowHtml(r: MarketRow): string {
   const perms = r.perms.length > 0
     ? ` <span class="settings-market-deps">${esc(t("settings.plugins_market_perms", { list: r.perms.join(", ") }))}</span>`
     : "";
+  const renderTags = [
+    r.render.appearance === "custom" ? t("settings.plugins_market_custom_appearance") : "",
+    r.render.engine === "iframe" ? t("settings.plugins_market_iframe") : "",
+    (r.render.slots ?? []).includes("chat-sidebar") ? t("settings.plugins_market_slot_chat_sidebar") : "",
+    (r.render.slots ?? []).includes("settings-section") ? t("settings.plugins_market_slot_settings_section") : "",
+  ]
+    .filter(Boolean)
+    .map(text => ` <span class="settings-market-deps">${esc(text)}</span>`)
+    .join("");
   const meta = r.broken
     ? `<span class="settings-market-broken">${esc(t("settings.plugins_market_broken", { err: r.broken }))}</span>`
-    : `<span class="settings-plugin-desc">${esc(r.description)}${deps}${perms}${
+    : `<span class="settings-plugin-desc">${esc(r.description)}${deps}${perms}${renderTags}${
         // 基础设施插件（无用户入口）留一句「去哪开关」，否则用户会奇怪市场里的插件点不开
         isHeadlessPlugin(r.id) ? `<span class="settings-market-deps">${esc(t("settings.local_model_managed"))}</span>` : ""
       }</span>`;
   // 基础插件随安装包走，**用户既不能装也不能卸**（2026-09-29 用户定）⇒ 只留「打开」。
   // 拓展插件才按「盘上事实」出下载 / 更新 / 卸载。
   const base = isBasePlugin(r.id);
-  // 基础设施插件**不给「打开」**（它没有面板）—— 开关在「设置 → AI」，但下载 / 卸载照留
+  // 基础设施插件**不给「打开」**（它没有面板）—— 开关在「更多设置 → 其他」，但下载 / 卸载照留
   const open = r.installed && !r.broken && !isHeadlessPlugin(r.id)
     ? `<button class="settings-install-btn" data-open-plugin="${esc(r.id)}">${t("settings.skill_open")}</button>`
     : "";
+  // 正在装这一行 ⇒ 留一个进度占位（由 `mountMarketInstall` 填环 / 阶段 / 暂停按钮）；
+  // 磁盘上还有断点 ⇒ 按钮文案改成「继续下载 (37%)」，点一下从断点续（2026-10-27）。
+  const live = liveMatches(r);
+  const pend = live ? undefined : pendingFor(r);
+  const pendText = pend
+    ? pend.total > 0
+      ? ` (${Math.round((pend.downloaded / pend.total) * 100)}%)`
+      : ` (${formatBytes(pend.downloaded)})`
+    : "";
   const download = !base && r.url
-    ? `<button class="settings-install-btn" data-download-plugin="${esc(r.id)}" data-plugin-url="${esc(r.url)}">${
-        r.update ? t("settings.plugins_market_update") : t("settings.plugins_market_download")
-      }</button>`
+    ? live
+      ? `<div class="dl-inline settings-market-progress" data-install-progress="1"></div>`
+      : `<button class="settings-install-btn" data-download-plugin="${esc(r.id)}" data-plugin-url="${esc(r.url)}" data-plugin-sha256="${esc(r.sha256)}">${
+          pend
+            ? `${t("settings.plugins_market_continue")}${pendText}`
+            : r.update ? t("settings.plugins_market_update") : t("settings.plugins_market_download")
+        }</button>`
     : "";
   const remove = !base && r.local
     ? `<button class="settings-skill-del-installed" data-uninstall-plugin="${esc(r.id)}">${t("settings.plugins_market_uninstall")}</button>`
     : "";
   return `
-      <div class="settings-market-row" title="${esc(r.source)}">
+      <div class="settings-market-row${live ? " is-installing" : ""}" title="${esc(r.source)}">
         <div class="settings-plugin-icon">${r.icon}</div>
         <div class="settings-plugin-info">
           <span class="settings-plugin-name">${esc(name)}</span>
@@ -1759,14 +1911,18 @@ async function renderMarket(container: HTMLElement) {
   const listEl = container.querySelector<HTMLElement>("#settings-plugin-market");
   if (!listEl) return;
   const myGen = ++marketRenderGen;
+  // 重绘前先对一次账：宿主是否还有安装任务、磁盘上还有哪些断点（2026-10-27）
+  await syncInstallFromHost();
   const local = await readLocalPlugins();
   if (myGen !== marketRenderGen) return; // 期间又画过一次 ⇒ 本次作废
   listEl.innerHTML = marketRowsHtml(mergeMarketRows([], local.list));
+  mountMarketInstall(listEl);
   writeMarketFooter(container, local.dir, local.error ? [t("settings.plugins_market_failed", { err: local.error })] : []);
 
   const idx = await fetchPluginIndex();
   if (myGen !== marketRenderGen) return; // 同上：旧快照不许盖掉新结果
   listEl.innerHTML = marketRowsHtml(mergeMarketRows(idx.list, local.list));
+  mountMarketInstall(listEl);
   writeMarketFooter(
     container,
     local.dir,
@@ -1775,6 +1931,238 @@ async function renderMarket(container: HTMLElement) {
       ...(idx.error ? [t("settings.plugins_market_index_failed", { err: idx.error })] : []),
     ],
   );
+  // 常驻锚点（2026-10-18）：安装 / 卸载 / 重扫都会回到这里，设置分组随之重新对账。
+  syncSettingsSections(container);
+  // 开发工具链分区也要跟着本机插件列表刷新（新装 / 卸载 / 清单变化）。
+  void renderToolchains(container);
+}
+
+/** 设置分组锚点的挂载句柄（2026-10-18）。面板关闭时必须 dispose —— 信道在 `window`
+ *  上挂了 `message` 监听，光靠 DOM 被替换不会自动摘掉。 */
+let settingsSectionsMount: AnchorMountHandle | null = null;
+
+/** 面板关闭时的收尾（main.ts 的 closePluginView 调用；无插件时是空操作）。 */
+export function detachSettingsHost(): void {
+  settingsSectionsMount?.dispose();
+  settingsSectionsMount = null;
+}
+
+/** 按清单 `render.slots` 对账设置分组：有插件 ⇒ 显示并挂载；没有 ⇒ **整块 hidden**。 */
+function syncSettingsSections(container: HTMLElement): void {
+  const host = container.querySelector<HTMLElement>("#settings-plugin-sections");
+  if (!host) return;
+  detachSettingsHost();
+  host.innerHTML = "";
+  const plugins = anchorPlugins("settings-section");
+  host.classList.toggle("hidden", plugins.length === 0);
+  if (plugins.length === 0) return;
+  settingsSectionsMount = mountAnchorPlugins(host, {
+    slot: "settings-section",
+    onLog: (level, message) => {
+      void invoke("log_frontend", { level, message }).catch(() => {});
+    },
+  });
+}
+
+// ── 开发工具链（轨道 H，2026-10-18）────────────────────────────────
+//
+// 只在用户授权后安装 / 构建；状态与账本都在 Rust 侧（`plugin_toolchain.rs`），
+// 这里只负责把授权 / 撤销 / 安装 / 运行变成按钮，并把构建输出原样展示。
+
+interface ToolchainProfileStatus {
+  id: string;
+  version: string;
+  dest: string;
+  installed: boolean;
+}
+
+interface ToolchainStatus {
+  pluginId: string;
+  declared: boolean;
+  fingerprint: string;
+  granted: boolean;
+  stale: boolean;
+  installed: boolean;
+  toolchainDir: string;
+  profiles: ToolchainProfileStatus[];
+  buildCommand: string;
+  buildArgs: string[];
+  buildCwd: string;
+  running: boolean;
+}
+
+let toolchainEventsStarted = false;
+let toolchainContainer: HTMLElement | null = null;
+/** 绘制代次：设置面板挂载与市场重绘可能同时触发，迟到的旧快照不许盖掉新结果。 */
+let toolchainRenderGen = 0;
+
+function toolchainMsg(container: HTMLElement, text: string, color: string): void {
+  const el = container.querySelector<HTMLElement>("#settings-toolchain-msg");
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = color;
+}
+
+/** 构建输出 / 结束事件只挂一次（与更新进度监听同一条纪律：别在每次重绘时叠监听）。 */
+async function ensureToolchainEvents(): Promise<void> {
+  if (toolchainEventsStarted) return;
+  toolchainEventsStarted = true;
+  try {
+    await listen("plugin-build-output", (ev) => {
+      const p = ev.payload as { pluginId: string; stream: string; line: string };
+      const pre = document.querySelector<HTMLElement>(
+        `[data-toolchain-output="${p.pluginId}"]`,
+      );
+      if (!pre) return;
+      pre.textContent += `[${p.stream}] ${p.line}\n`;
+      // 只看最近一段，避免长构建把 DOM 撑爆
+      const text = pre.textContent ?? "";
+      if (text.length > 120_000) pre.textContent = text.slice(-100_000);
+      pre.scrollTop = pre.scrollHeight;
+    });
+    await listen("plugin-build-done", (ev) => {
+      const p = ev.payload as { pluginId: string; code: number | null; success: boolean };
+      const pre = document.querySelector<HTMLElement>(
+        `[data-toolchain-output="${p.pluginId}"]`,
+      );
+      if (pre) {
+        pre.textContent +=
+          (p.success
+            ? t("settings.plugins_toolchain_build_ok")
+            : t("settings.plugins_toolchain_build_fail", { code: String(p.code ?? "?") })) + "\n";
+        pre.scrollTop = pre.scrollHeight;
+      }
+      if (toolchainContainer) void renderToolchains(toolchainContainer);
+    });
+  } catch { /* 事件挂不上不该让设置面板挂掉 */ }
+}
+
+function toolchainRowHtml(p: MarketPluginInfo, status: ToolchainStatus | null): string {
+  const dev = p.dev;
+  if (!dev) return "";
+  const state = status?.stale
+    ? t("settings.plugins_toolchain_stale")
+    : status?.granted
+      ? t("settings.plugins_toolchain_granted")
+      : t("settings.plugins_toolchain_not_granted");
+  const profiles = dev.toolchains.length > 0
+    ? t("settings.plugins_toolchain_profiles", { count: String(dev.toolchains.length) })
+    : "";
+  const installed = dev.toolchains.length > 0
+    ? (status?.installed
+        ? t("settings.plugins_toolchain_installed")
+        : t("settings.plugins_toolchain_missing"))
+    : "";
+  const running = status?.running ? t("settings.plugins_toolchain_running") : "";
+  const build = dev.build?.command
+    ? t("settings.plugins_toolchain_build_label", {
+        cmd: [dev.build.command, ...dev.build.args].join(" "),
+      })
+    : t("settings.plugins_toolchain_no_build");
+  const meta = [state, profiles, installed, running].filter(Boolean).join(" · ");
+  const granted = !!status?.granted;
+  const canInstall = granted && dev.toolchains.length > 0 && !status?.installed;
+  const canRun = granted && !!dev.build?.command;
+  const actions = [
+    !granted
+      ? `<button class="settings-install-btn" data-toolchain-action="grant">${t("settings.plugins_toolchain_grant")}</button>`
+      : `<button class="settings-install-btn" data-toolchain-action="revoke">${t("settings.plugins_toolchain_revoke")}</button>`,
+    canInstall
+      ? `<button class="settings-install-btn" data-toolchain-action="install">${t("settings.plugins_toolchain_install")}</button>`
+      : "",
+    canRun
+      ? (status?.running
+          ? `<button class="settings-install-btn" data-toolchain-action="stop">${t("settings.plugins_toolchain_stop")}</button>`
+          : `<button class="settings-install-btn" data-toolchain-action="run">${t("settings.plugins_toolchain_run")}</button>`)
+      : "",
+  ].filter(Boolean).join("");
+  return `
+      <div class="settings-market-row settings-toolchain-row" data-toolchain-plugin="${esc(p.id)}">
+        <div class="settings-plugin-icon">${(window as any).__lunac_plugin_icon?.(p.id) || p.icon || ""}</div>
+        <div class="settings-plugin-info">
+          <span class="settings-plugin-name">${esc(pluginName(p.id, p.name))}</span>
+          <span class="settings-plugin-desc">${esc(meta)}</span>
+          <span class="settings-plugin-desc">${esc(build)}</span>
+        </div>
+        ${actions}
+      </div>
+      <pre class="settings-toolchain-output" data-toolchain-output="${esc(p.id)}"></pre>`;
+}
+
+/** 重绘工具链分区。**只列 `valid && dev` 的插件**；没有就整块 hidden（不占位）。 */
+async function renderToolchains(container: HTMLElement): Promise<void> {
+  const myGen = ++toolchainRenderGen;
+  toolchainContainer = container;
+  const block = container.querySelector<HTMLElement>("#settings-toolchain-block");
+  const list = container.querySelector<HTMLElement>("#settings-toolchain-list");
+  if (!block || !list) return;
+  const local = await readLocalPlugins();
+  if (myGen !== toolchainRenderGen) return;
+  const plugins = local.list.filter((p) => p.valid && p.dev);
+  if (plugins.length === 0) {
+    block.classList.add("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  block.classList.remove("hidden");
+  const statuses = await Promise.all(
+    plugins.map((p) =>
+      invoke<ToolchainStatus>("plugin_toolchain_status", { pluginId: p.id }).catch(() => null),
+    ),
+  );
+  if (myGen !== toolchainRenderGen) return;
+  list.innerHTML = plugins.map((p, i) => toolchainRowHtml(p, statuses[i])).join("");
+  await ensureToolchainEvents();
+}
+
+/** 工具链按钮的事件委托（每次挂载绑一次；重绘只换 innerHTML）。 */
+function wireToolchains(container: HTMLElement): void {
+  const list = container.querySelector<HTMLElement>("#settings-toolchain-list");
+  if (!list) return;
+  list.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement | null)?.closest<HTMLButtonElement>("[data-toolchain-action]");
+    if (!btn) return;
+    const row = btn.closest<HTMLElement>("[data-toolchain-plugin]");
+    const pluginId = row?.dataset.toolchainPlugin || "";
+    const action = btn.dataset.toolchainAction || "";
+    if (!pluginId || !action) return;
+    void (async () => {
+      try {
+        if (action === "grant") {
+          await invoke("grant_plugin_toolchain", { pluginId });
+        } else if (action === "revoke") {
+          // 两段式确认（同卸载）：原生 confirm 在 WebView2 下不可靠
+          if (btn.dataset.armed !== "1") {
+            btn.dataset.armed = "1";
+            btn.textContent = t("settings.plugins_toolchain_confirm_revoke");
+            return;
+          }
+          await invoke("revoke_plugin_toolchain", { pluginId, removeFiles: false });
+          toolchainMsg(container, t("settings.plugins_toolchain_revoked"), "var(--text-dim)");
+        } else if (action === "install") {
+          btn.disabled = true;
+          await invoke("install_plugin_toolchain", { pluginId });
+        } else if (action === "run") {
+          const pid = await invoke<number>("run_plugin_build", { pluginId });
+          toolchainMsg(
+            container,
+            t("settings.plugins_toolchain_build_started", { pid: String(pid) }),
+            "var(--text-dim)",
+          );
+        } else if (action === "stop") {
+          await invoke("stop_plugin_build", { pluginId });
+        }
+      } catch (e) {
+        toolchainMsg(
+          container,
+          t("settings.plugins_toolchain_install_failed", { err: String(e) }),
+          "var(--red)",
+        );
+      }
+      await renderToolchains(container);
+    })();
+  });
+  void renderToolchains(container);
 }
 
 /** 表尾：错误行（黄）+ 插件目录（写着东西装哪儿了）。节点每次现查 —— 缓存引用会写进空气里。 */
@@ -1812,70 +2200,86 @@ function wirePluginMarket(container: HTMLElement) {
 
   const download = async (btn: HTMLButtonElement) => {
     const url = btn.dataset.pluginUrl || "";
+    // 索引给了 sha256 就交给宿主校验（对不上整包拒绝，旧版本不动）；没有则空串 = 迁移期
+    const sha256 = btn.dataset.pluginSha256 || "";
     if (!url) return;
+    const rowId = btn.dataset.downloadPlugin || "";
+
+    // 宿主同一时刻只允许**一次**安装（2026-10-27）：如果这一行已经有任务在跑（可能正暂停着），
+    // 这里只做「继续 / 把进度重新挂回」，**绝不再发一次安装** —— 否则会起第二个下载线程写同一个
+    // `.part`，界面上一快一慢两种进度、并且谁先读完谁把半截文件改名走（「秒完成但没装完」）。
+    const st = await invoke<{ active: boolean; id: string; url: string; paused: boolean }>(
+      "plugin_install_state",
+    ).catch(() => null);
+    if (st && st.active && (st.url === url || (!!st.id && st.id === rowId))) {
+      if (st.paused) await invoke("plugin_install_pause", { paused: false }).catch(() => {});
+      liveInstall = {
+        url: st.url || url,
+        id: st.id || rowId,
+        overall: new InstallOverall(),
+        percent: -1,
+        speed: 0,
+        extracting: false,
+        paused: false,
+      };
+      await ensureLiveListener();
+      const existingRow = btn.closest<HTMLElement>(".settings-market-row");
+      if (existingRow) {
+        existingRow.classList.add("is-installing");
+        if (!existingRow.querySelector("[data-install-progress]")) {
+          const box = document.createElement("div");
+          box.className = "dl-inline settings-market-progress";
+          box.dataset.installProgress = "1";
+          existingRow.appendChild(box);
+        }
+        mountMarketInstall(existingRow);
+      }
+      return;
+    }
+
     btn.disabled = true;
     showMsg(t("settings.plugins_market_installing"), "var(--text-dim)");
 
-    // ── 行内进度：小圆圈 + 中间数字 + 实时速度 ────────────────────
-    // 插在**那一行**上（不是弹窗）：用户点的是哪一行，进度就该出现在哪一行。
-    // 监听是**这一次下载自己的**、`finally` 里收掉 —— 事件是全局的（另一个窗口也可能在装），
-    // 谁发起谁自己听（见 download-progress.ts 顶部）。
+    // ── 行内进度：小圆圈 + 中间数字 + 实时速度 + 暂停（2026-10-27）──
+    // 状态存**模块级** `liveInstall`，事件走**一个**全局监听：关掉面板 / 切页签后
+    // 重绘出来的新行由 `mountMarketInstall()` 重新挂上，进度不会丢。
     const row = btn.closest<HTMLElement>(".settings-market-row");
-    const meter = new DownloadMeter();
-    const prog = document.createElement("div");
-    prog.className = "dl-inline settings-market-progress";
-    prog.innerHTML =
-      ringHtml(-1) +
-      `<span class="dl-meta">
-         <span class="dl-phase">${t("settings.plugins_market_downloading")}</span>
-         <span class="dl-speed">—</span>
-       </span>`;
-    row?.classList.add("is-installing");
-    row?.appendChild(prog);
-    const phaseEl = prog.querySelector<HTMLElement>(".dl-phase");
-    const speedEl = prog.querySelector<HTMLElement>(".dl-speed");
-    let unlisten: (() => void) | undefined;
-    // 阶段键：`download#0`（插件包本体）→ `download#1`（第 1 条依赖）→ `extract#1` …
-    // 变了就重置速度基线 —— 不同文件之间的字节数不连续，不重置会算出一个荒唐的速度。
-    let segKey = "";
-    try {
-      unlisten = await listen("plugin-install-progress", (ev) => {
-        const p = ev.payload as {
-          phase: string;
-          downloaded: number;
-          total: number;
-          index: number;
-        };
-        const key = `${p.phase}#${p.index}`;
-        if (key !== segKey) {
-          segKey = key;
-          meter.reset();
-        }
-        const extracting = p.phase === "extract";
-        const s = meter.push(p.downloaded, p.total);
-        updateRing(prog, extracting ? -1 : s.percent);
-        if (phaseEl) {
-          phaseEl.textContent = extracting
-            ? t("settings.plugins_market_extracting")
-            : t("settings.plugins_market_downloading");
-        }
-        if (speedEl) speedEl.textContent = extracting ? "—" : formatSpeed(s.speed);
-      });
-    } catch { /* 挂不上监听不该拦住安装本身 */ }
+    // 用**对象身份**判断「现在这条进度是不是我这次点击的」：连点 / 两个窗口同时点的时候，
+    // 后来者失败不能把先启动的那次进度一并清掉（那会表现成「进度突然消失」）。
+    const mine: LiveInstall = {
+      url,
+      id: rowId,
+      overall: new InstallOverall(),
+      percent: -1,
+      speed: 0,
+      extracting: false,
+      paused: false,
+    };
+    liveInstall = mine;
+    await ensureLiveListener();
+    if (row && !row.querySelector("[data-install-progress]")) {
+      row.classList.add("is-installing");
+      const box = document.createElement("div");
+      box.className = "dl-inline settings-market-progress";
+      box.dataset.installProgress = "1";
+      row.appendChild(box);
+    }
+    if (row) mountMarketInstall(row);
 
     try {
-      const id = await invoke<string>("install_plugin_from_url", { url });
+      const id = await invoke<string>("install_plugin_from_url", { url, sha256 });
+      if (liveInstall === mine) liveInstall = null;
       await refreshMarketPlugins();
       await renderMarket(container);
       showMsg(t("settings.plugins_market_installed_ok", { id }), "var(--green)");
     } catch (e: any) {
+      // 失败 / 被取消：清掉**自己那份**快照并重绘（行可能已不在页面上，靠重绘恢复最省事）
+      if (liveInstall === mine) {
+        liveInstall = null;
+        void renderMarket(container);
+      }
       showMsg(t("settings.plugins_market_install_failed", { err: String(e) }), "var(--red)");
       btn.disabled = false;
-      // 失败要把这一行恢复原样（重绘没发生，环还挂在上面）
-      row?.classList.remove("is-installing");
-      prog.remove();
-    } finally {
-      try { unlisten?.(); } catch { /* ignore */ }
     }
   };
 
@@ -1919,6 +2323,21 @@ function wirePluginMarket(container: HTMLElement) {
       //（那要动结果区 / 搜索栏状态，属于主界面的职责）
       const id = openBtn.dataset.openPlugin;
       if (id) (window as any).__lunac_open_plugin?.(id);
+      return;
+    }
+    // 暂停 / 继续（2026-10-27）：宿主那边是**原地等**，点「继续」同一任务接着读流
+    const pauseBtn = target.closest<HTMLButtonElement>("[data-install-pause]");
+    if (pauseBtn) {
+      const next = liveInstall ? !liveInstall.paused : true;
+      void (async () => {
+        try {
+          await invoke("plugin_install_pause", { paused: next });
+        } catch { /* 宿主没有这条命令也不该把界面卡住 */ }
+        if (liveInstall) {
+          liveInstall.paused = next;
+          paintLiveInstall();
+        }
+      })();
       return;
     }
     const dlBtn = target.closest<HTMLButtonElement>("[data-download-plugin]");
@@ -2035,6 +2454,23 @@ export async function attachSettingsListeners(container: HTMLElement) {
         color: var(--text-dim);
         margin-right: 8px;
       }
+      /* 开发工具链（2026-10-18）：构建输出原样展示；空时完全收起。 */
+      .settings-toolchain-output {
+        margin: 4px 0 10px;
+        padding: 8px 10px;
+        max-height: 180px;
+        overflow: auto;
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 0.7rem;
+        line-height: 1.5;
+        color: var(--text-dim);
+        background: rgba(var(--ink-rgb), 0.03);
+        border: 1px solid var(--border-glass);
+        border-radius: var(--radius);
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .settings-toolchain-output:empty { display: none; }
 
       /* Panes */
       .settings-pane {
@@ -2120,6 +2556,12 @@ export async function attachSettingsListeners(container: HTMLElement) {
       .settings-market-row.is-installing > button { display: none; }
       .settings-market-row.is-installing { background: rgba(var(--ink-rgb), 0.04); }
       .settings-market-progress { margin-left: auto; }
+      /* 进度里的「暂停 / 继续」比行内按钮小一档（它跟环、速度同一行，不能把行撑高） */
+      .settings-market-progress .settings-install-btn {
+        padding: 3px 8px;
+        font-size: 0.66rem;
+        flex-shrink: 0;
+      }
       .settings-market-broken { color: var(--yellow); font-size: 0.68rem; }
       .settings-btn {
         flex-shrink: 0;
@@ -2221,44 +2663,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
       @keyframes pulse-recording {
         from { opacity: 1; } to { opacity: 0.5; }
       }
-      .settings-toggle {
-        position: relative;
-        display: inline-block;
-        width: 36px;
-        height: 20px;
-        flex-shrink: 0;
-      }
-      .settings-toggle input { display: none; }
-      /* ⑤ 切换开关（项目内所有开关都吃这一条）—— 轨道与描边走「按钮自定义」。
-         轨道底的 alpha 取线条 alpha 的固定比例（关 0.31 / 开 0.44）：这样拖
-         「线条透明度」时开关的三层（描边 / 开启底 / 关闭底）同步缩放，不会只剩描边动。
-         默认 alpha 0.32 ⇒ 关闭底 0.0992≈改造前的 0.1、开启底 0.1408≈0.14，肉眼无差。
-         圆点**不动**：它是填充不是线条，仍跟随主题色（用户 2026-09-20：只管线条/描边）。 */
-      .settings-toggle-slider {
-        position: absolute;
-        cursor: pointer;
-        top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(var(--btn-line-rgb), calc(var(--btn-line-alpha) * 0.31));
-        border-radius: 20px;
-        transition: background 0.2s;
-      }
-      .settings-toggle-slider::before {
-        content: "";
-        position: absolute;
-        height: 14px; width: 14px;
-        left: 3px; bottom: 3px;
-        background: var(--text-dim);
-        border-radius: 50%;
-        transition: transform 0.2s, background 0.2s;
-      }
-      .settings-toggle input:checked + .settings-toggle-slider {
-        background: rgba(var(--btn-line-rgb), calc(var(--btn-line-alpha) * 0.44));
-        border: 1px solid rgba(var(--btn-line-rgb), var(--btn-line-alpha));
-      }
-      .settings-toggle input:checked + .settings-toggle-slider::before {
-        transform: translateX(16px);
-        background: rgb(var(--btn-line-rgb));
-      }
+      /* 切换开关的样式已收编到全局 styles.css（.settings-toggle）——
+         本面板与「更多设置」共用同一份，不再在这里注入第二套。 */
       .settings-plugin-list {
         max-height: 200px;
         overflow-y: auto;
@@ -2465,8 +2871,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
       }
       /* Skill store list */
       .settings-skill-list { max-height: 220px; overflow-y: auto; }
-      /* 动作按钮（打开 / 编辑）：底色与边框走 --accent 系，**文字走灰阶**
-         （ai-spec §11 规则 45 —— 文字只跟明暗、不带色相）。 */
+      /* 动作按钮（打开 / 编辑）：底色与边框走 --accent 系，**文字走固定灰阶**
+         （三档文字是 :root 固定值，不随主题色 / 蒙版漂移）。 */
       .settings-skill-open, .settings-skill-edit {
         padding: 3px 10px;
         font-size: 0.68rem;
@@ -2857,193 +3263,6 @@ export async function attachSettingsListeners(container: HTMLElement) {
   const updateProgressRing = container.querySelector("#settings-update-progress-ring") as HTMLElement | null;
   const updateProgressSpeed = container.querySelector("#settings-update-progress-speed") as HTMLElement | null;
   const updateAuto = container.querySelector("#settings-update-auto") as HTMLInputElement | null;
-
-  // ── 本地模型决策开关（2026-10-09；2026-10-15 起「开启前先补依赖」）──────────
-  // 编排：开 ⇒（若依赖未就位，**先**按清单下载依赖，带进度、可取消）→ 起 sidecar（首次落盘信任）
-  //       + 写开关 + 重载 agent（让 `LUNAC_LOCAL_MODEL_URL` 生效）；关 ⇒ 写开关 + 收 sidecar + 重载。
-  // 为什么在前端编排而不是让宿主自己起：sidecar 的**信任门**只在 webview 里能弹（默认拒绝），
-  // 宿主闷头起只会拿到 `needs_trust` 而什么都不发生。
-  const lmToggle = container.querySelector("#settings-local-model") as HTMLInputElement | null;
-  const lmHint = container.querySelector("#settings-local-model-hint") as HTMLElement | null;
-  const lmWarn = container.querySelector("#settings-local-model-warn") as HTMLElement | null;
-  const lmDeps = container.querySelector("#settings-local-model-deps") as HTMLElement | null;
-  const lmDepsBtn = container.querySelector("#settings-local-model-download") as HTMLButtonElement | null;
-  const lmProgress = container.querySelector("#settings-local-model-progress") as HTMLElement | null;
-  if (lmToggle && !lmToggle.disabled) {
-    // 状态 / 错误**直接写进那行提示**（不再单开一个提示元素）：空元素不占位，也不会再出现
-    // 「有文字但 opacity:0 ⇒ 看着是一块空白」（2026-10-09 修：原来挂在 `.settings-save-msg` 上）
-    // 提示行按**当前就绪状态**现算默认文案 —— 依赖装好后不能再留着「未就绪」那句。
-    const resetLmHint = () => {
-      if (!lmHint) return;
-      lmHint.textContent = !hasDiskPlugin("local-model")
-        ? t("settings.local_model_missing")
-        : !diskPluginReady("local-model")
-          ? t("settings.local_model_deps_missing")
-          : t("settings.local_model_hint");
-      lmHint.style.color = "var(--text-dim)";
-    };
-    const setLmMsg = (s: string, isErr = false) => {
-      if (!s) return resetLmHint();
-      if (!lmHint) return;
-      lmHint.textContent = s;
-      lmHint.style.color = isErr ? "var(--red)" : "var(--text-dim)";
-    };
-    // ── 依赖安装（**复用宿主 `install_plugin_dependencies`** —— 与 ocr-engine.ts:55 同一条路，
-    //    不新造第二套下载器）：进度经全局事件 `plugin-install-progress` 回传（按 id 过滤），
-    //    下载中按钮变「取消」（宿主下载循环据 `cancel_plugin_dependency_install` 中止）。
-    //    2.33 GiB ⇒ 必须有进度、能取消、失败可重试、有时间预期（预期写在 `local_model_deps_missing` 里）。──
-    let depBusy = false;
-    let depCancelled = false;
-    let depUnlisten: (() => void) | undefined;
-    const showDeps = (on: boolean) => lmDeps?.classList.toggle("hidden", !on);
-    const setDepsBtn = (label: string, disabled = false) => {
-      if (!lmDepsBtn) return;
-      lmDepsBtn.textContent = label;
-      lmDepsBtn.disabled = disabled;
-    };
-    const installDeps = async (): Promise<"ok" | "cancelled" | "failed"> => {
-      if (depBusy) return "failed";
-      depBusy = true;
-      depCancelled = false;
-      showDeps(true);
-      setDepsBtn(t("settings.local_model_deps_cancel"));
-      setLmMsg(t("settings.local_model_deps_downloading"));
-      if (lmProgress) {
-        lmProgress.classList.remove("hidden");
-        lmProgress.innerHTML =
-          ringHtml(-1) +
-          `<span class="dl-meta"><span class="dl-phase">${t("settings.local_model_deps_downloading")}</span>` +
-          `<span class="dl-speed">—</span></span>`;
-      }
-      const meter = new DownloadMeter();
-      // 阶段键：`download#1`（第 1 条依赖）→ `extract#1` → `download#2` …；变了就重置速度基线
-      //（不同文件之间的字节数不连续，不重置会算出一个荒唐的速度，见 download-progress.ts）。
-      let segKey = "";
-      try {
-        depUnlisten = await listen("plugin-install-progress", (ev) => {
-          const p = ev.payload as {
-            id: string;
-            phase: string;
-            downloaded: number;
-            total: number;
-            index: number;
-          };
-          if (p.id !== "local-model") return;
-          const key = `${p.phase}#${p.index}`;
-          if (key !== segKey) {
-            segKey = key;
-            meter.reset();
-          }
-          const extracting = p.phase === "extract";
-          const s = meter.push(p.downloaded, p.total);
-          if (lmProgress) {
-            updateRing(lmProgress, extracting ? -1 : s.percent);
-            const ph = lmProgress.querySelector<HTMLElement>(".dl-phase");
-            const sp = lmProgress.querySelector<HTMLElement>(".dl-speed");
-            if (ph) ph.textContent = extracting
-              ? t("settings.plugins_market_extracting")
-              : t("settings.local_model_deps_downloading");
-            if (sp) sp.textContent = extracting ? "—" : formatSpeed(s.speed);
-          }
-        });
-      } catch { /* 挂不上监听不该拦住安装本身 */ }
-      let result: "ok" | "cancelled" | "failed" = "failed";
-      try {
-        await invoke("install_plugin_dependencies", { id: "local-model" });
-        result = "ok";
-      } catch {
-        // 是「用户点了取消」还是「真失败」，前端自己分得清（宿主中止消息不必拿来做判据）
-        result = depCancelled ? "cancelled" : "failed";
-      } finally {
-        try { depUnlisten?.(); } catch { /* ignore */ }
-        depUnlisten = undefined;
-        depBusy = false;
-      }
-      lmProgress?.classList.add("hidden");
-      // 重扫一次：让 `hasDiskPlugin` / `diskPluginReady` 看到刚落盘的依赖
-      await refreshMarketPlugins().catch(() => {});
-      showDeps(!diskPluginReady("local-model"));
-      if (result === "ok") {
-        setLmMsg(t("settings.local_model_deps_done"));
-        if (lmToggle) lmToggle.disabled = false; // 依赖到位 ⇒ 开关可用
-      } else if (result === "cancelled") {
-        setLmMsg(t("settings.local_model_deps_cancelled"));
-      } else {
-        setLmMsg(t("settings.local_model_deps_failed"), true);
-      }
-      setDepsBtn(result === "failed"
-        ? t("settings.local_model_deps_retry")
-        : t("settings.local_model_download_deps"));
-      return result;
-    };
-    const turnOn = async () => {
-      lmToggle.disabled = true;
-      setLmMsg(t("settings.local_model_working"));
-      try {
-        if (!hasDiskPlugin("local-model")) throw new Error(t("settings.local_model_missing"));
-        // ① 开启前**先补依赖**：缺 `sidecar.command` 时先下 2.33 GiB 依赖（带进度、可取消）
-        if (!diskPluginReady("local-model")) {
-          const r = await installDeps();
-          if (r === "cancelled") return; // 用户取消：不继续、也不改落盘状态（勾选本就没勾上）
-          if (r !== "ok") throw new Error(t("settings.local_model_deps_failed"));
-        }
-        // ② 不经信任卡：直接落盘信任再起进程（原因见 sidecar.ts 的 startPluginSidecarTrusted）
-        await startPluginSidecarTrusted("local-model");
-        await invoke("local_model_config_set", { enabled: true });
-        lmToggle.checked = true;
-        setLmMsg("");
-        // 端点靠 spawn 时的环境变量下发 ⇒ 必须重启 agent 才生效（沿用全局桥）
-        await (window as any).__lunac_reload_agent?.();
-      } catch (e) {
-        lmToggle.checked = false; // 回滚：界面状态与落盘状态保持一致
-        setLmMsg(String(e instanceof Error ? e.message : e), true);
-      } finally {
-        lmToggle.disabled = false;
-      }
-    };
-    const turnOff = async () => {
-      lmToggle.disabled = true;
-      setLmMsg(t("settings.local_model_working"));
-      try {
-        await invoke("local_model_config_set", { enabled: false });
-        await stopPluginSidecar("local-model");
-        setLmMsg("");
-        await (window as any).__lunac_reload_agent?.();
-      } catch (e) {
-        lmToggle.checked = true;
-        setLmMsg(String(e instanceof Error ? e.message : e), true);
-      } finally {
-        lmToggle.disabled = false;
-      }
-    };
-    lmToggle.addEventListener("change", () => {
-      lmWarn?.classList.add("hidden");
-      if (lmToggle.checked) {
-        // 开：先回退勾选，弹**内联警告**；确认后才真信任 + 起进程（不用会被布局吞掉的信任卡）
-        lmToggle.checked = false;
-        lmWarn?.classList.remove("hidden");
-      } else {
-        void turnOff();
-      }
-    });
-    // 「下载依赖」按钮：闲时下载 / 失败后重试；**下载中变「取消」**（点了就中止本次下载）
-    lmDepsBtn?.addEventListener("click", () => {
-      if (depBusy) {
-        depCancelled = true;
-        setDepsBtn(t("settings.local_model_deps_cancel"), true);
-        void invoke("cancel_plugin_dependency_install").catch(() => {});
-        return;
-      }
-      void installDeps();
-    });
-    const lmOk = container.querySelector("#settings-local-model-ok") as HTMLButtonElement | null;
-    const lmCancel = container.querySelector("#settings-local-model-cancel") as HTMLButtonElement | null;
-    lmOk?.addEventListener("click", () => {
-      lmWarn?.classList.add("hidden");
-      void turnOn();
-    });
-    lmCancel?.addEventListener("click", () => lmWarn?.classList.add("hidden"));
-  }
 
   if (updateCheckBtn && updateStatusEl) {
     updateUi = {
@@ -3553,6 +3772,8 @@ export async function attachSettingsListeners(container: HTMLElement) {
   //    表由这里填（`renderMarket`），**不是**在 buildPluginsPane 里 —— 那里 await 网络
   //    会把「打开设置」一起拖住；绑定用事件委托，重绘多少次都不会出现死按钮。
   wirePluginMarket(container);
+  // 开发工具链（2026-10-18）：独立的授权 / 安装 / 构建分区，不复用市场行的按钮。
+  wireToolchains(container);
 
   // ── 用量与成本（A12）─────────────────────────────────────────
   // 分块自己会重渲染（确认 / 放弃候选价格之后），所以绑定的入口是个函数，
@@ -3713,6 +3934,7 @@ export const settingsPlugin: Plugin = {
   description: "Configure Lunac — hotkey, AI provider, plugins",
   keywords: ["settings", "设置", "config", "配置", "hotkey", "热键", "api", "key", "model", "plugin", "插件"],
   icon: "⚙️",
+  provides: ["settings.panel"],
 
   async execute(_input: string) {
     let hotkey = "Ctrl+Alt+Space";

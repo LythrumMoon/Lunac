@@ -68,15 +68,20 @@ pub struct SystemProxy {
 /// 读当前的系统代理。**读不到就返回默认值**（键不存在 / 被锁都是「没设代理」这个语义，
 /// 不是错误 —— 把「读不出来」报成错误会让「第一次打开这个插件」直接失败）。
 pub fn read() -> SystemProxy {
-    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ)
+    let Ok(key) =
+        RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ)
     else {
         return SystemProxy::default();
     };
     SystemProxy {
         // `ProxyEnable` 存的是 0/1 的 DWORD（不是 bool）
         enabled: key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0,
-        server: key.get_value::<String, _>("ProxyServer").unwrap_or_default(),
-        bypass: key.get_value::<String, _>("ProxyOverride").unwrap_or_default(),
+        server: key
+            .get_value::<String, _>("ProxyServer")
+            .unwrap_or_default(),
+        bypass: key
+            .get_value::<String, _>("ProxyOverride")
+            .unwrap_or_default(),
     }
 }
 
@@ -112,7 +117,12 @@ fn put_or_delete(key: &RegKey, name: &str, value: &str) -> Result<(), String> {
 /// 状态，而且它没有返回值可判 —— 顶多是「要重启相关程序才生效」，不该因此把整步判失败。
 fn notify() {
     unsafe {
-        InternetSetOptionW(std::ptr::null_mut(), OPT_SETTINGS_CHANGED, std::ptr::null_mut(), 0);
+        InternetSetOptionW(
+            std::ptr::null_mut(),
+            OPT_SETTINGS_CHANGED,
+            std::ptr::null_mut(),
+            0,
+        );
         InternetSetOptionW(std::ptr::null_mut(), OPT_REFRESH, std::ptr::null_mut(), 0);
     }
 }
@@ -174,7 +184,9 @@ pub struct ProxyConfig {
 pub const DEFAULT_BYPASS: &str = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*";
 
 fn config_path() -> PathBuf {
-    crate::storage::lunac_root_dir().join("config").join("proxy.json")
+    crate::storage::lunac_root_dir()
+        .join("config")
+        .join("proxy.json")
 }
 
 pub fn load_config() -> ProxyConfig {
@@ -397,7 +409,11 @@ mod tests {
     #[test]
     fn find_entry_returns_none_instead_of_a_blank_entry() {
         let cfg = ProxyConfig {
-            entries: vec![ProxyEntry { id: "a".into(), server: "1.2.3.4:80".into(), ..Default::default() }],
+            entries: vec![ProxyEntry {
+                id: "a".into(),
+                server: "1.2.3.4:80".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         assert!(find_entry(&cfg, "a").is_some());

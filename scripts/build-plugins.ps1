@@ -71,7 +71,7 @@ $OutDir = "$Root\release\plugin-packages"
 # 见下面 Get-PluginVersion 那一段的完整理由）。**只有真的改了这个插件，才动它这一行。**
 $Plugins = @{
   music = @{
-    version      = "0.9.36"
+    version      = "0.9.37"
     name         = "音乐"
     description  = "LRCLIB 歌词抓取 + Spotify 播放控制"
     keywords     = @("music", "音乐", "歌词", "music 音乐", "spotify", "lyrics", "lrclib")
@@ -80,6 +80,8 @@ $Plugins = @{
     # `window.float`（2026-09-29）：本插件一律在**悬浮窗**里打开。
     # 宿主不再按 id 认「音乐要开窗」—— 拓展插件要能独立打包分发，宿主写死的 id 表在磁盘插件上查不到。
     permissions  = @("window.float")
+    # 能力身份（E.1，2026-10-18）：宿主按能力定位插件；`id = 目录名` 仍是硬契约。
+    provides     = @("music.playback", "lyrics.lrclib")
     # dest 落在插件目录内 ⇒ `<exe 根>\Modules\music\bin\librespot.exe`；
     # 宿主 music.rs 的 find_librespot() 认这条路径，用户不必自己去填路径。
     dependencies = @(
@@ -101,6 +103,7 @@ $Plugins = @{
     icon         = "📋"
     homepage     = "https://github.com/LythrumMoon/Lunac"
     permissions  = @()
+    provides     = @("clipboard.history")
     dependencies = @()
   }
   # OCR（2026-09-29 从 bundle 摘出）：`layout.takeover` = 接管整个窗口（双栏：左图右文），
@@ -114,13 +117,14 @@ $Plugins = @{
   #   对不上时宿主整包拒绝安装 —— 换版本时务必同步更新（下载后 Get-FileHash -Algorithm SHA256）。
   #   上游 Releases 直链（公开、免鉴权）；该资产只有 `.7z`（没有 Windows 的 zip）。
   ocr = @{
-    version      = "0.9.10"
+    version      = "0.9.11"
     name         = "OCR 文字识别"
     description  = "OCR 图片文字识别 (PaddleOCR · 离线高精度)"
     keywords     = @("ocr", "识别", "文字识别", "图像识别", "图片转文字", "截图识别", "图识字", "文字提取")
     icon         = "🔍"
     homepage     = "https://github.com/LythrumMoon/Lunac"
     permissions  = @("layout.takeover")
+    provides     = @("ocr.recognize")
     dependencies = @(
       @{
         type   = "archive"
@@ -131,16 +135,27 @@ $Plugins = @{
     )
   }
   # 文件转换（2026-09-29 从 bundle 摘出）：引擎是本机 ffmpeg（宿主的 convert.rs 自己找），
-  # 所以同样无依赖。
+  # PDF 走本机 LibreOffice（也是宿主自己找），所以同样无依赖。
+  # 2026-10-24 重构：独立窗口（四类转换页签 / 双 300×250 框 / 多文件队列）⇒ 补 `window.float`
+  # 与定尺 `window`；**改了源码必须 +1 version**（否则已经装在机器上的那份收不到更新）。
   convert = @{
-    version      = "0.9.8"
+    version      = "0.9.9"
     name         = "文件转换"
-    description  = "图片 / 音频 / 视频格式互转 (Image / Audio / Video converter · ffmpeg)"
-    keywords     = @("转换", "格式转换", "转格式", "convert", "格式", "转码", "提取音频", "图片转换", "视频转换", "音频转换")
+    description  = "PDF / 视频 / 音频格式转换（ffmpeg + 本机 LibreOffice）"
+    keywords     = @("转换", "格式转换", "转格式", "convert", "格式", "转码", "提取音频", "图片转换", "视频转换", "音频转换", "pdf", "pdf转word", "pdf转图片", "mp4转gif")
     icon         = "🔄"
     homepage     = "https://github.com/LythrumMoon/Lunac"
-    permissions  = @()
+    permissions  = @("window.float")
+    provides     = @("media.convert")
     dependencies = @()
+    # 建窗初值：内容定尺 88 + 300 + 48 + 300（含列间距）= 766，加外层内边距 ⇒ 820；
+    # 与 `plugin_window.rs` 的 CONVERT_W / CONVERT_H **同一口径**（那边是缺省，这里是声明）。
+    window       = @{
+      width    = 820
+      height   = 470
+      minWidth = 780
+      minHeight = 430
+    }
   }
   # 代理（2026-10-02）：系统代理增删启用 + 让本机播放（librespot）走代理。
   # **零依赖**：宿主那半边 2026-10-01 就写好了（`src-tauri/src/system_proxy.rs` 的读/写/
@@ -151,27 +166,42 @@ $Plugins = @{
   # 判「有没有更新」只比**不同**。2026-10-06 踩过一次 —— proxy 源码改过之后没动版本号，
   # 结果「市场里是新内容、装在机器上的还是旧的」而用户端**收不到更新提示**（同一版本号）。
   proxy = @{
-    version      = "0.9.2"
+    version      = "0.10.5"
     name         = "代理"
-    description  = "系统代理管理 + 让本机播放（librespot）走代理"
-    keywords     = @("代理", "proxy", "系统代理", "梯子", "vpn", "socks5", "http proxy", "clash")
+    description  = "系统代理 + 自研代理内核（订阅 / 服务器 / 规则 / 请求日志）"
+    keywords     = @("代理", "proxy", "系统代理", "梯子", "vpn", "socks5", "http proxy", "订阅", "服务器")
     icon         = "🌐"
     homepage     = "https://github.com/LythrumMoon/Lunac"
-    permissions  = @("layout.takeover")
+    # `window.float`（2026-10-24 用户口径）：代理插件一律在**独立窗口**里打开；
+    # `layout.takeover` 保留给插件窗内部的整页挂载。
+    permissions  = @("layout.takeover", "window.float")
+    provides     = @("system.proxy")
+    # 2026-11-01（§待办 3-26 K3）：**内核依赖已删除**。自研引擎编进宿主，不需要任何外部
+    # 可执行文件；原来那条指向 MetaCubeX/mihomo 的 `archive` 依赖（下载 + sha256）随之移除。
+    # 别把它加回来 —— 那会把 GPL 内核重新变成代理插件的前置条件。
     dependencies = @()
+    # 三段式面板（工具区 / 中间区 / 日志区）是 1280×720 画的：与 plugin_window.rs 的
+    # 缺省档（640×560）不同，必须在这里声明，否则一开窗就挤成两行。
+    window       = @{
+      width     = 1280
+      height    = 720
+      minWidth  = 960
+      minHeight = 600
+    }
   }
   # 桌宠（L1，2026-09-29）：**第一个用 `window` 段声明自己形态的插件**。
   # 无权限（`permissions` 是空的）：它不是「一律开悬浮窗」那一类 —— 搜索打开的是
   # **控制台**面板，桌宠窗由控制台里的「显示桌宠」按钮开（理由见 pet.ts 文件头：
   # 穿透开着时桌宠窗收不到鼠标事件，开关必须落在另一个窗口里）。
   pet = @{
-    version      = "0.9.64"
+    version      = "0.9.65"
     name         = "桌宠"
     description  = "桌宠 —— 独立透明置顶的桌面形象窗（图片或 Live2D 模型，由你自己导入）"
     keywords     = @("桌宠", "宠物", "桌面宠物", "pet", "desktop pet", "live2d", "看板娘", "吉祥物")
     icon         = "🐾"
     homepage     = "https://github.com/LythrumMoon/Lunac"
     permissions  = @()
+    provides     = @("desktop.pet", "tts.zipvoice")
     # Live2D 的 **Cubism Core**（专有文件；协议 5.1 允许随包复制转发，义务见
     # docs/agent-feature-backlog.md 的 L1-B ① —— 随附 LICENSE 已落地，见下面的 `notices`）。
     # **为什么走 dependencies 而不是打进 index.js**（2026-09-30 三条本机实测的结论，见 L1 ②）：
@@ -291,20 +321,29 @@ $Plugins = @{
   #    依赖随装随下 —— zip 里是「exe + 一堆 DLL」，所以用 `archive` 而不是 `file`（与 ocr 的 PaddleOCR 同款）。
   # ⚠️ `MAX_DEP_BYTES` 2026-10-09 已由 512MB 提到 **4 GiB**（`plugin_market.rs`）—— 3B/4B 的 Q4_K_M
   #    约 2–3 GiB；`file` 依赖现在走**流式落盘**（不再整包读进内存）。别找超过 4 GiB 的档。
+  # **2026-10-24 换成 Vulkan 构建**（原来用 `-bin-win-cpu-x64.zip`）：
+  #   · 同一 build（b11803 / 0.7.0-dev，commit a37cc4610）的 Vulkan 包 **36.9 MB**，只比 CPU 包大 12.8 MB；
+  #   · 有 Vulkan 设备时自动 offload：本机 RTX 4060 Laptop 上 981 token 冷 prefill
+  #     **1,658.8 tok/s / 590.8 ms**，CPU 包 **95.3 tok/s / 10,241 ms** ⇒ **17.4×**；生成 47.0 vs 15.4 tok/s。
+  #   · 没有 Vulkan 的机器：把 `ggml-vulkan.dll` 拿掉实测仍能跑（**98.2 tok/s ≈ CPU**）⇒ CPU 兜底成立。
+  #   · ⚠️ **不要加 `--device Vulkan0`**：没有 Vulkan 设备时 llama.cpp 会直接 `invalid device` 退出；
+  #     只写 `-ngl 99`，让它自己挑设备（默认选 Vulkan0）。
+  #   · sha256 已与 GitHub release 页的 `expanded_assets` 清单逐字核对（`01D38D95…C72716`）。
   "local-model" = @{
-    version      = "0.11.0"
+    version      = "0.13.0"
     name         = "本地决策模型"
     description  = "本地小模型（llama-server）—— 只参与「要不要把消息发给云模型」的决策，省钱"
     keywords     = @("本地模型", "本地模型决策", "local model", "llama", "llama-server", "决策", "离线", "gguf", "省钱")
     icon         = "🧠"
     homepage     = "https://github.com/LythrumMoon/Lunac"
     permissions  = @("process.spawn")
+    provides     = @("model.local")
     dependencies = @(
       @{
         type   = "archive"
-        url    = "https://github.com/ggml-org/llama.cpp/releases/download/b11524/llama-b11524-bin-win-cpu-x64.zip"
+        url    = "https://github.com/ggml-org/llama.cpp/releases/download/b11803/llama-b11803-bin-win-vulkan-x64.zip"
         dest   = "bin"
-        sha256 = "66AAE07A0A7E37028ADBC391ADE7EFC9693B2015C3D31FFB19FC3C8BFA8787AE"
+        sha256 = "01D38D95C7CB22EB615C2EA3269C9E1623D64B663B9DF72C71DE3AB1FEC72716"
       }
       @{
         type   = "file"
@@ -320,9 +359,17 @@ $Plugins = @{
     #   并**杀掉进程**（2026-10-09 实测「拉起几秒后闪退」的真因）。
     sidecar      = @{
       command        = "bin/llama-server.exe"
-      # `-np 1` ⇒ **单槽**：llama-server 默认 `-np 4`，会按 4 × ctx 分配 KV（`-c 8192` 时约 4.7GB）；
-      #   本地决策模型同时只有一个调用方，单槽够用，直接把 KV 降到 ~1.2GB。
-      args           = @("-m", "models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "-c", "8192", "-np", "1", "--port", "8090")
+      # `-np 2`（2026-10-24 由 1 改 2）⇒ **两槽**：判定 / 抽取 / 改写 / 预筛 / 路由 / 预热
+      #   共用 agent 侧那道「按槽计数」的闸（`decide::channel_slots`），槽数由宿主从**本清单的
+      #   `-np`** 读出来注入 `LUNAC_LOCAL_MODEL_SLOTS`（与 `--port` 同一条纪律：清单是唯一真相源）。
+      #   为什么是 2：实测 `MemorySearch` 的查询改写会和预热 / 判定抢槽（1/3 次 busy-skip）。
+      #   `-np 1` 时 KV 约 1.2GB；`-np 2` 时 `n_ctx_slot = 4096`（`-c 8192` 被两槽均分）、
+      #   进程工作集实测 **2.6GB**（仍远低于下面的 8GiB 上限）；两槽是否真并行已实测：
+      #   单个 200-token 请求 4.3s，两个**并发** 4.8s（不是 8.6s）。
+      #   ⚠️ 槽数不是越大越好：每多一槽就把 `-c` 摊薄一半，超过 4 会被 agent 侧直接降回 1。
+      # `-ngl 99`（2026-10-24 Vulkan 构建）：把层全交给设备；**没有 Vulkan 设备时 llama.cpp 自动回落 CPU**
+      #   （实测 98.2 tok/s，与 CPU 包持平）⇒ 一条参数同时覆盖「有 GPU / 无 GPU」两种机器。
+      args           = @("-m", "models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "-c", "8192", "-np", "2", "-ngl", "99", "--port", "8090")
       transport      = "http"
       # ⚠️ **必须写 port（2026-10-09 修）**：宿主的就绪判定靠「端口可连」（第三方服务不会说 NDJSON
       #    握手行，见 ai-spec 规则 95）。之前只把 `--port` 放进了 args、没写这个 `port` 字段 ⇒
@@ -331,8 +378,73 @@ $Plugins = @{
       port           = 8090
       autostart      = $false
       readyTimeoutSec = 180
+      # 资源闸（E.6，2026-10-18）：该 sidecar 独立 Job Object 的上限；0 = 不限。
+      #   `memoryLimitMiB = 8192`（8 GiB，**单进程**上限）：4B Q4_K_M 权重 ~2.3 GiB +
+      #     `-c 8192 -np 2` 的双槽 KV（实测工作集 2.6 GiB）+ runtime/图缓冲，8 GiB 留足余量；
+      #     触顶会被内核直接终止（不是沙箱，只防失控吃满内存）。
+      #   `processLimit = 8`：llama-server 正常只有一个进程，留 8 给它的辅助进程；
+      #     防止异常 fork 打爆进程表。
+      memoryLimitMiB = 8192
+      processLimit   = 8
     }
   }
+}
+
+# ── 外部工程构建的插件（2026-11-01 加：资源库）──────────────────────────
+# 资源库（`resource-hub/apps/lunac-plugin`）是**独立 npm workspace**：它自带 vite 配置与清单
+# （`public/lunac-plugin.json`），不能走 `app/vite.plugins.config.ts` 的 `pluginEntries`
+# （root 与源码根都不同）。所以这里单独登记一条路：
+#   ① 在 `WorkDir` 里跑 `npm run build`（会先打 SDK / reader，再打插件）；
+#   ② 把 `Dist` 整个拷进 `app\plugin-dist\<id>\` —— 之后**完全复用**本脚本的
+#      清单校验 / zip / release\ext-plugins / dev Modules 四条路，不再有第二套打包逻辑。
+# **版本号唯一真相源** = 该插件自己的 `public/lunac-plugin.json`（本表不写第二份）；
+# 改了源码要发版时只改那份清单的 `version`。
+$ExternalPlugins = @{
+  "resource-hub" = @{
+    WorkDir = "resource-hub"
+    Dist    = "resource-hub\apps\lunac-plugin\dist"
+  }
+}
+
+# ── LibreOffice（convert 的 PDF 引擎，2026-10-27 用户要求「作为插件依赖装」）────
+#
+# **为什么必须走依赖**：PDF → Word / PPT / Excel / 图片只能靠 LibreOffice 的无头模式
+# （ffmpeg 读不了 PDF）。让用户自己去装 = 「插件装了却用不了」，与 ocr 的 PaddleOCR、
+# pet 的 zipvoice 是同一条路：自己托管一份**带版本 + sha256** 的压缩包，挂在公开 Release。
+#
+# **打包机准备步骤**（只需一次；换 LibreOffice 版本时重做 ①–③）：
+#   ① 取一台装了 LibreOffice 的机器的安装目录 `…\LibreOffice`，删掉这些（只影响帮助 / 模板）：
+#        help\、readmes\、license\、share\gallery\、share\autotext\、share\template\、
+#        program\*.pdb
+#      保留 `program\`（soffice.exe 与过滤器）+ `share\`（registry / filter 配置，转换必需）+ `presets\`。
+#   ② 压成 7z，**压缩包内保持单层 `LibreOffice\`**（安装器会把唯一顶层目录摊平）：
+#        & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=9 libreoffice-portable.7z .\LibreOffice\*
+#      ⚠️ 解压后总量必须 **< 1 GiB**（宿主 `plugin_market::MAX_DEP_EXTRACT_BYTES` 的硬上限，
+#         超了整包依赖会被拒）。仍超就先删 `share\fonts\`（只影响 PDF 的字体替换）。
+#   ③ 放到 `release\deps\libreoffice\libreoffice-portable.7z`，并上传到公开仓库：
+#        gh release create libreoffice-<版本> libreoffice-portable.7z -R LythrumMoon/lunac-plugins
+#   ④ 重跑本脚本 —— 下面这段会**自动**取本地文件的 sha256 写进清单（不再手抄哈希）。
+#
+# **没有这个文件时**：不声明依赖、只打一行提示；插件照旧能装，PDF 分页如实显示
+# 「未找到 LibreOffice」（宿主 `convert.rs` 仍会退到 PATH / Program Files 找系统安装）。
+# **不加 `local`**：那会把整棵树拷进 `release\ext-plugins\` 与 dev 的 `Modules\`，
+# 安装包体积会平白涨几百 MB —— 依赖由市场安装时下载，不进安装器。
+$LoAsset = Join-Path $Root "release\deps\libreoffice\libreoffice-portable.7z"
+$LoVersion = "25.2.5"
+if (Test-Path $LoAsset) {
+  $loSha = (Get-FileHash $LoAsset -Algorithm SHA256).Hash
+  $Plugins['convert'].dependencies = @(
+    @{
+      type   = "archive"
+      url    = "https://github.com/LythrumMoon/lunac-plugins/releases/download/libreoffice-$LoVersion/libreoffice-portable.7z"
+      dest   = "libreoffice"
+      sha256 = $loSha
+    }
+  )
+  $loMiB = [math]::Round((Get-Item $LoAsset).Length / 1MB, 1)
+  Write-Host "  convert: 已声明 LibreOffice 依赖（$loMiB MiB，sha256=$($loSha.Substring(0,8))…）" -ForegroundColor DarkGray
+} else {
+  Write-Host "  convert: 未找到 release\deps\libreoffice\libreoffice-portable.7z —— 本次不声明 PDF 引擎依赖（准备步骤见上方注释）" -ForegroundColor Yellow
 }
 
 # ── 版本号：**每个插件各带一份，不跟随应用版本**（2026-10-01 改，用户要求）──
@@ -347,8 +459,17 @@ $Plugins = @{
 #     只有 A 需要 +1（别按内容哈希自动推版本，那正是「没变化也喊更新」）。
 #   · 改完插件源码**必须跑一次本脚本**才生效（盘上是 `Modules\<id>\index.js`，不是源码）。
 function Get-PluginVersion([string]$id) {
-  $v = $Plugins[$id].version
-  if (-not $v) { throw "插件 '$id' 没写 version（见本脚本顶部的 `$Plugins 表）" }
+  if ($ExternalPlugins.ContainsKey($id)) {
+    # 外部工程插件的版本只看它自己的清单（单一真相源），不在本脚本再抄一份
+    $manifest = Join-Path $Root (Join-Path $ExternalPlugins[$id].Dist "lunac-plugin.json")
+    if (-not (Test-Path $manifest)) {
+      throw "外部插件 '$id' 的清单不存在：$manifest —— 先跑一次它的构建（不带 -NoBuild）"
+    }
+    $v = (Get-Content $manifest -Raw -Encoding UTF8 | ConvertFrom-Json).version
+  } else {
+    $v = $Plugins[$id].version
+  }
+  if (-not $v) { throw "插件 '$id' 没写 version（见本脚本顶部的 `$Plugins 表 / 它自己的清单）" }
   if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "插件 '$id' 的 version 必须形如 x.y.z，收到：$v" }
   return $v
 }
@@ -357,16 +478,28 @@ function Get-PluginVersion([string]$id) {
 # **一个入口一次 vite build**（2026-09-29）：多个入口放一起会让 Rollup 把共享模块提到
 # `plugin-dist/<chunk 名>/` 这种跨插件的公共 chunk 里，而插件包只搬走自己那个目录 ⇒
 # 那份 chunk 丢失、插件打开即失败。逐个入口各起一次就没有共享 chunk，产物单文件自包含。
-$Ids = if ($Plugin.Count -gt 0) { $Plugin } else { @($Plugins.Keys) }
+$Ids = if ($Plugin.Count -gt 0) { $Plugin } else { @($Plugins.Keys) + @($ExternalPlugins.Keys) }
 foreach ($id in $Ids) {
-  if (-not $Plugins.ContainsKey($id)) { throw "元数据表里没有插件 '$id'（见本脚本顶部的 `$Plugins）" }
+  if (-not $Plugins.ContainsKey($id) -and -not $ExternalPlugins.ContainsKey($id)) {
+    throw "元数据表里没有插件 '$id'（见本脚本顶部的 `$Plugins / `$ExternalPlugins）"
+  }
 }
 
 if (-not $NoBuild) {
-  Write-Host "[1/5] 构建插件包（vite lib 模式，逐个入口）..." -ForegroundColor Yellow
+  Write-Host "[1/5] 构建插件包（内置走 vite lib 模式；外部工程走它自己的 npm run build）..." -ForegroundColor Yellow
   Push-Location $AppDir
   try {
     foreach ($id in $Ids) {
+      if ($ExternalPlugins.ContainsKey($id)) {
+        # 外部工程：在它自己的 workspace 里构建（会顺带打 SDK / reader）
+        $ext = $ExternalPlugins[$id]
+        Push-Location (Join-Path $Root $ext.WorkDir)
+        try {
+          & npm run build
+          if ($LASTEXITCODE -ne 0) { throw "外部插件构建失败（$id，exit $LASTEXITCODE）" }
+        } finally { Pop-Location }
+        continue
+      }
       $env:LUNAC_PLUGIN = $id
       & npx vite build --config vite.plugins.config.ts
       if ($LASTEXITCODE -ne 0) { throw "vite 插件构建失败（$id，exit $LASTEXITCODE）" }
@@ -394,11 +527,42 @@ if (-not $NoBuild) {
   Write-Host "[1/5] 跳过构建（-NoBuild）" -ForegroundColor DarkGray
 }
 
+# 外部工程的产物统一同步到 `app\plugin-dist\<id>\`：后续清单校验 / zip / 两条暂存路
+# **只认这里**，这样它们不用知道「哪些插件是外部工程」。
+# `-NoBuild` 时也要做 —— 它只表示「不重新编译」，不代表不用铺产物。
+foreach ($id in $Ids) {
+  if (-not $ExternalPlugins.ContainsKey($id)) { continue }
+  $extSrc = Join-Path $Root $ExternalPlugins[$id].Dist
+  if (-not (Test-Path (Join-Path $extSrc "index.js"))) {
+    throw "外部插件 $id 缺少构建产物：$extSrc\index.js —— 先跑一次不带 -NoBuild 的构建"
+  }
+  $extDst = Join-Path $DistDir $id
+  if (Test-Path $extDst) { Remove-Item $extDst -Recurse -Force }
+  New-Item -ItemType Directory -Path $extDst -Force | Out-Null
+  Copy-Item -Path (Join-Path $extSrc "*") -Destination $extDst -Recurse -Force
+  # 清单是**拷贝**过来的（Copy-Item 保留原 mtime），而 build-release.ps1 的新鲜度判据拿
+  # 「暂存清单 mtime」当构建时间 ⇒ 必须把它刷成现在，否则刚构建完也会被判成「比源码旧」。
+  (Get-Item (Join-Path $extDst "lunac-plugin.json")).LastWriteTime = Get-Date
+  Write-Host "  $id（外部工程产物）→ app\plugin-dist\$id" -ForegroundColor DarkGray
+}
+
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 # ── ② 生成 lunac-plugin.json ───────────────────────────────────────
 Write-Host "[2/5] 生成清单..." -ForegroundColor Yellow
 foreach ($id in $Ids) {
+  if ($ExternalPlugins.ContainsKey($id)) {
+    # 外部工程的清单由它自己的 `public/lunac-plugin.json` 生成（vite 会拷进 dist）——
+    # 这里只**校验**，不重写：改写会造出第二份真相源，且会丢掉本脚本不认识的字段。
+    $extManifest = Join-Path (Join-Path $DistDir $id) "lunac-plugin.json"
+    if (-not (Test-Path $extManifest)) {
+      throw "外部插件 $id 缺少清单：$extManifest（确认它的 public\ 里有 lunac-plugin.json）"
+    }
+    $extMeta = Get-Content $extManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($extMeta.id -ne $id) { throw "外部插件 $id 的清单 id 是 '$($extMeta.id)' —— 与目录名不一致" }
+    Write-Host "  $id  v$(Get-PluginVersion $id)（清单由插件工程提供）" -ForegroundColor DarkGray
+    continue
+  }
   if (-not $Plugins.ContainsKey($id)) { throw "元数据表里没有插件 '$id'（见本脚本顶部的 `$Plugins）" }
   $meta = $Plugins[$id]
   # 版本号**逐插件取**（不是应用版本）：清单里的 version 就是市场判「有没有更新」的判据，
@@ -432,6 +596,11 @@ foreach ($id in $Ids) {
     permissions  = $meta.permissions
     dependencies = $deps
   }
+  # `provides` / `render`（2026-10-18 插件框架重构）：只在声明了才写；
+  # 不写 = 空身份 / `dom` + `inherit` + 空 `slots`，与老插件完全一致。
+  # `render.slots`（常驻锚点）随 `$meta.render` 原样写出，宿主负责校验枚举。
+  if ($meta.provides) { $manifest.provides = $meta.provides }
+  if ($meta.render) { $manifest.render = $meta.render }
   # `window` 段只有声明了形态的插件才写（见 plugin_market::PluginWindowShape）。
   # 不写 = 全部走宿主缺省（420×560 / 可缩放 / 进任务栏 / 有标题栏），
   # 也就是这一段加进来之前所有插件的样子 —— **别给它们补一个空对象**，
@@ -552,7 +721,9 @@ function Assert-DepInputClean([string]$id, $dep, [string]$localPath) {
   }
 }
 function Stage-PluginDir([string]$id, [string]$dst, [switch]$NoClean) {
-  $meta = $Plugins[$id]
+  # 外部工程插件不在 `$Plugins 表里：它没有 `dependencies` / `local` 需要预铺，
+  # 给它一张空表即可（下面的循环自然零次），不必在本函数里分叉。
+  $meta = if ($ExternalPlugins.ContainsKey($id)) { @{ dependencies = @() } } else { $Plugins[$id] }
   $src = Join-Path $DistDir $id
   # `-NoClean`（dev 那份用）：**不整目录删**，只覆盖构建产物。
   # 为什么（2026-10-09 实测踩到）：dev 的插件目录里躺着**本地铺的依赖**（本地模型 2.5GB 的

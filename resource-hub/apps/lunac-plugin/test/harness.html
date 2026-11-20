@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Resource Hub plugin harness</title>
+  <style>
+    :root {
+      --text: #f2f1ee;
+      --text-dim: #c2c3c4;
+      --text-muted: #8b8e92;
+      --surface-glass: #16181b;
+      --surface-rgb: 22, 24, 27;
+      --border-glass: rgba(207, 200, 187, 0.14);
+      --accent: #cfc8bb;
+      --accent-rgb: 207, 200, 187;
+      --ink-rgb: 255, 255, 255;
+      --shade-rgb: 0, 0, 0;
+      --shade-scale: 1;
+      --danger-rgb: 222, 115, 115;
+    }
+    html, body { margin: 0; height: 100%; background: #0d0f11; color: var(--text); font-family: "Segoe UI", system-ui, sans-serif; }
+    /* 与 app/src/styles.css 的全局「统一细滚动条」一致（仅 harness 预览用）。 */
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; border: none; }
+    ::-webkit-scrollbar-thumb { background: rgba(var(--ink-rgb), 0.18); border-radius: 2px; border: none; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(var(--ink-rgb), 0.32); }
+    #plugin-titlebar { display: none; }
+    #root { width: 1000px; max-width: calc(100% - 40px); height: min(680px, calc(100vh - 40px)); margin: 20px auto; background: var(--surface-glass); border: 1px solid var(--border-glass); border-radius: 8px; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="plugin-titlebar"></div>
+  <div id="root"></div>
+  <script type="module">
+    import plugin from "../dist/index.js";
+    import { addSource, loadState } from "../src/store.ts";
+    import { createMockHost } from "@resource-hub/source-sdk";
+
+    // 开发夹具：?fixture=1 漫画、?fixture=video 视频、?fixture=epub 小说、?fixture=js JS 源、?fixture=comic 漫画源、?fixture=videoext 视频扩展源、?fixture=broken 失败源。
+    const fixtureParam = new URLSearchParams(location.search).get("fixture");
+    if (fixtureParam) {
+      // 浏览器 harness 没有宿主：用 mock 顶替，并给沙箱补一个同步 XHR 的 host.request。
+      globalThis.__lunac_host = createMockHost({
+        allowEval: true,
+        engineRequest: (optionsJson) => {
+          const options = JSON.parse(optionsJson);
+          const xhr = new XMLHttpRequest();
+          try {
+            xhr.open(options.method || "GET", options.url, false);
+            for (const [key, value] of Object.entries(options.headers || {})) {
+              xhr.setRequestHeader(key, value);
+            }
+            xhr.send(options.body || null);
+          } catch (error) {
+            return JSON.stringify({ ok: false, error: String(error) });
+          }
+          const headers = {};
+          for (const line of xhr.getAllResponseHeaders().trim().split(/[\r\n]+/)) {
+            const index = line.indexOf(":");
+            if (index > 0) headers[line.slice(0, index).toLowerCase()] = line.slice(index + 1).trim();
+          }
+          return JSON.stringify({
+            ok: true,
+            response: { url: options.url, status: xhr.status, headers, body: xhr.responseText },
+          });
+        },
+      });
+
+      const file = fixtureParam === "video"
+        ? "source-video.json"
+        : fixtureParam === "epub"
+          ? "source-epub.json"
+          : fixtureParam === "js"
+            ? "source-js.json"
+            : fixtureParam === "comic"
+              ? "source-comic.json"
+              : fixtureParam === "videoext"
+                ? "source-video-ext.json"
+                : fixtureParam === "broken"
+                  ? "source-broken.json"
+                  : "source-demo.json";
+      const fixture = await (await fetch(`/test/fixtures/${file}`)).json();
+      const state = loadState();
+      // 刷新时夹具会重新导入；清掉其它 harness.* 夹具，避免旧 id 的来源残留。
+      state.sources = state.sources.filter(
+        (item) => !item.id.startsWith("harness.") || item.id === fixture.manifest.id,
+      );
+      // 保留用户在「域名设置」面板里保存的覆盖值。
+      const previous = state.sources.find((item) => item.id === fixture.manifest.id);
+      const manifest = previous?.manifest
+        ? {
+            ...fixture.manifest,
+            ...(previous.manifest.settings ? { settings: previous.manifest.settings } : {}),
+            ...(previous.manifest.headers ? { headers: previous.manifest.headers } : {}),
+          }
+        : fixture.manifest;
+      addSource(state, {
+        id: fixture.manifest.id,
+        name: fixture.manifest.name,
+        version: fixture.manifest.version,
+        kind: fixture.manifest.kind,
+        manifest,
+        rule: fixture.rule ?? {},
+        ...(fixture.script ? { script: fixture.script } : {}),
+        warnings: [],
+        importedAt: Date.now(),
+      });
+    }
+
+    const root = document.getElementById("root");
+    const result = await plugin.execute("星海");
+    root.innerHTML = result.content;
+    plugin.attach(root);
+  </script>
+</body>
+</html>

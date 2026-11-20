@@ -1,6 +1,6 @@
 [package]
 name = "lunac"
-version = "0.9.38"
+version = "0.9.45"
 edition = "2021"
 description = "Lunac - Native AI coding assistant with local + cloud hybrid inference"
 
@@ -16,10 +16,15 @@ arboard = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+# VLESS + REALITY（2026-11-02）：需要自己拼 TLS 1.3 ClientHello（把认证标签写进
+# legacy_session_id），native-tls / rustls 都不给这个入口 ⇒ 用 ring 的
+# X25519 / HKDF / AEAD / HMAC 原语实现最小 TLS 1.3 客户端。
+# ring 早已在依赖树里（rustls 的 provider），这里只是提为直接依赖，不新增下载。
+ring = "0.17"
 # 纯 Rust 7z 解压 —— PaddleOCR-json 的 Windows 发行包是 .7z（无 .zip 资产）
 sevenz-rust = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-tokio = { version = "1", features = ["sync", "macros"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "net", "time", "io-util"] }
 futures = "0.3"
 dotenvy = "0.15"
 base64 = "0.22"
@@ -37,6 +42,12 @@ winreg = "0.52"
 # 它能做的事这里用已在依赖树里的 `windows` 就够了，少一条下载、少一份维护。
 windows = { version = "0.58", features = [
     "Media_Ocr",
+    # 桌宠「语音输入」（2026-10-22，§待办 1-4 ⑤）：Windows 内置 `SpeechRecognizer`
+    # （离线、本地、零模型下载）。`Win32_System_WinRT` 提供 `RoInitialize` ——
+    # windows 0.58 **没有** `initialize_mta()`，识别搬进阻塞线程前必须先初始化 MTA。
+    # 两者都是同一个 `windows` crate 的 feature，不新增任何下载。
+    "Media_SpeechRecognition",
+    "Win32_System_WinRT",
     "Graphics_Imaging",
     "Storage",
     "Storage_Streams",
@@ -48,6 +59,10 @@ windows = { version = "0.58", features = [
     # 两者都是**同一个 `windows` crate 的 feature**，不新增任何下载（同 sha2 那条口径）。
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # 任务栏缩略图工具栏（2026-10-27，`taskbar_thumb.rs`）：ITaskbarList3 / THUMBBUTTON
+    # 与窗口子类化（SetWindowSubclass / DefSubclassProc）都在 `Win32_UI_Shell` 里。
+    # 同一个 `windows` crate 的 feature，不新增任何下载。
+    "Win32_UI_Shell",
     # 长期记忆的来源前缀要**宿主本地日期**（`GetLocalTime`，见 `mcp_server.rs` 的
     # `local_today`）：项目不引 chrono，UTC 在东八区会跨日错一天。同属既有 `windows`
     # crate 的 feature，不新增任何下载。
@@ -83,6 +98,64 @@ tuning-engine = { path = "../../tuning-engine" }
 # 是编码问题。它在依赖树里**本来就有**（reqwest 拉的），这里只是提为直接依赖，
 # 不新增任何下载（与上面 sha2 / percent-encoding 同一口径）。
 encoding_rs = "0.8"
+rquickjs = "0.14.0"
+# 自研代理引擎（2026-10-31，`native_proxy/`，用户裁决 C：先做 SS + Trojan + 规则的最小内核）。
+# **只引协议需要的原语，不引任何「代理框架」** —— 选型理由：
+#   · SS AEAD（SIP004）要 AES-GCM / ChaCha20-Poly1305 / MD5（EVP_BytesToKey）/ HKDF-SHA1，
+#     这四个都是纯 Rust 的 RustCrypto 实现，不带来 C 构建链；
+#   · Trojans 的 TLS 用 `native-tls`（Windows 走系统 SChannel）——不引 OpenSSL，
+#     也不需要 ring 那套 C/asm 构建；
+#   · 订阅是 Clash YAML，`serde_yaml` 只用来把它读成 `serde_json::Value`，
+#     解析规则仍是我们自己的 `native_proxy::clash`。
+aes-gcm = "0.10"
+# SIP023（SS-2022 多用户）：identity header 是「AES 单块加密」，
+# 用 `aes-gcm` 已经带进来的 `aes` 0.8（不新增下载）。
+aes = "0.8"
+chacha20poly1305 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+native-tls = "0.2"
+serde_yaml = "0.9"
+# SS-2022（SIP022）的会话子密钥：`blake3::derive_key("shadowsocks 2022 session subkey", psk||salt)`。
+# 纯 Rust、无 C 构建链；只给 `native_proxy::ss` 用。
+blake3 = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+bytes = "1"
+# Hysteria2（2026-10-31 第六轮，S2 的第一块，用户明确选择「直接上 QUIC」）。
+# **这一组依赖推翻了 native_proxy 第一轮选型时写下的「不引 C 构建链」偏好** ——
+# 用户已知情并选择继续（那条偏好只是本模块的局部取舍，不是仓库级规则）：
+#   · QUIC 只能由 `quinn` 提供，而 quinn 的 TLS 后端只有 rustls 的 `ring` / `aws-lc-rs`，
+#     两者都带 C/asm（本项目 rusqlite 的 `bundled` 本来也已经用了 cc，不是新增能力）；
+#   · Hysteria2 的认证是标准的 HTTP/3 请求（`POST /auth`），所以需要 `h3` + `h3-quinn`，
+#     自己实现 QPACK 不现实；
+#   · `http` / `bytes` 是 h3 的公开参数类型，必须提为直接依赖。
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+# Hysteria2 的 `obfs: salamander`：`BLAKE2b-256(key || salt)` 用来生成异或密钥流。
+# 纯 Rust、无 C 构建链；只给 `native_proxy::hysteria2` 用。
+blake2 = "0.10"
+# G3 传输层（2026-11-03）：`network: h2` / `network: grpc`。
+# 两者都是 HTTP/2 —— `h2` 是唯一的纯 Rust HTTP/2 协议栈（reqwest 的 HTTP/2 也用它），
+# 且**已经在 Cargo.lock 里**（h2 0.4.15 / tokio-rustls 0.26.4 随 reqwest 拉进来），
+# 这里只是提为直接依赖，不新增下载。`tokio-rustls` 关掉默认的 aws-lc-rs，
+# 与 rustls 那条一致走 ring（否则会多拉一条 C 构建链）。
+h2 = "0.4"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+
+# 插件 WebView 嗅探（2026-10-21，`plugin_sniff.rs`）：番剧的 m3u8 / mp4 只能靠
+# 拦截页面请求拿到。Tauri 的 `on_web_resource_request` 在 Windows 上只覆盖
+# tauri 自定义协议（远程页面收不到），所以这里直接调 WebView2 COM 的
+# `AddWebResourceRequestedFilter("*")`。两个 crate 本来就随 wry 在 Cargo.lock 里
+# （webview2-com 0.38.2 / windows-core 0.61.2），提为直接依赖**不新增下载**。
+# 只给 Windows 目标编译；其它平台 `plugin_sniff.rs` 走返回 unsupported 的桩。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows-core = "0.61"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

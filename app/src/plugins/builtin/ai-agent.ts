@@ -11,6 +11,7 @@ export const aiAgentPlugin: Plugin = {
   description: "Ask AI anything — code, writing, analysis & more",
   icon: "🤖",
   badge: "AI",
+  provides: ["ai.chat"],
 
   async execute(input: string) {
     const trimmed = input.trim().toLowerCase();

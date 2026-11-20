@@ -1,0 +1,15 @@
+{
+  "rsp": 1,
+  "generatedAt": "2026-10-19T00:00:00.000Z",
+  "entries": [
+    {
+      "id": "harness.uzvideo",
+      "name": "Harness uzVideo",
+      "version": "1.0.2",
+      "kind": ["anime"],
+      "engine": "js",
+      "upstream": "uzvideo",
+      "sourceUrl": "http://localhost:8123/test/fixtures/uzvideo-source.txt"
+    }
+  ]
+}

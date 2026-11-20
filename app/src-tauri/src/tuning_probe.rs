@@ -159,7 +159,11 @@ pub fn measure() -> Result<MeasuredResponse, String> {
     let p_tot = measure_powers(&mono, &y_total, rate)?;
     let (freqs, db, coverage) = collapse_default(&p_tot)?;
     let sys_db = collapse_at(&p_sys, &freqs);
-    let chain_db: Vec<f64> = db.iter().zip(&sys_db).map(|(total, sys)| total - sys).collect();
+    let chain_db: Vec<f64> = db
+        .iter()
+        .zip(&sys_db)
+        .map(|(total, sys)| total - sys)
+        .collect();
     let ref_db = player::tuning_reference_db(&freqs, rate);
 
     Ok(MeasuredResponse {
@@ -256,9 +260,8 @@ unsafe fn capture_inner(
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
 
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("枚举音频设备失败：{e}"))?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        .map_err(|e| format!("枚举音频设备失败：{e}"))?;
     let device = enumerator
         .GetDefaultAudioEndpoint(eRender, eConsole)
         .map_err(|e| format!("取默认输出设备失败：{e}"))?;
@@ -322,7 +325,9 @@ unsafe fn capture_inner(
     let capture: IAudioCaptureClient = client
         .GetService()
         .map_err(|e| format!("取采集接口失败：{e}"))?;
-    client.Start().map_err(|e| format!("启动回环采集失败：{e}"))?;
+    client
+        .Start()
+        .map_err(|e| format!("启动回环采集失败：{e}"))?;
     // 到这里采集真的在跑了 —— 放行播放。
     let _ = ready.send(Ok(()));
 
@@ -383,7 +388,11 @@ unsafe fn decode_one(p: *const u8, is_float: bool, bytes: usize) -> f64 {
         let b1 = *p.add(1) as u32;
         let b2 = *p.add(2) as u32;
         let raw = (b0 | (b1 << 8) | (b2 << 16)) as i32;
-        let signed = if raw & 0x0080_0000 != 0 { raw | !0x00FF_FFFF } else { raw };
+        let signed = if raw & 0x0080_0000 != 0 {
+            raw | !0x00FF_FFFF
+        } else {
+            raw
+        };
         signed as f64 / 8_388_608.0
     } else {
         0.0
@@ -552,7 +561,10 @@ fn collapse_default(p: &Powers) -> Result<(Vec<f64>, Vec<f64>, f64), String> {
 /// （两趟 `xpow` 相同，见 `Powers`），所以这里的 `None` 理论上不会出现；
 /// 真出现了就按「系统在这一格没影响」算（0dB），不让一个点毁掉整条曲线。
 fn collapse_at(p: &Powers, freqs: &[f64]) -> Vec<f64> {
-    freqs.iter().map(|f| band_db(p, *f).unwrap_or(0.0)).collect()
+    freqs
+        .iter()
+        .map(|f| band_db(p, *f).unwrap_or(0.0))
+        .collect()
 }
 
 /// `mono_x`（我们生成的扫频）与 `mono_y`（录回来的）→ 频响（**单趟**的便捷形态）。
@@ -618,8 +630,7 @@ mod tests {
         };
         let quarter = seg / 4;
         let f_early = count(lead, lead + quarter) as f64 / (quarter as f64 / rate);
-        let f_late =
-            count(lead + seg - quarter, lead + seg) as f64 / (quarter as f64 / rate);
+        let f_late = count(lead + seg - quarter, lead + seg) as f64 / (quarter as f64 / rate);
         assert!(
             f_late > f_early * 5.0,
             "扫频的频率没有随时间是上升的（前 {f_early:.0}Hz / 后 {f_late:.0}Hz）"
@@ -648,7 +659,8 @@ mod tests {
         assert!(cov > 0.8, "有效率只有 {cov}");
         for (f, d) in freqs.iter().zip(db.iter()) {
             let theory = 20.0
-                * ((1.0 - a) / (1.0 - 2.0 * a * (2.0 * PI * f / rate).cos() + a * a).sqrt()).log10();
+                * ((1.0 - a) / (1.0 - 2.0 * a * (2.0 * PI * f / rate).cos() + a * a).sqrt())
+                    .log10();
             assert!(
                 (d - theory).abs() < 1.0,
                 "{f:.0}Hz：实测 {d:.2}dB vs 理论 {theory:.2}dB"

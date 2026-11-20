@@ -15,8 +15,11 @@
 //! 数据形状（`ChatSession`）留在 `storage.rs` —— 本模块不定义业务类型，
 //! 免得出现两份「会话长什么样」的真相。
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
@@ -49,6 +52,12 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             pos        INTEGER NOT NULL DEFAULT 0,
             title      TEXT    NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0,
+            -- 最后一次**内容变化**的时间（2026-11-05）：历史列表按它排序，跨天继续的
+            -- 会话不会被当成「前一天」。旧库由下面的 ALTER 补列（0 ⇒ 前端回落 created_at）。
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            -- 会话状态（2026-11-05）：'' / running / interrupted / done。
+            -- 后端只在内容变化时补 'done'，中间态由前端显式上报。
+            status     TEXT    NOT NULL DEFAULT '',
             usage      TEXT,
             steps      TEXT,
             -- 待办清单时间线（2026-10-02，JSON 文本）——见 storage.rs 的 SessionTodo。
@@ -56,7 +65,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             todos      TEXT,
             -- 会话来源（2026-10-10）：'' = 普通聊天，'pet' = 桌宠发起。两条线程分开存，
             -- 前端历史 UI 据此分页。旧库由下面的 ALTER 补列。
-            source     TEXT NOT NULL DEFAULT ''
+            source     TEXT NOT NULL DEFAULT '',
+            -- 生成这段对话时的人格展示名（2026-10-24）：历史回放用它署名，
+            -- 避免「改了人格预设名，旧会话的署名跟着变」。旧库由 ALTER 补列。
+            persona    TEXT NOT NULL DEFAULT ''
         );
 
         -- 有隐式 rowid（FTS 表用它对应行），(session_id, idx) 保证会话内消息有序且不重。
@@ -100,7 +112,42 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         [],
     );
 
+    // 加列迁移（2026-10-24）：人格展示名。老库没有它 ⇒ 读出来是空串，前端回落当前名。
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN persona TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
+    // 加列迁移（2026-11-05）：最后活动时间与会话状态。老库补列后 `updated_at = 0`，
+    // 读取侧据此回落到 `created_at`（不在这里写值，避免每次打开库都改历史行）。
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
     Ok(())
+}
+
+/// 当前毫秒时间戳（`updated_at` 用）。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 一段消息的内容指纹。只用于「这次保存有没有改到会话内容」，不参与任何业务判断。
+fn hash_messages(msgs: &[ChatMessage]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for m in msgs {
+        m.role.hash(&mut h);
+        m.content.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// 全量写入：**在一个事务里**删掉所有旧数据，再按入参顺序插入。
@@ -108,7 +155,58 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
 /// 语义与旧的「整体重写 JSON」严格一致（前端传的是它内存里的**完整**列表，含被删掉的
 /// 会话），所以这里不做差异比对 —— 那样得在存储层猜前端的「哪条被删了」语义，更脆。
 /// 事务保证中途失败不会留下「会话还在、消息没了」的半截状态。
+///
+/// **`updated_at` / `status`（2026-11-05）**：`updated_at` 只在消息内容真的变化时推进，
+/// 否则每次全量重写都会把所有会话的时间盖成同一刻，排序失去意义。`status` 同理：
+/// 前端给了就尊重，没给时 —— 内容变了补 `done`，没变则保留旧值。
 fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> {
+    // 先抓旧快照：id → (消息指纹, updated_at, status)。只在保存这一刻做一次。
+    let mut prev: HashMap<String, (u64, u64, String)> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, updated_at, status FROM sessions")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            let (id, ts, st) = r.map_err(|e| e.to_string())?;
+            prev.insert(id, (0, ts, st));
+        }
+    }
+    {
+        let mut mstmt = conn
+            .prepare("SELECT session_id, role, content FROM messages ORDER BY session_id ASC, idx ASC")
+            .map_err(|e| e.to_string())?;
+        let mrows = mstmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    ChatMessage {
+                        role: r.get::<_, String>(1)?,
+                        content: r.get::<_, String>(2)?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut by_id: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        for r in mrows {
+            let (sid, msg) = r.map_err(|e| e.to_string())?;
+            by_id.entry(sid).or_default().push(msg);
+        }
+        for (id, msgs) in by_id {
+            if let Some(e) = prev.get_mut(&id) {
+                e.0 = hash_messages(&msgs);
+            }
+        }
+    }
+
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| e.to_string())?;
 
@@ -121,8 +219,8 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
 
         let mut ins_s = conn
             .prepare(
-                "INSERT INTO sessions(id, pos, title, created_at, usage, steps, todos, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO sessions(id, pos, title, created_at, usage, steps, todos, source, persona, updated_at, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
             .map_err(|e| e.to_string())?;
         let mut ins_m = conn
@@ -150,6 +248,37 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|e| e.to_string())?;
+
+            let hash = hash_messages(&s.messages);
+            let (updated_at, status) = match prev.get(&s.id) {
+                // 内容没变：时间与状态都沿用旧的（前端显式给了则尊重）。
+                Some((h, ts, st)) if *h == hash => {
+                    let ts = if s.updated_at > 0 {
+                        s.updated_at
+                    } else if *ts > 0 {
+                        *ts
+                    } else {
+                        s.created_at
+                    };
+                    let st = if s.status.is_empty() {
+                        st.clone()
+                    } else {
+                        s.status.clone()
+                    };
+                    (ts, st)
+                }
+                // 内容变了 / 新会话：时间推进；状态没给就记为 done。
+                // 这里**不读 `s.updated_at`** —— 前端保存时会带着旧值，读它会把时间钉死在过去。
+                _ => {
+                    let st = if s.status.is_empty() {
+                        "done".to_string()
+                    } else {
+                        s.status.clone()
+                    };
+                    (now_ms(), st)
+                }
+            };
+
             ins_s
                 .execute(rusqlite::params![
                     s.id,
@@ -159,7 +288,10 @@ fn write_all(conn: &Connection, sessions: &[ChatSession]) -> Result<(), String> 
                     usage,
                     steps,
                     todos,
-                    s.source
+                    s.source,
+                    s.persona,
+                    updated_at as i64,
+                    status
                 ])
                 .map_err(|e| e.to_string())?;
 
@@ -186,7 +318,7 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
     let mut out: Vec<ChatSession> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("SELECT id, title, created_at, usage, steps, todos, source FROM sessions ORDER BY pos ASC")
+            .prepare("SELECT id, title, created_at, usage, steps, todos, source, persona, updated_at, status FROM sessions ORDER BY pos ASC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -197,12 +329,23 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
                     id: row.get::<_, String>(0)?,
                     title: row.get::<_, String>(1)?,
                     created_at: row.get::<_, i64>(2)? as u64,
+                    // 老库的 updated_at 为 0 ⇒ 回落到 created_at，历史列表仍有可排序的值。
+                    updated_at: {
+                        let ts = row.get::<_, i64>(8)? as u64;
+                        if ts == 0 {
+                            row.get::<_, i64>(2)? as u64
+                        } else {
+                            ts
+                        }
+                    },
+                    status: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
                     // 单条记录坏掉不该让整个历史列表读不出来 ⇒ 解析失败按 None 处理。
                     usage: usage.and_then(|s| serde_json::from_str(&s).ok()),
                     steps: steps.and_then(|s| serde_json::from_str(&s).ok()),
                     todos: todos.and_then(|s| serde_json::from_str(&s).ok()),
                     // 老库该列为 NULL / 老记录没这个字段 ⇒ 一律空串（= 普通聊天）。
                     source: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    persona: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                     messages: Vec::new(),
                 })
             })
@@ -215,7 +358,9 @@ fn read_all(conn: &Connection) -> Result<Vec<ChatSession>, String> {
     let mut by_id: HashMap<String, Vec<ChatMessage>> = HashMap::new();
     {
         let mut mstmt = conn
-            .prepare("SELECT session_id, role, content FROM messages ORDER BY session_id ASC, idx ASC")
+            .prepare(
+                "SELECT session_id, role, content FROM messages ORDER BY session_id ASC, idx ASC",
+            )
             .map_err(|e| e.to_string())?;
         let mrows = mstmt
             .query_map([], |row| {
@@ -402,12 +547,15 @@ mod tests {
             id: id.into(),
             title: title.into(),
             created_at: 123,
+            updated_at: 0,
+            status: String::new(),
             usage: Some(SessionUsage {
                 hit: 7,
                 ..Default::default()
             }),
             steps: None,
             todos: None,
+            persona: String::new(),
             source: String::new(),
             messages: vec![
                 ChatMessage {
@@ -443,7 +591,16 @@ mod tests {
     #[test]
     fn cjk_substring_searchable_via_trigram() {
         let c = mem();
-        write_all(&c, &[session("s1", "标题", "帮我看看缓存命中率", "cache hit rate is low")]).unwrap();
+        write_all(
+            &c,
+            &[session(
+                "s1",
+                "标题",
+                "帮我看看缓存命中率",
+                "cache hit rate is low",
+            )],
+        )
+        .unwrap();
 
         let cjk: i64 = c
             .query_row(
@@ -553,6 +710,68 @@ mod tests {
         assert_eq!(back[0].id, "old");
         assert!(back[0].todos.is_none(), "老记录没有待办 → None");
         assert_eq!(back[0].source, "", "老记录没有来源 → 空串（普通聊天）");
+        assert_eq!(
+            back[0].persona, "",
+            "老记录没有署名 → 空串（前端回落当前名）"
+        );
+        assert_eq!(
+            back[0].updated_at, 1,
+            "老记录没有 updated_at ⇒ 回落 created_at，历史仍可排序"
+        );
+        assert_eq!(back[0].status, "", "老记录没有状态 → 空串（未知）");
+    }
+
+    /// `updated_at` / `status`（2026-11-05）：内容不变不推进时间；内容变了推进；
+    /// 前端显式给的状态优先；没给时新内容记 `done`。
+    #[test]
+    fn updated_at_advances_only_when_content_changes() {
+        let c = mem();
+        let mut s = session("s1", "标题", "问", "答");
+        s.status = "interrupted".into();
+        write_all(&c, &[s]).unwrap();
+        let first = read_all(&c).unwrap().remove(0);
+        let t1 = first.updated_at;
+        assert!(t1 > 0, "新会话必须有 updated_at");
+        assert_eq!(first.status, "interrupted");
+
+        // 同一内容再存一次（前端没传 updated_at / status）⇒ 沿用旧值
+        let again = session("s1", "标题", "问", "答");
+        write_all(&c, &[again]).unwrap();
+        let same = read_all(&c).unwrap().remove(0);
+        assert_eq!(same.updated_at, t1, "内容没变时 updated_at 不得推进");
+        assert_eq!(
+            same.status, "interrupted",
+            "内容没变时 status 不得被覆盖"
+        );
+
+        // 内容变化 ⇒ 推进，且状态缺省记 done
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let changed = session("s1", "标题", "问", "答（改了）");
+        write_all(&c, &[changed]).unwrap();
+        let moved = read_all(&c).unwrap().remove(0);
+        assert!(
+            moved.updated_at > t1,
+            "内容变化后 updated_at 必须推进，实际 {} <= {}",
+            moved.updated_at,
+            t1
+        );
+        assert_eq!(moved.status, "done", "新内容且未给状态 ⇒ done");
+    }
+
+    /// 人格署名（2026-10-24）：写进去什么、读回来就是什么；
+    /// 且同一会话被覆盖写时由前端传入的值决定（不在存储层猜）。
+    #[test]
+    fn persona_survives_roundtrip_and_overwrite() {
+        let c = mem();
+        let mut s = session("p1", "标题", "问", "答");
+        s.persona = "严谨工程师".into();
+        write_all(&c, &[s]).unwrap();
+        assert_eq!(read_all(&c).unwrap()[0].persona, "严谨工程师");
+
+        let mut s2 = session("p1", "标题", "问", "答");
+        s2.persona = "幽默助手".into();
+        write_all(&c, &[s2]).unwrap();
+        assert_eq!(read_all(&c).unwrap()[0].persona, "幽默助手");
     }
 
     /// 覆盖写 = 上一次的内容必须彻底消失（含 FTS 索引里的行）——
@@ -585,7 +804,11 @@ mod tests {
         assert!(import_legacy(&path, "{ not json").is_err());
         assert!(load(&path).unwrap().is_empty(), "坏 JSON 不该写入任何数据");
 
-        let n = import_legacy(&path, r#"[{"id":"x","title":"t","createdAt":1,"messages":[{"role":"user","content":"hi"}]}]"#).unwrap();
+        let n = import_legacy(
+            &path,
+            r#"[{"id":"x","title":"t","createdAt":1,"messages":[{"role":"user","content":"hi"}]}]"#,
+        )
+        .unwrap();
         assert_eq!(n, 1);
         assert_eq!(load(&path).unwrap()[0].id, "x");
 
@@ -618,7 +841,16 @@ mod tests {
     #[test]
     fn search_finds_cjk_substring_and_ascii_word() {
         let p = tmp_db("cjk");
-        save(&p, &[session("s1", "标题", "帮我看看缓存命中率", "cache hit rate")]).unwrap();
+        save(
+            &p,
+            &[session(
+                "s1",
+                "标题",
+                "帮我看看缓存命中率",
+                "cache hit rate",
+            )],
+        )
+        .unwrap();
 
         let hits = search(&p, "缓存命中", 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -647,7 +879,11 @@ mod tests {
     #[test]
     fn search_does_not_resurrect_deleted_sessions() {
         let p = tmp_db("sync");
-        save(&p, &[session("old", "旧", "独一无二的关键字甲乙丙", "旧回答")]).unwrap();
+        save(
+            &p,
+            &[session("old", "旧", "独一无二的关键字甲乙丙", "旧回答")],
+        )
+        .unwrap();
         assert_eq!(search(&p, "关键字甲乙丙", 10).unwrap().len(), 1);
 
         save(&p, &[session("new", "新", "换了一条会话", "新回答")]).unwrap();
@@ -672,7 +908,11 @@ mod tests {
         )
         .unwrap();
         let hits = search(&p, "%", 10).unwrap();
-        assert_eq!(hits.len(), 1, "% 必须按字面匹配（只有带百分号的那条算命中）");
+        assert_eq!(
+            hits.len(),
+            1,
+            "% 必须按字面匹配（只有带百分号的那条算命中）"
+        );
         assert_eq!(hits[0].session_id, "a");
         let _ = std::fs::remove_file(&p);
     }
@@ -695,5 +935,4 @@ mod tests {
         assert_eq!(hits[1].session_id, "old");
         let _ = std::fs::remove_file(&p);
     }
-
 }

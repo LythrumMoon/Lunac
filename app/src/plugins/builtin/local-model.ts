@@ -2,8 +2,8 @@
 //
 // 这是一个**基础设施插件**（`kinds.ts` 的 `isHeadlessPlugin`）：**只提供能力，没有用户入口**。
 //   · **不出现**在搜索结果里，插件市场行也**不给「打开」**；
-//   · 它的**开关**在「设置 → AI → 本地模型决策」——由设置面板负责启停宿主托管的
-//     `llama-server` 子进程（走 `app/src/plugins/sidecar.ts` 的 sidecar 桥）。
+//   · 它的**开关**在输入栏「更多设置 → 其他 → 本地模型决策」（2026-10-24 从设置面板迁入）
+//     ——由该面板负责启停宿主托管的 `llama-server` 子进程（走 `app/src/plugins/sidecar.ts` 的 sidecar 桥）。
 //   · 用户仍能在插件市场**下载 / 卸载**它（`local-model-<ver>.zip`）。
 //
 // 它服务两处「要不要把这条输入发给云模型」的决策（判定在 `core-agent/src/decide.rs`）：
@@ -30,7 +30,7 @@ const localModelPlugin: Plugin = {
       type: "html",
       content:
         `<div style="padding:12px 14px;font-size:.78rem;color:var(--text);line-height:1.7;">` +
-        `本地决策模型没有独立界面 —— 请在「设置 → AI → 本地模型决策」里开关。</div>`,
+        `本地决策模型没有独立界面 —— 请在输入栏「更多设置 → 其他 → 本地模型决策」里开关。</div>`,
     };
   },
 };

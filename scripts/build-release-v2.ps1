@@ -1,4 +1,4 @@
-# scripts/build-release-v2.ps1 -- build the Lunac v2 (Flutter) release installer.
+﻿# scripts/build-release-v2.ps1 -- build the Lunac v2 (Flutter) release installer.
 #
 # Usage (from anywhere):
 #   powershell -ExecutionPolicy Bypass -File scripts\build-release-v2.ps1

@@ -1,0 +1,12 @@
+{
+  "data": [
+    {
+      "id": "http://localhost:8123/test/fixtures/demo-chapters.json",
+      "title": "Harness 星海",
+      "author": "Fixture",
+      "cover": "",
+      "description": "用于验证「导入来源 → 搜索 → 章节 → 阅读」链路的本地夹具。",
+      "tags": "测试,演示"
+    }
+  ]
+}

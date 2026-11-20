@@ -133,9 +133,11 @@ fn paddle_ocr_dir() -> Result<PathBuf, String> {
     }
 
     // Priority 4: 相对当前工作目录（兜底）
-    if let Some(found) =
-        find_engine_dir(&std::env::current_dir().unwrap_or_default().join("paddle-ocr"))
-    {
+    if let Some(found) = find_engine_dir(
+        &std::env::current_dir()
+            .unwrap_or_default()
+            .join("paddle-ocr"),
+    ) {
         return Ok(found);
     }
 
@@ -189,15 +191,14 @@ pub fn recognize_image(image_path: &str, lang: &str) -> Result<String, String> {
     // CRITICAL: current_dir 必须设为 PaddleOCR-json.exe 所在目录，
     // 因为 config 中的模型路径（如 models/ch_PP-OCRv3_det_infer）是相对路径。
     let mut cmd = Command::new(&exe);
-    cmd.current_dir(&dir)
-        .args([
-            &format!("-image_path={}", image_path),
-            &format!("-config_path={}", config.display()),
-            "-ensure_ascii=false", // 中文直接 UTF-8 输出，不做 \uXXXX 转义
-            "-cpu_threads=4",      // 限制线程数，减少内存占用
-            "-det_db_box_thresh=0.3",
-            "-det_db_thresh=0.3",
-        ]);
+    cmd.current_dir(&dir).args([
+        &format!("-image_path={}", image_path),
+        &format!("-config_path={}", config.display()),
+        "-ensure_ascii=false", // 中文直接 UTF-8 输出，不做 \uXXXX 转义
+        "-cpu_threads=4",      // 限制线程数，减少内存占用
+        "-det_db_box_thresh=0.3",
+        "-det_db_thresh=0.3",
+    ]);
     #[cfg(target_os = "windows")]
     {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
@@ -243,8 +244,12 @@ pub fn recognize_image(image_path: &str, lang: &str) -> Result<String, String> {
     }
 
     // 解析 JSON 输出
-    let response: PaddleOcrResponse = serde_json::from_str(&json_line)
-        .map_err(|e| format!("Failed to parse PaddleOCR-json output: {}\nLine: {}", e, json_line))?;
+    let response: PaddleOcrResponse = serde_json::from_str(&json_line).map_err(|e| {
+        format!(
+            "Failed to parse PaddleOCR-json output: {}\nLine: {}",
+            e, json_line
+        )
+    })?;
 
     match response.code {
         100 => {
@@ -264,9 +269,16 @@ pub fn recognize_image(image_path: &str, lang: &str) -> Result<String, String> {
         _ => {
             // 错误：data 可能是字符串错误消息
             let msg = if response.data.is_string() {
-                response.data.as_str().unwrap_or("Unknown error").to_string()
+                response
+                    .data
+                    .as_str()
+                    .unwrap_or("Unknown error")
+                    .to_string()
             } else {
-                format!("PaddleOCR-json returned code {}: {:?}", response.code, response.data)
+                format!(
+                    "PaddleOCR-json returned code {}: {:?}",
+                    response.code, response.data
+                )
             };
             Err(msg)
         }
@@ -281,9 +293,15 @@ mod tests {
 
     #[test]
     fn test_config_for_lang() {
-        assert_eq!(paddle_ocr_config_for_lang("chs"), "models/config_chinese.txt");
+        assert_eq!(
+            paddle_ocr_config_for_lang("chs"),
+            "models/config_chinese.txt"
+        );
         assert_eq!(paddle_ocr_config_for_lang("en"), "models/config_en.txt");
         assert_eq!(paddle_ocr_config_for_lang("ja"), "models/config_japan.txt");
-        assert_eq!(paddle_ocr_config_for_lang("unknown"), "models/config_chinese.txt");
+        assert_eq!(
+            paddle_ocr_config_for_lang("unknown"),
+            "models/config_chinese.txt"
+        );
     }
 }

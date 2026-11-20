@@ -76,7 +76,9 @@ fn write_cache(apps: &[AppEntry]) {
         saved_ms: now_ms(),
         apps: apps.to_vec(),
     };
-    let Ok(json) = serde_json::to_string(&payload) else { return };
+    let Ok(json) = serde_json::to_string(&payload) else {
+        return;
+    };
     let tmp = dir.join("app-index-cache.json.tmp");
     if fs::write(&tmp, json).is_err() {
         return;
@@ -128,11 +130,7 @@ pub(crate) fn generate_pinyin_tokens(name: &str) -> Vec<String> {
     if !has_chinese(name) {
         return vec![];
     }
-    let syllables: Vec<&str> = name
-        .to_pinyin()
-        .flatten()
-        .map(|p| p.plain())
-        .collect();
+    let syllables: Vec<&str> = name.to_pinyin().flatten().map(|p| p.plain()).collect();
     if syllables.is_empty() {
         return vec![];
     }
@@ -184,7 +182,9 @@ fn exe_dir() -> PathBuf {
 }
 
 fn registry_path() -> PathBuf {
-    crate::storage::module_data_dir().join("custom").join("app_registry.json")
+    crate::storage::module_data_dir()
+        .join("custom")
+        .join("app_registry.json")
 }
 
 /// 旧路径（exe 同目录，release 安装目录内/开发 target 目录内）。
@@ -273,7 +273,10 @@ pub fn remove_custom_app(path: &str) -> Result<(), String> {
 /// 扫描，正是「加完自定义启动项后第一次搜索卡一下」的来源。改成就地重写后，
 /// 新增的启动项**立刻**可被搜到，且搜索路径依然只是读一次文件。
 fn sync_custom_apps() {
-    let system: Vec<AppEntry> = apps().into_iter().filter(|a| a.source != "custom").collect();
+    let system: Vec<AppEntry> = apps()
+        .into_iter()
+        .filter(|a| a.source != "custom")
+        .collect();
     write_cache(&merge_apps(system, custom_apps()));
 }
 
@@ -484,12 +487,24 @@ pub fn launch_app(path: &str) -> Result<(), String> {
     const SW_SHOWNORMAL: i32 = 1;
 
     // "open" verb lets Windows pick the default handler for .lnk/.exe/URLs
-    let op: Vec<u16> = OsStr::new("open").encode_wide().chain(std::iter::once(0)).collect();
-    let file: Vec<u16> = OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+    let op: Vec<u16> = OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let file: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     let ret = unsafe {
-        ShellExecuteW(0, op.as_ptr(), file.as_ptr(),
-            std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        ShellExecuteW(
+            0,
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
     };
 
     // ShellExecuteW returns > 32 on success
@@ -542,8 +557,16 @@ pub fn launch_elevated(file: &str, params: Option<&str>) -> Result<(), String> {
     const SW_SHOWNORMAL: i32 = 1;
     const SE_ERR_ACCESSDENIED: isize = 5;
 
-    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect() };
-    let op: Vec<u16> = OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
+    let wide = |s: &str| -> Vec<u16> {
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let op: Vec<u16> = OsStr::new("runas")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let file_w = wide(file);
     let params_w = params.map(wide);
 
@@ -637,7 +660,9 @@ mod tests {
             vec![mk("wechat", "custom"), mk("MyTool", "custom")],
         );
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|a| a.name == "WeChat" && a.source == "start_menu"));
+        assert!(merged
+            .iter()
+            .any(|a| a.name == "WeChat" && a.source == "start_menu"));
         assert!(merged.iter().any(|a| a.name == "MyTool"));
     }
 }

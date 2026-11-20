@@ -32,7 +32,8 @@ const WAIT_OBJECT_0: u32 = 0;
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateMutexW(attrs: isize, initial_owner: i32, name: *const u16) -> isize;
-    fn CreateEventW(attrs: isize, manual_reset: i32, initial_state: i32, name: *const u16) -> isize;
+    fn CreateEventW(attrs: isize, manual_reset: i32, initial_state: i32, name: *const u16)
+        -> isize;
     fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
     fn SetEvent(handle: isize) -> i32;
     fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
@@ -129,7 +130,17 @@ mod tests {
     #[test]
     fn wide_is_null_terminated_utf16() {
         let w = super::wide("Lunac");
-        assert_eq!(w, vec![b'L' as u16, b'u' as u16, b'n' as u16, b'a' as u16, b'c' as u16, 0]);
+        assert_eq!(
+            w,
+            vec![
+                b'L' as u16,
+                b'u' as u16,
+                b'n' as u16,
+                b'a' as u16,
+                b'c' as u16,
+                0
+            ]
+        );
     }
 
     #[test]

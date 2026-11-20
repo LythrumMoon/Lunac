@@ -217,7 +217,10 @@ fn maybe_elicit(session: &mut Session, tool: &ToolDef, arguments: &Value) -> Res
         "elicitation/create",
         json!({ "message": spec.message, "requestedSchema": spec.requested_schema }),
     )?;
-    let action = res.get("action").and_then(Value::as_str).unwrap_or("cancel");
+    let action = res
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("cancel");
     if action != "accept" {
         // 用户拒绝 / 取消：作为工具错误回给模型（不是桥坏了）。
         return Err("用户拒绝了本次输入请求（工具未执行）".into());
@@ -467,7 +470,11 @@ fn build_prompts_list(prompts: &[PromptDef]) -> Value {
 
 /// `prompts/get` 的 `result` 部分：`{description, messages:[{role,content}]}`。
 /// `arguments` 里的键按 `{{key}}` / `{{key }}` 两种写法替换（复用 `resolve_template`）。
-fn prompt_get_result(prompts: &[PromptDef], name: &str, arguments: &Value) -> Result<Value, String> {
+fn prompt_get_result(
+    prompts: &[PromptDef],
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("缺少 name 参数：要传 prompts/list 给出的 prompt 名".into());
@@ -484,7 +491,6 @@ fn prompt_get_result(prompts: &[PromptDef], name: &str, arguments: &Value) -> Re
         }]
     }))
 }
-
 
 // ── 长期记忆（A4，2026-09-20；作用域化 2026-10-13）──────────────────
 //
@@ -510,6 +516,16 @@ fn prompt_get_result(prompts: &[PromptDef], name: &str, arguments: &Value) -> Re
 // 命中率。超限**报错**而不是静默截断 —— 静默截断会让模型以为已经记住了。
 
 const MEMORY_FILE: &str = "MEMORY.md";
+/// **记忆页**子目录（§待办 3-24 分片 1–2，2026-10-31）：`Remember` 可带可选 `page`，
+/// 落 `<记忆目录>\pages\<page>.md`；**缺省页仍是 `MEMORY.md` 本身**（字节级兼容旧数据）。
+///
+/// 为什么要页：单文件是扁平 bullet，条目一多就谁也读不出「这条属于哪一块」。页只加**一层**
+/// 组织（`build` / `prefs` / `env`…），读取时按 `## <page>` 拼回同一段注入文本 ⇒
+/// 注入通道、冻结快照、上限口径**全部不变**（见 `docs/todo.md` §待办 3-24 的前置裁定）。
+const MEMORY_PAGES_DIR: &str = "pages";
+/// 页名上限（32 个字符足够表达「这一页是什么」；再长就是句子，不是名字了）。
+const MAX_MEMORY_PAGE_CHARS: usize = 32;
+
 /// 单条记忆上限（一条通常只有一两句；超过这个量级说明该拆成多条或先提炼）
 const MAX_MEMORY_ENTRY_CHARS: usize = 2_000;
 /// **正文额度**：只统计每条去掉行首 `- ` 与 `[YYYY-MM-DD · scope] ` 前缀后的正文
@@ -558,13 +574,85 @@ fn pet_scope_dir() -> PathBuf {
     crate::storage::module_data_dir().join("memory").join("pet")
 }
 
-/// 某一作用域的记忆文件路径。
-/// 全局 = `ModuleData\memory\MEMORY.md`（沿用旧落点）；桌宠 = `ModuleData\memory\pet\MEMORY.md`。
-fn memory_path_for(scope: MemoryScope) -> PathBuf {
+/// 某一作用域的记忆**目录**（页落它的 `pages\` 子目录）。
+fn memory_dir_for(scope: MemoryScope) -> PathBuf {
     match scope {
-        MemoryScope::Global => crate::storage::module_data_dir().join("memory").join(MEMORY_FILE),
-        MemoryScope::Pet => pet_scope_dir().join(MEMORY_FILE),
+        MemoryScope::Global => crate::storage::module_data_dir().join("memory"),
+        MemoryScope::Pet => pet_scope_dir(),
     }
+}
+
+/// 某一作用域的**默认页**路径（= `MEMORY.md`，沿用旧落点）。
+/// 全局 = `ModuleData\memory\MEMORY.md`；桌宠 = `ModuleData\memory\pet\MEMORY.md`。
+fn memory_path_for(scope: MemoryScope) -> PathBuf {
+    memory_dir_for(scope).join(MEMORY_FILE)
+}
+
+/// 解析 `Remember` 传来的 `page`：`None` / 空 = 默认页（`MEMORY.md`）。
+///
+/// 页名是**路径片段**，所以形状必须收死（否则 `../x` 就能写到记忆目录外）：
+/// 1–32 位、`[a-z0-9]` 开头、其余只允许 `[a-z0-9_-]`。大写 / 空格 / 中文一律**报错并给出
+/// 建议值**（不静默改写 —— 静默改写会让「我明明写过这一页」变成找不到）。
+pub fn parse_memory_page(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let valid = raw.len() <= MAX_MEMORY_PAGE_CHARS
+        && raw.bytes().enumerate().all(|(i, b)| match b {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'-' | b'_' => i > 0,
+            _ => false,
+        });
+    if !valid {
+        let slug: String = raw
+            .chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        return Err(format!(
+            "记忆页名不合法（\"{raw}\"）：只能用 1–{MAX_MEMORY_PAGE_CHARS} 位小写字母 / 数字 / `-` / `_`，\
+             且不能以 `-` / `_` 开头（建议：\"{slug}\"）"
+        ));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+/// 某一页的落盘路径。`page = None` ⇒ 默认页 `MEMORY.md`。
+fn memory_page_path(scope: MemoryScope, page: Option<&str>) -> PathBuf {
+    page_path_in(&memory_dir_for(scope), page)
+}
+
+/// 目录级的页路径（单测用这一层，绝不碰真实的 `ModuleData`）。
+fn page_path_in(dir: &std::path::Path, page: Option<&str>) -> PathBuf {
+    match page {
+        None => dir.join(MEMORY_FILE),
+        Some(page) => dir.join(MEMORY_PAGES_DIR).join(format!("{page}.md")),
+    }
+}
+
+/// 目录级的页名列表（单测用这一层）。
+fn list_pages_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let pages = dir.join(MEMORY_PAGES_DIR);
+    if !pages.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = fs::read_dir(&pages)
+        .map_err(|e| format!("读取记忆页目录失败：{e}"))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let stem = path.file_stem()?.to_str()?.to_string();
+            (path.extension().and_then(|e| e.to_str()) == Some("md")).then_some(stem)
+        })
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 /// 读记忆全文（不存在 ⇒ 空串，属全新安装的正常情况）。
@@ -579,7 +667,87 @@ fn read_memory_at(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn read_memory(scope: MemoryScope) -> Result<String, String> {
-    read_memory_at(&memory_path_for(scope))
+    read_memory_in_dir(&memory_dir_for(scope))
+}
+
+/// 页内 `[[other-page]]` 引用（§待办 3-24 分片 3）：**只认合法页名**，去重保序，最多 8 个。
+///
+/// 为什么要有它：页把记忆切开之后，模型读到「构建那页说了 X」却不知道 X 在别的页里 ——
+/// 一行索引就够了。**不递归展开**（页 A 引用 B、B 又引用 C 时不会把 C 拉进来）：
+/// 递归会让注入体积随引用图指数式变化，而这个功能的目的只是「告诉你去哪一页找」。
+fn page_refs(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("[[") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            break;
+        };
+        let name = after[..end].trim();
+        if let Ok(Some(name)) = parse_memory_page(Some(name)) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+            if out.len() >= 8 {
+                break;
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+/// 目录级读取（单测用这一层）：默认页在前，各页按名字序拼在后面。
+/// **没有任何页时逐字节等于旧行为**（循环不执行）—— 旧数据、旧快照都不受影响。
+///
+/// **总长有硬顶**（与写侧同一个 `MEMORY_TOTAL_HARD_CAP_CHARS`）：这段文本每轮都进上下文，
+/// 页可以有很多个 ⇒ 必须有个「拼到哪儿为止」的判据。超出时**不静默丢**：后面的页不拼，
+/// 末尾留一行 `[N more memory page(s) omitted …]`，模型看得见、也知道该用 replace 合并。
+fn read_memory_in_dir(dir: &std::path::Path) -> Result<String, String> {
+    let mut text = read_memory_at(&dir.join(MEMORY_FILE))?;
+    let existing = list_pages_in(dir)?;
+    let mut omitted = 0usize;
+    for page in &existing {
+        let body = read_memory_at(&page_path_in(dir, Some(page)))?;
+        if body.trim().is_empty() {
+            continue;
+        }
+        // 互链索引（分片 3）：只列**真实存在**的页；指向不存在页的 `[[x]]` 原样留在正文里
+        // （它本身就是「这一页还没写」的记号，不需要额外提示）。
+        let refs: Vec<String> = page_refs(&body)
+            .into_iter()
+            .filter(|r| existing.contains(r))
+            .collect();
+        let mut block = String::new();
+        if text.is_empty() {
+            block.push_str(&format!("## {page}\n"));
+        } else {
+            if !text.ends_with('\n') {
+                block.push('\n');
+            }
+            block.push('\n');
+            block.push_str(&format!("## {page}\n"));
+        }
+        block.push_str(&body);
+        if !body.ends_with('\n') {
+            block.push('\n');
+        }
+        if !refs.is_empty() {
+            block.push_str(&format!("→ refs: {}\n", refs.join(", ")));
+        }
+        if text.chars().count() + block.chars().count() > MEMORY_TOTAL_HARD_CAP_CHARS {
+            omitted += 1;
+            continue;
+        }
+        text.push_str(&block);
+    }
+    if omitted > 0 {
+        text.push_str(&format!(
+            "\n[{omitted} more memory page(s) omitted: the combined text would exceed \
+             {MEMORY_TOTAL_HARD_CAP_CHARS} chars — consolidate older pages with Remember replace]\n"
+        ));
+    }
+    Ok(text)
 }
 
 /// 行首来源前缀（B1，2026-10-17）的严格形状：`[YYYY-MM-DD · global|pet] `。
@@ -604,7 +772,9 @@ fn split_provenance_prefix(text: &str) -> Option<(&str, &str)> {
 
 /// 去掉行首来源前缀；没有前缀（旧数据 / 非宿主生成）⇒ 原样返回。
 fn strip_provenance_prefix(text: &str) -> &str {
-    split_provenance_prefix(text).map(|(_, body)| body).unwrap_or(text)
+    split_provenance_prefix(text)
+        .map(|(_, body)| body)
+        .unwrap_or(text)
 }
 
 /// 本次写入要盖的来源前缀（不含行首 `- `，也不含其后的空格）。
@@ -683,13 +853,24 @@ fn tag_bullet_lines(text: &str, prefix: &str) -> String {
     out
 }
 
-/// 宿主本地日期（`YYYY-MM-DD`）。
+/// 宿主本地日期 + 时间戳（`YYYY-MM-DD`, `YYYYMMDD-HHMMSS`）。
 ///
 /// 日期必须由宿主取：模型生成的日期不可信；UTC 在东八区会跨日错一天（项目不引 chrono，
 /// 见 `log.rs` 顶注），这里直接调 Win32 `GetLocalTime`（`windows` 已是既有依赖）。
-fn local_today() -> String {
+/// cron 日志文件名与 usage 的按天分片共用这一份，不各写一套时间换算。
+pub(crate) fn local_date_time() -> (String, String) {
     let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
+    (
+        format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        ),
+    )
+}
+
+fn local_today() -> String {
+    local_date_time().0
 }
 
 /// 把记忆正文按行切成 `(行首字节偏移, 行内容)`（不丢字节：偏移用于按内容删除时精确定位）。
@@ -808,7 +989,10 @@ fn delete_memory_entry_at(path: &std::path::Path, needle: &str) -> Result<String
         fs::create_dir_all(dir).map_err(|e| format!("建记忆目录失败 {e}"))?;
     }
     fs::write(path, next.as_bytes()).map_err(|e| format!("写入记忆失败：{e}"))?;
-    Ok(format!("已删除一条记忆（剩 {} 条）", split_entries(&next).len()))
+    Ok(format!(
+        "已删除一条记忆（剩 {} 条）",
+        split_entries(&next).len()
+    ))
 }
 
 /// 写入层的来源标注（B1，2026-10-17）：`None` = 不加前缀（成长笔记 / 人格建议复用同一落盘助手）。
@@ -930,19 +1114,34 @@ fn write_memory_at(
     fs::write(path, next.as_bytes()).map_err(|e| format!("写入记忆失败：{e}"))?;
     Ok(format!(
         "{} 记忆已保存（{} 字符）。",
-        if replace { "整体替换：" } else { "追加一条：" },
+        if replace {
+            "整体替换："
+        } else {
+            "追加一条："
+        },
         next.chars().count()
     ))
 }
 
-fn write_memory_entry(scope: MemoryScope, content: &str, replace: bool) -> Result<String, String> {
+fn write_memory_entry(
+    scope: MemoryScope,
+    content: &str,
+    replace: bool,
+    page: Option<&str>,
+) -> Result<String, String> {
     let date = local_today();
-    write_memory_at(
-        &memory_path_for(scope),
+    let path = memory_page_path(scope, page);
+    let result = write_memory_at(
+        &path,
         content,
         replace,
         Some(MemoryProvenance { scope, date: &date }),
-    )
+    )?;
+    // 带页时在回执里点明落点：模型下一轮要知道「这一条不在默认页」。
+    Ok(match page {
+        Some(page) => format!("{result}（页：{page}）"),
+        None => result,
+    })
 }
 
 /// 把记忆文件截断为空（**文件不存在 ⇒ 幂等空操作**）。
@@ -961,18 +1160,36 @@ pub fn memory_read_text(scope: MemoryScope) -> Result<String, String> {
     read_memory(scope)
 }
 
-/// 前端「清空长期记忆 / 桌宠成长笔记」的入口：把该作用域的记忆文件截断为空。
-/// 破坏性操作，调用方（前端）负责二次确认；这里只做确定性落盘，不新增提示路径。
+/// 前端「清空长期记忆 / 桌宠成长笔记」的入口：把该作用域的记忆**清空**（默认页截断为空，
+/// 各页文件逐个删除）。破坏性操作，调用方（前端）负责二次确认；这里只做确定性落盘。
 pub fn clear_memory_text(scope: MemoryScope) -> Result<(), String> {
-    clear_memory_at(&memory_path_for(scope))
+    clear_memory_in_dir(&memory_dir_for(scope))
+}
+
+/// 目录级清空（单测用这一层）：默认页截断为空 + 删掉所有页文件。
+fn clear_memory_in_dir(dir: &std::path::Path) -> Result<(), String> {
+    clear_memory_at(&dir.join(MEMORY_FILE))?;
+    // 页也要一起清 —— 「清空长期记忆」只清一半会让人以为没清干净（§待办 3-24）。
+    for page in list_pages_in(dir)? {
+        let path = page_path_in(dir, Some(&page));
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| format!("清空记忆页失败 {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// 列出某作用域的全部记忆条目（**桌宠设置窗「成长笔记」列表的数据源**）。
+///
+/// 注意：这里只列**默认页**（`MEMORY.md`）。页是模型侧的整理维度，设置窗目前仍按一份
+/// 扁平列表展示（§待办 3-24 分片 2 之后如需按页分组再加，不在此处半途改口径）。
 pub fn memory_entries(scope: MemoryScope) -> Result<Vec<String>, String> {
     list_memory_entries_at(&memory_path_for(scope))
 }
 
 /// 按内容删掉**一条**记忆（**桌宠设置窗「逐条删」的数据源**）：删 A 不动 B。
+/// 与 [`memory_entries`] 同口径 —— 只作用于默认页。
 pub fn memory_delete_entry(scope: MemoryScope, needle: &str) -> Result<String, String> {
     delete_memory_entry_at(&memory_path_for(scope), needle)
 }
@@ -1016,7 +1233,10 @@ fn handle_memory_method(method: &str, params: Option<&Value>) -> Result<String, 
                 .and_then(|p| p.get("replace"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            write_memory_entry(scope, content, replace)
+            // 页（§待办 3-24）：缺省 = 默认页；形状在这里**唯一**校验（agent 侧只透传）。
+            let page =
+                parse_memory_page(params.and_then(|p| p.get("page")).and_then(Value::as_str))?;
+            write_memory_entry(scope, content, replace, page.as_deref())
         }
         other => Err(format!("未知记忆方法: {other}")),
     }
@@ -1174,6 +1394,32 @@ pub fn merge_persona_suggestion(suggestion: &str) -> Result<(), String> {
     )
 }
 
+/// 分派资源库来源（A5，2026-10-18）的**自定义方法**。
+///
+/// 只读列表 + 安装一条；删除**刻意不开放给 AI**（用户资产，删错就没了 —— UI 里可删）。
+/// 文件层校验在 `resource_hub.rs`；RSP 语义校验仍在插件的 TS SDK。
+fn handle_resource_hub_method(method: &str, params: Option<&Value>) -> Result<String, String> {
+    match method {
+        "lunac/resource_hub_sources" => {
+            let items = crate::resource_hub::list_sources()?;
+            serde_json::to_string(&json!({ "total": items.len(), "items": items }))
+                .map_err(|e| format!("序列化来源列表失败：{e}"))
+        }
+        "lunac/resource_hub_install" => {
+            let source = params
+                .and_then(|p| p.get("source"))
+                .ok_or_else(|| "缺少 source 参数（形状 = { manifest, rule }）".to_string())?;
+            let force = params
+                .and_then(|p| p.get("force"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = crate::resource_hub::install_source(source, force)?;
+            Ok(format!("已安装来源：{path}"))
+        }
+        other => Err(format!("未知资源库方法: {other}")),
+    }
+}
+
 /// 分派桌宠自我区（成长笔记 / 人格建议）的**自定义方法**（形状与 `handle_memory_method` 一致：
 /// 错误走 `result + isError`）。**三条只有「读成长笔记」与两条「只追加写」** ——
 /// 没有任何改核心人格、或改删历史条目的入口（合并只能走宿主命令）。
@@ -1292,8 +1538,12 @@ fn run_shell_with_timeout(
         }
     };
 
-    let stdout = out.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-    let stderr = err.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stdout = out
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = err
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
 
     if exit_status.success() {
         // Return stdout if non-empty, otherwise stderr for informational output
@@ -1358,7 +1608,9 @@ fn execute_tool_handler(
                 req = req.header(k.as_str(), v.as_str());
             }
 
-            let resp = req.send().map_err(|e| format!("HTTP request failed: {}", e))?;
+            let resp = req
+                .send()
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
             let status = resp.status();
             let body_text = resp
                 .text()
@@ -1414,7 +1666,13 @@ fn color_name(r: f32, g: f32, b: f32) -> &'static str {
         return "黑";
     }
     if s < 0.15 {
-        return if v > 0.9 { "白" } else if v > 0.6 { "浅灰" } else { "深灰" };
+        return if v > 0.9 {
+            "白"
+        } else if v > 0.6 {
+            "浅灰"
+        } else {
+            "深灰"
+        };
     }
     const NAMES: [&str; 12] = [
         "红", "橙", "黄", "黄绿", "绿", "青绿", "青", "蓝", "蓝紫", "紫", "品红", "粉",
@@ -1424,8 +1682,18 @@ fn color_name(r: f32, g: f32, b: f32) -> &'static str {
 
 fn dominant_hue_desc(hue_hist: &[usize; 12], n: f32) -> String {
     const NAMES: [&str; 12] = [
-        "红调", "橙调", "黄调", "黄绿调", "绿调", "青绿调", "青调", "蓝调", "蓝紫调", "紫调",
-        "品红调", "粉调",
+        "红调",
+        "橙调",
+        "黄调",
+        "黄绿调",
+        "绿调",
+        "青绿调",
+        "青调",
+        "蓝调",
+        "蓝紫调",
+        "紫调",
+        "品红调",
+        "粉调",
     ];
     let total: usize = hue_hist.iter().sum();
     if total == 0 {
@@ -1858,43 +2126,51 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef], session: &mut Session) ->
             error: None,
         },
         Some("tools/call") => {
-            let params = req.params.as_ref().and_then(|v| v.get("name")).and_then(|n| n.as_str()).map(|n| n.to_string());
-            let args = req.params.as_ref().and_then(|v| v.get("arguments")).cloned().unwrap_or(Value::Null);
+            let params = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n.to_string());
+            let args = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::Null);
 
             match params {
-                Some(name) => {
-                    match tools.iter().find(|t| t.name == name) {
-                        Some(tool) => match run_tool_def(session, tool, &args) {
-                            Ok(text) => McpResponse {
-                                jsonrpc: "2.0".into(),
-                                id: req.id.clone(),
-                                result: Some(json!({
-                                    "content": [{ "type": "text", "text": text }],
-                                    "isError": false
-                                })),
-                                error: None,
-                            },
-                            Err(msg) => McpResponse {
-                                jsonrpc: "2.0".into(),
-                                id: req.id.clone(),
-                                result: Some(json!({
-                                    "content": [{ "type": "text", "text": msg }],
-                                    "isError": true
-                                })),
-                                error: None,
-                            },
-                        },
-                        None => McpResponse {
+                Some(name) => match tools.iter().find(|t| t.name == name) {
+                    Some(tool) => match run_tool_def(session, tool, &args) {
+                        Ok(text) => McpResponse {
                             jsonrpc: "2.0".into(),
                             id: req.id.clone(),
-                            error: Some(McpError {
-                                code: -32602,
-                                message: format!("Tool not found: {}", name),
-                            }),
-                            result: None,
+                            result: Some(json!({
+                                "content": [{ "type": "text", "text": text }],
+                                "isError": false
+                            })),
+                            error: None,
                         },
-                    }
-                }
+                        Err(msg) => McpResponse {
+                            jsonrpc: "2.0".into(),
+                            id: req.id.clone(),
+                            result: Some(json!({
+                                "content": [{ "type": "text", "text": msg }],
+                                "isError": true
+                            })),
+                            error: None,
+                        },
+                    },
+                    None => McpResponse {
+                        jsonrpc: "2.0".into(),
+                        id: req.id.clone(),
+                        error: Some(McpError {
+                            code: -32602,
+                            message: format!("Tool not found: {}", name),
+                        }),
+                        result: None,
+                    },
+                },
                 None => McpResponse {
                     jsonrpc: "2.0".into(),
                     id: req.id.clone(),
@@ -2011,6 +2287,15 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef], session: &mut Session) ->
                 Err(msg) => text_err(req.id.clone(), msg),
             }
         }
+        // 资源库来源（A5，2026-10-18）：自定义方法、不列进 tools/list。
+        // AI 侧只有「读列表」与「安装一条」；删除仍只在插件 UI 里。
+        Some(m) if m.starts_with("lunac/resource_hub_") => {
+            let method = m.to_string();
+            match handle_resource_hub_method(&method, req.params.as_ref()) {
+                Ok(text) => text_ok(req.id.clone(), text),
+                Err(msg) => text_err(req.id.clone(), msg),
+            }
+        }
         // 桌宠自我区（成长笔记 / 人格建议，2026-10-13）：同上，自定义方法、不列进 tools/list。
         // 只有「读成长笔记」与两条「只追加写」；**没有**任何改核心人格的方法（合并走宿主命令）。
         Some(m) if m.starts_with("lunac/pet_") || m.starts_with("lunac/persona_") => {
@@ -2049,7 +2334,11 @@ fn handle_request(req: &McpRequest, tools: &[ToolDef], session: &mut Session) ->
 
 pub fn run_stdio() {
     let tools = load_tools();
-    eprintln!("[mcp] Loaded {} user-defined tools from {:?}", tools.len(), tools_dir());
+    eprintln!(
+        "[mcp] Loaded {} user-defined tools from {:?}",
+        tools.len(),
+        tools_dir()
+    );
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -2119,6 +2408,15 @@ mod tests {
         Some(MemoryProvenance { scope, date })
     }
 
+    /// 资源库桥（A5，2026-10-18）：安装缺 `source` 必须报错；删除**没有**开放给 AI。
+    #[test]
+    fn resource_hub_bridge_requires_source_and_has_no_delete() {
+        let err = handle_resource_hub_method("lunac/resource_hub_install", None).unwrap_err();
+        assert!(err.contains("source"), "实际：{err}");
+        let err = handle_resource_hub_method("lunac/resource_hub_delete", None).unwrap_err();
+        assert!(err.contains("未知资源库方法"), "实际：{err}");
+    }
+
     /// `resources/read` 的**安全边界**（A3，2026-09-20）。`uri` 是模型给的，而模型会被
     /// 读到的文件内容提示注入 ⇒ 「只能读 tools 目录内的 .json」这条必须由单测钉死，
     /// 否则一次改动就可能把任意文件读取能力悄悄放出去。
@@ -2147,14 +2445,19 @@ mod tests {
             "deploy.json".to_string(),
             "deploy".to_string(),
         ] {
-            let got = resolve_resource(&root, &uri).unwrap_or_else(|e| panic!("{uri} 应可解析: {e}"));
+            let got =
+                resolve_resource(&root, &uri).unwrap_or_else(|e| panic!("{uri} 应可解析: {e}"));
             assert_eq!(got, root.join("deploy.json").canonicalize().unwrap());
         }
 
         // ② 越界 / 非 .json / 目录 / 空串 / 别的 scheme 一律拒
         for bad in [
             format!("file:///{}", outside.display()),
-            format!("file:///{}/../{}", root.display(), outside.file_name().unwrap().to_string_lossy()),
+            format!(
+                "file:///{}/../{}",
+                root.display(),
+                outside.file_name().unwrap().to_string_lossy()
+            ),
             "readme.md".to_string(),
             "readme".to_string(),
             String::new(),
@@ -2162,10 +2465,7 @@ mod tests {
             "..\\deploy".to_string(),
             "sub/deploy.json".to_string(),
         ] {
-            assert!(
-                resolve_resource(&root, &bad).is_err(),
-                "必须拒绝：{bad:?}"
-            );
+            assert!(resolve_resource(&root, &bad).is_err(), "必须拒绝：{bad:?}");
         }
 
         let _ = fs::remove_dir_all(&root);
@@ -2190,8 +2490,20 @@ mod tests {
         assert_eq!(read_memory_at(&file).unwrap(), "");
 
         // ② 追加两条 ⇒ 逐条成行，先写的在前，每条都带宿主来源前缀（B1）
-        assert!(write_memory_at(&file, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
-        assert!(write_memory_at(&file, "项目用 Rust", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(
+            &file,
+            "用户偏好中文",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(write_memory_at(
+            &file,
+            "项目用 Rust",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
         let text = read_memory_at(&file).unwrap();
         assert_eq!(
             text,
@@ -2200,13 +2512,20 @@ mod tests {
 
         // ③ 同一条重写 ⇒ 不改文件（去重；同日期刷新是 no-op）
         let before = text.clone();
-        assert!(write_memory_at(&file, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE))
-            .unwrap()
-            .contains("already"));
+        assert!(write_memory_at(
+            &file,
+            "用户偏好中文",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .unwrap()
+        .contains("already"));
         assert_eq!(read_memory_at(&file).unwrap(), before, "重复条目不得写进去");
 
         // ④ 空条目 / 超长单条 / 超正文额度替换 ⇒ 拒绝（**不许静默截断**）
-        assert!(write_memory_at(&file, "   ", false, tagged(MemoryScope::Global, TEST_DATE)).is_err());
+        assert!(
+            write_memory_at(&file, "   ", false, tagged(MemoryScope::Global, TEST_DATE)).is_err()
+        );
         assert!(write_memory_at(
             &file,
             &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1),
@@ -2228,7 +2547,9 @@ mod tests {
         let mut wrote = 0;
         loop {
             let entry = format!("{filler}{wrote}");
-            if write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_err() {
+            if write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE))
+                .is_err()
+            {
                 break;
             }
             wrote += 1;
@@ -2253,7 +2574,10 @@ mod tests {
             tagged(MemoryScope::Global, TEST_DATE)
         )
         .is_ok());
-        assert_eq!(read_memory_at(&file).unwrap(), "- [2026-10-17 · global] 只剩这一条\n");
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-17 · global] 只剩这一条\n"
+        );
 
         // 模型自带的「假日期 / 假 scope」一律被宿主覆盖（日期只信宿主）。
         assert!(write_memory_at(
@@ -2307,7 +2631,10 @@ mod tests {
         let text = read_memory_at(&file).unwrap();
         assert!(!text.contains("99887766"), "裸 key 泄露：{text}");
         assert!(!text.contains("abcdef123456"), "键值对凭据泄露：{text}");
-        assert!(text.starts_with("- [2026-10-17 · global] "), "首条仍须是带前缀的 bullet：{text}");
+        assert!(
+            text.starts_with("- [2026-10-17 · global] "),
+            "首条仍须是带前缀的 bullet：{text}"
+        );
         assert!(text.contains("\n  "), "多行续行缩进被破坏了：{text}");
 
         // 普通内容逐字不变（不能被脱敏误伤）
@@ -2340,7 +2667,13 @@ mod tests {
         let file = dir.join("MEMORY.md");
 
         // 先写一条 ⇒ 再清空 ⇒ 读到空串（截断而非删除文件，路径保持不变）
-        assert!(write_memory_at(&file, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(
+            &file,
+            "用户偏好中文",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
         assert!(!read_memory_at(&file).unwrap().is_empty());
         assert!(clear_memory_at(&file).is_ok());
         assert_eq!(read_memory_at(&file).unwrap(), "");
@@ -2380,14 +2713,42 @@ mod tests {
         let dir = tmp_memory_dir("memscope");
         let gfile = dir.join("MEMORY.md");
         let pfile = dir.join("pet").join("MEMORY.md");
-        assert!(write_memory_at(&gfile, "全局约定", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
-        assert!(write_memory_at(&pfile, "桌宠笔记", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
-        assert_eq!(read_memory_at(&gfile).unwrap(), "- [2026-10-17 · global] 全局约定\n");
-        assert_eq!(read_memory_at(&pfile).unwrap(), "- [2026-10-17 · pet] 桌宠笔记\n");
+        assert!(write_memory_at(
+            &gfile,
+            "全局约定",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(write_memory_at(
+            &pfile,
+            "桌宠笔记",
+            false,
+            tagged(MemoryScope::Pet, TEST_DATE)
+        )
+        .is_ok());
+        assert_eq!(
+            read_memory_at(&gfile).unwrap(),
+            "- [2026-10-17 · global] 全局约定\n"
+        );
+        assert_eq!(
+            read_memory_at(&pfile).unwrap(),
+            "- [2026-10-17 · pet] 桌宠笔记\n"
+        );
 
         let g_before = read_memory_at(&gfile).unwrap();
-        assert!(write_memory_at(&pfile, "桌宠第二条", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
-        assert_eq!(read_memory_at(&gfile).unwrap(), g_before, "写桌宠私有不得影响全局注入");
+        assert!(write_memory_at(
+            &pfile,
+            "桌宠第二条",
+            false,
+            tagged(MemoryScope::Pet, TEST_DATE)
+        )
+        .is_ok());
+        assert_eq!(
+            read_memory_at(&gfile).unwrap(),
+            g_before,
+            "写桌宠私有不得影响全局注入"
+        );
         assert_eq!(list_memory_entries_at(&pfile).unwrap().len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
@@ -2398,7 +2759,10 @@ mod tests {
     fn memory_scope_parse_is_strict() {
         assert_eq!(MemoryScope::parse(None).unwrap(), MemoryScope::Global);
         assert_eq!(MemoryScope::parse(Some("")).unwrap(), MemoryScope::Global);
-        assert_eq!(MemoryScope::parse(Some("global")).unwrap(), MemoryScope::Global);
+        assert_eq!(
+            MemoryScope::parse(Some("global")).unwrap(),
+            MemoryScope::Global
+        );
         assert_eq!(MemoryScope::parse(Some("pet")).unwrap(), MemoryScope::Pet);
         assert_eq!(MemoryScope::parse(Some(" pet ")).unwrap(), MemoryScope::Pet);
         assert!(MemoryScope::parse(Some("other")).is_err());
@@ -2411,12 +2775,36 @@ mod tests {
         let dir = tmp_memory_dir("memtag");
         let gfile = dir.join("MEMORY.md");
         let pfile = dir.join("pet").join("MEMORY.md");
-        assert!(write_memory_at(&gfile, "用户偏好中文", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
-        assert!(write_memory_at(&pfile, "桌宠喜欢被摸头", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
-        assert_eq!(read_memory_at(&gfile).unwrap(), "- [2026-10-17 · global] 用户偏好中文\n");
-        assert_eq!(read_memory_at(&pfile).unwrap(), "- [2026-10-17 · pet] 桌宠喜欢被摸头\n");
-        assert!(!read_memory_at(&gfile).unwrap().contains("摸头"), "全局文件不得混入桌宠条目");
-        assert!(!read_memory_at(&pfile).unwrap().contains("用户偏好"), "桌宠文件不得混入全局条目");
+        assert!(write_memory_at(
+            &gfile,
+            "用户偏好中文",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(write_memory_at(
+            &pfile,
+            "桌宠喜欢被摸头",
+            false,
+            tagged(MemoryScope::Pet, TEST_DATE)
+        )
+        .is_ok());
+        assert_eq!(
+            read_memory_at(&gfile).unwrap(),
+            "- [2026-10-17 · global] 用户偏好中文\n"
+        );
+        assert_eq!(
+            read_memory_at(&pfile).unwrap(),
+            "- [2026-10-17 · pet] 桌宠喜欢被摸头\n"
+        );
+        assert!(
+            !read_memory_at(&gfile).unwrap().contains("摸头"),
+            "全局文件不得混入桌宠条目"
+        );
+        assert!(
+            !read_memory_at(&pfile).unwrap().contains("用户偏好"),
+            "桌宠文件不得混入全局条目"
+        );
 
         // 日期来自宿主本地时钟（Win32 GetLocalTime），必须是 10 位 ISO 形状。
         let today = local_today();
@@ -2424,7 +2812,9 @@ mod tests {
         assert_eq!(today.len(), 10, "日期必须 YYYY-MM-DD：{today}");
         assert!(b[4] == b'-' && b[7] == b'-', "分隔符位置错：{today}");
         assert!(
-            b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()),
+            b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()),
             "非法日期：{today}"
         );
         assert_eq!(
@@ -2461,7 +2851,10 @@ mod tests {
             "- [2026-10-17 · global] User prefers TABS\n",
             "只刷新日期：正文保持首次落盘的原文，条目数不变"
         );
-        assert_eq!(list_memory_entries_at(&file).unwrap(), vec!["User prefers TABS".to_string()]);
+        assert_eq!(
+            list_memory_entries_at(&file).unwrap(),
+            vec!["User prefers TABS".to_string()]
+        );
 
         // 再以更早的日期写入同一条 ⇒ 同样只刷新（最后确认时间可以变早，由写入顺序决定）。
         assert!(write_memory_at(
@@ -2472,7 +2865,10 @@ mod tests {
         )
         .unwrap()
         .contains("already"));
-        assert_eq!(read_memory_at(&file).unwrap(), "- [2026-10-15 · global] User prefers TABS\n");
+        assert_eq!(
+            read_memory_at(&file).unwrap(),
+            "- [2026-10-15 · global] User prefers TABS\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2592,7 +2988,9 @@ mod tests {
         let mut i = 0;
         loop {
             let entry = format!("{big}{i}");
-            if let Err(e) = write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)) {
+            if let Err(e) =
+                write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE))
+            {
                 assert!(e.contains("正文额度"), "400 字条目应先撞正文额度：{e}");
                 break;
             }
@@ -2610,9 +3008,13 @@ mod tests {
             "文件总长必须 ≤ {MEMORY_TOTAL_HARD_CAP_CHARS}，实际 {}",
             full.chars().count()
         );
-        assert!(
-            write_memory_at(&file, &format!("{big}{i}"), false, tagged(MemoryScope::Global, TEST_DATE)).is_err()
-        );
+        assert!(write_memory_at(
+            &file,
+            &format!("{big}{i}"),
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_err());
         assert_eq!(read_memory_at(&file).unwrap(), full, "超限不得落盘");
 
         let _ = fs::remove_dir_all(&dir);
@@ -2628,7 +3030,8 @@ mod tests {
             let entry = format!("{i:03}{}", "a".repeat(117));
             assert_eq!(entry.chars().count(), 120);
             assert!(
-                write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok(),
+                write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE))
+                    .is_ok(),
                 "正文未超额（第 {i} 条）不应因前缀被拒"
             );
         }
@@ -2653,7 +3056,10 @@ mod tests {
         // 3 × 1900 = 5700；再来一条 301 ⇒ 正文 6001（单条均未超 2000）。
         for i in 0..3 {
             let entry = format!("{i}{}", "d".repeat(1899));
-            assert!(write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+            assert!(
+                write_memory_at(&file, &entry, false, tagged(MemoryScope::Global, TEST_DATE))
+                    .is_ok()
+            );
         }
         let before = read_memory_at(&file).unwrap();
         let err = write_memory_at(
@@ -2696,7 +3102,10 @@ mod tests {
         assert_eq!(wrote, 200);
         let full = read_memory_at(&file).unwrap();
         assert_eq!(full.chars().count(), MEMORY_TOTAL_HARD_CAP_CHARS);
-        assert!(memory_body_chars(&full) < MEMORY_BODY_BUDGET_CHARS, "正文应仍有余量");
+        assert!(
+            memory_body_chars(&full) < MEMORY_BODY_BUDGET_CHARS,
+            "正文应仍有余量"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2709,7 +3118,9 @@ mod tests {
         let file = dir.join("MEMORY.md");
 
         // 正文超额：4 × 2000 = 8000 正文，总长约 8100（未过 9000）⇒ 必须报正文额度。
-        let body_over: Vec<String> = (0..4).map(|i| format!("- {i}{}", "r".repeat(1999))).collect();
+        let body_over: Vec<String> = (0..4)
+            .map(|i| format!("- {i}{}", "r".repeat(1999)))
+            .collect();
         let err = write_memory_at(
             &file,
             &body_over.join("\n"),
@@ -2717,11 +3128,16 @@ mod tests {
             tagged(MemoryScope::Global, TEST_DATE),
         )
         .unwrap_err();
-        assert!(err.contains("正文额度"), "replace 正文超额应报正文额度：{err}");
+        assert!(
+            err.contains("正文额度"),
+            "replace 正文超额应报正文额度：{err}"
+        );
         assert!(!file.exists(), "拒绝时不得落盘");
 
         // 总长超额：300 条 × 11 字正文 = 3300 正文；落盘每行 36 字 ⇒ 总长 10800 ⇒ 报总长硬顶。
-        let too_many: Vec<String> = (0..300).map(|i| format!("- e{i:03}{}", "x".repeat(7))).collect();
+        let too_many: Vec<String> = (0..300)
+            .map(|i| format!("- e{i:03}{}", "x".repeat(7)))
+            .collect();
         let err = write_memory_at(
             &file,
             &too_many.join("\n"),
@@ -2729,7 +3145,10 @@ mod tests {
             tagged(MemoryScope::Global, TEST_DATE),
         )
         .unwrap_err();
-        assert!(err.contains("总长度硬顶"), "replace 前缀过多应报总长硬顶：{err}");
+        assert!(
+            err.contains("总长度硬顶"),
+            "replace 前缀过多应报总长硬顶：{err}"
+        );
         assert!(!err.contains("正文额度"), "正文未满时不应报正文额度：{err}");
         assert!(!file.exists(), "拒绝时不得落盘");
 
@@ -2747,7 +3166,13 @@ mod tests {
         let shrink_file = dir.join("SHRINK.md");
         let long_secret = format!("偏好中文 sk-{}", "z".repeat(6_100));
         assert!(
-            write_memory_at(&shrink_file, &long_secret, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok(),
+            write_memory_at(
+                &shrink_file,
+                &long_secret,
+                false,
+                tagged(MemoryScope::Global, TEST_DATE)
+            )
+            .is_ok(),
             "脱敏后已低于正文额度，不得按原文拒绝"
         );
         let shrunk = read_memory_at(&shrink_file).unwrap();
@@ -2758,14 +3183,32 @@ mod tests {
         let grow_file = dir.join("GROW.md");
         for i in 0..3 {
             let entry = format!("{i}{}", "g".repeat(1899));
-            assert!(write_memory_at(&grow_file, &entry, false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+            assert!(write_memory_at(
+                &grow_file,
+                &entry,
+                false,
+                tagged(MemoryScope::Global, TEST_DATE)
+            )
+            .is_ok());
         }
-        assert_eq!(memory_body_chars(&read_memory_at(&grow_file).unwrap()), 5700);
+        assert_eq!(
+            memory_body_chars(&read_memory_at(&grow_file).unwrap()),
+            5700
+        );
         let before = read_memory_at(&grow_file).unwrap();
         let tail = format!("{}sk-a", "g".repeat(296));
         assert_eq!(tail.chars().count(), 300);
-        let err = write_memory_at(&grow_file, &tail, false, tagged(MemoryScope::Global, TEST_DATE)).unwrap_err();
-        assert!(err.contains("正文额度"), "脱敏后正文 6001 应报正文额度：{err}");
+        let err = write_memory_at(
+            &grow_file,
+            &tail,
+            false,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("正文额度"),
+            "脱敏后正文 6001 应报正文额度：{err}"
+        );
         assert_eq!(read_memory_at(&grow_file).unwrap(), before, "超限不得落盘");
 
         let _ = fs::remove_dir_all(&dir);
@@ -2777,19 +3220,40 @@ mod tests {
     fn memory_dedupes_on_normalized_entry() {
         let dir = tmp_memory_dir("memnorm");
         let file = dir.join("MEMORY.md");
-        assert!(write_memory_at(&file, "User prefers   TABS", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(
+            &file,
+            "User prefers   TABS",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
         // 只差内部多余空格 ⇒ 视为同一条
-        assert!(write_memory_at(&file, "User prefers TABS", false, tagged(MemoryScope::Global, TEST_DATE))
-            .unwrap()
-            .contains("already"));
+        assert!(write_memory_at(
+            &file,
+            "User prefers TABS",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .unwrap()
+        .contains("already"));
         // 只差大小写 ⇒ 视为同一条
-        assert!(write_memory_at(&file, "user prefers tabs", false, tagged(MemoryScope::Global, TEST_DATE))
-            .unwrap()
-            .contains("already"));
+        assert!(write_memory_at(
+            &file,
+            "user prefers tabs",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .unwrap()
+        .contains("already"));
         // 内容确实不同 ⇒ 不是重复，要落盘
-        assert!(!write_memory_at(&file, "User prefers spaces", false, tagged(MemoryScope::Global, TEST_DATE))
-            .unwrap()
-            .contains("already"));
+        assert!(!write_memory_at(
+            &file,
+            "User prefers spaces",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .unwrap()
+        .contains("already"));
         assert_eq!(list_memory_entries_at(&file).unwrap().len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
@@ -2801,9 +3265,27 @@ mod tests {
     fn memory_delete_removes_one_entry_only() {
         let dir = tmp_memory_dir("memdel");
         let file = dir.join("MEMORY.md");
-        assert!(write_memory_at(&file, "条目A", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
-        assert!(write_memory_at(&file, "条目B", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
-        assert!(write_memory_at(&file, "多行第一条\n续行内容", false, tagged(MemoryScope::Global, TEST_DATE)).is_ok());
+        assert!(write_memory_at(
+            &file,
+            "条目A",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(write_memory_at(
+            &file,
+            "条目B",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
+        assert!(write_memory_at(
+            &file,
+            "多行第一条\n续行内容",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE)
+        )
+        .is_ok());
         assert_eq!(list_memory_entries_at(&file).unwrap().len(), 3);
 
         // 删 A（归一匹配：大小写差异也认）—— B 与多行条目必须原样在
@@ -2823,7 +3305,10 @@ mod tests {
 
         // 多行条目（含续行）整块删
         assert!(delete_memory_entry_at(&file, "多行第一条\n续行内容").is_ok());
-        assert_eq!(list_memory_entries_at(&file).unwrap(), vec!["条目B".to_string()]);
+        assert_eq!(
+            list_memory_entries_at(&file).unwrap(),
+            vec!["条目B".to_string()]
+        );
 
         // 删空 ⇒ 读到空串、无条目（注入侧即空）
         assert!(delete_memory_entry_at(&file, "条目B").is_ok());
@@ -2841,11 +3326,18 @@ mod tests {
         let growth = pet_growth_path();
         let suggest = persona_suggestions_path();
         let pet_mem = memory_path_for(MemoryScope::Pet);
-        assert_eq!(growth.parent(), pet_mem.parent(), "与桌宠记忆同目录（同族）");
+        assert_eq!(
+            growth.parent(),
+            pet_mem.parent(),
+            "与桌宠记忆同目录（同族）"
+        );
         assert_ne!(growth, pet_mem, "成长笔记另立文件，不混进 MEMORY.md");
         assert_ne!(suggest, pet_mem, "建议区另立文件，不混进 MEMORY.md");
         assert!(growth.ends_with("memory/pet/GROWTH.md"), "{growth:?}");
-        assert!(suggest.ends_with("memory/pet/PERSONA_SUGGESTIONS.md"), "{suggest:?}");
+        assert!(
+            suggest.ends_with("memory/pet/PERSONA_SUGGESTIONS.md"),
+            "{suggest:?}"
+        );
         for p in [&growth, &suggest] {
             assert!(
                 !p.to_string_lossy().contains("config"),
@@ -2869,18 +3361,25 @@ mod tests {
         assert!(write_memory_at(&file, "被夸时轻轻晃一下就好", false, None).is_ok());
         assert_eq!(
             list_memory_entries_at(&file).unwrap(),
-            vec!["说话可以更简短一点".to_string(), "被夸时轻轻晃一下就好".to_string()]
+            vec![
+                "说话可以更简短一点".to_string(),
+                "被夸时轻轻晃一下就好".to_string()
+            ]
         );
 
         // ② 归一去重：只差空白 / 大小写视为同一条，不重复落盘
-        assert!(write_memory_at(&file, "  说话可以更简短一点  ", false, None)
-            .unwrap()
-            .contains("already"));
+        assert!(
+            write_memory_at(&file, "  说话可以更简短一点  ", false, None)
+                .unwrap()
+                .contains("already")
+        );
         assert_eq!(list_memory_entries_at(&file).unwrap().len(), 2);
 
         // ③ 单条超限 ⇒ 报错、不落盘（不静默截断）
         let before = read_memory_at(&file).unwrap();
-        assert!(write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false, None).is_err());
+        assert!(
+            write_memory_at(&file, &"x".repeat(MAX_MEMORY_ENTRY_CHARS + 1), false, None).is_err()
+        );
         assert_eq!(read_memory_at(&file).unwrap(), before, "超限不得落盘");
 
         // ④ 逐条删：删 A 不动 B
@@ -2900,7 +3399,10 @@ mod tests {
         let full = read_memory_at(&file).unwrap();
         assert!(memory_body_chars(&full) <= MEMORY_BODY_BUDGET_CHARS);
         assert!(full.chars().count() <= MEMORY_TOTAL_HARD_CAP_CHARS);
-        assert!(write_memory_at(&file, &format!("{big}{i}"), false, None).is_err(), "总量超限必须报错");
+        assert!(
+            write_memory_at(&file, &format!("{big}{i}"), false, None).is_err(),
+            "总量超限必须报错"
+        );
         assert_eq!(read_memory_at(&file).unwrap(), full, "总量超限不得落盘");
 
         let _ = fs::remove_dir_all(&dir);
@@ -2925,7 +3427,10 @@ mod tests {
             "lunac/merge_persona_suggestion",
         ] {
             let e = handle_pet_self_method(bad, Some(&json!({ "content": "x" }))).unwrap_err();
-            assert!(e.contains("未知"), "{bad} 不该被桥识别（AI 不得改核心人格）：{e}");
+            assert!(
+                e.contains("未知"),
+                "{bad} 不该被桥识别（AI 不得改核心人格）：{e}"
+            );
         }
     }
 
@@ -2943,10 +3448,15 @@ mod tests {
         // 在册建议 ⇒ 合并成功：人格追加该段、建议从建议区摘掉
         assert!(write_memory_at(&persona, "你是桌面宠物。", true, None).is_ok());
         assert!(write_memory_at(&sug, "说话时可以偶尔用一点点俏皮话", false, None).is_ok());
-        assert!(merge_persona_suggestion_at("说话时可以偶尔用一点点俏皮话", &persona, &sug).is_ok());
+        assert!(
+            merge_persona_suggestion_at("说话时可以偶尔用一点点俏皮话", &persona, &sug).is_ok()
+        );
         let p = read_memory_at(&persona).unwrap();
         assert!(p.contains("你是桌面宠物。") && p.contains("说话时可以偶尔用一点点俏皮话"));
-        assert!(list_memory_entries_at(&sug).unwrap().is_empty(), "合并成功后建议应被摘掉");
+        assert!(
+            list_memory_entries_at(&sug).unwrap().is_empty(),
+            "合并成功后建议应被摘掉"
+        );
 
         // 长度上限：合并后超 `MAX_PERSONA_CHARS` ⇒ 报错，**人格与建议区都不动**（先校验后写）
         fs::create_dir_all(&dir).unwrap();
@@ -2954,9 +3464,20 @@ mod tests {
         assert!(write_memory_at(&sug, "再补一句俏皮话", false, None).is_ok());
         let before = read_memory_at(&persona).unwrap();
         let err = merge_persona_suggestion_at("再补一句俏皮话", &persona, &sug).unwrap_err();
-        assert!(err.contains("上限") || err.contains("过长"), "应报长度上限：{err}");
-        assert_eq!(read_memory_at(&persona).unwrap(), before, "校验不过不得写人格");
-        assert_eq!(list_memory_entries_at(&sug).unwrap().len(), 1, "校验不过不得摘建议");
+        assert!(
+            err.contains("上限") || err.contains("过长"),
+            "应报长度上限：{err}"
+        );
+        assert_eq!(
+            read_memory_at(&persona).unwrap(),
+            before,
+            "校验不过不得写人格"
+        );
+        assert_eq!(
+            list_memory_entries_at(&sug).unwrap().len(),
+            1,
+            "校验不过不得摘建议"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2977,7 +3498,13 @@ mod tests {
 
         // 四份都先有内容
         assert!(write_memory_at(&persona, "你是桌面宠物。", true, None).is_ok());
-        assert!(write_memory_at(&mem, "用户喜欢简洁", false, tagged(MemoryScope::Pet, TEST_DATE)).is_ok());
+        assert!(write_memory_at(
+            &mem,
+            "用户喜欢简洁",
+            false,
+            tagged(MemoryScope::Pet, TEST_DATE)
+        )
+        .is_ok());
         assert!(write_memory_at(&growth, "说话可以更简短一点", false, None).is_ok());
         assert!(write_memory_at(&sug, "可以偶尔用点俏皮话", false, None).is_ok());
         assert!(write_memory_at(&sug, "被夸时轻轻晃一下", false, None).is_ok());
@@ -2990,16 +3517,34 @@ mod tests {
         // 清空建议区（与宿主命令同一实现）：条目清空、读为空串
         assert!(clear_memory_at(&sug).is_ok());
         assert_eq!(read_memory_at(&sug).unwrap(), "");
-        assert!(list_memory_entries_at(&sug).unwrap().is_empty(), "清空后建议列表必须为空");
+        assert!(
+            list_memory_entries_at(&sug).unwrap().is_empty(),
+            "清空后建议列表必须为空"
+        );
 
         // 另三份原样不动
-        assert_eq!(read_memory_at(&persona).unwrap(), persona_before, "核心人格不得被清空波及");
-        assert_eq!(read_memory_at(&mem).unwrap(), mem_before, "事实记忆不得被清空波及");
-        assert_eq!(read_memory_at(&growth).unwrap(), growth_before, "成长笔记不得被清空波及");
+        assert_eq!(
+            read_memory_at(&persona).unwrap(),
+            persona_before,
+            "核心人格不得被清空波及"
+        );
+        assert_eq!(
+            read_memory_at(&mem).unwrap(),
+            mem_before,
+            "事实记忆不得被清空波及"
+        );
+        assert_eq!(
+            read_memory_at(&growth).unwrap(),
+            growth_before,
+            "成长笔记不得被清空波及"
+        );
 
         // 幂等：文件不存在时清空不报错，且不凭空新建文件
         let missing = dir.join("NOT_THERE.md");
-        assert!(clear_memory_at(&missing).is_ok(), "文件不存在 ⇒ 幂等空操作，不报错");
+        assert!(
+            clear_memory_at(&missing).is_ok(),
+            "文件不存在 ⇒ 幂等空操作，不报错"
+        );
         assert!(!missing.exists(), "清空不得凭空新建文件");
 
         let _ = fs::remove_dir_all(&dir);
@@ -3032,27 +3577,52 @@ mod tests {
 
         let list = load_prompts_from(&dir);
         let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"], "必须按文件名排序（prompts/list 的排列要稳定）");
-        assert_eq!(list[0].description, "代码评审", "无 frontmatter ⇒ 取正文首个非空行（去 #）");
-        assert_eq!(list[1].description, "部署检查清单", "有 frontmatter ⇒ 取 description:");
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "必须按文件名排序（prompts/list 的排列要稳定）"
+        );
+        assert_eq!(
+            list[0].description, "代码评审",
+            "无 frontmatter ⇒ 取正文首个非空行（去 #）"
+        );
+        assert_eq!(
+            list[1].description, "部署检查清单",
+            "有 frontmatter ⇒ 取 description:"
+        );
 
         let listed = build_prompts_list(&list);
         assert_eq!(
             listed.pointer("/prompts/0/name").and_then(Value::as_str),
             Some("a")
         );
-        assert_eq!(listed.pointer("/prompts/1/description").and_then(Value::as_str), Some("部署检查清单"));
+        assert_eq!(
+            listed
+                .pointer("/prompts/1/description")
+                .and_then(Value::as_str),
+            Some("部署检查清单")
+        );
 
         let got = prompt_get_result(&list, "b", &json!({ "target": "prod" })).unwrap();
         assert_eq!(
-            got.pointer("/messages/0/content/text").and_then(Value::as_str),
+            got.pointer("/messages/0/content/text")
+                .and_then(Value::as_str),
             Some("请检查 prod 的部署。\n"),
             "{{target}} 要按 arguments 替换"
         );
-        assert_eq!(got.get("description").and_then(Value::as_str), Some("部署检查清单"));
+        assert_eq!(
+            got.get("description").and_then(Value::as_str),
+            Some("部署检查清单")
+        );
 
-        assert!(prompt_get_result(&list, "  ", &json!({})).is_err(), "空 name 要报错");
-        assert!(prompt_get_result(&list, "missing", &json!({})).is_err(), "找不到的名字要报错");
+        assert!(
+            prompt_get_result(&list, "  ", &json!({})).is_err(),
+            "空 name 要报错"
+        );
+        assert!(
+            prompt_get_result(&list, "missing", &json!({})).is_err(),
+            "找不到的名字要报错"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3065,7 +3635,9 @@ mod tests {
             name: "deploy".into(),
             description: String::new(),
             input_schema: json!({}),
-            handler: ToolHandler::Builtin { name: "noop".into() },
+            handler: ToolHandler::Builtin {
+                name: "noop".into(),
+            },
             elicit: Some(ElicitSpec {
                 message: "需要部署目标".into(),
                 requested_schema: json!({
@@ -3088,13 +3660,32 @@ mod tests {
             roots_asked: false,
             root: None,
         };
-        let merged = maybe_elicit(&mut session, &tool, &json!({ "target": "old", "keep": true }))
-            .expect("accept 应当成功");
-        assert_eq!(merged.get("target").and_then(Value::as_str), Some("prod"), "用户填的覆盖原参数");
-        assert_eq!(merged.get("keep").and_then(Value::as_bool), Some(true), "没冲突的原参数保留");
-        assert_eq!(merged.get("extra").and_then(Value::as_u64), Some(1), "用户新填的键并进来");
+        let merged = maybe_elicit(
+            &mut session,
+            &tool,
+            &json!({ "target": "old", "keep": true }),
+        )
+        .expect("accept 应当成功");
+        assert_eq!(
+            merged.get("target").and_then(Value::as_str),
+            Some("prod"),
+            "用户填的覆盖原参数"
+        );
+        assert_eq!(
+            merged.get("keep").and_then(Value::as_bool),
+            Some(true),
+            "没冲突的原参数保留"
+        );
+        assert_eq!(
+            merged.get("extra").and_then(Value::as_u64),
+            Some(1),
+            "用户新填的键并进来"
+        );
         let sent = String::from_utf8(output).unwrap();
-        assert!(sent.contains("\"method\":\"elicitation/create\""), "实际发出：{sent}");
+        assert!(
+            sent.contains("\"method\":\"elicitation/create\""),
+            "实际发出：{sent}"
+        );
         assert!(sent.contains("需要部署目标"), "message 要原样带给客户端");
 
         // ② decline ⇒ Err（工具不执行）
@@ -3109,10 +3700,16 @@ mod tests {
             roots_asked: false,
             root: None,
         };
-        assert!(maybe_elicit(&mut session, &tool, &json!({})).is_err(), "用户拒绝 ⇒ 工具不执行");
+        assert!(
+            maybe_elicit(&mut session, &tool, &json!({})).is_err(),
+            "用户拒绝 ⇒ 工具不执行"
+        );
 
         // ③ 没声明 elicit 的工具：原样返回，且**不发任何请求**
-        let plain = ToolDef { elicit: None, ..tool };
+        let plain = ToolDef {
+            elicit: None,
+            ..tool
+        };
         let mut input = std::io::Cursor::new(Vec::new());
         let mut output: Vec<u8> = Vec::new();
         let mut session = Session {
@@ -3165,10 +3762,16 @@ mod tests {
             "取首个 root"
         );
         // 再问一次：不再发请求（缓存），返回值不变
-        assert_eq!(session.workspace_root(), Some(PathBuf::from("D:/work/first")));
+        assert_eq!(
+            session.workspace_root(),
+            Some(PathBuf::from("D:/work/first"))
+        );
         // 到这里 `session` 不再使用 ⇒ 对 `output` 的借用结束，可以读回它
         let sent = String::from_utf8(output).unwrap();
-        assert!(sent.contains("\"method\":\"roots/list\""), "实际发出：{sent}");
+        assert!(
+            sent.contains("\"method\":\"roots/list\""),
+            "实际发出：{sent}"
+        );
         assert_eq!(
             sent.matches("\"method\":\"roots/list\"").count(),
             1,
@@ -3176,9 +3779,218 @@ mod tests {
         );
 
         // ③ `file:///` 解析边界
-        assert_eq!(file_uri_to_path("file:///C:/x"), Some(PathBuf::from("C:/x")));
+        assert_eq!(
+            file_uri_to_path("file:///C:/x"),
+            Some(PathBuf::from("C:/x"))
+        );
         assert_eq!(file_uri_to_path("file:///"), None, "空路径不是有效 root");
-        assert_eq!(file_uri_to_path("https://example.com"), None, "非 file: 一律拒");
+        assert_eq!(
+            file_uri_to_path("https://example.com"),
+            None,
+            "非 file: 一律拒"
+        );
+    }
+
+    // ── 记忆页（§待办 3-24 分片 1–2，2026-10-31）──────────────────
+
+    /// 目录夹具：每次一个新临时目录（并行安全，绝不碰真实 `ModuleData`）。
+    fn page_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-mcp-page-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 页名形状：合法值原样返回；非法值报错并给出建议 slug（不静默改写）。
+    #[test]
+    fn memory_page_name_is_validated_with_a_suggestion() {
+        assert_eq!(parse_memory_page(None).unwrap(), None);
+        assert_eq!(parse_memory_page(Some("   ")).unwrap(), None);
+        assert_eq!(
+            parse_memory_page(Some("build")).unwrap(),
+            Some("build".into())
+        );
+        assert_eq!(
+            parse_memory_page(Some(" env-2_x ")).unwrap(),
+            Some("env-2_x".into())
+        );
+
+        for bad in ["../etc", "Build", "有中文", "-lead", "a/b", &"x".repeat(33)] {
+            let err = parse_memory_page(Some(bad)).expect_err("非法页名必须拒");
+            assert!(err.contains("记忆页名不合法"), "{bad} → {err}");
+        }
+        // 建议值：大写 / 空格 / 中文都被折成 `-`（提示用，不自动采用）
+        let err = parse_memory_page(Some("Build Env")).unwrap_err();
+        assert!(err.contains("build-env"), "建议值应在错误里：{err}");
+    }
+
+    /// 写页只落 `pages\<page>.md`，默认页一个字节都不动。
+    #[test]
+    fn memory_page_write_keeps_the_default_file_untouched() {
+        let dir = page_test_dir("write");
+        let file = dir.join("MEMORY.md");
+        write_memory_at(
+            &file,
+            "默认页的事实",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&file).unwrap();
+
+        let page_file = page_path_in(&dir, Some("build"));
+        write_memory_at(
+            &page_file,
+            "构建要跑 tsc",
+            false,
+            tagged(MemoryScope::Global, TEST_DATE),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            before,
+            "默认页不得被页写入改动"
+        );
+        assert!(page_file.exists(), "页文件应落在 pages\\<page>.md");
+        assert!(page_file.ends_with(PathBuf::from("pages").join("build.md")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 读取：默认页在前，各页按名字序在后，每页一行 `## <page>` 头。
+    /// 没有任何页时**逐字节等于旧行为**（这条是兼容性的硬断言）。
+    #[test]
+    fn memory_read_concatenates_pages_in_name_order() {
+        let dir = page_test_dir("read");
+        let empty = read_memory_in_dir(&dir).unwrap();
+        assert_eq!(empty, "", "空目录 = 空串（旧行为）");
+
+        let file = dir.join("MEMORY.md");
+        write_memory_at(&file, "默认页的事实\n", false, None).unwrap();
+        let default_only = read_memory_in_dir(&dir).unwrap();
+        assert_eq!(
+            default_only,
+            fs::read_to_string(&file).unwrap(),
+            "无页时逐字节等于文件本身"
+        );
+
+        write_memory_at(&page_path_in(&dir, Some("zeta")), "Z 页", false, None).unwrap();
+        write_memory_at(&page_path_in(&dir, Some("alpha")), "A 页", false, None).unwrap();
+        let text = read_memory_in_dir(&dir).unwrap();
+        let alpha = text.find("## alpha").expect("应有 alpha 页头");
+        let zeta = text.find("## zeta").expect("应有 zeta 页头");
+        assert!(alpha < zeta, "页按名字序：{text}");
+        assert!(text.starts_with('-'), "默认页在最前：{text}");
+        assert!(text.contains("## alpha\n- A 页"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 互链（分片 3）：页内 `[[page]]` 在注入时展开成一行 `→ refs:` 索引；
+    /// **只列真实存在的页**，且**不递归**（被引用的页不会因为别人引它而多出索引）。
+    #[test]
+    fn page_references_are_listed_after_the_body_without_recursion() {
+        let dir = page_test_dir("refs");
+        write_memory_at(
+            &page_path_in(&dir, Some("alpha")),
+            "详见 [[beta]] 与 [[missing]] 两处",
+            false,
+            None,
+        )
+        .unwrap();
+        write_memory_at(&page_path_in(&dir, Some("beta")), "B 页内容", false, None).unwrap();
+
+        let text = read_memory_in_dir(&dir).unwrap();
+        assert!(
+            text.contains("## alpha\n- 详见 [[beta]] 与 [[missing]] 两处\n→ refs: beta\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("refs: beta, missing"),
+            "不存在的页不进索引：{text}"
+        );
+        assert!(
+            !text.contains("## beta\n- B 页内容\n→ refs:"),
+            "不递归：beta 没引用别人，就不该有索引行：{text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 引用提取：去重、保序、最多 8 个；非法页名（大写 / 中文）不算引用。
+    #[test]
+    fn page_refs_are_deduped_bounded_and_validated() {
+        let mut body = String::from("[[a]] [[a]] [[Bad]] [[中文]]");
+        for i in 0..10 {
+            body.push_str(&format!(" [[r{i}]]"));
+        }
+        let refs = page_refs(&body);
+        assert_eq!(refs.first().map(String::as_str), Some("a"), "{refs:?}");
+        assert_eq!(refs.iter().filter(|r| *r == "a").count(), 1, "{refs:?}");
+        assert_eq!(refs.len(), 8, "上限 8：{refs:?}");
+        assert!(!refs.iter().any(|r| r == "Bad" || r == "中文"), "{refs:?}");
+    }
+
+    /// 页多了也要有硬顶：拼到 9000 就停，并留一行「N more pages omitted」（不静默丢）。
+    #[test]
+    fn memory_read_stops_at_the_total_hard_cap_and_says_so() {
+        let dir = page_test_dir("cap");
+        // 每页写满（单条上限内），6 页 ≈ 11.4k 字符 ⇒ 必然越过 9000 的总长硬顶。
+        for i in 0..6 {
+            let page = format!("p{i}");
+            write_memory_at(
+                &page_path_in(&dir, Some(&page)),
+                &"x".repeat(1_900),
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        let text = read_memory_in_dir(&dir).unwrap();
+        assert!(
+            text.contains("more memory page(s) omitted"),
+            "超出硬顶必须显式说明，而不是静默丢掉：{text}"
+        );
+        // 去掉那一行提示后，正文本身不超过硬顶（提示行是给模型看的，不占预算）。
+        let body: usize = text
+            .lines()
+            .filter(|l| !l.starts_with('['))
+            .map(|l| l.chars().count() + 1)
+            .sum();
+        assert!(
+            body <= MEMORY_TOTAL_HARD_CAP_CHARS,
+            "拼接正文 {body} 超过硬顶"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 清空：默认页截断为空 + 页文件全删（不留半份）。
+    #[test]
+    fn memory_clear_removes_default_and_pages() {
+        let dir = page_test_dir("clear");
+        let file = dir.join("MEMORY.md");
+        write_memory_at(&file, "默认页的事实", false, None).unwrap();
+        write_memory_at(
+            &page_path_in(&dir, Some("build")),
+            "页里的事实",
+            false,
+            None,
+        )
+        .unwrap();
+
+        clear_memory_in_dir(&dir).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "", "默认页应被截断");
+        assert!(
+            !page_path_in(&dir, Some("build")).exists(),
+            "页文件应被删除"
+        );
+        assert!(list_pages_in(&dir).unwrap().is_empty());
+        // 幂等：再清一次不报错
+        clear_memory_in_dir(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }
-

@@ -1,0 +1,32 @@
+// ignore
+import { VideoDetail } from './core/core/uzVideo.js';
+// ignore
+async function searchVideo(args) {
+  return JSON.stringify({ data: [] });
+}
+
+async function getClassList() {
+  return JSON.stringify({ class: [{ type_id: 'hot', type_name: '热门' }] });
+}
+
+async function getVideoList(args) {
+  const data = [];
+  for (let i = 1; i <= 40; i++) {
+    data.push({ vod_id: 'u-' + i, vod_name: '更新作品 ' + i, vod_pic: '', type_name: '动画' });
+  }
+  return JSON.stringify({ data });
+}
+
+async function getVideoDetail(args) {
+  return JSON.stringify({
+    data: {
+      vod_name: '星海 动画',
+      vod_play_from: '线路1',
+      vod_play_url: '第1集$http://localhost:8123/test/fixtures/video.m3u8',
+    },
+  });
+}
+
+async function getVideoPlayUrl(args) {
+  return JSON.stringify({ urls: [{ name: '高清', url: args.url }] });
+}

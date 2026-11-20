@@ -87,8 +87,8 @@ pub enum Kind {
 impl Kind {
     fn for_ext(ext: &str) -> Kind {
         match ext {
-            "doc" | "docx" | "pdf" | "txt" | "md" | "rtf" | "odt" | "xls" | "xlsx" | "csv" | "ppt"
-            | "pptx" | "odp" | "ods" | "epub" | "json" | "xml" | "yaml" | "yml" | "log" => {
+            "doc" | "docx" | "pdf" | "txt" | "md" | "rtf" | "odt" | "xls" | "xlsx" | "csv"
+            | "ppt" | "pptx" | "odp" | "ods" | "epub" | "json" | "xml" | "yaml" | "yml" | "log" => {
                 Kind::Document
             }
             "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff"
@@ -200,7 +200,9 @@ fn state() -> &'static RwLock<IndexState> {
 
 /// 缓存文件：<exe 根>\temp\file-index-cache.json（与 app-index-cache.json 同目录）。
 pub fn cache_path() -> PathBuf {
-    crate::storage::lunac_root_dir().join("temp").join("file-index-cache.json")
+    crate::storage::lunac_root_dir()
+        .join("temp")
+        .join("file-index-cache.json")
 }
 
 // ── 启动与刷新 ───────────────────────────────────────────────────
@@ -251,7 +253,10 @@ fn load_cache() {
         }
         Ok(other) => {
             // 版本不符：当作没有索引，等重扫覆盖（不在这里删文件）
-            crate::log::info(format!("文件索引版本不符（{}≠{INDEX_VERSION}），将重建", other.version));
+            crate::log::info(format!(
+                "文件索引版本不符（{}≠{INDEX_VERSION}），将重建",
+                other.version
+            ));
         }
         Err(e) => crate::log::warn(format!("文件索引解析失败: {e}")),
     }
@@ -332,7 +337,10 @@ fn scan_and_save() {
     let count = files.len();
     let dir_count = dir_table.len();
     let saved_ms = now_ms();
-    let root_strings: Vec<String> = roots.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let root_strings: Vec<String> = roots
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     let payload = PersistedIndex {
         version: INDEX_VERSION,
         saved_ms,
@@ -362,7 +370,11 @@ fn scan_and_save() {
     crate::log::info(format!(
         "文件索引已重建: {count} 条 / {dir_count} 个目录 / 根 {} 个{}{elapsed}ms",
         roots.len(),
-        if truncated { "（已达上限，索引不完整）" } else { "，耗时 " }
+        if truncated {
+            "（已达上限，索引不完整）"
+        } else {
+            "，耗时 "
+        }
     ));
     crate::log::info(format!(
         "文件索引各根累计: {}",
@@ -618,9 +630,10 @@ fn rank(
         let q_all = &tokens_l[0];
         // 拼音只在「单 token + 纯 ASCII + 长度合理」时试 —— 多词/带标点的查询
         // 走拼音没有意义，徒增开销。
-        let allow_pinyin =
-            single && q_all.len() >= 2 && q_all.len() <= FUZZY_MAX_QUERY_LEN
-                && q_all.chars().all(|c| c.is_ascii_alphanumeric());
+        let allow_pinyin = single
+            && q_all.len() >= 2
+            && q_all.len() <= FUZZY_MAX_QUERY_LEN
+            && q_all.chars().all(|c| c.is_ascii_alphanumeric());
         let mut pinyin_budget = PINYIN_SCAN_CAP;
         for (i, e) in entries.iter().enumerate() {
             if seen.contains(&i) {
@@ -646,7 +659,11 @@ fn rank(
                         }
                     }
                 }
-                if ok { Some(total / tokens_l.len() as i32) } else { None }
+                if ok {
+                    Some(total / tokens_l.len() as i32)
+                } else {
+                    None
+                }
             };
             if score.is_none() && allow_pinyin && pinyin_budget > 0 {
                 pinyin_budget -= 1;
@@ -673,7 +690,11 @@ fn rank(
                 name: e.name.clone(),
                 path: join_path(dir, &e.name),
                 kind: e.kind.as_str().to_string(),
-                ext: if e.kind == Kind::Folder { String::new() } else { extension_of(&e.name) },
+                ext: if e.kind == Kind::Folder {
+                    String::new()
+                } else {
+                    extension_of(&e.name)
+                },
                 modified: e.modified,
             }
         })
@@ -694,7 +715,9 @@ fn join_path(dir: &str, name: &str) -> String {
 /// 搜索（只读内存索引，永不同步扫盘）。
 pub fn search(query: &str, kind: Option<&str>, limit: usize) -> Vec<FileHit> {
     let limit = clamp_limit(limit);
-    let Ok(st) = state().read() else { return Vec::new() };
+    let Ok(st) = state().read() else {
+        return Vec::new();
+    };
     if !st.loaded {
         return Vec::new();
     }
@@ -744,7 +767,10 @@ mod tests {
     fn rank_names(entries: &[(String, FileEntry)], query: &str, kind: Option<&str>) -> Vec<String> {
         let dirs: Vec<String> = vec![r"C:\a".to_string()];
         let files: Vec<FileEntry> = entries.iter().map(|(_, e)| e.clone()).collect();
-        rank(&dirs, &files, query, kind, 10).into_iter().map(|h| h.name).collect()
+        rank(&dirs, &files, query, kind, 10)
+            .into_iter()
+            .map(|h| h.name)
+            .collect()
     }
 
     #[test]
@@ -798,8 +824,15 @@ mod tests {
             hit("季度报告.xlsx", Kind::Document, 5),
             hit("季度报告.png", Kind::Image, 9),
         ];
-        assert_eq!(rank_names(&entries, "季度 报告", Some("document")), vec!["季度报告.xlsx"]);
-        assert_eq!(rank_names(&entries, "报告 季度", None).len(), 2, "多词顺序无关");
+        assert_eq!(
+            rank_names(&entries, "季度 报告", Some("document")),
+            vec!["季度报告.xlsx"]
+        );
+        assert_eq!(
+            rank_names(&entries, "报告 季度", None).len(),
+            2,
+            "多词顺序无关"
+        );
     }
 
     /// 空查询 = 最近文件（按修改时间倒序）
@@ -810,7 +843,11 @@ mod tests {
             hit("new.txt", Kind::Document, 900),
         ];
         assert_eq!(rank_names(&entries, "", None), vec!["new.txt", "old.txt"]);
-        assert_eq!(rank_names(&entries, "   ", None).len(), 2, "纯空白等同空查询");
+        assert_eq!(
+            rank_names(&entries, "   ", None).len(),
+            2,
+            "纯空白等同空查询"
+        );
     }
 
     /// 路径由「目录表 + 文件名」拼回，且只在返回命中项时才算
@@ -837,7 +874,10 @@ mod tests {
         let dirs = vec![r"C:\a".to_string()];
         let files: Vec<FileEntry> = entries.iter().map(|(_, e)| e.clone()).collect();
         assert_eq!(rank(&dirs, &files, "f", None, 8).len(), 8);
-        assert!(rank(&dirs, &files, "f", None, 0).is_empty(), "rank 本身不管夹取");
+        assert!(
+            rank(&dirs, &files, "f", None, 0).is_empty(),
+            "rank 本身不管夹取"
+        );
         // 夹取（search 用）至少给 1、最多 MAX_RESULTS
         assert_eq!(clamp_limit(0), 1);
         assert_eq!(clamp_limit(usize::MAX), MAX_RESULTS);
@@ -847,12 +887,24 @@ mod tests {
     /// 子序列打分：顺序命中即算，顺序不对/字符缺失不命中；且**永远低于「包含」档（500）**
     #[test]
     fn subsequence_matching_is_a_fallback_tier() {
-        assert!(score_subsequence("最近记录列表.docx", "zjl").is_none(), "中文名不吃 ASCII 子序列");
-        assert!(score_subsequence("recent-journal-list.md", "zjl").is_none(), "没有 z 就不该命中");
+        assert!(
+            score_subsequence("最近记录列表.docx", "zjl").is_none(),
+            "中文名不吃 ASCII 子序列"
+        );
+        assert!(
+            score_subsequence("recent-journal-list.md", "zjl").is_none(),
+            "没有 z 就不该命中"
+        );
         let s = score_subsequence("Zebra Journal List.md", "zjl").expect("z-j-l 按顺序出现");
-        assert!((100..200).contains(&s), "子序列必须落在包含档之下，实测 {s}");
+        assert!(
+            (100..200).contains(&s),
+            "子序列必须落在包含档之下，实测 {s}"
+        );
         assert!(s < 500, "模糊命中不得盖过包含命中");
-        assert!(score_subsequence("abc", "").is_none(), "空查询不算子序列命中");
+        assert!(
+            score_subsequence("abc", "").is_none(),
+            "空查询不算子序列命中"
+        );
     }
 
     /// 拼音兜底：全拼（weixin）与首字母（wx）都能命中含汉字的文件名，全拼更确定
@@ -862,7 +914,10 @@ mod tests {
         let initial = score_pinyin("微信截图.png", "wx").expect("首字母应命中");
         assert!(full > initial, "全拼比首字母更确定：{full} vs {initial}");
         assert!(full < 500, "拼音是兜底档，不得盖过包含命中");
-        assert!(score_pinyin("report.docx", "weixin").is_none(), "无汉字不产生拼音命中");
+        assert!(
+            score_pinyin("report.docx", "weixin").is_none(),
+            "无汉字不产生拼音命中"
+        );
     }
 
     /// 第一轮没凑够才跑兜底：精确/前缀/包含优先，模糊只补空缺
@@ -875,7 +930,10 @@ mod tests {
         // "report" 有精确命中；另一条既不含 report、也不是 report 的子序列 → 只出一条
         assert_eq!(rank_names(&entries, "report", None), vec!["report.docx"]);
         // "rjl" 第一轮零命中 → 走子序列兜底，命中 recent-journal-list
-        assert_eq!(rank_names(&entries, "rjl", None), vec!["recent-journal-list.md"]);
+        assert_eq!(
+            rank_names(&entries, "rjl", None),
+            vec!["recent-journal-list.md"]
+        );
         // 兜底轮跑完后，精确命中的那条仍排在模糊命中的前面
         let both = vec![
             hit("rjl-report.docx", Kind::Document, 1),
@@ -915,7 +973,11 @@ mod tests {
             started.elapsed().map(|d| d.as_millis()).unwrap_or(0),
             st.truncated
         );
-        assert!(st.count > 50, "扫出 {} 条，太少了，像是根目录没解析成功", st.count);
+        assert!(
+            st.count > 50,
+            "扫出 {} 条，太少了，像是根目录没解析成功",
+            st.count
+        );
         let text = fs::read_to_string(cache_path()).expect("索引文件应已落盘");
         let back: PersistedIndex = serde_json::from_str(&text).expect("落盘 JSON 必须能读回");
         assert_eq!(back.files.len(), st.count);
@@ -923,7 +985,10 @@ mod tests {
         println!("cache bytes = {}", text.len());
         // 搜索路径只读内存索引
         let hits = search("a", None, 5);
-        assert!(hits.iter().all(|h| !h.path.is_empty()), "命中项必须带回完整路径");
+        assert!(
+            hits.iter().all(|h| !h.path.is_empty()),
+            "命中项必须带回完整路径"
+        );
         // 空查询 = 最近文件，按修改时间倒序
         let recent = search("", None, 5);
         assert!(recent.windows(2).all(|w| w[0].modified >= w[1].modified));

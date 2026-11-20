@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
   "productName": "Lunac",
-  "version": "0.9.38",
+  "version": "0.9.45",
   "identifier": "com.lunac.app",
   "build": {
     "frontendDist": "../dist",
@@ -32,7 +32,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://asset.localhost https://asset.localhost; img-src 'self' data: https: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' http://asset.localhost https://asset.localhost",
+      "csp": "default-src 'self' http://asset.localhost https://asset.localhost; img-src 'self' data: https: http://asset.localhost https://asset.localhost http://lunac-media.localhost https://lunac-media.localhost; media-src 'self' http://lunac-media.localhost https://lunac-media.localhost; connect-src 'self' http://asset.localhost https://asset.localhost http://lunac-media.localhost https://lunac-media.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' http://asset.localhost https://asset.localhost; frame-src 'self' http://lunac-plugin.localhost https://lunac-plugin.localhost",
       "assetProtocol": {
         "enable": true,
         "scope": ["**"]
@@ -47,6 +47,7 @@
     ],
     "resources": {
       "../../core-agent/target/release/agent.exe": "agent.exe",
+      "../media-proxy/target/release/lunac-media-proxy.exe": "lunac-media-proxy.exe",
       "themes": "themes"
     },
     "windows": {

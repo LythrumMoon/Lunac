@@ -4,11 +4,13 @@
 // agent.exe（自研 core-agent，见 docs/ai-spec.md §3.5）是 Agent 后端，
 // 可选、按需经 start_cli 拉起。
 
-use crate::AppState;
-use crate::proxy_server;
 use crate::cli_bridge;
-use crate::windows_ocr;
 use crate::paddle_ocr;
+use crate::pinyin_bridge;
+use crate::proxy_server;
+use crate::voice_input;
+use crate::windows_ocr;
+use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{BufRead, BufReader, Read};
@@ -69,7 +71,7 @@ pub struct CliOutput {
 // ── Path helpers ──────────────────────────────────────────────────
 
 /// 自研 agent 后端二进制名（core-agent 的 cargo 产物）。
-const AGENT_EXE: &str = "agent.exe";
+pub(crate) const AGENT_EXE: &str = "agent.exe";
 
 /// Returns the directory containing the compiled agent binary (`agent.exe`).
 /// Priority:
@@ -78,7 +80,7 @@ const AGENT_EXE: &str = "agent.exe";
 ///   2. exe_dir/            — 便携版 / NSIS 安装根（agent.exe 与 lunac.exe 同目录）
 ///   3. dev: <repo>/core-agent/target/{release,debug}  — cargo 产物
 ///   4. dev: <repo>/core    — 兜底（历史 agent.exe 所在目录）
-fn core_dir() -> std::path::PathBuf {
+pub(crate) fn core_dir() -> std::path::PathBuf {
     let exe_dir = std::env::current_exe()
         .unwrap()
         .parent()
@@ -152,7 +154,6 @@ fn core_dir() -> std::path::PathBuf {
 // 「有的绑了、有的没绑」，而没绑的那种是**静默**的（只在宿主崩溃时才现形，
 // 正是本仓最怕的一类）。详见 `child_job.rs` 的模块头。
 
-
 // ── Agent HTTP bridge (VSCode extension) ─────────────────────────
 // Same logic as start_cli but without Tauri AppHandle/State dependencies.
 // Called by agent_server.rs via POST /agent/start.
@@ -175,7 +176,11 @@ pub fn start_agent_http() -> Result<String, String> {
     }
 
     // Ripgrep vendor path
-    let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
+    let rg_dir = dir
+        .join("utils")
+        .join("vendor")
+        .join("ripgrep")
+        .join("x64-win32");
     if rg_dir.join("rg.exe").exists() {
         let rg_str = rg_dir.display().to_string();
         let old_path = env::var("PATH").unwrap_or_default();
@@ -189,16 +194,19 @@ pub fn start_agent_http() -> Result<String, String> {
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--verbose".into(),
-        "--input-format".into(), "stream-json".into(),
-        "--output-format".into(), "stream-json".into(),
+        "--input-format".into(),
+        "stream-json".into(),
+        "--output-format".into(),
+        "stream-json".into(),
         "--include-partial-messages".into(),
-        "--permission-prompt-tool".into(), "stdio".into(),
+        "--permission-prompt-tool".into(),
+        "stdio".into(),
     ];
 
     // MCP bridge
     {
-        let lunac_exe = std::env::current_exe()
-            .unwrap_or_else(|_| std::path::PathBuf::from("lunac.exe"));
+        let lunac_exe =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("lunac.exe"));
         args.push("--mcp-server".into());
         args.push(format!("stdio:{}", lunac_exe.display()));
     }
@@ -206,7 +214,9 @@ pub fn start_agent_http() -> Result<String, String> {
     args.push(".".into());
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let mut child = spawn_child(&agent_path, &args_refs, &dir, &[])?;
+    // VSCode HTTP 桥的 spawn 同样给 `LUNAC_CRON_DIR`（与常驻路径同一个注入值）。
+    let cron_env = [cron_dir_env(), tasks_dir_env()];
+    let mut child = spawn_child(&agent_path, &args_refs, &dir, &cron_env)?;
 
     let stdin = child.stdin.take();
     if let Some(stdin) = stdin {
@@ -247,7 +257,7 @@ pub fn start_agent_http() -> Result<String, String> {
     Ok("Agent started".into())
 }
 
-fn spawn_child(
+pub(crate) fn spawn_child(
     program: &str,
     args: &[&str],
     cwd: &std::path::Path,
@@ -266,7 +276,9 @@ fn spawn_child(
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", program, e))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn {}: {}", program, e))?;
         // 绑定生命周期：lunac 退出（含崩溃/强杀）→ 子进程必死（见 child_job.rs）
         crate::child_job::assign(&child);
         Ok(child)
@@ -313,16 +325,11 @@ fn tool_blacklist_args(custom: &[String]) -> Vec<String> {
     args
 }
 
-
 /// Security profiles map to CLI permission modes + directory scoping.
 /// - "safe":  read-only, no writes anywhere (plan mode)
 /// - "project": auto-approve edits in project dir (acceptEdits + --add-dir)
 /// - "full":   bypass all permission checks (dangerous, admin only)
-fn cli_args_for_profile<'a>(
-    profile: &str,
-    cwd: &'a std::path::Path,
-    args: &'a mut Vec<String>,
-) {
+fn cli_args_for_profile<'a>(profile: &str, cwd: &'a std::path::Path, args: &'a mut Vec<String>) {
     match profile {
         "safe" => {
             args.push("--permission-mode".into());
@@ -334,13 +341,197 @@ fn cli_args_for_profile<'a>(
             args.push("--add-dir".into());
             args.push(cwd.display().to_string());
         }
-        _ => { // "project" (default)
+        _ => {
+            // "project" (default)
             args.push("--permission-mode".into());
             args.push("acceptEdits".into());
             args.push("--add-dir".into());
             args.push(cwd.display().to_string());
         }
     }
+}
+
+/// `LUNAC_CRON_DIR` 的注入值（**唯一构造点**）：路径来自 `storage::cron_dir()`，
+/// 这里只负责确保目录存在。常驻 agent（`agent_envs`）与 VSCode HTTP 桥的 spawn 共用。
+fn cron_dir_env() -> (&'static str, String) {
+    let dir = match crate::storage::ensure_cron_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            crate::log::warn(format!("创建定时任务目录失败: {e}"));
+            crate::storage::cron_dir()
+        }
+    };
+    ("LUNAC_CRON_DIR", dir.to_string_lossy().to_string())
+}
+
+/// `LUNAC_TASKS_DIR` 的注入值（2026-10-22，S2 通用任务队列）。
+///
+/// 与 `LUNAC_CRON_DIR` **同一个目录**（`ModuleData\tasks`），只是变量名分开：
+/// agent 侧 `TaskEnqueue` / `TaskList` / `TaskCancel` 只认这个变量，不猜路径。
+fn tasks_dir_env() -> (&'static str, String) {
+    let (_, dir) = cron_dir_env();
+    ("LUNAC_TASKS_DIR", dir)
+}
+
+/// **agent.exe 的 spawn 环境变量 —— 唯一真相源**（2026-10-17 阶段 0 抽出）。
+///
+/// 常驻 agent（`start_cli_process`）与 cron 手动单发（`cron_run_now`）必须拿到**同一套**
+/// env：工作区锁 / 读禁目录 / 技能 / 插件 / 本地模型 / 日志 / 搜索 / 思考 / hooks /
+/// persona / MCP / 定时任务目录。此前这段拼装内嵌在 `start_cli_process` 里，cron 若另抄
+/// 一份就会随时间漂移（`docs/forbidden.md` §禁用 62）。
+///
+/// 返回值用 `Vec<(&'static str, String)>`：键全是字面量，值随运行期状态变化。
+pub(crate) fn agent_envs(state: &AppState) -> Vec<(&'static str, String)> {
+    // Workspace lock: when a workspace is configured, the CLI must deny
+    // access outside it (filesystem.ts reads this env var).
+    let mut envs: Vec<(&'static str, String)> = Vec::new();
+    if workspace_is_locked(state) {
+        envs.push(("LUNAC_WORKSPACE_LOCKED", "1".into()));
+    }
+    // 桌宠模型目录读禁（②1，2026-10-13）：把桌宠**当前模型目录**作为 agent 的读禁目录注入，
+    // 让 Read / Glob / Grep 拒读该目录。**只拦读、写不管**，且**独立于工作区锁**
+    //（未配工作区也拦）。空则不注入（= 不设闸）。⚠️ 策略级路径闸，**不是沙箱**：
+    // shell（Cmd / PowerShell）仍能读到、符号链接 / junction 也可绕过（前端/agent 注释同此口径）。
+    // **改后需重启 agent 才生效**（env 只在 spawn 时注入）。
+    {
+        let dir = state
+            .pet_model_dir
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            envs.push(("LUNAC_DENY_READ_DIRS", dir.to_string()));
+        }
+    }
+    // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
+    // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
+    envs.push((
+        "LUNAC_SKILLS_DIR",
+        lunac_skills_dir().to_string_lossy().to_string(),
+    ));
+    // 插件目录（<exe 根>\Modules）→ agent.exe（2026-09-28）：agent 靠它
+    //   ① 把 Modules 加进可访问目录（工作区锁生效时也写得进去，见 core-agent tools.rs 的 guard）；
+    //   ② 在环境块里告诉模型「插件放这儿、规范在同目录的 README.md」。
+    // 于是「让 Lunac 自己做一个插件」不需要 dev 版、也不需要开发者环境 —— 就是写几个文件。
+    envs.push((
+        "LUNAC_MODULES_DIR",
+        crate::plugin_market::plugins_dir()
+            .to_string_lossy()
+            .to_string(),
+    ));
+    // 定时任务目录（<exe 根>\ModuleData\tasks，2026-10-17 阶段 0）→ agent.exe：
+    // `CronList` 只认这个变量（不猜路径）；agent 侧同时把它并进 `Ctx.add_dirs`，
+    // 工作区锁生效时也读得到。路径的唯一真相源是 `storage::cron_dir()`。
+    envs.push(cron_dir_env());
+    // 通用任务队列目录（2026-10-22，S2）：与 cron 同一个 `tasks\` 目录，变量名独立。
+    envs.push(tasks_dir_env());
+    // 本地决策模型（S1 形态 B，2026-10-09）：**装了 `local-model` 插件才注入**端点。
+    // 走 `envs`（spawn 作用域）而不是 `configure_agent_env` 的 `set_var` —— 后者的语义是
+    // 「进程全局的凭据」，而这条**随插件装 / 卸而变化**：不注入（= 不在 envs 里）就等于
+    // 告诉 agent「本机没有本地决策模型」，它会退回桩后端 / fail-open。
+    if let Some((url, slots)) = local_model_env() {
+        // 落一行 —— 这条**随插件装 / 卸而变**，排障时要能一眼看到「这次到底喂没喂给 agent」。
+        crate::log::info(format!("本地决策模型端点 → agent: {url}（{slots} 槽）"));
+        envs.push(("LUNAC_LOCAL_MODEL_URL", url));
+        // 并发槽数只在 >1 时注入（= 插件清单写了 `-np 2`）：单槽 / 老插件不新增变量，
+        // agent 侧 `channel_slots()` 缺省就是 1 ⇒ 行为与改造前逐字节一致。
+        if slots > 1 {
+            envs.push(("LUNAC_LOCAL_MODEL_SLOTS", slots.to_string()));
+        }
+        // **一个开关管到底**（2026-10-24，§待办 3-15）：以前这里只下发端点，`LUNAC_LOCAL_DECIDE`
+        // 只能靠用户手工设环境变量 ⇒ 界面显示「模型已就绪」但 agent 侧 `decide=0`、零判定行。
+        // 现在开关打开（且 `decide` 未被排障关掉）就一并下发，两者不再能各说各话。
+        if crate::storage::load_local_model_config().decide {
+            envs.push(("LUNAC_LOCAL_DECIDE", "1".to_string()));
+        } else {
+            // 排障档：只探活、不决策。必须留下证据 —— 否则又是「看着已就绪、实际零判定」。
+            crate::log::warn(
+                "本地模型已注入端点，但 config\\local_model.json 的 decide=false ⇒ 本地决策层未开启（仅探活）",
+            );
+        }
+    }
+    // 日志目录 → agent.exe：与宿主写同一份目录（<exe 根>\temp\logs），排障只需
+    // 看一个地方。agent 没拿到该变量时会自行回退到 <agent.exe 目录>\temp\logs
+    // （见 core-agent/src/log.rs）。
+    envs.push((
+        "LUNAC_LOG_DIR",
+        crate::log::log_dir().to_string_lossy().to_string(),
+    ));
+    // WebSearch 主源（服务商 + key）→ agent.exe（core-agent 经
+    // LUNAC_SEARCH_PROVIDER / LUNAC_SEARCH_KEY 读取）；未配置时先看模型供应商是否自带
+    // 搜索 API（DeepSeek，见下面 `LUNAC_AI_PROVIDER`），最后才是无 key 的 Bing / 百度兜底。
+    if let Ok(p) = env::var("AI_SEARCH_PROVIDER") {
+        let p = p.trim();
+        if !p.is_empty() {
+            envs.push(("LUNAC_SEARCH_PROVIDER", p.to_lowercase()));
+        }
+    }
+    if let Ok(k) = env::var("AI_SEARCH_KEY") {
+        let k = k.trim();
+        if !k.is_empty() {
+            envs.push(("LUNAC_SEARCH_KEY", k.to_string()));
+        }
+    }
+    // 模型供应商名 → agent.exe（2026-11-05）：供应商自带搜索 API 时（当前 DeepSeek），
+    // agent 的 `WebSearch` 在用户**没单独配搜索服务商**时会直接用同一把模型 key 走官方
+    // 搜索（见 core-agent `tools.rs::vendor_search_target`）。这里只给「是谁」，
+    // key 仍走 `LUNAC_AGENT_TOKEN` —— 不新增第二份凭据。
+    if let Ok(p) = env::var("AI_PROVIDER") {
+        let p = p.trim();
+        if !p.is_empty() {
+            envs.push(("LUNAC_AI_PROVIDER", p.to_lowercase()));
+        }
+    }
+
+    // 思考开关 → agent.exe 环境变量（只有开 / 关两档，见 docs/ai-spec.md §3.5）。
+    // core-agent 依据 LUNAC_THINKING 决定 thinking 形态（off = disabled，其余 = 开），
+    // 并对不接受该字段的端点自动走 400 降级链，无需宿主再干预。
+    // **不再传「思考预算」** —— 实测端点不 enforce budget_tokens，传数字只会造成
+    // 「三档真的不一样」的错觉（2026-09-15 收敛两档）。
+    let thinking_mode = state
+        .thinking_mode
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "on".into());
+    envs.push((
+        "LUNAC_THINKING",
+        if thinking_mode == "off" { "off" } else { "on" }.into(),
+    ));
+
+    // 权限 hooks（A9）→ agent.exe：**无条件给路径**（文件还不存在也给）。
+    // 「文件不在 = 没配 hooks」这个判据只有 agent 一处（它按 mtime 热重载同一份文件），
+    // 于是用户在设置面板新建/改 `enabled` 都能被立刻捕获 —— 若宿主只在「文件已存在」时
+    // 才注入，用户这次开的开关就得等下次 spawn agent 才生效（一类「开了没反应」的坑）。
+    envs.push((
+        "LUNAC_HOOKS_FILE",
+        crate::storage::hooks_config_path()
+            .to_string_lossy()
+            .to_string(),
+    ));
+
+    // 用户人格 / 自定义提示词（L2）→ agent.exe：同样**无条件给路径**（文件还不存在也给）。
+    // agent 启动时读一次、拼进系统提示词的固定段；「文件不存在 ⇒ 只用内置人格」这个判据
+    // 只有 agent 一处。**它不是热重载的**：面板保存后要重启 agent 才生效（改的正是固定前缀，
+    // 热读会让前缀每轮都变、把端点侧缓存打掉 —— 见 ai-spec §11 规则 18/23）。
+    envs.push((
+        "LUNAC_PERSONA_FILE",
+        crate::storage::persona_config_path()
+            .to_string_lossy()
+            .to_string(),
+    ));
+
+    // 远端 MCP 服务器（2026-10-01）→ agent.exe：同样**无条件给路径**（文件还不存在也给）。
+    // 「文件不在 = 没配远端服务器」这个判据只有 agent 一处（core-agent/src/mcp.rs 的
+    // `load_config`）。**新增服务器要重启 agent 才生效** —— 工具表是每次请求都要发的固定
+    // 前缀，中途增删工具会把它整段打掉（与 skills 同一条纪律）。
+    envs.push((
+        "LUNAC_MCP_FILE",
+        crate::storage::mcp_config_path()
+            .to_string_lossy()
+            .to_string(),
+    ));
+    envs
 }
 
 fn start_cli_process(
@@ -352,7 +543,8 @@ fn start_cli_process(
         return Ok(()); // already running
     }
 
-    let profile = state.security_profile
+    let profile = state
+        .security_profile
         .lock()
         .map(|g| g.clone())
         .unwrap_or_else(|_| "project".into());
@@ -368,7 +560,6 @@ fn start_cli_process(
     // (instead of the default "ask" for the whole-system mode).
     // 判据与 `effective_workdir()` / `workspace_is_locked()` 共用一处（候选价格文件也
     // 必须落在同一个目录里，见 §A12 的注释）—— 两处漂移会让面板永远看不见候选价格。
-    let workspace_locked = workspace_is_locked(state);
     let workdir = effective_workdir(state);
 
     let agent_exe = core_dir.join(AGENT_EXE);
@@ -400,8 +591,8 @@ fn start_cli_process(
     // lunac.exe --mcp-server as a child process.
     // The MCP server reads user-defined tools from <exe 根>\tools\
     {
-        let lunac_exe = std::env::current_exe()
-            .unwrap_or_else(|_| std::path::PathBuf::from("lunac.exe"));
+        let lunac_exe =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("lunac.exe"));
         args.push("--mcp-server".into());
         args.push(format!("stdio:{}", lunac_exe.display()));
     }
@@ -424,109 +615,8 @@ fn start_cli_process(
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    // Workspace lock: when a workspace is configured, the CLI must deny
-    // access outside it (filesystem.ts reads this env var).
-    let mut envs: Vec<(&str, String)> = Vec::new();
-    if workspace_locked {
-        envs.push(("LUNAC_WORKSPACE_LOCKED", "1".into()));
-    }
-    // 桌宠模型目录读禁（②1，2026-10-13）：把桌宠**当前模型目录**作为 agent 的读禁目录注入，
-    // 让 Read / Glob / Grep 拒读该目录。**只拦读、写不管**，且**独立于工作区锁**
-    //（未配工作区也拦）。空则不注入（= 不设闸）。⚠️ 策略级路径闸，**不是沙箱**：
-    // shell（Cmd / PowerShell）仍能读到、符号链接 / junction 也可绕过（前端/agent 注释同此口径）。
-    // **改后需重启 agent 才生效**（env 只在 spawn 时注入）。
-    {
-        let dir = state
-            .pet_model_dir
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        let dir = dir.trim();
-        if !dir.is_empty() {
-            envs.push(("LUNAC_DENY_READ_DIRS", dir.to_string()));
-        }
-    }
-    // 已安装技能固定目录 → agent.exe（core-agent 经 LUNAC_SKILLS_DIR 扫描
-    // <dir>/<技能名>/SKILL.md），与 lunac 设置「技能扩展」管理的目录一致。
-    envs.push(("LUNAC_SKILLS_DIR", lunac_skills_dir().to_string_lossy().to_string()));
-    // 插件目录（<exe 根>\Modules）→ agent.exe（2026-09-28）：agent 靠它
-    //   ① 把 Modules 加进可访问目录（工作区锁生效时也写得进去，见 core-agent tools.rs 的 guard）；
-    //   ② 在环境块里告诉模型「插件放这儿、规范在同目录的 README.md」。
-    // 于是「让 Lunac 自己做一个插件」不需要 dev 版、也不需要开发者环境 —— 就是写几个文件。
-    envs.push((
-        "LUNAC_MODULES_DIR",
-        crate::plugin_market::plugins_dir().to_string_lossy().to_string(),
-    ));
-    // 本地决策模型（S1 形态 B，2026-10-09）：**装了 `local-model` 插件才注入**端点。
-    // 走 `envs`（spawn 作用域）而不是 `configure_agent_env` 的 `set_var` —— 后者的语义是
-    // 「进程全局的凭据」，而这条**随插件装 / 卸而变化**：不注入（= 不在 envs 里）就等于
-    // 告诉 agent「本机没有本地决策模型」，它会退回桩后端 / fail-open。
-    if let Some(url) = local_model_env() {
-        // 落一行 —— 这条**随插件装 / 卸而变**，排障时要能一眼看到「这次到底喂没喂给 agent」。
-        crate::log::info(format!("本地决策模型端点 → agent: {url}"));
-        envs.push(("LUNAC_LOCAL_MODEL_URL", url));
-    }
-    // 日志目录 → agent.exe：与宿主写同一份目录（<exe 根>\temp\logs），排障只需
-    // 看一个地方。agent 没拿到该变量时会自行回退到 <agent.exe 目录>\temp\logs
-    // （见 core-agent/src/log.rs）。
-    envs.push(("LUNAC_LOG_DIR", crate::log::log_dir().to_string_lossy().to_string()));
-    // WebSearch 主源（服务商 + key）→ agent.exe（core-agent 经
-    // LUNAC_SEARCH_PROVIDER / LUNAC_SEARCH_KEY 读取）；未配置时 agent
-    // 直接走无 key 的 Bing / 百度兜底源。
-    if let Ok(p) = env::var("AI_SEARCH_PROVIDER") {
-        let p = p.trim();
-        if !p.is_empty() {
-            envs.push(("LUNAC_SEARCH_PROVIDER", p.to_lowercase()));
-        }
-    }
-    if let Ok(k) = env::var("AI_SEARCH_KEY") {
-        let k = k.trim();
-        if !k.is_empty() {
-            envs.push(("LUNAC_SEARCH_KEY", k.to_string()));
-        }
-    }
-
-    // 思考开关 → agent.exe 环境变量（只有开 / 关两档，见 docs/ai-spec.md §3.5）。
-    // core-agent 依据 LUNAC_THINKING 决定 thinking 形态（off = disabled，其余 = 开），
-    // 并对不接受该字段的端点自动走 400 降级链，无需宿主再干预。
-    // **不再传「思考预算」** —— 实测端点不 enforce budget_tokens，传数字只会造成
-    // 「三档真的不一样」的错觉（2026-09-15 收敛两档）。
-    let thinking_mode = state
-        .thinking_mode
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| "on".into());
-    envs.push((
-        "LUNAC_THINKING",
-        if thinking_mode == "off" { "off" } else { "on" }.into(),
-    ));
-
-    // 权限 hooks（A9）→ agent.exe：**无条件给路径**（文件还不存在也给）。
-    // 「文件不在 = 没配 hooks」这个判据只有 agent 一处（它按 mtime 热重载同一份文件），
-    // 于是用户在设置面板新建/改 `enabled` 都能被立刻捕获 —— 若宿主只在「文件已存在」时
-    // 才注入，用户这次开的开关就得等下次 spawn agent 才生效（一类「开了没反应」的坑）。
-    envs.push((
-        "LUNAC_HOOKS_FILE",
-        crate::storage::hooks_config_path().to_string_lossy().to_string(),
-    ));
-
-    // 用户人格 / 自定义提示词（L2）→ agent.exe：同样**无条件给路径**（文件还不存在也给）。
-    // agent 启动时读一次、拼进系统提示词的固定段；「文件不存在 ⇒ 只用内置人格」这个判据
-    // 只有 agent 一处。**它不是热重载的**：面板保存后要重启 agent 才生效（改的正是固定前缀，
-    // 热读会让前缀每轮都变、把端点侧缓存打掉 —— 见 ai-spec §11 规则 18/23）。
-    envs.push((
-        "LUNAC_PERSONA_FILE",
-        crate::storage::persona_config_path().to_string_lossy().to_string(),
-    ));
-
-    // 远端 MCP 服务器（2026-10-01）→ agent.exe：同样**无条件给路径**（文件还不存在也给）。
-    // 「文件不在 = 没配远端服务器」这个判据只有 agent 一处（core-agent/src/mcp.rs 的
-    // `load_config`）。**新增服务器要重启 agent 才生效** —— 工具表是每次请求都要发的固定
-    // 前缀，中途增删工具会把它整段打掉（与 skills 同一条纪律）。
-    envs.push((
-        "LUNAC_MCP_FILE",
-        crate::storage::mcp_config_path().to_string_lossy().to_string(),
-    ));
+    // ── agent 环境变量（常驻 agent 与 cron 单发共用这一处，见 `agent_envs`）──
+    let envs = agent_envs(state);
 
     crate::log::info(format!(
         "agent spawn: workdir={} args=[{}]",
@@ -552,18 +642,26 @@ fn start_cli_process(
                 if let Ok(line) = line {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() && trimmed.starts_with('{') {
-                        let _ = app_clone.emit("cli-output", CliOutput { line: trimmed.clone() });
+                        let _ = app_clone.emit(
+                            "cli-output",
+                            CliOutput {
+                                line: trimmed.clone(),
+                            },
+                        );
                         // Also broadcast to HTTP SSE subscribers (VSCode extension)
                         cli_bridge::broadcast_output(trimmed);
                     }
                 }
             }
             // stdout pipe closed → CLI process exited
-            let _ = app_clone.emit("cli-status", StatusPayload {
-                state: "closed".into(),
-                message: "CLI process exited".into(),
-                instance,
-            });
+            let _ = app_clone.emit(
+                "cli-status",
+                StatusPayload {
+                    state: "closed".into(),
+                    message: "CLI process exited".into(),
+                    instance,
+                },
+            );
         });
     }
 
@@ -597,11 +695,14 @@ fn start_cli_process(
     // scanning --add-dir . Once initialized, it processes the buffered
     // message. system/init arrives later (per-query-turn) and is used
     // by the frontend for status display only — NOT for cliReady.
-    if let Err(e) = app.emit("cli-status", StatusPayload {
-        state: "stdout".into(),
-        message: "CLI stdin ready".into(),
-        instance,
-    }) {
+    if let Err(e) = app.emit(
+        "cli-status",
+        StatusPayload {
+            state: "stdout".into(),
+            message: "CLI stdin ready".into(),
+            instance,
+        },
+    ) {
         eprintln!("[start_cli] Failed to emit stdout status: {}", e);
     }
 
@@ -633,36 +734,61 @@ pub(crate) fn ai_credentials() -> Result<(String, String, String), String> {
 /// **只在插件装了才返回 `Some`** —— agent 侧 `decide::LocalHttpConfig::from_env()` 就认
 /// 「这个变量在不在」：没装 = 不注入 = agent 退回桩后端 / fail-open，**不会去连一个空地址**。
 ///
-/// 端口**从插件清单的 `sidecar.args` 里读**（`--port <n>`）：清单是端口的**唯一真相源**
-/// （`plugin_sidecar.rs` 就是按它起进程的），宿主再写一份常量迟早与它漂移。
-/// 清单读不到 / 解析不出 ⇒ 缺省 8090（与插件面板里的常量一致）。
-fn local_model_env() -> Option<String> {
+/// 端口与**并发槽数**都从插件清单的 `sidecar.args` 里读（`--port <n>` / `-np <n>`）：
+/// 清单是这两者的**唯一真相源**（`plugin_sidecar.rs` 就是按它起进程的），宿主再写一份常量
+/// 迟早与它漂移。清单读不到 / 解析不出 ⇒ 缺省 8090 / 1 槽。
+fn local_model_env() -> Option<(String, usize)> {
     // 总开关关闭 = 不下发端点 = agent 不介入本地决策（退回远端 / 桩后端）。
     if !crate::storage::load_local_model_config().enabled {
         return None;
     }
-    let manifest = crate::plugin_market::plugins_dir()
-        .join("local-model")
-        .join("lunac-plugin.json");
+    // 按能力定位（2026-10-18）：目录名不是唯一真相 —— 插件可以用 `provides: ["local-model"]`
+    // 声明自己提供这个能力；与窗口 / sidecar 共用同一个解析器。
+    let dir = crate::plugin_market::resolve_plugin_dir(
+        &crate::plugin_market::plugins_dir(),
+        "local-model",
+    )?;
+    let manifest = dir.join(crate::plugin_market::MANIFEST_FILE);
     if !manifest.is_file() {
         return None;
     }
-    let port = std::fs::read_to_string(&manifest)
+    let args = std::fs::read_to_string(&manifest)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| {
-            let args = v.get("sidecar")?.get("args")?.as_array()?.clone();
-            let i = args.iter().position(|a| a.as_str() == Some("--port"))?;
-            args.get(i + 1)?.as_str().map(str::to_string)
-        })
-        .unwrap_or_else(|| "8090".into());
-    Some(format!("http://127.0.0.1:{port}"))
+        .and_then(|v| v.get("sidecar")?.get("args")?.as_array().cloned())
+        .unwrap_or_default();
+    let port = arg_value(&args, "--port").unwrap_or_else(|| "8090".into());
+    Some((format!("http://127.0.0.1:{port}"), local_slots(&args)))
+}
+
+/// 从 `sidecar.args` 取某个「开关 + 值」形态的参数（如 `--port 8090`）。
+fn arg_value(args: &[serde_json::Value], flag: &str) -> Option<String> {
+    let i = args.iter().position(|a| a.as_str() == Some(flag))?;
+    args.get(i + 1)?.as_str().map(str::to_string)
+}
+
+/// `llama-server` 的并发槽数（`-np N` / `--parallel N` / `--parallel=N`）。
+///
+/// 只做「解析 + 非零校验」，**上限不在这里卡** —— 上限归 agent 侧 `channel_slots()`（
+/// `decide::MAX_LOCAL_SLOTS`），避免同一个阈值两处实现（`forbidden.md` §禁用 62）。
+/// 非法 / 缺省 ⇒ 1（= 改造前的单槽行为）。
+fn local_slots(args: &[serde_json::Value]) -> usize {
+    let raw = arg_value(args, "-np")
+        .or_else(|| arg_value(args, "--parallel"))
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.as_str()?.strip_prefix("--parallel=").map(str::to_string))
+        });
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
 }
 
 /// 把凭据注入自研 agent 后端（core-agent）读取的环境变量。
 /// 鉴权必须走 `authorization: Bearer`；用 `x-api-key` 会被兼容端点判 401。
-/// 另注入 WebSearch 主源的「服务商 + key」（空 = 只走无 key 的 Bing/百度兜底）。
-fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
+/// 另注入 WebSearch 主源的「服务商 + key」（空 = 先看模型供应商是否自带搜索 API，
+/// 再退回无 key 的 Bing/百度兜底）。
+pub(crate) fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
     let agent_url = agent_endpoint(api_url, env::var("AI_AGENT_URL").ok().as_deref());
     // 记一行「这次喂给 agent 的是哪把 key」（末 4 位 + 端点 + 模型）：
     // 与 `AI 配置来源=…` 那行对照，「改了 key 仍 401」不用再翻 WebView2 的 leveldb。
@@ -674,7 +800,9 @@ fn configure_agent_env(api_url: &str, api_key: &str, model: &str) {
     env::set_var("LUNAC_AGENT_TOKEN", api_key);
     env::set_var("LUNAC_AGENT_MODEL", model);
     match env::var("AI_SEARCH_PROVIDER") {
-        Ok(p) if !p.trim().is_empty() => env::set_var("LUNAC_SEARCH_PROVIDER", p.trim().to_lowercase()),
+        Ok(p) if !p.trim().is_empty() => {
+            env::set_var("LUNAC_SEARCH_PROVIDER", p.trim().to_lowercase())
+        }
         _ => env::remove_var("LUNAC_SEARCH_PROVIDER"),
     }
     match env::var("AI_SEARCH_KEY") {
@@ -725,7 +853,10 @@ fn apply_ai_config(cfg: &crate::storage::AiConfig) {
     if cfg.search_provider.trim().is_empty() {
         env::remove_var("AI_SEARCH_PROVIDER");
     } else {
-        env::set_var("AI_SEARCH_PROVIDER", cfg.search_provider.trim().to_lowercase());
+        env::set_var(
+            "AI_SEARCH_PROVIDER",
+            cfg.search_provider.trim().to_lowercase(),
+        );
     }
     if cfg.search_key.trim().is_empty() {
         env::remove_var("AI_SEARCH_KEY");
@@ -832,7 +963,11 @@ pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<Str
 
     // ripgrep：把随附目录（<core>\utils\vendor\ripgrep\x64-win32）前置进 PATH，
     // 并强制走系统 PATH 模式。
-    let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
+    let rg_dir = dir
+        .join("utils")
+        .join("vendor")
+        .join("ripgrep")
+        .join("x64-win32");
     if rg_dir.join("rg.exe").exists() {
         let rg_str = rg_dir.display().to_string();
         let old_path = env::var("PATH").unwrap_or_default();
@@ -853,18 +988,26 @@ pub async fn start_cli(app: AppHandle, state: State<'_, AppState>) -> Result<Str
     //   桌宠发的那一轮被塞进 `pendingTurns` 却永不发出（2026-10-11 用户报障）。
     //   这里补发一次 `stdout`（语义正确：复用路径下 stdin 本就已就绪）。
     let already_running = cli_bridge::is_running();
-    app.emit("cli-status", StatusPayload {
-        state: if already_running { "stdout".into() } else { "starting".into() },
-        message: if already_running {
-            "CLI stdin ready (reused running agent)".into()
-        } else {
-            format!("Mode agent, agent.exe at {}", dir.display())
+    app.emit(
+        "cli-status",
+        StatusPayload {
+            state: if already_running {
+                "stdout".into()
+            } else {
+                "starting".into()
+            },
+            message: if already_running {
+                "CLI stdin ready (reused running agent)".into()
+            } else {
+                format!("Mode agent, agent.exe at {}", dir.display())
+            },
+            // 复用路径下宿主不持有在跑进程的 instance（它由原建窗那次 spawn 分配）。
+            // 置 0 = 「不代表某一次具体 spawn」的既有语义（见 StatusPayload.instance），
+            // 前端据此不把它当作某个实例的 closed 过滤依据 —— 正是这里要的效果。
+            instance: 0,
         },
-        // 复用路径下宿主不持有在跑进程的 instance（它由原建窗那次 spawn 分配）。
-        // 置 0 = 「不代表某一次具体 spawn」的既有语义（见 StatusPayload.instance），
-        // 前端据此不把它当作某个实例的 closed 过滤依据 —— 正是这里要的效果。
-        instance: 0,
-    }).ok();
+    )
+    .ok();
 
     start_cli_process(&state, app.clone(), &dir)?;
     Ok("Agent started".into())
@@ -882,6 +1025,50 @@ pub async fn stop_cli(_state: State<'_, AppState>) -> Result<String, String> {
 pub async fn send_message(_state: State<'_, AppState>, message: String) -> Result<String, String> {
     cli_bridge::write_to_cli(&message)?;
     Ok("Message sent".into())
+}
+
+// ── 定时任务（2026-10-17 阶段 1：宿主调度 + 只读单发）──────
+//
+// 实现全部在 `cron.rs`（调度线程 / 纯函数 / 单发 runner / 状态与锁）。这里只保留 IPC 薄壳：
+//   · `cron_list`     设置面板列表（定义 + 运行态 + schedulerAlive）；
+//   · `cron_run_now`  手动触发一次（与调度器共用同一个 runner）；
+//   · `cron_set_busy` 前端在流式开始 / 结束时调用，忙则调度器记 `skipped_busy`。
+//
+// 数据契约（路径唯一真相源 = `storage::cron_dir()`）：
+//   · `cron.json`       定义，只由 agent 侧的 CronCreate / CronDelete 写；
+//   · `cron-state.json` 运行态，只由 `cron.rs` 写；
+//   · `cron.lock`       两个写者共用的跨进程锁。
+
+/// 给设置面板读的定时任务列表（含运行态与 `schedulerAlive`）。
+#[tauri::command]
+pub fn cron_list() -> Result<serde_json::Value, String> {
+    crate::cron::list()
+}
+
+/// 手动触发一条 job —— 与调度器共用 `cron.rs::execute_job`（没有第二份 runner）。
+#[tauri::command]
+pub async fn cron_run_now(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let workdir = effective_workdir(&state);
+    let envs = agent_envs(&state);
+    run_blocking(move || crate::cron::run_now(&id, &workdir, envs)).await
+}
+
+/// 前端忙态（流式开始 / 结束）。调度器看到忙就记 `skipped_busy`，不排队。
+#[tauri::command]
+pub fn cron_set_busy(busy: bool) {
+    crate::cron::set_busy(busy);
+}
+
+/// 逐 job 开关「无人值守可写」（2026-10-27，§待办 3-1d 阶段 2B）。
+///
+/// **必须由用户在任务列表里点两次确认**（前端做二次确认，红字写明「无人值守 + 可写」）。
+/// 模型没有任何通道能把它打开：`CronCreate` 恒写 `writeAccess: false`。
+#[tauri::command]
+pub fn cron_set_write_access(id: String, allow: bool) -> Result<serde_json::Value, String> {
+    crate::cron::set_write_access(id.trim(), allow)
 }
 
 // ── 长期记忆 / 桌宠事实记忆的前端入口（2026-10-11 / 2026-10-13）──
@@ -989,11 +1176,12 @@ pub fn clear_persona_suggestions() -> Result<(), String> {
 pub async fn get_status(_state: State<'_, AppState>) -> Result<StatusPayload, String> {
     let cli_running = cli_bridge::is_running();
     let state_str = if cli_running { "ready" } else { "idle" };
-    let message = format!(
-        "CLI: {}",
-        if cli_running { "running" } else { "stopped" },
-    );
-    Ok(StatusPayload { state: state_str.into(), message, instance: 0 })
+    let message = format!("CLI: {}", if cli_running { "running" } else { "stopped" },);
+    Ok(StatusPayload {
+        state: state_str.into(),
+        message,
+        instance: 0,
+    })
 }
 
 // ── Security profile ────────────────────────────────────────────
@@ -1007,7 +1195,10 @@ pub async fn set_security_profile(
 ) -> Result<String, String> {
     // Validate profile
     if !["safe", "project", "full"].contains(&profile.as_str()) {
-        return Err(format!("Invalid profile: {}. Use safe/project/full.", profile));
+        return Err(format!(
+            "Invalid profile: {}. Use safe/project/full.",
+            profile
+        ));
     }
 
     // Update stored profile
@@ -1090,7 +1281,11 @@ pub fn launch_app(path: String) -> Result<(), String> {
 /// `file_index_status` 决定显示「正在建立索引」。
 /// `(async)` 同理：搜索每次击键都会调，必须抛到工作线程。
 #[tauri::command(async)]
-pub fn search_files(query: String, kind: Option<String>, limit: usize) -> Vec<crate::file_indexer::FileHit> {
+pub fn search_files(
+    query: String,
+    kind: Option<String>,
+    limit: usize,
+) -> Vec<crate::file_indexer::FileHit> {
     crate::file_indexer::search(&query, kind.as_deref(), limit)
 }
 
@@ -1180,6 +1375,64 @@ pub fn launch_app_elevated(path: String) -> Result<(), String> {
     crate::app_indexer::launch_elevated(raw, None)
 }
 
+/// 把「宿主自己认识的路径」转成**资源管理器 / `start` 也认识**的形式。
+///
+/// 两件事：
+///   ① 去掉 Windows verbatim 前缀（`\\?\`、`\\?\UNC\` → `\\`）；
+///   ② `/` 归一成 `\`、折叠重复分隔符（保留 UNC 开头的 `\\`）。
+///
+/// 为什么必须做：`\\?\D:\a\b.md` 能过 `Path::exists()`，但 `explorer.exe /select,` 与
+/// `cmd /c start ""` 都不认这个前缀 —— explorer 的表现是**静默退回「文档」目录**，
+/// 用户看到的就是「点『在文件管理器中打开』只打开了文档文件夹」（2026-10-29 报障）。
+/// 来源：agent 的 `--add-dir` 在含空格 / 中文的工作区上会给 verbatim 形式，
+/// 而前端又把它当基准拼相对路径（`absAgentPath`）。
+fn host_visible_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = match trimmed.strip_prefix("\\\\?\\UNC\\") {
+        Some(rest) => format!("\\\\{rest}"),
+        None => trimmed
+            .strip_prefix("\\\\?\\")
+            .unwrap_or(trimmed)
+            .to_string(),
+    };
+    let mut out = String::with_capacity(stripped.len());
+    let mut last_sep = stripped.starts_with("\\\\");
+    if last_sep {
+        out.push_str("\\\\");
+    }
+    for ch in stripped.chars().skip(if last_sep { 2 } else { 0 }) {
+        if ch == '/' || ch == '\\' {
+            if !last_sep {
+                out.push('\\');
+                last_sep = true;
+            }
+        } else {
+            out.push(ch);
+            last_sep = false;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod host_visible_path_tests {
+    use super::host_visible_path;
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_shell_consumers() {
+        // 盘符 verbatim：agent 工作目录在含空格 / 中文的路径上就是这个形状
+        assert_eq!(host_visible_path(r"\\?\D:\a b\c.md"), r"D:\a b\c.md");
+        // UNC verbatim 还原成普通 UNC（开头的 `\\` 必须保留）
+        assert_eq!(host_visible_path(r"\\?\UNC\srv\share\x"), r"\\srv\share\x");
+        // 正斜杠 / 重复分隔符归一
+        assert_eq!(host_visible_path("D:/a/b.md"), r"D:\a\b.md");
+        assert_eq!(host_visible_path(r"D:\a\\b.md"), r"D:\a\b.md");
+        // 已经是普通形式的不动
+        assert_eq!(host_visible_path(r"\\srv\share\x"), r"\\srv\share\x");
+        assert_eq!(host_visible_path(r"C:\"), r"C:\");
+    }
+}
+
 /// 在资源管理器中**定位并选中**一个文件（backlog §8.1「被改动文件的路径追踪」）。
 ///
 /// 入参来自模型在 `Write` / `Edit` 的 `tool_use` 里给出的 `file_path`，属**外部输入**，
@@ -1198,7 +1451,9 @@ pub fn reveal_in_explorer(path: String) -> Result<(), String> {
     if raw.is_empty() {
         return Err("路径为空".into());
     }
-    let p = std::path::PathBuf::from(raw);
+    // verbatim（`\\?\`）能过 exists()，但 explorer 不认 ⇒ 必须换成普通形式再传。
+    let normalized = host_visible_path(raw);
+    let p = std::path::PathBuf::from(&normalized);
     if !p.is_absolute() {
         return Err(format!("只接受绝对路径：{raw}"));
     }
@@ -1207,7 +1462,7 @@ pub fn reveal_in_explorer(path: String) -> Result<(), String> {
     }
     // `/select,<目录>` 带尾反斜杠时 explorer 会当成「打开该盘根」，先去掉。
     // 长度 <= 3 的是盘符根（`C:\`），去掉就变成 `C:`（当前目录），必须保留。
-    let mut target = p.display().to_string();
+    let mut target = normalized;
     while target.len() > 3 && (target.ends_with('\\') || target.ends_with('/')) {
         target.pop();
     }
@@ -1550,8 +1805,12 @@ pub fn hooks_file_path() -> Result<String, String> {
 /// agent 实际的工作目录 —— 与 `start_cli_process` **必须同一套判据**：
 /// 配了工作区就用它，否则用 `default_work_dir()`。两处一旦漂移，候选价格文件就会被
 /// 写到一个宿主不看的目录里（面板永远显示「没有候选」）。
-fn effective_workdir(state: &AppState) -> std::path::PathBuf {
-    let ws = state.workspace.lock().map(|g| g.clone()).unwrap_or_default();
+pub(crate) fn effective_workdir(state: &AppState) -> std::path::PathBuf {
+    let ws = state
+        .workspace
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     let ws = ws.trim().to_string();
     if ws.is_empty() {
         default_work_dir()
@@ -1561,7 +1820,7 @@ fn effective_workdir(state: &AppState) -> std::path::PathBuf {
 }
 
 /// 配了工作区 ⇒ 给 agent 设工作区锁（越界读写直接拒，见 core-agent `tools::guard()`）
-fn workspace_is_locked(state: &AppState) -> bool {
+pub(crate) fn workspace_is_locked(state: &AppState) -> bool {
     !state
         .workspace
         .lock()
@@ -1595,10 +1854,7 @@ pub fn pricing_file_path() -> Result<String, String> {
 /// 确认候选价格：校验通过才覆盖 `pricing.json`（顺带删掉候选文件）。
 /// `today` 由前端给（本地日期，`YYYY-MM-DD`），宿主在落盘这一刻盖上顶层 `updated_at`。
 #[tauri::command]
-pub fn commit_pricing_pending(
-    today: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub fn commit_pricing_pending(today: String, state: State<'_, AppState>) -> Result<String, String> {
     let path = crate::storage::commit_pricing_pending(&effective_workdir(&state), &today)?;
     crate::log::info(format!("pricing.json 已更新：{}", path.display()));
     Ok(path.display().to_string())
@@ -1767,7 +2023,9 @@ fn write_side_file(model_path: &str, name: &str, json: &str, what: &str) -> Resu
 /// lunac **新建动作文件**的目录：`<模型目录>/lunac-live2d/motions`。用户 / 作者自带的
 /// `*.motion3.json` 不住这里（它们留在模型目录里原来的位置，位置不能动）。
 fn motion_file_dir(model_path: &str) -> Result<std::path::PathBuf, String> {
-    Ok(pet_model_dir(model_path)?.join(PET_SIDE_DIR).join(PET_MOTIONS_SUBDIR))
+    Ok(pet_model_dir(model_path)?
+        .join(PET_SIDE_DIR)
+        .join(PET_MOTIONS_SUBDIR))
 }
 
 /// 校验一个动作文件名，返回**纯文件名**。
@@ -1941,7 +2199,11 @@ pub fn list_exp3_files(dir: String) -> Result<Vec<ExpressionFile>, String> {
             let display = std::fs::read_to_string(&p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("Name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("Name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| name.trim_end_matches(".exp3.json").to_string());
             out.push(ExpressionFile {
@@ -2042,7 +2304,11 @@ pub fn scan_model_folder(dir: String) -> Result<ModelFolderScan, String> {
         if !p.is_file() {
             continue;
         }
-        let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_ascii_lowercase) else {
+        let Some(name) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_ascii_lowercase)
+        else {
             continue;
         };
         let s = p.to_string_lossy().to_string();
@@ -2100,7 +2366,6 @@ pub fn open_mcp_config() -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
-
 // ── AI Workspace ──────────────────────────────────────────────────
 // Simple mode removed (2026-08-04): the app runs Agent (agent.exe) only.
 // The workspace is the directory the agent may operate in — used as the
@@ -2138,7 +2403,21 @@ pub fn set_workspace(path: String, state: State<'_, AppState>) -> Result<String,
 
 #[tauri::command]
 pub fn get_workspace(state: State<'_, AppState>) -> String {
-    state.workspace.lock().map(|g| g.clone()).unwrap_or_default()
+    state
+        .workspace
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// 当前 agent 的**有效工作目录**（绝对路径，唯一真相源 = `effective_workdir`）。
+///
+/// 前端用它把模型给 `Write` / `Edit` 的相对 `file_path` 解析成绝对路径 ——
+/// `reveal_in_explorer` / `open_path` / `snapshot_read_text` 都只接受绝对路径；
+/// 不解析时表现为「点文件打不开、改动内容读不到」（用户 2026-10-22 报障）。
+#[tauri::command]
+pub fn get_agent_workdir(state: State<'_, AppState>) -> String {
+    effective_workdir(&state).display().to_string()
 }
 
 /// 桌宠当前**模型目录** → 宿主（2026-10-13，②1「桌宠模型目录禁止 AI 读取」）。
@@ -2191,7 +2470,11 @@ fn ensure_agent_running(state: &AppState, app: &AppHandle) -> Result<(), String>
     }
 
     // ripgrep：与 start_cli() 相同 —— 随附目录前置进 PATH 并强制走系统 PATH 模式。
-    let rg_dir = dir.join("utils").join("vendor").join("ripgrep").join("x64-win32");
+    let rg_dir = dir
+        .join("utils")
+        .join("vendor")
+        .join("ripgrep")
+        .join("x64-win32");
     if rg_dir.join("rg.exe").exists() {
         let rg_str = rg_dir.display().to_string();
         let old_path = env::var("PATH").unwrap_or_default();
@@ -2201,11 +2484,15 @@ fn ensure_agent_running(state: &AppState, app: &AppHandle) -> Result<(), String>
         env::set_var("USE_BUILTIN_RIPGREP", "0");
     }
 
-    app.emit("cli-status", StatusPayload {
-        state: "starting".into(),
-        message: format!("Agent CLI at {}", dir.display()),
-        instance: 0, // informational — not tied to a specific spawn
-    }).ok();
+    app.emit(
+        "cli-status",
+        StatusPayload {
+            state: "starting".into(),
+            message: format!("Agent CLI at {}", dir.display()),
+            instance: 0, // informational — not tied to a specific spawn
+        },
+    )
+    .ok();
 
     start_cli_process(state, app.clone(), &dir)?;
     Ok(())
@@ -2327,10 +2614,8 @@ pub fn list_tool_files() -> Result<Vec<ToolFileEntry>, String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map_or(false, |e| e == "json") {
-                let content = std::fs::read_to_string(&path)
-                    .unwrap_or_default();
-                let tool: Result<crate::mcp_server::ToolDef, _> =
-                    serde_json::from_str(&content);
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let tool: Result<crate::mcp_server::ToolDef, _> = serde_json::from_str(&content);
                 files.push(ToolFileEntry {
                     filename: path
                         .file_name()
@@ -2463,7 +2748,11 @@ pub fn list_expression_files(model_path: String) -> Result<Vec<ExpressionFile>, 
         let name = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|json| json.get("Name").and_then(|v| v.as_str()).map(str::to_string))
+            .and_then(|json| {
+                json.get("Name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| stem.to_string());
 
@@ -2702,7 +2991,9 @@ pub fn open_path(path: String) -> Result<(), String> {
     if p.contains('"') {
         return Err("路径含引号，已拒绝".into());
     }
-    let pb = std::path::Path::new(&p);
+    // 同上：verbatim 前缀 `\\?\` 会让 `start` 失败（表现为「点了没反应」）。
+    let target = host_visible_path(&p);
+    let pb = std::path::Path::new(&target);
     if !pb.is_absolute() {
         return Err(format!("只接受绝对路径：{p}"));
     }
@@ -2713,7 +3004,7 @@ pub fn open_path(path: String) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         Command::new("cmd")
-            .raw_arg(format!("/c start \"\" \"{p}\""))
+            .raw_arg(format!("/c start \"\" \"{target}\""))
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn()
             .map_err(|e| format!("打开失败：{e}"))?;
@@ -2768,9 +3059,270 @@ pub fn local_model_config_get() -> bool {
 
 /// 「本地模型决策」开关：写盘。**同步命令** —— 就是一次小文件读写，
 /// 与 updater 的 `update_config_set` 同款，不必搬阻塞池。
+///
+/// `decide` 可选（2026-10-24）：不传 = **保留原值**（兼容旧前端只传 `enabled`）；
+/// 传了就一起落盘。默认 `true` 由 `LocalModelConfig::default()` 给出。
 #[tauri::command]
-pub fn local_model_config_set(enabled: bool) -> Result<(), String> {
-    crate::storage::save_local_model_config(&crate::storage::LocalModelConfig { enabled })
+pub fn local_model_config_set(enabled: bool, decide: Option<bool>) -> Result<(), String> {
+    let prev = crate::storage::load_local_model_config();
+    crate::storage::save_local_model_config(&crate::storage::LocalModelConfig {
+        enabled,
+        decide: decide.unwrap_or(prev.decide),
+    })
+}
+
+/// 本地模型探活结果（2026-10-24）。**「端点已注入」≠「模型能用」**：
+/// `llama-server` 可能还在加载、崩了、或压根没起。这里做一次真实 HTTP 探活，
+/// 把「已加载 / 已就绪 / 失败原因」变成可观测事实（前端「更多设置 → 其他」显示）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalModelProbe {
+    pub enabled: bool,
+    pub ready: bool,
+    pub url: String,
+    pub latency_ms: u64,
+    pub model: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 探活超时：llama.cpp 在加载模型期间 `/health` 会回 503，前端不该等太久。
+const LOCAL_MODEL_PROBE_TIMEOUT_MS: u64 = 3_000;
+
+/// 探活一次：`GET /health` 200 即就绪；模型名从 `/v1/models` 顺带取（取不到不算失败）。
+///
+/// 回环端点一律 `.no_proxy()`（`docs/code-standards.md` §规范 5）：Windows 上 reqwest
+/// 会读系统代理却不认绕过表，不加这一行会出现「本机端点连不上」的假故障。
+fn probe_local_model_once(url: &str, timeout_ms: u64) -> Result<Option<String>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("建 HTTP client 失败：{e}"))?;
+    let health = client
+        .get(format!("{}/health", url.trim_end_matches('/')))
+        .send()
+        .map_err(|e| format!("连不上本地模型：{e}"))?;
+    if !health.status().is_success() {
+        return Err(format!("HTTP {}", health.status()));
+    }
+    let model = client
+        .get(format!("{}/v1/models", url.trim_end_matches('/')))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| {
+            v.get("data")?
+                .get(0)?
+                .get("id")?
+                .as_str()
+                .map(str::to_string)
+        });
+    Ok(model)
+}
+
+/// sidecar 启动后的**后台探活**（`plugin_sidecar::start` 在 `local-model` 起好后调它）。
+///
+/// 为什么要重试：`llama-server` 先监听端口、再加载模型 —— 刚起时 `/health` 是 503。
+/// 30s 内反复试，成功 / 超时各落一行日志（`本地模型就绪` / `本地模型探活失败`）。
+pub(crate) fn probe_local_model_startup(url: String) {
+    let started = std::time::Instant::now();
+    let mut last_err = String::from("尚未开始");
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        match probe_local_model_once(&url, 1_500) {
+            Ok(model) => {
+                crate::log::info(format!(
+                    "本地模型就绪：{url}（model={}，{} ms）",
+                    model.unwrap_or_else(|| "unknown".into()),
+                    started.elapsed().as_millis()
+                ));
+                return;
+            }
+            Err(e) => last_err = e,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    crate::log::warn(format!(
+        "本地模型探活失败（30s）：{url} —— {last_err}。端点仍会下发，但本地决策会 fail-open"
+    ));
+}
+
+/// 前端主动探活（打开「更多设置 → 其他」/ 开关切换后各调一次）。
+#[tauri::command]
+pub async fn local_model_probe() -> LocalModelProbe {
+    let enabled = crate::storage::load_local_model_config().enabled;
+    let Some((url, _slots)) = local_model_env() else {
+        return LocalModelProbe {
+            enabled,
+            ready: false,
+            url: String::new(),
+            latency_ms: 0,
+            model: None,
+            error: Some("未启用或未安装 local-model".into()),
+        };
+    };
+    let probe_url = url.clone();
+    let started = std::time::Instant::now();
+    let result =
+        run_blocking(move || probe_local_model_once(&probe_url, LOCAL_MODEL_PROBE_TIMEOUT_MS))
+            .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(model) => {
+            crate::log::info(format!(
+                "本地模型探活：ready=true（{url}，{latency_ms} ms，model={}）",
+                model.clone().unwrap_or_else(|| "unknown".into())
+            ));
+            LocalModelProbe {
+                enabled,
+                ready: true,
+                url,
+                latency_ms,
+                model,
+                error: None,
+            }
+        }
+        Err(error) => {
+            crate::log::warn(format!(
+                "本地模型探活：ready=false（{url}，{latency_ms} ms）—— {error}"
+            ));
+            LocalModelProbe {
+                enabled,
+                ready: false,
+                url,
+                latency_ms,
+                model: None,
+                error: Some(error),
+            }
+        }
+    }
+}
+
+// ── 本地决策层状态（2026-10-24，§待办 3-15）────────────────────────
+//
+// 「模型已就绪」与「决策层在跑」是两件事。C 组实验第一次启动时前者为 true、后者 0 条判定，
+// 用户看到「已就绪」却什么也没发生，只能去 grep 日志。这里把后者做成一个可查询的事实。
+
+#[derive(Debug, Default, Serialize)]
+pub struct LocalDecisionCounts {
+    pub prewarm: usize,
+    pub safety: usize,
+    pub memory: usize,
+    pub rewrite: usize,
+    pub route: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDecisionStatus {
+    /// 配置层面「应当参与」= `enabled && decide`。
+    pub enabled: bool,
+    pub config_enabled: bool,
+    pub config_decide: bool,
+    pub endpoint: String,
+    pub slots: usize,
+    pub counts: LocalDecisionCounts,
+    /// 最近一条判定行（原文，截 200 字符）。
+    pub last_line: Option<String>,
+}
+
+/// 从一份 agent 日志里数判定行。**排除 `INFO  tool …`**：那是执行 grep / PowerShell 时
+/// 把关键词当参数打印出来的回显，不是真判定（B 组实验的「0 命中」就是按这条口径算的）。
+fn count_decision_lines(text: &str) -> (LocalDecisionCounts, Option<String>) {
+    let mut c = LocalDecisionCounts::default();
+    let mut last = None;
+    for line in text.lines() {
+        if line.contains("INFO  tool ") {
+            continue;
+        }
+        let mut hit = false;
+        if line.contains("本地判定预热完成") {
+            c.prewarm += 1;
+            hit = true;
+        }
+        if line.contains("安全预筛：") {
+            c.safety += 1;
+            hit = true;
+        }
+        if line.contains("记忆候选抽取：") {
+            c.memory += 1;
+            hit = true;
+        }
+        if line.contains("检索查询改写：") {
+            c.rewrite += 1;
+            hit = true;
+        }
+        if line.contains("能力路由：") {
+            c.route += 1;
+            hit = true;
+        }
+        if hit {
+            last = Some(line.trim().chars().take(200).collect());
+        }
+    }
+    (c, last)
+}
+
+/// 取最近一份 `agent-*.log` 的正文（读不到就空串 —— 状态查询不该因为日志缺失而失败）。
+fn latest_agent_log_text() -> String {
+    let dir = crate::log::log_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return String::new();
+    };
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !(name.starts_with("agent-") && name.ends_with(".log")) {
+            continue;
+        }
+        let Ok(m) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().map_or(true, |(t, _)| m > *t) {
+            best = Some((m, p));
+        }
+    }
+    let Some((_, path)) = best else {
+        return String::new();
+    };
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// 本地决策层状态：开关是否真的开着 + 最近一份日志里有没有判定行（2026-10-24）。
+#[tauri::command]
+pub fn local_decision_status() -> LocalDecisionStatus {
+    let cfg = crate::storage::load_local_model_config();
+    let (endpoint, slots) = local_model_env().unwrap_or_default();
+    let (counts, last_line) = count_decision_lines(&latest_agent_log_text());
+    LocalDecisionStatus {
+        enabled: cfg.enabled && cfg.decide,
+        config_enabled: cfg.enabled,
+        config_decide: cfg.decide,
+        endpoint,
+        slots,
+        counts,
+        last_line,
+    }
+}
+
+#[cfg(test)]
+mod local_decision_status_tests {
+    use super::count_decision_lines;
+
+    #[test]
+    fn counts_only_real_decision_lines() {
+        let log = "2026-10-24T12:08:06Z INFO  安全预筛：medium（只记账，不改审批）\n\
+2026-10-24T12:10:49Z INFO  记忆候选抽取：5 条（只落账本，不改任何注入）\n\
+2026-10-24T12:00:00Z INFO  tool PowerShell ok args={\"command\":\"grep 安全预筛：\"}\n\
+2026-10-24T12:05:30Z INFO  本地判定预热完成（结果丢弃：skip）\n";
+        let (c, last) = count_decision_lines(log);
+        assert_eq!(c.safety, 1, "tool 回显不能被算成判定行");
+        assert_eq!(c.memory, 1);
+        assert_eq!(c.prewarm, 1);
+        assert_eq!(c.rewrite, 0);
+        assert_eq!(c.route, 0);
+        assert!(last.unwrap().contains("本地判定预热完成"));
+    }
 }
 
 /// 拉取**插件市场索引**（`plugin_market::INDEX_URL` = 公开仓库 `LythrumMoon/lunac-plugins`
@@ -2810,7 +3362,9 @@ fn fetch_plugin_index_blocking() -> Result<Vec<crate::plugin_market::PluginIndex
     let mut bytes: Vec<u8> = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
-        let n = resp.read(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| format!("Read error: {e}"))?;
         if n == 0 {
             break;
         }
@@ -2860,7 +3414,9 @@ pub(crate) fn validate_public_https_url(raw: &str) -> Result<(), String> {
         return Err("地址缺少主机名".into());
     }
     if host.parse::<std::net::IpAddr>().is_ok() {
-        return Err(format!("不允许 IP 字面量地址（含 loopback / 内网）：{host}"));
+        return Err(format!(
+            "不允许 IP 字面量地址（含 loopback / 内网）：{host}"
+        ));
     }
     let lower = host.to_ascii_lowercase();
     if lower == "localhost"
@@ -2886,56 +3442,85 @@ pub(crate) fn validate_public_https_url(raw: &str) -> Result<(), String> {
 /// **没有总超时**（2026-09-30 用户要求，见 `plugin_market::open_https_stream`）：只留建连与读超时。
 /// 进度经 `plugin-install-progress` 事件回传（前端画进度环 + 实时速度）。
 #[tauri::command]
-pub async fn install_plugin_from_url(app: AppHandle, url: String) -> Result<String, String> {
-    run_blocking(move || install_plugin_from_url_blocking(&app, url)).await
+pub async fn install_plugin_from_url(
+    app: AppHandle,
+    url: String,
+    sha256: Option<String>,
+) -> Result<String, String> {
+    run_blocking(move || install_plugin_from_url_blocking(&app, url, sha256.unwrap_or_default()))
+        .await
 }
 
 /// 见 `install_plugin_from_url`：真正干活的同步体，只在阻塞线程池里跑。
-fn install_plugin_from_url_blocking(app: &AppHandle, url: String) -> Result<String, String> {
+fn install_plugin_from_url_blocking(
+    app: &AppHandle,
+    url: String,
+    sha256: String,
+) -> Result<String, String> {
+    // 单飞闸（2026-10-27）：暂停中的任务仍占着闸，此时再发一次安装会起第二个下载线程，
+    // 两个线程写同一个 `.part` ⇒ 进度一快一慢、且可能「秒完成但没装完」。恢复请走暂停/继续。
+    let _busy = crate::plugin_market::try_begin_install("插件包")?;
     let url = url.trim().to_string();
     // 插件包会被解压执行 ⇒ 只收 https，且拒 loopback / 内网（见 `validate_public_https_url`）
     validate_public_https_url(&url)?;
+    // 哈希格式在下载**之前**就校验：写错就没必要再下几十 MB
+    let expected = sha256.trim().to_string();
+    if !expected.is_empty() && !crate::plugin_market::is_sha256_hex(&expected) {
+        return Err(format!("sha256 必须是 64 位十六进制：{expected}"));
+    }
     let limit = crate::plugin_market::MAX_ARCHIVE_BYTES;
-    let over = || format!("插件包超过上限（{} MB）", limit / 1024 / 1024);
     // 插件 id 要等解压出清单才知道，所以「插件包本体」这一段先不带 id/条数（前端只看 bytes）
     let emit = |p: crate::plugin_market::DependencyProgress| {
         let _ = app.emit("plugin-install-progress", p);
     };
-    let mut resp = crate::plugin_market::open_https_stream(&url)?;
-    // 两道拦截：先看 Content-Length（省得白下几十 MB），再按**真实读到的字节**累计
-    if let Some(len) = resp.content_length() {
-        if len > limit {
-            return Err(over());
+    // 2026-10-27：**可续传**下载 —— 半截文件在 `temp\downloads\`，关面板 / 切页签 /
+    // 退出应用后重来都能接着下（见 `plugin_market::fetch_resumable`）。
+    crate::plugin_market::begin_package_install(&url);
+    let fetched = crate::plugin_market::fetch_package_bytes(
+        &url,
+        limit,
+        &expected,
+        &mut |phase, downloaded, total| {
+            emit(crate::plugin_market::DependencyProgress {
+                id: String::new(),
+                phase: phase.to_string(),
+                downloaded,
+                total,
+                index: 0,
+                count: 0,
+            });
+        },
+    );
+    let bytes = match fetched {
+        Ok(b) => b,
+        Err(e) => {
+            crate::plugin_market::finish_package_install();
+            return Err(e);
         }
+    };
+    // 供应链完整性（2026-10-18，E.5）：索引给了 sha256 就必须对上，否则**不进安装管线**
+    //（旧版本不会被覆盖）。没给 = 迁移期，只 warn 留痕。
+    if let Err(e) = crate::plugin_market::verify_package_sha256(&bytes, &expected) {
+        crate::plugin_market::finish_package_install();
+        return Err(e);
     }
-    let total = resp.content_length().unwrap_or(0);
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = resp
-            .read(&mut buf)
-            .map_err(|e| format!("Read error: {}", e))?;
-        if n == 0 {
-            break;
-        }
-        if bytes.len() as u64 + n as u64 > limit {
-            return Err(over());
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        emit(crate::plugin_market::DependencyProgress {
-            id: String::new(),
-            phase: "download".into(),
-            downloaded: bytes.len() as u64,
-            total,
-            index: 0,
-            count: 0,
-        });
+    if expected.trim().is_empty() {
+        crate::log::warn(format!(
+            "插件包没有 sha256，已按「只校验 https」安装：{url} —— 发布端应补上校验和"
+        ));
     }
-    let id = crate::plugin_market::install_from_bytes_with_progress(
+    let id = match crate::plugin_market::install_from_bytes_with_progress(
         &bytes,
         &crate::plugin_market::plugins_dir(),
         &mut |p| emit(p),
-    )?;
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::plugin_market::finish_package_install();
+            return Err(e);
+        }
+    };
+    crate::plugin_market::finish_package_install();
     crate::log::info(format!(
         "插件已安装：{}（{} 字节，来源 {url}）",
         id,
@@ -2955,7 +3540,15 @@ fn install_plugin_from_url_blocking(app: &AppHandle, url: String) -> Result<Stri
 #[tauri::command]
 pub async fn install_plugin_dependencies(app: AppHandle, id: String) -> Result<(), String> {
     run_blocking(move || {
-        let dir = crate::plugin_market::plugins_dir().join(id.trim());
+        // 单飞闸：依赖补齐也各算一次安装（与包本体的闸同一把，避免并发写同一个 .part）
+        let _busy = crate::plugin_market::try_begin_install("插件依赖")?;
+        // 按 id / provides 定位（2026-10-18）：与窗口、sidecar 共用同一个解析器，
+        // 不再假设「请求里的 id 一定等于目录名」。
+        let dir = crate::plugin_market::resolve_plugin_dir(
+            &crate::plugin_market::plugins_dir(),
+            id.trim(),
+        )
+        .ok_or_else(|| format!("插件不存在：{}", id.trim()))?;
         let text = std::fs::read_to_string(dir.join(crate::plugin_market::MANIFEST_FILE))
             .map_err(|e| format!("读不到插件清单（{e}）"))?;
         let manifest = crate::plugin_market::parse_manifest(&text)?;
@@ -2970,6 +3563,232 @@ pub async fn install_plugin_dependencies(app: AppHandle, id: String) -> Result<(
         Ok(())
     })
     .await
+}
+
+/// 暂停 / 继续**当前这次**插件下载（2026-10-27）。
+///
+/// 暂停 = 断开当前连接、半截文件留在 `temp\downloads\`；继续 = 按断点发 `Range` 接上。
+/// 没有活动下载时调用也安全（只置一个标志，下一次下载开始时会被清掉）。
+#[tauri::command]
+pub async fn plugin_install_pause(paused: bool) -> Result<(), String> {
+    crate::plugin_market::set_install_paused(paused);
+    Ok(())
+}
+
+/// 当前安装状态快照（2026-10-27）。
+///
+/// 为什么需要：下载是宿主侧的阻塞任务，**关掉设置面板 / 切到别的分页它照样在跑**；
+/// 界面重绘后靠这条命令把进度环、暂停按钮重新挂回对应的那一行。
+#[tauri::command]
+pub async fn plugin_install_state() -> Result<crate::plugin_market::InstallState, String> {
+    Ok(crate::plugin_market::install_state())
+}
+
+/// 磁盘上还剩的下载断点（2026-10-27）。
+///
+/// 强制退出 Lunac 后重开：`temp\downloads\` 里的 `.part` 还在 ⇒ 界面据此显示
+/// 「继续下载（已下 x%）」，点一下即从断点续。
+#[tauri::command]
+pub async fn plugin_pending_downloads() -> Result<Vec<crate::plugin_market::PendingDownload>, String>
+{
+    run_blocking(|| Ok(crate::plugin_market::pending_downloads())).await
+}
+
+/// 插件开发工具链（轨道 H，2026-10-18）：状态 / 授权 / 撤销 / 安装 / 构建。
+/// 账本与执行都在 `plugin_toolchain.rs`；这里只是 async 薄壳（规范 5）。
+#[tauri::command]
+pub async fn plugin_toolchain_status(
+    plugin_id: String,
+) -> Result<crate::plugin_toolchain::ToolchainStatus, String> {
+    run_blocking(move || crate::plugin_toolchain::status(&plugin_id)).await
+}
+
+#[tauri::command]
+pub async fn grant_plugin_toolchain(
+    plugin_id: String,
+) -> Result<crate::plugin_toolchain::ToolchainStatus, String> {
+    run_blocking(move || crate::plugin_toolchain::grant(&plugin_id)).await
+}
+
+#[tauri::command]
+pub async fn revoke_plugin_toolchain(
+    plugin_id: String,
+    remove_files: Option<bool>,
+) -> Result<crate::plugin_toolchain::ToolchainStatus, String> {
+    run_blocking(move || crate::plugin_toolchain::revoke(&plugin_id, remove_files.unwrap_or(false)))
+        .await
+}
+
+#[tauri::command]
+pub async fn install_plugin_toolchain(
+    app: AppHandle,
+    plugin_id: String,
+) -> Result<crate::plugin_toolchain::ToolchainStatus, String> {
+    run_blocking(move || crate::plugin_toolchain::install(&app, &plugin_id)).await
+}
+
+#[tauri::command]
+pub async fn run_plugin_build(app: AppHandle, plugin_id: String) -> Result<u32, String> {
+    run_blocking(move || crate::plugin_toolchain::run_build(&app, &plugin_id)).await
+}
+
+#[tauri::command]
+pub fn stop_plugin_build(plugin_id: String) -> bool {
+    crate::plugin_toolchain::stop_build(&plugin_id)
+}
+
+/// 资源库来源存储（A5，2026-10-18）：AI 的 `SourceInstall` 与插件 UI 的「导入来源」
+/// 共用同一目录（`<exe 根>\ModuleData\resource-hub\sources`）。
+///
+/// 这三个命令只做**文件层**读写；RSP 语义校验在插件的 TS SDK（唯一真相源）。
+#[tauri::command]
+pub async fn resource_hub_sources() -> Result<Vec<serde_json::Value>, String> {
+    run_blocking(crate::resource_hub::list_sources).await
+}
+
+#[tauri::command]
+pub async fn resource_hub_install_source(
+    source: serde_json::Value,
+    force: Option<bool>,
+) -> Result<String, String> {
+    run_blocking(move || crate::resource_hub::install_source(&source, force.unwrap_or(false))).await
+}
+
+#[tauri::command]
+pub async fn resource_hub_delete_source(id: String) -> Result<bool, String> {
+    run_blocking(move || crate::resource_hub::delete_source(&id)).await
+}
+
+/// 资源库「作品级结果卡」的广播事件（A7 二期，2026-10-28）。
+///
+/// 插件搜完后把首页几条作品回传宿主，宿主**广播给所有窗口**；只有 DOM 里存在
+/// 同 `query` 的 `ResourceHubOpen` 卡片的窗口会渲染（其余窗口静默丢弃）。
+pub const RESOURCE_HUB_RESULTS_EVENT: &str = "lunac-resource-hub-results";
+
+/// 回传载荷的硬上限：条数与整包字节。插件只该回「首页几条」，不是整库。
+const RH_RESULTS_MAX_ITEMS: usize = 20;
+const RH_RESULTS_MAX_BYTES: usize = 64 * 1024;
+
+/// 收敛回传载荷（纯函数，便于单测）：形状不对就报可读错误；`items` 超上限只截断。
+fn normalize_rh_results(payload: &str) -> Result<serde_json::Value, String> {
+    if payload.len() > RH_RESULTS_MAX_BYTES {
+        return Err(format!(
+            "results payload too large ({} bytes, max {RH_RESULTS_MAX_BYTES})",
+            payload.len()
+        ));
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| format!("payload is not valid JSON: {e}"))?;
+    let query = value
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Err("payload.query must not be empty".into());
+    }
+    if query.chars().count() > 200 {
+        return Err("payload.query must be at most 200 characters".into());
+    }
+    {
+        let items = value
+            .get_mut("items")
+            .and_then(|v| v.as_array_mut())
+            .ok_or("payload.items must be an array")?;
+        items.truncate(RH_RESULTS_MAX_ITEMS);
+    }
+    Ok(value)
+}
+
+/// 插件 → 聊天窗的作品结果（A7 二期）：**纯转发**，不开窗、不写盘、不联网。
+///
+/// 为什么必须经宿主：插件只活在插件窗口里，要送到聊天窗只能靠宿主广播
+/// （`Emitter::emit` 是发给所有窗口的）。聊天窗与主窗都注册了同一个监听，
+/// 谁手上有那张卡谁渲染，另一侧没有就不动 —— 不需要知道用户开的是哪个窗。
+#[tauri::command]
+pub fn resource_hub_publish_results(app: AppHandle, payload: String) -> Result<(), String> {
+    let value = normalize_rh_results(&payload)?;
+    app.emit(RESOURCE_HUB_RESULTS_EVENT, value)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod resource_hub_results_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 合法载荷原样通过；`items` 超过上限只截断，不整体失败。
+    #[test]
+    fn results_payload_is_truncated_not_rejected() {
+        let items: Vec<serde_json::Value> = (0..(RH_RESULTS_MAX_ITEMS + 5))
+            .map(|i| json!({ "sourceId": "s", "workId": format!("w{i}"), "title": "t" }))
+            .collect();
+        let raw = json!({ "query": "海贼王", "items": items }).to_string();
+        let value = normalize_rh_results(&raw).expect("valid payload");
+        assert_eq!(
+            value["items"].as_array().map(|a| a.len()),
+            Some(RH_RESULTS_MAX_ITEMS)
+        );
+        assert_eq!(value["query"], json!("海贼王"));
+    }
+
+    /// 缺 query / query 全空白 / items 不是数组 / 不是 JSON ⇒ 一律可读错误。
+    #[test]
+    fn results_payload_rejects_bad_shapes() {
+        let cases: Vec<String> = vec![
+            "not json".to_string(),
+            "[]".to_string(),
+            json!({ "items": [] }).to_string(),
+            json!({ "query": "   ", "items": [] }).to_string(),
+            json!({ "query": "x", "items": {} }).to_string(),
+            json!({ "query": "x".repeat(201), "items": [] }).to_string(),
+        ];
+        for raw in cases {
+            assert!(normalize_rh_results(&raw).is_err(), "should reject: {raw}");
+        }
+    }
+}
+
+/// 插件 KV（A3，2026-10-18）：按插件 id 命名空间；清单必须声明 `storage.plugin`。
+/// 命令只做 async 薄壳，读写 / 配额 / 原子写在 `plugin_kv.rs`。
+#[tauri::command]
+pub async fn plugin_kv_get(
+    plugin_id: String,
+    key: String,
+) -> Result<Option<serde_json::Value>, String> {
+    run_blocking(move || crate::plugin_kv::get(&plugin_id, &key)).await
+}
+
+#[tauri::command]
+pub async fn plugin_kv_set(
+    plugin_id: String,
+    key: String,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    run_blocking(move || crate::plugin_kv::set(&plugin_id, &key, value)).await
+}
+
+#[tauri::command]
+pub async fn plugin_kv_remove(plugin_id: String, key: String) -> Result<bool, String> {
+    run_blocking(move || crate::plugin_kv::remove(&plugin_id, &key)).await
+}
+
+#[tauri::command]
+pub async fn plugin_kv_keys(plugin_id: String) -> Result<Vec<String>, String> {
+    run_blocking(move || crate::plugin_kv::keys(&plugin_id)).await
+}
+
+/// 插件脚本沙箱（A4，2026-10-18）：在一次性 QuickJS 运行时里执行来源脚本。
+/// 命令只做 async 薄壳，能力门 / 超时 / 内存上限都在 `plugin_engine.rs`。
+#[tauri::command]
+pub async fn plugin_engine_eval(
+    plugin_id: String,
+    code: String,
+    timeout_ms: Option<u64>,
+    args: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    run_blocking(move || crate::plugin_engine::eval(&plugin_id, &code, timeout_ms, args)).await
 }
 
 /// 中止**当前这次**依赖下载（2026-10-15）。
@@ -2989,6 +3808,10 @@ pub fn uninstall_plugin(id: String) -> Result<String, String> {
     // 留一个「插件已经不存在、进程还在跑」的状态是最难解释的（同预检 #57 的口径）。
     crate::plugin_sidecar::stop(&id);
     crate::plugin_market::uninstall(&id, &crate::plugin_market::plugins_dir())?;
+    // A3（2026-10-18）：插件数据也一起清 —— 「卸载 = 完全不存在」。
+    if let Err(e) = crate::plugin_kv::clear(&id) {
+        crate::log::warn(format!("清除插件 KV 失败（{id}）：{e}"));
+    }
     crate::log::info(format!("插件已卸载：{id}"));
     Ok(id)
 }
@@ -3020,9 +3843,7 @@ fn download_tool_from_url_blocking(url: String) -> Result<String, String> {
         return Err(format!("HTTP {}: download failed", resp.status().as_u16()));
     }
 
-    let body = resp
-        .text()
-        .map_err(|e| format!("Read error: {}", e))?;
+    let body = resp.text().map_err(|e| format!("Read error: {}", e))?;
 
     // Validate as ToolDef
     let _tool: crate::mcp_server::ToolDef =
@@ -3030,7 +3851,9 @@ fn download_tool_from_url_blocking(url: String) -> Result<String, String> {
 
     // Derive filename from tool name, fallback to URL stem
     let filename = if let Ok(tool) = serde_json::from_str::<crate::mcp_server::ToolDef>(&body) {
-        let base = tool.name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-");
+        let base = tool
+            .name
+            .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-");
         format!("{}.json", base)
     } else {
         let stem = url
@@ -3040,7 +3863,11 @@ fn download_tool_from_url_blocking(url: String) -> Result<String, String> {
             .split('?')
             .next()
             .unwrap_or("tool");
-        if stem.ends_with(".json") { stem.to_string() } else { format!("{}.json", stem) }
+        if stem.ends_with(".json") {
+            stem.to_string()
+        } else {
+            format!("{}.json", stem)
+        }
     };
 
     let dir = mcp_tools_dir();
@@ -3083,6 +3910,26 @@ pub async fn run_paddle_ocr(path: String, lang: Option<String>) -> Result<String
         paddle_ocr::recognize_image(&path, &lang)
     })
     .await
+}
+
+// ── 桌宠语音输入（2026-10-22，§待办 1-4 ⑤）─────────────────────────
+/// 用 Windows 内置 `SpeechRecognizer` 识别**一句**，返回 `{ text, reason }`。
+///
+/// 走 `run_blocking`：WinRT 的识别是阻塞调用（等句末静音，最长 ~20s），留在主线程
+/// 就是「点了麦克风 ⇒ 整个窗口未响应」。套间初始化在 `voice_input` 里自己做
+/// （windows 0.58 没有 `initialize_mta()`，见上面 `run_ocr` 的注释）。
+#[tauri::command]
+pub async fn recognize_speech() -> Result<voice_input::VoiceResult, String> {
+    run_blocking(voice_input::recognize_once).await
+}
+
+// ── 插件桥：拼音编码（阅读插件「拼音检索」，2026-10-22）────────────
+//
+// 只读、无副作用；插件侧按批调用（`__lunac_host.pinyin.encode([标题…])`）。
+// 上限在 `pinyin_bridge`：单条 512 字符、每次 2000 条 —— 防插件把整章正文塞进来。
+#[tauri::command]
+pub async fn pinyin_encode(texts: Vec<String>) -> Vec<pinyin_bridge::PinyinEntry> {
+    pinyin_bridge::encode_texts(&texts)
 }
 
 // ── OCR 引擎（PaddleOCR-json）状态 ───────────────────────────────
@@ -3155,10 +4002,10 @@ pub fn save_temp_image(data_url: String) -> Result<String, String> {
     let ext = match mime {
         "image/jpeg" | "image/jpg" => "jpg",
         "image/bmp" => "bmp",
-        "image/webp" => "png",     // PaddleOCR-json does not support webp natively
-        "image/gif" => "png",       // PaddleOCR-json does not support gif natively
+        "image/webp" => "png", // PaddleOCR-json does not support webp natively
+        "image/gif" => "png",  // PaddleOCR-json does not support gif natively
         "image/tiff" | "image/tif" => "tiff",
-        _ => "png",                 // default: PNG (canvas.toDataURL always outputs PNG)
+        _ => "png", // default: PNG (canvas.toDataURL always outputs PNG)
     };
 
     // Parse base64: strip the header part (data:image/...;base64,)
@@ -3166,15 +4013,11 @@ pub fn save_temp_image(data_url: String) -> Result<String, String> {
         .split(',')
         .nth(1)
         .ok_or("Invalid data URL format")?;
-    let bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        b64,
-    )
-    .map_err(|e| format!("Base64 decode failed: {e}"))?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+        .map_err(|e| format!("Base64 decode failed: {e}"))?;
 
     let tmp_path = temp_image_path("ocr", ext);
-    std::fs::write(&tmp_path, &bytes)
-        .map_err(|e| format!("Write temp file failed: {e}"))?;
+    std::fs::write(&tmp_path, &bytes).map_err(|e| format!("Write temp file failed: {e}"))?;
 
     Ok(tmp_path.to_string_lossy().to_string())
 }
@@ -3245,7 +4088,9 @@ pub fn read_clipboard_file_paths() -> Vec<String> {
                 let count = DragQueryFileW(h, 0xFFFFFFFF, ptr::null_mut(), 0) as usize;
                 for i in 0..count {
                     let len = DragQueryFileW(h, i as u32, ptr::null_mut(), 0) as usize;
-                    if len == 0 { continue; }
+                    if len == 0 {
+                        continue;
+                    }
                     let mut buf: Vec<u16> = vec![0; len + 1];
                     DragQueryFileW(h, i as u32, buf.as_mut_ptr(), buf.len() as u32);
                     if let Some(path) = OsString::from_wide(&buf[..len]).into_string().ok() {
@@ -3263,8 +4108,6 @@ pub fn read_clipboard_file_paths() -> Vec<String> {
     }
 }
 
-
-
 #[cfg(target_os = "windows")]
 fn read_clipboard_image_files() -> Vec<String> {
     use std::ffi::OsString;
@@ -3272,8 +4115,8 @@ fn read_clipboard_image_files() -> Vec<String> {
     use std::ptr;
 
     const IMAGE_EXTS: &[&str] = &[
-        ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif", ".ico",
-        ".PNG", ".JPG", ".JPEG", ".BMP", ".TIFF", ".TIF", ".WEBP", ".GIF", ".ICO",
+        ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif", ".ico", ".PNG", ".JPG",
+        ".JPEG", ".BMP", ".TIFF", ".TIF", ".WEBP", ".GIF", ".ICO",
     ];
 
     #[link(name = "user32")]
@@ -3302,7 +4145,9 @@ fn read_clipboard_image_files() -> Vec<String> {
             let count = DragQueryFileW(h, 0xFFFFFFFF, ptr::null_mut(), 0) as usize;
             for i in 0..count {
                 let len = DragQueryFileW(h, i as u32, ptr::null_mut(), 0) as usize;
-                if len == 0 { continue; }
+                if len == 0 {
+                    continue;
+                }
                 let mut buf: Vec<u16> = vec![0; len + 1];
                 DragQueryFileW(h, i as u32, buf.as_mut_ptr(), buf.len() as u32);
                 if let Some(path) = OsString::from_wide(&buf[..len]).into_string().ok() {
@@ -3317,7 +4162,7 @@ fn read_clipboard_image_files() -> Vec<String> {
     }
 
     paths
- }
+}
 
 #[cfg(not(target_os = "windows"))]
 fn read_clipboard_image_files() -> Vec<String> {
@@ -3341,12 +4186,16 @@ fn read_clipboard_image_files() -> Vec<String> {
 #[tauri::command(async)]
 pub fn read_clipboard_backup_image() -> String {
     #[cfg(not(target_os = "windows"))]
-    { String::new() }
+    {
+        String::new()
+    }
 
     #[cfg(target_os = "windows")]
     {
         // DIB (BMP/BI_BITFIELDS/BI_JPEG/BI_PNG) first, then registered "PNG".
-        clipboard_dib_to_bmp().or_else(clipboard_png_to_file).unwrap_or_default()
+        clipboard_dib_to_bmp()
+            .or_else(clipboard_png_to_file)
+            .unwrap_or_default()
     }
 }
 
@@ -3372,22 +4221,36 @@ fn clipboard_png_to_file() -> Option<String> {
 
     struct CloseClipboardOnDrop;
     impl Drop for CloseClipboardOnDrop {
-        fn drop(&mut self) { unsafe { CloseClipboard(); } }
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
     }
 
     unsafe {
         const PNG_NAME: &[u16] = &[0x50, 0x4e, 0x47, 0x00]; // L"PNG"
         let cf_png = RegisterClipboardFormatW(PNG_NAME.as_ptr());
-        if cf_png == 0 { return None; }
-        if OpenClipboard(0) == 0 { return None; }
+        if cf_png == 0 {
+            return None;
+        }
+        if OpenClipboard(0) == 0 {
+            return None;
+        }
         let _guard = CloseClipboardOnDrop;
 
         let h = GetClipboardData(cf_png);
-        if h == 0 { return None; }
+        if h == 0 {
+            return None;
+        }
         let size = GlobalSize(h);
-        if size < 8 { return None; } // PNG signature is 8 bytes
+        if size < 8 {
+            return None;
+        } // PNG signature is 8 bytes
         let ptr = GlobalLock(h);
-        if ptr == 0 { return None; }
+        if ptr == 0 {
+            return None;
+        }
         let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
         // Validate PNG signature before trusting the payload
         if bytes.len() < 8 || bytes[0..8] != [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] {
@@ -3431,29 +4294,39 @@ fn clipboard_dib_to_bmp() -> Option<String> {
     struct CloseClipboardOnDrop;
     impl Drop for CloseClipboardOnDrop {
         fn drop(&mut self) {
-            unsafe { CloseClipboard(); }
+            unsafe {
+                CloseClipboard();
+            }
         }
     }
 
     unsafe {
         // 1. Open clipboard
-        if OpenClipboard(0) == 0 { return None; }
+        if OpenClipboard(0) == 0 {
+            return None;
+        }
         let _guard = CloseClipboardOnDrop;
 
         // 2. Try CF_DIBV5 first, then CF_DIB
         let h_dibv5 = GetClipboardData(CF_DIBV5);
         let h_dib = GetClipboardData(CF_DIB);
         let h_used = if h_dibv5 != 0 { h_dibv5 } else { h_dib };
-        if h_used == 0 { return None; }
+        if h_used == 0 {
+            return None;
+        }
 
         // 3. Lock and validate BEFORE any bulk copy. GlobalSize returns the
         //    allocation size of the HGLOBAL; a broken handle (or an owner that
         //    lied about the format) must never feed an out-of-bounds read.
         let size = GlobalSize(h_used);
         // DIB header is at least 40 bytes (BITMAPINFOHEADER)
-        if size < 40 { return None; }
+        if size < 40 {
+            return None;
+        }
         let ptr = GlobalLock(h_used);
-        if ptr == 0 { return None; }
+        if ptr == 0 {
+            return None;
+        }
         let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
 
         // Header sanity check — reject obviously corrupt DIBs.
@@ -3491,7 +4364,9 @@ fn clipboard_dib_to_bmp() -> Option<String> {
         if bi_compression == 4 || bi_compression == 5 {
             let ext = if bi_compression == 4 { "jpg" } else { "png" };
             let payload_start = bi_size as usize;
-            if payload_start >= dib.len() { return None; }
+            if payload_start >= dib.len() {
+                return None;
+            }
             let payload: Vec<u8> = dib[payload_start..].to_vec();
             let temp_path = temp_image_path("clip", ext);
             std::fs::write(&temp_path, &payload).ok()?;
@@ -3500,8 +4375,11 @@ fn clipboard_dib_to_bmp() -> Option<String> {
 
         // 5. Calculate bfOffBits: BMP header + DIB header size (incl. masks for BI_BITFIELDS)
         let mut dib_header_size: u32 = bi_size as u32;
-        if bi_compression == 3 { dib_header_size += 12; }
-        else if bi_bit_count <= 8 { dib_header_size += (1u32 << bi_bit_count) * 4; }
+        if bi_compression == 3 {
+            dib_header_size += 12;
+        } else if bi_bit_count <= 8 {
+            dib_header_size += (1u32 << bi_bit_count) * 4;
+        }
         let pixel_offset: u32 = 14 + dib_header_size;
         let file_size: u32 = (14 + size) as u32;
 
@@ -3546,8 +4424,7 @@ pub fn open_in_vscode() -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
 
-        let dir = std::env::current_dir()
-            .unwrap_or_else(|_| dirs_current_user_home());
+        let dir = std::env::current_dir().unwrap_or_else(|_| dirs_current_user_home());
 
         // Find the VSCode "code" executable — try multiple known paths
         let code_path = find_vscode();
@@ -3565,7 +4442,12 @@ pub fn open_in_vscode() -> Result<(), String> {
             ] {
                 if candidates.exists() {
                     let _ = Command::new("cmd")
-                        .args(["/c", code, "--install-extension", &candidates.to_string_lossy()])
+                        .args([
+                            "/c",
+                            code,
+                            "--install-extension",
+                            &candidates.to_string_lossy(),
+                        ])
                         .creation_flags(0x0800_0000)
                         .spawn();
                     break;
@@ -3721,43 +4603,88 @@ pub fn get_system_language() -> String {
 #[cfg(target_os = "windows")]
 fn lang_id_to_tag(lang_id: u16) -> String {
     match lang_id {
-        0x0804 => "zh-CN".into(),  // Chinese (Simplified, PRC)
-        0x0404 => "zh-TW".into(),  // Chinese (Traditional, Taiwan)
+        0x0804 => "zh-CN".into(),                   // Chinese (Simplified, PRC)
+        0x0404 => "zh-TW".into(),                   // Chinese (Traditional, Taiwan)
         0x0c04 | 0x1404 | 0x1004 => "zh-HK".into(), // Chinese (HK/Macau/Singapore)
-        0x0409 | 0x0809 | 0x0c09 | 0x1009 | 0x1409 | 0x1809 | 0x1c09 | 0x2009 | 0x2409 | 0x2809 | 0x2c09 | 0x3009 | 0x3409 => "en".into(), // English (all variants)
-        0x0411 => "ja".into(),      // Japanese
-        0x0412 => "ko".into(),      // Korean
-        0x0407 => "de".into(),      // German
-        0x040c => "fr".into(),      // French
-        0x0410 => "it".into(),      // Italian
-        0x0c0a => "es".into(),      // Spanish
-        0x0416 => "pt-BR".into(),   // Portuguese (Brazil)
-        0x0419 => "ru".into(),      // Russian
-        0x0401 => "ar".into(),      // Arabic
-        0x041d => "sv".into(),      // Swedish
-        0x041f => "tr".into(),      // Turkish
-        0x0413 => "nl".into(),      // Dutch
-        0x0414 => "nb".into(),      // Norwegian
-        0x0415 => "pl".into(),      // Polish
-        0x0405 => "cs".into(),      // Czech
-        0x040e => "hu".into(),      // Hungarian
-        0x040b => "fi".into(),      // Finnish
-        0x0406 => "da".into(),      // Danish
-        0x0408 => "el".into(),      // Greek
-        0x040d => "he".into(),      // Hebrew
-        0x0421 => "id".into(),      // Indonesian
-        0x041a => "hr".into(),      // Croatian
-        0x0418 => "ro".into(),      // Romanian
-        0x041b => "sk".into(),      // Slovak
-        0x0424 => "sl".into(),      // Slovenian
-        0x0422 => "uk".into(),      // Ukrainian
-        0x0425 => "et".into(),      // Estonian
-        0x0426 => "lv".into(),      // Latvian
-        0x0427 => "lt".into(),      // Lithuanian
-        0x0429 => "fa".into(),      // Persian
-        0x041e => "th".into(),      // Thai
-        0x042a => "vi".into(),      // Vietnamese
-        _ => "en".into(),           // Fallback to English
+        0x0409 | 0x0809 | 0x0c09 | 0x1009 | 0x1409 | 0x1809 | 0x1c09 | 0x2009 | 0x2409 | 0x2809
+        | 0x2c09 | 0x3009 | 0x3409 => "en".into(), // English (all variants)
+        0x0411 => "ja".into(),                      // Japanese
+        0x0412 => "ko".into(),                      // Korean
+        0x0407 => "de".into(),                      // German
+        0x040c => "fr".into(),                      // French
+        0x0410 => "it".into(),                      // Italian
+        0x0c0a => "es".into(),                      // Spanish
+        0x0416 => "pt-BR".into(),                   // Portuguese (Brazil)
+        0x0419 => "ru".into(),                      // Russian
+        0x0401 => "ar".into(),                      // Arabic
+        0x041d => "sv".into(),                      // Swedish
+        0x041f => "tr".into(),                      // Turkish
+        0x0413 => "nl".into(),                      // Dutch
+        0x0414 => "nb".into(),                      // Norwegian
+        0x0415 => "pl".into(),                      // Polish
+        0x0405 => "cs".into(),                      // Czech
+        0x040e => "hu".into(),                      // Hungarian
+        0x040b => "fi".into(),                      // Finnish
+        0x0406 => "da".into(),                      // Danish
+        0x0408 => "el".into(),                      // Greek
+        0x040d => "he".into(),                      // Hebrew
+        0x0421 => "id".into(),                      // Indonesian
+        0x041a => "hr".into(),                      // Croatian
+        0x0418 => "ro".into(),                      // Romanian
+        0x041b => "sk".into(),                      // Slovak
+        0x0424 => "sl".into(),                      // Slovenian
+        0x0422 => "uk".into(),                      // Ukrainian
+        0x0425 => "et".into(),                      // Estonian
+        0x0426 => "lv".into(),                      // Latvian
+        0x0427 => "lt".into(),                      // Lithuanian
+        0x0429 => "fa".into(),                      // Persian
+        0x041e => "th".into(),                      // Thai
+        0x042a => "vi".into(),                      // Vietnamese
+        _ => "en".into(),                           // Fallback to English
+    }
+}
+
+#[cfg(test)]
+mod local_model_slots_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 清单写 `-np 2` ⇒ 2 槽（这是把 `-np 1` 改成 `-np 2` 后宿主必须跟着读的那条）。
+    #[test]
+    fn slots_come_from_the_manifest_args() {
+        let args = vec![
+            json!("-c"),
+            json!("8192"),
+            json!("-np"),
+            json!("2"),
+            json!("--port"),
+            json!("8090"),
+        ];
+        assert_eq!(local_slots(&args), 2);
+        assert_eq!(arg_value(&args, "--port").as_deref(), Some("8090"));
+    }
+
+    /// 老清单 / 没写 / 非法值 ⇒ **一律 1 槽**（= 改造前的单槽行为，不新增并发）。
+    #[test]
+    fn slots_fall_back_to_one() {
+        assert_eq!(local_slots(&[json!("-np"), json!("1")]), 1);
+        assert_eq!(local_slots(&[json!("--port"), json!("8090")]), 1);
+        assert_eq!(local_slots(&[json!("-np"), json!("0")]), 1);
+        assert_eq!(local_slots(&[json!("-np")]), 1);
+        assert_eq!(local_slots(&[json!("-np"), json!("abc")]), 1);
+    }
+
+    /// `--parallel` 的两种写法都认（llama.cpp 里两个名字等价）。
+    #[test]
+    fn parallel_spellings_are_accepted() {
+        assert_eq!(local_slots(&[json!("--parallel"), json!("2")]), 2);
+        assert_eq!(local_slots(&[json!("--parallel=2")]), 2);
+    }
+
+    /// 上限归 agent 侧卡（`decide::MAX_LOCAL_SLOTS`）⇒ 宿主原样透传，不在这里降级。
+    #[test]
+    fn host_does_not_clamp_the_upper_bound() {
+        assert_eq!(local_slots(&[json!("-np"), json!("9")]), 9);
     }
 }
 
@@ -3833,7 +4760,12 @@ mod pet_side_file_tests {
         let p = resolve_pet_side_file(&model, "lunac.chains.json").unwrap();
         assert_eq!(p, old);
         assert!(old.is_file());
-        assert_eq!(read_side_file(&model, "lunac.chains.json", "动作链文件").unwrap().unwrap(), "{\"c\":1}");
+        assert_eq!(
+            read_side_file(&model, "lunac.chains.json", "动作链文件")
+                .unwrap()
+                .unwrap(),
+            "{\"c\":1}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3843,7 +4775,8 @@ mod pet_side_file_tests {
         let (dir, model) = fake_model("write");
         let old = dir.join("lunac.params.json");
         std::fs::write(&old, "{\"stale\":1}").unwrap();
-        let ret = write_side_file(&model, "lunac.params.json", "{\"fresh\":2}", "参数缓存").unwrap();
+        let ret =
+            write_side_file(&model, "lunac.params.json", "{\"fresh\":2}", "参数缓存").unwrap();
         let want = dir.join("lunac-live2d").join("lunac.params.json");
         assert_eq!(Path::new(&ret), want);
         assert_eq!(std::fs::read_to_string(&want).unwrap(), "{\"fresh\":2}");
@@ -3868,7 +4801,9 @@ mod pet_side_file_tests {
         let authored = dir.join("author.motion3.json");
         std::fs::write(&authored, "{}").unwrap();
         assert_eq!(
-            find_motion_file(&model, "author.motion3.json").unwrap().unwrap(),
+            find_motion_file(&model, "author.motion3.json")
+                .unwrap()
+                .unwrap(),
             authored
         );
         let renamed = rename_motion_file(

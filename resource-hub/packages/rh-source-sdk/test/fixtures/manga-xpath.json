@@ -1,0 +1,13 @@
+{
+  "api": "1",
+  "type": "anime",
+  "name": "Fixture XPath",
+  "version": "1.0",
+  "baseURL": "https://fixture.example/",
+  "searchURL": "https://fixture.example/search?query=@keyword",
+  "searchList": "//div[@class='item']",
+  "searchName": "//div[@class='item']/a",
+  "searchResult": "//div[@class='item']/a",
+  "chapterRoads": "//ul[@id='chapters']",
+  "chapterResult": "//li/a"
+}

@@ -1,0 +1,32 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "harness.broken",
+    "name": "Harness Broken",
+    "version": "1.0.0",
+    "kind": ["comic"],
+    "engine": "declarative",
+    "entry": "rule.json",
+    "baseUrl": "http://localhost:8123",
+    "capabilities": ["search", "explore"]
+  },
+  "rule": {
+    "search": {
+      "request": { "method": "GET", "url": "/test/fixtures/does-not-exist.json" },
+      "list": { "jsonPath": "$.data[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } }
+      }
+    },
+    "explore": {
+      "request": { "method": "GET", "url": "/test/fixtures/does-not-exist.json" },
+      "list": { "jsonPath": "$.data[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } }
+      }
+    }
+  },
+  "warnings": []
+}

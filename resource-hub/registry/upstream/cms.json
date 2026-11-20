@@ -1,0 +1,44 @@
+[
+  {
+    "name": "百度采集",
+    "key": "baidu",
+    "version": "1.0.0",
+    "api": "https://api.apibdzy.com/api.php/provide/vod",
+    "note": "2026-10-21 探测：搜索 25 集直链 m3u8，延迟约 1.2s"
+  },
+  {
+    "name": "暴风采集",
+    "key": "baofeng",
+    "version": "1.0.0",
+    "api": "https://bfzyapi.com/api.php/provide/vod",
+    "note": "2026-10-21 探测：搜索 46 集直链 m3u8，延迟约 1.9s"
+  },
+  {
+    "name": "虎牙采集",
+    "key": "huya",
+    "version": "1.0.0",
+    "api": "https://www.huyaapi.com/api.php/provide/vod/from/hym3u8",
+    "note": "2026-10-21 探测：搜索 36 集直链 m3u8，延迟约 0.8s"
+  },
+  {
+    "name": "量子采集",
+    "key": "liangzi",
+    "version": "1.0.0",
+    "api": "https://cj.lziapi.com/api.php/provide/vod",
+    "note": "2026-10-21 探测：搜索 36 集（直链与播放页混合），延迟约 0.5s"
+  },
+  {
+    "name": "非凡采集",
+    "key": "feifan",
+    "version": "1.0.0",
+    "api": "https://api.ffzyapi.com/api.php/provide/vod",
+    "note": "2026-10-21 探测：搜索 31 集（播放页需 WebView 嗅探），延迟约 1.1s"
+  },
+  {
+    "name": "火狐采集",
+    "key": "huohu",
+    "version": "1.0.0",
+    "api": "https://hhzyapi.com/api.php/provide/vod",
+    "note": "2026-10-21 探测：搜索 36 集（播放页需 WebView 嗅探），延迟约 1.0s"
+  }
+]

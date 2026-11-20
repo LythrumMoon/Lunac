@@ -202,7 +202,7 @@
     <!-- 自定义背景图层（嵌入结果区/插件界面，随面板大小贴合，默认无图） -->
     <div id="app-bg-image"></div>
     <!-- AI history left drawer (golden ratio ~38.2%) -->
-    <div id="chat-drawer" class="hidden">
+    <div id="chat-drawer" class="hidden" aria-hidden="true">
       <div id="chat-drawer-header">
         <span>Conversations</span>
         <button id="chat-drawer-close" title="Close history">
@@ -221,6 +221,10 @@
       <div id="chat-drawer-list"></div>
     </div>
     <div id="results-list"></div>
+    <!-- 常驻锚点：聊天侧栏（2026-10-18，C.4.1）。
+         内容由 main.ts 的 syncChatSidebar() 按清单 `render.slots` 挂载；
+         **无插件时整块 hidden**（不留空占位），卸载后由 sync 清空。 -->
+    <aside id="chat-sidebar" class="hidden" aria-hidden="true"></aside>
     <!-- 「提问节点」（2026-10-02；同日按用户要求改成**右侧竖排小圆点**）：
          常驻的只有**一排点** —— 其中一颗高亮 = 「现在读到哪条提问」；鼠标移到轨道上才展开
          列出问题正文的窗口（移开即收）。
@@ -238,23 +242,31 @@
     <div id="chat-node-rail" class="hidden">
       <div id="chat-node-dots"></div>
     </div>
-      <!-- 任务抽屉（2026-09-21）：待办清单**不再占用对话链路**，改成输入框上方的一条小抽屉。
-           没有内容（既无待办、也无改动文件）时整块隐藏；「确认」= 收工，清空并收起抽屉。
-           结构：标题 + 进度文本 + 三个按钮（详细任务 / 更改文件 / 确认）+ 两个可展开的列表。
-           图标（`✔ ◐ ○` 与 `📋`）按用户要求全部去掉，状态只用文字颜色区分。 -->
+      <!-- 任务抽屉（2026-09-21；2026-10-22 改三页签）：
+           待办 / 改动文件 / 后台命令收进输入框上方一条小抽屉。**三页互斥**（只显示一页）：
+           左侧三个分页按钮，右侧显示当前页的数量文本；「确认」只在待办页右下角。
+           没有内容（三页全空）时整块隐藏。状态**不用 emoji**：完成与否靠左侧小方块（CSS）区分。 -->
       <div id="todo-drawer" class="hidden">
         <div id="todo-drawer-head">
-          <span id="todo-drawer-title"></span>
-          <span id="todo-drawer-progress"></span>
-          <button id="todo-drawer-tasks-btn" type="button"></button>
-          <button id="todo-drawer-files-btn" type="button"></button>
-          <button id="todo-drawer-ok-btn" type="button"></button>
+          <div id="todo-drawer-tabs">
+            <button id="todo-drawer-tab-tasks" type="button" data-drawer-tab="tasks"></button>
+            <button id="todo-drawer-tab-files" type="button" data-drawer-tab="files"></button>
+            <button id="todo-drawer-tab-bg" type="button" data-drawer-tab="bg"></button>
+          </div>
+          <span id="todo-drawer-count"></span>
         </div>
-        <ul id="todo-drawer-tasks" class="todo-items hidden"></ul>
-        <ul id="todo-drawer-files" class="todo-items hidden"></ul>
-        <!-- 后台运行的命令（2026-10-01）：与上面两个不同，它**始终展开** ——
-             用户正等着它跑完，不该再点一层才看得见；每行右侧一颗「取消」。 -->
-        <ul id="todo-drawer-bg" class="todo-items hidden"></ul>
+        <div id="todo-drawer-page-tasks" class="todo-page">
+          <ul id="todo-drawer-tasks" class="todo-items"></ul>
+          <div id="todo-drawer-tasks-foot">
+            <button id="todo-drawer-ok-btn" type="button"></button>
+          </div>
+        </div>
+        <div id="todo-drawer-page-files" class="todo-page hidden">
+          <ul id="todo-drawer-files" class="todo-items"></ul>
+        </div>
+        <div id="todo-drawer-page-bg" class="todo-page hidden">
+          <ul id="todo-drawer-bg" class="todo-items"></ul>
+        </div>
       </div>
       <!-- 审批停靠位（2026-10-02 用户要求「权限卡 / 计划卡停靠输入框位置」）：
            卡片出现在这里（输入栏正上方），出现期间输入栏整条让位（body.approval-open，
@@ -331,6 +343,7 @@
                 <button type="button" class="chat-hist-tab" data-more-tab="workspace" aria-pressed="false"></button>
                 <button type="button" class="chat-hist-tab" data-more-tab="tools" aria-pressed="false"></button>
                 <button type="button" class="chat-hist-tab" data-more-tab="persona" aria-pressed="false"></button>
+                <button type="button" class="chat-hist-tab" data-more-tab="security" aria-pressed="false"></button>
                 <button type="button" class="chat-hist-tab" data-more-tab="other" aria-pressed="false"></button>
               </div>
               <!-- 页容器：只有这一层滚动（.chat-more-pages）；页签栏常驻其外，不随内容滚走。 -->
@@ -361,16 +374,17 @@
                 <span class="chat-more-label" id="chat-profile-label"></span>
                 <button id="chat-profile-btn" type="button"></button>
               </div>
-              <!-- 思考开关：两档分段（开 / 关，图标由 main.ts 用既有 THINK_SVG 填入）。
+              <!-- 思考开关：两态开关（开 / 关，图标由 main.ts 用既有 THINK_SVG 填入）。
                    2026-10-16 用户要求从「其他」页挪到「权限」页（id 与逻辑一个不动）。 -->
               <div class="chat-more-row">
-                <span class="chat-more-ic" id="chat-more-think-ic"></span>
-                <span class="chat-more-label" id="chat-more-think-label"></span>
-                <div class="chat-more-seg" id="chat-mode-seg">
-                  <button type="button" data-mode="on"></button>
-                  <button type="button" data-mode="off"></button>
+                  <span class="chat-more-ic" id="chat-more-think-ic"></span>
+                  <span class="chat-more-label" id="chat-more-think-label"></span>
+                  <!-- 两态开关（2026-10-24）：与设置面板同一套 .settings-toggle（全局样式）。 -->
+                  <label class="settings-toggle">
+                    <input type="checkbox" id="chat-mode-toggle" checked>
+                    <span class="settings-toggle-slider"></span>
+                  </label>
                 </div>
-              </div>
                 </div>
                 <div class="chat-more-page" data-more-page="workspace" hidden>
               <!-- 工作区：原独立弹窗的内容，扁平化成一行（无嵌套弹窗） -->
@@ -445,16 +459,63 @@
                 </div>
               </div>
                 </div>
+                <div class="chat-more-page" data-more-page="security" hidden>
+              <!-- 白箱边界账本（W0，2026-11-01）：只记录 / 导出判定，不执行拦截。
+                   口径见 docs/sandbox-research.md；它不是沙箱（forbidden.md §禁用 1）。 -->
+              <div class="chat-more-row chat-more-block">
+                <span class="chat-more-label" id="chat-security-title"></span>
+                <div class="chat-more-hint" id="chat-security-hint"></div>
+                <div class="chat-more-actions">
+                  <button id="chat-security-refresh" type="button"></button>
+                  <button id="chat-security-export" type="button"></button>
+                </div>
+                <div id="chat-security-list" class="chat-security-list"></div>
+                <span id="chat-security-msg" class="chat-more-hint"></span>
+              </div>
+              <div class="chat-more-row chat-more-block">
+                <span class="chat-more-label" id="chat-security-preview-title"></span>
+                <input id="chat-security-preview-input" class="chat-security-input" type="text"
+                       autocomplete="off" spellcheck="false" />
+                <div class="chat-more-actions">
+                  <button id="chat-security-preview-run" type="button"></button>
+                </div>
+                <span id="chat-security-preview-result" class="chat-more-hint"></span>
+                <span id="chat-security-preview-note" class="chat-more-hint"></span>
+              </div>
+                </div>
                 <div class="chat-more-page" data-more-page="other" hidden>
+              <!-- 本地模型决策（2026-10-24 从「设置 → AI」迁入）：开关 + 依赖下载 + 真实探活状态。
+                   「端点已注入」不等于「模型能用」，状态行显示宿主 probe 的结果。 -->
+              <div id="chat-local-model" class="chat-more-block"></div>
               <!-- 阶段状态栏（L4 调试，默认关）：开启后窗口右上角浮出一条「agent 当前阶段」。
-                   与上面几行同构（label + 两档分段）；浮标颜色走四类自定义变量，
+                   与上面几行同构（label + 两态开关）；浮标颜色走四类自定义变量，
                    定位 fixed + pointer-events:none（不占布局、不挡输入框）。见 main.ts setDebugPhase。 -->
               <div class="chat-more-row">
-                <span class="chat-more-label" id="chat-debugphase-label"></span>
-                <div class="chat-more-seg" id="chat-debugphase-seg">
-                  <button type="button" data-mode="on"></button>
-                  <button type="button" data-mode="off"></button>
+                  <span class="chat-more-label" id="chat-debugphase-label"></span>
+                  <label class="settings-toggle">
+                    <input type="checkbox" id="chat-debugphase-toggle">
+                    <span class="settings-toggle-slider"></span>
+                  </label>
                 </div>
+              <!-- 生成中的发送方式（2026-11-02，§待办 3-28.1）：点一下循环三档。
+                   排队 = 本轮结束后再发（默认）；立即插入 = 在轮首安全点注入，不丢当前工作；
+                   暂停 = 在安全点收口并落检查点，输入框里的文字保留待续。 -->
+              <div class="chat-more-row">
+                <span class="chat-more-label" id="chat-steer-label"></span>
+                <button id="chat-steer-btn" type="button"></button>
+              </div>
+              <!-- 定时任务（2026-10-17 阶段 0，从设置面板迁入）：只读列表 + 手动运行。
+                   不提供新建 / 编辑 / 删除；滚动只由 .chat-more-pages 一层承担。 -->
+              <div class="chat-cron-section" id="chat-cron-section">
+                <div class="chat-cron-head">
+                  <span class="chat-cron-title" id="chat-cron-title"></span>
+                  <div class="chat-more-actions">
+                    <button type="button" id="chat-cron-refresh"></button>
+                  </div>
+                </div>
+                <div class="chat-cron-hint" id="chat-cron-hint"></div>
+                <div class="chat-cron-msg" id="chat-cron-msg"></div>
+                <div class="chat-cron-list" id="chat-cron-body"></div>
               </div>
                 </div>
               </div>
@@ -514,7 +575,12 @@
     </div>
     <!-- Status bar (always visible, bottom rounded) -->
     <div id="status-bar">
-      <span id="status-text">Loading...</span>
+      <span id="status-left">
+        <span id="status-text">Loading...</span>
+        <!-- 代理状态泡泡框（2026-11-03）：只表示「服务（系统代理）」开/关，
+             文案与状态由 main.ts 的 renderProxyPill 写入。 -->
+        <span id="proxy-state-pill" class="hidden">代理:关</span>
+      </span>
       <span id="token-dashboard" class="hidden"></span>
       <span id="status-hint">Esc to close</span>
     </div>

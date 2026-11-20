@@ -821,6 +821,9 @@ let playlists: PlaylistDto[] | null = null;
 let playlistsLoading = false;
 
 let queue: QueueDto | null = null;
+/** 上一次写进**插件窗标题**的文本（2026-10-24）：只在换曲时写一次，
+ *  不在每帧刷新里重复 invoke。 */
+let lastWinTitle = "";
 let queueOpen = false;
 /** 队列内容对应的曲目 id：只在换歌时才重拉（否则每秒一次 API 调用）。 */
 let queueFor = "";
@@ -1294,6 +1297,11 @@ let progressTimer: number | undefined;
 let progressBaseMs = 0;
 let progressBaseAt = 0;
 let unlistenAuth: (() => void) | null = null;
+/** 任务栏缩略图按钮的事件监听（2026-10-27）：宿主子类化插件窗后，
+ *  点缩略图里的上一曲 / 播放暂停 / 下一曲会回发 `music-taskbar`。 */
+let unlistenTaskbar: (() => void) | null = null;
+/** 上一次下发给宿主的任务栏参数（`syncTaskbarThumb` 的去重记账）——值没变就不重复 invoke。 */
+let lastThumbArgs: { hasPrev: boolean; hasNext: boolean; playing: boolean } | null = null;
 let currentRoot: HTMLElement | null = null;
 /** 运行代次：attach 每次递增，旧回调据此丢弃自己的结果（防「关了又开」时的串扰）。 */
 let gen = 0;
@@ -3981,6 +3989,17 @@ function renderSide(root: HTMLElement) {
       : items.map(it => libRowHtml(sideTab, it)).join("");
   }
   setHtml(box, html);
+  // 打开播放队列时**定位到当前正在播放的那一首**（2026-10-24 用户口径）：
+  // 队列可能很长，固定在顶部会让人第一眼看不到「现在放到哪」。
+  // 用 `requestAnimationFrame` 是因为 `setHtml` 刚换完节点，等这一帧布局完成再滚，
+  // 否则 `scrollIntoView` 拿到的是旧高度、滚不到位。
+  if (localQueueOpen && localQueueIndex >= 0) {
+    const idx = localQueueIndex;
+    requestAnimationFrame(() => {
+      const row = box.querySelector<HTMLElement>(`[data-act="queue-play"][data-i="${idx}"]`);
+      row?.scrollIntoView({ block: "nearest" });
+    });
+  }
 }
 
 /** 只把「主区正在看哪一项」的选中态同步到左栏（**不重建列表**）。
@@ -4517,7 +4536,7 @@ function renderLocalList(root: HTMLElement) {
  *  （能入库 = 能出声 / 能出画面）；这里只是给文件对话框一个初筛，真播不了由宿主如实报错。 */
 const QUEUE_EXTS = [
   "mp3", "flac", "m4a", "m4b", "mp4", "aac", "ogg", "oga", "opus", "spx", "wav", "wave",
-  "aif", "aiff", "aifc", "ape", "wv", "mpc", "m4v", "mov",
+  "aif", "aiff", "aifc", "ape", "wv", "mpc", "m4v", "mov", "webm",
 ];
 
 /** 把一个文件路径包成一条本地曲目。**只有 `path` 是硬信息**，其余字段走文件名兜底 ——
@@ -5124,6 +5143,51 @@ function renderLocalQueueDD(root: HTMLElement) {
   setHtml(box, html);
 }
 
+/** 把「歌名 - 歌手」写进插件窗标题（2026-10-24 用户口径）。
+ *
+ *  Alt+Tab / Win+Tab 的任务切换界面显示的是**窗口标题**，而插件窗建窗时标题写死为
+ *  插件 id（`plugin_window.rs` 的 `.title(plugin_id)`）⇒ 音乐窗永远只显示 "music"。
+ *  这里在每次本地曲目变化时同步一次；宿主命令只对 `plugin-*` 窗口生效，
+ *  所以本插件跑在主面板里时调用是 no-op，不必自己判断「我现在在哪」。
+ *  传空串 = 没有在播 ⇒ 回落插件名。 */
+function syncWindowTitle(name: string, artist: string) {
+  const fallback = (() => {
+    const v = t("plugin.music");
+    return v === "plugin.music" ? "music" : v;
+  })();
+  const next = name ? (artist ? `${name} - ${artist}` : name) : fallback;
+  if (next === lastWinTitle) return;
+  lastWinTitle = next;
+  void invoke("plugin_window_set_title", { title: next }).catch(() => {});
+}
+
+/** 把本地播放状态推给宿主的**任务栏缩略图工具栏**（2026-10-27 用户口径）。
+ *
+ *  任务栏缩略图预览里的「上一曲 / 播放(暂停) / 下一曲」是宿主的原生按钮
+ *  （`ITaskbarList3`，见 `taskbar_thumb.rs`），不是网页控件 —— 这里只负责把三件事
+ *  推过去：两侧按钮可不可用、中间那枚画「播放」还是「暂停」。
+ *
+ *  `hasPrev` / `hasNext` 按 `localQueue.length > 1` 近似（与 UI 上那两枚的置灰判据
+ *  同源；真正的边界判定在 `advanceLocal` 里，按播放模式还会绕回）。
+ *
+ *  挂在 `renderLocalNowbar`（每一个本地状态变化的必经之路）上，而那个函数会被每拍
+ *  调用 ⇒ **值没变就不重复 invoke**（去重记账 = `lastThumbArgs`）。
+ *  主窗口里的音乐面板调用它是 no-op（宿主只认 `plugin-*` 窗），不必自己判形态。 */
+function syncTaskbarThumb() {
+  const multi = localQueue.length > 1;
+  const next = {
+    hasPrev: multi,
+    hasNext: multi,
+    playing: !!(localPlayer?.active && localPlayer.playing),
+  };
+  const last = lastThumbArgs;
+  if (last && last.hasPrev === next.hasPrev && last.hasNext === next.hasNext && last.playing === next.playing) {
+    return;
+  }
+  lastThumbArgs = next;
+  void invoke("taskbar_thumb_set", next).catch(() => {});
+}
+
 /** 本地播放条（`#music-lnowbar`）。
  *
  *  **「本地页 + 有会话」时出现**：没有会话时它没有任何可控制的对象（与
@@ -5141,6 +5205,9 @@ function renderLocalQueueDD(root: HTMLElement) {
  *  （那正是这把开关的意思），于是它会短暂处于「在放、但当前这一页没有它的控制条」
  *  ——切回本地页就又能控制。这是用户明确要的取舍，不是漏判。 */
 function renderLocalNowbar(root: HTMLElement) {
+  // 任务栏缩略图工具栏（2026-10-27）：与下面这些重绘同源 —— 本地状态一变就推一次。
+  // 去重在 `syncTaskbarThumb` 里（值没变不发 IPC），所以放在这个高频必经点上是安全的。
+  syncTaskbarThumb();
   // **画面层的刷新挂在这里**（2026-10-01 用户第 8 条）——放在最前面、早于下面两条
   // `return`：那两条一旦命中（栏不可见 / 没有会话），画面层恰恰也该跟着拆掉，
   // 排在它们后面就会「栏收掉了、画面还挂在那里空转」。
@@ -5172,6 +5239,7 @@ function renderLocalNowbar(root: HTMLElement) {
   const path = (lp && live ? lp.path : "") || tr?.path || "";
   if (!tr && !live) {
     // 空态（栏常驻之后才有这一支）：没播过任何本地歌曲时给一句话，而不是一条空白盒。
+    syncWindowTitle("", "");
     setText(bar.querySelector("#music-lnow-n"), t("music.local_bar_empty"));
     setText(bar.querySelector("#music-lnow-a"), "");
     setHtml(bar.querySelector("#music-lnow-cover"), SVG.note);
@@ -5181,6 +5249,8 @@ function renderLocalNowbar(root: HTMLElement) {
     if (bp0 && localSeekRatio < 0) bp0.style.setProperty("--seek-pct", "0%");
   } else {
     const name = tr?.title || path.split(/[\\/]/).pop() || path;
+    // 窗口标题跟着换曲（Alt+Tab / 任务栏预览都读它）；只在插件窗里生效。
+    syncWindowTitle(name, tr?.artist ?? "");
     setText(bar.querySelector("#music-lnow-n"), name);
     setText(bar.querySelector("#music-lnow-a"), tr ? [tr.artist, tr.album].filter(Boolean).join(" · ") : "");
     setHtml(
@@ -5574,6 +5644,8 @@ function closeMediaPlaylist(root: HTMLElement) {
 function localErrText(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
   if (raw.includes("ERR_NO_AUDIO_DEVICE")) return t("music.local_no_device");
+  if (raw.includes("ERR_NO_FFMPEG")) return t("music.local_no_ffmpeg");
+  if (raw.includes("ERR_FFMPEG_RUN")) return t("music.local_ffmpeg_failed");
   if (raw.includes("找不到这个文件")) return t("music.local_file_missing");
   if (raw.includes("解不开") || raw.includes("打不开")) return t("music.local_decode_failed");
   return raw;
@@ -5594,6 +5666,9 @@ async function startLocalPlay(root: HTMLElement, path: string, resumeMs = 0): Pr
   // **放在 `localBusy` 之后**：这一下若因为重入被丢掉，就没必要去停对面。
   await enforceExclusive(root, "local");
   localBusy = true;
+  // `.webm` 首播要宿主导 ffmpeg 抽音轨（缓存命中后不再转）：先说一句，
+  // 否则十几秒没有任何反馈，看起来像卡死。
+  if (/\.webm$/i.test(path)) note(root, t("music.local_webm_warmup"));
   try {
     localPlayer = await invoke<LocalPlayerDto>("player_play", { path });
   } catch (e) {
@@ -7121,6 +7196,19 @@ export async function attachMusicListeners(root: HTMLElement) {
     } else {
       msg(ev.payload.message || t("music.auth_failed"));
     }
+  });
+
+  // 任务栏缩略图按钮（2026-10-27）：宿主在 `plugin-*` 窗上装了 ITaskbarList3 的三枚
+  // 按钮，点按时回发这条事件。宿主用**定向 emit**（目标 = 本窗 label），所以曲线窗
+  // 与主面板不会收到别人的点击。
+  if (unlistenTaskbar) { unlistenTaskbar(); unlistenTaskbar = null; }
+  // 窗口可能被复用去装别的插件 / 重开面板 ⇒ 这次挂载要重新推一遍任务栏状态
+  lastThumbArgs = null;
+  unlistenTaskbar = await listen<string>("music-taskbar", (ev) => {
+    if (!view.isConnected) return;
+    if (ev.payload === "prev") void advanceLocal(view, -1, false);
+    else if (ev.payload === "next") void advanceLocal(view, 1, false);
+    else if (ev.payload === "toggle") void toggleLocalPause(view);
   });
 
   // ── 两态互切 ──
@@ -8712,6 +8800,10 @@ export async function attachMusicListeners(root: HTMLElement) {
   renderQueue(view);
   syncPlayerBody(view);
   renderStatus(view);
+  // 任务栏缩略图工具栏**开窗就要有**（2026-10-27）：上面那些 render 不一定走到
+  // `renderLocalNowbar`（默认态是 Spotify 页），而宿主是「第一次调用时才 AddButtons」——
+  // 不在这里补一次，用户要先进一次本地页才能看到那三枚按钮。
+  syncTaskbarThumb();
   // 429 硬闸是**进程级 + 粘性**的：面板关掉再打开时模块态是新的，必须问宿主一次，
   // 否则用户会看到「请求全被拒 + 没有恢复按钮」的死局（见 SpotifyApiStateDto）。
   // **放在 startPolling 之前**：别让第一次 tick 在「还不知道闸拉着」时白打一轮请求。
@@ -8778,6 +8870,9 @@ export function stopMusicPolling() {
     void invoke("player_stop").catch(() => {});
   }
   if (unlistenAuth) { unlistenAuth(); unlistenAuth = null; }
+  if (unlistenTaskbar) { unlistenTaskbar(); unlistenTaskbar = null; }
+  // 面板没了 ⇒ 下一次挂载必须重新把任务栏状态推一遍（去重记账跟着作废）
+  lastThumbArgs = null;
   // 进度线节点随面板一起被拆掉了，别留着悬空引用（下次 attach 会重新收集）
   seekBars = [];
   // 抽屉的「翻到另一侧」也不带出去（下次挂载从「当前页自己那条」开始，见 barSwap）

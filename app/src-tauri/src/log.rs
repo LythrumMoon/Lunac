@@ -103,12 +103,12 @@ fn now_utc() -> (i64, u32, u32, u32, u32, u32) {
     (y, mo, d, h, mi, s)
 }
 
-fn utc_date() -> String {
+pub(crate) fn utc_date() -> String {
     let (y, mo, d, ..) = now_utc();
     format!("{y:04}-{mo:02}-{d:02}")
 }
 
-fn utc_stamp() -> String {
+pub(crate) fn utc_stamp() -> String {
     let (y, mo, d, h, mi, s) = now_utc();
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
@@ -491,7 +491,7 @@ fn match_prefixed_token(chars: &[char], i: usize) -> Option<usize> {
     const PREFIXES: [&str; 10] = [
         "ghp_", "gho_", "ghs_", "ghu_", // GitHub PAT / OAuth / server / user
         "xoxb-", "xoxp-", "xoxa-", // Slack bot / user / app
-        "AIza",   // Google API key
+        "AIza",  // Google API key
         "AKIA", "ASIA", // AWS access key id
     ];
     for p in PREFIXES {
@@ -515,7 +515,9 @@ fn match_prefixed_token(chars: &[char], i: usize) -> Option<usize> {
 /// JWT 头恒以 `eyJ` 开头（base64url 的 `{"`），据此锚定，普通文本不会误伤。
 fn match_jwt(chars: &[char], i: usize) -> Option<usize> {
     const HEAD: usize = 3;
-    if chars.get(i) != Some(&'e') || chars.get(i + 1) != Some(&'y') || chars.get(i + 2) != Some(&'J')
+    if chars.get(i) != Some(&'e')
+        || chars.get(i + 1) != Some(&'y')
+        || chars.get(i + 2) != Some(&'J')
     {
         return None;
     }
@@ -558,7 +560,9 @@ fn match_conn_string(chars: &[char], i: usize) -> Option<(usize, usize)> {
     {
         j += 1;
     }
-    if !(chars.get(j) == Some(&':') && chars.get(j + 1) == Some(&'/') && chars.get(j + 2) == Some(&'/'))
+    if !(chars.get(j) == Some(&':')
+        && chars.get(j + 1) == Some(&'/')
+        && chars.get(j + 2) == Some(&'/'))
     {
         return None;
     }
@@ -662,7 +666,10 @@ mod tests {
         let s = r#"{"api_key":"sk-abcdef123456","model":"deepseek-flash"}"#;
         let masked = mask_secrets(s);
         assert!(!masked.contains("abcdef123456"), "secret leaked: {masked}");
-        assert!(masked.contains("deepseek-flash"), "non-secret mangled: {masked}");
+        assert!(
+            masked.contains("deepseek-flash"),
+            "non-secret mangled: {masked}"
+        );
     }
 
     /// 末 4 位是「改了 key 却没生效」这类问题唯一的现场线索，必须留得住 ——
@@ -713,10 +720,20 @@ mod tests {
         ] {
             let s = format!("私钥：\n  -----BEGIN {kind}-----\n  SECRETBBBBODY\n  MORE\n  -----END {kind}-----\n完");
             let m = mask_secrets(&s);
-            assert!(m.contains(&format!("-----BEGIN {kind}-----")), "{kind} BEGIN 行应保留：{m}");
-            assert!(m.contains(&format!("-----END {kind}-----")), "{kind} END 行应保留：{m}");
+            assert!(
+                m.contains(&format!("-----BEGIN {kind}-----")),
+                "{kind} BEGIN 行应保留：{m}"
+            );
+            assert!(
+                m.contains(&format!("-----END {kind}-----")),
+                "{kind} END 行应保留：{m}"
+            );
             assert!(!m.contains("SECRETBBBBODY"), "{kind} 私钥体泄露：{m}");
-            assert_eq!(m.matches('\n').count(), s.matches('\n').count(), "{kind} 换行数必须不变：{m}");
+            assert_eq!(
+                m.matches('\n').count(),
+                s.matches('\n').count(),
+                "{kind} 换行数必须不变：{m}"
+            );
             assert!(m.contains("\n  ***\n"), "{kind} 续行缩进被破坏：{m}");
         }
         // 证书 / 公钥（非机密）不动
@@ -734,7 +751,10 @@ mod tests {
             ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
         );
         let m = mask_secrets(&format!("here {jwt} end"));
-        assert!(!m.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"), "JWT 泄露：{m}");
+        assert!(
+            !m.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+            "JWT 泄露：{m}"
+        );
         assert!(m.starts_with("here eyJ"), "锚定头 eyJ 应保留：{m}");
         assert!(m.ends_with(" end"), "尾部普通文本不该动：{m}");
         // 只有两段 ⇒ 不是 JWT，原样保留
@@ -767,7 +787,10 @@ mod tests {
     #[test]
     fn mask_hides_bare_connection_string() {
         // 夹具拆段拼接：拼接后口令仍在（照常只抹口令），源码里不再成形。
-        let m = mask_secrets(concat!("dsn=postgres://alice:s3cr", "etPw@db.internal:5432/app"));
+        let m = mask_secrets(concat!(
+            "dsn=postgres://alice:s3cr",
+            "etPw@db.internal:5432/app"
+        ));
         assert!(!m.contains("s3cretPw"), "连接串口令泄露：{m}");
         assert_eq!(m, "dsn=postgres://alice:***@db.internal:5432/app");
         let plain = "see https://example.com/path?q=1";
@@ -777,14 +800,19 @@ mod tests {
     /// 多行 bullet 的形状守卫：`- ` 起头、续行缩进、换行数都不受脱敏影响。
     #[test]
     fn mask_keeps_multiline_bullet_shape() {
-        let s = "- 用户提到 key sk-live-99887766\n  第二行：token=abcdef123456\n  普通续行\n- 另一条";
+        let s =
+            "- 用户提到 key sk-live-99887766\n  第二行：token=abcdef123456\n  普通续行\n- 另一条";
         let m = mask_secrets(s);
         assert!(m.starts_with("- "), "首行仍是 bullet：{m}");
         assert!(!m.contains("99887766"), "裸 key 泄露：{m}");
         assert!(!m.contains("abcdef123456"), "键值对泄露：{m}");
         assert!(m.contains("\n  "), "续行缩进被破坏：{m}");
         assert!(m.contains("普通续行"), "普通文本不该动：{m}");
-        assert_eq!(m.matches('\n').count(), s.matches('\n').count(), "换行数必须不变：{m}");
+        assert_eq!(
+            m.matches('\n').count(),
+            s.matches('\n').count(),
+            "换行数必须不变：{m}"
+        );
     }
 
     /// 反向守卫（按实现如实写）：只有「敏感键名 / 锚定前缀」紧跟取值符或形态时才打码，

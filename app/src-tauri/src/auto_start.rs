@@ -15,10 +15,10 @@
 //      否则会出现「关不掉的任务」。删除失败会如实报错（开关弹回去），
 //      不能像早期那样「发个后台线程就不管了」。
 
-use std::process::Command;
+use serde::Serialize;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use serde::Serialize;
+use std::process::Command;
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -137,11 +137,7 @@ fn delete_logon_task() -> Result<(), String> {
 fn create_logon_task() -> Result<(), String> {
     let cmd = startup_command_line()?;
     let out = schtasks_output(&[
-        "/create",
-        "/tn", TASK_NAME,
-        "/tr", &cmd,
-        "/sc", "onlogon",
-        "/f",
+        "/create", "/tn", TASK_NAME, "/tr", &cmd, "/sc", "onlogon", "/f",
     ])?;
     if out.status.success() {
         Ok(())
@@ -538,9 +534,7 @@ pub fn repair_auto_start_on_startup() {
             note("修复检查：计划任务已指向当前 exe，跳过");
         }
         TaskProbe::Command(cmd) => {
-            note(format!(
-                "修复检查：计划任务指向的是别的程序（{cmd}）→ 重建"
-            ));
+            note(format!("修复检查：计划任务指向的是别的程序（{cmd}）→ 重建"));
             rebuild_logon_task();
         }
         // 解析不出来时按旧行为重建：宁可多 spawn 一次，也不能让自愈能力静默消失
@@ -608,7 +602,9 @@ mod tests {
             r"D:\cc\app\src-tauri\TARGET\Release\deps\lunac.exe"
         ));
         assert!(!looks_like_dev_build_path(r"D:\Lunac\lunac.exe"));
-        assert!(!looks_like_dev_build_path(r"C:\Program Files\Lunac\lunac.exe"));
+        assert!(!looks_like_dev_build_path(
+            r"C:\Program Files\Lunac\lunac.exe"
+        ));
         // 测试进程本身就是开发构建（debug 或 target\release 下的 deps）→ 必须判为 true：
         // 一旦这个断言变红，就说明守卫失效、测试机上的自启会被开发构建改写。
         assert!(is_dev_build());

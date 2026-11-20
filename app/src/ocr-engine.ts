@@ -16,10 +16,10 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DownloadMeter, type DownloadSample } from "./download-progress.js";
+import { InstallOverall, type InstallSample } from "./download-progress.js";
 
-/** 进度回调收到的东西：`sample` 是百分比 + 速度，`phase` 是宿主当前在干什么。 */
-export type OcrEngineProgress = DownloadSample & { phase: string };
+/** 进度回调收到的东西：`sample` 是**整次安装**的百分比 + 速度，`phase` 是宿主当前在干什么。 */
+export type OcrEngineProgress = InstallSample & { phase: string };
 
 /**
  * 触发 `ocr` 插件的依赖安装（= 引擎）。
@@ -34,7 +34,7 @@ export function installOcrEngine(
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let unlisten: (() => void) | undefined;
-    const meter = new DownloadMeter();
+    const overall = new InstallOverall();
     void (async () => {
       try {
         unlisten = await listen("plugin-install-progress", (ev) => {
@@ -43,9 +43,11 @@ export function installOcrEngine(
             phase: string;
             downloaded: number;
             total: number;
+            index: number;
+            count: number;
           };
           if (p.id !== "ocr") return;
-          onProgress?.({ ...meter.push(p.downloaded, p.total), phase: p.phase });
+          onProgress?.({ ...overall.push(p), phase: p.phase });
         });
       } catch {
         /* 监听挂不上不该拦住安装本身 —— 大不了没有进度 */

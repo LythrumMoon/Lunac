@@ -42,8 +42,8 @@ use rusqlite::{params_from_iter, types::Value, Connection};
 
 /// 允许入库的**音频**扩展名（`lofty` 认得的那些容器）。**只做初筛**，见头注释第 ① 条。
 const AUDIO_EXTS: &[&str] = &[
-    "mp3", "flac", "m4a", "m4b", "mp4", "aac", "ogg", "oga", "opus", "spx", "wav", "wave",
-    "aif", "aiff", "aifc", "ape", "wv", "mpc",
+    "mp3", "flac", "m4a", "m4b", "mp4", "aac", "ogg", "oga", "opus", "spx", "wav", "wave", "aif",
+    "aiff", "aifc", "ape", "wv", "mpc",
 ];
 
 /// 允许入库的**视频**扩展名（2026-10-01 用户第 8 条：本地播放要支持视频）。
@@ -55,14 +55,17 @@ const AUDIO_EXTS: &[&str] = &[
 ///     `symphonia-isomp4` + `symphonia-aac`（见它的 Cargo.toml `mp4 = [...]`），
 ///     所以上面这三个容器里的音轨**同一条链路就能出声**。
 ///
-/// **刻意不收的三种，理由逐条写清**（别按「常见格式」把它们加进来）：
+/// **`webm`（2026-10-30 用户裁定加入）**：画面 Chromium 认（VP8/VP9/AV1），但音轨
+/// 绝大多数是 **Opus**，rodio 默认特性里没有 opus 解码 ⇒ 由 `player.rs` 先用**本机
+/// ffmpeg** 把音轨抽成临时 m4a 再交给 rodio。因此它多了一条前置条件：**没装 ffmpeg
+/// 就如实拒绝播放**（`ERR_NO_FFMPEG`），不做「有画面没声音」这种静默失败。
+///
+/// **刻意不收的**（别按「常见格式」把它们加进来）：
 ///   · `mkv` / `avi`：Chromium **不出画面**（它不支持这两个容器）⇒ 加进来只会得到
 ///     「点了没反应」或一条没有画面的音频流；
-///   · `webm`：画面能出，但它的音轨绝大多数是 **Opus**，而 rodio 的默认特性里
-///     **没有 opus 解码**（`symphonia-all` 才有）⇒ 会变成「有画面没声音」——
-///     那是最难查的一类静默失败，宁可不收。
+///   · `wmv` / `flv`：同上，Chromium 不解这两个容器。
 /// 想要播这几种的用户，走**已有的转换插件**（ffmpeg）转成 mp4。
-const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov"];
+const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov", "webm"];
 
 /// 目录遍历深度上限（相对根）—— 防「指向 C:\ 的根」把整台机器走穿。
 const MAX_DEPTH: usize = 16;
@@ -143,7 +146,9 @@ fn db_path() -> PathBuf {
 }
 
 fn covers_dir() -> PathBuf {
-    crate::storage::lunac_root_dir().join("temp").join("music-covers")
+    crate::storage::lunac_root_dir()
+        .join("temp")
+        .join("music-covers")
 }
 
 fn now_ms() -> i64 {
@@ -201,7 +206,11 @@ fn normalize_root(input: &str) -> String {
 fn title_from_path(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+        .unwrap_or_else(|| {
+            path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
 }
 
 /// 会不会是「同一份封面」：字节级内容哈希（同专辑几十首共用一张图 ⇒ 只写一个文件）。
@@ -342,9 +351,13 @@ fn parse_pls(text: &str) -> Vec<String> {
         if line.is_empty() || line.starts_with('[') || line.starts_with(';') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let key = k.trim().to_ascii_lowercase();
-        let Some(n) = key.strip_prefix("file") else { continue };
+        let Some(n) = key.strip_prefix("file") else {
+            continue;
+        };
         // `file` 后面必须**全是数字**：不然 `filename=` 这类键也会被当成一首歌。
         if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
             continue;
@@ -382,7 +395,9 @@ fn open(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| format!("打开媒体库失败: {e}"))?;
     // 与 chat_db 同一口径：WAL + 等锁。**扫描写、界面读是并发的**，没有这两条就会
     // 在扫描中途「浏览本地库」时报 database is locked。
-    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=3000;");
+    let _ = conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=3000;",
+    );
     init_schema(&conn)?;
     Ok(conn)
 }
@@ -448,7 +463,8 @@ fn list_roots_on(conn: &Connection) -> Result<Vec<MediaRootDto>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn add_root_on(conn: &Connection, path: &str) -> Result<(), String> {
@@ -463,8 +479,11 @@ fn add_root_on(conn: &Connection, path: &str) -> Result<(), String> {
 /// 删根：**连同它的曲目一起删**（留着就是永不失效的幽灵条目）。
 fn remove_root_on(conn: &mut Connection, path: &str) -> Result<usize, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM tracks WHERE root = ?1", rusqlite::params![path])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM tracks WHERE root = ?1",
+        rusqlite::params![path],
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM roots WHERE path = ?1", rusqlite::params![path])
         .map_err(|e| e.to_string())?;
     let n = tx.changes() as usize;
@@ -505,8 +524,20 @@ fn upsert_track(conn: &Connection, t: &TrackRow) -> Result<(), String> {
              duration_ms=excluded.duration_ms, ext=excluded.ext,
              size=excluded.size, mtime=excluded.mtime, cover=excluded.cover"#,
         rusqlite::params![
-            t.path, t.root, t.title, t.artist, t.album, t.album_artist, t.track_no, t.year,
-            t.genre, t.duration_ms, t.ext, t.size, t.mtime, t.cover
+            t.path,
+            t.root,
+            t.title,
+            t.artist,
+            t.album,
+            t.album_artist,
+            t.track_no,
+            t.year,
+            t.genre,
+            t.duration_ms,
+            t.ext,
+            t.size,
+            t.mtime,
+            t.cover
         ],
     )
     .map_err(|e| format!("写入曲目失败: {e}"))?;
@@ -742,7 +773,10 @@ struct ParsedTags {
 /// 不画假的；真的时长要解码器才知道，而那是播放时的事。
 fn video_fallback_tags(path: &Path) -> ParsedTags {
     ParsedTags {
-        title: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        title: path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         artist: String::new(),
         album: String::new(),
         album_artist: String::new(),
@@ -1155,7 +1189,9 @@ pub async fn media_remove_root(path: String) -> Result<Vec<MediaRootDto>, String
         let norm = normalize_root(&path);
         let mut conn = open_db()?;
         let n = remove_root_on(&mut conn, &norm)?;
-        crate::log::info(&format!("media: 已移除媒体目录 {norm}（同时删掉 {n} 行索引）"));
+        crate::log::info(&format!(
+            "media: 已移除媒体目录 {norm}（同时删掉 {n} 行索引）"
+        ));
         list_roots_on(&conn)
     })
     .await
@@ -1195,8 +1231,11 @@ pub async fn media_delete_file(path: String) -> Result<(), String> {
                 other => other.to_string(),
             })?;
         // 再删库行（已拿到 cover）；删完界面就不会再列出它。
-        conn.execute("DELETE FROM tracks WHERE path = ?1", rusqlite::params![path])
-            .map_err(|e| format!("删除索引失败: {e}"))?;
+        conn.execute(
+            "DELETE FROM tracks WHERE path = ?1",
+            rusqlite::params![path],
+        )
+        .map_err(|e| format!("删除索引失败: {e}"))?;
         // ② 只删**文件**、绝不删目录（目录即便同名也一律跳过）。
         let target = Path::new(&path);
         if target.is_file() {
@@ -1210,7 +1249,10 @@ pub async fn media_delete_file(path: String) -> Result<(), String> {
         if !cover.is_empty() {
             let cover_path = covers_dir().join(&cover);
             if let Err(e) = std::fs::remove_file(&cover_path) {
-                crate::log::warn(&format!("media: 删除封面缓存失败 {}: {e}", cover_path.display()));
+                crate::log::warn(&format!(
+                    "media: 删除封面缓存失败 {}: {e}",
+                    cover_path.display()
+                ));
             }
         }
         crate::log::info(&format!("media: 已删除文件 {path}"));
@@ -1319,7 +1361,7 @@ mod tests {
     /// 视频扩展名（2026-10-01 用户第 8 条）：**它有自己的一张表**，`mp4` 在两张表里都在。
     #[test]
     fn video_extensions_are_their_own_table() {
-        for e in ["mp4", ".MP4", "m4v", "mov"] {
+        for e in ["mp4", ".MP4", "m4v", "mov", "webm"] {
             assert!(is_video_ext(e), "{e} 应该算视频");
             assert!(is_indexable_ext(e), "{e} 应该能进媒体库");
         }
@@ -1327,8 +1369,8 @@ mod tests {
         for e in ["mp3", "flac", "wav", "m4a", "opus"] {
             assert!(!is_video_ext(e), "{e} 不是视频");
         }
-        // 刻意不收的三种（Chromium 不出画面 / 音轨是 Opus）：连库都不该进
-        for e in ["mkv", "avi", "webm", "wmv", "flv"] {
+        // 刻意不收的（Chromium 压根不解这些容器）：连库都不该进
+        for e in ["mkv", "avi", "wmv", "flv"] {
             assert!(!is_video_ext(e), "{e} 刻意不收，理由见 VIDEO_EXTS 的注释");
             assert!(!is_indexable_ext(e), "{e} 不该进媒体库");
         }
@@ -1436,7 +1478,12 @@ mod tests {
         for (p, t, ar, al) in [
             (r"D:\Music\1.mp3", "晴天", "周杰伦", "叶惠美"),
             (r"D:\Music\2.mp3", "夜曲", "周杰伦", "十一月的萧邦"),
-            (r"D:\Music\3.mp3", "Bohemian Rhapsody", "Queen", "A Night at the Opera"),
+            (
+                r"D:\Music\3.mp3",
+                "Bohemian Rhapsody",
+                "Queen",
+                "A Night at the Opera",
+            ),
         ] {
             upsert_track(&c, &track(p, r"D:\Music", t, ar, al)).unwrap();
         }
@@ -1478,7 +1525,10 @@ mod tests {
     /// 没有标签时标题兜底用文件名 —— 但**绝不返回空标题**（界面上会变成一行空白）。
     #[test]
     fn title_falls_back_to_the_file_stem() {
-        assert_eq!(title_from_path(Path::new(r"D:\M\Artist - Song.mp3")), "Artist - Song");
+        assert_eq!(
+            title_from_path(Path::new(r"D:\M\Artist - Song.mp3")),
+            "Artist - Song"
+        );
         assert_eq!(title_from_path(Path::new(r"D:\M\无扩展名")), "无扩展名");
         assert_eq!(title_from_path(Path::new("song.flac")), "song");
     }
@@ -1525,9 +1575,18 @@ mod tests {
     /// 后缀只认那三种（大小写都算），别的一个不接。
     #[test]
     fn only_the_three_playlist_extensions_are_recognised() {
-        assert_eq!(playlist_format(Path::new(r"D:\a.m3u")), Some(PlaylistFormat::M3u));
-        assert_eq!(playlist_format(Path::new(r"D:\a.M3U8")), Some(PlaylistFormat::M3u));
-        assert_eq!(playlist_format(Path::new(r"D:\a.pls")), Some(PlaylistFormat::Pls));
+        assert_eq!(
+            playlist_format(Path::new(r"D:\a.m3u")),
+            Some(PlaylistFormat::M3u)
+        );
+        assert_eq!(
+            playlist_format(Path::new(r"D:\a.M3U8")),
+            Some(PlaylistFormat::M3u)
+        );
+        assert_eq!(
+            playlist_format(Path::new(r"D:\a.pls")),
+            Some(PlaylistFormat::Pls)
+        );
         assert_eq!(playlist_format(Path::new(r"D:\a.mp3")), None);
         assert_eq!(playlist_format(Path::new(r"D:\noext")), None);
     }
@@ -1568,8 +1627,14 @@ mod tests {
     #[test]
     fn entries_resolve_against_the_playlist_directory() {
         let base = Path::new(r"D:\Lists");
-        assert_eq!(resolve_playlist_entry(r"D:\Music\a.mp3", base), PathBuf::from(r"D:\Music\a.mp3"));
-        assert_eq!(resolve_playlist_entry("sub/a.mp3", base), PathBuf::from(r"D:\Lists\sub\a.mp3"));
+        assert_eq!(
+            resolve_playlist_entry(r"D:\Music\a.mp3", base),
+            PathBuf::from(r"D:\Music\a.mp3")
+        );
+        assert_eq!(
+            resolve_playlist_entry("sub/a.mp3", base),
+            PathBuf::from(r"D:\Lists\sub\a.mp3")
+        );
         assert_eq!(
             resolve_playlist_entry("file://D:/Music/a.mp3", base),
             PathBuf::from("D:/Music/a.mp3")
@@ -1636,7 +1701,11 @@ mod tests {
         let dto = read_playlist(&c, &list.display().to_string()).unwrap();
         assert_eq!(dto.total, 1, "坏的那一条要被跳过");
         assert_eq!(dto.items.len(), 1);
-        assert!(dto.items[0].path.ends_with("a.wav"), "{}", dto.items[0].path);
+        assert!(
+            dto.items[0].path.ends_with("a.wav"),
+            "{}",
+            dto.items[0].path
+        );
         assert_eq!(dto.items[0].title, "a", "没有标签 ⇒ 用文件名兜底");
 
         // 不是播放列表的文件要明确报错（界面据此说人话），而不是给一份空列表

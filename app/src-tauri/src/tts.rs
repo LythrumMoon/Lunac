@@ -194,7 +194,13 @@ pub(crate) fn play_wav_bytes(app: &tauri::AppHandle, bytes: &[u8]) -> Result<(),
 /// 形态照 `player.rs`：`DeviceSinkBuilder::open_default_sink()` → `Player::connect_new` →
 /// `append`。这里的 sink / Player 都是**本次一次性的**（每条朗读各开一次、放完即弃），
 /// 与音乐播放那套常驻设备的状态机刻意分开 —— 两者互不干扰，朗读结束回收掉这条流即可。
-fn play_wav(path: &Path, app: &tauri::AppHandle, fps: u32, env: &[u8], volume: f32) -> Result<(), String> {
+fn play_wav(
+    path: &Path,
+    app: &tauri::AppHandle,
+    fps: u32,
+    env: &[u8],
+    volume: f32,
+) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("打开音频失败：{e}"))?;
     // `Decoder::try_from(File)` 会顺手设上 byte_len（同 player.rs 的 `open_decoder`）。
     let decoder = Decoder::try_from(file).map_err(|e| format!("解码音频失败：{e}"))?;
@@ -297,7 +303,11 @@ mod tests {
         let (fps, env) = mouth_envelope(&wav_pcm16(sr, &s));
         assert_eq!(fps, MOUTH_FPS);
         let half = env.len() / 2;
-        assert!((env.len() as i32 - (MOUTH_FPS * 2) as i32).abs() <= 1, "len={}", env.len());
+        assert!(
+            (env.len() as i32 - (MOUTH_FPS * 2) as i32).abs() <= 1,
+            "len={}",
+            env.len()
+        );
         assert!(env[..half].iter().all(|&v| v == 0), "静音段必须闭嘴");
         assert!(env[half..].iter().all(|&v| v > 200), "有声段必须张嘴");
     }

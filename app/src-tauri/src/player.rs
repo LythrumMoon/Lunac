@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use rodio::{ChannelCount, Decoder, Sample, SampleRate, Source};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tuning_engine::chain::{Chain, ChainRuntime};
 use tuning_engine::config::ChainConfig;
 use tuning_engine::convolution::Convolver;
@@ -93,7 +94,10 @@ fn volume() -> f32 {
 /// 而且**这条路的两头都不依赖它**：真解不出来的视频，画面层自己会报错、
 /// 宿主的 rodio 也会如实报「解不开」（见 `open_decoder`）。
 fn is_video_path(p: &Path) -> bool {
-    let ext = p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
     crate::media_lib::is_video_ext(&ext)
 }
 
@@ -108,8 +112,110 @@ fn open_decoder(path: &Path) -> Result<(Decoder<std::io::BufReader<std::fs::File
     }
     let file = std::fs::File::open(path).map_err(|e| format!("打不开 {}：{e}", path.display()))?;
     let dec = Decoder::try_from(file).map_err(|e| format!("解不开 {}：{e}", path.display()))?;
-    let ms = dec.total_duration().map(|d| d.as_millis() as u64).unwrap_or(0);
+    let ms = dec
+        .total_duration()
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     Ok((dec, ms))
+}
+
+// ── `.webm`：先用 ffmpeg 把音轨抽出来（2026-10-30）────────────────────
+//
+// **为什么必须抽**：rodio（内含 symphonia）的默认特性里**没有 Matroska 解复用器**，
+// 直接 `Decoder::try_from` 只会得到「解不开」；而 WebM 的画面 Chromium 认得
+// （VP8/VP9/AV1），所以「画面归 `<video>`、声音归 rodio」这条分工不用改。
+// **为什么缓存**：转码很贵（24 分钟的一集约几十秒），同一集重播不该再转一遍。
+// 缓存目录与 `music-covers` 同口径（`<exe 根>\temp\...`，**可删缓存**）。
+const WEBM_AUDIO_KEEP: usize = 20;
+
+fn is_webm_path(p: &Path) -> bool {
+    p.extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("webm"))
+        .unwrap_or(false)
+}
+
+/// 抽音轨并落到缓存，返回**可解码的音频文件**路径。
+///
+/// 失败语义都是**可读的**（前端 `localErrText` 认得 `ERR_NO_FFMPEG` / `ERR_FFMPEG_RUN`）：
+/// 没装 ffmpeg 就拒绝播放，而不是给用户一段「有画面没声音」的静默失败。
+fn webm_audio_cache(path: &Path) -> Result<PathBuf, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("找不到这个文件：{}（{e}）", path.display()))?;
+    // 缓存键 = 路径 + 体积 + mtime：同一集重播命中，文件被替换后自动失效。
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    if let Ok(stamp) = meta.modified().and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| std::io::Error::other("mtime 早于 epoch"))
+    }) {
+        hasher.update(stamp.as_secs().to_le_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    let dir = crate::storage::lunac_root_dir()
+        .join("temp")
+        .join("webm-audio");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建不了临时目录 {}：{e}", dir.display()))?;
+    let target = dir.join(format!("{}.m4a", &digest[..16]));
+    if target.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(target);
+    }
+
+    let ffmpeg = crate::convert::resolve_engine("ffmpeg").ok_or_else(|| {
+        "ERR_NO_FFMPEG：播放 .webm 需要本机 ffmpeg 先把音轨抽出来 —— 把 ffmpeg.exe 放到程序根目录，或装到 PATH 后重试"
+            .to_string()
+    })?;
+    let output = std::process::Command::new(&ffmpeg)
+        .arg("-y")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .args(["-vn", "-ac", "2", "-c:a", "aac", "-b:a", "192k"])
+        .arg(&target)
+        .output()
+        .map_err(|e| format!("ERR_FFMPEG_RUN：ffmpeg 起不来（{e}）"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&target);
+        let raw = String::from_utf8_lossy(&output.stderr);
+        let tail = raw.trim().lines().last().unwrap_or("").to_string();
+        let tail = if tail.len() > 240 {
+            tail[..240].to_string()
+        } else {
+            tail
+        };
+        return Err(format!("ERR_FFMPEG_RUN：抽音轨失败（{tail}）"));
+    }
+    sweep_webm_cache(&dir);
+    Ok(target)
+}
+
+/// 只保留最近 `WEBM_AUDIO_KEEP` 份：缓存是**可删**的，不能无限长大。
+fn sweep_webm_cache(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_audio = path
+                .extension()
+                .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("m4a"))
+                .unwrap_or(false);
+            if !is_audio {
+                return None;
+            }
+            entry.metadata().ok()?.modified().ok().map(|at| (at, path))
+        })
+        .collect();
+    if files.len() <= WEBM_AUDIO_KEEP {
+        return;
+    }
+    files.sort_by_key(|(at, _)| *at);
+    for (_, path) in files.iter().take(files.len() - WEBM_AUDIO_KEEP) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 当前状态。**`active` 的判据是「队列里还有没有没放完的 source」**：
@@ -119,7 +225,10 @@ fn open_decoder(path: &Path) -> Result<(Decoder<std::io::BufReader<std::fs::File
 fn dto_of(session: Option<&Session>) -> PlayerDto {
     let volume = volume();
     let Some(s) = session else {
-        return PlayerDto { volume, ..Default::default() };
+        return PlayerDto {
+            volume,
+            ..Default::default()
+        };
     };
     let active = !s.player.empty();
     PlayerDto {
@@ -348,7 +457,8 @@ impl TuningConfig {
         ));
         let mut cfg = self.clone();
         cfg.if_else.retain(|b| b.channel < channels);
-        cfg.channel_copy.retain(|c| c.from < channels && c.to < channels);
+        cfg.channel_copy
+            .retain(|c| c.from < channels && c.to < channels);
         cfg
     }
 }
@@ -393,7 +503,12 @@ fn filters_from_preset(key: &str) -> Option<(f64, Vec<TuningFilter>)> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let preamp_db = v.get("preamp_db").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let mut out = Vec::new();
-    for f in v.get("filters").and_then(|x| x.as_array()).cloned().unwrap_or_default() {
+    for f in v
+        .get("filters")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
         out.push(TuningFilter {
             kind: f.get("kind")?.as_str()?.to_string(),
             freq_hz: f.get("freq_hz")?.as_f64()?,
@@ -452,7 +567,10 @@ fn effective_json(cfg: &TuningConfig) -> String {
     // 新效果器：**只在用户真的填了才带上** —— 引擎对每个字段都有缺省语义
     //（不写 = 不启用），少发几个字段能让落盘配置与下发 JSON 都干净。
     if !cfg.graphic_eq.is_empty() {
-        o.insert("graphic_eq".into(), serde_json::Value::Array(cfg.graphic_eq.clone()));
+        o.insert(
+            "graphic_eq".into(),
+            serde_json::Value::Array(cfg.graphic_eq.clone()),
+        );
     }
     if cfg.delay_ms != 0.0 {
         o.insert("delay_ms".into(), serde_json::json!(cfg.delay_ms));
@@ -465,8 +583,15 @@ fn effective_json(cfg: &TuningConfig) -> String {
         // 相对路径按 **Lunac 根目录**展开：进程 cwd 不一定是安装目录（dev 下还是
         // `target\debug`），直接把它丢给引擎会「同一个配置在两台机器上时灵时不灵」。
         let p = PathBuf::from(ir);
-        let full = if p.is_absolute() { p } else { crate::storage::lunac_root_dir().join(p) };
-        o.insert("convolution".into(), serde_json::json!(full.to_string_lossy()));
+        let full = if p.is_absolute() {
+            p
+        } else {
+            crate::storage::lunac_root_dir().join(p)
+        };
+        o.insert(
+            "convolution".into(),
+            serde_json::json!(full.to_string_lossy()),
+        );
     }
     // 通道段（P5-2）：每条段同样**只发 `on` 的**、摘掉面板用的 `on`；两边都空的块
     // **整个丢掉** —— 引擎对「then 与 else 都空」的块直接报错（那是个摆设），而用户在面板上
@@ -573,7 +698,9 @@ pub(crate) fn tuning_shared() -> Arc<TuningShared> {
 }
 
 fn tuning_config_path() -> PathBuf {
-    crate::storage::lunac_root_dir().join("config").join("tuning.json")
+    crate::storage::lunac_root_dir()
+        .join("config")
+        .join("tuning.json")
 }
 
 fn load_tuning_config() -> TuningConfig {
@@ -581,8 +708,8 @@ fn load_tuning_config() -> TuningConfig {
         return default_tuning_config();
     };
     // BOM 要容忍：PowerShell 的 `Set-Content -Encoding UTF8` 会写（同 music.rs）
-    let cfg: TuningConfig =
-        serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_else(|_| default_tuning_config());
+    let cfg: TuningConfig = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .unwrap_or_else(|_| default_tuning_config());
     migrate_tuning(cfg)
 }
 
@@ -596,7 +723,10 @@ fn save_tuning_config(cfg: &TuningConfig) -> Result<(), String> {
 }
 
 fn preset_json(key: &str) -> Option<&'static str> {
-    TUNING_PRESETS.iter().find(|(k, _)| *k == key).map(|(_, j)| *j)
+    TUNING_PRESETS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, j)| *j)
 }
 
 // ── 用户预设（P5-1，2026-10-03）────────────────────────────────────
@@ -708,7 +838,10 @@ fn read_preset_file(path: &Path) -> Result<TuningPreset, String> {
         .map_err(|e| format!("不是合法的预设 JSON：{e}"))?;
     if p.name.trim().is_empty() {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        p.name = stem.strip_prefix(PRESET_FILE_PREFIX).unwrap_or(stem).to_string();
+        p.name = stem
+            .strip_prefix(PRESET_FILE_PREFIX)
+            .unwrap_or(stem)
+            .to_string();
     }
     if p.name.trim().is_empty() {
         return Err("预设没有名字".to_string());
@@ -781,7 +914,8 @@ fn delete_user_preset(dir: &Path, name: &str) -> Result<(), String> {
 
 /// 重命名（改的是 JSON 里的 `name`，文件名跟着净化后的新名字走）。
 fn rename_user_preset(dir: &Path, from: &str, to: &str) -> Result<(), String> {
-    let old_path = find_user_preset_path(dir, from).ok_or_else(|| format!("没有叫「{from}」的预设"))?;
+    let old_path =
+        find_user_preset_path(dir, from).ok_or_else(|| format!("没有叫「{from}」的预设"))?;
     if find_user_preset_path(dir, to).is_some() {
         return Err(format!("ERR_PRESET_EXISTS：已经有一个叫「{to}」的预设"));
     }
@@ -844,7 +978,11 @@ pub struct TuningResponse {
 /// 曲线用的采样率：最近一次建链记下的那个，没记过就用 48k（最常见的档）。
 fn tuning_response_rate() -> f64 {
     let r = tuning_shared().last_rate.load(Ordering::Relaxed);
-    if r == 0 { 48000.0 } else { r as f64 }
+    if r == 0 {
+        48000.0
+    } else {
+        r as f64
+    }
 }
 
 /// 最近一次建链那条流的**声道数**（0 = 还没放过东西）。
@@ -957,7 +1095,10 @@ fn tuning_dto(cfg: &TuningConfig) -> TuningDto {
     TuningDto {
         enabled: cfg.enabled,
         preset: cfg.preset.clone(),
-        presets: TUNING_PRESETS.iter().map(|(k, _)| (*k).to_string()).collect(),
+        presets: TUNING_PRESETS
+            .iter()
+            .map(|(k, _)| (*k).to_string())
+            .collect(),
         user_presets: list_user_presets(&presets_dir())
             .into_iter()
             .map(|p| p.name)
@@ -974,7 +1115,11 @@ fn tuning_dto(cfg: &TuningConfig) -> TuningDto {
         if_else: cfg.if_else.clone(),
         channels: tuning_response_channels(),
         cond_db,
-        response: TuningResponse { sample_rate: rate, freqs, db },
+        response: TuningResponse {
+            sample_rate: rate,
+            freqs,
+            db,
+        },
     }
 }
 
@@ -1072,7 +1217,9 @@ impl<S: Source> TuningSource<S> {
         match ChainRuntime::new(&chain, channels) {
             Ok(rt) => self.rt = Some(rt),
             Err(e) => {
-                crate::log::warn(format!("player: 调音链的运行期建不起来，这一首按直通放（{e}）"));
+                crate::log::warn(format!(
+                    "player: 调音链的运行期建不起来，这一首按直通放（{e}）"
+                ));
                 return;
             }
         }
@@ -1192,7 +1339,10 @@ impl<S: Source> Source for TuningSource<S> {
 pub(crate) fn tuned_buffer(samples: Vec<f32>, channels: u16, rate: u32) -> impl Source {
     let ch = ChannelCount::new(channels).unwrap_or(ChannelCount::MIN);
     let sr = SampleRate::new(rate).unwrap_or(SampleRate::MIN);
-    TuningSource::new(rodio::buffer::SamplesBuffer::new(ch, sr, samples), tuning_shared())
+    TuningSource::new(
+        rodio::buffer::SamplesBuffer::new(ch, sr, samples),
+        tuning_shared(),
+    )
 }
 
 /// 同一段内存样本 **不经调音链**播出去（直通）。
@@ -1258,7 +1408,21 @@ fn play(path: &str) -> Result<PlayerDto, String> {
     // 先把解码器开出来：**开不了就别把正在放的那首停掉**（用户点了坏文件，
     // 不该把他的播放也带走）。
     let p = PathBuf::from(path);
-    let (decoder, duration_ms) = open_decoder(&p)?;
+    // `.webm` 的音轨 rodio 解不了（没有 Matroska 解复用器）⇒ 先抽成缓存里的 m4a。
+    // 抽不出来就**直接拒播**：那张 URL / 那一行在界面上会显示可读的原因。
+    let decode_path = if is_webm_path(&p) {
+        webm_audio_cache(&p)?
+    } else {
+        p.clone()
+    };
+    let (decoder, duration_ms) = open_decoder(&decode_path).map_err(|e| {
+        if decode_path == p {
+            e
+        } else {
+            // 报**用户点的那一份**，不要把缓存里的临时路径抛到界面上。
+            format!("解不开 {}：{e}", p.display())
+        }
+    })?;
     // 调音状态要在**拿 SESSION 锁之前**取：首次访问它会读一次盘，
     // 而 SESSION 锁是播放/暂停/状态轮询共用的那把 —— 别把读盘塞进临界区。
     let tuning = tuning_shared();
@@ -1282,7 +1446,12 @@ fn play(path: &str) -> Result<PlayerDto, String> {
     player.set_volume(volume());
     // 解码器外面套一层调音链（关着的时候它逐样本原样透传，代价是一次原子读）
     player.append(TuningSource::new(decoder, tuning));
-    *guard = Some(Session { sink, player, path: p, duration_ms });
+    *guard = Some(Session {
+        sink,
+        player,
+        path: p,
+        duration_ms,
+    });
     Ok(dto_of(guard.as_ref()))
 }
 
@@ -1339,7 +1508,11 @@ pub fn player_seek(position_ms: u64) -> Result<PlayerDto, String> {
 /// 音量 0.0–1.0（超出即夹取，不报错 —— 滑条抖动送进来 1.0000001 不该是错误）。
 #[tauri::command]
 pub fn player_volume(volume: f32) -> Result<PlayerDto, String> {
-    let v = if volume.is_finite() { volume.clamp(0.0, 1.0) } else { DEFAULT_VOLUME };
+    let v = if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_VOLUME
+    };
     VOLUME.store(v.to_bits(), Ordering::Relaxed);
     let guard = SESSION.lock().map_err(|e| e.to_string())?;
     if let Some(s) = guard.as_ref() {
@@ -1353,7 +1526,10 @@ pub fn player_volume(volume: f32) -> Result<PlayerDto, String> {
 pub fn player_status() -> PlayerDto {
     match SESSION.lock() {
         Ok(g) => dto_of(g.as_ref()),
-        Err(_) => PlayerDto { volume: volume(), ..Default::default() },
+        Err(_) => PlayerDto {
+            volume: volume(),
+            ..Default::default()
+        },
     }
 }
 
@@ -1569,7 +1745,11 @@ pub fn player_tuning_preset_save(name: String, overwrite: bool) -> Result<Tuning
     let mut cfg = current_tuning()?;
     // **存之前先让引擎验一遍**：存进去一条编不成链的预设，等于埋一个「点了就直通」的雷。
     build_chain_from(&cfg, 44100.0)?;
-    save_user_preset(&presets_dir(), &TuningPreset::snapshot(&cfg, name), overwrite)?;
+    save_user_preset(
+        &presets_dir(),
+        &TuningPreset::snapshot(&cfg, name),
+        overwrite,
+    )?;
     cfg.preset = name.to_string();
     apply_tuning_config(cfg)
 }
@@ -1775,11 +1955,14 @@ mod tests {
     fn video_is_decided_by_the_extension_alone() {
         assert!(is_video_path(Path::new(r"D:\Movies\假期.MP4")));
         assert!(is_video_path(Path::new(r"D:\Movies\clip.mov")));
+        // 2026-10-30：webm 在表里了（画面 Chromium 认，音轨由 ffmpeg 抽）
+        assert!(is_video_path(Path::new(r"D:\Movies\a.webm")));
+        assert!(is_video_path(Path::new(r"D:\Movies\A.WEBM")));
         assert!(!is_video_path(Path::new(r"D:\Music\song.mp3")));
         assert!(!is_video_path(Path::new(r"D:\Music\no-extension")));
-        // 刻意不收的容器（Chromium 不出画面 / 音轨是 Opus）——别再被加回来
+        // 刻意不收的容器（Chromium 不解）——别再被加回来
         assert!(!is_video_path(Path::new(r"D:\Movies\a.mkv")));
-        assert!(!is_video_path(Path::new(r"D:\Movies\a.webm")));
+        assert!(!is_video_path(Path::new(r"D:\Movies\a.avi")));
     }
 
     #[test]
@@ -1808,7 +1991,11 @@ mod tests {
         let started = play(&p.display().to_string())
             .expect("开不出音频输出设备（这台机器上有可用的输出设备吗？）");
         assert!(started.active, "刚 append 完就该是 active：{started:?}");
-        assert!(started.duration_ms >= 500, "时长该报出来，实得 {}", started.duration_ms);
+        assert!(
+            started.duration_ms >= 500,
+            "时长该报出来，实得 {}",
+            started.duration_ms
+        );
 
         std::thread::sleep(Duration::from_millis(250));
         let mid = player_status();
@@ -1854,7 +2041,12 @@ mod tests {
         /// 报错信息里一个字都没提到采样率）。
         fn ramp(n: usize, ch: u16, rate: u32) -> Self {
             let samples = (0..n).map(|k| ((k % 32) as f32 / 32.0) - 0.5).collect();
-            Self { samples, rate, ch, i: 0 }
+            Self {
+                samples,
+                rate,
+                ch,
+                i: 0,
+            }
         }
     }
 
@@ -1926,7 +2118,10 @@ mod tests {
         // 面板照 `presets` 画按钮 ⇒ 它必须与这张表同源（少一条 = 界面上永远选不到那一档）
         let dto = tuning_dto(&TuningConfig::default());
         assert_eq!(dto.presets.len(), TUNING_PRESETS.len());
-        assert!(dto.presets.iter().any(|k| k == &dto.preset), "默认档必须在名单里");
+        assert!(
+            dto.presets.iter().any(|k| k == &dto.preset),
+            "默认档必须在名单里"
+        );
     }
 
     #[test]
@@ -1935,11 +2130,18 @@ mod tests {
         // 那条链会静默消失**（界面上还亮着 preset、实际是直通）。
         let legacy: TuningConfig =
             serde_json::from_str(r#"{ "enabled": true, "preset": "vocal" }"#).unwrap();
-        assert!(legacy.filters.is_empty(), "前提：老配置反序列化出来确实没有段");
+        assert!(
+            legacy.filters.is_empty(),
+            "前提：老配置反序列化出来确实没有段"
+        );
         let m = migrate_tuning(legacy);
         assert!(!m.filters.is_empty(), "必须把预设展开成段");
         assert_eq!(m.preset, "vocal");
-        assert!(m.preamp_db < 0.0, "vocal 的 preamp 是负的（防削波），收到 {}", m.preamp_db);
+        assert!(
+            m.preamp_db < 0.0,
+            "vocal 的 preamp 是负的（防削波），收到 {}",
+            m.preamp_db
+        );
 
         // 认不出的预设键 ⇒ 回落默认档（与改造前同一行为）
         let junk: TuningConfig = serde_json::from_str(r#"{ "preset": "nope" }"#).unwrap();
@@ -1948,7 +2150,11 @@ mod tests {
         // 认不出的键 ⇒ 回落默认档。**默认档是 `flat`（空链）**（2026-10-03 用户口径
         // 「改成空链条、原声作为初始值」）⇒ 这里断言的是「一段都不加、preamp 为 0」。
         assert_eq!(DEFAULT_PRESET, "flat");
-        assert!(m2.filters.is_empty(), "默认档是空链，不该凭空多出段：{:?}", m2.filters);
+        assert!(
+            m2.filters.is_empty(),
+            "默认档是空链，不该凭空多出段：{:?}",
+            m2.filters
+        );
         assert_eq!(m2.preamp_db, 0.0);
 
         // **已经有段的配置一个字都不许被改**（哪怕 preset 是 custom）
@@ -1973,9 +2179,15 @@ mod tests {
         with_off.filters[0].on = false;
 
         let json = effective_json(&with_off);
-        assert!(!json.contains("\"on\""), "on 是面板概念，不能进引擎的 JSON：{json}");
+        assert!(
+            !json.contains("\"on\""),
+            "on 是面板概念，不能进引擎的 JSON：{json}"
+        );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["filters"].as_array().unwrap().len(), cfg.filters.len() - 1);
+        assert_eq!(
+            v["filters"].as_array().unwrap().len(),
+            cfg.filters.len() - 1
+        );
         // 关一段**真的**改变了链（不是「关了个寂寞」）
         assert_ne!(effective_json(&cfg), json);
 
@@ -2044,7 +2256,10 @@ mod tests {
     #[test]
     fn bass_and_treble_shortcuts_become_shelf_filters_only_when_nonzero() {
         let mut cfg = cfg_of(true, "flat");
-        assert!(!effective_json(&cfg).contains("shelf"), "0dB 时不该凭空多出 shelf");
+        assert!(
+            !effective_json(&cfg).contains("shelf"),
+            "0dB 时不该凭空多出 shelf"
+        );
 
         cfg.bass_db = 6.0;
         cfg.treble_db = -3.0;
@@ -2123,8 +2338,16 @@ mod tests {
     fn for_channels_drops_slots_and_copies_the_stream_does_not_have() {
         let mut cfg = cfg_of(true, "flat");
         cfg.if_else = vec![
-            TuningCondBlock { channel: 0, then: Vec::new(), else_filters: Vec::new() },
-            TuningCondBlock { channel: 5, then: Vec::new(), else_filters: Vec::new() },
+            TuningCondBlock {
+                channel: 0,
+                then: Vec::new(),
+                else_filters: Vec::new(),
+            },
+            TuningCondBlock {
+                channel: 5,
+                then: Vec::new(),
+                else_filters: Vec::new(),
+            },
         ];
         cfg.channel_copy = vec![
             TuningCopy { from: 0, to: 1 }, // 立体声里合法
@@ -2145,9 +2368,15 @@ mod tests {
 
     #[test]
     fn preset_file_name_sanitizes_and_avoids_windows_reserved_names() {
-        assert_eq!(preset_file_name("我的低音").as_deref(), Some("preset-我的低音.json"));
+        assert_eq!(
+            preset_file_name("我的低音").as_deref(),
+            Some("preset-我的低音.json")
+        );
         // 路径分隔符与 Windows 禁用字符换成 `_`
-        assert_eq!(preset_file_name("a/b:c*d").as_deref(), Some("preset-a_b_c_d.json"));
+        assert_eq!(
+            preset_file_name("a/b:c*d").as_deref(),
+            Some("preset-a_b_c_d.json")
+        );
         // 保留名靠 `preset-` 前缀躲开（`CON.json` 在 Windows 上仍是保留名）
         assert_eq!(preset_file_name("CON").as_deref(), Some("preset-CON.json"));
         // 净化后空的（只有空白 / 点）⇒ 这个名字落不成文件
@@ -2167,7 +2396,10 @@ mod tests {
         save_user_preset(&dir, &p, false).unwrap();
 
         // 列表里给的是**显示名**（不是文件名）
-        let names: Vec<String> = list_user_presets(&dir).into_iter().map(|x| x.name).collect();
+        let names: Vec<String> = list_user_presets(&dir)
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
         assert_eq!(names, vec!["我的低音"]);
         // 同名再存且不覆盖 ⇒ `ERR_PRESET_EXISTS`（前端据此让用户确认）
         assert!(save_user_preset(&dir, &p, false)
@@ -2234,7 +2466,10 @@ mod tests {
         let json = effective_json(&cfg);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let p = v.get("convolution").and_then(|x| x.as_str()).unwrap();
-        assert!(Path::new(p).is_absolute(), "相对路径必须被锚到 Lunac 根：{p}");
+        assert!(
+            Path::new(p).is_absolute(),
+            "相对路径必须被锚到 Lunac 根：{p}"
+        );
         assert!(p.ends_with("room.wav"), "{p}");
     }
 
@@ -2246,13 +2481,22 @@ mod tests {
         assert_eq!(r.db.len(), RESPONSE_POINTS);
         assert!(r.sample_rate >= 8000.0);
         // 两端
-        assert!((19.9..=20.1).contains(&r.freqs[0]), "起点是 {}Hz", r.freqs[0]);
+        assert!(
+            (19.9..=20.1).contains(&r.freqs[0]),
+            "起点是 {}Hz",
+            r.freqs[0]
+        );
         assert!(r.freqs[RESPONSE_POINTS - 1] >= 19_999.0);
         // 对数等分 ⇒ 相邻比值恒定（这条钉的是「别换成线性等分」：
         // 线性画出来低频那一半会被压成一根线，用户没法在低频调音）
         let ratio = r.freqs[1] / r.freqs[0];
         for w in r.freqs.windows(2) {
-            assert!((w[1] / w[0] - ratio).abs() < 1e-9, "不是对数等分：{} → {}", w[0], w[1]);
+            assert!(
+                (w[1] / w[0] - ratio).abs() < 1e-9,
+                "不是对数等分：{} → {}",
+                w[0],
+                w[1]
+            );
         }
         // 曲线必须**真的是这条链**。bass = low_shelf(+6dB @120) + high_shelf(−2dB @9k)
         // + preamp(−6) ⇒ 低频端被 preamp 抵到 **0dB 附近**（+6 − 6），高端 ≈ −8dB。
@@ -2261,8 +2505,14 @@ mod tests {
         // 少了这条断言，「曲线恒为平线」也能过。
         let low = r.db[0];
         let high = r.db[RESPONSE_POINTS - 1];
-        assert!(low - high > 4.0, "低端 {low}dB / 高端 {high}dB —— 曲线没接上链");
-        assert!((-1.0..=1.0).contains(&low), "低端应被 preamp 抵到 0dB 附近，收到 {low}dB");
+        assert!(
+            low - high > 4.0,
+            "低端 {low}dB / 高端 {high}dB —— 曲线没接上链"
+        );
+        assert!(
+            (-1.0..=1.0).contains(&low),
+            "低端应被 preamp 抵到 0dB 附近，收到 {low}dB"
+        );
         assert!(r.db.iter().all(|d| d.is_finite()));
     }
 
@@ -2320,7 +2570,9 @@ mod tests {
         let raw: Vec<Sample> = TestSource::ramp(256, 1, 48000).collect();
         assert_eq!(head, raw[..128].to_vec(), "改之前必须是直通");
         assert!(
-            tail.iter().zip(&raw[128..]).any(|(a, b)| (a - b).abs() > 1e-4),
+            tail.iter()
+                .zip(&raw[128..])
+                .any(|(a, b)| (a - b).abs() > 1e-4),
             "版本号涨了却没换链 —— 面板改了档、听感上什么都没发生"
         );
     }
@@ -2339,14 +2591,24 @@ mod tests {
 
         let shared = shared_with(true, "bass");
         let stereo: Vec<Sample> = TuningSource::new(
-            TestSource { samples: interleaved, rate: 48000, ch: 2, i: 0 },
+            TestSource {
+                samples: interleaved,
+                rate: 48000,
+                ch: 2,
+                i: 0,
+            },
             shared.clone(),
         )
         .collect();
 
         for (ch, mono_in) in [(0usize, left), (1usize, right)] {
             let mono: Vec<Sample> = TuningSource::new(
-                TestSource { samples: mono_in, rate: 48000, ch: 1, i: 0 },
+                TestSource {
+                    samples: mono_in,
+                    rate: 48000,
+                    ch: 1,
+                    i: 0,
+                },
                 shared.clone(),
             )
             .collect();

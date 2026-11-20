@@ -58,9 +58,46 @@ export interface MarketPluginInfo {
   /** 这个插件要**复用哪些内置（基础）插件的挂载监听**（2026-10-05）。
    *  由 `attach.ts` 逐个调对应的 `attachXxxListeners(root)`；认不出的 id 只忽略并 warn。 */
   reuse: string[];
+  /** 能力身份（2026-10-18）：宿主按它定位插件；`id` 仍是目录名。 */
+  provides: string[];
+  /** 渲染方式与外观级别（2026-10-18）。缺省 `dom` + `inherit`。 */
+  render: MarketRenderSpec;
   /** 这个插件声明的**本机进程**（2026-10-06，L12 档 1，见 `Modules\README.md`）。
    *  `null` = 没有 sidecar（字段由 serde 直出，Rust 侧是 `Option<SidecarSpec>`）。 */
   sidecar: MarketSidecar | null;
+  /** 这个插件声明的**开发工具链**（2026-10-18，轨道 H）。`null` = 没有 `dev` 段。
+   *  设置页据此显示「开发工具链」分区；**未授权不能装、不能构建**。 */
+  dev: MarketDevSpec | null;
+}
+
+/** 与 Rust 侧 `plugin_market::PluginDevSpec` 一一对应（2026-10-18）。 */
+export interface MarketDevSpec {
+  toolchains: MarketToolchainProfile[];
+  build: MarketBuildSpec | null;
+}
+
+export interface MarketToolchainProfile {
+  id: string;
+  url: string;
+  sha256: string;
+  dest: string;
+  kind: string;
+  version: string;
+  binDir: string;
+}
+
+export interface MarketBuildSpec {
+  command: string;
+  args: string[];
+  cwd: string;
+}
+
+/** 与 Rust 侧 `plugin_market::PluginRenderSpec` 一一对应（2026-10-18）。 */
+export interface MarketRenderSpec {
+  engine: "dom" | "iframe";
+  appearance: "inherit" | "custom";
+  /** 常驻挂载锚点（只允许 iframe 引擎）：`chat-sidebar` / `settings-section`。 */
+  slots: string[];
 }
 
 /** 与 Rust 侧 `plugin_market::SidecarSpec` 一一对应（2026-10-06）。 */
@@ -106,6 +143,8 @@ export interface MarketIndexEntry {
   keywords: string[];
   icon: string;
   homepage: string;
+  /** 插件 zip 的 sha256；空串 = 旧索引（迁移期仍可装，宿主会 warn 留痕）。 */
+  sha256: string;
 }
 
 /** 拉市场索引（宿主去拉，见 `commands::fetch_plugin_index` 的两条理由）。
@@ -189,6 +228,12 @@ export async function refreshMarketPlugins(): Promise<MarketPluginInfo[]> {
     pluginRegistry.register(wrap(p));
     marketRegistered.add(p.id);
   }
+  // 常驻锚点（2026-10-18）：安装 / 卸载 / 重扫后让宿主重新对账「哪些插件该挂在哪个槽位」。
+  // 用 DOM 事件而不是直接 import 主窗 —— `market.ts` 被主窗、插件窗、设置面板共用，
+  // 反向依赖会成环。
+  try {
+    window.dispatchEvent(new CustomEvent("lunac-market-refreshed"));
+  } catch { /* 非浏览器环境（单测）忽略 */ }
   return list;
 }
 
@@ -205,6 +250,10 @@ function wrap(info: MarketPluginInfo): Plugin {
     permissions: info.permissions || [],
     // 复用声明（2026-10-05）：让磁盘插件能挂上某个基础插件的监听，见 attach.ts
     reuse: info.reuse || [],
+    // 能力身份 / 渲染方式（2026-10-18）
+    provides: info.provides || [],
+    render: info.render ?? { engine: "dom", appearance: "inherit", slots: [] },
+    dir: info.dir,
     // sidecar（2026-10-06）：面板打开时若声明了 autostart，宿主会自动起进程（见 sidecar.ts）
     sidecar: info.sidecar ?? undefined,
     execute: async (input: string): Promise<PluginResult> => {

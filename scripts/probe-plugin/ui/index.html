@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Lunac 信道探针</title>
+<!--
+  §待办 3-10 的**探针文档**（2026-10-27）：宿主不执行这里的脚本，而是把它当 iframe 挂起来
+  （Windows 上是 `http://lunac-plugin.localhost/probe/ui/index.html`，由
+  `app/src/plugins/channel/host.ts` 的 `pluginFrameUrl()` 生成；写 `lunac-plugin://` 在
+  WebView2 上不会触发 load，见 `plugin_scheme.rs` 的头注释）。
+
+  它只做一件事：把信道里发生过的每件事**逐条写出来**，让 dev 真机验收时有可截图的判据：
+    ① 握手：收到 `hello` 并回 `ready`（否则宿主 3s 后报 E_TIMEOUT）；
+    ② 主题：`theme.changed` 的 token 有没有落到 documentElement（`appearance: inherit`）；
+    ③ 挂载：`mount` 的 slot 是 `window` / `chat-sidebar` / `settings-section`；
+    ④ 执行：`execute` 次数（在搜索栏里再执行一次同一插件就会多一条）；
+    ⑤ 尺寸：`host.resize` 与主动上报的 `ui.resize`；
+    ⑥ 收尾：`lifecycle: dispose`（关面板 / 卸载 / 重扫时应出现）。
+
+  样式只用宿主四类变量（`--surface-glass` / `--text` / `--border-glass` / `--btn-line`），
+  非法值一律回退到写死的深色，保证「宿主没给 token」时也能看出是探针自身在画。
+-->
+<style>
+  :root { color-scheme: dark light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 10px 12px;
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+    background: var(--surface-glass, #17171b);
+    color: var(--text, #e8e8ee);
+  }
+  h1 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+  .mark { color: var(--text-dim, #9a9aa8); font-size: 11px; margin-bottom: 8px; }
+  .row { display: flex; gap: 8px; align-items: baseline; }
+  .badge {
+    flex: 0 0 auto; min-width: 74px; padding: 0 6px; text-align: center;
+    border: 1px solid var(--border-glass, #3a3a44); border-radius: 4px;
+    color: var(--text-dim, #9a9aa8); font-size: 10px;
+  }
+  #swatch {
+    height: 6px; margin: 8px 0; border-radius: 3px;
+    background: var(--btn-bg, rgba(255,255,255,.08));
+    border: 1px solid var(--btn-line, #3a3a44);
+  }
+  ol { margin: 0; padding-left: 18px; }
+  li { word-break: break-all; }
+  li.ok { color: var(--green, #79d297); }
+  li.warn { color: var(--yellow, #e8c06a); }
+  button {
+    margin-top: 8px; padding: 3px 10px; font: inherit; cursor: pointer;
+    color: var(--text, #e8e8ee);
+    background: var(--btn-bg, rgba(255,255,255,.08));
+    border: 1px solid var(--btn-line, #3a3a44); border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+  <h1>信道探针 · probe</h1>
+  <div class="mark">iframe 引擎 / appearance=inherit / slots=chat-sidebar + settings-section</div>
+  <div id="swatch"></div>
+  <ol id="log"></ol>
+  <button id="ping" type="button">发一条 log 给宿主</button>
+<script>
+(() => {
+  // 信道版本与 `channel/protocol.ts` 的 CHANNEL_VERSION 必须一致
+  const CHANNEL_VERSION = 1;
+  const logEl = document.getElementById("log");
+  const count = { hello: 0, theme: 0, mount: 0, execute: 0, resize: 0, dispose: 0 };
+  const markers = { slot: "-" };
+
+  const rid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const send = (type, method, payload, id) =>
+    parent.postMessage({ v: CHANNEL_VERSION, id: id || rid(), type, method, payload, ts: Date.now() }, "*");
+  const row = (text, cls) => {
+    const li = document.createElement("li");
+    if (cls) li.className = cls;
+    li.textContent = text;
+    logEl.appendChild(li);
+  };
+  const applyTheme = (tokens) => {
+    for (const [k, v] of Object.entries(tokens || {})) {
+      if (k.startsWith("--") && typeof v === "string" && v) {
+        document.documentElement.style.setProperty(k, v);
+      }
+    }
+  };
+  const reportSize = () => {
+    send("event", "ui.resize", { height: Math.max(100, document.documentElement.scrollHeight) });
+  };
+
+  window.addEventListener("message", (ev) => {
+    // 只认父窗口（与 channel/client.ts 同一条纪律）
+    if (ev.source !== window.parent) return;
+    const m = ev.data;
+    if (!m || m.v !== CHANNEL_VERSION || typeof m.method !== "string") return;
+
+    if (m.type === "event") {
+      switch (m.method) {
+        case "hello": {
+          count.hello++;
+          const p = m.payload || {};
+          row(`hello：plugin=${p.pluginId || "?"} api=${p.apiVersion || "?"} caps=${(p.caps || []).join(",") || "—"}`, "ok");
+          send("event", "ready", { channelVersion: CHANNEL_VERSION });
+          row("→ ready（握手完成）", "ok");
+          reportSize();
+          break;
+        }
+        case "theme.changed": {
+          count.theme++;
+          applyTheme(m.payload && m.payload.tokens);
+          const probe = getComputedStyle(document.documentElement).getPropertyValue("--text").trim();
+          row(`theme.changed：mode=${(m.payload && m.payload.mode) || "?"} tokens→--text=${probe || "（空，走回退色）"}`, probe ? "ok" : "warn");
+          break;
+        }
+        case "locale.changed":
+          row(`locale.changed：${(m.payload && m.payload.locale) || "?"}`);
+          break;
+        case "host.resize":
+          count.resize++;
+          row(`host.resize：${(m.payload && m.payload.width) || "?"}×${(m.payload && m.payload.height) || "?"}`);
+          break;
+        case "lifecycle":
+          if ((m.payload && m.payload.phase) === "dispose") count.dispose++;
+          row(`lifecycle：${(m.payload && m.payload.phase) || "?"}`, "warn");
+          break;
+        default:
+          row(`event：${m.method}`);
+      }
+      return;
+    }
+
+    if (m.type === "req") {
+      if (m.method === "mount") {
+        count.mount++;
+        const p = m.payload || {};
+        markers.slot = p.slot || "window";
+        row(`mount #${count.mount}：slot=${markers.slot}，input=${JSON.stringify(p.input === undefined ? null : p.input)}`, "ok");
+        send("res", "mount", { ok: true, slot: markers.slot }, m.id);
+        reportSize();
+        return;
+      }
+      if (m.method === "execute") {
+        count.execute++;
+        row(`execute #${count.execute}：input=${JSON.stringify(m.payload && m.payload.input)}`, "ok");
+        send("res", "execute", { ok: true, count: count.execute }, m.id);
+        return;
+      }
+      send("err", m.method, { code: "E_UNSUPPORTED", message: `探针未实现 ${m.method}` }, m.id);
+    }
+  });
+
+  document.getElementById("ping").addEventListener("click", () => {
+    send("event", "log", {
+      level: "info",
+      message: `probe 自检：hello=${count.hello} theme=${count.theme} mount=${count.mount}(${markers.slot}) execute=${count.execute} resize=${count.resize} dispose=${count.dispose}`,
+    });
+    reportSize();
+  });
+
+  row("iframe 已加载，等待宿主 hello（3s 内没有 = 握手失败）");
+})();
+</script>
+</body>
+</html>

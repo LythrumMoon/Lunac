@@ -1,0 +1,5 @@
+{
+  "book": [
+    { "url": "http://localhost:8123/test/fixtures/demo.epub" }
+  ]
+}

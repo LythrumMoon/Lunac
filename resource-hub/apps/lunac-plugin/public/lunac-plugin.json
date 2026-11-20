@@ -1,0 +1,22 @@
+{
+  "id": "resource-hub",
+  "name": "阅读",
+  "description": "漫画 / 小说 / 番剧 / 电视剧聚合阅读与播放",
+  "keywords": ["阅读", "漫画", "小说", "番剧", "电视剧", "资源", "read", "comic", "novel", "anime"],
+  "icon": "",
+  "version": "0.2.5",
+  "entry": "index.js",
+  "homepage": "",
+  "permissions": ["window.float", "net.fetch", "storage.plugin", "media.proxy", "engine.eval", "webview.sniff"],
+  "provides": ["resource.reader"],
+  "window": {
+    "width": 1280,
+    "height": 720,
+    "minWidth": 720,
+    "minHeight": 420,
+    "resizable": true,
+    "skipTaskbar": false,
+    "alwaysOnTop": false,
+    "chrome": true
+  }
+}

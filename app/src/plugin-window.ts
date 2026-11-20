@@ -22,7 +22,18 @@ import { pluginRegistry } from "./plugins/registry";
 import { registerBuiltinPlugins } from "./plugins/builtin/index";
 import { attachPluginListeners, detachPluginListeners } from "./plugins/attach";
 import { refreshMarketPlugins } from "./plugins/market";
+import { ChannelHost, pluginFrameUrl } from "./plugins/channel/host";
+import { collectThemeTokens } from "./plugins/channel/theme";
 import { installHostBridge } from "./plugins/host";
+import type {
+  LunacEngineApi,
+  LunacMediaApi,
+  LunacNetApi,
+  LunacNetResponse,
+  LunacPinyinApi,
+  LunacPluginStorage,
+  LunacSniffApi,
+} from "./plugins/host";
 import { createSidecarBridge, activatePluginSidecar, deactivatePluginSidecar, maybeAutoStartSidecar } from "./plugins/sidecar";
 
 /** 主题变量事件：主窗口 → 所有窗口（见 main.ts 的 broadcastThemeVars）。 */
@@ -42,6 +53,15 @@ const titleEl = document.getElementById("plugin-title") as HTMLElement;
 
 let currentPluginId = "";
 let renderGen = 0;
+/** iframe 引擎的信道；DOM 引擎始终为 null。 */
+let currentChannel: ChannelHost | null = null;
+/** Windows 下 Tauri 自定义协议的实际 origin（见 plugin_scheme.rs）。 */
+const IFRAME_ORIGIN = "http://lunac-plugin.localhost";
+
+function disposeChannel(): void {
+  currentChannel?.dispose();
+  currentChannel = null;
+}
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -53,11 +73,14 @@ function esc(s: string): string {
  *  CSSStyleDeclaration 的迭代包含自定义属性；自己记账才是确定的。
  *  换主题时先按这张表清空，再套新的一份（否则被删掉的变量会留旧值）。 */
 let appliedThemeKeys: string[] = [];
+/** 最近一次套用的主题变量快照；iframe 握手后整份发给插件。 */
+let currentThemeVars: Record<string, string> = {};
 
 function applyThemeVars(vars: Record<string, string>) {
   const s = document.documentElement.style;
   for (const k of appliedThemeKeys) s.removeProperty(k);
   appliedThemeKeys = [];
+  currentThemeVars = {};
   for (const [k, v] of Object.entries(vars)) {
     if (!k.startsWith("--")) continue;
     // 空串 = 主窗口那边已经清掉了这个变量（切回默认主题），这里也必须删掉，
@@ -66,13 +89,16 @@ function applyThemeVars(vars: Record<string, string>) {
     if (v === "") s.removeProperty(k);
     else s.setProperty(k, v);
     appliedThemeKeys.push(k);
+    currentThemeVars[k] = v;
   }
+  currentChannel?.themeChanged();
 }
 
 // ── 渲染 ──────────────────────────────────────────────────────────
 
 async function render(pluginId: string, input: string) {
   const myGen = ++renderGen;
+  disposeChannel();
   // 换插件前先把上一个插件的定时器/监听收掉（同一个窗口可以被复用去装另一个插件）
   if (currentPluginId && currentPluginId !== pluginId) {
     detachPluginListeners(currentPluginId);
@@ -94,6 +120,12 @@ async function render(pluginId: string, input: string) {
   // 清单声明了 sidecar.autostart ⇒ 面板一出来就起进程（首次仍会先弹信任卡）
   maybeAutoStartSidecar(!!plugin.sidecar?.autostart);
 
+  // iframe 引擎（opt-in）：文档从 `lunac-plugin://` 加载，宿主与插件只走 postMessage。
+  if (plugin.render?.engine === "iframe") {
+    renderIframe(plugin, input, myGen);
+    return;
+  }
+
   try {
     const result = await plugin.execute(input);
     if (myGen !== renderGen) return; // 期间又换了一次插件，本次结果作废
@@ -109,6 +141,222 @@ async function render(pluginId: string, input: string) {
     console.error("[lunac plugin-window] execute failed:", e);
   }
 }
+
+/** iframe 引擎：建 iframe → 握手 → mount。失败必须可见，不能留白。 */
+function renderIframe(plugin: {
+  id: string;
+  permissions?: string[];
+  render?: { engine?: "dom" | "iframe"; appearance?: "inherit" | "custom" };
+}, input: string, myGen: number): void {
+  root.innerHTML = "";
+  const frame = document.createElement("iframe");
+  frame.className = "plugin-iframe";
+  // 自定义协议是独立 origin（Windows = http://lunac-plugin.localhost），
+  // 与宿主跨源；allow-same-origin 让 targetOrigin 可校验，不构成同源。
+  frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+  frame.src = pluginFrameUrl(plugin.id);
+  root.appendChild(frame);
+
+  const fail = (message: string): void => {
+    if (myGen !== renderGen) return;
+    root.innerHTML = `<div class="plugin-result"><div class="plugin-result-content">${esc(message)}</div></div>`;
+  };
+
+  const host = new ChannelHost({
+    iframe: frame,
+    pluginId: plugin.id,
+    permissions: plugin.permissions ?? [],
+    engine: "iframe",
+    origin: IFRAME_ORIGIN,
+    appearance: plugin.render?.appearance ?? "inherit",
+    getTheme: () => ({ mode: "dark", tokens: collectThemeTokens(Object.keys(currentThemeVars)) }),
+    handlers: {
+      "net.fetch": async (payload) => {
+        const req = payload as {
+          url: string;
+          method?: string;
+          headers?: Record<string, string>;
+          body?: string;
+          timeoutMs?: number;
+          maxBytes?: number;
+        };
+        return invoke("plugin_net_request", {
+          pluginId: plugin.id,
+          url: req.url,
+          method: req.method,
+          headers: req.headers,
+          body: req.body,
+          timeoutMs: req.timeoutMs,
+          maxBytes: req.maxBytes,
+        });
+      },
+    },
+    onReady: () => {
+      if (myGen !== renderGen) return;
+      void host
+        .mount(input, "window", { width: root.clientWidth, height: root.clientHeight })
+        .catch((e: unknown) => fail(e instanceof Error ? e.message : String(e)));
+    },
+    onLog: (level, message) => reportFrontend(level, `[plugin ${plugin.id}] ${message}`),
+    onError: (error) => fail(`${t("plugin.float_init_failed")}（${error.code}: ${error.message}）`),
+  });
+  currentChannel = host;
+  host.start();
+}
+
+// ── 宿主能力桥（apiVersion 3，2026-10-18）──────────────────────────
+//
+// 插件不能直连网络：`net.request` 一律走宿主命令，Rust 侧按清单
+// `permissions: ["net.fetch"]` 校验，并拒绝本机 / 私网地址。
+
+function createNetBridge(): LunacNetApi {
+  return {
+    request: async (req) => {
+      if (!currentPluginId) throw new Error("插件尚未就绪");
+      return invoke<LunacNetResponse>("plugin_net_request", {
+        pluginId: currentPluginId,
+        url: req.url,
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+        timeoutMs: req.timeoutMs,
+        maxBytes: req.maxBytes,
+      });
+    },
+  };
+}
+
+/** 旧版 storage 桥的 localStorage 前缀：一次性迁移到宿主 KV 后删除。 */
+function legacyPrefix(pluginId: string): string {
+  return `lunac.plugin.${pluginId}.`;
+}
+
+let legacyMigration: { pluginId: string; done: Promise<void> } | null = null;
+
+/**
+ * 把旧 localStorage 数据搬进宿主 KV（每个插件每次会话只跑一次）。
+ * 宿主 KV 已存在的键优先，旧值直接丢弃；失败不阻断后续调用。
+ */
+function migrateLegacyStorage(): Promise<void> {
+  const pluginId = currentPluginId;
+  if (!pluginId) return Promise.resolve();
+  if (legacyMigration?.pluginId === pluginId) return legacyMigration.done;
+  const done = (async () => {
+    const prefix = legacyPrefix(pluginId);
+    const legacy: Array<[string, unknown]> = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const full = localStorage.key(i);
+      if (!full || !full.startsWith(prefix)) continue;
+      const raw = localStorage.getItem(full);
+      if (raw === null) continue;
+      try {
+        legacy.push([full.slice(prefix.length), JSON.parse(raw)]);
+      } catch {
+        // 旧值不是 JSON：没有可迁移的语义，直接删掉。
+        localStorage.removeItem(full);
+      }
+    }
+    if (!legacy.length) return;
+    const existing = new Set(
+      await invoke<string[]>("plugin_kv_keys", { pluginId }),
+    );
+    for (const [key, value] of legacy) {
+      if (!existing.has(key)) {
+        await invoke("plugin_kv_set", { pluginId, key, value });
+      }
+      localStorage.removeItem(prefix + key);
+    }
+  })().catch((e) => {
+    // 未声明 storage.plugin 等场景：不迁移，保留旧数据，后续命令会给出 E_DENIED。
+    console.warn("[lunac plugin-window] storage 迁移失败:", e);
+  });
+  legacyMigration = { pluginId, done };
+  return done;
+}
+
+function createStorageBridge(): LunacPluginStorage {
+  const requirePlugin = (): string => {
+    if (!currentPluginId) throw new Error("插件尚未就绪");
+    return currentPluginId;
+  };
+  return {
+    async get<T = unknown>(key: string): Promise<T | undefined> {
+      const pluginId = requirePlugin();
+      await migrateLegacyStorage();
+      const value = await invoke<T | null>("plugin_kv_get", { pluginId, key });
+      return value === null ? undefined : value;
+    },
+    async set(key: string, value: unknown): Promise<void> {
+      const pluginId = requirePlugin();
+      await migrateLegacyStorage();
+      await invoke("plugin_kv_set", { pluginId, key, value });
+    },
+    async remove(key: string): Promise<void> {
+      const pluginId = requirePlugin();
+      await migrateLegacyStorage();
+      await invoke("plugin_kv_remove", { pluginId, key });
+    },
+    async keys(): Promise<string[]> {
+      const pluginId = requirePlugin();
+      await migrateLegacyStorage();
+      return invoke<string[]>("plugin_kv_keys", { pluginId });
+    },
+  };
+}
+
+const mediaBridge: LunacMediaApi = {
+  proxy(
+    url: string,
+    options?: { referer?: string; userAgent?: string; cookie?: string },
+  ): string {
+    if (!currentPluginId) return url;
+    // 只代理 http(s) 绝对地址；data: / blob: 之类原样返回。
+    if (!/^https?:\/\//i.test(url)) return url;
+    const query: string[] = [];
+    if (options?.referer) query.push(`r=${encodeURIComponent(options.referer)}`);
+    if (options?.userAgent) query.push(`u=${encodeURIComponent(options.userAgent)}`);
+    if (options?.cookie) query.push(`c=${encodeURIComponent(options.cookie)}`);
+    return (
+      `http://lunac-media.localhost/${encodeURIComponent(currentPluginId)}/` +
+      encodeURIComponent(url) +
+      (query.length ? `?${query.join("&")}` : "")
+    );
+  },
+};
+
+const engineBridge: LunacEngineApi = {
+  async eval(
+    code: string,
+    options?: { timeoutMs?: number; args?: unknown },
+  ): Promise<unknown> {
+    if (!currentPluginId) throw new Error("插件尚未就绪");
+    return invoke("plugin_engine_eval", {
+      pluginId: currentPluginId,
+      code,
+      timeoutMs: options?.timeoutMs,
+      args: options?.args,
+    });
+  },
+};
+
+const sniffBridge: LunacSniffApi = {
+  async media(url: string, options?: { timeoutMs?: number }): Promise<string[]> {
+    if (!currentPluginId) throw new Error("插件尚未就绪");
+    return invoke<string[]>("plugin_sniff_media", {
+      pluginId: currentPluginId,
+      url,
+      timeoutMs: options?.timeoutMs,
+    });
+  },
+};
+
+/** 拼音编码（2026-10-22）：宿主用既有 `pinyin` crate 批量转全拼 / 首字母。
+ *  只读、无权限门；上限在 Rust 侧（单条 512 字符、每次 2000 条）。 */
+const pinyinBridge: LunacPinyinApi = {
+  encode(texts: string[]): Promise<Array<{ full: string; initials: string }>> {
+    return invoke("pinyin_encode", { texts });
+  },
+};
 
 // ── 标题栏三按钮 ──────────────────────────────────────────────────
 
@@ -133,6 +381,7 @@ function wireTitlebar() {
 
   btn("plugin-close")?.addEventListener("click", () => {
     detachPluginListeners(currentPluginId);
+    disposeChannel();
     // 面板关了 ⇒ sidecar 一起收掉（宿主侧在窗口 Destroyed 也会再收一次，双保险）
     deactivatePluginSidecar();
     void invoke("plugin_window_close").catch(() => {});
@@ -175,7 +424,17 @@ window.addEventListener("unhandledrejection", (e) =>
   loadSavedLanguage();
   // 磁盘插件的宿主桥：**必须在 registerBuiltinPlugins / refreshMarketPlugins 之前装好**，
   // 否则插件模块一加载就 import 到未初始化的一份 i18n（见 plugins/host.ts 头注释）。
-  installHostBridge({ t, apiVersion: 2, sidecar: createSidecarBridge() });
+  installHostBridge({
+    t,
+    apiVersion: 3,
+    sidecar: createSidecarBridge(),
+    net: createNetBridge(),
+    storage: createStorageBridge(),
+    media: mediaBridge,
+    engine: engineBridge,
+    sniff: sniffBridge,
+    pinyin: pinyinBridge,
+  });
   registerBuiltinPlugins();
   // 插件可能只装在 `<exe 根>\Modules\` 里（第三方 / 用户自建）—— 不扫这一下，
   // 悬浮窗遇到它们只会显示「未知插件」（主窗口本来就会扫，这里补上同一件事）
@@ -204,7 +463,14 @@ window.addEventListener("unhandledrejection", (e) =>
   // 会被**桌宠窗**一起收到 ⇒ `render()` 整页重挂（重载模型 + 清掉主动反应的 `proactiveBusy`
   // ⇒ 主动对话回复丢失）。见 ai-spec §4.5「plugin-window-input 必须定向」。
   void getCurrentWindow().listen<string>("plugin-window-input", ev => {
-    if (typeof ev.payload === "string" && currentPluginId) void render(currentPluginId, ev.payload);
+    if (typeof ev.payload !== "string" || !currentPluginId) return;
+    if (currentChannel) {
+      void currentChannel.execute(ev.payload).catch((e: unknown) => {
+        console.error("[lunac plugin-window] channel execute failed:", e);
+      });
+      return;
+    }
+    void render(currentPluginId, ev.payload);
   });
 
   // 宿主在**建窗之前**就把载荷写好了（前端可能比命令返回更快），所以这里直接取

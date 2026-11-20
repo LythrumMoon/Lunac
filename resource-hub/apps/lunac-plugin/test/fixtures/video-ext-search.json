@@ -1,0 +1,18 @@
+{
+  "data": [
+    {
+      "vod_id": "1",
+      "vod_name": "星海 动画",
+      "vod_pic": "",
+      "vod_content": "用于验证 uzVideo type 101 兼容层的本地夹具。",
+      "type_name": "动画"
+    },
+    {
+      "vod_id": "2",
+      "vod_name": "风起 剧场版",
+      "vod_pic": "",
+      "vod_content": "第二条本地夹具。",
+      "type_name": "动画"
+    }
+  ]
+}

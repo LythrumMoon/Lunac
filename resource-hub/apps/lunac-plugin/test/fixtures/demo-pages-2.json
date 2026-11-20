@@ -1,0 +1,6 @@
+{
+  "images": [
+    { "src": "/test/fixtures/page-2.svg" },
+    { "src": "/test/fixtures/page-1.svg" }
+  ]
+}

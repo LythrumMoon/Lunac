@@ -23,6 +23,7 @@ use serde::Serialize;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 
 // ── 格式表 ────────────────────────────────────────────────────────
@@ -31,15 +32,24 @@ use tauri::{AppHandle, Emitter};
 // 而 ffmpeg 自己会在解不开时明确报错（错误信息原样回给面板）。按魔数判类型是**接收方**
 // 才需要的纪律（见 ai-spec §11 规则 60 对图片附件的口径），不适用于本场景。
 
-const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "jfif", "webp", "bmp", "tif", "tiff", "gif", "ico", "heic", "avif"];
-const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "ape", "amr"];
-const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "ts", "3gp", "rmvb"];
+const IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "jfif", "webp", "bmp", "tif", "tiff", "gif", "ico", "heic", "avif",
+];
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "ape", "amr",
+];
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "ts", "3gp", "rmvb",
+];
 
 /// 可选的输出格式（刻意只列 ffmpeg 稳的：不加 avif / heic 这类要看构建的编码器，
 /// 也不加 ico —— ffmpeg 写 ico 会走 mjpeg 且尺寸受限，容易给用户一个「转出来是坏的」）。
 const IMAGE_TARGETS: &[&str] = &["png", "jpg", "webp", "bmp", "tiff", "gif"];
 const AUDIO_TARGETS: &[&str] = &["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus"];
 const VIDEO_TARGETS: &[&str] = &["mp4", "mkv", "webm", "avi", "mov", "gif"];
+/// PDF 的目标（2026-10-24 用户需求）。Word / PPT / Excel / 图片都走 **LibreOffice 无头模式**
+/// —— ffmpeg 读不了 PDF，这不是「引擎没选对」，是格式族不同。
+const PDF_TARGETS: &[&str] = &["docx", "pptx", "xlsx", "png"];
 
 fn ext_of(path: &str) -> String {
     Path::new(path)
@@ -49,7 +59,9 @@ fn ext_of(path: &str) -> String {
 }
 
 fn kind_of(ext: &str) -> &'static str {
-    if IMAGE_EXTS.contains(&ext) {
+    if ext == "pdf" {
+        "pdf"
+    } else if IMAGE_EXTS.contains(&ext) {
         "image"
     } else if AUDIO_EXTS.contains(&ext) {
         "audio"
@@ -67,6 +79,7 @@ fn targets_for(kind: &str) -> Vec<String> {
         "image" => IMAGE_TARGETS,
         "audio" => AUDIO_TARGETS,
         "video" => VIDEO_TARGETS,
+        "pdf" => PDF_TARGETS,
         _ => &[],
     };
     let mut out: Vec<String> = list.iter().map(|s| s.to_string()).collect();
@@ -93,13 +106,10 @@ fn targets_for_input(kind: &str, ext: &str, has_audio: bool) -> Vec<String> {
 
 /// 找 ffmpeg / ffprobe。顺序：**exe 根自带的副本 → PATH**（WinGet Links 就在 PATH 上）。
 /// 只找、不下载。
-fn resolve_engine(name: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_engine(name: &str) -> Option<PathBuf> {
     let root = crate::storage::lunac_root_dir();
     let exe = format!("{name}.exe");
-    let local = [
-        root.join(&exe),
-        root.join("ffmpeg").join("bin").join(&exe),
-    ];
+    let local = [root.join(&exe), root.join("ffmpeg").join("bin").join(&exe)];
     for cand in local {
         if cand.is_file() {
             return Some(cand);
@@ -123,16 +133,69 @@ pub struct EngineDto {
     pub path: String,
     /// 形如 `8.1.1`；空 = 没探到（不影响能不能用）。
     pub version: String,
+    /// PDF 引擎（LibreOffice）是否可用（2026-10-24）。`false` ⇒ PDF 分页只展示说明。
+    pub pdf_found: bool,
+    pub pdf_version: String,
+}
+
+/// 找 LibreOffice 的 `soffice`（2026-10-27 调整口径）：
+///
+/// ① **插件自带的那份**（清单里的 `archive` 依赖，解到 `<插件目录>\libreoffice\`）——
+///    用户不必自己装，这是首选；
+/// ② PATH / exe 根；
+/// ③ 两个默认安装位置（用户自己装过的情况）。
+///
+/// 依赖解压会自动摊平「唯一的顶层目录」（见 `plugin_market::flatten_single_top_dir`），
+/// 所以打包时只要保证 `.../program/soffice.exe` 在压缩包里，落盘就是 `libreoffice\program\...`；
+/// 便携版常见的 `LibreOffice\program\...` 也一并认，免得资产换一种打法是「查不到」。
+fn bundled_soffice() -> Option<PathBuf> {
+    let base = crate::plugin_market::plugins_dir()
+        .join("convert")
+        .join("libreoffice");
+    [
+        base.join("program").join("soffice.exe"),
+        base.join("LibreOffice").join("program").join("soffice.exe"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+fn resolve_soffice() -> Option<PathBuf> {
+    if let Some(p) = bundled_soffice() {
+        return Some(p);
+    }
+    if let Some(p) = resolve_engine("soffice") {
+        return Some(p);
+    }
+    let candidates = [
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ];
+    candidates.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
 #[tauri::command]
 pub async fn convert_engine_status() -> Result<EngineDto, String> {
     run_blocking(|| {
+        let soffice = resolve_soffice();
+        let pdf_version = soffice
+            .as_ref()
+            .and_then(|p| Command::new(p).arg("--version").output().ok())
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .map(|l| l.trim().to_string())
+            })
+            .unwrap_or_default();
         let Some(ffmpeg) = resolve_engine("ffmpeg") else {
             return Ok(EngineDto {
                 found: false,
                 path: String::new(),
                 version: String::new(),
+                pdf_found: soffice.is_some(),
+                pdf_version,
             });
         };
         // `-version` 的第一行是 `ffmpeg version 8.1.1-full_build-... `，取第二个词
@@ -153,6 +216,8 @@ pub async fn convert_engine_status() -> Result<EngineDto, String> {
             found: true,
             path: ffmpeg.to_string_lossy().to_string(),
             version,
+            pdf_found: soffice.is_some(),
+            pdf_version,
         })
     })
     .await
@@ -268,17 +333,65 @@ pub struct ConvertResult {
     pub elapsed_ms: i64,
 }
 
-/// 输出路径：源文件同目录、同主名、换扩展名。
+/// 当前正在跑的 ffmpeg（pid + 目标路径），供「取消这个文件」使用（2026-10-24）。
+static RUN_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+static RUN_DST: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+fn running_pid() -> &'static Mutex<Option<u32>> {
+    RUN_PID.get_or_init(|| Mutex::new(None))
+}
+fn running_dst() -> &'static Mutex<Option<PathBuf>> {
+    RUN_DST.get_or_init(|| Mutex::new(None))
+}
+
+/// 取消当前转换：按 pid 结束进程树，并删掉半成品。
+///
+/// **只对 ffmpeg 生效**（PDF / LibreOffice 走一次性进程，不在这里杀 —— 避免误杀用户
+/// 自己开着的 LibreOffice）。前端「泡泡框删除」会先调它再移除条目。
+#[tauri::command]
+pub fn convert_cancel() -> Result<(), String> {
+    let pid = *running_pid()
+        .lock()
+        .map_err(|_| "转换状态锁损坏".to_string())?;
+    let dst = running_dst().lock().ok().and_then(|mut s| s.take());
+    if let Some(pid) = pid {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+        }
+    }
+    if let Some(dst) = dst {
+        let _ = std::fs::remove_file(dst);
+    }
+    if let Ok(mut slot) = running_pid().lock() {
+        *slot = None;
+    }
+    Ok(())
+}
+
+/// 输出路径：默认源文件同目录（可用 `output_dir` 覆盖）、同主名、换扩展名。
 ///
 /// **三条硬约束**：① 绝不等于源文件（否则就是覆盖用户的原始素材）；
 /// ② 已存在就加 ` (1)` / ` (2)` 递增 —— 静默覆盖是最不该发生的事；
 /// ③ 路径由**宿主**算，前端只传目标扩展名（别让前端决定写哪儿）。
+#[cfg(test)]
 fn unique_output(input: &Path, target: &str) -> Result<PathBuf, String> {
     let dir = input.parent().unwrap_or_else(|| Path::new("."));
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .ok_or_else(|| "源文件没有名字".to_string())?;
+    unique_output_in(dir, &stem, target)
+}
+
+/// 指定目录下的不冲突输出路径（2026-10-24：支持「保存目录」设置）。
+fn unique_output_in(dir: &Path, stem: &str, target: &str) -> Result<PathBuf, String> {
     let mut candidate = dir.join(format!("{stem}.{target}"));
     let mut n = 1;
     while candidate.exists() {
@@ -299,7 +412,12 @@ fn unique_output(input: &Path, target: &str) -> Result<PathBuf, String> {
 /// `-progress pipe:1`（结构化进度走 stdout，实测字段 `out_time_us` 是**微秒**，
 /// 同行的 `out_time_ms` 在 ffmpeg 8 里同样是微秒 —— 所以只认 `out_time_us`）。
 #[tauri::command]
-pub async fn convert_run(app: AppHandle, input: String, target: String) -> Result<ConvertResult, String> {
+pub async fn convert_run(
+    app: AppHandle,
+    input: String,
+    target: String,
+    output_dir: Option<String>,
+) -> Result<ConvertResult, String> {
     run_blocking(move || {
         let started = std::time::Instant::now();
         let src = PathBuf::from(input.trim());
@@ -309,6 +427,103 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
         let target = target.trim().trim_start_matches('.').to_lowercase();
         let src_ext = ext_of(&src.to_string_lossy());
         let kind = kind_of(&src_ext);
+        let stem = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| "源文件没有名字".to_string())?;
+        // 保存目录（2026-10-24）：前端设置过就用它，否则回落到源文件同目录。
+        let out_dir = output_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| src.parent().unwrap_or(Path::new(".")).to_path_buf());
+        if !out_dir.is_dir() {
+            return Err("ERR_OUT_DIR".into());
+        }
+
+        // ── PDF：ffmpeg 读不了，走 LibreOffice 无头模式 ──────────────
+        if kind == "pdf" {
+            let Some(soffice) = resolve_soffice() else {
+                return Err("ERR_NO_PDF_ENGINE".into());
+            };
+            if !PDF_TARGETS.contains(&target.as_str()) {
+                return Err(format!("不支持 pdf → {target}"));
+            }
+            // 先转到一个临时目录再改名：LibreOffice 会按源主名直接覆盖目标目录里的同名文件。
+            let tmp = std::env::temp_dir().join(format!(
+                "lunac-convert-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&tmp).map_err(|e| format!("建临时目录失败：{e}"))?;
+            let profile = tmp.join("profile");
+            let url = format!("file:///{}", profile.to_string_lossy().replace('\\', "/"));
+            let out = Command::new(&soffice)
+                .arg(format!("-env:UserInstallation={url}"))
+                .arg("--headless")
+                .arg("--norestore")
+                .arg("--convert-to")
+                .arg(&target)
+                .arg("--outdir")
+                .arg(&tmp)
+                .arg(&src)
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("启动 LibreOffice 失败：{e}"))?;
+            if !out.status.success() {
+                let detail = String::from_utf8_lossy(&out.stderr)
+                    .trim()
+                    .chars()
+                    .take(500)
+                    .collect::<String>();
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(if detail.is_empty() {
+                    format!("转换失败：LibreOffice 退出码 {:?}", out.status.code())
+                } else {
+                    format!("转换失败：{detail}")
+                });
+            }
+            let produced = std::fs::read_dir(&tmp)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_file() && ext_of(&p.to_string_lossy()) == target);
+            let Some(produced) = produced else {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err("转换失败：LibreOffice 没有产出文件（PDF 转图片只导出第一页）".into());
+            };
+            let dst = unique_output_in(&out_dir, &stem, &target)?;
+            let moved = std::fs::rename(&produced, &dst)
+                .or_else(|_| std::fs::copy(&produced, &dst).map(|_| ()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            moved.map_err(|e| format!("写入输出文件失败：{e}"))?;
+            let size = std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
+            let elapsed_ms = started.elapsed().as_millis() as i64;
+            let _ = app.emit(
+                "convert-progress",
+                ConvertProgress {
+                    percent: 100.0,
+                    total_ms: 0,
+                },
+            );
+            crate::log::info(&format!(
+                "convert(pdf): {} → {}（{size} 字节）",
+                src.display(),
+                dst.display()
+            ));
+            return Ok(ConvertResult {
+                output: dst.to_string_lossy().to_string(),
+                size,
+                elapsed_ms,
+            });
+        }
+
         // 先探再校验：无音轨的视频抽音轨这一条只有 probe 之后才知道，放在这里
         // 才能给出「不支持 mp4 → mp3」这种能看懂的拒绝，而不是 ffmpeg 的报错原文。
         let (total_secs, has_audio) = if kind == "image" || kind == "unknown" {
@@ -316,14 +531,17 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
         } else {
             probe_input(&src)
         };
-        if !targets_for_input(kind, &src_ext, has_audio).iter().any(|t| *t == target) {
+        if !targets_for_input(kind, &src_ext, has_audio)
+            .iter()
+            .any(|t| *t == target)
+        {
             return Err(format!("不支持 {src_ext} → {target}"));
         }
         let Some(ffmpeg) = resolve_engine("ffmpeg") else {
             return Err("ERR_NO_ENGINE".into());
         };
 
-        let dst = unique_output(&src, &target)?;
+        let dst = unique_output_in(&out_dir, &stem, &target)?;
         let total_ms = (total_secs * 1000.0).round() as i64;
 
         let mut child = Command::new(&ffmpeg)
@@ -342,6 +560,15 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
+        // 记录 pid 供「取消这个文件」用（2026-10-24）。
+        {
+            if let Ok(mut slot) = running_pid().lock() {
+                *slot = Some(child.id());
+            }
+            if let Ok(mut slot) = running_dst().lock() {
+                *slot = Some(dst.clone());
+            }
+        }
         // **绑到 lunac.exe 的生命周期上**（预检 #57，2026-10-02）：ffmpeg 是转换插件起的
         // 子进程。它是「一次转换一个」的短命进程，跑完自己就退，但在它跑完之前
         // 宿主崩了 / 被强杀，它就成了孤儿 —— 而它此刻正在用户的磁盘上写半个文件。
@@ -361,8 +588,12 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
         if let Some(stdout) = child.stdout.take() {
             let mut last_emit = 0.0f64;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Some(us) = line.strip_prefix("out_time_us=") else { continue };
-                let Ok(us) = us.trim().parse::<i64>() else { continue };
+                let Some(us) = line.strip_prefix("out_time_us=") else {
+                    continue;
+                };
+                let Ok(us) = us.trim().parse::<i64>() else {
+                    continue;
+                };
                 let percent = if total_ms > 0 {
                     ((us as f64 / 1000.0) / total_ms as f64 * 100.0).clamp(0.0, 99.9)
                 } else {
@@ -378,6 +609,12 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
         }
 
         let status = child.wait().map_err(|e| format!("等待 ffmpeg 失败：{e}"))?;
+        if let Ok(mut slot) = running_pid().lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = running_dst().lock() {
+            *slot = None;
+        }
         let err_text = err_handle.join().unwrap_or_default();
         if !status.success() {
             // 失败要把半成品删掉，别在用户目录里留一个「转坏了的文件」
@@ -403,8 +640,12 @@ pub async fn convert_run(app: AppHandle, input: String, target: String) -> Resul
         );
         crate::log::info(&format!(
             "convert: {} → {}（{} 字节，{}ms）",
-            src.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            dst.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            src.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            dst.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
             size,
             elapsed_ms
         ));
@@ -452,12 +693,22 @@ mod tests {
         let with_audio = targets_for_input("video", "mp4", true);
         assert!(with_audio.iter().any(|t| t == "mp3"));
         let silent = targets_for_input("video", "mp4", false);
-        assert!(!silent.iter().any(|t| t == "mp3"), "无音轨的视频不该列音频目标");
-        assert!(silent.iter().any(|t| t == "webm"), "摘音频目标不该动视频目标");
+        assert!(
+            !silent.iter().any(|t| t == "mp3"),
+            "无音轨的视频不该列音频目标"
+        );
+        assert!(
+            silent.iter().any(|t| t == "webm"),
+            "摘音频目标不该动视频目标"
+        );
         // has_audio 只对视频有意义：纯音频文件的候选不受它影响
-        assert!(targets_for_input("audio", "wav", false).iter().any(|t| t == "mp3"));
+        assert!(targets_for_input("audio", "wav", false)
+            .iter()
+            .any(|t| t == "mp3"));
         // 源扩展名本身要被摘掉
-        assert!(!targets_for_input("audio", "wav", true).iter().any(|t| t == "wav"));
+        assert!(!targets_for_input("audio", "wav", true)
+            .iter()
+            .any(|t| t == "wav"));
     }
 
     #[test]
@@ -482,7 +733,10 @@ mod tests {
         // ② 已存在 ⇒ 加 ` (1)`
         std::fs::write(&first, b"y").unwrap();
         let second = unique_output(&src, "webm").unwrap();
-        assert_eq!(second.file_name().unwrap().to_string_lossy(), "clip (1).webm");
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "clip (1).webm"
+        );
 
         // ③ 目标扩展名与源相同（不该发生，但必须保证不覆盖源文件）
         let same = unique_output(&src, "mp4").unwrap();

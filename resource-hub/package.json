@@ -1,0 +1,21 @@
+{
+  "name": "resource-hub",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @resource-hub/source-sdk && npm run build -w @resource-hub/reader && npm run build -w @resource-hub/lunac-plugin",
+    "test": "npm run test -w @resource-hub/source-sdk && npm run test -w @resource-hub/reader",
+    "typecheck": "npm run typecheck -w @resource-hub/source-sdk && npm run typecheck -w @resource-hub/reader && npm run typecheck -w @resource-hub/lunac-plugin",
+    "registry:build": "node scripts/build-registry.mjs",
+    "source:validate": "node scripts/validate-source.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vite": "^6.3.0"
+  }
+}

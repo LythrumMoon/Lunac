@@ -627,7 +627,7 @@ function onOffText(on: boolean): string {
 /** 「主动反应」区块（设置窗）。**成本红线**：默认关 + 最小间隔 + 每日上限 + 今日已用回显。
  *  2026-10-17 用户口径：三个主动反应（主动说话 / 自动抓屏 / 屏幕变化触发）**合并成一个**——
  *  只留一个开关 + 一个间隔；「画面有变化就带截图、否则主动说一句」由桌宠侧统一判定。
- *  隐私提示仍保留在界面上（开启后才会看屏幕，隐藏 / 最小化立即停）。 */
+ *  2026-10-22 用户口径：**删掉两段解释文案**（合并窗口说明、抓屏行为说明）——只留控件与数字。 */
 function proactiveBlock(cfg: PetConfig): string {
   const pr = cfg.proactive;
   const used = proactiveUsedToday();
@@ -663,13 +663,11 @@ function proactiveBlock(cfg: PetConfig): string {
       <input type="text" id="pet-proactive-gap" class="pet-param-num" inputmode="numeric" autocomplete="off" spellcheck="false" value="${pr.screenMinGapSec}" aria-label="${esc(t("pet.proactive_screen_gap"))}">
       <span class="pet-val">${t("pet.proactive_second")}</span>
     </div>
-    <div class="pet-note">${esc(t("pet.proactive_gap_hint"))}</div>
     <div class="pet-row">
       <span class="pet-label">${t("pet.proactive_screen_diff")}</span>
       <input type="text" id="pet-proactive-diff" class="pet-param-num" inputmode="numeric" autocomplete="off" spellcheck="false" value="${pr.screenDiff}" aria-label="${esc(t("pet.proactive_screen_diff"))}">
     </div>
     <div class="pet-note">${esc(t("pet.proactive_diff_hint"))}</div>
-    <div class="pet-note" id="pet-proactive-hint">${esc(t("pet.proactive_shot_hint"))}</div>
     <div class="pet-note" id="pet-proactive-usage">${esc(usage)}</div>
   </div>`;
 }
@@ -1170,7 +1168,7 @@ function renderMotions(): void {
       const on = idle.has(f.name.toLowerCase());
       return `<div class="pet-mo-row" data-mo-i="${i}">
       <input class="pet-mo-name" data-mo-name="${i}" spellcheck="false" value="${esc(f.name)}" title="${esc(f.path)}">
-      <button type="button" class="pet-btn pet-btn-toggle pet-mo-idle${on ? " on" : ""}" data-mo-idle="${i}" aria-pressed="${on ? "true" : "false"}" title="循环播放：勾上后，模型闲下来（没有别的动作在播）时会按顺序轮流播放它；是否循环由该文件自己的 Meta.Loop 决定">循环播放：${on ? "开" : "关"}</button>
+      <button type="button" class="pet-btn pet-btn-toggle pet-mo-idle${on ? " on" : ""}" data-mo-idle="${i}" aria-pressed="${on ? "true" : "false"}" title="循环播放：勾上后，模型闲下来（没有别的动作在播）时会按顺序轮流播放它；是否循环由该文件自己的 Meta.Loop 决定">循环：${on ? "开" : "关"}</button>
       <button type="button" class="pet-btn pet-mo-run" data-mo-run="${i}">播放</button>
       <button type="button" class="pet-btn pet-mo-del" data-mo-del="${i}">删除</button>
       <div class="pet-chain-bar pet-mo-bar" data-bar-idx="${i}"><i></i><span class="pet-mo-bar-t">${esc(f.name)}</span></div>
@@ -1229,6 +1227,16 @@ const STOP_SVG =
   `<g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6"><rect x="5" y="5" width="14" height="14" rx="2.5"/></g>` +
   `<rect x="5" y="5" width="14" height="14" rx="2.5"/>` +
   `<circle cx="8.6" cy="8.6" r="0.9" fill="currentColor" stroke="none"/></svg>`;
+
+/** 「语音输入」按钮的图标（麦克风；同一套残影 + 点彩语言，`currentColor` 跟随按钮文字色）。 */
+const MIC_SVG =
+  `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" ` +
+  `stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">` +
+  `<g opacity="0.28" transform="translate(-0.7,-0.7)" stroke-width="1.6">` +
+  `<rect x="9" y="2.8" width="6" height="11.4" rx="3"/><path d="M6.4 11.2a5.6 5.6 0 0 0 11.2 0"/><path d="M12 16.8V20"/></g>` +
+  `<rect x="9" y="2.8" width="6" height="11.4" rx="3"/>` +
+  `<path d="M6.4 11.2a5.6 5.6 0 0 0 11.2 0"/><path d="M12 16.8V20"/>` +
+  `<circle cx="17.5" cy="17.5" r="0.4" fill="currentColor" stroke="none" opacity="0.45"/></svg>`;
 
 /** 窗上「缩放手柄」的图标（右下角斜向抓握；严格线性 SVG）。`currentColor` 跟随 `--text-dim`
  *  （hover 变 `--text`），不写死色值。 */
@@ -1748,7 +1756,7 @@ function settingsHtml(cfg: PetConfig): string {
       <textarea id="pet-persona-text" class="pet-persona-text" rows="6" spellcheck="false" maxlength="8000" placeholder=""></textarea>
       <div class="pet-row pet-persona-actions">
         <button type="button" id="pet-persona-save" class="pet-btn pet-btn-primary">${t("settings.persona_save")}</button>
-        <button type="button" id="pet-persona-clear" class="pet-btn">${t("pet.persona_clear")}</button>
+        <button type="button" id="pet-persona-clear" class="pet-btn" data-armed-text="${esc(t("pet.list_clear_armed"))}">${t("pet.persona_clear")}</button>
         <button type="button" id="pet-persona-restart" class="pet-btn">${t("settings.persona_restart")}</button>
       </div>
       <div class="pet-note" id="pet-persona-msg"></div>
@@ -2702,9 +2710,14 @@ async function attachSettings(root: HTMLElement): Promise<void> {
         const ta = el<HTMLTextAreaElement>("pet-persona-text");
         void savePetPersona(ta?.value ?? "", MSG_PERSONA_SAVED).catch(e => report("保存桌宠人格失败", e));
       } else if (t.closest("#pet-persona-clear")) {
-        const ta = el<HTMLTextAreaElement>("pet-persona-text");
-        if (ta) ta.value = "";
-        void savePetPersona("", MSG_PERSONA_CLEARED).catch(e => report("清空桌宠人格失败", e));
+        // 2026-10-22 用户口径：清空核心人格是**不可恢复**的，走与列表清空同款的两段式确认。
+        const btn = el("pet-persona-clear");
+        if (!btn) return;
+        armedRun(btn, () => {
+          const ta = el<HTMLTextAreaElement>("pet-persona-text");
+          if (ta) ta.value = "";
+          void savePetPersona("", MSG_PERSONA_CLEARED).catch(e => report("清空桌宠人格失败", e));
+        });
       } else if (t.closest("#pet-persona-restart")) {
         // 「重启 AI」按钮：桌宠窗没有 `__lunac_reload_agent` 桥 ⇒ 广播给主窗执行（见 main.ts）。
         setPersonaMsg(MSG_PERSONA_RESTARTING);
@@ -3435,7 +3448,9 @@ async function attachSettings(root: HTMLElement): Promise<void> {
         else delete next[model];
         saveConfig({ ...c, idleMotions: next });
         renderMotions();
-        void emit(CTL_EVENT, { type: "reload" });
+        // 2026-10-22：**不重挂模型**（`reload` 会拆纹理 + 重载，画面空一大截；连点几次还会叠画布）。
+        // 只让桌宠窗把新列表交给引擎热更新（见 CTL_EVENT 的 `idle-set`）。
+        void emit(CTL_EVENT, { type: "idle-set" });
         return;
       }
       const runI = idxOf(t, "[data-mo-run]");
@@ -3587,6 +3602,7 @@ function petHtml(): string {
   <div class="pet-bottom">
     <div class="pet-chat-inputrow">
       <textarea class="pet-chat-input" id="pet-chat-input" rows="1" spellcheck="false" autocomplete="off" placeholder="${esc(t("pet.ai_chat_placeholder"))}" aria-label="${esc(t("pet.ai_chat"))}"></textarea>
+      <button type="button" class="pet-chat-mic" id="pet-chat-mic" title="${esc(t("pet.voice_input"))}" aria-label="${esc(t("pet.voice_input"))}">${MIC_SVG}</button>
       <button type="button" class="pet-chat-stop" id="pet-chat-stop" title="${esc(t("pet.chat_stop"))}" aria-label="${esc(t("pet.chat_stop"))}">${STOP_SVG}</button>
       <button type="button" class="pet-chat-close" id="pet-chat-close" title="${esc(t("pet.ai_chat_close"))}" aria-label="${esc(t("pet.ai_chat_close"))}">×</button>
     </div>
@@ -3682,6 +3698,11 @@ const PET_CSS = `
 .pet-chat-stop{display:none;flex:0 0 auto;align-items:center;justify-content:center;width:30px;height:30px;box-sizing:border-box;background:rgba(var(--btn-bg-rgb),var(--btn-bg-alpha));border:1px solid rgba(var(--btn-line-rgb),var(--btn-line-alpha));border-radius:6px;color:rgb(var(--btn-line-rgb));cursor:pointer;padding:0;}
 .pet-chat-stop.on{display:flex;}
 .pet-chat-stop:hover{background:rgba(var(--btn-bg-rgb),calc(var(--btn-bg-alpha) + 0.06));}
+/* 语音输入（2026-10-22）：与中止按钮同形同色，常显；识别中挂 .on = 线条色淡底，按钮禁用。 */
+.pet-chat-mic{appearance:none;display:flex;flex:0 0 auto;align-items:center;justify-content:center;width:30px;height:30px;box-sizing:border-box;background:rgba(var(--btn-bg-rgb),var(--btn-bg-alpha));border:1px solid rgba(var(--btn-line-rgb),var(--btn-line-alpha));border-radius:6px;color:rgb(var(--btn-line-rgb));cursor:pointer;padding:0;}
+.pet-chat-mic:hover{background:rgba(var(--btn-bg-rgb),calc(var(--btn-bg-alpha) + 0.06));}
+.pet-chat-mic.on{background:rgba(var(--btn-line-rgb),.18);}
+.pet-chat-mic:disabled{cursor:default;opacity:.55;}
 .pet-empty{position:absolute;left:50%;bottom:38%;transform:translateX(-50%);text-align:center;font-size:.72rem;line-height:1.7;color:var(--text-dim);background:var(--surface-glass);border:1px solid var(--border-glass);border-radius:var(--radius);padding:10px 14px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);}
 .pet-empty span{font-size:.66rem;opacity:.75;}
 .pet-menu{position:absolute;display:none;flex-direction:column;min-width:132px;padding:4px;background:var(--surface-glass);border:1px solid var(--border-glass);border-radius:var(--radius);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);box-shadow:0 8px 24px rgba(var(--shade-rgb),.28);}
@@ -3880,6 +3901,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   const chatText = el("pet-chat-text");
   const chatClose = el("pet-chat-close");
   const chatStop = el("pet-chat-stop");
+  const chatMic = el<HTMLButtonElement>("pet-chat-mic");
   const chatInput = el<HTMLTextAreaElement>("pet-chat-input");
   const resizeHandle = el("pet-resize-handle");
 
@@ -4983,6 +5005,48 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
   chatClose?.addEventListener("click", onChatCloseClick);
   chatStop?.addEventListener("click", onChatStopClick);
 
+  // ── 语音输入（2026-10-22，§待办 1-4 ⑤）──────────────────────────
+  // 宿主 Windows 内置识别，**一次一句**、离线；成功即走 sendToAI —— 与「主动反应 / 抓屏」
+  // 同一条「桌宠发起」链路，不新开对话通道、不写第二套消息格式。
+  // 失败按宿主回的 `reason` 给一句人话（没装语音包 / 麦克风被隐私设置关了是两种不同原因）。
+  let voiceBusy = false;
+  const onChatMicClick = () => {
+    if (voiceBusy) return;
+    voiceBusy = true;
+    chatMic?.classList.add("on");
+    if (chatMic) chatMic.disabled = true;
+    showToast(t("pet.voice_listening"), 2600);
+    void invoke<{ text: string; reason: string }>("recognize_speech")
+      .then((r) => {
+        if (r && r.reason === "ok" && typeof r.text === "string" && r.text.trim()) {
+          if (chatInput) chatInput.value = "";
+          sendToAI(r.text);
+          return;
+        }
+        const reason = r?.reason ?? "unknown";
+        showToast(
+          reason === "no-speech" || reason === "canceled"
+            ? t("pet.voice_no_speech")
+            : reason === "microphone-unavailable"
+              ? t("pet.voice_no_mic")
+              : reason === "language-not-supported"
+                ? t("pet.voice_no_language")
+                : t("pet.voice_failed"),
+          3200,
+        );
+      })
+      .catch((e) => {
+        reportPet("语音识别失败", e);
+        showToast(t("pet.voice_failed"), 3200);
+      })
+      .finally(() => {
+        voiceBusy = false;
+        chatMic?.classList.remove("on");
+        if (chatMic) chatMic.disabled = false;
+      });
+  };
+  chatMic?.addEventListener("click", onChatMicClick);
+
   // ── 口型（lip-sync，2026-10-10）────────────────────────────────
   // **为什么是宿主喂包络**：音频在宿主播（WebView 放不出声音，见 ai-spec §4.6）⇒ 宿主在
   // **开始播之前**把这条 WAV 的「张嘴幅度包络」定向发过来（`tts.rs` 的 `MOUTH_EVENT`），
@@ -5410,6 +5474,23 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
       void paint();
       return;
     }
+    // 「循环播放」列表热更新（2026-10-22）：勾 / 取消**不重挂模型**，只把新列表交给引擎。
+    // 列表按当前配置 + 实际扫描结果重算（配置里可能留着已删 / 改名的死项，引擎侧也会再过滤一次）。
+    if (p.type === "idle-set" && inPetWindow()) {
+      void (async () => {
+        const h = l2dHandle;
+        const modelPath = loadConfig().model.trim();
+        if (!h || !modelPath) return;
+        try {
+          const all = await listMotionFiles(modelPath);
+          const idle = idleNameSet(modelPath);
+          h.setIdleMotions(all.filter(f => idle.has(f.name.toLowerCase())).map(f => f.path));
+        } catch (e) {
+          reportPet("更新循环播放列表失败", e);
+        }
+      })();
+      return;
+    }
     // 设置窗的「隐藏模型」：**只隐藏本窗、不销毁**（用户 2026-10-10 口径 —— 原来那枚按钮会把
     // 整个桌宠窗关掉）。本窗自己 `hide()`，宿主不会补发 `plugin-window-visibility` ⇒ 这里
     // 主动走一遍 `applyHidden()` 把动画 / 定时器停掉；再显示走 `open_plugin_window` 的
@@ -5631,6 +5712,7 @@ async function attachPetWindow(root: HTMLElement): Promise<void> {
     offResized();
     l2dHandle?.setMouthOpen(null);
     chatInput?.removeEventListener("keydown", onChatKeydown);
+    chatMic?.removeEventListener("click", onChatMicClick);
     chatClose?.removeEventListener("click", onChatCloseClick);
     window.removeEventListener("mousemove", onShapeDragMove);
     window.removeEventListener("mouseup", onShapeDragUp);

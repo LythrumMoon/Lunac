@@ -1,0 +1,39 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "harness.epub",
+    "name": "Harness EPUB",
+    "version": "1.0.0",
+    "kind": ["novel"],
+    "engine": "declarative",
+    "entry": "rule.json",
+    "baseUrl": "http://localhost:8123",
+    "capabilities": ["search", "chapters", "content"]
+  },
+  "rule": {
+    "search": {
+      "request": { "method": "GET", "url": "/test/fixtures/demo-search.json" },
+      "list": { "jsonPath": "$.data[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } },
+        "author": { "selector": { "jsonPath": "author" } },
+        "tags": { "selector": { "jsonPath": "tags" } }
+      }
+    },
+    "chapters": {
+      "request": { "method": "GET", "url": "@workUrl" },
+      "list": { "jsonPath": "$.chapters[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } }
+      }
+    },
+    "content": {
+      "request": { "method": "GET", "url": "/test/fixtures/book-content.json" },
+      "list": { "jsonPath": "$.book[*]" },
+      "fields": { "content": { "selector": { "jsonPath": "url" } } }
+    },
+    "contentFormat": "epub"
+  }
+}

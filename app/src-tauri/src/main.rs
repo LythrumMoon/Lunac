@@ -6,129 +6,230 @@
 
 mod hotkey;
 // 全局低级鼠标钩子（WH_MOUSE_LL）：桌宠鼠标穿透态下 Alt+右键 唤出菜单（按需懒启停）。
-mod mouse_hook;
-mod commands;
-mod child_job;
 mod app_indexer;
+mod child_job;
+mod commands;
 mod file_indexer;
+mod mouse_hook;
 mod system_catalog;
 mod system_proxy;
-// mihomo 内核托管（2026-10-03）：代理插件的第二条腿。`system_proxy` 管「Windows 的
-// 代理设置」，这里管「代理能力本身」（内核进程 + 订阅 + 节点 + 规则），见模块头。
+// 代理配置与内核生命周期（2026-10-03 建；2026-11-01 起 native-only，mihomo 路径已删）。
+// `system_proxy` 管「Windows 的代理设置」，这里管「代理能力本身」（配置 + 订阅 + 节点 + 启停）。
 mod mihomo;
+// 自研代理引擎（2026-10-31）：纯 Rust、编进宿主，覆盖 7 种协议 + TLS/WS + SOCKS5 UDP。
 mod icon_extractor;
+mod native_proxy;
+mod plugin_market;
 mod proxy_server;
 mod storage;
-mod plugin_market;
-mod chat_db;
+// 白箱边界账本（W0，2026-11-01）：只记录 / 导出判定，不提供隔离（见 docs/sandbox-research.md）。
+mod security_ledger;
+// 插件宿主代请求（net.fetch，2026-10-18）：CSP 下插件唯一的联网出口。
+mod plugin_net;
+// 插件自定义协议（lunac-plugin，2026-10-18）：iframe 引擎的文档与静态资源入口。
+mod plugin_scheme;
+// 插件媒体代理（lunac-media，2026-10-18，A2）：带 Referer / UA 的图片与视频字节。
+mod media_proxy;
+mod plugin_media;
+// 插件 KV（A3，2026-10-18）：按插件 id 命名空间的宿主侧持久化。
+mod plugin_kv;
+// 插件脚本沙箱（A4，2026-10-18）：QuickJS 一次性运行时，无宿主能力绑定。
+mod plugin_engine;
+// 插件 WebView 嗅探（2026-10-21）：隐藏 WebView2 + 请求拦截，取番剧 m3u8 / mp4。
 mod appearance;
 mod auto_start;
+mod chat_db;
 mod mcp_server;
+mod plugin_sniff;
+mod voice_input;
 mod windows_ocr;
-mod paddle_ocr;
-mod music;
+// 插件桥：文本 → 全拼 / 首字母（阅读插件「拼音检索」，2026-10-22）。只读、无副作用。
 mod media_lib;
+mod music;
+mod paddle_ocr;
+mod pinyin_bridge;
 // 本地文件播放（音乐插件「本地音乐」页的出声口，2026-10-01）。与 `media_lib` 分开：
 // 那边是**索引**（能看），这边是**出声**（能听）—— 两件事的失败面完全不同。
-mod player;
 mod live_audio;
+mod player;
 // 调音的**实时硬件测量**（WASAPI 回环，2026-10-02）。与 `player` 分开：那边管
 // 「出声」，这边管「把出到硬件的声量回来」，而且它整段是 COM/WASAPI 的裸调用 ——
 // 混进 player.rs 只会让那个文件同时承担两种完全不同的失败面。
-mod tuning_probe;
 mod convert;
-mod translate;
 mod plugin_window;
+mod translate;
+mod tuning_probe;
+// 任务栏缩略图工具栏（2026-10-27）：音乐插件窗的「上一曲 / 播放暂停 / 下一曲」。
+// 见 src/taskbar_thumb.rs。
 mod plugin_sidecar;
+mod taskbar_thumb;
+// 插件开发工具链（轨道 H，2026-10-18）：授权账本 + 工具链安装 + 构建执行。
+mod plugin_toolchain;
+// 资源库来源的宿主侧存储（A5，2026-10-18）：AI 安装 / 插件导入共用同一目录。
+mod resource_hub;
 mod screenshot;
 // 桌宠回复的本机离线**语音朗读**（2026-10-10，`tts.rs`）：WinRT 语音合成 + rodio 出声。
 // 与 `windows_ocr.rs` 同源（都是 WinRT），但失败一律静默跳过，不 panic。
+mod cli_bridge;
 mod tts;
 mod tts_zipvoice;
-mod cli_bridge;
+// 定时任务调度器（2026-10-17 阶段 1）：30s tick + 只读单发 + 状态/锁/通知。
+mod cron;
+// 通用后台任务队列（2026-10-22，S2）：宿主 worker 顺序执行 TaskEnqueue 入队的只读长任务。
+mod task_queue;
+// 唤醒判据 + 唤醒源登记表（§待办 3-23 分片 2–3，2026-10-31）：后台循环按需醒，
+// 三类来源（定时 / 队列文件 / IDE 请求）只在**真的干活**时登记一行日志。
 mod agent_server;
 mod log;
+mod wake;
 // Win32 裸 FFI 小工具（进程表枚举 / 后台线程降级）。**必须只有一处声明** —— 同一个
 // Win32 符号在本 crate 里出现两种签名会触发 `clashing_extern_declarations`。
-mod win_proc;
 mod single_instance;
-mod updater;
 mod snapshots;
+mod updater;
+mod win_proc;
 
 use commands::{
-    start_cli, stop_cli, send_message, get_status,
-    // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
-    get_memory, clear_memory,
-    // 桌宠事实记忆（桌宠私有 `pet\MEMORY.md`，AI 经 Remember 写）的前端入口
-    get_pet_memory, delete_pet_memory_note, clear_pet_memory,
-    // 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）
-    get_pet_growth, delete_pet_growth_note, clear_pet_growth,
-    get_persona_suggestions, delete_persona_suggestion, merge_persona_suggestion,
-    clear_persona_suggestions,
-    set_security_profile, list_start_menu_apps,
-    set_query_state, set_recording_state, set_ui_mode, set_chips_empty,
-    set_ai_mode, set_thinking_mode, set_detached, get_ai_config, set_ai_config, test_ai_connection,
-    get_hooks_config, set_hooks_enabled, hooks_file_path,
-    get_pricing_state, pricing_file_path, commit_pricing_pending, discard_pricing_pending,
-    get_persona, set_persona,
-    get_pet_persona, set_pet_persona,
-    read_pet_hotkeys, write_pet_hotkeys,
-    read_pet_chains, write_pet_chains,
-    read_pet_params, write_pet_params,
-    write_motion_file, delete_motion_file, rename_motion_file,
-    list_exp3_files, list_motion_files, scan_model_folder,
-    get_mcp_config, open_mcp_config,
-    set_workspace, get_workspace, set_tool_blacklist,
-    set_pet_model_dir,
-    search_apps, launch_app, add_custom_app, remove_custom_app, list_custom_apps,
-    get_app_icon,
-    get_file_thumbnail,
-    search_files, file_index_status, refresh_file_index,
-    system_catalog, open_setting, run_system_action, run_system_action_elevated,
-    launch_app_elevated, reveal_in_explorer,
-    notify_sound,
-    set_hotkey_combo, get_hotkey_combo,
-    set_auto_start, get_auto_start_info,
+    add_custom_app,
+    cancel_plugin_dependency_install,
     check_file_exists,
+    clear_memory,
+    clear_persona_suggestions,
+    clear_pet_growth,
+    clear_pet_memory,
+    commit_pricing_pending,
+    delete_motion_file,
+    delete_persona_suggestion,
+    delete_pet_growth_note,
+    delete_pet_memory_note,
+    delete_skill,
+    delete_temp_image,
+    delete_tool_file,
+    discard_pricing_pending,
+    download_tool_from_url,
+    fetch_plugin_index,
+    file_index_status,
+    get_agent_workdir,
+    get_ai_config,
+    get_app_icon,
+    get_auto_start_info,
+    get_file_thumbnail,
+    get_hooks_config,
+    get_hotkey_combo,
+    get_mcp_config,
+    // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
+    get_memory,
+    get_persona,
+    get_persona_suggestions,
+    // 桌宠成长笔记 / 人格修订建议（2026-10-13，人格地基）
+    get_pet_growth,
+    // 桌宠事实记忆（桌宠私有 `pet\MEMORY.md`，AI 经 Remember 写）的前端入口
+    get_pet_memory,
+    get_pet_persona,
+    get_pricing_state,
+    get_status,
+    get_system_language,
+    get_workspace,
+    hide_lunac,
+    hooks_file_path,
+    import_skill_content,
+    install_plugin_dependencies,
+    install_plugin_from_url,
+    install_skill_from_url,
+    launch_app,
+    launch_app_elevated,
+    list_custom_apps,
+    list_exp3_files,
     // 桌宠表情按钮：列出模型文件同层目录里实际存在的 *.exp3.json（见 commands.rs）
     list_expression_files,
-    list_tool_files, read_tool_file, save_tool_file, delete_tool_file,
-    download_tool_from_url,
-    list_installed_skills, read_skill_file, save_skill_file, delete_skill,
-    import_skill_content, install_skill_from_url,
-    open_path,
-    list_installed_plugins, install_plugin_from_url, uninstall_plugin, plugins_dir_path,
-    local_model_config_get, local_model_config_set,
-    install_plugin_dependencies,
-    cancel_plugin_dependency_install,
-    fetch_plugin_index,
-    run_ocr,
-    save_temp_image,
-    delete_temp_image,
-    read_clipboard_files,
-    read_clipboard_file_paths,
-    read_clipboard_backup_image,
-    open_in_vscode,
-    open_file_in_vscode,
-    get_system_language,
-    run_paddle_ocr,
+    list_installed_plugins,
+    list_installed_skills,
+    list_motion_files,
+    list_start_menu_apps,
+    list_tool_files,
+    local_decision_status,
+    local_model_config_get,
+    local_model_config_set,
+    local_model_probe,
+    merge_persona_suggestion,
+    notify_sound,
     ocr_engine_status,
-    hide_lunac,
+    open_file_in_vscode,
+    open_in_vscode,
+    open_mcp_config,
+    open_path,
+    open_setting,
+    pinyin_encode,
+    plugin_install_pause,
+    plugin_install_state,
+    plugin_pending_downloads,
+    plugins_dir_path,
+    pricing_file_path,
+    read_clipboard_backup_image,
+    read_clipboard_file_paths,
+    read_clipboard_files,
+    read_pet_chains,
+    read_pet_hotkeys,
+    read_pet_params,
+    read_skill_file,
+    read_tool_file,
+    recognize_speech,
+    refresh_file_index,
+    remove_custom_app,
+    rename_motion_file,
+    reveal_in_explorer,
+    run_ocr,
+    run_paddle_ocr,
+    run_system_action,
+    run_system_action_elevated,
+    save_skill_file,
+    save_temp_image,
+    save_tool_file,
+    scan_model_folder,
+    search_apps,
+    search_files,
+    send_message,
+    set_ai_config,
+    set_ai_mode,
+    set_auto_start,
+    set_chips_empty,
+    set_detached,
+    set_hooks_enabled,
+    set_hotkey_combo,
+    set_persona,
+    set_pet_model_dir,
+    set_pet_persona,
+    set_query_state,
+    set_recording_state,
+    set_security_profile,
+    set_thinking_mode,
+    set_tool_blacklist,
+    set_ui_mode,
+    set_workspace,
+    start_cli,
+    stop_cli,
+    system_catalog,
+    test_ai_connection,
+    uninstall_plugin,
+    write_motion_file,
+    write_pet_chains,
+    write_pet_hotkeys,
+    write_pet_params,
 };
 use std::process::Command as StdCommand;
 use std::sync::Mutex;
 use tauri::{
-    Manager, WindowEvent,
-    tray::{TrayIconBuilder, TrayIconEvent, MouseButton},
     menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    Manager, WindowEvent,
 };
 
 pub struct AppState {
     pub cli_stdin: Mutex<Option<std::process::ChildStdin>>,
     pub cli_process: Mutex<Option<std::process::Child>>,
     pub security_profile: Mutex<String>, // "safe" | "project" | "full"
-    pub ai_mode: Mutex<String>, // "agent" (simple mode removed 2026-08-04)
-    pub thinking_mode: Mutex<String>, // 思考开关: "on" | "off"
+    pub ai_mode: Mutex<String>,          // "agent" (simple mode removed 2026-08-04)
+    pub thinking_mode: Mutex<String>,    // 思考开关: "on" | "off"
     pub workspace: Mutex<String>, // AI agent workspace dir; empty = user home dir (whole system)
     pub tool_blacklist: Mutex<Vec<String>>, // user-custom tool blacklist; merged with defaults on agent.exe start
     /// 桌宠当前模型目录（绝对路径；空 = 未设 / 已清除）。桌宠插件在模型目录确定 / 变化时上报，
@@ -317,13 +418,30 @@ fn main() {
             added += 1;
         }
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", &merged);
-        crate::log::info(format!("WebView2 browser args（合并 {added} 项）: {merged}"));
+        crate::log::info(format!(
+            "WebView2 browser args（合并 {added} 项）: {merged}"
+        ));
     }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // iframe 引擎：Windows 上是 `http://lunac-plugin.localhost/<id>/ui/index.html`
+        // （地址由前端 `pluginFrameUrl()` 按平台生成，不能写 `lunac-plugin://`）
+        .register_uri_scheme_protocol(plugin_scheme::SCHEME, |_ctx, request| {
+            plugin_scheme::handle(request)
+        })
+        // 媒体代理：`lunac-media://localhost/<plugin-id>/<encoded-url>?r=…&u=…`
+        // 只服务声明了 `permissions: ["media.proxy"]` 的插件，且拒绝私网目标。
+        // **必须异步**：同步处理器会在 WebView 主线程上等网络，几十张封面就能让窗口
+        // 触发 AppHang（2026-10-20 取证）。`dispatch` 只入队，网络在媒体线程池里跑。
+        .register_asynchronous_uri_scheme_protocol(
+            plugin_media::SCHEME,
+            |_ctx, request, responder| {
+                plugin_media::dispatch(request, responder);
+            },
+        )
         .setup(move |app| {
             // Show the window unless launched in silent auto-start mode
             // (--background, 点15). The window config has visible:false so a
@@ -337,10 +455,7 @@ fn main() {
             // ── System tray ──
             let show_hide = MenuItemBuilder::with_id("show_hide", "Show / Hide").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit Lunac").build(app)?;
-            let menu = MenuBuilder::new(app)
-                .item(&show_hide)
-                .item(&quit)
-                .build()?;
+            let menu = MenuBuilder::new(app).item(&show_hide).item(&quit).build()?;
 
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().cloned().unwrap())
@@ -427,6 +542,14 @@ fn main() {
             // 永不扫盘（见 docs/ai-spec.md §2.1.2 与 file_indexer.rs 头注释）。
             crate::file_indexer::init();
 
+            // 定时任务目录（<exe 根>\ModuleData\tasks，2026-10-17 阶段 0 / 1）：路径只在
+            // `storage::cron_dir()` 定义一次；这里只负责保证目录存在。`cron.json` 由 agent
+            // 侧写、`cron-state.json` 由调度器写；调度线程在下面 `app.manage` 之后启动。
+            match crate::storage::ensure_cron_dir() {
+                Ok(dir) => crate::log::info(format!("定时任务目录: {}", dir.display())),
+                Err(e) => crate::log::warn(format!("创建定时任务目录失败: {e}")),
+            }
+
             // 2026-10-09：删掉了「后台活动自检」（原 `activity.rs`，每秒采一次整族 CPU/IO）。
             // 它 2026-10-08 为排查「玩游戏时周期性卡顿」而生，10-08/10-09 的 `activity:` 日志
             // 已把病根点名清楚（top_cpu 一直是游戏本体 launcher/yysls、代理 hongmo、IDE Trae，
@@ -452,6 +575,11 @@ fn main() {
                 tool_blacklist: Mutex::new(Vec::new()),
                 pet_model_dir: Mutex::new(String::new()),
             });
+            // 定时任务调度器必须在 `AppState` 托管之后启动（线程里要读工作区 / env）。
+            // 30s tick；`stop()` 由退出路径调用，tick 以 500ms 粒度检查停止标志。
+            crate::cron::start(app.handle().clone());
+            // 通用任务队列 worker：3s tick，取最早一条 pending 顺序跑（与 cron 共用单飞闸）。
+            crate::task_queue::start(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -510,6 +638,11 @@ fn main() {
                     system_proxy::restore_on_exit();
                     let state = window.state::<AppState>();
 
+                    // 定时任务调度线程先停（tick 不再发起新运行）；正在跑的单发子进程由
+                    // `child_job` 的 Job Object 随宿主退出收掉。
+                    crate::cron::stop();
+                    crate::task_queue::stop();
+
                     // Process/stdin live in cli_bridge since the agent HTTP
                     // bridge refactor; AppState fields are legacy no-ops.
                     if let Ok(mut stdin_guard) = state.cli_stdin.lock() {
@@ -549,6 +682,12 @@ fn main() {
             start_cli,
             stop_cli,
             send_message,
+            // 定时任务（2026-10-17 阶段 1）：列表 + 手动触发 + 前端忙态。
+            commands::cron_list,
+            commands::cron_run_now,
+            commands::cron_set_busy,
+            // 逐 job 的「无人值守可写」授权（2026-10-27，阶段 2B）：只能用户点。
+            commands::cron_set_write_access,
             // 长期记忆的前端入口（斜杠命令 /memory、/memory clear，2026-10-11）
             get_memory,
             clear_memory,
@@ -606,6 +745,7 @@ fn main() {
             open_mcp_config,
             set_workspace,
             get_workspace,
+            get_agent_workdir,
             set_tool_blacklist,
             // 桌宠模型目录 → 宿主（②1，2026-10-13）：决定 agent 的读禁目录（只拦读）。
             set_pet_model_dir,
@@ -630,16 +770,41 @@ fn main() {
             system_proxy::proxy_config_set,
             system_proxy::proxy_enable,
             system_proxy::proxy_disable,
-            // mihomo 内核托管（2026-10-03）：安装 / 起停 / 节点 / 测速 / 模式 / 日志。
+            // 代理内核（2026-11-01 起只剩自研）：配置 / 起停 / 节点 / 测速 / 模式 / 日志。
+            // 「安装内核」那条命令已随 mihomo 一起删除（§待办 3-26 K3）。
             mihomo::mihomo_status,
-            mihomo::mihomo_install_core,
             mihomo::mihomo_config_set,
             mihomo::mihomo_start,
             mihomo::mihomo_stop,
+            // 2026-11-03：引擎（本机监听口）与服务（系统代理）拆开 —— 打开面板静默
+            // 拉起引擎以便未开服务也能测延迟；关闭面板时按「服务是否开着」决定去留。
+            mihomo::mihomo_engine_start,
+            mihomo::mihomo_engine_stop,
             mihomo::mihomo_proxies,
             mihomo::mihomo_delay,
             mihomo::mihomo_select,
             mihomo::mihomo_set_mode,
+            mihomo::mihomo_set_engine,
+            // 代理插件面板本来就调用这几个命令，但之前**漏了注册**（`invoke` 直接
+            // 报 command not found）：订阅节点增删、系统代理单独开关、订阅节点数。
+            mihomo::mihomo_providers,
+            mihomo::mihomo_node_add,
+            mihomo::mihomo_node_del,
+            mihomo::mihomo_system_proxy_set,
+            // 2026-11-01 代理面板重构：服务器清单 / 订阅更新 / 域名日志 / 自定义节点 / 出口信息 / TUN。
+            mihomo::mihomo_servers,
+            mihomo::mihomo_refresh_subs,
+            mihomo::mihomo_requests,
+            mihomo::mihomo_node_add_custom,
+            mihomo::mihomo_exit_info,
+            mihomo::mihomo_set_tun,
+            // TUN 的管理员闸门（2026-11-02）：前端先问是否已提权，未提权时弹警告框；
+            // release 由 `mihomo_relaunch_elevated` 提权重启，dev 只提示手动重启。
+            mihomo::mihomo_is_elevated,
+            mihomo::mihomo_relaunch_elevated,
+            mihomo::mihomo_is_dev_build,
+            // 自研代理引擎自己的运行状态（节点数 / 活跃连接 / 上错原因）。
+            native_proxy::native_proxy_status,
             mihomo::mihomo_log,
             run_system_action,
             run_system_action_elevated,
@@ -650,6 +815,10 @@ fn main() {
             snapshots::snapshot_restore_text,
             snapshots::snapshots_save,
             snapshots::snapshots_load,
+            // 白箱边界账本（W0）：追加 / 最近 / 导出。
+            security_ledger::security_ledger_append,
+            security_ledger::security_ledger_recent,
+            security_ledger::security_ledger_export,
             storage::save_chat_sessions,
             storage::load_chat_sessions,
             storage::save_clipboard_history,
@@ -686,11 +855,18 @@ fn main() {
             install_plugin_from_url,
             install_plugin_dependencies,
             cancel_plugin_dependency_install,
+            // 下载的暂停 / 继续 / 状态查询（2026-10-27）：离屏后重新挂回进度用
+            plugin_install_pause,
+            plugin_install_state,
+            plugin_pending_downloads,
             uninstall_plugin,
             plugins_dir_path,
             // 本地模型决策开关（2026-10-09）：与插件列表同段，读 / 写该开关。
             local_model_config_get,
             local_model_config_set,
+            local_model_probe,
+            // 本地决策层状态（2026-10-24）：解决「模型已就绪但 decide=0」的黑盒。
+            local_decision_status,
             fetch_plugin_index,
             run_ocr,
             save_temp_image,
@@ -702,6 +878,8 @@ fn main() {
             open_file_in_vscode,
             get_system_language,
             run_paddle_ocr,
+            recognize_speech,
+            pinyin_encode,
             ocr_engine_status,
             // 音乐插件（歌词 + Spotify 播放控制）—— 见 src/music.rs
             music::music_config_get,
@@ -718,92 +896,94 @@ fn main() {
             music::spotify_play_context,
             music::spotify_play_uri,
             music::spotify_set_play_mode,
-        // 「我喜欢的歌曲」（收藏夹，走 /me/tracks）/ 一次播一串 / 搜索（2026-09-27 加）
-        music::spotify_liked,
-        music::spotify_play_uris,
-        music::spotify_search,
-        // Library（专辑 / 歌手 / 电台）+ 条目的曲目 + 设备列表 / 转移（2026-09-28 加）
-        music::spotify_artists,
-        music::spotify_albums,
-        music::spotify_shows,
-        // 「最常听」两栏（2026-10-01 用户第 4 条）**需要 `user-top-read`** ——
-        // 老令牌没它时那一栏会如实报 `Insufficient client scope`，不是「空的」
-        //（见 music.rs 的 SCOPES 说明）。
-        // 「新发行」已于 2026-10-02 整条删除（`/browse/new-releases` 对个人应用
-        // 永久 403，见 music.rs 的 SCOPES 注释）。
-        music::spotify_top_artists,
-        music::spotify_top_tracks,
-        music::spotify_item_tracks,
-        music::spotify_devices,
-        music::spotify_transfer,
-        // 「Spotify 请求闸」（2026-10-02）：一旦 429 就硬停所有 Web API 请求，
-        // 由用户在面板上手动恢复（取代原来的「定时冷却」，见 music.rs 那段注释）。
-        music::spotify_api_state,
-        music::spotify_resume,
-        // 本机播放（librespot 子进程）—— 登入一次后不依赖 Spotify 桌面端出声
-        music::librespot_status,
-        music::librespot_start,
-        music::librespot_stop,
-        // 首次登录（`-j`）：没有凭据的 librespot 不会成为一台已登录设备（见 music.rs）
-        music::librespot_login,
-        // 改本机播放的代理并**按需重起**（2026-10-02）：代理是启动参数，热改不了；
-        // 代理插件的「一键联动」走这条，宿主独占「什么时候该重起」这条判断。
-        music::librespot_set_proxy,
-        // 「播放在哪」自动就位（2026-09-30）：面板打开时调一次 —— 有官方端就用官方端，
-        // 没有就自动拉起 librespot。见 music.rs 的 music_autoconfigure。
-        music::music_autoconfigure,
-        // 本地音乐**媒体库**（2026-10-01，backlog L9 第一刀）—— 目录扫描 + 标签/封面/时长。
-        // **不含播放**（解码出声是 L5 S1 的活，见 media_lib.rs 头注释）。
-        media_lib::media_roots,
-        media_lib::media_add_root,
-        media_lib::media_remove_root,
-        // 删**单个文件**（2026-10-11）：从库里删一条曲目 = 删磁盘文件 + 库中那行 + 它的封面缓存。
-        // 安全边界：只认库里已有的路径、只删文件不删目录、目标不存在仍清索引（见 media_lib.rs）。
-        media_lib::media_delete_file,
-        media_lib::media_scan_start,
-        media_lib::media_scan_status,
-        media_lib::media_tracks,
-        // 打开一份播放列表文件（.m3u / .m3u8 / .pls）→ 它的曲目（2026-10-01 第二批）。
-        // **只读那个文件**：不入库、也不要求它的目录已被添加 —— 播放列表常常指向别处。
-        media_lib::media_playlist,
-        // 本地文件**播放**（2026-10-01）。`player_play` 是唯一 async 的一条
-        // （开解码器要读盘）；其余是内存里的状态机操作，同步即可。
-        // **不含队列**：队列（下一首是谁）留在前端 —— 那里才有列表的上下文。
-        player::player_play,
-        player::player_pause,
-        player::player_resume,
-        player::player_stop,
-        player::player_seek,
-        player::player_volume,
-        player::player_status,
-        // 调音（`tuning-engine` 的挂点，2026-10-01 用户第 5 条）：总开关 + 一档预设。
-        // **不再是独立插件** —— 引擎（`tuning-engine/`）以库依赖进宿主，
-        // 面板长在音乐插件的设置页里（见 player.rs 的 TUNING_PRESETS）。
-        player::player_tuning_get,
-        player::player_tuning_set,
-        // P0（2026-10-02）：链从「一个预设键」扩成「可编辑的段 + 频响曲线」，
-        // 所以拆成三条各管一件事（见 player.rs）：只改开关 / 展开一档预设 / 覆盖整条链。
-        player::player_tuning_set_enabled,
-        player::player_tuning_apply_preset,
-        player::player_tuning_set_chain,
-        // 用户预设（P5-1，2026-10-03）：把当前链存成命名预设、重命名 / 删除、导入 / 导出。
-        // **文件对话框在前端**，这四条只收路径、只做文件 IO（见 player.rs 那一段注释）。
-        player::player_tuning_preset_save,
-        player::player_tuning_preset_delete,
-        player::player_tuning_preset_rename,
-        player::player_tuning_preset_import,
-        player::player_tuning_preset_export,
-        // A-B 盲测（两个快照槽，2026-10-06）
-        player::player_tuning_ab_state,
-        player::player_tuning_ab_save,
-        player::player_tuning_ab_apply,
-        // 实时测量（2026-10-02）：播两段扫频（一趟直通 / 一趟走链）、用 WASAPI 回环录回来，
-        // 量出「最终输出」与「仅自身链」。**会出声约 6 秒** —— 见 src/tuning_probe.rs。
-        tuning_probe::player_tuning_measure,
-        // 文件转换插件（图片 / 音频 / 视频，走 ffmpeg）—— 见 src/convert.rs
-        convert::convert_engine_status,
-        convert::convert_probe,
-        convert::convert_run,
+            // 「我喜欢的歌曲」（收藏夹，走 /me/tracks）/ 一次播一串 / 搜索（2026-09-27 加）
+            music::spotify_liked,
+            music::spotify_play_uris,
+            music::spotify_search,
+            // Library（专辑 / 歌手 / 电台）+ 条目的曲目 + 设备列表 / 转移（2026-09-28 加）
+            music::spotify_artists,
+            music::spotify_albums,
+            music::spotify_shows,
+            // 「最常听」两栏（2026-10-01 用户第 4 条）**需要 `user-top-read`** ——
+            // 老令牌没它时那一栏会如实报 `Insufficient client scope`，不是「空的」
+            //（见 music.rs 的 SCOPES 说明）。
+            // 「新发行」已于 2026-10-02 整条删除（`/browse/new-releases` 对个人应用
+            // 永久 403，见 music.rs 的 SCOPES 注释）。
+            music::spotify_top_artists,
+            music::spotify_top_tracks,
+            music::spotify_item_tracks,
+            music::spotify_devices,
+            music::spotify_transfer,
+            // 「Spotify 请求闸」（2026-10-02）：一旦 429 就硬停所有 Web API 请求，
+            // 由用户在面板上手动恢复（取代原来的「定时冷却」，见 music.rs 那段注释）。
+            music::spotify_api_state,
+            music::spotify_resume,
+            // 本机播放（librespot 子进程）—— 登入一次后不依赖 Spotify 桌面端出声
+            music::librespot_status,
+            music::librespot_start,
+            music::librespot_stop,
+            // 首次登录（`-j`）：没有凭据的 librespot 不会成为一台已登录设备（见 music.rs）
+            music::librespot_login,
+            // 改本机播放的代理并**按需重起**（2026-10-02）：代理是启动参数，热改不了；
+            // 代理插件的「一键联动」走这条，宿主独占「什么时候该重起」这条判断。
+            music::librespot_set_proxy,
+            // 「播放在哪」自动就位（2026-09-30）：面板打开时调一次 —— 有官方端就用官方端，
+            // 没有就自动拉起 librespot。见 music.rs 的 music_autoconfigure。
+            music::music_autoconfigure,
+            // 本地音乐**媒体库**（2026-10-01，backlog L9 第一刀）—— 目录扫描 + 标签/封面/时长。
+            // **不含播放**（解码出声是 L5 S1 的活，见 media_lib.rs 头注释）。
+            media_lib::media_roots,
+            media_lib::media_add_root,
+            media_lib::media_remove_root,
+            // 删**单个文件**（2026-10-11）：从库里删一条曲目 = 删磁盘文件 + 库中那行 + 它的封面缓存。
+            // 安全边界：只认库里已有的路径、只删文件不删目录、目标不存在仍清索引（见 media_lib.rs）。
+            media_lib::media_delete_file,
+            media_lib::media_scan_start,
+            media_lib::media_scan_status,
+            media_lib::media_tracks,
+            // 打开一份播放列表文件（.m3u / .m3u8 / .pls）→ 它的曲目（2026-10-01 第二批）。
+            // **只读那个文件**：不入库、也不要求它的目录已被添加 —— 播放列表常常指向别处。
+            media_lib::media_playlist,
+            // 本地文件**播放**（2026-10-01）。`player_play` 是唯一 async 的一条
+            // （开解码器要读盘）；其余是内存里的状态机操作，同步即可。
+            // **不含队列**：队列（下一首是谁）留在前端 —— 那里才有列表的上下文。
+            player::player_play,
+            player::player_pause,
+            player::player_resume,
+            player::player_stop,
+            player::player_seek,
+            player::player_volume,
+            player::player_status,
+            // 调音（`tuning-engine` 的挂点，2026-10-01 用户第 5 条）：总开关 + 一档预设。
+            // **不再是独立插件** —— 引擎（`tuning-engine/`）以库依赖进宿主，
+            // 面板长在音乐插件的设置页里（见 player.rs 的 TUNING_PRESETS）。
+            player::player_tuning_get,
+            player::player_tuning_set,
+            // P0（2026-10-02）：链从「一个预设键」扩成「可编辑的段 + 频响曲线」，
+            // 所以拆成三条各管一件事（见 player.rs）：只改开关 / 展开一档预设 / 覆盖整条链。
+            player::player_tuning_set_enabled,
+            player::player_tuning_apply_preset,
+            player::player_tuning_set_chain,
+            // 用户预设（P5-1，2026-10-03）：把当前链存成命名预设、重命名 / 删除、导入 / 导出。
+            // **文件对话框在前端**，这四条只收路径、只做文件 IO（见 player.rs 那一段注释）。
+            player::player_tuning_preset_save,
+            player::player_tuning_preset_delete,
+            player::player_tuning_preset_rename,
+            player::player_tuning_preset_import,
+            player::player_tuning_preset_export,
+            // A-B 盲测（两个快照槽，2026-10-06）
+            player::player_tuning_ab_state,
+            player::player_tuning_ab_save,
+            player::player_tuning_ab_apply,
+            // 实时测量（2026-10-02）：播两段扫频（一趟直通 / 一趟走链）、用 WASAPI 回环录回来，
+            // 量出「最终输出」与「仅自身链」。**会出声约 6 秒** —— 见 src/tuning_probe.rs。
+            tuning_probe::player_tuning_measure,
+            // 文件转换插件（图片 / 音频 / 视频，走 ffmpeg）—— 见 src/convert.rs
+            convert::convert_engine_status,
+            convert::convert_probe,
+            convert::convert_run,
+            // 取消当前 ffmpeg 转换（2026-10-24）：泡泡框上的「×」调它，然后才移除条目。
+            convert::convert_cancel,
             // 翻译插件（2026-09-29）：词典底座 + 模型补漏，译文落 SQLite（见 translate.rs）
             translate::translate_lookup,
             translate::translate_ai,
@@ -812,6 +992,9 @@ fn main() {
             plugin_window::open_plugin_ids,
             plugin_window::plugin_window_init,
             plugin_window::plugin_window_close,
+            plugin_window::plugin_window_set_title,
+            // 任务栏缩略图工具栏（2026-10-27）：只对 plugin-* 窗口生效，见 src/taskbar_thumb.rs
+            taskbar_thumb::taskbar_thumb_set,
             plugin_window::close_plugin_window,
             plugin_window::plugin_window_minimize,
             plugin_window::plugin_window_set_pin,
@@ -832,6 +1015,32 @@ fn main() {
             plugin_sidecar::plugin_sidecar_running,
             plugin_sidecar::plugin_sidecar_trust,
             plugin_sidecar::plugin_sidecar_deny,
+            // 插件宿主代请求（net.fetch）：清单声明 `permissions: ["net.fetch"]` 才放行，
+            // 私网 / 本机地址一律拒绝。见 src/plugin_net.rs
+            plugin_net::plugin_net_request,
+            // 插件 WebView 嗅探（webview.sniff）：清单声明才放行。见 src/plugin_sniff.rs
+            plugin_sniff::plugin_sniff_media,
+            // 插件开发工具链（轨道 H，2026-10-18）：授权 / 安装 / 撤销 / 构建。
+            // 账本 = config\plugin-toolchain.json；未授权一律拒绝。见 src/plugin_toolchain.rs
+            commands::plugin_toolchain_status,
+            commands::grant_plugin_toolchain,
+            commands::revoke_plugin_toolchain,
+            commands::install_plugin_toolchain,
+            commands::run_plugin_build,
+            commands::stop_plugin_build,
+            // 资源库来源存储（A5，2026-10-18）：插件 UI 与 AI 安装共用同一目录。
+            commands::resource_hub_sources,
+            commands::resource_hub_install_source,
+            commands::resource_hub_delete_source,
+            // 资源库作品级结果卡（A7 二期，2026-10-28）：插件 → 聊天窗，只广播不落盘。
+            commands::resource_hub_publish_results,
+            // 插件 KV（A3，2026-10-18）：按插件 id 命名空间；卸载即清除。
+            commands::plugin_kv_get,
+            commands::plugin_kv_set,
+            commands::plugin_kv_remove,
+            commands::plugin_kv_keys,
+            // 插件脚本沙箱（A4，2026-10-18）：`engine.eval`；需 `permissions: ["engine.eval"]`。
+            commands::plugin_engine_eval,
             // 屏幕截图（通用宿主能力，2026-10-06）—— 见 src/screenshot.rs
             // 框选由**宿主的全屏置顶覆盖窗**（`shot-overlay`）完成：发起 → 取背景图 → 裁剪/取消。
             screenshot::screenshot_overlay_begin,

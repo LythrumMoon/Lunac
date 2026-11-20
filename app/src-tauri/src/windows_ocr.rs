@@ -57,8 +57,9 @@ pub fn recognize_image(path: &str) -> Result<String, String> {
     // Create OCR engine using user's system language profile.
     // UWP OCR supports all languages installed in Windows Settings → Language.
     // For Chinese: install Chinese language pack in Windows Settings.
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .map_err(|e| format!("OcrEngine creation failed: {e}. Install language pack in Windows Settings."))?;
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| {
+        format!("OcrEngine creation failed: {e}. Install language pack in Windows Settings.")
+    })?;
 
     let result = engine
         .RecognizeAsync(&software_bitmap)
@@ -66,7 +67,9 @@ pub fn recognize_image(path: &str) -> Result<String, String> {
         .get()
         .map_err(|e| format!("RecognizeAsync failed: {e}"))?;
 
-    let text = result.Text().map_err(|e| format!("Text extraction failed: {e}"))?;
+    let text = result
+        .Text()
+        .map_err(|e| format!("Text extraction failed: {e}"))?;
     Ok(text.to_string())
 }
 

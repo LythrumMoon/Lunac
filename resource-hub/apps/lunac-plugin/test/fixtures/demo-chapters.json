@@ -1,0 +1,6 @@
+{
+  "chapters": [
+    { "id": "http://localhost:8123/test/fixtures/demo-pages.json", "title": "第 1 话 · 夹具" },
+    { "id": "http://localhost:8123/test/fixtures/demo-pages-2.json", "title": "第 2 话 · 按需加载" }
+  ]
+}

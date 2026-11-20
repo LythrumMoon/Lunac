@@ -174,18 +174,22 @@ fn open_overlay(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
     let (x, y, w, h) = virtual_rect()?;
-    let win = WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App("screenshot.html".into()))
-        .title("Lunac")
-        // 无边框 + 置顶 + 不进任务栏 = ShareX 那个 `RegionCaptureForm` 的形态
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .shadow(false)
-        // 先不显示：几何要用**物理**单位摆准了再亮相（否则会先闪一下默认尺寸的白窗）
-        .visible(false)
-        .build()
-        .map_err(|e| format!("建截屏覆盖窗失败：{e}"))?;
+    let win = WebviewWindowBuilder::new(
+        app,
+        OVERLAY_LABEL,
+        WebviewUrl::App("screenshot.html".into()),
+    )
+    .title("Lunac")
+    // 无边框 + 置顶 + 不进任务栏 = ShareX 那个 `RegionCaptureForm` 的形态
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .shadow(false)
+    // 先不显示：几何要用**物理**单位摆准了再亮相（否则会先闪一下默认尺寸的白窗）
+    .visible(false)
+    .build()
+    .map_err(|e| format!("建截屏覆盖窗失败：{e}"))?;
 
     // ⚠️ builder 的 `position` / `inner_size` 收的是**逻辑**单位（DPI 缩放下 ≠ 物理像素），
     // 而我们要铺满的是**整块虚拟桌面**（`GetSystemMetrics` 给的是物理像素）——
@@ -221,7 +225,8 @@ fn crop(x: i64, y: i64, w: i64, h: i64) -> Result<ScreenShot, String> {
     if cw < 2 || ch < 2 {
         return Err("ERR_TOO_SMALL".into());
     }
-    let sub = image::imageops::crop_imm(&s.rgba, cx as u32, cy as u32, cw as u32, ch as u32).to_image();
+    let sub =
+        image::imageops::crop_imm(&s.rgba, cx as u32, cy as u32, cw as u32, ch as u32).to_image();
     Ok(ScreenShot {
         data_url: to_data_url(&sub)?,
         width: cw as u32,

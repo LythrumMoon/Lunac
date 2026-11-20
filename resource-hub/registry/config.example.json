@@ -1,0 +1,21 @@
+{
+  "kazumi": {
+    "index": "registry/upstream/kazumi.json",
+    "baseUrl": "https://raw.githubusercontent.com/Predidit/KazumiRules/main/",
+    "attribution": "KazumiRules (MIT)"
+  },
+  "venera": {
+    "index": "registry/upstream/venera.json",
+    "baseUrl": "https://raw.githubusercontent.com/handahao666-boop/venera_comic_source/main/",
+    "attribution": "Venera comic sources"
+  },
+  "uzvideo": {
+    "index": "registry/upstream/uzvideo.json",
+    "baseUrl": "https://raw.githubusercontent.com/YYDS678/uzVideo-extensions/main/",
+    "attribution": "uzVideo extensions"
+  },
+  "cms": {
+    "index": "registry/upstream/cms.json",
+    "attribution": "公开 TVBox / LibreTV 配置聚合"
+  }
+}

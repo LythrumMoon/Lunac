@@ -91,6 +91,8 @@ struct Session {
     dir: PathBuf,
     child: Child,
     stdin: ChildStdin,
+    /// 独立 job（E.6：只有清单配置了资源上限时才存在；`Drop` 关闭句柄即收掉残留子进程）。
+    job: Option<crate::child_job::Job>,
     /// http 端口（stdio-only 时为 `None`）。
     port: Option<u16>,
     next_id: u64,
@@ -107,6 +109,7 @@ const MAX_RESTARTS: u32 = 3;
 struct Proc {
     child: Child,
     stdin: ChildStdin,
+    job: Option<crate::child_job::Job>,
     port: Option<u16>,
 }
 
@@ -168,10 +171,9 @@ fn spec_for(plugin_id: &str) -> Result<(PathBuf, SidecarSpec), String> {
     if !plugin_market::is_safe_id(id) {
         return Err(format!("插件 id 非法：{plugin_id}"));
     }
-    let dir = plugin_market::plugins_dir().join(id);
-    if !dir.is_dir() {
-        return Err(format!("插件不存在：{id}"));
-    }
+    // 按 id / provides 定位（2026-10-18）：sidecar 的落点必须与窗口、依赖安装一致。
+    let dir = plugin_market::resolve_plugin_dir(&plugin_market::plugins_dir(), id)
+        .ok_or_else(|| format!("插件不存在：{id}"))?;
     let text = std::fs::read_to_string(dir.join(plugin_market::MANIFEST_FILE))
         .map_err(|e| format!("读不到插件清单：{e}"))?;
     let manifest = plugin_market::parse_manifest(&text)?;
@@ -297,6 +299,7 @@ pub fn start(app: &AppHandle, owner_label: &str, plugin_id: &str) -> Result<Side
             dir: dir.clone(),
             child: p.child,
             stdin: p.stdin,
+            job: p.job,
             port,
             next_id: 1,
             pending: HashMap::new(),
@@ -311,6 +314,14 @@ pub fn start(app: &AppHandle, owner_label: &str, plugin_id: &str) -> Result<Side
     crate::log::info(format!(
         "plugin_sidecar: {id} 已启动（transport={t}, port={port:?}, owner={owner_label}）"
     ));
+    // 本地模型（2026-10-24）：**启动后立刻做真实探活**，别只信「端点已注入」。
+    // 放到独立线程：加载模型期间 /health 可能是 503，重试最多 30s，不能阻塞 sidecar 启动。
+    if id.eq_ignore_ascii_case("local-model") {
+        if let Some(p) = port {
+            let url = format!("http://127.0.0.1:{p}");
+            std::thread::spawn(move || crate::commands::probe_local_model_startup(url));
+        }
+    }
     Ok(started(id, port))
 }
 
@@ -341,8 +352,7 @@ fn spawn_proc(
         if c.is_empty() {
             dir.to_path_buf()
         } else {
-            plugin_market::safe_join(dir, c)
-                .ok_or_else(|| format!("sidecar.cwd 越界：{c}"))?
+            plugin_market::safe_join(dir, c).ok_or_else(|| format!("sidecar.cwd 越界：{c}"))?
         }
     };
 
@@ -363,8 +373,36 @@ fn spawn_proc(
     }
 
     let mut child = cmd.spawn().map_err(|e| format!("起 sidecar 失败：{e}"))?;
-    // **spawn 之后立刻 assign**（预检 #57：宿主崩溃时由内核收掉，不留孤儿）
-    crate::child_job::assign(&child);
+    // **spawn 之后立刻绑定生命周期**（预检 #57：宿主崩溃时由内核收掉，不留孤儿）。
+    // E.6（2026-10-18）：清单配置了资源上限 ⇒ 用**该 sidecar 自己的 job**（内存 / 进程数），
+    // 不再挂全局 job —— 全局 job 里还有 agent 等进程，不能给它们套 sidecar 的限额。
+    let limits = crate::child_job::JobLimits {
+        process_memory_limit: spec.memory_limit_mib as usize * 1024 * 1024,
+        job_memory_limit: 0,
+        active_process_limit: spec.process_limit,
+    };
+    let mut job = if limits.is_set() {
+        crate::child_job::Job::create(limits)
+    } else {
+        None
+    };
+    if let Some(j) = &job {
+        if j.assign(&child) {
+            crate::log::info(format!(
+                "plugin_sidecar: {id} 使用独立 job（memory={} MiB, processes={}）",
+                spec.memory_limit_mib, spec.process_limit
+            ));
+        } else {
+            // 极老系统 / 已在别的 job 里：回落全局 job，至少保证崩溃回收。
+            crate::log::warn(format!(
+                "plugin_sidecar: {id} 独立 job 分配失败，回落全局 job（资源限额未生效）"
+            ));
+            job = None;
+        }
+    }
+    if job.is_none() {
+        crate::child_job::assign(&child);
+    }
 
     let stdin = child.stdin.take().ok_or("拿不到 sidecar stdin")?;
     let stdout = child.stdout.take().ok_or("拿不到 sidecar stdout")?;
@@ -374,7 +412,10 @@ fn spawn_proc(
             for line in BufReader::new(se).lines().map_while(Result::ok) {
                 let line = line.trim();
                 if !line.is_empty() {
-                    crate::log::warn(format!("plugin_sidecar[{pid}] stderr: {}", truncate(line, 400)));
+                    crate::log::warn(format!(
+                        "plugin_sidecar[{pid}] stderr: {}",
+                        truncate(line, 400)
+                    ));
                 }
             }
         });
@@ -410,7 +451,12 @@ fn spawn_proc(
         None
     };
 
-    Ok(Proc { child, stdin, port })
+    Ok(Proc {
+        child,
+        stdin,
+        job,
+        port,
+    })
 }
 
 /// 等「就绪」。**两个信号任一成立即可**（见模块头注释）：
@@ -420,7 +466,10 @@ fn spawn_proc(
 ///      只能靠「端口起来了」判就绪（2026-10-09：本地决策模型换 4B 后暴露 ——
 ///      之前 sidecar 这条链路其实从没对 `llama-server` 真跑通）。
 /// 超时取 `sidecar.readyTimeoutSec`（缺省 10s；大模型冷启要几十秒，清单里写大些）。
-fn wait_ready(spec: &SidecarSpec, ready_rx: &mpsc::Receiver<Result<Option<u16>, String>>) -> Result<Option<u16>, String> {
+fn wait_ready(
+    spec: &SidecarSpec,
+    ready_rx: &mpsc::Receiver<Result<Option<u16>, String>>,
+) -> Result<Option<u16>, String> {
     let wants_http = matches!(spec.transport.trim(), "http" | "both");
     let probe_port = wants_http && spec.port != 0;
     let deadline = Instant::now() + Duration::from_secs(spec.ready_timeout_sec.max(1));
@@ -465,7 +514,9 @@ fn ensure_alive(s: &mut Session, plugin_id: &str) -> Result<(), String> {
         return Err("sidecar 进程已退出（restart 非 on-failure，不自动重起）".into());
     }
     if s.attempts >= MAX_RESTARTS {
-        return Err(format!("sidecar 进程已退出，且已重起 {MAX_RESTARTS} 次（放弃）"));
+        return Err(format!(
+            "sidecar 进程已退出，且已重起 {MAX_RESTARTS} 次（放弃）"
+        ));
     }
     let backoff = Duration::from_millis(200 * (1u64 << s.attempts.min(4)));
     crate::log::warn(format!(
@@ -478,6 +529,7 @@ fn ensure_alive(s: &mut Session, plugin_id: &str) -> Result<(), String> {
     let p = spawn_proc(&s.app, &s.owner_label, plugin_id, &s.spec, &s.dir)?;
     s.child = p.child;
     s.stdin = p.stdin;
+    s.job = p.job; // 旧 job 句柄在这里被 drop（关闭即收掉旧进程树的残留）
     s.port = p.port;
     Ok(())
 }
@@ -520,7 +572,12 @@ fn spawn_reader(
                     continue;
                 }
                 // 主动推：原样转给插件面板
-                emit_to(&app, &owner_label, EVENT_NAME, json!({ "pluginId": plugin_id, "payload": v }));
+                emit_to(
+                    &app,
+                    &owner_label,
+                    EVENT_NAME,
+                    json!({ "pluginId": plugin_id, "payload": v }),
+                );
                 continue;
             }
             let id = id.unwrap_or(0);
@@ -557,7 +614,12 @@ fn spawn_reader(
         for tx in waiters {
             let _ = tx.send(Err("sidecar 进程已退出".into()));
         }
-        emit_to(&app, &owner_label, EXIT_EVENT, json!({ "pluginId": plugin_id }));
+        emit_to(
+            &app,
+            &owner_label,
+            EXIT_EVENT,
+            json!({ "pluginId": plugin_id }),
+        );
     });
 }
 
@@ -629,7 +691,9 @@ pub fn http(
     let id = plugin_id.trim();
     // path 必须是「以 / 开头的相对路径」：挡住 `http://evil` 之类的整串注入
     if !path.starts_with('/') || path.contains("://") || path.chars().any(char::is_control) {
-        return Err(format!("sidecar.http 的 path 必须是以 / 开头的相对路径：{path}"));
+        return Err(format!(
+            "sidecar.http 的 path 必须是以 / 开头的相对路径：{path}"
+        ));
     }
     let (_, spec) = spec_for(id)?;
     if !is_trusted(id, &spec) {
@@ -681,6 +745,8 @@ pub fn http(
 fn kill(s: &mut Session) {
     let _ = s.child.kill();
     let _ = s.child.wait();
+    // E.6：关闭独立 job 的句柄 —— KILL_ON_JOB_CLOSE 会收掉 sidecar 自己 fork 出的残留进程。
+    s.job.take();
 }
 
 pub fn is_running(plugin_id: &str) -> bool {
@@ -771,8 +837,10 @@ pub async fn plugin_sidecar_request(
     method: String,
     params: Option<Value>,
 ) -> Result<Value, String> {
-    crate::commands::run_blocking(move || request(&plugin_id, &method, params.unwrap_or(Value::Null)))
-        .await
+    crate::commands::run_blocking(move || {
+        request(&plugin_id, &method, params.unwrap_or(Value::Null))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -824,9 +892,21 @@ mod tests {
         let b = spec("bin/other.exe", "");
         let c = spec("bin/tool.exe", "00");
         assert_eq!(fingerprint("p", &a), fingerprint("p", &a));
-        assert_ne!(fingerprint("p", &a), fingerprint("p", &b), "command 变了指纹必须变");
-        assert_ne!(fingerprint("p", &a), fingerprint("p", &c), "sha256 变了指纹必须变");
-        assert_ne!(fingerprint("p", &a), fingerprint("q", &a), "id 变了指纹必须变");
+        assert_ne!(
+            fingerprint("p", &a),
+            fingerprint("p", &b),
+            "command 变了指纹必须变"
+        );
+        assert_ne!(
+            fingerprint("p", &a),
+            fingerprint("p", &c),
+            "sha256 变了指纹必须变"
+        );
+        assert_ne!(
+            fingerprint("p", &a),
+            fingerprint("q", &a),
+            "id 变了指纹必须变"
+        );
         assert_eq!(fingerprint("p", &a).len(), 16);
     }
 

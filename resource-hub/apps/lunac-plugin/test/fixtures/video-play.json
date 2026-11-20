@@ -1,0 +1,6 @@
+{
+  "lines": [
+    { "url": "http://localhost:8123/test/fixtures/video.m3u8", "type": "hls" },
+    { "url": "http://localhost:8123/test/fixtures/video.mp4", "type": "mp4" }
+  ]
+}

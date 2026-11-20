@@ -263,6 +263,7 @@ const toolEditor: Plugin = {
   description: "Manage AI Agent custom tools (MCP bridge)",
   keywords: ["tool", "tools", "工具", "mcp", "agent", "skill", "插件", "扩展"],
   icon: "🔧",
+  provides: ["tools.mcp"],
 
   async execute(_input: string) {
     const tools = await loadToolFiles();

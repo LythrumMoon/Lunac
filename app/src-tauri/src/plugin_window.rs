@@ -155,6 +155,18 @@ const MIN_H: f64 = 200.0;
 const MUSIC_W: f64 = 1280.0;
 const MUSIC_H: f64 = 720.0;
 
+/// **文件转换插件的独立窗**（2026-10-24 重构）。
+///
+/// 内容形状由用户定尺：最左四类转换页签（88）+ 输入框（300）+ 中间图标/进度（48）
+/// + 输出框（300），列间距各 10 ⇒ 主体 766；再加 `.plugin-result` 的左右内边距 32
+/// 与窗口外层 4 ⇒ **820** 刚好不挤。
+/// 高度 = 顶栏（引擎 + 保存目录）24 + 目标格式 24 + 框 250 + 泡泡 22 + 提示行 14
+/// + 各处间距 ≈ 380；留到 **470** 是为了让标题栏浮出（40）与多行泡泡都不触发滚动。
+const CONVERT_W: f64 = 820.0;
+const CONVERT_H: f64 = 470.0;
+const CONVERT_MIN_W: f64 = 780.0;
+const CONVERT_MIN_H: f64 = 430.0;
+
 /// **AI 聊天的独立窗口**（2026-09-29 用户定：「ai 插件也需要独立界面状态……并去除小窗口
 /// 和大窗口，独立界面尺寸设置成与音乐插件相同的」）。
 ///
@@ -236,6 +248,8 @@ fn default_size(plugin_id: &str, shape: Option<&PluginWindowShape>) -> (f64, f64
         (CHAT_W, CHAT_H)
     } else if plugin_id == "music" {
         (MUSIC_W, MUSIC_H)
+    } else if plugin_id == "convert" {
+        (CONVERT_W, CONVERT_H)
     } else if plugin_id == CURVE_WINDOW_KEY {
         (CURVE_W, CURVE_H)
     } else {
@@ -260,6 +274,8 @@ fn min_size(plugin_id: &str, shape: Option<&PluginWindowShape>) -> (f64, f64) {
         (CHAT_MIN_W, CHAT_MIN_H)
     } else if plugin_id == "music" {
         (MIN_W, MUSIC_MIN_H)
+    } else if plugin_id == "convert" {
+        (CONVERT_MIN_W, CONVERT_MIN_H)
     } else if plugin_id == CURVE_WINDOW_KEY {
         (CURVE_MIN_W, CURVE_MIN_H)
     } else {
@@ -297,10 +313,10 @@ fn page_for(plugin_id: &str) -> &'static str {
 /// 而「清单坏了」这件事 `list_installed` 那边已经如实列给用户看了，不该在这里
 /// 变成「窗开不出来」。`parse_manifest` 里的 warn 会照常留痕。
 fn declared_shape(plugin_id: &str) -> Option<PluginWindowShape> {
-    let path = crate::plugin_market::plugins_dir()
-        .join(plugin_id)
-        .join("lunac-plugin.json");
-    let text = std::fs::read_to_string(path).ok()?;
+    // 按 id / provides 定位（2026-10-18）：窗口形态与 sidecar、依赖安装读的是同一份清单。
+    let dir =
+        crate::plugin_market::resolve_plugin_dir(&crate::plugin_market::plugins_dir(), plugin_id)?;
+    let text = std::fs::read_to_string(dir.join(crate::plugin_market::MANIFEST_FILE)).ok()?;
     crate::plugin_market::parse_manifest(&text).ok()?.window
 }
 
@@ -334,9 +350,9 @@ fn pending() -> &'static Mutex<HashMap<String, PendingInit>> {
 fn is_safe_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 40
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-')
+        && id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'
+        })
         && !id.starts_with('.')
 }
 
@@ -415,7 +431,11 @@ pub fn open(
     //
     // ⚠️ **附属窗（带 key）不继承清单形态**：那份清单描述的是**主窗**
     //（音乐清单的 1280×720 与 float 只对主窗成立），套到曲线窗上会把尺寸改错。
-    let shape = if key.is_none() { declared_shape(plugin_id) } else { None };
+    let shape = if key.is_none() {
+        declared_shape(plugin_id)
+    } else {
+        None
+    };
 
     // 必须在建窗**之前**写好：页面可能比这条命令返回得更快，前端一启动就会来取。
     //
@@ -571,7 +591,32 @@ pub fn open_plugin_ids(app: AppHandle) -> Vec<String> {
 /// 少一处隐式耦合。计数在 `on_window_event` 的 `Destroyed` 分支里减。
 #[tauri::command]
 pub fn plugin_window_close(window: WebviewWindow) -> Result<(), String> {
-    window.destroy().map_err(|e| format!("关闭插件窗口失败：{e}"))
+    window
+        .destroy()
+        .map_err(|e| format!("关闭插件窗口失败：{e}"))
+}
+
+/// 设置**调用窗口自身**的标题（插件窗专用，2026-10-24）。
+///
+/// 为什么需要它：Windows 的 Alt+Tab / Win+Tab 预览用的是**窗口标题**，插件窗建窗时
+/// 标题写死成插件 id（见 `open()` 的 `.title(plugin_id)`）⇒ 音乐窗永远显示 "music"，
+/// 分不出正在放什么。音乐插件在换曲时调这里，把标题换成「歌名 - 歌手」。
+///
+/// **只对 `plugin-*` 窗口生效**：主窗口标题由 Tauri 配置管，插件不该能改掉它。
+/// 非插件窗调用是 no-op（不报错）—— 同一个插件既可能在主面板、也可能在悬浮窗里跑，
+/// 让调用方去判断「我现在在哪」只会多一处漂移。
+#[tauri::command]
+pub fn plugin_window_set_title(window: WebviewWindow, title: String) -> Result<(), String> {
+    if !window.label().starts_with("plugin-") {
+        return Ok(());
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(());
+    }
+    window
+        .set_title(title)
+        .map_err(|e| format!("设置插件窗口标题失败：{e}"))
 }
 
 /// 按插件 id **从外面**关掉它的悬浮窗（2026-09-29 加，给「卸载插件」用）。
@@ -624,7 +669,9 @@ pub fn close_keyed(app: &AppHandle, plugin_id: &str) -> Vec<String> {
 
 #[tauri::command]
 pub fn plugin_window_minimize(window: WebviewWindow) -> Result<(), String> {
-    window.minimize().map_err(|e| format!("最小化插件窗口失败：{e}"))
+    window
+        .minimize()
+        .map_err(|e| format!("最小化插件窗口失败：{e}"))
 }
 
 /// 当前置顶状态。前端拿它初始化按钮的按下态 —— 建窗时的初值由
@@ -657,7 +704,10 @@ pub fn plugin_window_set_pin(window: WebviewWindow, pinned: bool) -> Result<(), 
 /// `is_ignore_cursor_events()` 这种读法（`tao` 只把 `WS_EX_TRANSPARENT | WS_EX_LAYERED`
 /// 按标记位算出来，不给回读）。调用方按回值记账即可，**别把它当成回读**。
 #[tauri::command]
-pub fn plugin_window_set_click_through(window: WebviewWindow, ignore: bool) -> Result<bool, String> {
+pub fn plugin_window_set_click_through(
+    window: WebviewWindow,
+    ignore: bool,
+) -> Result<bool, String> {
     if !window.label().starts_with(LABEL_PREFIX) {
         return Err("ERR_NOT_PLUGIN_WINDOW".into());
     }
@@ -686,7 +736,12 @@ pub fn plugin_window_set_resizable(window: WebviewWindow, resizable: bool) -> Re
 /// 尺寸收窄：按插件 id 的**下限**夹取、上限 `2000`（与 `plugin_window_resize` 同源口径）。
 /// 抽成纯函数是为了能单测「坏值 / 越界不落出去」这件事（`plugin_window_resize` 与
 /// `plugin_window_resize_anchored` 共用它，两处的 clamp 不得漂移）。
-fn clamp_size(plugin_id: &str, shape: Option<&PluginWindowShape>, width: f64, height: f64) -> (f64, f64) {
+fn clamp_size(
+    plugin_id: &str,
+    shape: Option<&PluginWindowShape>,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
     let (min_w, min_h) = min_size(plugin_id, shape);
     (width.clamp(min_w, 2000.0), height.clamp(min_h, 2000.0))
 }
@@ -758,7 +813,11 @@ pub fn plugin_window_resize(window: WebviewWindow, width: f64, height: f64) -> R
 /// 前端据此同款记账；失败（含被最小化顶回）照常返回 `ERR_SIZE_STUCK`，前端**不重试同一个值**
 /// （见 pet.ts 的 failedH），故不会死循环。
 #[tauri::command]
-pub fn plugin_window_resize_anchored(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+pub fn plugin_window_resize_anchored(
+    window: WebviewWindow,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
     if !width.is_finite() || !height.is_finite() {
         return Err("ERR_BAD_SIZE".into());
     }
@@ -768,8 +827,12 @@ pub fn plugin_window_resize_anchored(window: WebviewWindow, width: f64, height: 
     // 先量当前几何：inner 高度（逻辑）+ 外框左上角（物理）。取外框而不是内容位置——
     // 下沿锚定关心的是整扇窗在屏幕上的位置。
     let (cur_h, cur_top) = {
-        let sz = window.inner_size().map_err(|e| format!("读窗口尺寸失败：{e}"))?;
-        let pos = window.outer_position().map_err(|e| format!("读窗口位置失败：{e}"))?;
+        let sz = window
+            .inner_size()
+            .map_err(|e| format!("读窗口尺寸失败：{e}"))?;
+        let pos = window
+            .outer_position()
+            .map_err(|e| format!("读窗口位置失败：{e}"))?;
         (f64::from(sz.height) / scale, pos.y)
     };
     let new_top = anchored_top(cur_top, cur_h, h, scale);
@@ -778,10 +841,7 @@ pub fn plugin_window_resize_anchored(window: WebviewWindow, width: f64, height: 
         .map_err(|e| format!("调整插件窗口尺寸失败：{e}"))?;
     if new_top != cur_top {
         // 外框左上角的 x 保持不动（`set_size` 后它仍是旧的 x），只挪 y。
-        let x = window
-            .outer_position()
-            .map(|p| p.x)
-            .unwrap_or(0);
+        let x = window.outer_position().map(|p| p.x).unwrap_or(0);
         window
             .set_position(tauri::PhysicalPosition::new(x, new_top))
             .map_err(|e| format!("移动插件窗口失败：{e}"))?;
@@ -803,17 +863,25 @@ pub fn note_destroyed(label: &str) {
     if !label.starts_with(LABEL_PREFIX) {
         return;
     }
-    pending().lock().map(|mut g| {
-        g.remove(label);
-    }).ok();
+    pending()
+        .lock()
+        .map(|mut g| {
+            g.remove(label);
+        })
+        .ok();
     // 可见性记账同样要收 —— 窗口标签可以被复用（关掉再开是常态），
     // 留着旧值会让下一次建窗的**第一条** `Resized` 被误判成「没翻转」而不下发。
-    last_visible().lock().map(|mut g| {
-        g.remove(label);
-    }).ok();
+    last_visible()
+        .lock()
+        .map(|mut g| {
+            g.remove(label);
+        })
+        .ok();
     // saturating：宁可停在 0，也不要回绕成 usize::MAX 把守卫永久关掉
     OPEN_WINDOWS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        })
         .ok();
     crate::log::info(&format!("plugin_window: closed {label}"));
 }
@@ -845,7 +913,10 @@ mod tests {
         let (def_w, def_h) = default_size(CURVE_WINDOW_KEY, None);
         let (min_w, min_h) = min_size(CURVE_WINDOW_KEY, None);
         assert_eq!((def_w, def_h), (CURVE_W, CURVE_H));
-        assert!(min_w <= def_w && min_h <= def_h, "曲线窗最小尺寸大于默认尺寸");
+        assert!(
+            min_w <= def_w && min_h <= def_h,
+            "曲线窗最小尺寸大于默认尺寸"
+        );
         assert!((def_w, def_h) != (WIN_W, WIN_H), "曲线窗不该落回通用尺寸");
         // key 的白名单（它会直接拼进 label）
         assert!(is_safe_window_key("curve"));
@@ -859,12 +930,18 @@ mod tests {
         // 播放态实测 159（长条 130 + 外层 29）⇒ 音乐窗的下限必须低于它，否则
         // `set_size` 会被夹成 200，长条下面多出一截空白（2026-09-28 的线上现象）。
         let (_, music_min_h) = min_size("music", None);
-        assert!(music_min_h < 159.0, "music 最小高度 {music_min_h} 会把 159 的播放态夹住");
+        assert!(
+            music_min_h < 159.0,
+            "music 最小高度 {music_min_h} 会把 159 的播放态夹住"
+        );
         // 任何插件都不得出现「最小 > 默认」（那样一建窗就被系统夹一次）
         for id in ["music", "memo", "clipboard-history"] {
             let (min_w, min_h) = min_size(id, None);
             let (def_w, def_h) = default_size(id, None);
-            assert!(min_w <= def_w && min_h <= def_h, "{id} 的最小尺寸大于默认尺寸");
+            assert!(
+                min_w <= def_w && min_h <= def_h,
+                "{id} 的最小尺寸大于默认尺寸"
+            );
         }
     }
 
@@ -956,15 +1033,24 @@ mod tests {
         // 否则前端事件队列会被一串同值刷爆。
         // 用独有 label：这组用例共享同一个全局记账表，多个用例并行跑。
         let label = "plugin-test-vis-flip";
-        assert!(take_visibility_change(label, true), "首次（表里还没有这一条）应当下发");
+        assert!(
+            take_visibility_change(label, true),
+            "首次（表里还没有这一条）应当下发"
+        );
         assert!(!take_visibility_change(label, true), "同一个值重复来不出声");
         assert!(take_visibility_change(label, false), "最小化那一次必须下发");
-        assert!(!take_visibility_change(label, false), "连续最小化不重复下发");
+        assert!(
+            !take_visibility_change(label, false),
+            "连续最小化不重复下发"
+        );
         assert!(take_visibility_change(label, true), "还原那一次必须下发");
         // 收尾：别把条目留给别的用例
-        last_visible().lock().map(|mut g| {
-            g.remove(label);
-        }).ok();
+        last_visible()
+            .lock()
+            .map(|mut g| {
+                g.remove(label);
+            })
+            .ok();
     }
 
     #[test]
@@ -987,14 +1073,29 @@ mod tests {
     fn clamp_size_bounds_bad_and_out_of_range_values() {
         // 通用下限 300×200；上限 2000
         assert_eq!(clamp_size("memo", None, 500.0, 400.0), (500.0, 400.0));
-        assert_eq!(clamp_size("memo", None, 10.0, 10.0), (MIN_W, MIN_H), "下限必须兜住");
-        assert_eq!(clamp_size("memo", None, 9_999.0, 9_999.0), (2000.0, 2000.0), "上限必须兜住");
+        assert_eq!(
+            clamp_size("memo", None, 10.0, 10.0),
+            (MIN_W, MIN_H),
+            "下限必须兜住"
+        );
+        assert_eq!(
+            clamp_size("memo", None, 9_999.0, 9_999.0),
+            (2000.0, 2000.0),
+            "上限必须兜住"
+        );
         // 桌宠按清单那一份下限取（minWidth 160 / minHeight 200）；越小越要按它、不能套通用 300
         let pet = pet_shape();
         let (w, h) = clamp_size("pet", Some(&pet), 100.0, 100.0);
-        assert_eq!((w, h), (120.0, 160.0), "要按清单的 minWidth/minHeight 夹，而不是通用档");
+        assert_eq!(
+            (w, h),
+            (120.0, 160.0),
+            "要按清单的 minWidth/minHeight 夹，而不是通用档"
+        );
         // 只声明 minHeight（minHeight 300 ≤ 初始 380）⇒ 高度按 300 兜住，宽度走清单 120
-        let only_min_h = PluginWindowShape { min_height: 300.0, ..pet_shape() };
+        let only_min_h = PluginWindowShape {
+            min_height: 300.0,
+            ..pet_shape()
+        };
         let (w2, h2) = clamp_size("pet", Some(&only_min_h), 100.0, 100.0);
         assert_eq!((w2, h2), (120.0, 300.0));
     }
@@ -1020,7 +1121,10 @@ mod tests {
             let moved = anchored_top(top, cur, new, s);
             let bottom_before = f64::from(top) + cur * s;
             let bottom_after = f64::from(moved) + new * s;
-            assert!((bottom_before - bottom_after).abs() < 1.0, "下沿必须不动：{bottom_before} vs {bottom_after}");
+            assert!(
+                (bottom_before - bottom_after).abs() < 1.0,
+                "下沿必须不动：{bottom_before} vs {bottom_after}"
+            );
         }
     }
 
@@ -1051,9 +1155,15 @@ mod tests {
         // 未声明（`pet_shape()` 就是桌宠那份清单的写法，没写 alwaysOnTop）
         assert_eq!(pet_shape().always_on_top, None);
         // 只覆盖置顶这一项，其余形态不动
-        let off = PluginWindowShape { always_on_top: Some(false), ..pet_shape() };
+        let off = PluginWindowShape {
+            always_on_top: Some(false),
+            ..pet_shape()
+        };
         assert_eq!(off.always_on_top, Some(false));
-        let on = PluginWindowShape { always_on_top: Some(true), ..pet_shape() };
+        let on = PluginWindowShape {
+            always_on_top: Some(true),
+            ..pet_shape()
+        };
         assert_eq!(on.always_on_top, Some(true));
     }
 }

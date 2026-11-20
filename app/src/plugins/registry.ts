@@ -38,6 +38,13 @@ export interface Plugin {
    *  `attachXxxListeners(root)` —— 让 AI 生成的插件照搬某个基础插件的面板 HTML 时，
    *  按钮能真的工作。只认 `BASE_PLUGIN_IDS` 里且在 `attach.ts` 有监听的那些，其余忽略。 */
   reuse?: string[];
+  /** 能力身份（2026-10-18）：供宿主按能力定位插件；`id` 仍是目录名。 */
+  provides?: string[];
+  /** 渲染方式与外观级别（2026-10-18）。缺省 `dom` + `inherit`。
+   *  `slots` = 常驻挂载锚点（只允许 iframe 引擎，见 docs/todo.md C.4.1）。 */
+  render?: { engine?: "dom" | "iframe"; appearance?: "inherit" | "custom"; slots?: string[] };
+  /** 插件目录绝对路径（仅磁盘插件；iframe 引擎用它拼 `ui/index.html`）。 */
+  dir?: string;
   /** **自带本机进程**（2026-10-06，仅磁盘插件从清单带过来）。前端只用它的 `autostart`：
    *  面板打开时是否自动起进程（真正的起 / 收 / 信任门在 `plugins/sidecar.ts` 与 Rust 侧）。 */
   sidecar?: { autostart?: boolean };
@@ -185,7 +192,7 @@ class PluginRegistry {
     // 它**仍然注册在 registry 里**（设置页那条入口与 `__lunac_execute_tool_editor` 桥
     // 要靠它），所以只在这里挡，不动注册。
     // 基础设施插件（`isHeadlessPlugin`，如 local-model）**也不进搜索结果** —— 它没有用户入口，
-    // 开关在「设置 → AI」，但**仍留在插件市场**（判据分开的原因见 kinds.ts）。
+    // 开关在「更多设置 → 其他」，但**仍留在插件市场**（判据分开的原因见 kinds.ts）。
     const pool = this.plugins.filter(p => !isMergedPlugin(p.id) && !isHeadlessPlugin(p.id));
     if (!q) return pool.slice(0, 6);
 

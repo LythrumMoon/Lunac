@@ -286,6 +286,16 @@ if (-not $token) {
     Fail-Setup ("没有可用的 API key：请配好 {0} 的 AI_API_KEY，或设 env / 传 -Token" -f $EnvFile)
 }
 
+# -McpExe 必须转成**绝对路径**：agent 是以**它自己的 cwd**（run\workspace）为基准去 spawn
+# 这个命令的 ⇒ 传相对路径会 spawn 失败（os error 3），表现为工具回 `bridge-unavailable`
+# 而不是报错，很容易误判成「桥没实现」。
+if ($McpExe) {
+    if (-not (Test-Path -LiteralPath $McpExe)) {
+        Fail-Setup ("-McpExe 指向的文件不存在: {0}（请传绝对路径或仓库内相对路径；release 布局 = app\src-tauri\target\release\lunac.exe）" -f $McpExe)
+    }
+    $McpExe = (Resolve-Path -LiteralPath $McpExe).Path
+}
+
 # ── 组装 query 列表 ──────────────────────────────────────────────
 $queries = @()
 if ($QueryFile) {

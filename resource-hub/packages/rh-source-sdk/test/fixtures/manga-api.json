@@ -1,0 +1,21 @@
+{
+  "api": "9",
+  "type": "anime",
+  "name": "Fixture API",
+  "version": "2.0",
+  "baseURL": "https://api-fixture.example/",
+  "searchMode": "api",
+  "searchApiConfig": {
+    "request": {
+      "method": "GET",
+      "url": "https://api-fixture.example/suggest",
+      "query": { "wd": "@keyword" }
+    },
+    "listPath": "$.list[*]",
+    "namePath": "$.name",
+    "sourcePath": "$.id",
+    "sourceTemplate": "https://api-fixture.example/work/@source/"
+  },
+  "chapterRoads": "//ul[@class='playlist']",
+  "chapterResult": "//li/a"
+}

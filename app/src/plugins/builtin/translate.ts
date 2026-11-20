@@ -68,6 +68,7 @@ export const translatePlugin: Plugin = {
   description: "Translate text and look words up — 翻译与查词",
   icon: "🔤",
   badge: "Dict",
+  provides: ["text.translate"],
 
   async execute(input: string) {
     // 搜索栏里的文字直接当待译内容预填（`翻译 hello` 这类前缀一并剥掉 —— 用户是

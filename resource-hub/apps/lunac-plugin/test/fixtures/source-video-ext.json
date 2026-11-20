@@ -1,0 +1,23 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "harness.videoext",
+    "name": "Harness VideoExt",
+    "version": "1.0.0",
+    "kind": [
+      "anime"
+    ],
+    "engine": "js",
+    "entry": "source.js",
+    "baseUrl": "http://localhost:8123",
+    "capabilities": [
+      "search",
+      "explore",
+      "chapters",
+      "play"
+    ]
+  },
+  "rule": {},
+  "script": "// ignore\nimport { VideoDetail } from './core/core/uzVideo.js';\n// ignore\nasync function searchVideo(args) {\n  const res = await req('http://localhost:8123/test/fixtures/video-ext-search.json', { responseType: 'json' });\n  return JSON.stringify({ data: res.data.data });\n}\n\nasync function getClassList() {\n  return JSON.stringify({ class: [{ type_id: 'hot', type_name: '热门' }] });\n}\n\nasync function getVideoList(args) {\n  const data = [];\n  for (let i = 1; i <= 40; i++) {\n    data.push({ vod_id: 'seg-' + i, vod_name: '分段作品 ' + i, vod_pic: '', type_name: '动画', vod_class: '动画,冒险', vod_blurb: '第 ' + i + ' 部作品简介' });\n  }\n  return JSON.stringify({ data });\n}\n\nasync function getVideoDetail(args) {\n  return JSON.stringify({\n    data: {\n      vod_name: '星海 动画',\n      vod_blurb: '星海动画简介',\n      vod_class: '动画,冒险',\n      vod_director: '导演甲',\n      vod_play_from: '线路1$$$线路2',\n      vod_play_url: '第1集$http://localhost:8123/test/fixtures/video.m3u8#第2集$http://localhost:8123/test/fixtures/video.m3u8$$$第1集$http://localhost:8123/test/fixtures/video.mp4',\n    },\n  });\n}\n\nasync function getVideoPlayUrl(args) {\n  return JSON.stringify({ urls: [{ name: '高清', url: args.url }] });\n}\n",
+  "warnings": []
+}

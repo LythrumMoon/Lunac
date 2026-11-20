@@ -1,0 +1,42 @@
+{
+  "manifest": {
+    "rsp": 1,
+    "id": "harness.fixture",
+    "name": "Harness Fixture",
+    "version": "1.0.0",
+    "kind": ["comic"],
+    "engine": "declarative",
+    "entry": "rule.json",
+    "baseUrl": "http://localhost:8123",
+    "capabilities": ["search", "chapters", "pages"]
+  },
+  "rule": {
+    "search": {
+      "request": { "method": "GET", "url": "/test/fixtures/demo-search.json" },
+      "list": { "jsonPath": "$.data[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } },
+        "author": { "selector": { "jsonPath": "author" } },
+        "cover": { "selector": { "jsonPath": "cover" } },
+        "description": { "selector": { "jsonPath": "description" } },
+        "tags": { "selector": { "jsonPath": "tags" } }
+      }
+    },
+    "chapters": {
+      "request": { "method": "GET", "url": "@workUrl" },
+      "list": { "jsonPath": "$.chapters[*]" },
+      "fields": {
+        "id": { "selector": { "jsonPath": "id" } },
+        "title": { "selector": { "jsonPath": "title" } }
+      }
+    },
+    "pages": {
+      "request": { "method": "GET", "url": "@chapterUrl" },
+      "list": { "jsonPath": "$.images[*]" },
+      "fields": {
+        "url": { "selector": { "jsonPath": "src" } }
+      }
+    }
+  }
+}

@@ -4,10 +4,10 @@
 
 #![allow(non_snake_case)]
 
+use base64::Engine as _;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use base64::Engine as _;
 
 // ── Windows GDI FFI ─────────────────────────────────────────────
 
@@ -230,7 +230,10 @@ fn encode_png_rgba(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
 
 /// Convert Windows wide string path to UTF-16 for FFI.
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 图标抽取的**进程内串行闸**。
@@ -319,14 +322,7 @@ unsafe fn icon_to_png(hicon: isize) -> Option<String> {
     bi.biCompression = BI_RGB;
 
     let mut pv_bits: *mut u8 = std::ptr::null_mut();
-    let dib = CreateDIBSection(
-        mem_dc,
-        &bi,
-        DIB_RGB_COLORS,
-        &mut pv_bits,
-        0,
-        0,
-    );
+    let dib = CreateDIBSection(mem_dc, &bi, DIB_RGB_COLORS, &mut pv_bits, 0, 0);
     if dib == 0 || pv_bits.is_null() {
         DeleteDC(mem_dc);
         ReleaseDC(0, hdc);

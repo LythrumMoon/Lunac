@@ -156,7 +156,9 @@ impl TranslateResult {
 // （省掉 `PRAGMA user_version` 版本簿记，现在只有 v1，簿记是纯负担）。
 
 fn cache_path() -> PathBuf {
-    crate::storage::module_data_dir().join("translate").join("cache.db")
+    crate::storage::module_data_dir()
+        .join("translate")
+        .join("cache.db")
 }
 
 fn open_cache() -> Result<Connection, String> {
@@ -210,7 +212,9 @@ fn cache_put(res: &TranslateResult) {
         return;
     }
     let Ok(conn) = open_cache() else { return };
-    let Ok(payload) = serde_json::to_string(res) else { return };
+    let Ok(payload) = serde_json::to_string(res) else {
+        return;
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -294,7 +298,10 @@ fn mymemory_translate(
     }
     let v: Value = serde_json::from_str(&raw).ok()?;
     // `responseStatus` 在额度用尽时是 403（HTTP 仍是 200）—— 单独判一下，日志里能看出区别
-    let inner = v.get("responseStatus").and_then(Value::as_i64).unwrap_or(200);
+    let inner = v
+        .get("responseStatus")
+        .and_then(Value::as_i64)
+        .unwrap_or(200);
     if inner != 200 {
         crate::log::warn(format!("[translate] MyMemory 拒绝：responseStatus={inner}"));
         return None;
@@ -345,7 +352,10 @@ fn trs_line(node: &Value) -> Option<String> {
     }
 }
 
-fn youdao_detail(client: &reqwest::blocking::Client, text: &str) -> (String, Vec<String>, Vec<TranslateExample>) {
+fn youdao_detail(
+    client: &reqwest::blocking::Client,
+    text: &str,
+) -> (String, Vec<String>, Vec<TranslateExample>) {
     let mut phonetic = String::new();
     let mut explains: Vec<String> = Vec::new();
     let mut examples: Vec<TranslateExample> = Vec::new();
@@ -397,8 +407,16 @@ fn youdao_detail(client: &reqwest::blocking::Client, text: &str) -> (String, Vec
 
     // 音标：英 / 美两条都取（只取一个有偏向，用户看不出缺的是哪一边）
     if let Some(w) = v.pointer("/ec/word/0") {
-        let uk = w.get("ukphone").and_then(Value::as_str).unwrap_or("").trim();
-        let us = w.get("usphone").and_then(Value::as_str).unwrap_or("").trim();
+        let uk = w
+            .get("ukphone")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let us = w
+            .get("usphone")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         phonetic = match (uk.is_empty(), us.is_empty()) {
             (false, false) if uk != us => format!("英 {uk}  美 {us}"),
             (false, _) => uk.to_string(),
@@ -407,7 +425,12 @@ fn youdao_detail(client: &reqwest::blocking::Client, text: &str) -> (String, Vec
         };
         if let Some(arr) = w.get("trs").and_then(Value::as_array) {
             for item in arr {
-                if let Some(line) = item.get("tr").and_then(Value::as_array).and_then(|a| a.first()).and_then(trs_line) {
+                if let Some(line) = item
+                    .get("tr")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(trs_line)
+                {
                     // 去重：有道同一个词会在不同词性下重复同一条释义
                     if !explains.contains(&line) {
                         explains.push(line);
@@ -421,7 +444,12 @@ fn youdao_detail(client: &reqwest::blocking::Client, text: &str) -> (String, Vec
         if let Some(arr) = v.pointer("/ce/word/0/trs").and_then(Value::as_array) {
             for item in arr {
                 // 中文词条多一层：`tr[0].l` 自己就是 {i:…,#tran:…}，故先取 `l` 再进 trs_line
-                let Some(l) = item.get("tr").and_then(Value::as_array).and_then(|a| a.first()).and_then(|t| t.get("l")) else {
+                let Some(l) = item
+                    .get("tr")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(|t| t.get("l"))
+                else {
                     continue;
                 };
                 if let Some(line) = trs_line(l) {
@@ -435,9 +463,16 @@ fn youdao_detail(client: &reqwest::blocking::Client, text: &str) -> (String, Vec
     explains.truncate(MAX_EXPLAINS);
 
     // 双语例句：`blng_sents_part.sentence-pair[]`（`sentence` 原文 / `sentence-translation` 译文）
-    if let Some(pairs) = v.pointer("/blng_sents_part/sentence-pair").and_then(Value::as_array) {
+    if let Some(pairs) = v
+        .pointer("/blng_sents_part/sentence-pair")
+        .and_then(Value::as_array)
+    {
         for p in pairs {
-            let src = p.get("sentence").and_then(Value::as_str).unwrap_or("").trim();
+            let src = p
+                .get("sentence")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             let dst = p
                 .get("sentence-translation")
                 .and_then(Value::as_str)
@@ -480,7 +515,8 @@ fn model_endpoint() -> Result<String, String> {
         }
     }
     let (api_url, _, _) = crate::commands::ai_credentials()?;
-    let base = crate::commands::agent_endpoint(&api_url, std::env::var("AI_AGENT_URL").ok().as_deref());
+    let base =
+        crate::commands::agent_endpoint(&api_url, std::env::var("AI_AGENT_URL").ok().as_deref());
     Ok(format!("{}/v1/messages", base.trim().trim_end_matches('/')))
 }
 
@@ -589,14 +625,20 @@ fn model_translate(
 /// **永不返回 Err**（除了空输入）：网络故障、被反爬、额度用尽都只是「这次没查到」，
 /// 不该在面板上变成一行红色错误 —— 那会把「对方今天不通」说成「你这个词有问题」。
 #[tauri::command]
-pub async fn translate_lookup(text: String, from: String, to: String) -> Result<TranslateResult, String> {
+pub async fn translate_lookup(
+    text: String,
+    from: String,
+    to: String,
+) -> Result<TranslateResult, String> {
     run_blocking(move || {
         let text = text.trim().to_string();
         if text.is_empty() {
             return Err("没有要翻译的内容".into());
         }
         if text.chars().count() > DICT_MAX_CHARS {
-            return Err(format!("文本过长（上限 {DICT_MAX_CHARS} 字），请分段或改用 AI 翻译"));
+            return Err(format!(
+                "文本过长（上限 {DICT_MAX_CHARS} 字），请分段或改用 AI 翻译"
+            ));
         }
         let from = resolve_from(&from, &text);
         let to = to.trim().to_string();
@@ -632,7 +674,11 @@ pub async fn translate_lookup(text: String, from: String, to: String) -> Result<
 /// 模型补漏（**花钱**）：只在用户点按钮时调用。结果同样落缓存 ——
 /// 同一句问第二次不该再付一次钱（用户原话：「译文存数据库，避免二次翻译」）。
 #[tauri::command]
-pub async fn translate_ai(text: String, from: String, to: String) -> Result<TranslateResult, String> {
+pub async fn translate_ai(
+    text: String,
+    from: String,
+    to: String,
+) -> Result<TranslateResult, String> {
     run_blocking(move || {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -688,8 +734,14 @@ mod tests {
     #[test]
     fn cache_key_is_scoped_by_language_pair() {
         // 同一句「hello」在 en→zh 与 zh→en 下必须是两条（否则会把译文当原文查回来）
-        assert_ne!(cache_key("en", "zh-CN", "hello"), cache_key("zh-CN", "en", "hello"));
-        assert_eq!(cache_key("en", "zh-CN", "hi"), cache_key("en", "zh-CN", "hi"));
+        assert_ne!(
+            cache_key("en", "zh-CN", "hello"),
+            cache_key("zh-CN", "en", "hello")
+        );
+        assert_eq!(
+            cache_key("en", "zh-CN", "hi"),
+            cache_key("en", "zh-CN", "hi")
+        );
     }
 
     #[test]

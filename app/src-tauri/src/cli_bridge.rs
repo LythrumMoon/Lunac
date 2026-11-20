@@ -116,6 +116,27 @@ fn kill_process_tree(pid: u32) {
     let _ = pid;
 }
 
+/// 强制结束一个子进程及其整棵进程树，并等它退出（最多 2s）。
+///
+/// **唯一实现**：`kill_and_cleanup`（常驻 agent）与 `commands::cron_run_now`（cron 超时 /
+/// 收尾）共用这一份，避免两处各写一套「先 taskkill /T 再 kill」的差异。
+pub fn kill_tree(child: &mut Child) {
+    // Kill the whole tree first (parent must still be alive for /T to find children),
+    // then the process itself as a fallback.
+    kill_process_tree(child.id());
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break, // exited
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => break, // timeout / error — drop handle
+        }
+    }
+}
+
 /// Kill agent.exe **and the command(s) it is currently running**, then clean up state.
 /// Called on stop or app shutdown.
 ///
@@ -124,21 +145,8 @@ fn kill_process_tree(pid: u32) {
 /// Never blocks indefinitely: taskkill 与 TerminateProcess 都带超时轮询，绝不无限等
 /// （一个卡死的 agent.exe 不许冻住 stop_cli）。
 pub fn kill_and_cleanup() {
-    // Kill the whole tree first (parent must still be alive for /T to find children),
-    // then the process itself as a fallback.
     if let Some(mut child) = take_process() {
-        kill_process_tree(child.id());
-        let _ = child.kill();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,           // exited
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                _ => break,                      // timeout / error — drop handle
-            }
-        }
+        kill_tree(&mut child);
     }
     // Clear stdin
     if let Some(m) = CLI_STDIN.get() {

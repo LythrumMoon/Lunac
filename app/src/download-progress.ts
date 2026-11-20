@@ -116,3 +116,79 @@ export function updateRing(root: ParentNode, percent: number): boolean {
   if (pct) pct.textContent = known ? String(Math.round(percent)) : "";
   return true;
 }
+
+/** `InstallOverall.push()` 的返回值：在单文件样本之外多带「第几个 / 共几个 / 在解压」。 */
+export interface InstallSample extends DownloadSample {
+  /** 当前是第几个文件（0 = 插件包本体；「只补依赖」的入口不会有 0） */
+  index: number;
+  /** 本次一共几个文件；0 = 还不知道（插件包本体那一段） */
+  count: number;
+  /** 当前阶段是不是解压 */
+  extracting: boolean;
+}
+
+/**
+ * 一次**安装**的总体进度：插件包本体 + 每一条依赖。
+ *
+ * 为什么需要它（2026-10-27 用户报「桌宠下载时进度条不断抖动」）：宿主是**逐个文件**
+ * 下载的（插件包 → 依赖 1 → 依赖 2 …），每条 `DependencyProgress` 的 `downloaded/total`
+ * 只针对**当前这个文件**。直接拿它画环，换文件时就是 100% → 0% 再来一遍 ——
+ * 桌宠正是这种形状（Live2D Core 几十 KB，紧接着 ZipVoice 149 MB），抖得最明显。
+ *
+ * 折算方式：**整次安装切成等权的 N 步**（插件包算一步、每条依赖算一步），
+ * 总进度 =（已完成步数 + 当前步内的比例）/ 总步数 ⇒ **只增不减**。
+ *
+ * 步数还不知道的那一段（插件包本体下载时宿主给 `count = 0`）回 **-1**（环转圈、不写数字）：
+ * 与其先画一个 100% 再掉回 0%，不如这一段干脆不给数字。
+ *
+ * 速度不按文件清零：换文件时把上一个文件的字节并入基线（`offset`），
+ * 否则每次换文件都会先显示 0 B/s，看着像断了。
+ */
+export class InstallOverall {
+  private meter = new DownloadMeter();
+  private segKey = "";
+  /** 已完成文件的字节数（只为让跨文件的速度连续） */
+  private offset = 0;
+  private lastDownloaded = 0;
+  private lastTotal = 0;
+  /** 本次安装是否包含「插件包本体」那一步 */
+  private bodySeen = false;
+
+  push(
+    p: { phase: string; downloaded: number; total: number; index: number; count: number },
+    now: number = Date.now(),
+  ): InstallSample {
+    const key = `${p.phase}#${p.index}`;
+    if (key !== this.segKey) {
+      this.offset +=
+        this.lastTotal > 0 ? Math.min(this.lastDownloaded, this.lastTotal) : this.lastDownloaded;
+      this.segKey = key;
+    }
+    if (p.index === 0) this.bodySeen = true;
+    this.lastDownloaded = p.downloaded;
+    this.lastTotal = p.total;
+
+    // 总字节传 0 ⇒ 这里只要速度；百分比由下面的「等权步」算
+    const { speed } = this.meter.push(this.offset + p.downloaded, 0, now);
+    const extracting = p.phase === "extract";
+    const downloaded = this.offset + p.downloaded;
+
+    // 还不知道总共几步 ⇒ 不给数字（环转圈）
+    if (p.count === 0) {
+      return { percent: -1, speed, downloaded, total: 0, index: 0, count: 0, extracting };
+    }
+    const steps = p.count + (this.bodySeen ? 1 : 0);
+    const unit = (this.bodySeen ? 1 : 0) + Math.max(0, p.index - 1);
+    // 解压没有字节进度，但**不把环退回 0** —— 停在「这一步已经完成」的位置
+    const frac = extracting ? 1 : p.total > 0 ? Math.min(1, p.downloaded / p.total) : 0;
+    return {
+      percent: Math.floor(((unit + frac) / steps) * 100),
+      speed,
+      downloaded,
+      total: 0,
+      index: p.index,
+      count: p.count,
+      extracting,
+    };
+  }
+}
