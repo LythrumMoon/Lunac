@@ -181,6 +181,37 @@ void main() {
     expect(text.startsWith(chunk), isTrue);
   });
 
+  test('mid-turn snapshot keeps the question and partial thinking', () {
+    // 强制结束 / 闪退时没有 result 事件；只要提问一发出，快照就必须可落盘，
+    // 并且带上当前已经产生的思考（ChatPanel 的流式节流落盘依赖这条）。
+    final model = ChatModel()..addUser('请分析这个项目');
+    expect(model.historyJson(), isNotNull, reason: 'addUser 之后就必须能落盘');
+
+    model.apply({
+      'type': 'stream_event',
+      'event': {
+        'type': 'content_block_delta',
+        'delta': {'type': 'thinking_delta', 'thinking': '正在分析目录'},
+      },
+    });
+    final snapshot = model.historyJson()!;
+    final messages = snapshot['messages'] as List;
+    expect(
+      messages.any(
+        (m) => m is Map && m['role'] == 'user' && m['content'] == '请分析这个项目',
+      ),
+      isTrue,
+    );
+    final steps = snapshot['steps'] as List;
+    expect(
+      steps.any(
+        (s) => s is Map && s['kind'] == 'thinking' && s['text'] == '正在分析目录',
+      ),
+      isTrue,
+      reason: '半截思考也要进快照：$steps',
+    );
+  });
+
   test('tool_use and tool_result are paired by tool_use_id', () {
     final model = ChatModel()..addUser('列目录');
     model.apply({

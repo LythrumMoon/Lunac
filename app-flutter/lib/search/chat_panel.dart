@@ -83,6 +83,11 @@ class _ChatPanelState extends State<ChatPanel> {
   StreamSubscription<Map<String, dynamic>>? _subscription;
   String? _startError;
 
+  /// 流式过程中的落盘节流（2026-11-21）：一轮可能跑几分钟，只靠 `result` 落盘
+  /// 时，强制结束 / 闪退会把整个新会话丢掉。这里每 900ms 最多写一次快照；
+  /// 用户提问在 `_send` 里先同步落一次，保证「问题本身」一定在盘上。
+  Timer? _persistTimer;
+
   /// 历史列表是否打开（面板内切换，不新开窗口）。
   bool _historyOpen = false;
   List<ChatHistoryMeta> _historyMeta = const [];
@@ -256,7 +261,9 @@ class _ChatPanelState extends State<ChatPanel> {
 
   @override
   void dispose() {
-    // 关面板时把当前会话落一次盘（不打断进行中的回合，agent 仍然常驻）。
+    // 流式过程中的节流落盘（见 `_schedulePersist`）。
+    _persistTimer?.cancel();
+    _persistTimer = null;
     _persist();
     // 面板关掉就不再收事件：忙态必须放掉，否则调度器会一直以为前端在流式跑。
     if (_cronBusy) {
@@ -299,6 +306,10 @@ class _ChatPanelState extends State<ChatPanel> {
     }
     // 面板关闭期间 agent 仍可能在跑：先把积压事件折叠进模型，再接实时流。
     drainAgentEvents(_consumeEvent);
+    if (_model.busy) {
+      // 这些事件可能是崩溃前最后一段输出，别等下一轮 result 才落盘。
+      _schedulePersist();
+    }
     _listen();
     setState(() => _startError = null);
   }
@@ -874,9 +885,14 @@ class _ChatPanelState extends State<ChatPanel> {
     setState(() => _consumeEvent(event));
     // 流式忙态同步给宿主调度器：忙时定时任务记 `skipped_busy`，不排队、不并发跑 agent。
     _syncCronBusy();
-    // 一轮结束（busy true → false）时落盘一次，历史列表里马上能看到。
+    // 一轮结束（busy true → false）时立刻落盘一次，历史列表里马上能看到。
     if (wasBusy && !_model.busy) {
+      _persistTimer?.cancel();
+      _persistTimer = null;
       _persist();
+    } else if (wasBusy || _model.busy) {
+      // 流式中：节流落盘，防止强制结束 / 闪退把本回合整体吞掉。
+      _schedulePersist();
     }
     if (wasBusy || _model.busy) {
       _scrollToEnd();
@@ -1164,6 +1180,8 @@ class _ChatPanelState extends State<ChatPanel> {
     // 生成中的两种语义（§待办 3-28.1）：排队 vs 立即插入。
     final steerInsert = _model.busy && _insertWhileBusy;
     _model.addUser(body, steerInsert: steerInsert);
+    // 先落盘再发：即使发送过程中进程被强制结束，用户这条提问也已经在历史里。
+    _persist();
     // vision 缺省 = 开（与 v1 `storage::default_vision` 一致）。
     final vision = readAiConfig()['vision'] != false;
     final sent = sendAgentLine(
@@ -1350,6 +1368,20 @@ class _ChatPanelState extends State<ChatPanel> {
     if (snapshot != null) {
       saveChatHistory(snapshot);
     }
+  }
+
+  /// 流式期间节流落盘：900ms 内最多一次，避免每个 delta 都序列化 `steps`。
+  ///
+  /// 触发点在 `_onEvent`（思考 / 正文 / 工具卡都算），因此即使进程被强制结束，
+  /// 最多丢最后 0.9 秒的输出；用户提问由 `_send` 同步落盘，不会丢。
+  void _schedulePersist() {
+    if (_persistTimer?.isActive ?? false) {
+      return;
+    }
+    _persistTimer = Timer(const Duration(milliseconds: 900), () {
+      _persistTimer = null;
+      _persist();
+    });
   }
 
   /// 打开沙箱盘预览窗（AI 的受控工作目录，`temp/transStorage`）。
