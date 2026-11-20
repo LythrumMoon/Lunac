@@ -2169,13 +2169,13 @@ class ChatModel {
     _turnRequests = 0;
   }
 
+  /// 流式增量直接追加，**不做 4000 字截断**。
+  ///
+  /// `_maxEntryChars` 只用于落盘（`_clipStep`）与工具输出：思考 / 正文在流式过程中
+  /// 若从头部裁掉，会表现成「4000 字后前面的字被吞掉、思考结束才恢复」（用户
+  /// 2026-11-21 报障）。内存里保留全文，界面才能边想边看到完整过程。
   static void _append(ChatEntry entry, String chunk) {
-    final next = entry.text + chunk;
-    if (next.length <= _maxEntryChars) {
-      entry.text = next;
-      return;
-    }
-    entry.text = '…${next.substring(next.length - _maxEntryChars)}';
+    entry.text += chunk;
   }
 
   static String _contentText(dynamic content) {

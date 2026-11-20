@@ -131,6 +131,56 @@ void main() {
     expect(lastOf(model, ChatEntryKind.thinking).text, '先想一下');
   });
 
+  test(
+    'long streaming thinking keeps its beginning (no 4000-char head loss)',
+    () {
+      final model = ChatModel()..addUser('q');
+      final chunk = List.filled(100, '思考内容').join(); // 每次 400 字
+      for (var i = 0; i < 30; i++) {
+        model.apply({
+          'type': 'stream_event',
+          'event': {
+            'type': 'content_block_delta',
+            'delta': {'type': 'thinking_delta', 'thinking': chunk},
+          },
+        });
+      }
+      final thinking = lastOf(model, ChatEntryKind.thinking).text;
+      expect(thinking.length, greaterThan(4000));
+      // 头部必须还在：旧实现从 4000 字起把开头裁掉，用户看到「前面的字被吞」。
+      expect(thinking.startsWith(chunk), isTrue);
+      expect(thinking, List.filled(30, chunk).join());
+
+      // 整包 assistant 到达后仍以全量覆盖，内容不丢。
+      model.apply({
+        'type': 'assistant',
+        'message': {
+          'content': [
+            {'type': 'thinking', 'thinking': thinking},
+          ],
+        },
+      });
+      expect(lastOf(model, ChatEntryKind.thinking).text, thinking);
+    },
+  );
+
+  test('long streaming assistant text keeps its beginning too', () {
+    final model = ChatModel()..addUser('q');
+    final chunk = List.filled(250, '回答内容').join(); // 每次 1000 字
+    for (var i = 0; i < 6; i++) {
+      model.apply({
+        'type': 'stream_event',
+        'event': {
+          'type': 'content_block_delta',
+          'delta': {'type': 'text_delta', 'text': chunk},
+        },
+      });
+    }
+    final text = lastOf(model, ChatEntryKind.assistant).text;
+    expect(text.length, greaterThan(4000));
+    expect(text.startsWith(chunk), isTrue);
+  });
+
   test('tool_use and tool_result are paired by tool_use_id', () {
     final model = ChatModel()..addUser('列目录');
     model.apply({
