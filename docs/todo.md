@@ -21,9 +21,9 @@
 - **共享内核**：`core-agent/`（agent）、`indexer/`、`tuning-engine/`、`app-flutter/rust/`。
 - **最近完成的检查**：
   - `flutter analyze`：0 issue
-  - `app-flutter/rust`：`cargo check --release` **0 warning**；`cargo test --lib` **600 passed**
-    （仅剩 2 个环境依赖用例会偶发失败，见 P0-2）
-  - `core-agent`：`cargo test --offline` **498 passed / 0 failed / 16 ignored**
+  - `app-flutter/rust`：`cargo check --release` **0 warning**；`cargo test --lib`
+    **600 passed / 0 failed / 7 ignored**（连续跑 3 次全绿）
+  - `core-agent`：`cargo test --offline` **507 passed / 0 failed / 16 ignored**
   - `scripts\build-release-v2.ps1`：**exit 0、日志 0 warning**，产出
     `release\Lunac-1.0.0-Setup.exe`（约 21.6 MB），包内含 `agent.exe`、无 `cli.exe`
 - **本轮已完成（2026-11-20）**：
@@ -31,37 +31,25 @@
   - 历史回写保留用户提问、任务抽屉改用内容概括命名；
   - 新增图书馆式检索库（日期 → 对话 → 任务 → 操作，标签 + 优先级）；
   - 长期记忆接同一套索引，额度提高到 24000 / 16000 / 4000；
-  - 清理全部 Rust 构建 warning；修复 `core-agent/src/main.rs` 的 U+FFFD 乱码。
+  - 清理全部 Rust 构建 warning；修复 `core-agent/src/main.rs` 的 U+FFFD 乱码；
+  - `app-flutter/`、`indexer/`、`core-agent` 新模块、v2 脚本与文档已提交
+    （commit `ac60e32`），不再只存在于工作副本；
+  - 稳定两个环境依赖测试：ruleset 回环请求改 `.no_proxy()`，ConPTY 用例转
+    `#[ignore]`（真机用 `--ignored` 跑）；
+  - 新增 `scripts/verify-v2.ps1` 一键验收入口，并已实跑通过。
 
 ---
 
 ## 1. P0 阻断 / 项目卫生（先做）
 
-### P0-1 把 `app-flutter/` 纳入版本控制
-- **现状**：`git status` 里整个 `app-flutter/` 仍是 `??`（untracked），大量 v2 源码、
-  测试、Rust 薄层只在工作副本里；一次误删/回滚就会丢。
-- **要做**：确认 `.gitignore` 只排除 `build/`、`target/`、`.dart_tool/` 等产物后，
-  把 `app-flutter/` 的源码、`pubspec.yaml`、`rust/src`、`windows/linux` 壳提交。
-- **验收**：新克隆能直接 `flutter pub get` + `cargo check`，不依赖当前机器的工作副本。
-
-### P0-2 稳定两个环境依赖测试
-- **现象**：`app-flutter/rust cargo test --lib` 偶发两项失败：
-  1. `terminal::imp::tests::terminal_spawns_and_echoes_a_command`（ConPTY 环境）；
-  2. `native_proxy::ruleset::tests::an_http_provider_is_fetched_once_then_served_from_cache`
-     （并行测试抢 `127.0.0.1:1352`）。
-- **要做**：二选一：
-  - 用随机端口 / 串行锁隔离 ruleset 用例；ConPTY 用例在无控制台环境标记 `#[ignore]`；
-  - 或统一挂到 `#[ignore]` 的「真机验收」组，并在 `testing.md` 写明运行方式。
-- **验收**：连续跑 3 次 `cargo test --lib` 全绿，不再看运气。
-
-### P0-3 安装包在干净机 / 卸载重装场景复验
+### P0-1 安装包在干净机 / 卸载重装场景复验
 - **现状**：`build-release-v2.ps1` 已能稳定产出安装包；上一轮 `M5z-补81` 的 release
   闪退只做过符号化定位，仍需真机连续开关插件窗 / 长跑复测。
 - **要做**：干净 Windows 虚拟机装一次 → 启动 → 开关设置 / 聊天 / 音乐 / 桌宠插件窗 →
   卸载 → 确认 `ModuleData`、`config`、托盘、自启动项清理干净。
 - **验收**：安装、运行、卸载三份记录；无残留进程、无启动项、无崩溃 dump。
 
-### P0-4 Linux 构建与最小验收
+### P0-2 Linux 构建与最小验收
 - **现状**：v2 目标为 Windows + Linux 双端；Linux 侧只做过环境准备，未跑完整构建。
 - **要做**：按 `flutter-migration.md` 的 M4/M6 在 Linux 上跑一次
   `flutter build linux` + `cargo test` + 启动搜索/聊天；记录 GTK / WebKitGTK / 托盘差异。
@@ -181,32 +169,23 @@
 
 ## 6. 本轮新增的优化建议
 
-1. **加一条 v2 验收入口**：新增 `scripts/verify-v2.ps1`，一次跑
-   `flutter analyze` → `flutter test` → `cargo check --release` → `cargo test --lib`
-   → `scripts/build-release-v2.ps1 -NoBuild`，作为提交前/发版前唯一入口。
-2. **把 warning 守门写进脚本**：`build-release-v2.ps1` 目前只检查 exit code；
+1. **把 warning 守门写进脚本**：`build-release-v2.ps1` 目前只检查 exit code；
    可在 cargo 输出里断言 `warning:` 为 0（或提供 `-AllowWarnings` 开关），防止重新长回来。
-3. **检索库可观测性**：给 `library.db` 加 `entries` 行数 / 文件大小 / 最近重建时间的只读接口，
+2. **检索库可观测性**：给 `library.db` 加 `entries` 行数 / 文件大小 / 最近重建时间的只读接口，
    设置页或日志里能看见「索引是否膨胀 / 是否需要重建」。
-4. **记忆注入策略 A/B**：当前 24k 整段注入 + `MemorySearch` 按需检索并存；
+3. **记忆注入策略 A/B**：当前 24k 整段注入 + `MemorySearch` 按需检索并存；
    可对比「整段注入」与「只注入索引 + 检索」两种方案的上下文占用与答对率。
-5. **测试隔离**：ruleset HTTP 用例改随机端口；ConPTY 用例按环境 `#[ignore]`，
-   避免「每次全绿靠运气」。
-6. **仓库卫生**：`app-flutter/` 纳入 git 后，确认 `build/`、`target/`、`.dart_tool/`、
-   `release/` 不被提交；当前 `docs/archive/todo-2026-11-20-full.md` 只作历史，不再更新。
-7. **文档索引**：`docs/README.md` 的归档表补上 `todo-2026-11-20-full.md`，
-   并注明「新待办只写 `docs/todo.md`」。
-8. **`chat_history` 全量重写**：当前每次保存仍把 100 条会话的完整 JSON 序列化后整文件
+4. **`chat_history` 全量重写**：当前每次保存仍把 100 条会话的完整 JSON 序列化后整文件
    rename；会话变多后写放大明显。可改成 SQLite 会话表（或按会话分片追加），并给历史列表
    加分页，避免一次把全部 `messages` 读进内存。
-9. **检索库查询路径**：`library::search` 目前是 `LIKE + 内存打分`；数据量上来后可加
+5. **检索库查询路径**：`library::search` 目前是 `LIKE + 内存打分`；数据量上来后可加
    FTS5（CJK 用 trigram）或把 `tags` 拆成独立表，让「按标签/任务收窄」真正走索引。
-10. **记忆索引增量更新**：`memory::sync_index` 每次写入都重读整个 scope 再重建；可只
-    替换变化的那条 bullet，减少大记忆文件上的写放大。
-11. **`library.db` 生命周期**：补保留上限、过期日期清理、`VACUUM` 触发条件与损坏重建；
-    当前只有重建入口，没有长期维护策略。
-12. **Flutter 侧历史列表**：`loadChatHistory()` 一次返回全部会话；会话接近 100 条时，
-    首屏会解析大量 `messages`/`steps`。可改成元数据分页 + 点开再取详情。
+6. **记忆索引增量更新**：`memory::sync_index` 每次写入都重读整个 scope 再重建；可只
+   替换变化的那条 bullet，减少大记忆文件上的写放大。
+7. **`library.db` 生命周期**：补保留上限、过期日期清理、`VACUUM` 触发条件与损坏重建；
+   当前只有重建入口，没有长期维护策略。
+8. **Flutter 侧历史列表**：`loadChatHistory()` 一次返回全部会话；会话接近 100 条时，
+   首屏会解析大量 `messages`/`steps`。可改成元数据分页 + 点开再取详情。
 
 ---
 

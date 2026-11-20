@@ -257,10 +257,23 @@ fn is_fresh(path: &Path, interval_secs: u64) -> bool {
         .unwrap_or(false)
 }
 
+fn is_loopback_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]")
+}
+
 fn fetch(url: &str, timeout: Duration) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        .user_agent(format!("lunac/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("lunac/{}", env!("CARGO_PKG_VERSION")));
+    // 回环地址必须绕开系统代理：Windows 的 WinINET 代理不认「本机直连」，
+    // 单测里的本地规则集服务会因此偶发连不上（与 docs/code-standards §规范 5 同一条纪律）。
+    if is_loopback_url(url) {
+        builder = builder.no_proxy();
+    }
+    let client = builder
         .build()
         .map_err(|e| format!("HTTP 客户端创建失败：{e}"))?;
     let response = client
