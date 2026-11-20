@@ -195,30 +195,7 @@
    - 测试：`core-agent` 的 `memory_mode_switch_and_index_directory` 覆盖解析、目录压缩、
      预算截断、full/index 文案差异与固定前缀；`app-flutter/rust` 的
      `memory_mode_env_passthrough_skips_empty_values` 覆盖透传。
-
-**A/B 操作步骤（真实会话）**
-
-1. 先跑 `full`（默认，不设变量）N 个有代表性的会话，记录每次启动日志里的
-   `长期记忆已注入（N 字）`。
-2. `setx LUNAC_MEMORY_MODE index`（或从终端 `set LUNAC_MEMORY_MODE=index` 后启动
-   `lunac.exe`），重启应用，再跑同类的 N 个会话。先确认工具编辑器里没有禁用
-   `MemorySearch`（index 模式依赖它取正文）。
-3. 对比三组数：
-   - 上下文体积：日志里的注入字数（`记忆注入模式：index` 会额外打一行）；
-   - 检索行为：`MemorySearch 命中 … 条` 的调用次数与 `reason=ok` 比例；
-   - 答对率：同一批问题的人工判定（正确 / 漏答 / 编造）。
-4. 结果写入本节下方表格；没有明显答对率下降就保留 `index`，否则回 `full`。
-
-| 日期 | 模式 | 会话数 | 平均注入字数 | MemorySearch 调用 | 答对率 | 结论 |
-|---|---|---|---|---|---|---|
-| 2026-11-21 | full（合成 24k 语料） | — | 22817 | — | — | 单测基线 |
-| 2026-11-21 | index（同上） | — | 2784（目录 2051） | — | — | 体积降到 12.2% |
-| 待填 | full（真实会话） | | | | | |
-| 待填 | index（真实会话） | | | | | |
-
-> 合成语料那一行由 `core-agent` 单测
-> `index_mode_shrinks_a_full_memory_block` 实测（`cargo test --offline … -- --nocapture`），
-> 只证明上下文占用；答对率必须用真实会话按上面步骤补。
+   - 真实会话的对比步骤与记录表见本节末「记忆注入 A/B」。
 4. **`chat_history` 已改 SQLite**：`ModuleData/history/chat.db`，`sessions` 表按 id
    upsert，只写一条会话；旧 `chat-history.v2.json` 首次升级导入一次（有
    `legacy_imported` 标记，删掉的会话不会被导回）。
@@ -233,6 +210,30 @@
 8. **Flutter 历史列表已分页/轻量化**：`lunac_chat_history_meta` 只返回
    `id / title / createdAt / updatedAt / messageCount`，点开某行才通过
    `lunac_chat_history_session` 读完整 payload；分叉只取标题也用元数据。
+
+### 记忆注入 A/B（真实会话操作步骤）
+
+1. 先跑 `full`（默认，不设变量）N 个有代表性的会话，记录每次启动日志里的
+   `长期记忆已注入（N 字）`。
+2. `setx LUNAC_MEMORY_MODE index`（或从终端 `set LUNAC_MEMORY_MODE=index` 后启动
+   `lunac.exe`），重启应用，再跑同类的 N 个会话。先确认工具编辑器里没有禁用
+   `MemorySearch`（index 模式依赖它取正文）。
+3. 对比三组数：
+   - 上下文体积：日志里的注入字数（`记忆注入模式：index` 会额外打一行）；
+   - 检索行为：`MemorySearch 命中 … 条` 的调用次数与 `reason=ok` 比例；
+   - 答对率：同一批问题的人工判定（正确 / 漏答 / 编造）。
+4. 结果写入下表；没有明显答对率下降就保留 `index`，否则回 `full`。
+
+| 日期 | 模式 | 会话数 | 平均注入字数 | MemorySearch 调用 | 答对率 | 结论 |
+|---|---|---|---|---|---|---|
+| 2026-11-21 | full（合成 24k 语料） | — | 22817 | — | — | 单测基线 |
+| 2026-11-21 | index（同上） | — | 2784（目录 2051） | — | — | 体积降到 12.2% |
+| 待填 | full（真实会话） | | | | | |
+| 待填 | index（真实会话） | | | | | |
+
+> 合成语料那一行由 `core-agent` 单测
+> `index_mode_shrinks_a_full_memory_block` 实测（`cargo test --offline … -- --nocapture`），
+> 只证明上下文占用；答对率必须用真实会话按上面步骤补。
 
 验收口径（最近实跑）：
 
