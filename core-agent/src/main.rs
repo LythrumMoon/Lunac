@@ -4032,20 +4032,21 @@ fn memory_block(
     // 尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入已按同值封顶），
     // 尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入已按同值封顶），
     let raw = fetch_memory(bridge, scope).unwrap_or_default();
-    let body = match mode {
-        MemoryMode::Full => cap_inject(&raw),
+    // 老格式 / 没有 bullet 时目录会空：退回整段注入，**连说明文案也退回 full**，
+    // 否则会出现「下面只是目录」但实际贴了整份正文的自相矛盾提示。
+    let (text_mode, body) = match mode {
+        MemoryMode::Full => (MemoryMode::Full, cap_inject(&raw)),
         MemoryMode::Index => {
             let index = memory_index_text(&raw);
             if index.is_empty() && !raw.trim().is_empty() {
-                // 老格式 / 没有 bullet：目录会空，宁可多注一点也别把记忆整份丢掉。
                 eprintln!("[agent] 记忆目录为空（无 bullet），本次退回整段注入");
-                cap_inject(&raw)
+                (MemoryMode::Full, cap_inject(&raw))
             } else {
-                index
+                (MemoryMode::Index, index)
             }
         }
     };
-    let block = memory_block_text_mode(mode, remember_tool_on, &body, scope);
+    let block = memory_block_text_mode(text_mode, remember_tool_on, &body, scope);
     if block.is_empty() {
         return block;
     }
