@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../platform/agent.dart';
+import '../platform/appearance.dart';
 import '../platform/change_review.dart';
 import '../platform/chat_history.dart';
 import '../platform/clipboard_files.dart';
@@ -2095,6 +2096,9 @@ class _ChatPanelState extends State<ChatPanel> {
         clipBehavior: Clip.antiAlias,
         child: Stack(
           children: [
+            // AI 对话背景：自定义背景图铺在面板内部（严格跟随本面板的圆角 / 裁剪），
+            // 标题栏 / 输入栏 / 正文都浮在它上面。
+            Positioned.fill(child: appearancePanelBackdrop()),
             Column(
               children: [
                 _buildHeader(),

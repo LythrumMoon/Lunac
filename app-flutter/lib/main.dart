@@ -191,10 +191,8 @@ class LunacApp extends StatelessWidget {
         title: 'Lunac',
         debugShowCheckedModeBanner: false,
         theme: buildLunacTheme(),
-        // 自定义背景图（v1 `--bg-image`）：画在透明窗与玻璃面板之间。
-        builder: (context, child) =>
-            appearanceBackdrop(child ?? const SizedBox.shrink()),
-        // 首次启动不聚焦：先只显示圆形按钮 1.5s，再拉开搜索栏；结果抽屉等聚焦后展开。
+        // 背景图只画在搜索结果区 / AI 对话面板内部（见 `appearancePanelBackdrop`），
+        // 不再铺整窗：整窗透明区域会把图露在最底层。
         home: const SearchPage(
           focusOnMount: false,
           revealDelay: Duration(milliseconds: 1500),

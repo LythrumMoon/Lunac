@@ -53,8 +53,7 @@ class PluginWindowApp extends StatelessWidget {
       builder: (context, revision, child) => MaterialApp(
         debugShowCheckedModeBanner: false,
         theme: buildLunacTheme(),
-        builder: (context, child) =>
-            appearanceBackdrop(child ?? const SizedBox.shrink()),
+        // 背景图只由各面板自己画（AI 对话在 ChatPanel 内部）；插件窗外壳不铺。
         home: const PluginWindowPage(),
       ),
     );

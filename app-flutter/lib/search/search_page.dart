@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../platform/app_window.dart';
+import '../platform/appearance.dart';
 import '../platform/attachment_window.dart';
 import '../platform/clipboard.dart';
 import '../platform/drop.dart';
@@ -2444,7 +2445,15 @@ class _SearchPageState extends State<SearchPage> with TickerProviderStateMixin {
                   border: Border(top: BorderSide(color: LunacColors.divider)),
                 ),
                 clipBehavior: Clip.antiAlias,
-                child: _buildResults(),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // 自定义背景图严格铺在结果区内部（跟随面板圆角 / 裁剪），
+                    // 不再作为整窗最底层的一层。
+                    Positioned.fill(child: appearancePanelBackdrop()),
+                    _buildResults(),
+                  ],
+                ),
               ),
             )
           : const SizedBox(height: 0),

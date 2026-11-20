@@ -171,9 +171,9 @@ ThemeData buildLunacTheme() {
 /// 参数刻意用基础类型而不是 `AppearanceConfig`：`platform/appearance.dart` 已经
 /// 依赖本文件（色板），这里再反向引用会形成循环。
 ///
-/// 注意：主窗是透明窗（Scaffold 透明），所以这一层画在 `MaterialApp.builder` 里
-/// 正好补在「桌面」与「玻璃面板」之间；插件窗 / 附件抽屉是整窗外壳，图片是否可见
-/// 取决于它们自己的面板透明度。
+/// 2026-11-21（用户口径）：背景图**只铺在搜索结果区 / AI 对话面板内部**，不再铺整窗
+/// （整窗透明区域会把图露在最底层，看起来像单独一层）。面板用 [AppearanceBackdropImage]
+/// 在自身裁剪区内铺底，位置与圆角由面板容器决定。
 class AppearanceBackdrop extends StatelessWidget {
   const AppearanceBackdrop({
     super.key,
@@ -194,9 +194,49 @@ class AppearanceBackdrop extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (imagePath == null || imagePath!.isEmpty || opacity <= 0) {
+      return child;
+    }
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        AppearanceBackdropImage(
+          imagePath: imagePath,
+          blur: blur,
+          saturate: saturate,
+          opacity: opacity,
+          sheen: sheen,
+        ),
+        child,
+      ],
+    );
+  }
+}
+
+/// 只画背景图本身（无子组件）：面板把它放在内容下方即可。
+///
+/// 没有图片 / 透明度为 0 ⇒ [SizedBox.shrink]（调用方的 Stack 不需要额外判断）。
+class AppearanceBackdropImage extends StatelessWidget {
+  const AppearanceBackdropImage({
+    super.key,
+    required this.imagePath,
+    required this.blur,
+    required this.saturate,
+    required this.opacity,
+    required this.sheen,
+  });
+
+  final String? imagePath;
+  final double blur;
+  final double saturate;
+  final double opacity;
+  final double sheen;
+
+  @override
+  Widget build(BuildContext context) {
     final path = imagePath;
     if (path == null || path.isEmpty || opacity <= 0) {
-      return child;
+      return const SizedBox.shrink();
     }
     Widget image = Image.file(
       File(path),
@@ -242,7 +282,6 @@ class AppearanceBackdrop extends StatelessWidget {
               ),
             ),
           ),
-        child,
       ],
     );
   }

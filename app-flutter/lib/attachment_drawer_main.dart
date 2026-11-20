@@ -39,8 +39,7 @@ class AttachmentDrawerApp extends StatelessWidget {
       builder: (context, revision, child) => MaterialApp(
         debugShowCheckedModeBanner: false,
         theme: buildLunacTheme(),
-        builder: (context, child) =>
-            appearanceBackdrop(child ?? const SizedBox.shrink()),
+        // 背景图只属于搜索结果区 / AI 对话面板；附件抽屉不铺。
         home: const _DrawerPage(),
       ),
     );

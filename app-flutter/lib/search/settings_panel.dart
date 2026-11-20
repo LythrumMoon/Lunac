@@ -4090,7 +4090,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
   /// 「风格 → 背景」：背景图来源 + 「自定义」四个滑块（v1 `buildAppearancePane` 第一段）。
   ///
   /// 背景图保存的是**盘上绝对路径**（v1 存 `convertFileSrc` 后的 asset URL）；
-  /// 由 `MaterialApp.builder` 里的 [AppearanceBackdrop] 负责画。
+  /// 由搜索结果区 / AI 对话面板内部的 [AppearanceBackdropImage] 负责画（不再铺整窗）。
   List<Widget> _buildBackgroundRows() {
     final rows = <Widget>[];
     final path = _appearance.bgImage;

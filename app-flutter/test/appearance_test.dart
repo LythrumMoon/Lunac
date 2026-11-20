@@ -1,7 +1,8 @@
 // 平台薄层单测：外观 JSON → Dart 结构 + 主题 tokens → 运行时色板（不加载 DLL）。
 import 'dart:ui' show TextDirection;
 
-import 'package:flutter/material.dart' show Color, Directionality, Image, Text;
+import 'package:flutter/material.dart'
+    show Center, Color, Directionality, Image, SizedBox, Size, Text;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lunac/platform/appearance.dart';
 import 'package:lunac/theme.dart';
@@ -209,5 +210,34 @@ void main() {
     );
     expect(find.text('content'), findsOneWidget);
     expect(find.byType(Image), findsNothing);
+  });
+
+  testWidgets('panel backdrop fills exactly the panel box', (tester) async {
+    // 2026-11-21 用户口径：背景图只铺在结果区 / AI 对话面板内部，尺寸必须等于面板本身
+    // （不是整窗的一层）。这里锁住「父级给多大就画多大」。
+    await tester.pumpWidget(
+      const Directionality(
+        textDirection: TextDirection.ltr,
+        child: Center(
+          child: SizedBox(
+            width: 120,
+            height: 80,
+            child: AppearanceBackdropImage(
+              imagePath: 'missing-panel-bg.png',
+              blur: 0,
+              saturate: 100,
+              opacity: 0.8,
+              sheen: 0,
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(find.byType(AppearanceBackdropImage), findsOneWidget);
+    expect(find.byType(Image), findsOneWidget);
+    expect(
+      tester.getSize(find.byType(AppearanceBackdropImage)),
+      const Size(120, 80),
+    );
   });
 }

@@ -107,15 +107,16 @@ class ThemePackage {
     return ThemePackage(
       id: id,
       name: manifest['name'] is String ? manifest['name'] as String : id,
-      version: manifest['version'] is String ? manifest['version'] as String : '',
+      version: manifest['version'] is String
+          ? manifest['version'] as String
+          : '',
       author: manifest['author'] is String ? manifest['author'] as String : '',
       builtin: json['builtin'] == true,
       dir: json['dir'] is String ? json['dir'] as String : '',
       accent: tokens is Map && tokens['accent'] is String
           ? tokens['accent'] as String
           : '',
-      hasBackground:
-          resolved is Map && resolved['background'] is String,
+      hasBackground: resolved is Map && resolved['background'] is String,
       iconCount: icons is Map ? icons.length : 0,
       tokens: {
         if (tokens is Map)
@@ -260,6 +261,7 @@ class AppearanceConfig {
     String? overlayColor,
     double? overlayAlpha,
     String? bgImage,
+
     /// 显式清除背景图（`bgImage: null` 在 copyWith 里表示「保持原值」）。
     bool clearBgImage = false,
     double? bgBlur,
@@ -320,20 +322,35 @@ String? pickBackgroundImage() {
   return path == null || path.isEmpty ? null : path;
 }
 
-/// 背景图层（`MaterialApp.builder` 用）：按当前外观配置套 [AppearanceBackdrop]。
+/// 面板内背景（搜索结果区 / AI 对话）：按当前外观配置返回一层只画图片的组件。
 ///
-/// 没有背景图时 [AppearanceBackdrop] 内部直接返回 [child]（不加一层 Stack）。
-Widget appearanceBackdrop(Widget child) {
+/// 只铺在调用方自己的裁剪区内，位置 / 圆角严格跟随面板；没有背景图 =
+/// [SizedBox.shrink]。相同配置复用同一个 widget 实例，避免每次按键重建图片滤镜。
+Widget appearancePanelBackdrop() {
   final config = readAppearanceConfig();
-  return AppearanceBackdrop(
+  final key = [
+    config.bgImage ?? '',
+    config.bgBlur.toStringAsFixed(2),
+    config.bgSaturate.toStringAsFixed(2),
+    config.bgOpacity.toStringAsFixed(3),
+    config.sheen.toStringAsFixed(3),
+  ].join('|');
+  if (key == _panelBackdropKey && _panelBackdrop != null) {
+    return _panelBackdrop!;
+  }
+  _panelBackdropKey = key;
+  _panelBackdrop = AppearanceBackdropImage(
     imagePath: config.bgImage,
     blur: config.bgBlur,
     saturate: config.bgSaturate,
     opacity: config.bgOpacity,
     sheen: config.sheen,
-    child: child,
   );
+  return _panelBackdrop!;
 }
+
+String? _panelBackdropKey;
+Widget? _panelBackdrop;
 
 /// 读外观配置；桥接缺失 / 读坏 = 默认值。
 AppearanceConfig readAppearanceConfig() {
@@ -532,7 +549,8 @@ void applyAppearance(ThemePackage? theme, AppearanceConfig config) {
   final base = config.tintBase ? null : parseThemeColor(config.baseColor);
   final source = base ?? LunacColors.background;
   final background =
-      Color.lerp(const Color(0xFF16181B), source, config.surfaceAlpha) ?? source;
+      Color.lerp(const Color(0xFF16181B), source, config.surfaceAlpha) ??
+      source;
   LunacColors.apply(
     background: background,
     surface: _lift(background, 0.03),
@@ -552,7 +570,9 @@ void applyAppearance(ThemePackage? theme, AppearanceConfig config) {
     }
     final overlay = parseThemeColor(config.overlayColor);
     if (overlay != null) {
-      LunacColors.apply(divider: overlay.withValues(alpha: config.overlayAlpha));
+      LunacColors.apply(
+        divider: overlay.withValues(alpha: config.overlayAlpha),
+      );
     }
   }
   if (config.textLight != 0) {
