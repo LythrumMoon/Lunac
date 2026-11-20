@@ -21,7 +21,7 @@ import 'sha256.dart';
 
 /// 当前版本。发布前与 v1 同一套版本号（`app/src-tauri/Cargo.toml`）；M6 打包时改成
 /// 构建注入，不再手改这里。
-const String kAppVersion = '1.0.0';
+const String kAppVersion = '1.0.1';
 
 /// 版本清单的固定入口（GitHub「最新一个非预发布 Release」的资产）。
 const String kUpdateManifestUrl =

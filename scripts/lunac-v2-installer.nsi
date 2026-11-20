@@ -17,7 +17,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
-!define PRODUCT_VERSION "1.0.0"
+!define PRODUCT_VERSION "1.0.1"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
 InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac" "InstallLocation"
