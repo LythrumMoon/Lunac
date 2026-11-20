@@ -82,11 +82,8 @@ const ABI_VERSION: u32 = 2;
 
 /// 单次搜索最多返回的条数（界面最多显示 5 行，其余在列表里滚动）。
 const MAX_RESULTS: usize = 12;
-/// 应用 / 文件各占的上限，避免一边把结果全吃掉。
+/// 简要搜索里应用占的上限（空查询只取最近打开的 5 个，v1 `search_apps` 同口径）。
 const MAX_APP_HITS: usize = 6;
-const MAX_FILE_HITS: usize = 6;
-/// 有查询词时给两条兜底行（Web 搜索 / 提问 AI）预留的槽位，保证它们始终可达。
-const FALLBACK_ROWS: usize = 2;
 
 /// 一条内置命令 / 目录动作。
 struct Entry {
@@ -2899,106 +2896,119 @@ pub extern "C" fn lunac_pet_merge_suggestion(text: *const c_char) -> *mut c_char
     to_c_string(memory::merge_persona_suggestion_json(&root, &read_arg(text)))
 }
 
-/// 搜索：内置命令 / 目录 + 应用 + 文件（空查询只返回内置目录）。
+/// 按「最近在 Lunac 里打开的时间」降序；时间相同保持插入顺序（v1 recency 排序同口径）。
+fn sort_by_recency(items: &mut [(u64, usize, serde_json::Value)]) {
+    items.sort_by_key(|(stamp, order, _)| (std::cmp::Reverse(*stamp), *order));
+}
+
+/// 简要搜索（搜索栏下方的小结果区）：应用 + 内置插件，**不返回文件**。
+///
+/// 排序对齐 v1 `renderMixedResults`：应用、插件按「最近在 Lunac 里打开的时间」降序；
+/// 没打开过的保持原始顺序（应用按名称、插件按目录顺序）。文件只出现在详细搜索
+/// （双击搜索栏）里，简要搜索不再混入文件结果。
 ///
 /// 返回 JSON 数组字符串；**调用方负责** `lunac_free_string`。
 #[no_mangle]
 pub extern "C" fn lunac_search(query: *const c_char) -> *mut c_char {
     let query = read_arg(query);
     let trimmed = query.trim();
-    if !trimmed.is_empty() {
-        ensure_indexer();
-    }
+    ensure_indexer();
 
-    let mut items: Vec<serde_json::Value> = Vec::new();
+    let plugins = search_entries(&query);
+    let mut head: Vec<(u64, usize, serde_json::Value)> = Vec::new();
+    let mut push_head = |stamp: u64, value: serde_json::Value| {
+        let order = head.len();
+        head.push((stamp, order, value));
+    };
 
-    if trimmed.is_empty() {
-        // 空查询 = 启动页：只列内置动作（Web 搜索 / AI / 目录 / 退出）。
-        items.extend(search_entries(&query).into_iter().map(|e| {
-            json!({
-                "id": e.id,
-                "title": e.title,
-                "subtitle": e.subtitle,
-                "kind": e.kind,
-            })
-        }));
+    // 应用：空查询 = 最近打开的 5 个；有查询词 = 相关性前 6 个，再按打开时间稳定重排。
+    let app_limit = if trimmed.is_empty() { 5 } else { MAX_APP_HITS };
+    let mut apps = if trimmed.is_empty() {
+        lunac_indexer::app_indexer::apps()
     } else {
-        // 备忘录「标识」命中优先：用户输入的正是自己设过的检索标识（精确 / 前缀），
-        // 应当排在最前直接进入编辑（v1 的 `memo-tag-open` 结果项同语义）。
-        let memo_root = exe_dir().unwrap_or_else(|| PathBuf::from("."));
-        for (id, tag) in memo::search_tags(&memo_root, trimmed) {
-            items.push(json!({
-                "id": format!("memo:{id}"),
-                "title": format!("编辑备忘录 · {tag}"),
-                "subtitle": "备忘录",
-                "kind": "command",
-            }));
-        }
-
-        // 有查询词时的顺序与 v1 一致：应用 → 文件 → 内置命令 → Web 搜索兜底 → 提问 AI。
-        let app_limit =
-            MAX_APP_HITS.min(MAX_RESULTS.saturating_sub(items.len() + FALLBACK_ROWS));
-        let mut app_hits = lunac_indexer::app_indexer::search_apps(trimmed, app_limit);
-        // 同等匹配下「常用的排前面」（v1 recency）：稳定排序，不打乱相关性顺序。
-        app_hits.sort_by_key(|app| {
-            std::cmp::Reverse(recency::score(&format!("app:{}", app.path)))
-        });
-        for app in app_hits {
-            items.push(json!({
-                "id": format!("app:{}", app.path),
+        lunac_indexer::app_indexer::search_apps(trimmed, app_limit)
+    };
+    apps.sort_by_key(|app| std::cmp::Reverse(recency::score(&format!("app:{}", app.path))));
+    apps.truncate(app_limit);
+    for app in apps {
+        let key = format!("app:{}", app.path);
+        push_head(
+            recency::score(&key),
+            json!({
+                "id": key,
                 "title": app.name,
                 "subtitle": "应用程序",
                 "kind": "app",
-            }));
+            }),
+        );
+    }
+
+    // 插件 / 内置动作（空查询 = 全部；有查询词 = 标题 / 副标题 / 关键词 / 拼音命中）。
+    for entry in &plugins {
+        push_head(
+            recency::score(entry.id),
+            json!({
+                "id": entry.id,
+                "title": entry.title,
+                "subtitle": entry.subtitle,
+                "kind": entry.kind,
+            }),
+        );
+    }
+
+    // 兜底行单独一档：预留条数，保证永远可达（否则会被高 recency 的应用 / 插件挤掉）。
+    let mut tail: Vec<(u64, usize, serde_json::Value)> = Vec::new();
+    if !trimmed.is_empty() {
+        // 备忘录「标识」直达：精确 / 前缀命中，排最前直接进入编辑（v1 同语义）。
+        let memo_root = exe_dir().unwrap_or_else(|| PathBuf::from("."));
+        for (id, tag) in memo::search_tags(&memo_root, trimmed) {
+            push_head(
+                u64::MAX,
+                json!({
+                    "id": format!("memo:{id}"),
+                    "title": format!("编辑备忘录 · {tag}"),
+                    "subtitle": "备忘录",
+                    "kind": "command",
+                }),
+            );
         }
 
-        if items.len() < MAX_RESULTS.saturating_sub(FALLBACK_ROWS) {
-            let file_limit =
-                MAX_FILE_HITS.min(MAX_RESULTS.saturating_sub(items.len() + FALLBACK_ROWS));
-            for hit in lunac_indexer::file_indexer::search(trimmed, None, file_limit) {
-                items.push(json!({
-                    "id": format!("file:{}", hit.path),
-                    "title": hit.name,
-                    "subtitle": hit.path,
-                    "kind": "file",
-                }));
-            }
+        // 插件行已命中（输入 web / ai）时不再重复放兜底行（v1 `renderedPluginIds` 同款）。
+        if !plugins.iter().any(|entry| entry.id == "web-home") {
+            tail.push((
+                recency::score("web-home"),
+                0,
+                json!({
+                    "id": format!("web:{trimmed}"),
+                    "title": format!("用 {} 搜索 “{trimmed}”", settings::current_display()),
+                    "subtitle": format!("{}: {trimmed}", settings::current_display()),
+                    "kind": "web",
+                }),
+            ));
         }
-
-        if items.len() < MAX_RESULTS.saturating_sub(FALLBACK_ROWS) {
-            for entry in search_entries(&query) {
-                if items.len() >= MAX_RESULTS.saturating_sub(FALLBACK_ROWS) {
-                    break;
-                }
-                items.push(json!({
-                    "id": entry.id,
-                    "title": entry.title,
-                    "subtitle": entry.subtitle,
-                    "kind": entry.kind,
-                }));
-            }
-        }
-
-        // 兜底：与 v1 一样，最后两行的「用搜索引擎搜这个词」「用 AI 提问」永远可达。
-        if items.len() < MAX_RESULTS {
-            items.push(json!({
-                "id": format!("web:{trimmed}"),
-                "title": format!("用 {} 搜索 “{trimmed}”", settings::current_display()),
-                "subtitle": format!("{}: {trimmed}", settings::current_display()),
-                "kind": "web",
-            }));
-        }
-        // v1 的 `ai-fallback` 排在 `ws-fallback` 之后（同样未用过时按插入顺序稳定排序）。
-        if items.len() < MAX_RESULTS {
-            items.push(json!({
-                "id": format!("ai:{trimmed}"),
-                "title": format!("用 AI 提问：{trimmed}"),
-                "subtitle": "AI 助手问答",
-                "kind": "command",
-            }));
+        if !plugins.iter().any(|entry| entry.id == "ai") {
+            tail.push((
+                recency::score("ai"),
+                1,
+                json!({
+                    "id": format!("ai:{trimmed}"),
+                    "title": format!("用 AI 提问：{trimmed}"),
+                    "subtitle": "AI 助手问答",
+                    "kind": "command",
+                }),
+            ));
         }
     }
 
+    // 应用 + 插件按打开时间降序（时间相同保持插入顺序）；空查询不截断（目录要完整）。
+    sort_by_recency(&mut head);
+    if !trimmed.is_empty() {
+        head.truncate(MAX_RESULTS.saturating_sub(tail.len()));
+    }
+    sort_by_recency(&mut tail);
+    head.extend(tail);
+
+    let items: Vec<serde_json::Value> = head.into_iter().map(|(_, _, value)| value).collect();
     let text = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
     to_c_string(text)
 }
@@ -3133,6 +3143,21 @@ pub extern "C" fn lunac_system_catalog(query: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn lunac_run_action(id: *const c_char) -> i32 {
     let action = read_arg(id);
+
+    // 记录「最近在 Lunac 里打开」的时间：简要搜索结果按这个时间排序（v1 recency 同义）。
+    // `web:<查询词>` / `ai:<查询词>` 归到固定插件键，避免时间被拆散到每个查询词上。
+    if !action.is_empty() {
+        let key = if action.starts_with("ai:") {
+            "ai"
+        } else if action.starts_with("web:") {
+            "web-home"
+        } else if action.starts_with("memo:") {
+            "memo"
+        } else {
+            action.as_str()
+        };
+        recency::record(key);
+    }
 
     // 「用 AI 提问」兜底行（`ai:<查询词>`）：由 Dart 打开对话面板并预填查询词。
     if action.starts_with("ai:") {
@@ -4167,12 +4192,51 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         let arr = parsed.as_array().expect("array");
-        assert_eq!(arr.len(), CATALOG.len());
+        // 空查询 = 插件目录 + 最近打开的应用（索引未扫到应用时就是完整目录）。
+        assert!(arr.len() >= CATALOG.len(), "内置动作不能被应用挤掉");
         for item in arr {
             for key in ["id", "title", "subtitle", "kind"] {
                 assert!(item.get(key).and_then(|v| v.as_str()).is_some(), "missing {key}");
             }
+            assert_ne!(item["kind"], "file", "简要搜索不得返回文件");
         }
+    }
+
+    #[test]
+    fn brief_search_never_returns_files() {
+        // 文件只属于详细搜索；简要搜索列表里不应出现 kind=file（2026-11-21 用户口径）。
+        for query in ["a", "cargo", "test", "设置"] {
+            let input = CString::new(query).unwrap();
+            let raw = lunac_search(input.as_ptr());
+            assert!(!raw.is_null());
+            let text = unsafe { CStr::from_ptr(raw) }
+                .to_str()
+                .expect("json must be UTF-8")
+                .to_string();
+            lunac_free_string(raw);
+            let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+            let arr = parsed.as_array().expect("array");
+            assert!(
+                arr.iter().all(|item| item["kind"] != "file"),
+                "query={query} 不得返回文件：{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn recency_order_is_time_desc_with_stable_ties() {
+        let mut items = vec![
+            (10, 0, serde_json::json!({"id": "old"})),
+            (30, 1, serde_json::json!({"id": "new"})),
+            (30, 2, serde_json::json!({"id": "new-tie"})),
+            (0, 3, serde_json::json!({"id": "never"})),
+        ];
+        sort_by_recency(&mut items);
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|(_, _, value)| value["id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, ["new", "new-tie", "old", "never"]);
     }
 
     #[test]
