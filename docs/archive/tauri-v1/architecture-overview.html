@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lunac 整体架构（2026-10-18）</title>
+<style>
+  :root {
+    --bg: #f4f4f2;
+    --panel: #ffffff;
+    --ink: #1f2328;
+    --muted: #5c6370;
+    --line: #d8d8d4;
+    --accent: #3b6ea5;
+    --ok: #2f7a4f;
+    --warn: #9a6b1f;
+    --code: #f7f7f5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    padding: 40px 24px 28px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header .wrap, main { max-width: 1180px; margin: 0 auto; }
+  h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: .5px; }
+  header p { margin: 0; color: var(--muted); }
+  nav {
+    position: sticky; top: 0; z-index: 2;
+    background: rgba(244,244,242,.94);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  nav .wrap { max-width: 1180px; margin: 0 auto; padding: 10px 24px; display: flex; flex-wrap: wrap; gap: 14px; }
+  nav a { color: var(--muted); text-decoration: none; font-size: 13px; }
+  nav a:hover { color: var(--accent); }
+  main { padding: 12px 24px 64px; }
+  section { margin-top: 36px; }
+  h2 { font-size: 20px; margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  h3 { font-size: 15px; margin: 22px 0 8px; color: var(--muted); font-weight: 600; }
+  p { margin: 8px 0; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  pre {
+    margin: 12px 0 0;
+    padding: 16px 18px;
+    overflow: auto;
+    background: var(--code);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font: 12.5px/1.55 Consolas, "Cascadia Mono", "Courier New", monospace;
+    color: #24292f;
+    tab-size: 2;
+  }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; background: #fafaf8; }
+  code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: #ececea;
+    font: 12.5px Consolas, "Cascadia Mono", monospace;
+  }
+  .ok { color: var(--ok); font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  .muted { color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Lunac 整体架构</h1>
+    <p>2026-10-18 · Windows 桌面宿主 / 自研 Agent / 插件生态 / 资源库当前局势</p>
+  </div>
+</header>
+
+<nav>
+  <div class="wrap">
+    <a href="#overview">系统总览</a>
+    <a href="#frontend">前端分层</a>
+    <a href="#host">宿主模块</a>
+    <a href="#ai">AI 数据流</a>
+    <a href="#plugin">插件生态</a>
+    <a href="#data">数据目录</a>
+    <a href="#resource-hub">资源库</a>
+    <a href="#status">当前局势</a>
+  </div>
+</nav>
+
+<main>
+  <section id="overview">
+    <h2>1. 系统总览</h2>
+    <div class="card">
+      <p>Lunac 是“主控芯片”：一个 Tauri 宿主 <code>lunac.exe</code>、一个自研 Agent 后端 <code>agent.exe</code>，以及三类插件形态。</p>
+      <pre>┌───────────────────────── Windows（便携根 = exe 所在目录）─────────────────────────┐
+│                                                                                  │
+│  ┌────────────── WebView2 前端（Tauri 2）──────────────┐                          │
+│  │ main.html        主窗：搜索 / 结果区 / AI 对话 / 设置 │                          │
+│  │ plugin.html      插件悬浮窗（apiVersion 3）           │                          │
+│  │ screenshot.html  截图遮罩                            │                          │
+│  │ 常驻锚点：chat-sidebar / settings-section            │                          │
+│  └───────────────────────┬─────────────────────────────┘                          │
+│                          │ Tauri invoke / event                                  │
+│  ┌───────────────────────▼─────────────────────────────┐     ┌─────────────────┐   │
+│  │ lunac.exe  宿主 Rust 内核                            │     │ VS Code 扩展     │   │
+│  │                                                      │     │ HTTP 127.0.0.1  │   │
+│  │ 窗口/热键/托盘  插件市场/运行时  存储/日志            │◀────│ :8789 /agent/*  │   │
+│  │ 网络/媒体/QuickJS  cron  OCR/TTS/音乐/代理/调音…     │     └─────────────────┘   │
+│  └──────┬───────────────────┬───────────────────┬──────┘                          │
+│         │                   │                   │                                 │
+│         │ stdio stream-json │ 直接进程管理       │ 自定义协议 / 宿主代请求          │
+│         ▼                   ▼                   ▼                                 │
+│  ┌──────────────┐   ┌────────────────┐   ┌──────────────────────────────┐         │
+│  │ agent.exe    │   │ 插件 sidecar    │   │ 外部世界                      │         │
+│  │ core-agent   │   │ 插件自带 exe    │   │ 模型 API / 插件市场 / 来源站点 │         │
+│  │ 对话+工具循环 │   │ （信任卡 + Job）│   │ 本机应用 / OCR / 音频设备      │         │
+│  └──────┬───────┘   └────────────────┘   └──────────────────────────────┘         │
+│         │ stdio MCP                                                               │
+│         ▼                                                                         │
+│  ┌──────────────────────────────┐                                                 │
+│  │ lunac.exe --mcp-server       │  tools/*.json → shell / http / builtin           │
+│  │ + lunac/* 自定义方法          │  记忆 / 会话 / 宠物 / 资源库工具                 │
+│  └──────────────────────────────┘                                                 │
+└──────────────────────────────────────────────────────────────────────────────────┘</pre>
+      <p class="muted">三条信道：WebView 插件 → <code>__lunac_host</code> / postMessage；插件 sidecar → stdout NDJSON 或宿主代请求；Agent → stdio stream-json + MCP。</p>
+    </div>
+  </section>
+
+  <section id="frontend">
+    <h2>2. 前端分层</h2>
+    <div class="card">
+      <pre>app/src/
+├─ main.ts                 主窗总控：搜索、结果区、AI 对话、审批、设置
+├─ plugin-window.ts        插件悬浮窗入口（独立 Vite 构建）
+├─ screenshot-overlay.ts   截图遮罩
+│
+├─ plugins/
+│  ├─ registry.ts          插件注册表（内置 + 磁盘统一视图）
+│  ├─ host.ts              __lunac_host 桥安装与类型
+│  ├─ sidecar.ts           sidecar 前端桥
+│  ├─ market.ts            插件市场 / 安装 / 索引
+│  ├─ anchor-slots.ts      常驻锚点挂载
+│  ├─ builtin/             编译进主程序的内置插件
+│  ├─ channel/             iframe 信道协议 + 宿主端 + 客户端
+│  └─ attach.ts            内置面板监听复用
+│
+├─ i18n.ts                 多语言
+├─ usage-cost.ts           用量 / 成本仪表
+├─ file-chips.ts           附件
+└─ styles.css              主题变量与界面样式</pre>
+    </div>
+  </section>
+
+  <section id="host">
+    <h2>3. 宿主 Rust 模块地图</h2>
+    <div class="card">
+      <pre>app/src-tauri/src/
+├─ 壳与窗口
+│  ├─ main.rs               模块装配 / 命令注册 / 生命周期
+│  ├─ plugin_window.rs      插件悬浮窗
+│  ├─ screenshot.rs         截图遮罩
+│  ├─ hotkey.rs             全局热键
+│  ├─ mouse_hook.rs         鼠标钩子（桌宠菜单）
+│  ├─ single_instance.rs    单实例
+│  ├─ auto_start.rs         开机自启
+│  ├─ updater.rs            应用内更新
+│  └─ appearance.rs         外观 / 主题
+│
+├─ 搜索与索引
+│  ├─ app_indexer.rs        开始菜单应用
+│  ├─ file_indexer.rs       文件索引
+│  ├─ system_catalog.rs     系统设置目录
+│  └─ icon_extractor.rs     图标提取
+│
+├─ AI 宿主侧
+│  ├─ commands.rs           Tauri 命令总入口（大量 async 薄壳）
+│  ├─ cli_bridge.rs         agent.exe 进程 / stdin / stdout 广播
+│  ├─ agent_server.rs       VS Code HTTP + SSE 桥
+│  ├─ mcp_server.rs         lunac.exe --mcp-server
+│  ├─ cron.rs               按需唤醒（睡到最近的 nextRunAt，≤60s）+ agent.exe --print 单发
+│  ├─ wake.rs               唤醒判据 + 唤醒源登记（timer / queue_file / ide_request）
+│  ├─ chat_db.rs            会话数据库
+│  ├─ storage.rs            便携数据根与配置读写
+│  ├─ snapshots.rs          任务快照
+│  └─ log.rs                日志
+│
+├─ 插件运行时
+│  ├─ plugin_market.rs      扫描 / 清单校验 / 依赖安装 / 卸载
+│  ├─ plugin_scheme.rs      lunac-plugin://（ui / assets）
+│  ├─ plugin_sidecar.rs     sidecar 进程 / 信任卡 / 通道
+│  ├─ plugin_toolchain.rs   dev 工具链授权 / 安装 / 构建
+│  ├─ plugin_net.rs         net.fetch（SSRF / 私网拒绝 / 体积上限）
+│  ├─ plugin_media.rs       lunac-media 媒体代理（Range / Referer / UA）
+│  ├─ plugin_kv.rs          storage.plugin（按 id 隔离 / 配额 / 卸载即清）
+│  └─ plugin_engine.rs      engine.eval（QuickJS 一次性运行时）
+│
+├─ 系统能力
+│  ├─ system_proxy.rs       Windows 代理设置
+│  ├─ mihomo.rs             代理配置 + 自研内核生命周期（mihomo 路径已删）
+│  ├─ native_proxy/         自研代理引擎（SS / SS-2022（含 SIP003 插件）/ Trojan / VLESS / VMess / AnyTLS / Hysteria2；TCP + UDP，含 salamander / gecko 混淆）
+│  ├─ proxy_server.rs       本机模型 / API 代理
+│  ├─ windows_ocr.rs        WinRT OCR
+│  ├─ paddle_ocr.rs         离线 OCR
+│  ├─ tts.rs / tts_zipvoice.rs  语音合成
+│  ├─ music.rs / media_lib.rs / player.rs / live_audio.rs
+│  ├─ tuning_probe.rs       WASAPI 实时测量
+│  ├─ convert.rs            文件转换
+│  └─ translate.rs          翻译
+│
+└─ 资源库
+   └─ resource_hub.rs       来源安装目录（AI 与插件共用）</pre>
+    </div>
+  </section>
+
+  <section id="ai">
+    <h2>4. AI 数据流</h2>
+    <div class="card">
+      <pre>用户输入
+   │
+   ▼
+main.ts ── invoke(send_message) ──▶ commands.rs ──▶ cli_bridge.rs
+                                                       │ NDJSON 写入 stdin
+                                                       ▼
+                                                  agent.exe / core-agent
+                                                  ├─ 上下文与压缩
+                                                  ├─ 模型请求（流式）
+                                                  ├─ 工具循环
+                                                  ├─ 成本闸 / 轮次预算
+                                                  └─ 审批控制
+                                                       │
+              ┌────────────────────────────────────────┼─────────────────────────┐
+              ▼                    ▼                   ▼                         ▼
+        内置工具              MCP 工具桥            技能 / 记忆              定时任务
+   Read/Write/Cmd/...   lunac.exe --mcp-server   skills/*/SKILL.md      cron.rs 单发
+                        + 远端 MCP 服务器          MEMORY.md
+              │                    │
+              └────────────┬───────┘
+                           ▼
+                stdout NDJSON（assistant / tool_result / result）
+                           │
+                           ▼
+                 cli_bridge 广播 → Tauri event → main.ts 渲染
+                           │
+                           └─ can_use_tool ⇄ 审批卡 ⇄ control_response</pre>
+      <p>VS Code 走另一条入口：<code>agent_server.rs</code> 在 <code>127.0.0.1:8789</code> 提供 start / message / stream，复用同一个 <code>agent.exe</code>。</p>
+    </div>
+  </section>
+
+  <section id="plugin">
+    <h2>5. 插件生态与能力门</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>插件包结构</h3>
+        <pre>Modules/&lt;id&gt;/
+├─ lunac-plugin.json
+│    id / version / permissions
+│    provides / dependencies
+│    window / sidecar / render / dev
+├─ index.js              DOM 引擎入口
+├─ ui/index.html         iframe 引擎入口（可选）
+├─ server/*.exe          sidecar（可选）
+└─ .toolchain/           用户授权的工具链（可选）</pre>
+      </div>
+      <div class="card">
+        <h3>宿主桥（apiVersion 3）</h3>
+        <pre>__lunac_host
+├─ t / apiVersion
+├─ sidecar
+├─ net.request      ← permissions: ["net.fetch"]
+├─ storage          ← permissions: ["storage.plugin"]
+├─ media.proxy      ← permissions: ["media.proxy"]
+└─ engine.eval      ← permissions: ["engine.eval"]</pre>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h3>能力与信任边界</h3>
+      <table>
+        <thead><tr><th>能力</th><th>门 / 边界</th></tr></thead>
+        <tbody>
+          <tr><td><code>process.spawn</code></td><td>信任卡，默认拒绝；sidecar 可设内存 / 进程数上限</td></tr>
+          <tr><td><code>net.fetch</code></td><td>能力门 + 只允许 http(s) + 拒绝本机 / 私网 + 超时 / 体积上限</td></tr>
+          <tr><td><code>media.proxy</code></td><td>能力门 + 只代理公网 + 转发 Range + 重定向逐跳复检</td></tr>
+          <tr><td><code>storage.plugin</code></td><td>能力门 + 按 id 隔离 + 配额 + 卸载即清</td></tr>
+          <tr><td><code>engine.eval</code></td><td>能力门 + QuickJS 无宿主绑定 + 超时 / 内存上限；<strong>不是 OS 沙箱</strong></td></tr>
+          <tr><td><code>dev</code> 工具链</td><td>只有用户能授权；按清单指纹失效；永不自动安装 / 构建</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">iframe 是 DOM / CSS / 脚本作用域边界，不是安全沙箱；插件本质上是本机可执行代码。</p>
+    </div>
+  </section>
+
+  <section id="data">
+    <h2>6. 数据目录</h2>
+    <div class="card">
+      <pre>&lt;exe 根&gt;\
+├─ lunac.exe
+├─ agent.exe
+├─ Modules\&lt;id&gt;\                 插件包
+├─ ModuleData\
+│  ├─ history\                   会话历史
+│  ├─ usage\                     用量账本
+│  ├─ memo\                      备忘录
+│  ├─ plans\                     计划文档
+│  ├─ tasks\                     定时任务
+│  ├─ resource-hub\sources\      资源库来源（AI 与插件共用）
+│  └─ plugin-data\&lt;id&gt;\kv.json   插件 KV
+├─ config\
+│  ├─ ai.json / mcp.json / hooks.json / persona.md / pricing.json
+│  ├─ plugin-trusted.json        sidecar 信任记录
+│  └─ plugin-toolchain.json      开发工具链授权账本
+├─ skills\                       技能
+├─ tools\                        用户自定义 MCP 工具
+├─ temp\logs\                    日志
+└─ paddle-ocr\                   离线 OCR</pre>
+    </div>
+  </section>
+
+  <section id="resource-hub">
+    <h2>7. 资源库当前局势</h2>
+    <div class="card">
+      <pre>                 ┌──────────────── 共享契约 ────────────────┐
+                 │ packages/rh-source-sdk                  │
+                 │ RSP v1 / Host API v3 / Kazumi 转换       │
+                 │ packages/rh-reader                      │
+                 └───────────────┬─────────────────────────┘
+                                 │
+          ┌──────────────────────┴──────────────────────┐
+          ▼                                             ▼
+┌───────────────────────┐                    ┌────────────────────────┐
+│ Windows：Lunac 插件    │                    │ APK / IPA：独立应用     │
+│ apps/lunac-plugin     │                    │ 各自内嵌 JS 引擎        │
+│ 依赖 lunac.exe 宿主    │                    │ 不依赖 Lunac 宿主       │
+└──────────┬────────────┘                    └────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Track A（宿主 / AI 侧）                                       │
+│ ✅ A1 net.fetch       ✅ A2 media.proxy                       │
+│ ✅ A3 storage.plugin  ✅ A4 engine.eval                       │
+│ ✅ A5 AI 工具：Search / Validate / Diagnose / Install          │
+│ ⬜ A7 对话入口                                                │
+├──────────────────────────────────────────────────────────────┤
+│ Track B（插件侧）                                             │
+│ ✅ 声明式来源 / 搜索 / 详情 / 章节 / 漫画 / 小说阅读 / 进度落盘 │
+│ ⬜ 跨章加载   ⬜ 缓存 / 限速 / AbortSignal                     │
+│ ⬜ 视频播放   ⬜ Venera / uzVideo 适配                          │
+└──────────────────────────────────────────────────────────────┘</pre>
+    </div>
+  </section>
+
+  <section id="status">
+    <h2>8. 当前局势</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>领域</th><th>状态</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>外壳 / 插件框架</td><td class="ok">E.0–E.6 完成</td><td>剩余 iframe、常驻锚点、工具链构建的真机验证</td></tr>
+          <tr><td>宿主 API v3</td><td class="ok">四项全部落地</td><td><code>net.fetch</code> / <code>media.proxy</code> / <code>storage.plugin</code> / <code>engine.eval</code></td></tr>
+          <tr><td>资源库 Windows 插件</td><td class="warn">链路已通</td><td>声明式来源、搜索、阅读、进度可用；缓存、视频、JS 源适配未接</td></tr>
+          <tr><td>资源库移动端</td><td class="warn">独立应用</td><td>只共享 SDK 契约，不共享 Lunac 宿主实现</td></tr>
+          <tr><td>发布</td><td class="warn">待收尾</td><td>插件版本号尚未逐个提升</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <p>关键落点：app/src-tauri/src/main.rs · core-agent/src/main.rs · app/src-tauri/src/plugin_market.rs · app/src-tauri/src/plugin_sidecar.rs · resource-hub/README.md</p>
+    <p>本文为架构速览，不替代 docs/ 下的规范与设计文档。</p>
+  </footer>
+</main>
+</body>
+</html>

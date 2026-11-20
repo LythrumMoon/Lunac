@@ -16,6 +16,22 @@
 | [`ui-style.md`](./ui-style.md) | 界面与前端风格：色板 / 变量 / **所有按钮与态** / 圆角间距 / 图标 / 弹层 / 滚动条 / 选中禁用 hover / 主题明暗 / **自定义颜色四类**（§界面 11） | 写 / 改界面样式前 |
 
 > 另有 `docs/parse-minidump.ps1`（**脚本不是文档，未动**）。
+>
+> **v2（Flutter）迁移**：
+> - [`flutter-migration.md`](./flutter-migration.md) —— 2026-11-03 立项的第二代前端迁移文档：
+>   不变的部分（`core-agent` / `native_proxy` / `stream-json` 协议）、能力映射表、里程碑、
+>   Linux 环境准备、备份与「暂停 GitHub 维护」纪律。
+> - v1（Tauri + WebView2）的现行文档已冻结快照到
+>   [`archive/tauri-v1/`](./archive/tauri-v1/README.md)（**只读**，不再更新）。
+>
+> **设计记录（非规范）**：
+> - [`sandbox-research.md`](./sandbox-research.md) —— 2026-11-01 **沙箱调研与「白箱边界」方案**（§待办 3-2 的结论）：Windows 候选隔离机制对比（Job Object / Low IL / 受限令牌 / AppContainer / MXC / WDAC / Windows Sandbox）、MXC 的学习模式与 `denials.json` 证据、Lunac 自己的五件套（决策账本 / 原因码 / 预演 / 导出 / 撤销）与 W0–W3 分阶段。**结论：不做黑箱沙箱承诺，先做白箱边界。**
+> - [`acceptance-map.md`](./acceptance-map.md) —— 2026-10-31 **实际验收账本**（目前只覆盖自研代理引擎）：「能力 → 实现文件 → 自动化用例（具体测试名）→ 真机条目（`testing.md` §测试 27 第几条）→ 状态」。只登记有证据的项，🟡 不许写成 ✅。**结论看它，怎么跑看 `testing.md`，待办仍看 `todo.md`**。
+> - [`acceptance-roadmap.md`](./acceptance-roadmap.md) —— 2026-10-22「已实现、只差真机验收」条目的**执行路线图**：7 个批次、每批的判据 / 取证 / 注销动作。**怎么跑看它，登记仍看 `todo.md`**。
+> - [`theme-palette-icon-design.md`](./theme-palette-icon-design.md) —— 2026-10-21 主题配色（方案 A 石墨·香槟银为默认，方案 B 雾银·冷石墨留档）+ 插件图标设计（默认插件包 + 星光、阅读插件书本）。
+> - [`theme-impression-design.md`](./theme-impression-design.md) —— 2026-10-18 默认主题「中性石墨 · 印象化」的人物描述、页面配色取向、icon / 动效转译与落地清单。可复用条款已并入 `ui-style.md`，本文只作取证。
+> - [`resource-hub-design.md`](./resource-hub-design.md) —— 2026-10-18 资源整合平台（漫画 / 小说 / 番剧 / 电视剧）设计：**Windows 只做 Lunac 拓展插件，iOS / Android 做共享内核的独立应用**；统一来源协议 RSP、声明式来源与三个适配器；iOS **暂不考虑 App Store**，只走 **LiveContainer + SideStore 自签名**（含 Windows 工作流与国内自建 Anisette 服务器方案）；Android 暂不走 Google Play；MIT、个人项目、非商用、无广告；另含 **AI 侧 / 插件侧并行开发计划**。Windows 插件、规则仓库与移动端共享内核已落地（见 §13.5）；移动端 Tauri 外壳 **2026-10-22 暂时移出待办**。公开仓库：[`lunac-rules`](https://github.com/LythrumMoon/lunac-rules) / [`lunac-reader-mobile`](https://github.com/LythrumMoon/lunac-reader-mobile)。
+> - [`architecture-overview.html`](./architecture-overview.html) —— 2026-10-18 单页架构速览（进程拓扑 / 前端分层 / 宿主模块 / AI 数据流 / 插件能力门 / 数据目录 / 资源库局势）。可直接用浏览器打开；**速览，不替代规范**。
 
 ## 二、历史归档（`docs/archive/`，旧文件保留不删）
 
@@ -30,6 +46,8 @@
 | `agent-implementation.md` | agent 实现现状与本地扩展格式 |
 | `project-layout.md` | 项目目录地图 |
 | `agent-feature-backlog-history.md` | **本次新建**：backlog 中已完成 / 已闭环条目的压缩归档 |
+| `todo-2026-11-20-full.md` | **2026-11-20 新建**：`todo.md` 重整前的全文快照（793 KB）。新待办只写 `docs/todo.md`；旧编号、实测数字、已完成项在这里按原样检索 |
+| `tauri-v1/` | **2026-11-03 新建**：v1（Tauri + WebView2）现行文档的**冻结快照**（只读），用于迁移 Flutter 时对照规则与契约 |
 
 ## 三、新旧映射表（`ai-spec.md` 章节级）
 

@@ -29,8 +29,27 @@ use serde_json::{json, Value};
 /// 单条描述上限：列表只用于「发现」，正文由 Skill 工具按需加载，
 /// 描述写太长只会白占每轮前缀（旧 CLI 同样截到 250 字符）。
 const MAX_DESC_CHARS: usize = 250;
-/// 技能清单在系统提示词里的总字符预算，超出部分只报数量
-const LISTING_BUDGET_CHARS: usize = 8_000;
+/// 技能清单在系统提示词里的总字符预算，超出部分只报数量。
+pub const LISTING_BUDGET_CHARS: usize = 8_000;
+
+/// 清单统计（§待办 3-28.11）：给「超预算告警」用 —— 日志与界面都要看到「有几个没列出来」。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListingStats {
+    pub total: usize,
+    pub listed: usize,
+}
+
+impl ListingStats {
+    /// 超出 [`LISTING_BUDGET_CHARS`] 而没进清单的技能数。
+    pub fn omitted(&self) -> usize {
+        self.total.saturating_sub(self.listed)
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.omitted() > 0
+    }
+}
+
 /// 一个技能最多登记多少个**自带资源文件**（2026-09-20 A5 剩余项）。
 /// 边界刻意**保守**：漏掉一个深层文件只是少一条提示，把 `node_modules` 里几千条路径
 /// 灌进上下文则是灾难。到顶时如实上报「还有没列出的」，**不静默截断**。
@@ -332,10 +351,14 @@ pub fn tool_def() -> Value {
     })
 }
 
-/// 拼进系统提示词的技能清单。空表返回空串（调用方保持原提示词）。
-pub fn listing(skills: &[Skill]) -> String {
+/// 拼进系统提示词的技能清单（附带统计）。空表返回空串（调用方保持原提示词）。
+pub fn listing_with_stats(skills: &[Skill]) -> (String, ListingStats) {
+    let stats = ListingStats {
+        total: skills.len(),
+        listed: 0,
+    };
     if skills.is_empty() {
-        return String::new();
+        return (String::new(), stats);
     }
     let mut out = String::from(
         "\n\nAvailable skills — when a request matches one, call the Skill tool with its key. \
@@ -369,7 +392,13 @@ pub fn listing(skills: &[Skill]) -> String {
             skills.len() - listed
         ));
     }
-    out
+    (
+        out,
+        ListingStats {
+            total: skills.len(),
+            listed,
+        },
+    )
 }
 
 /// 执行 **inline** `Skill` 调用：返回该技能正文（`$ARGUMENTS` 已替换）。
@@ -406,6 +435,64 @@ pub fn run(skills: &[Skill], input: &Value) -> Result<String, String> {
     ))
 }
 
+/// 技能级记忆的注入预算（字符，§待办 3-28.10 ①）。
+///
+/// 只花**该技能 fork 子代理**的上下文（4k ≈ 一屏笔记），主对话前缀一个字都不动。
+/// 超预算按字截断并标 `…(truncated)` —— 与预加载技能同一条纪律：不静默丢。
+pub const SKILL_MEMORY_BUDGET_CHARS: usize = 4_000;
+
+/// 宿主开关：`LUNAC_SKILL_MEMORY=on` 才启用技能级记忆（未设置 / 其它值 = 关）。
+///
+/// 关着时**完全不碰盘**，`Remember` 也照旧写本轮作用域那一份 —— 行为与改造前逐字节一致。
+pub fn skill_memory_enabled() -> bool {
+    matches!(
+        std::env::var("LUNAC_SKILL_MEMORY").ok().as_deref().map(str::trim),
+        Some("on") | Some("1") | Some("true")
+    )
+}
+
+/// 技能 key 归一（与宿主 `memory::parse_skill_key` 同口径）：小写、1–64 位、
+/// 只允许 `a-z0-9-_`、不以分隔符开头。**不合法 ⇒ `None`**（拼路径前必须过这一关）。
+fn normalize_skill_key(raw: &str) -> Option<String> {
+    let key = raw.trim().to_ascii_lowercase();
+    let valid = !key.is_empty()
+        && key.chars().count() <= 64
+        && !key.starts_with('-')
+        && !key.starts_with('_')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    valid.then_some(key)
+}
+
+/// 纯函数：读 `<memory_dir>/skills/<key>/MEMORY.md`（默认页），超预算截断。
+///
+/// 只读默认页：技能级命名空间**不支持分页**（宿主的 `write_entry` 会拒绝 `page`），
+/// 所以这里不必重复宿主的「默认页 + pages/ 拼接」那一套规则。
+pub fn read_skill_memory_at(memory_dir: &std::path::Path, raw_key: &str) -> Option<String> {
+    let key = normalize_skill_key(raw_key)?;
+    let path = memory_dir.join("skills").join(key).join("MEMORY.md");
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= SKILL_MEMORY_BUDGET_CHARS {
+            out.push_str("\n…(truncated)\n");
+            break;
+        }
+        out.push(ch);
+    }
+    Some(out)
+}
+
+/// 生产入口：目录来自宿主注入的 `LUNAC_MEMORY_DIR`（= `<exe 根>\ModuleData\memory`）。
+pub fn skill_memory_text(raw_key: &str) -> Option<String> {
+    let dir = std::env::var("LUNAC_MEMORY_DIR").ok()?;
+    read_skill_memory_at(std::path::Path::new(dir.trim()), raw_key)
+}
+
 /// 测试夹具：造一条最小 `Skill`。`content` 走**真实的 frontmatter 解析路径**
 /// （与 `load()` 同源），免得夹具与生产解析各说各话。
 ///
@@ -433,6 +520,43 @@ mod tests {
     /// 造一条技能（`load()` 的解析路径 + 目录名当 key，只是省掉磁盘）
     fn skill(key: &str, content: &str) -> Skill {
         test_skill(key, content)
+    }
+
+    /// 只要清单文本、不关心统计时用（统计本身另有断言）。
+    fn listing(skills: &[Skill]) -> String {
+        listing_with_stats(skills).0
+    }
+
+    /// §待办 3-28.10 ①：技能级记忆只读默认页、按预算截断、非法 key 直接拒绝。
+    #[test]
+    fn skill_memory_reads_only_the_default_page_and_respects_the_budget() {
+        let dir = temp_skill_dir("skill-memory");
+        let memory = dir.join("memory");
+        put(&memory, "skills/demo/MEMORY.md", "- [2026-11-19 · skill:demo] 先跑测试\n");
+        put(&memory, "skills/other/MEMORY.md", "- 别的技能的记忆\n");
+        // 分页不注入（宿主也拒绝写分页）：即便盘上有，也不会出现在读取结果里。
+        put(&memory, "skills/demo/pages/notes.md", "- 分页内容\n");
+
+        let text = read_skill_memory_at(&memory, "DEMO").expect("大小写归一后能读到");
+        assert!(text.contains("先跑测试"));
+        assert!(!text.contains("别的技能的记忆"), "按 key 隔离");
+        assert!(!text.contains("分页内容"), "只读默认页");
+
+        // 不存在 / 空白 / 非法 key ⇒ None（不报错、不拼出越界路径）。
+        assert!(read_skill_memory_at(&memory, "missing").is_none());
+        assert!(read_skill_memory_at(&memory, "a/b").is_none());
+        assert!(read_skill_memory_at(&memory, "..").is_none());
+        put(&memory, "skills/blank/MEMORY.md", "   \n");
+        assert!(read_skill_memory_at(&memory, "blank").is_none());
+
+        // 预算：超长按字截断并留标记。
+        let huge = "x".repeat(SKILL_MEMORY_BUDGET_CHARS + 50);
+        put(&memory, "skills/huge/MEMORY.md", &huge);
+        let clipped = read_skill_memory_at(&memory, "huge").unwrap();
+        assert!(clipped.ends_with("…(truncated)\n"));
+        assert!(clipped.chars().count() <= SKILL_MEMORY_BUDGET_CHARS + 20);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真实临时技能目录 —— `collect_resources()` 是唯一走磁盘的部分，没法用内存糊过去。
@@ -558,6 +682,32 @@ mod tests {
         assert!(out.contains("- forked: 干活的 [subagent]"), "{out}");
         assert!(out.contains("- plain: 读的\n"), "{out}");
         assert!(listing(&[]).is_empty(), "空表回空串（调用方保持原提示词）");
+    }
+
+    /// §待办 3-28.11：超预算时要**回收统计**（总数 / 已列 / 未列），没超时 `omitted == 0`
+    /// —— 日志与 `system/init` 都靠这份数字，不能只靠字符串里那句「还有 N 个」去反推。
+    #[test]
+    fn listing_reports_how_many_were_dropped_by_the_budget() {
+        let long = "长".repeat(MAX_DESC_CHARS);
+        let skills: Vec<Skill> = (0..60)
+            .map(|i| {
+                skill(
+                    &format!("s{i:02}"),
+                    &format!("---\ndescription: {long}\n---\nX"),
+                )
+            })
+            .collect();
+        let (out, stats) = listing_with_stats(&skills);
+        assert_eq!(stats.total, 60);
+        assert!(stats.listed > 0 && stats.listed < 60, "{stats:?}");
+        assert_eq!(stats.omitted(), 60 - stats.listed);
+        assert!(stats.truncated());
+        assert!(out.contains("installed but not listed"), "{out}");
+
+        let (_, small) = listing_with_stats(&skills[..2]);
+        assert_eq!(small.total, 2);
+        assert_eq!(small.omitted(), 0);
+        assert!(!small.truncated());
     }
 
     /// 自带资源：只收真文件、**相对路径 + `/` 分隔 + 已排序**，`SKILL.md` 自己不算资源；

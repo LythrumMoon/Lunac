@@ -26,10 +26,11 @@
 // **冷启动预热（2026-10-15）**：真机暴露 —— `llama-server` 冷启后**第一次**判定耗时
 // **>1500ms**（撞 [`LOCAL_DECIDE_TIMEOUT`]）⇒ 首次预筛静默 fail-open（行为安全，但等于没生效）；
 // 热机后正常。故 [`warmup_with`] 发**一次**极短请求把模型加载 / 首次 KV / 连接吃进缓存，
-// **丢弃结果、不进账本、不改预筛语义**。**超时值 1500ms 不动**；只在开关开 + 端点已配时预热
+// **丢弃结果、不进账本、不改预筛语义**。**预热只覆盖判定这一份 system**；判定上限 2026-10-24
+// 放宽到 3000ms（冷 prefill 实测 ~1.8s，见该常量注释）；只在开关开 + 端点已配时预热
 // （[`warmup_config`]），默认关 ⇒ **零预热、零请求**。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -193,7 +194,14 @@ pub fn obviously_not_reviewable(input: &str) -> bool {
 ///
 /// 为什么放在这里而不是各后端各写一份：**超时口径必须一致**，否则「多慢算坏」会各说各话。
 /// 形态 B 的 `llama-server` 后端用它包住 HTTP 调用（见 [`decide`]），超时即 `Err`（⇒ fail-open）。
-pub const LOCAL_DECIDE_TIMEOUT: Duration = Duration::from_millis(1500);
+///
+/// ⚠️ **2026-10-24 由 1500ms 放宽到 3000ms（实测依据，不是拍脑袋）**：CPU 上 4B Q4 的
+/// **冷 prefill** 实测 **~103 tok/s**（b11524 与 b11803 一致：187 token 的 system 约 **1.81s**），
+/// 而 `WARMUP_TIMEOUT` 只预热**判定**用的那份 system —— 记忆抽取 / 检索改写 / 安全预筛 /
+/// 能力路由各自的 system 都是**首次冷 prefill**，在 1500ms 下必然 fail-open（安全，但等于没生效，
+/// 真机 `cargo test --ignored` 复现：decide 通过、其余三类 `fail-open-backend-error`）。
+/// 放宽只影响「后端多慢才判坏」；热机后同一 system 命中前缀缓存，实测仍在 **~150ms** 量级。
+pub const LOCAL_DECIDE_TIMEOUT: Duration = Duration::from_millis(3_000);
 
 /// 运行 `f` 并给它一个截止时间。超时 / 耗时超限 ⇒ `Err`（由 [`decide`] 折成放行）。
 ///
@@ -210,53 +218,99 @@ pub fn within_deadline<T>(limit: Duration, f: impl FnOnce() -> Result<T, String>
     Ok(out)
 }
 
-// ── 本地模型通道：进程级非阻塞互斥（2026-10-16）───────────────────────────────
+// ── 本地模型通道：进程级非阻塞闸（2026-10-16；2026-10-24 改为「按槽计数」）──────────────
 //
-// **要解决什么**：`llama-server` 以 `-np 1`（**单并发槽**）运行。「同一个回合」里预筛（判定，
-// 上限 1500ms）与记忆候选抽取（上限 5000ms）会**几乎同时**发往同一个本地端点 ⇒ **互相排队** ⇒
+// **要解决什么**：`llama-server` 默认 `-np 1`（**单并发槽**）。「同一个回合」里预筛（判定，
+// 上限 3000ms）与记忆候选抽取（上限 5000ms）会**几乎同时**发往同一个本地端点 ⇒ **互相排队** ⇒
 // 两条都等到各自超时 ⇒ 双双 fail-open。真机日志铁证：抽取 `latency 5009ms`、判定 `1515ms`
-// 都在各自上限处被掐断，而**单独**一次预筛只需 1133ms。冷启动预热也会和判定抢那一个槽。
+// 都在各自上限处被掐断，而**单独**一次预筛只需 1133ms。冷启动预热也会和判定抢那一个槽；
+// `MemorySearch` 的查询改写与预热 / 判定抢槽（实测 1/3 次 `busy-skip`）也是同一根因。
 //
-// **口径**：判定 / 抽取 / 预热都是「**摊销的尽力而为**」调用 —— **跳过无损**，排队等只会把两个
-// 请求都拖死。故三者**共用这一把进程级非阻塞锁**（`try_lock` 语义）：拿不到锁就**立即跳过本次**
-// （判定 / 抽取折成 `fallback=true` + `reason="busy-skip"`，预热只记一行 info），**绝不排队等待**。
-// 单一真相源 = 本模块的 [`try_acquire_local_channel`]（判定 / 抽取 / 预热都经它取锁）。
+// **口径**：判定 / 抽取 / 改写 / 预筛 / 路由 / 预热都是「**摊销的尽力而为**」调用 —— **跳过
+// 无损**，排队等只会把两个请求都拖死。故它们共用这一道**进程级非阻塞闸**：拿不到槽就**立即
+// 跳过本次**（折成 `fallback=true` + `reason="busy-skip"`，预热只记一行 info），**绝不排队
+// 等待**。单一真相源 = 本模块的 [`try_acquire_local_channel`]。
 //
-// ⚠️ **新增任何打本地端点的调用都要经 [`ChannelGated`] 包一层**（或自行取锁），否则仍会与
-// 判定 / 抽取抢那唯一一个并发槽。⚠️ **不改超时值、不动 `-np`、不引入「每轮多请求」**。
+// **槽数**（2026-10-24 起）：= `llama-server -np N` 的 N，由宿主从**插件清单的 `sidecar.args`**
+// 里读出来、经 `LUNAC_LOCAL_MODEL_SLOTS` 注入（与 `--port` 同一条纪律：清单是唯一真相源，
+// 宿主不另写一份常量）。未配 / 老插件（`-np 1`）⇒ **1**，行为与改造前逐字节一致。
+// 实测（2026-10-24，Qwen3-4B Q4 + Vulkan，`-c 8192 -np 2`）：`n_ctx_slot = 4096`、
+// 进程工作集 2.6 GB；单个 200-token 请求 4.3s，两个**并发** 4.8s（不是 8.6s）⇒ 真并行。
+//
+// ⚠️ **新增任何打本地端点的调用都要经 [`ChannelGated`] 包一层**（或自行取锁）。
+// ⚠️ **不改超时值、不引入「每轮多请求」**；槽数只跟清单走。
 
-/// 「本地模型通道忙」的**哨兵错误**：`ChannelGated` 拿不到锁时返回它，由 [`decide`]（以及
+/// 「本地模型通道忙」的**哨兵错误**：`ChannelGated` 拿不到槽时返回它，由 [`decide`]（以及
 /// `memory_candidates::extract`）折成 `busy-skip`（**立即跳过、绝不排队**）。单一真相源 = 此常量。
 pub const BUSY_SKIP: &str = "busy-skip";
 
-/// 本地模型通道是否已被占用（**进程级**：判定 / 抽取 / 预热共用一个端点，故共用这一把锁）。
-static LOCAL_CHANNEL_BUSY: AtomicBool = AtomicBool::new(false);
+/// 认得的最大槽数：再大只会把每槽上下文摊得更薄，不是这套调用形态需要的。
+pub const MAX_LOCAL_SLOTS: usize = 4;
+
+/// 本地端点的并发槽数；`0` = 尚未初始化（见 [`channel_slots`]）。
+static LOCAL_CHANNEL_SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// 已在飞的本地请求数（判定 / 抽取 / 改写 / 预筛 / 路由 / 预热共用这一道闸）。
+static LOCAL_CHANNEL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// 测试专用：串行化**所有**会碰本地通道锁的单测（锁是进程级静态量，而 `cargo test` 默认并行 ⇒
 /// 「持锁」测试会与「取锁」测试互相干扰）。**生产代码不使用**。
 #[cfg(test)]
 pub(crate) static TEST_CHANNEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 通道锁的持有凭证；`drop` 即释放。
+/// 通道槽的持有凭证；`drop` 即归还一个槽。
 pub struct LocalChannelGuard;
 
 impl Drop for LocalChannelGuard {
     fn drop(&mut self) {
-        LOCAL_CHANNEL_BUSY.store(false, Ordering::Release);
+        LOCAL_CHANNEL_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/// **非阻塞**获取本地模型通道：`Some` = 拿到了；`None` = 已有本地请求在飞 ⇒ 调用方**立即跳过
-/// 本次**（不排队）。判定 / 抽取 / 预热都从这里取锁（唯一真相源）。
+/// 本地端点的并发槽数（`LUNAC_LOCAL_MODEL_SLOTS`；缺省 / 非法 / 超 [`MAX_LOCAL_SLOTS`] ⇒ 1）。
+///
+/// 只读一次环境（首访时算好存进原子量）：宿主只在 spawn 时注入，运行期不会变。
+pub fn channel_slots() -> usize {
+    let cur = LOCAL_CHANNEL_SLOTS.load(Ordering::Acquire);
+    if cur != 0 {
+        return cur;
+    }
+    let n = std::env::var("LUNAC_LOCAL_MODEL_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=MAX_LOCAL_SLOTS).contains(n))
+        .unwrap_or(1);
+    // 并发初始化无害：两个线程算出的都是同一个值。
+    let _ = LOCAL_CHANNEL_SLOTS.compare_exchange(0, n, Ordering::AcqRel, Ordering::Acquire);
+    LOCAL_CHANNEL_SLOTS.load(Ordering::Acquire)
+}
+
+/// 测试专用：直接改槽数（`0` = 下次按环境重新初始化）。**生产代码不使用**。
+#[cfg(test)]
+pub(crate) fn set_channel_slots_for_test(n: usize) {
+    LOCAL_CHANNEL_SLOTS.store(n, Ordering::Release);
+}
+
+/// **非阻塞**获取一个本地槽：`Some` = 拿到了；`None` = 槽已占满（单槽时等价于「已有请求
+/// 在飞」）⇒ 调用方**立即跳过本次**（不排队）。判定 / 抽取 / 改写 / 预筛 / 路由 / 预热都从
+/// 这里取槽（唯一真相源）。
 pub fn try_acquire_local_channel() -> Option<LocalChannelGuard> {
-    if LOCAL_CHANNEL_BUSY.swap(true, Ordering::AcqRel) {
-        None
-    } else {
-        Some(LocalChannelGuard)
+    let limit = channel_slots();
+    loop {
+        let cur = LOCAL_CHANNEL_IN_FLIGHT.load(Ordering::Acquire);
+        if cur >= limit {
+            return None;
+        }
+        if LOCAL_CHANNEL_IN_FLIGHT
+            .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(LocalChannelGuard);
+        }
     }
 }
 
-/// 给「打本地端点的后端」套上通道互斥：拿不到锁 ⇒ `Err(`[`BUSY_SKIP`]`)`（由 [`decide`] 折成
+/// 给「打本地端点的后端」套上通道闸：拿不到槽 ⇒ `Err(`[`BUSY_SKIP`]`)`（由 [`decide`] 折成
 /// `busy-skip`）。生产里 `LocalHttp`（判定 / 预热）与 `LocalExtract`（抽取）都经它包一层。
 pub struct ChannelGated<D> {
     inner: D,
@@ -409,10 +463,10 @@ const WARMUP_INPUT: &str = "warmup";
 
 /// 预热的**专用超时**：**必须长于** [`LOCAL_DECIDE_TIMEOUT`]。
 ///
-/// 为什么不能沿用判定的 1500ms（真机实测 2026-10-15）：冷启后的**第一次推理本身**就 >1500ms ——
+/// 为什么不能沿用判定那条上限（2026-10-15 实测时它是 1500ms）：冷启后的**第一次推理本身**就 >1500ms ——
 /// 若预热沿用 1500ms 上限，预热请求会在冷推理完成前就超时收摊，服务端并不保证留下「已热身」的
 /// 状态。预热在**后台线程**、只打本地端点、只跑一次，用一个更宽的上限把它**跑完**才是它存在的
-/// 意义。⚠️ 这只放宽**预热自己**的上限；判定的 1500ms（`LOCAL_DECIDE_TIMEOUT`）**一个字不改**。
+/// 意义。⚠️ 这只放宽**预热自己**的上限；判定的 `LOCAL_DECIDE_TIMEOUT`（当前 3000ms）**不动**。
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 预热是否该做：**开关开 + 端点已配**两个条件同时成立才预热，否则 `None`（⇒ 零请求）。
@@ -773,6 +827,7 @@ mod tests {
     fn gated_request_busy_skips_immediately_without_waiting() {
         // 通道锁是进程级静态量 ⇒ 本测试「持锁」必须与其它碰锁的单测串行（见 TEST_CHANNEL_LOCK）。
         let _serial = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_channel_slots_for_test(1);
         let guard = try_acquire_local_channel().expect("首个请求应拿到通道");
         let d = ChannelGated::new(Slow);
         let t0 = Instant::now();
@@ -788,15 +843,50 @@ mod tests {
         assert_eq!(out2.action, Action::Run);
         assert!(!out2.fallback, "通道空闲时不产生 busy-skip");
         assert_eq!(out2.reason, "stub-run");
+        set_channel_slots_for_test(0);
     }
 
-    /// 通道锁语义：非阻塞（第二次拿不到、回 `None` 而非阻塞等待）、`drop` 即释放。
+    /// 通道闸语义：非阻塞（槽满时拿不到、回 `None` 而非阻塞等待）、`drop` 即归还。
     #[test]
     fn channel_lock_is_exclusive_and_non_blocking() {
         let _serial = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 槽数是进程级全局量 ⇒ 显式钉成单槽（= 老插件 / 未配 `LUNAC_LOCAL_MODEL_SLOTS`）。
+        set_channel_slots_for_test(1);
         let g = try_acquire_local_channel().expect("首次应为 Some");
         assert!(try_acquire_local_channel().is_none(), "持锁时第二次必须立即为 None（不排队）");
         drop(g);
         assert!(try_acquire_local_channel().is_some(), "释放后恢复可获取");
+        set_channel_slots_for_test(0);
+    }
+
+    /// 多槽（2026-10-24）：清单写 `-np 2` 时允许**两个**本地请求同时在飞，第三个才 busy-skip；
+    /// 归还一个槽后恢复。⇒ `MemorySearch` 的改写与预热 / 判定不再互相饿死。
+    #[test]
+    fn channel_allows_two_in_flight_when_the_endpoint_has_two_slots() {
+        let _serial = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_channel_slots_for_test(2);
+        let g1 = try_acquire_local_channel().expect("第 1 个应拿到槽");
+        let g2 = try_acquire_local_channel().expect("第 2 个应拿到槽");
+        assert!(try_acquire_local_channel().is_none(), "两槽都占满 ⇒ 立即 None（不排队）");
+        drop(g1);
+        assert!(try_acquire_local_channel().is_some(), "归还一个后恢复一个槽");
+        drop(g2);
+        set_channel_slots_for_test(0);
+    }
+
+    /// 槽数只认环境变量，且**非法值一律退回 1**（宁少不多：多于服务端槽数会重新排队）。
+    #[test]
+    fn channel_slots_fall_back_to_one_on_bad_input() {
+        let _serial = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for bad in ["", "0", "abc", "5", "-2"] {
+            std::env::set_var("LUNAC_LOCAL_MODEL_SLOTS", bad);
+            set_channel_slots_for_test(0);
+            assert_eq!(channel_slots(), 1, "非法槽数 {bad:?} 应退回 1");
+        }
+        std::env::set_var("LUNAC_LOCAL_MODEL_SLOTS", "2");
+        set_channel_slots_for_test(0);
+        assert_eq!(channel_slots(), 2);
+        std::env::remove_var("LUNAC_LOCAL_MODEL_SLOTS");
+        set_channel_slots_for_test(0);
     }
 }

@@ -1,0 +1,166 @@
+[package]
+name = "lunac_core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Lunac v2 的 Rust 侧薄层：把 Rust 能力经 C ABI 暴露给 Dart（M0 起）"
+
+[lib]
+name = "lunac_core"
+# cdylib：Windows 产出 lunac_core.dll，Linux 产出 liblunac_core.so，由 Dart FFI 加载。
+crate-type = ["cdylib"]
+
+[dependencies]
+# 搜索结果以 JSON 交给 Dart（键序不影响解析；这里不追求字节稳定，因为不进请求前缀）。
+serde_json = "1"
+# 主题包 / 外观的 JSON 解析用 derive（serde_json 已传递依赖 serde，这里只是显式引用；
+# 与 v1 `app/src-tauri` 同一套写法）。
+serde = { version = "1", features = ["derive"] }
+# 应用 / 文件索引与 v1 共用同一份实现（app/src-tauri 与这里都依赖它）。
+lunac-indexer = { path = "../../indexer" }
+# 翻译插件的词典底座（2026-11-12）：与 v1 `app/src-tauri/Cargo.toml` 同款依赖 ——
+# 免 key 的 MyMemory / 有道都是 HTTPS，本地缓存用 SQLite（`ModuleData/translate/cache.db`）。
+# 只开 translate 需要的 feature（v1 还有 stream，那部分属于 AI 对话主链路，这里不用）。
+# 代价：debug cdylib 会显著增大（hyper / tokio / native-tls / bundled sqlite）；
+# 这是「与 v1 同款口径」换来的，详见 translate.rs 顶部说明。
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# 插件市场（2026-11-13）：下载 zip 后校验 sha256、再解压到 `<exe 根>/Modules/<id>`。
+# 两个版本与 v1 `app/src-tauri/Cargo.toml` 完全一致（本机已有缓存，不新增下载量级）。
+sha2 = "0.10"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# `archive` 形态的插件依赖：上游引擎发行包常是 `.7z`（PaddleOCR-json 只有 7z 资产），
+# 与 v1 `app/src-tauri/Cargo.toml` 同一个版本（本机 registry 已有缓存，不新增下载量级）。
+# 纯 Rust；解压时必须自己给 extract_fn（默认那个不拦 `..\..`，见 `extract_sevenz`）。
+sevenz-rust = "0.6"
+
+# 自研代理引擎（2026-11-15 重建；v1 `native_proxy/` 已随误删丢失，只能按
+# docs/acceptance-map.md 的能力账本重写）：
+#   · native-tls：Windows 走 schannel（系统根证书，不内置 CA）；ALPN 走 `alpn` feature
+#     （节点里写了 `alpn= h2,http/1.1` 时不至于静默丢掉）。
+#   · base64：分享链接 / VMess JSON / WS key；
+#   · url：分享链接解析（不手写 percent-decode）；
+#   · SS AEAD 用 RustCrypto 的**纯 Rust**实现（aes-gcm / chacha20poly1305 / hkdf + sha1）。
+#     这一层刻意不用 ring：不需要它的性能，纯 Rust 栈更少的编译前置（2026-11-15 更正：
+#     「本机没 gcc ⇒ ring 编不过」的旧结论已作废 —— 仓库自带 `mingw64\bin\gcc.exe`，
+#     `rust/build.ps1` 会把它加到 PATH，ring / aws-lc-rs 都能编，见 docs 的 M5z-补38）。
+native-tls = { version = "0.2", features = ["alpn"] }
+base64 = "0.22"
+url = "2"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+# SS-2022 的 UDP 独立头要用 **AES 分组密码**（SIP022 §3.2.1：`block_cipher := aes_new(psk)`），
+# 这不是 AEAD；`aes-gcm` 只暴露 AEAD，所以显式引 `aes`（它本来就是 aes-gcm 的传递依赖，
+# 版本与锁文件里的一致，不新增下载）。
+aes = "0.8"
+hkdf = "0.12"
+sha1 = "0.10"
+getrandom = "0.2"
+# SS-2022（SIP022）的子密钥派生：`blake3::derive_key`。
+# 特意开 `pure` 关掉汇编 / SIMD 路径 —— 默认特性在 Windows 上会走 C / 汇编内核，
+# 需要 `cc` 找到编译器（与 ring 同一个坑：用户机器不一定有 gcc / ml64）。
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
+# Clash / mihomo YAML 订阅（`proxies:` 段）。纯 Rust、无 C 依赖 ——
+# `serde_yaml` 已停维护，`ring` / `aws-lc-rs` 那条路在本机（windows-gnu、无 gcc）编不过。
+yaml-rust2 = "0.13"
+
+# Hysteria2（2026-11-15 重建；v1 `hysteria2.rs` 已丢失，按官方 Protocol 规范重写）：
+#   · quinn：QUIC（含 RFC 9221 datagram，UDP 转发要用）；
+#   · rustls（**只用 ring**：本机编译走 `mingw64\bin\gcc.exe`，见 docs 的 M5z-补38）；
+#   · h3 / h3-quinn：认证那一步是真的 HTTP/3 请求（`POST https://hysteria/auth`），
+#     手写 QPACK 风险高，交给现成实现；
+#   · tokio：QUIC 必须有异步运行时（对外仍是阻塞流，见 hysteria2.rs 文件头）；
+#   · blake2：Salamander 混淆的 `BLAKE2b-256(key + salt)`。
+# 这几个 crate 与 v1（quinn / quic-go 那条线）语义对齐，且本机 registry 已有缓存。
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "io-util"] }
+quinn = "0.11"
+# HTTP/2 系传输（`network: h2` / `grpc`，2026-11-15）：h2 客户端 + 与 native-tls 的异步桥。
+# 两者都在本机 registry 缓存里（h2-0.4.x / tokio-native-tls-0.3.1）。
+h2 = "0.4"
+tokio-native-tls = "0.3"
+# REALITY（2026-11-15 重建）：自写 TLS 1.3 客户端要用 X25519 / HKDF / AES-GCM / HMAC-SHA512 /
+# SHA-256 / Ed25519 验签。ring 本来就在依赖树里（rustls 的 crypto 后端），显式依赖不新增下载。
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+blake2 = "0.10"
+webpki-roots = "0.26"
+# `quinn::Connection::send_datagram` 收的是 `bytes::Bytes`（quinn 不 re-export，必须直接依赖；
+# 它本来就在依赖树里，不新增下载）。
+bytes = "1"
+# 自研调音（2026-11-15）：v1 的 DSP 内核是仓库里的独立 crate（`tuning-engine/`，纯 Rust +
+# 只有 serde），v1 也是把它当**库依赖**接进宿主的。这里照同一条口径依赖，
+# 不重写任何滤波器 —— 控制面在 `rust/src/tuning.rs`。
+tuning-engine = { path = "../../tuning-engine" }
+# 内置工具 `image_pattern_analysis`（v1 `mcp_server.rs` 的 analyze_image_pattern 原样移植）：
+# 只开 png / jpeg 两种解码器 —— 用户工具文档里写的输入就是 jpg/png，
+# 其余格式不开可少编一大堆解码器。纯 Rust，无需外部依赖。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# REALITY 的临时密钥要算**两次** ECDH（认证用 pbk、TLS 1.3 用 ServerHello 的 key_share），
+# 而 ring 的 `agree_ephemeral` 会吃掉私钥（一把钥匙只许协商一次）。x25519-dalek 的
+# `StaticSecret` 可以反复 `diffie_hellman`。纯 Rust（fiat-crypto），无 C / 汇编依赖。
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "getrandom"] }
+# REALITY × Xray 26：上游 26 起强制 ClientHello 带 `X25519MLKEM768`（draft-ietf-tls-ecdhe-mlkem），
+# key_share 里放的是 ML-KEM-768 封装密钥（1184B），服务端回来的 1088B 密文要 decapsulate。
+# RustCrypto 的纯 Rust 实现（FIPS 203），`getrandom` 只用于随机数源。
+ml-kem = { version = "0.3", features = ["getrandom"] }
+# VMess `chunk masking` / `global padding`：分块长度与填充长度都取自
+# `SHAKE128(bodyIV)` 的字节流（v2fly `encoding/auth.go` 的 `ShakeSizeParser`）。
+# RustCrypto 的纯 Rust Keccak，只用到 Shake128 的 XOF。
+sha3 = "0.10"
+
+# 桌宠窗（2026-11-12）：v1 的 Live2D 渲染器是一份跑在 WebView 里的 ESM bundle，
+# v2 要拿到「与 v1 完全相同的最终效果」就只能继续用 WebView2。Flutter 的 webview 插件
+# 没有暴露 `put_DefaultBackgroundColor(transparent)`（透明是硬需求），所以这里直接持有
+# WebView2 控制器。这两个 crate 与 v1（tauri/wry）用的是同一版本线，且本机已有缓存。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38.2"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    # 预览区终端（`terminal.rs`）：ConPTY 的 5 个 API + 起子进程要的管道 / 属性表。
+    # `Win32_System_Pipes` 不自动带 `Win32_Security`（CreatePipe 的签名用到它），
+    # 所以两个都要显式列上。全是本机已缓存的 windows crate，不新增下载。
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    # 路由规则 `PROCESS-NAME`（2026-11-15，`native_proxy/process.rs`）：
+    # `GetExtendedTcpTable` 在 IpHelper 里，`QueryFullProcessImageNameW` 在 Threading 里（已开）。
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    # 调音的**实时硬件测量**（2026-11-15，`tuning_probe.rs`）：WASAPI 回环采集
+    # （IMMDeviceEnumerator / IAudioClient / IAudioCaptureClient）都在 `Media_Audio`。
+    # 与 v1 `app/src-tauri` 同一条路：不用第三方 `wasapi` crate。
+    "Win32_Media_Audio",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# 本地音乐媒体库（2026-11-12，music.rs）：标签 / 时长 / 内嵌封面。
+# 与 v1 `app/src-tauri` 同款 `lofty`（0.25.4）—— 纯 Rust、不解码音频，
+# 所以不需要 FFmpeg / rodio（出声由 Dart 侧的 just_audio 负责）。
+# 体积代价：debug cdylib 会增加约 2–3 MB（lofty 及其自带的格式解析器，全部纯 Rust）。
+lofty = "0.25.4"
+# LRC 歌词的编码容错（UTF-8 / UTF-16 / GBK）。纯查表的小 crate（约 1 MB），
+# 与 v1 `media_lib.rs` 的 `.m3u` 解码同款依赖。
+encoding_rs = "0.8"
+# 本地音频的**解码 + 出声**（2026-11-15，player.rs；v1 `app/src-tauri/Cargo.toml`
+# 用的是同一个版本 `rodio = "0.22.2"`）。
+# 为什么不用 Dart 的 just_audio 了：调音链（tuning-engine）必须挂在**解码后、出声前**
+# 的样本流上；just_audio 在 Dart 侧，Rust 拿不到样本 ⇒ 调音打开也不改变声音。
+# rodio 给的正是那个挂点（`Source` 适配器），且内置位置 / 暂停 / seek 语义，
+# 与 v1 的播放状态机同口径。**刻意只进宿主**：WebView 放不出声音。
+rodio = "0.22.2"
+
+# 架构改造期**不做 release 构建**（docs/flutter-migration.md §六）：
+# 这里故意不提供 release 相关配置，构建入口是 rust/build.ps1（debug）。

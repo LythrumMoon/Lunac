@@ -1,0 +1,13 @@
+[package]
+name = "lunac-indexer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Lunac 应用 / 文件索引的共享实现（v1 宿主与 v2 Flutter 薄层共用）"
+
+[dependencies]
+pinyin = { version = "0.11", features = ["plain"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 应用图标：PNG 字节 → base64 data URL（与 v1 用同一版本）。
+base64 = "0.22"

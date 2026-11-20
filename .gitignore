@@ -27,8 +27,12 @@ app/src-tauri/target-check/
 app/src-tauri/gen/
 # 自研 agent 核心（core-agent）的编译产物
 core-agent/target/
+# 共享索引库（indexer）的编译产物
+indexer/target/
 # 调音插件的 DSP 引擎内核（tuning-engine）的编译产物
 tuning-engine/target/
+# 媒体代理 helper（app/media-proxy）的编译产物
+app/media-proxy/target/
 # Tauri 侧随附的二进制（历史遗留目录）
 app/src-tauri/binaries/
 # VS Code 扩展的编译输出（源在 vscode-extension/src/）

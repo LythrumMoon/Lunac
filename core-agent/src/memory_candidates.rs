@@ -56,7 +56,8 @@ ws ::= [ \t\r\n]*"#;
 /// 单条候选的字符上限（超长则截断）—— 防单条候选异常长撑爆账本引用与后续消费。
 const MAX_FACT_CHARS: usize = 300;
 
-/// 单次抽取的**硬上限**：**故意长于** [`decide::LOCAL_DECIDE_TIMEOUT`]（1500ms）。
+/// 单次抽取的**硬上限**：**故意长于** [`decide::LOCAL_DECIDE_TIMEOUT`]（2026-10-15 实测时为 1500ms，
+/// 2026-10-24 起判定上限已放宽到 3000ms；抽取仍是 5000ms，仍严格更长）。
 ///
 /// 为什么不沿用 1500ms（2026-10-15 真机实测）：抽取要生成**几十个 token** 的 JSON 数组，而判定
 /// 只要 **1 个 token** 的枚举 —— 两者耗时不同量级。实测（Qwen3-4B、纯 CPU、`-c 8192 -np 1`、
@@ -129,7 +130,7 @@ impl<E: Extractor> Extractor for ChannelGated<E> {
 impl LocalExtract {
     pub fn new(cfg: decide::LocalHttpConfig) -> Self {
         // 抽取自有**更宽但仍硬**的超时上限（理由见 [`LOCAL_EXTRACT_TIMEOUT`]）：HTTP client 的
-        // `timeout` 与第二道闸都按它走，**不沿用判定的 1500ms**。
+        // `timeout` 与第二道闸都按它走，**不沿用判定那条上限**。
         LocalExtract { cfg: decide::LocalHttpConfig { timeout: LOCAL_EXTRACT_TIMEOUT, ..cfg } }
     }
 }

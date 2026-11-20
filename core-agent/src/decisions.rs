@@ -18,6 +18,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,12 @@ pub struct DecideRecord {
     /// 各候选的**可追溯引用**（**只存 hash 与长度，绝不含原文**）。见 [`CandidateRef`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<CandidateRef>>,
+    /// **安全预筛**（`kind = "safety-prescreen"`）被评估的**工具名**；其余 kind 为 `None`。
+    ///
+    /// 只记工具名（如 `Cmd` / `PowerShell` / `Write`），**不记命令或文件内容** —— 原文只用于
+    /// 当次判定，账本里只有输入哈希。`skip_serializing_if` ⇒ 其余 kind 的账本行**逐字节不变**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 /// 单条记忆候选在账本里的**可追溯引用**：只有**指纹与长度**，**没有原文**。
@@ -93,10 +100,18 @@ pub fn path_for(dir: &Path, scope: MemoryScope) -> PathBuf {
     dir.join(format!("{}.jsonl", scope.as_str()))
 }
 
+/// 账本写入的**进程级串行闸**。
+///
+/// 安全预筛（`safety_prescreen`）在**后台线程**写账本，其余切片在主循环写 ⇒ 若并发，
+/// 「一行内容 + 换行」这两次 `write_all` 会交错，产出坏行。锁只围着一次追加，代价可忽略；
+/// 单线程调用点的行为逐字节不变。
+static APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 /// 追加写入一条留痕（append-only JSONL）。失败只 warn、绝不影响主流程。
 ///
 /// 日志只记**类型与判定**，**不记输入原文**（原文本来就没进账本，只有哈希）。
 pub fn append(dir: &Path, scope: MemoryScope, rec: &DecideRecord) {
+    let _serial = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let line = match serde_json::to_string(rec) {
         Ok(l) => l,
         Err(e) => {
@@ -170,6 +185,7 @@ mod tests {
             session_id: "sess-1".into(),
             candidate_count: None,
             candidates: None,
+            tool: None,
         }
     }
 
@@ -266,6 +282,46 @@ mod tests {
         assert_eq!(loaded[0].verdict, "run");
         assert_eq!(loaded[0].candidate_count, None, "老行新字段缺省为 None");
         assert_eq!(loaded[0].candidates, None);
+        assert_eq!(loaded[0].tool, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **向后兼容 ③**：安全预筛行只带工具名，**不带命令 / 文件内容**。
+    #[test]
+    fn safety_line_carries_tool_name_but_no_plaintext() {
+        let dir = std::env::temp_dir().join(format!("lunac-dec-safety-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut r = rec(9, "high");
+        r.kind = "safety-prescreen".into();
+        r.tool = Some("PowerShell".into());
+        r.reason = "model-high".into();
+        append(&dir, MemoryScope::Global, &r);
+        let blob = std::fs::read_to_string(path_for(&dir, MemoryScope::Global)).unwrap();
+        assert!(blob.contains("\"tool\":\"PowerShell\""), "工具名应在账本里：{blob}");
+        assert!(blob.contains("\"verdict\":\"high\""));
+        // 非该 kind 的行不带 tool 字段（逐字节不变的保证）。
+        assert!(!serde_json::to_string(&rec(1, "run")).unwrap().contains("\"tool\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **并发写入**：安全预筛在后台线程写、主循环也写 ⇒ 行不得交错（每条都能被解析）。
+    #[test]
+    fn concurrent_appends_produce_well_formed_lines() {
+        let dir = std::env::temp_dir().join(format!("lunac-dec-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    append(&d, MemoryScope::Global, &rec((t * 100 + i) as i64, "run"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(count(&dir, MemoryScope::Global), 100, "100 条并发写入必须全部可解析");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

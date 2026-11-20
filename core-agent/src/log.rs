@@ -354,6 +354,19 @@ pub fn mask_secrets(s: &str) -> String {
                 out.push(chars[i]);
                 i += 1;
             }
+            // `Authorization: Bearer <token>`：键名分支会把 `Bearer` 当成值，真正的
+            // token 就漏在下一段（旧实现只靠 `sk-` 规则兜住带前缀的 key）。这里先跳过
+            // 认证方案词，让 `***` 落在 token 上。
+            if let Some(scheme) = auth_scheme_len(&chars, i) {
+                for _ in 0..scheme {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] == ' ' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
             i = value_end(&chars, i);
             out.push_str("***");
             continue;
@@ -391,6 +404,28 @@ fn match_secret_key(chars: &[char], i: usize) -> Option<usize> {
         }
         if j < chars.len() && matches!(chars[j], ':' | '=' | '"' | '\'') {
             return Some(klen);
+        }
+    }
+    None
+}
+
+/// 从 `i` 起是否是一个 HTTP 认证方案词（后接空白）；返回词长。
+///
+/// 只服务于 `mask_secrets` 的键名分支：`Authorization: Bearer <token>` 里
+/// `Bearer` 不是秘密，真正要抹掉的是它后面的 token。
+fn auth_scheme_len(chars: &[char], i: usize) -> Option<usize> {
+    const SCHEMES: [&str; 3] = ["bearer", "basic", "digest"];
+    for scheme in SCHEMES {
+        let len = scheme.chars().count();
+        if i + len >= chars.len() {
+            continue;
+        }
+        let candidate: String = chars[i..i + len].iter().collect();
+        if !candidate.eq_ignore_ascii_case(scheme) {
+            continue;
+        }
+        if chars[i + len] == ' ' {
+            return Some(len);
         }
     }
     None
@@ -564,6 +599,11 @@ mod tests {
     fn mask_hides_bearer_and_bare_sk() {
         let masked = mask_secrets("Authorization: Bearer sk-live-99887766");
         assert!(!masked.contains("99887766"), "secret leaked: {masked}");
+
+        // 不带 `sk-` 前缀的 JWT 也必须抹掉（旧实现会把 `Bearer` 当值，token 漏在后面）
+        let jwt = mask_secrets("curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1\"");
+        assert!(!jwt.contains("eyJhbGciOiJIUzI1"), "secret leaked: {jwt}");
+        assert!(jwt.contains("Bearer"), "方案词保留便于辨认：{jwt}");
 
         let bare = mask_secrets(r#"{"search_key":"sk-live-11223344"}"#);
         assert!(!bare.contains("11223344"), "secret leaked: {bare}");

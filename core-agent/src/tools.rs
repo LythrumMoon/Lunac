@@ -1,5 +1,5 @@
 // core-agent/src/tools.rs
-// 内置工具：Read / Write / Edit / NotebookEdit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite / RepoMap
+// 内置工具：Read / Write / Edit / NotebookEdit / Cmd / PowerShell / Glob / Grep / WebSearch / WebFetch / AskUserQuestion / TodoWrite / RepoMap / CronCreate / CronDelete / CronList
 //
 // 工具名保持 PascalCase —— 前端 main.ts 对 "Cmd" / "PowerShell" 有专门的
 // 命令展示与危险命令分类分支（agentToolArgsDelta / classifyRequest /
@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -89,6 +89,10 @@ const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/web-search";
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 const EXA_ENDPOINT: &str = "https://api.exa.ai/search";
 const FIRECRAWL_ENDPOINT: &str = "https://api.firecrawl.dev/v2/search";
+/// DeepSeek 官方搜索（2026-11-05）：与模型**同源同 key**，见 `deepseek_search`。
+const DEEPSEEK_SEARCH_ENDPOINT: &str = "https://api.deepseek.com/v1/tools/search";
+/// DeepSeek `query` 官方限 128 字符（按字符，不是字节）
+const DEEPSEEK_QUERY_MAX_CHARS: usize = 128;
 const BING_SEARCH_ENDPOINT: &str = "https://www.bing.com/search";
 const BAIDU_SEARCH_ENDPOINT: &str = "https://www.baidu.com/s";
 /// 抓取类兜底源的最小间隔（秒）—— 官方未公开限流值，社区经验 1 req/s 是安全上限
@@ -234,6 +238,15 @@ pub struct Ctx {
     /// ⇒ 它们自动继承本轮作用域，桌宠轮里派生的复盘也写桌宠那一份，不必逐层传参。
     /// `Copy` 值语义足够 —— 它是**每轮**的事实，不需要 `Arc` 共享。
     pub memory_scope: MemoryScope,
+    /// **fork 技能的记忆命名空间**（§待办 3-28.10 ①，2026-11-19）：`Some(key)` = 这个
+    /// `Ctx` 属于「某个技能的 fork 子代理」，`Remember` 写 `<key>` 的私有记忆
+    /// （`lunac/memory_write` 带 `scope=skill&skill=<key>`）。
+    ///
+    /// · 主循环恒为 `None`（行为与改造前逐字节一致）；
+    /// · 只有 `run_forked_skill` 在宿主开关 `LUNAC_SKILL_MEMORY=on` 时克隆一份并置位；
+    /// · 与 `memory_scope` 共用同一个决策点：**技能级**优先于**全局 / 桌宠**
+    ///   （技能 fork 里写全局会污染主对话每轮都注入的那一份）。
+    pub skill_scope: Option<String>,
 }
 
 /// 实时输出回调：`(stream, chunk)`，`stream ∈ {"stdout", "stderr"}`。
@@ -339,7 +352,7 @@ pub fn write_blocked(ctx: &Ctx, what: &str) -> Option<String> {
 
 // ── 工具定义（Anthropic Messages API 的 tools schema）─────────────
 
-/// 二十五个内置工具的 schema；`disallowed`（来自 `--disallowedTools`）里的
+/// 内置工具的 schema 表；`disallowed`（来自 `--disallowedTools`）里的
 /// 名字不进入请求体 —— 数组更短，也少一轮缓存失效。
 pub fn defs(disallowed: &[String]) -> Vec<Value> {
     let all = vec![
@@ -493,11 +506,38 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "WebBrowser",
+            "description": "Render a URL in a real headless browser (the locally installed \
+                Microsoft Edge or Google Chrome) and return the page AFTER its JavaScript has \
+                run. Use this instead of WebFetch when a page only shows its content once \
+                scripts execute (SPA / infinite scroll shells / JS-gated content), or when \
+                WebFetch returns an empty or near-empty body. Read-only with respect to your \
+                files (it writes nothing but a throwaway temporary browser profile that is \
+                deleted afterwards), but it IS an external network outlet and needs approval. \
+                It only opens, waits and dumps the DOM — it cannot click, type or screenshot. \
+                It starts a fresh browser per call, so prefer WebFetch for plain documents and \
+                raise wait_ms only when the page needs more time. Returns the page title plus \
+                readable text (format=\"text\", default) or the raw rendered DOM \
+                (format=\"html\"), truncated.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Absolute http(s) URL to render" },
+                    "wait_ms": { "type": "integer", "description": "Virtual time budget for scripts/network in milliseconds (default 5000, max 20000)" },
+                    "format": { "type": "string", "enum": ["text", "html"], "description": "text = readable text (default), html = raw rendered DOM" }
+                },
+                "required": ["url"]
+            }
+        }),
+        json!({
             "name": "AskUserQuestion",
             "description": "Ask the user 1-4 multiple-choice questions and wait for the answer. \
                 Use it when you are genuinely blocked on a decision only the user can make \
                 (ambiguous requirement, a choice between approaches). Do not use it to ask for \
-                permission or to confirm an action — just say it in plain text.",
+                permission or to confirm an action — just say it in plain text. \
+                Before calling it, write one short paragraph in the visible reply covering what \
+                you were doing, where you are now, and what needs deciding; the question card \
+                alone gives the user no context.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -541,7 +581,12 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             "description": "Create or update the task list shown to the user. Send the COMPLETE \
                 list every time — it replaces the previous one. Keep at most one entry \
                 in_progress, and flip an entry to completed the moment it is done. Use it for \
-                multi-step work so the user can follow along; skip it for a single trivial step.",
+                multi-step work so the user can follow along; skip it for a single trivial step. \
+                For work with real ordering, give entries an `id` and list prerequisites in \
+                `blocked_by`: the result then reports which entries are Ready vs Blocked, so you \
+                never start a step whose prerequisite is still pending (unknown ids, duplicates \
+                and dependency cycles are rejected, and an entry with an unfinished prerequisite \
+                cannot be marked in_progress).",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -552,7 +597,9 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                             "properties": {
                                 "content": { "type": "string", "description": "Imperative form, e.g. \"Run the tests\"" },
                                 "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
-                                "activeForm": { "type": "string", "description": "Present continuous form, e.g. \"Running the tests\"" }
+                                "activeForm": { "type": "string", "description": "Present continuous form, e.g. \"Running the tests\"" },
+                                "id": { "type": "string", "description": "Stable short id, unique within this list (e.g. \"build\", \"test\"). Required if another entry references it." },
+                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of entries that must be completed before this one can start" }
                             },
                             "required": ["content", "status", "activeForm"]
                         }
@@ -600,6 +647,24 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "Preview",
+            "description": "Show something in the AI preview window (the workspace panel attached \
+                to the chat). Call this right after you launch an application so the user gets a \
+                \"预览: <app>\" tab, and use it to put a file or a URL in front of the user \
+                instead of dumping its contents into the reply. The preview cannot embed native \
+                windows: app tabs are bookmarks to the external window, while file / url tabs \
+                render inside the panel.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Tab title. For an app use \"预览: <应用名>\"." },
+                    "kind": { "type": "string", "enum": ["app", "file", "url", "workspace"], "description": "app = a launched application (external window); file = a workspace file to render; url = a web page; workspace = focus the workspace tab." },
+                    "target": { "type": "string", "description": "App path or command for app; workspace-relative path for file; absolute http(s) URL for url. Leave empty for workspace." }
+                },
+                "required": ["title", "kind"]
+            }
+        }),
+        json!({
             "name": "SessionSearch",
             "description": "Search the user's OWN past chat sessions in this app (a local \
                 full-text index over earlier conversations) and return matching messages \
@@ -607,8 +672,10 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 conversation — \"last time\", \"we discussed that before\", \"上次\", \
                 \"之前聊过的\" — because you cannot recall past sessions from memory. \
                 Nothing about earlier sessions is shown to you automatically, so this tool \
-                is the only way to read what was actually said. Read-only and local: it never \
-                touches the network.",
+                is the only way to read what was actually said. The local index is organized \
+                as date → conversation → task → operation, so you can narrow by tags / date / \
+                session / task and receive only the matched operations. Read-only and local: \
+                it never touches the network.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -619,6 +686,23 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum matching messages to return (default 10, max 30)"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tag filter from the local library index (date → conversation → task → operation). Use tags you saw earlier or words from the current task; entries are matched by tag before full text."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Optional local date filter, YYYY-MM-DD. Use it when the user remembers when something happened."
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Optional conversation id or title substring. Use it to stay inside one past conversation."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Optional task title / id substring inside that conversation. Each task is one user question."
                     }
                 },
                 "required": ["query"]
@@ -666,10 +750,20 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 The subagent cannot see this conversation and cannot ask the user questions, \
                 so `prompt` must be completely self-contained. It can read and modify files, \
                 so make the task description precise. It cannot launch further subagents. \
+                SCALE IT: ONE subagent is the default; a job that needs one search, one file \
+                or one answer is cheaper done by yourself, so do not delegate it. Dispatch \
+                2-3 in the SAME message only when the tasks are truly independent AND each \
+                needs many tool calls (never more than 3 in one turn). Keep every wrap-up \
+                step — README, manifest / changelog, final summary, self-check conclusion — \
+                in YOUR OWN context: a subagent cannot see its siblings' reports, so \
+                synthesis delegated to one of them comes back incomplete. \
                 Several Agent calls issued in the SAME message run CONCURRENTLY (up to 3 at \
-                a time), so when you have independent tasks, dispatch them together in one \
-                message rather than one at a time; reports come back in the order you issued \
-                the calls.",
+                a time), and reports come back in the order you issued the calls. \
+                Set `background: true` only when the task must outlive this turn (a long \
+                build / audit) — you then get an acknowledgement immediately and its report \
+                is appended to a later turn automatically. Background subagents are visible in \
+                the activity panel, can be stopped by the user, and still obey the same round \
+                and token budgets.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -680,6 +774,20 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                     "prompt": {
                         "type": "string",
                         "description": "The complete task for the subagent: what to do, which paths or commands to use, and what its report must contain. It sees nothing but this string."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run this subagent in the BACKGROUND so it keeps working after this turn ends. You get an acknowledgement now and its report is merged into a later turn; the user sees it in the activity panel and can stop it. Default false (report comes back in this turn)."
+                    },
+                    "skills": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional skill keys (folder names under the skills directory) whose bodies are preloaded into THIS subagent's system prompt, so it starts already knowing the procedure. Costs context in the subagent only — your own prompt is unchanged. Unknown keys fail the call with the list of available keys."
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": crate::subagent_role::ROLE_VALUES,
+                        "description": "Optional role that fixes the subagent's tool set and report contract. explore = read-only search (Read/Glob/Grep); coding = implementation (Read/Write/Edit/Cmd/PowerShell); review = review only (read + test commands, no edits); research = external facts (WebSearch/WebFetch/WebBrowser + read); general/omitted = current unrestricted behaviour."
                     }
                 },
                 "required": ["description", "prompt"]
@@ -834,6 +942,306 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
                 "required": []
             }
         }),
+        json!({
+            "name": "LSP",
+            "description": "Get compiler / language-server diagnostics for ONE source file, the \
+                way an editor would: it starts the local language server for that file type \
+                (rust-analyzer, typescript-language-server, pyright-langserver / pylsp, gopls, \
+                clangd, lua-language-server — whichever is on PATH), opens the file, and returns \
+                the diagnostics it publishes. Use it after Write/Edit to check that the change \
+                actually compiles instead of guessing. Read-only and local: it never writes your \
+                files, never touches the network, and needs no approval. ALWAYS returns JSON text \
+                with a reason: unsupported-extension (unknown file type), no-server (none of the \
+                candidate servers is installed — `servers` lists what it looked for), \
+                spawn-failed, initialize-failed, timeout (server did not publish diagnostics \
+                before the deadline), read-failed. A file with no problems returns reason=ok and \
+                an empty list. Note: it starts a fresh server per call and may wait for the \
+                project to finish indexing — raise `timeout` for big rust-analyzer projects, and \
+                prefer asking once after a batch of edits over asking after every single edit.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Absolute or workspace-relative path to the source file" },
+                    "timeout": { "type": "integer", "description": "Total budget in milliseconds (default 20000, 1000..60000) — includes server start + analysis" },
+                    "limit": { "type": "integer", "description": "Max diagnostics to return (default 50, 1..200)" }
+                },
+                "required": ["file_path"]
+            }
+        }),
+        json!({
+            "name": "CronCreate",
+            "description": "Create a scheduled task (cron job) that runs this agent in read-only \
+                mode at a fixed interval or at a local wall-clock time. The job is stored on disk \
+                and executed by the host application while it is running. Every run is a fresh \
+                single-shot session with no conversation context, and tools that need approval \
+                (writes, shells, web access, subagents) are denied — only read-only tools are \
+                available. Requires an interactive approval card and a configured workspace. \
+                Minimum interval is 15 minutes; maxRunsPerDay defaults to 12 (hard cap 48); \
+                at most 20 jobs; the prompt must be 1..8000 characters and contain no credentials.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "schedule": {
+                        "type": "object",
+                        "description": "Either {kind:\"every\", everyMinutes:N} (N = 15..1440) or {kind:\"daily\", at:\"HH:MM\"} in local time",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["every", "daily"] },
+                            "everyMinutes": { "type": "integer", "minimum": 15, "maximum": 1440 },
+                            "at": { "type": "string", "description": "Local wall-clock time, exactly HH:MM (24-hour)" }
+                        },
+                        "required": ["kind"]
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The query sent to a fresh read-only agent on every run (1..8000 chars). It must be self-contained — no conversation context is carried over."
+                    },
+                    "enabled": { "type": "boolean", "description": "Whether the job is enabled at creation (default true)" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "pet"],
+                        "description": "Memory scope. Phase 1 only supports \"global\"; \"pet\" is rejected with an explanation."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Phase 1 only accepts an empty value or the current workspace path. A workspace must already be configured."
+                    },
+                    "notify": {
+                        "type": "string",
+                        "enum": ["none", "toast", "sound", "toast_sound"],
+                        "description": "How the host announces a finished run (default \"toast\", an in-app overlay event)"
+                    },
+                    "maxRunsPerDay": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 48,
+                        "description": "Per-job daily run cap (default 12, hard cap 48)"
+                    }
+                },
+                "required": ["schedule", "prompt"]
+            }
+        }),
+        json!({
+            "name": "CronDelete",
+            "description": "Delete a scheduled task by id. Idempotent: deleting an id that does \
+                not exist still succeeds (alreadyGone=true), so retries are safe. No approval is \
+                needed, but it is a write and is rejected in read-only (plan) mode.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Job id, as returned by CronCreate or CronList" }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "CronList",
+            "description": "List the scheduled tasks (cron jobs) stored in the local cron store, \
+                merging each job definition with its last-run state (lastRunAt / nextRunAt / \
+                lastStatus / lastSummary / lastError / runCount / failureCount / \
+                consecutiveFailures / autoDisabled). Read-only and local. Prompts are truncated \
+                to their first 200 characters; promptChars carries the original length. Jobs run \
+                only while the host application is running, each run is a fresh read-only \
+                session, and host-side daily caps may skip runs. Always returns JSON text; a \
+                missing or corrupt store is reported with an explicit reason instead of throwing.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "includeDisabled": { "type": "boolean", "description": "Include disabled jobs (default false)" },
+                    "enabled": { "type": "boolean", "description": "When set, return only jobs whose enabled flag matches (overrides includeDisabled)" }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "TaskEnqueue",
+            "description": "Queue a one-shot long-running task for the host application to run in \
+                the background. The task runs read-only (plan mode): writes, shells, web access, \
+                subagents, cron tools and task tools are denied; only local read-only tools are \
+                available. Tasks run one at a time in FIFO order. Each task gets up to maxRounds \
+                rounds: the first round sends the prompt, later rounds continue the same session \
+                (--continue --resume) while the model reports unfinished todos. The host must be \
+                running. Requires an interactive approval card and a configured workspace. \
+                Returns the new task id; use TaskList / TaskCancel to inspect or cancel it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Self-contained task instruction (1..8000 chars)" },
+                    "maxRounds": { "type": "integer", "description": "Continuation rounds, 1..20 (default 5)" }
+                },
+                "required": ["prompt"]
+            }
+        }),
+        json!({
+            "name": "TaskList",
+            "description": "List queued background tasks from the local task queue, including \
+                status (pending / running / done / failed / cancelled), round, sessionId, summary \
+                and error. Read-only and local; prompts are truncated to their first 200 \
+                characters. Always returns JSON text; a missing or corrupt store is reported \
+                with an explicit reason instead of throwing.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "includeFinished": { "type": "boolean", "description": "Include done / failed / cancelled tasks (default true)" }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "TaskCancel",
+            "description": "Cancel a queued background task by id. Only pending tasks can be \
+                cancelled; a running task is rejected (let it finish or wait for the host to \
+                stop). Idempotent: cancelling an already-cancelled id succeeds. No approval is \
+                needed, but it is a write and is rejected in read-only (plan) mode.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id, as returned by TaskEnqueue or TaskList" }
+                },
+                "required": ["id"]
+            }
+        }),
+        // `ImageMeasure`（§待办 3-19 第一步，2026-10-30）：**别猜像素坐标**。
+        // 2026-10-27/29 的「四杯照片标尺寸」会话里，模型 12 轮都在写 PowerShell 采样脚本猜坐标；
+        // 这一件把「量」变成一次确定性调用，描述里刻意写死「先量再画」的用法。
+        json!({
+            "name": "ImageMeasure",
+            "description": "Measure a local image deterministically instead of estimating pixel \
+                coordinates. Returns the image size, the foreground bounding box (pixels whose \
+                luma is below `threshold`, optionally limited to `region`), the first/last \
+                foreground pixel on requested rows / columns, and optionally an ASCII thumbnail. \
+                Use it BEFORE drawing or reporting any coordinates: measure the edges here, then \
+                pass exact numbers on. Numbers are absolute pixels of the decoded image; rows are \
+                y, columns are x, and bbox.right / bbox.bottom are inclusive. Read-only and local.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Absolute or workspace-relative path to a png / jpeg / gif / bmp / webp file" },
+                    "threshold": { "type": "integer", "description": "0-255. Pixels darker than this count as foreground (default 128)" },
+                    "region": {
+                        "type": "object",
+                        "description": "Optional sub-rectangle to measure; clipped to the image",
+                        "properties": {
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" },
+                            "width": { "type": "integer" },
+                            "height": { "type": "integer" }
+                        }
+                    },
+                    "scan_rows": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Row (y) indexes to report first/last foreground x on (max 32)"
+                    },
+                    "scan_cols": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Column (x) indexes to report first/last foreground y on (max 32)"
+                    },
+                    "ascii_columns": { "type": "integer", "description": "Include an ASCII thumbnail this many characters wide (8-200)" }
+                },
+                "required": ["file_path"]
+            }
+        }),
+        // `ImageAnnotate`（§待办 3-19 第二步，2026-10-30）：**别手写绘图脚本**。
+        // 描述里刻意把「先 ImageMeasure 再画」「坐标越界会被拒」「画完 Read 回来看」写成用法，
+        // 因为 2026-10-27/29 那次会话的病根就是模型拿不到确定的像素、只能反复猜。
+        json!({
+            "name": "ImageAnnotate",
+            "description": "Draw dimension lines, extension lines, arrows and text (including \
+                Chinese) onto a local image from a declarative spec, and save the result as PNG. \
+                The tool does the drawing; you only supply coordinates in image pixels. \
+                Workflow: (1) call ImageMeasure first to get exact edges, (2) send a spec here, \
+                (3) Read the returned output file to look at it, (4) only tweak numbers that are \
+                visibly wrong. Items are drawn in array order (later items paint on top). \
+                Coordinates outside the image are rejected with the real image size, so no silent \
+                clipping. Writes a new PNG (source is never overwritten) and reports every resolved \
+                coordinate, so results can be re-checked with ImageMeasure.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Source image (png / jpeg / gif / bmp / webp), absolute or workspace-relative" },
+                    "output_path": { "type": "string", "description": "PNG to write. Defaults to <source stem>.annotated.png beside the source" },
+                    "font_family": { "type": "string", "description": "System font name for text; defaults to Microsoft YaHei, then SimHei / SimSun / Arial" },
+                    "items": {
+                        "type": "array",
+                        "description": "Drawing items, painted in this order (max 200)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "enum": ["line", "dimension", "arrow", "text"], "description": "line = plain line (use for extension lines); dimension = dimension line with arrows and an optional label; arrow = single-headed leader; text = free text" },
+                                "from": { "type": "object", "description": "Start point in image pixels (line / dimension / arrow)", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] },
+                                "to": { "type": "object", "description": "End point in image pixels (line / dimension / arrow)", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] },
+                                "at": { "type": "object", "description": "Anchor point: required for text; optional for a dimension label (default = midpoint, offset along the normal)", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] },
+                                "text": { "type": "string", "description": "Text body (text) or label (dimension)" },
+                                "color": { "type": "string", "description": "#RGB / #RRGGBB / #RRGGBBAA (alpha last, CSS order). Default #FF3B30" },
+                                "width": { "type": "number", "description": "Stroke width in px, 0.5-64 (default 2)" },
+                                "arrow": { "type": "string", "enum": ["none", "start", "end", "both"], "description": "Which ends get arrow heads; default both for dimension, end for arrow, none for line" },
+                                "arrow_dir": { "type": "string", "enum": ["out", "in"], "description": "out = tip at the endpoint, triangle body inside the line (drafting standard); in = triangle drawn outside the endpoint" },
+                                "arrow_size": { "type": "number", "description": "Arrow head length in px, 4-200 (default 14)" },
+                                "size": { "type": "number", "description": "Font size in px for text / labels, 6-400 (default 20)" },
+                                "align": { "type": "string", "enum": ["left", "center", "right"], "description": "Horizontal alignment against the anchor; vertical is always centered (default center for labels, left for text)" },
+                                "label_offset": { "type": "number", "description": "Dimension label offset along the line normal (-dy, dx); negative puts it above a left-to-right horizontal line (default -14)" },
+                                "bg": { "type": "string", "description": "Optional background box behind the text, same color syntax (use #00000080 for a translucent dark plate)" },
+                                "pad": { "type": "number", "description": "Background box padding in px (default 4)" }
+                            },
+                            "required": ["type"]
+                        }
+                    }
+                },
+                "required": ["file_path", "items"]
+            }
+        }),
+        // `Screenshot`（§待办 3-28.5 第一步，2026-11-16）：**别再拼截图脚本**。
+        // 2026-11-01 的手柄图会话里，模型只能现写 headless 浏览器 / PowerShell 截图，
+        // 同一张图出了十几版；这一件把「抓一帧」变成一次确定性调用。
+        json!({
+            "name": "Screenshot",
+            "description": "Capture the screen to a PNG file and return its path + pixel size. Use it \
+                instead of writing headless-browser or PowerShell screenshot scripts. \
+                mode=screen (default) captures the whole virtual desktop (all monitors merged); \
+                mode=rect captures rect {x,y,width,height} in PHYSICAL screen pixels (negative \
+                origins are allowed and clipped to the screen). The PNG goes to \
+                <system temp>/lunac/shots/ and never into the workspace. Requires approval \
+                because it reads the user's screen. DRM-protected windows come out black; \
+                per-window capture is not implemented.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "enum": ["screen", "rect"], "description": "screen = whole virtual desktop (default); rect = the rectangle below" },
+                    "rect": {
+                        "type": "object",
+                        "description": "Required for mode=rect; physical screen pixels",
+                        "properties": {
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" },
+                            "width": { "type": "integer" },
+                            "height": { "type": "integer" }
+                        },
+                        "required": ["x", "y", "width", "height"]
+                    }
+                }
+            }
+        }),
+        // `ImageDiff`（§待办 3-28.5 第二步，2026-11-16）：视觉回归 = 固定镜头 + golden + diff。
+        // 只读两张本地图片，给可复算的数字；**尺寸不同直接报错**（绝不缩放对齐）。
+        json!({
+            "name": "ImageDiff",
+            "description": "Compare two local images pixel by pixel for visual regression (golden vs \
+                actual). Returns width/height, differentPixels, percent, meanAbsDiff (0-255), the \
+                bounding box of the differing pixels, and up to 32 sample points. Both images must \
+                have the same size: the tool never scales, because scaling can hide an overall \
+                offset. Render goldens with a fixed viewport and device scale factor. \
+                Read-only and local.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "golden": { "type": "string", "description": "Path to the reference image (png / jpeg / gif / bmp / webp)" },
+                    "actual": { "type": "string", "description": "Path to the image under test" },
+                    "threshold": { "type": "integer", "description": "0-255. Per-channel difference above this counts as different (default 0)" }
+                },
+                "required": ["golden", "actual"]
+            }
+        }),
     ];
 
     all.into_iter()
@@ -863,10 +1271,13 @@ pub fn names(tools: &[Value]) -> Vec<String> {
 ///   ② `subagent_tool_defs()` 要把它们剔掉（子代理不接桥 ⇒ 留着就是保证失败）；
 ///   ③ 启动时的条件注册。
 /// **新增这类工具只改这个数组**，别在三处分别硬编码字符串。
-pub const BRIDGE_TOOLS: [&str; 9] = [
+pub const BRIDGE_TOOLS: [&str; 11] = [
     "SessionSearch",
     // 长期记忆的只读检索（§待办 3-9 B 项，2026-10-17）：走 `lunac/memory_read`，只读。
     "MemorySearch",
+    // 资源库来源（A5，2026-10-18）：读列表 / 安装一条都走宿主（来源目录在宿主侧）。
+    "ResourceHubSearch",
+    "SourceInstall",
     "ListMcpResourcesTool",
     "ReadMcpResourceTool",
     "ListMcpPromptsTool",
@@ -910,9 +1321,44 @@ pub fn remember_tool() -> Value {
                 "replace": {
                     "type": "boolean",
                     "description": "Replace the ENTIRE memory with `content` instead of appending. Only for consolidating/rewriting when the memory is full or messy."
+                },
+                "page": {
+                    "type": "string",
+                    "description": "Optional page to file this fact under (lowercase slug: letters / digits / - / _, e.g. \"build\" or \"env\"). Pages are read back together with the main memory under a `## <page>` heading; they are a grouping device only. Omit to use the single default memory. With replace=true, only that page is replaced."
                 }
             },
             "required": ["content"]
+        }
+    })
+}
+
+/// `RunScript` 的 schema（§待办 3-28.15 PTC / Code Mode）。**不进 `defs()`** —— 由
+/// `main.rs` 在 `LUNAC_PTC=on` 时条件追加；默认关着时模型根本看不到它。
+///
+/// 只绑定**只读**三件（`Read` / `Glob` / `Grep`）：一次 `tool_use` 里把「读 A、读 B、
+/// 读 C 再合并」压成一次模型往返。写类 / 命令类 / 网络类**刻意不绑定** —— 程序里第 N 次
+/// 调用没法在当下弹审批卡（docs/ptc-research.md §3.4）。
+pub fn run_script_tool() -> Value {
+    json!({
+        "name": "RunScript",
+        "description": "Run a short JavaScript program that calls READ-ONLY tools in a loop \
+            and returns only what you print. Use it when a task needs many Read / Glob / Grep \
+            calls whose results you would otherwise have to copy between steps: one script \
+            replaces many round-trips. Available bindings: `lunac.read(path, {offset, limit})`, \
+            `lunac.glob(pattern, {path})`, `lunac.grep(pattern, {path, glob})` — each returns the \
+            tool's text. Use `console.log(...)` for the result you want back; only that output \
+            is returned (plus a per-call trace). No filesystem / network / require access. \
+            Hard limits: 50 tool calls, 60 seconds, 256 KiB of intermediate text; exceeding any \
+            of them aborts the script and reports why.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "JavaScript source to run (max 20,000 chars). Call the `lunac` bindings and print with `console.log`."
+                }
+            },
+            "required": ["code"]
         }
     })
 }
@@ -1090,6 +1536,9 @@ pub fn needs_approval(name: &str) -> bool {
             | "PowerShell"
             | "WebSearch"
             | "WebFetch"
+            // `WebBrowser`（2026-10-23）**要问**：与 `WebFetch` 同判据 —— 它是**外部数据出口**
+            // （浏览器会把 URL / 页面里的凭据带出去），只是把「取页面」换成了「跑 JS 再取」。
+            | "WebBrowser"
             | "AskUserQuestion"
             // `Remember` **要问**：它写的是**跨会话长期记忆**，而记忆会在用户没看见的
             // 时候被注入以后的每一次对话 —— 副作用比「改一个文件」更持久。
@@ -1126,6 +1575,40 @@ pub fn needs_approval(name: &str) -> bool {
             // [`gated_in_read_only`]（只读档该拒、而不是「问了再做」）。
             | "EnterWorktree"
             | "ExitWorktree"
+            // `ImageAnnotate`（§待办 3-19 第二步，2026-10-30）**要问**：它是**写类** ——
+            // 在磁盘上生成一张新 PNG。判据与 `Write` 完全相同（那正是它做的事，只是内容
+            // 由 GDI+ 画出来），只读档 / 计划相位下由 [`write_blocked`] 直接拒。
+            // ⚠️ 与它成对的 `ImageMeasure` **刻意不在这里**：那件只读一个本地图片、
+            // 纯 CPU 算像素，与 `Read` 同级（与 `SendUserFile` 同一条判据）。
+            | "ImageAnnotate"
+            // `Screenshot`（§待办 3-28.5，2026-11-16）**要问**：它读的是**用户的屏幕**（隐私），
+            // 与 `WebFetch` 同一条判据 —— 数据可能包含聊天窗口 / 密码框 / 其他应用的内容。
+            // 与 `ImageMeasure` 的区别：后者只读一个用户明确指定的文件；抓屏是「把眼前的一切拍下来」。
+            // 产物只落系统临时目录，不写工作区 ⇒ 不进 `write_blocked`，但要进
+            // `gated_in_read_only`（计划相位也会问）。
+            | "Screenshot"
+            // `CronCreate`（2026-10-17 阶段 1）**必须问**：它持续产生 API 调用（成本副作用）
+            // 并写持久化文件；而且用户已裁定「所有运行模式都强制弹卡（不因自动档跳过）」。
+            // 单发 / `--dangerously-skip-permissions` 路径另有一道硬拒绝（见 main.rs 的
+            // `dispatch_tool`），不靠这里单独兜住。
+            // `CronDelete` **刻意不在这里**（免审批）：它只删一条本地定义，幂等；
+            // 只读档仍由 `write_blocked` 拒（见 `run()`）。
+            | "CronCreate"
+            // `TaskEnqueue`（2026-10-22，S2 通用任务队列）：与 CronCreate 同判据 ——
+            // 它会让宿主在后台持续花 API 钱，用户必须在卡上明确同意。
+            | "TaskEnqueue"
+            // 资源库来源（A5，2026-10-18）：
+            //   · `SourceInstall` 要问 —— 写持久文件（用户资产），与 `Remember` 同判据；
+            //   · `SourceDiagnose` 要问 —— 它向来源站点发一次真实请求（外部数据出口，
+            //     与 `WebFetch` 同判据）；
+            //   · `SourceValidate` / `ResourceHubSearch` 都是纯本地读，**不问**。
+            | "SourceInstall"
+            | "SourceDiagnose"
+            // `RunScript`（§待办 3-28.15 PTC）**必须问**：它跑的是**模型写的代码**。
+            // 绑定表只有只读三件（脚本内部的每一次调用都免审批），但「批准这段脚本」
+            // 终究是用户对「一段程序要在我的机器上跑」的裁决 —— 与 `Agent` 同型：
+            // 外层这次卡就是唯一的裁决点，卡上带着完整脚本正文。
+            | "RunScript"
     )
 }
 
@@ -1152,12 +1635,27 @@ pub fn needs_approval(name: &str) -> bool {
 /// 只读（plan）档下**仍需**审批的工具。
 ///
 /// 只读档对写类工具免于询问，是因为它们会被 `run()` 直接拒绝（问了白问）。
-/// 下面这三件在只读档是**放行**的，且都必须经过前端交互：
+/// 下面这几件在只读档是**放行**的，且都必须经过前端交互：
 ///   · `WebSearch` —— 会把查询词发往外部搜索源
-///   · `WebFetch` —— 唯一的外部数据出口（`Read` 到的文件内容能拼进 URL 带出）
+///   · `WebFetch` —— 外部数据出口（`Read` 到的文件内容能拼进 URL 带出）
+///   · `WebBrowser`（2026-10-23）—— 同 `WebFetch` 的外部出口，只是先跑 JS 再取页面；
+///     它只写一个用完即删的临时浏览器 profile，不改用户文件
 ///   · `AskUserQuestion` —— 交互就是它的功能；不问等于拿不到答案
 pub fn gated_in_read_only(name: &str) -> bool {
-    matches!(name, "WebSearch" | "WebFetch" | "AskUserQuestion")
+    matches!(
+        name,
+        "WebSearch"
+            | "WebFetch"
+            | "WebBrowser"
+            | "AskUserQuestion"
+            // `Screenshot`（§待办 3-28.5，2026-11-16）：抓屏是**读用户屏幕**（隐私），
+            // 不是「改本机」—— 计划相位不该因为它不是写类就静默放行。
+            | "Screenshot"
+            // `RunScript`（§待办 3-28.15）：只读绑定在只读档也确实无害，但它是**模型写的代码**，
+            // 与 `Agent` 同一条纪律 —— 「跑一段程序」这个决定在全档位都要用户点头；
+            // 只读档若静默放行，等于把唯一的裁决点也省掉了。
+            | "RunScript"
+    )
 }
 
 /// 该工具是否**只读且互不干扰** —— 可以与其他只读工具**并行**执行（见 main.rs
@@ -1190,9 +1688,18 @@ pub fn parallel_safe(name: &str) -> bool {
     matches!(
         name,
         "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "TodoWrite"
+        // `ImageMeasure`（§待办 3-19，2026-10-30）：纯读一个本地图片文件 + 纯 CPU 统计，
+        // 不写盘、不发请求，也不依赖别的调用的先后 ⇒ 收进白名单。
+        | "ImageMeasure"
+        // `ImageDiff`（§待办 3-28.5，2026-11-16）：只读两张本地图片 + 纯 CPU 比对，
+        // 不写盘、不发请求 ⇒ 与 `ImageMeasure` 同级，收进白名单。
+        // `Screenshot` **刻意不收**：它读的是实时屏幕，两张并发抓帧只会互相干扰。
+        | "ImageDiff"
         // `PetControl`（桌宠动作，2026-10-10）：agent 侧无副作用（效果全在前端广播），
         // 与 `TodoWrite` 同级 ⇒ 收进白名单（前端按到达顺序执行，动作不会乱序）。
         | "PetControl"
+        // `Preview`（预览窗标签，2026-11-14）：同样只发前端事件，不碰本机。
+        | "Preview"
         // `ListPeers`（A13，2026-10-05）：纯读进程内的 peer 登记处，不写盘、不发请求 ⇒
         // 收进白名单。`SendMessage` **刻意不收** —— 它会改共享的收件箱（有副作用），
         // 与白名单「只收纯读工具」的口径不符。
@@ -1213,6 +1720,19 @@ pub fn parallel_safe(name: &str) -> bool {
 pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
     match name {
         "Read" => read(ctx, input),
+        // `ImageMeasure`（§待办 3-19 第一步，2026-10-30）：确定性像素测量。
+        // 只读 / 本地 / 免审批（不进 `needs_approval` / `gated_in_read_only`）。
+        "ImageMeasure" => crate::image_measure::run(ctx, input),
+        // `ImageAnnotate`（§待办 3-19 第二步，2026-10-30）：按规格 JSON 画线 / 箭头 / 中文文本。
+        // **写类** —— 要审批（见 `needs_approval`），只读档 / 计划相位由 `resolve_write_path`
+        // 里的 `write_blocked` 直接拒；不进并行白名单。
+        "ImageAnnotate" => crate::image_annotate::run(ctx, input),
+        // `Screenshot`（§待办 3-28.5，2026-11-16）：抓虚拟桌面 / 像素矩形 → PNG 到临时目录。
+        // **要审批**（隐私），计划相位也问（见 `needs_approval` / `gated_in_read_only`）；
+        // 不写工作区，所以不走 `write_blocked`。
+        "Screenshot" => crate::screenshot::run(ctx, input),
+        // `ImageDiff`（§待办 3-28.5，2026-11-16）：golden 图逐像素比对，只读免审批。
+        "ImageDiff" => crate::image_diff::run(ctx, input),
         "Write" => write(ctx, input),
         "Edit" => edit(ctx, input),
         // NotebookEdit（2026-10-11）：写类 —— 按 cell 编辑 `.ipynb`，拦法与 `Edit` 同源。
@@ -1223,11 +1743,22 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "Grep" => grep(ctx, input),
         "WebSearch" => web_search(input),
         "WebFetch" => webfetch(input),
+        // WebBrowser（2026-10-23，A13 最后一项）：**外部网络出口** —— 起本机无头 Edge/Chrome
+        // 渲染一次、取跑完 JS 的 DOM。写盘只有一次性临时 profile（用完即删）；要审批、
+        // 只读档也要问（见 `needs_approval` / `gated_in_read_only`）。
+        "WebBrowser" => crate::webbrowser::run(input),
         "AskUserQuestion" => ask_user_question(input),
         "TodoWrite" => todo_write(input),
+        // PTC / Code Mode（§待办 3-28.15）：一次跑完多次只读调用。只读绑定 + 硬预算
+        // 在 `ptc.rs` 里；外层审批在 `needs_approval`。开关关着时它不在工具表里，
+        // 但这里仍保留分支 —— 手工构造的调用会走进 `ptc::run` 自己那道预算与白名单。
+        "RunScript" => crate::ptc::run(ctx, input),
         // PetControl（桌宠动作，2026-10-10）：**不碰本机、不落盘、免审批** —— agent 侧只回一句
         // 回执，真正的效果由前端执行（见 `pet_control` 的函数注释）。
         "PetControl" => pet_control(input),
+        // Preview（预览窗标签，2026-11-14）：与 `PetControl` 同型 —— 效果全在前端，
+        // 结构化载荷由 main.rs 发成 `system/preview_open`。
+        "Preview" => preview_tab(input),
         // 多代理通信（A13，2026-10-05）：**无本机副作用** —— 只读写进程内的 peer 登记处，
         // 因此免审批、只读档放行（`needs_approval` / `gated_in_read_only` 里都没有它们）。
         "ListPeers" => list_peers(input),
@@ -1240,6 +1771,36 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         // RepoMap（2026-10-14）：**只读、本地、免审批** —— 它只读工作区里的源文件、回一张
         // 符号骨架；不写盘、不发请求。按需调用 ⇒ 不进固定前缀（见下方实现段注释）。
         "RepoMap" => repo_map(ctx, input),
+        // LSP（2026-10-23，A13 剩余能力）：**只读、本地、免审批** —— 起本机语言服务器取
+        // 一个文件的诊断。不写用户文件、不发网络请求；没装服务器时回 JSON（reason=no-server），
+        // 不抛硬错误（见 `lsp.rs` 文件头）。
+        "LSP" => crate::lsp::run(ctx, input),
+        // CronCreate / CronDelete（2026-10-17 阶段 1）：都写 `<LUNAC_CRON_DIR>\cron.json`，
+        // 只读档 / 计划相位下按写类直接拒（与 `Write` 同源）。`CronCreate` 还需要用户审批
+        // （见 `needs_approval`）；`CronDelete` 免审批（幂等，只删本地定义）。
+        "CronCreate" => match write_blocked(ctx, "CronCreate") {
+            Some(why) => Err(why),
+            None => cron_create(ctx, input),
+        },
+        "CronDelete" => match write_blocked(ctx, "CronDelete") {
+            Some(why) => Err(why),
+            None => cron_delete(input),
+        },
+        // CronList（2026-10-17 阶段 0/1）：**只读、免审批** —— 只读 `LUNAC_CRON_DIR` 下的
+        // `cron.json` + `cron-state.json` 并合并；不写盘、不触发任何执行。输出恒为 JSON 文本。
+        "CronList" => cron_list(input),
+        // TaskEnqueue / TaskCancel / TaskList（2026-10-22，S2 通用任务队列）：
+        // 前两件是写类（只读档 / 计划相位按写类直接拒），TaskEnqueue 还要审批卡；
+        // TaskList 只读、免审批。
+        "TaskEnqueue" => match write_blocked(ctx, "TaskEnqueue") {
+            Some(why) => Err(why),
+            None => task_enqueue(ctx, input),
+        },
+        "TaskCancel" => match write_blocked(ctx, "TaskCancel") {
+            Some(why) => Err(why),
+            None => task_cancel(input),
+        },
+        "TaskList" => task_list(input),
         // ImageGen（A13，2026-10-03）：**写类** —— 它往 `temp\images\` 落图。
         // 只读档 / 计划相位的拦法与 Write 同源（`write_blocked`），但**不**进
         // `gated_in_read_only`：只读档下它该被**拒绝**，而不是「问了再做」。
@@ -1493,7 +2054,7 @@ pub fn parse_deny_read_dirs(raw: &str) -> Vec<PathBuf> {
 /// ⚠️ **策略级路径闸，不是沙箱**：只拦 `Read` / `Glob` / `Grep`；`Cmd` / `PowerShell` 仍能读到
 /// （刻意不解析 shell 命令行，见 [`path_arg_kind`] 的注释）、符号链接 / junction 也能绕过
 /// （词法比较不解析链接）。见 `forbidden.md` §禁用 1.1。
-fn guard_read(ctx: &Ctx, path: &Path) -> Result<(), String> {
+pub(crate) fn guard_read(ctx: &Ctx, path: &Path) -> Result<(), String> {
     if let Some(root) = in_deny_read_dirs(&ctx.deny_read_dirs, path) {
         return Err(format!(
             "Access denied: {} is inside a read-blocked directory ({})",
@@ -1502,6 +2063,33 @@ fn guard_read(ctx: &Ctx, path: &Path) -> Result<(), String> {
         ));
     }
     guard(ctx, path)
+}
+
+/// LSP 工具用：**解析路径 + 读类闸**（与 `Read` 完全同源 —— 不新造第二套归一 / 越界判断，
+/// 否则「读禁目录」这类闸会在新工具上漏掉）。
+pub(crate) fn resolve_read_path(ctx: &Ctx, raw: &str) -> Result<PathBuf, String> {
+    let path = resolve(ctx, raw);
+    guard_read(ctx, &path)?;
+    Ok(path)
+}
+
+/// 写类工具用：**解析路径 + 写档位闸 + 越界闸**（与 `Write` 同源，见 [`write_blocked`] / [`guard`]）。
+///
+/// `what` 只进拒绝文案（模型要知道是哪一件被禁了）。新增「写一个用户指定路径」的工具
+/// 一律走这里，别各自抄一份 `write_blocked` + `guard` —— 抄漏一处就是一条绕过只读档的旁路。
+pub(crate) fn resolve_write_path(ctx: &Ctx, what: &str, raw: &str) -> Result<PathBuf, String> {
+    if let Some(why) = write_blocked(ctx, what) {
+        return Err(why);
+    }
+    let path = resolve(ctx, raw);
+    guard(ctx, &path)?;
+    Ok(path)
+}
+
+/// LSP 工具用：语言服务器的**根目录**（进了 worktree 就是它，否则是工作区根 —— 与相对路径
+/// 解析、Glob / Grep 默认根同一条口径，见 [`effective_cwd`]）。
+pub(crate) fn lsp_root(ctx: &Ctx) -> PathBuf {
+    effective_cwd(ctx)
 }
 
 // ── Read ─────────────────────────────────────────────────────────
@@ -1526,7 +2114,7 @@ fn read(ctx: &Ctx, input: &Value) -> Result<String, String> {
     }
 
     let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    // 图片不能按 UTF-8 读 —— PNG/JPEG 会变成一整片 `�PNG…` 乱码（2026-10-05 用户报的问题）。
+    // 图片不能按 UTF-8 读 —— PNG/JPEG 会变成一整片乱码（2026-10-05 用户报的问题）。
     // 只贴「哨兵 + 绝对路径」，图片本身由 `main.rs` 的 `tool_result_block` 换成 image 块
     // 交给视觉模型（复用 A8 的魔术字节判定与体积上限，见 `IMAGE_SENTINEL`）。
     if let Some(media) = crate::image_media_type(&bytes) {
@@ -1556,12 +2144,37 @@ fn read(ctx: &Ctx, input: &Value) -> Result<String, String> {
 
     let mut out = String::new();
     for (i, line) in lines[start..end].iter().enumerate() {
-        out.push_str(&format!("{}\t{}\n", start + i + 1, line));
+        out.push_str(&format!(
+            "{}\t{}\n",
+            start + i + 1,
+            clip_line(line, MAX_LINE_CHARS)
+        ));
     }
     if out.is_empty() {
         out = format!("(empty file: {} lines total)", lines.len());
     }
     Ok(out)
+}
+
+// ── 写类工具的按路径互斥（2026-11-15）────────────────────────────────
+//
+// 为什么需要：主循环里写类工具是**串行**的（`parallel_safe` 不含 Write / Edit /
+// NotebookEdit），但**并行子代理**（最多 3 个，`SUBAGENT_PARALLELISM`）可以同时写同一个
+// 文件 —— 典型丢更新：两个子代理各读一遍、各改一处，后写的把先写的覆盖掉。
+// 这里按「规范化小写路径」哈希到 64 个分片锁之一：同文件必串行，不同文件互不影响。
+const WRITE_LOCK_SHARDS: usize = 64;
+
+fn write_lock_for(path: &Path) -> &'static Mutex<()> {
+    static SHARDS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+    let shards = SHARDS.get_or_init(|| (0..WRITE_LOCK_SHARDS).map(|_| Mutex::new(())).collect());
+    // 小写化：Windows 路径大小写不敏感，`C:\A.rs` 与 `c:\a.rs` 必须是同一把锁。
+    let key = path.to_string_lossy().to_lowercase();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    &shards[(hash as usize) % WRITE_LOCK_SHARDS]
 }
 
 // ── Write ────────────────────────────────────────────────────────
@@ -1583,13 +2196,49 @@ fn secret_note(text: &str) -> String {
     )
 }
 
+/// 写入前的编码闸（2026-11-05，§待办 1-17 第 5 条）。
+///
+/// 两个真实故障：
+///   · PowerShell 生成的 tweak 带 UTF-8 BOM，TweakXL 在 `1:1` 报 `Expected group name`，
+///     整份静默跳过 ⇒ 连续五轮「正常」作废；
+///   · `neck-ab.cmd` 是 UTF-8 无 BOM，`cmd.exe` 按系统代码页 936 解码中文注释，
+///     `if (...) else (...)` 解析崩溃、`ren` 一次都没执行，窗口一闪而过。
+///
+/// 规则：任何写入一律去掉开头的 BOM；`.cmd` / `.bat` 的正文必须是纯 ASCII，
+/// 否则直接拒绝，并告诉模型把逻辑放进 `.mjs` / `.ps1`、`.cmd` 只留一行 ASCII 壳。
+fn normalize_write_content(path: &Path, content: &str) -> Result<String, String> {
+    let mut text = content;
+    if let Some(stripped) = text.strip_prefix('\u{feff}') {
+        text = stripped;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "cmd" | "bat") {
+        if let Some((i, ch)) = text.char_indices().find(|(_, c)| !c.is_ascii()) {
+            return Err(format!(
+                "Refusing to write non-ASCII content to {}: cmd.exe decodes .cmd/.bat with the \
+                 system code page (936 here), so Chinese text breaks `if (...) else (...)` blocks \
+                 and the file silently does nothing. Put the logic in a .mjs or .ps1 file and keep \
+                 the .cmd as a one-line ASCII wrapper (first non-ASCII char at byte {i}: {ch:?}).",
+                path.display()
+            ));
+        }
+    }
+    Ok(text.to_string())
+}
+
 fn write(ctx: &Ctx, input: &Value) -> Result<String, String> {
     if let Some(why) = write_blocked(ctx, "Write") {
         return Err(why);
     }
     let path = resolve(ctx, &str_arg(input, "file_path")?);
     guard(ctx, &path)?;
-    let content = str_arg(input, "content")?;
+    // 与并行子代理按文件互斥（见 `write_lock_for`）：整段写盘期间持有，覆盖「建目录 + 写」。
+    let _write_guard = write_lock_for(&path).lock().unwrap_or_else(|e| e.into_inner());
+    let content = normalize_write_content(&path, &str_arg(input, "content")?)?;
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1612,6 +2261,8 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     }
     let path = resolve(ctx, &str_arg(input, "file_path")?);
     guard(ctx, &path)?;
+    // 读-改-写整段持锁（丢更新的就是这一段），与 `Write` 同一把分片锁。
+    let _write_guard = write_lock_for(&path).lock().unwrap_or_else(|e| e.into_inner());
 
     let old = str_arg(input, "old_string")?;
     if old.is_empty() {
@@ -1640,6 +2291,8 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     } else {
         text.replacen(&old, &new, 1)
     };
+    // 与 Write 同一道编码闸：编辑后的全文也不得带 BOM，`.cmd` / `.bat` 不得含非 ASCII。
+    let updated = normalize_write_content(&path, &updated)?;
     fs::write(&path, updated.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(format!(
         "Edited {}: replaced {count} occurrence(s){}",
@@ -1674,6 +2327,8 @@ fn notebook_edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     }
     let path = resolve(ctx, &str_arg(input, "notebook_path")?);
     guard(ctx, &path)?;
+    // 读-改-写整段持锁（与 `Write` / `Edit` 同一把分片锁）。
+    let _write_guard = write_lock_for(&path).lock().unwrap_or_else(|e| e.into_inner());
 
     let mode = match input.get("edit_mode").and_then(Value::as_str).unwrap_or("replace") {
         "replace" => NotebookMode::Replace,
@@ -2299,6 +2954,117 @@ impl Utf8Carry {
     }
 }
 
+// ── 只读扫描缓存（§待办 1-17 第 6 条，2026-11-05）──────────────────
+//
+// 为什么要它：同一份目录在单会话里被重复全量扫描，是「单日 665 次 PowerShell /
+// 71M 命中 token」的主要来源。`Grep` / `RepoMap` 是仅有的两个**会把每个文件读进
+// 内存**的只读工具 —— 参数相同且文件系统没变时，应当复用上次结果，而不是再读一遍。
+//
+// 失效判据不是 TTL，而是文件系统事实（mtime + 长度）：
+//   · 目录 mtime 变 = 有增 / 删 / 改名 ⇒ 整条缓存作废（新文件不会漏掉）；
+//   · 文件 mtime 或长度变 = 内容变了 ⇒ 整条缓存作废。
+// 任一不成立就重扫 —— 宁可多扫一次，也不返回过期结果。
+//
+// 缓存只在**进程内**（会话期间有效）、最多 `SCAN_CACHE_MAX` 条；只存最终文本。
+// 命中有日志 `scan-cache hit`，排障时能直接回答「这一轮到底扫没扫盘」。
+const SCAN_CACHE_MAX: usize = 8;
+
+struct ScanStamp {
+    dirs: Vec<(PathBuf, SystemTime)>,
+    files: Vec<(PathBuf, SystemTime, u64)>,
+}
+
+impl ScanStamp {
+    fn capture(dirs: &[PathBuf], files: &[PathBuf]) -> Self {
+        let mut stamp = Self {
+            dirs: Vec::with_capacity(dirs.len()),
+            files: Vec::with_capacity(files.len()),
+        };
+        for d in dirs {
+            if let Some(t) = fs::metadata(d).and_then(|m| m.modified()).ok() {
+                stamp.dirs.push((d.clone(), t));
+            }
+        }
+        for f in files {
+            if let Ok(meta) = fs::metadata(f) {
+                if let Ok(t) = meta.modified() {
+                    stamp.files.push((f.clone(), t, meta.len()));
+                }
+            }
+        }
+        stamp
+    }
+
+    fn is_current(&self) -> bool {
+        for (d, want) in &self.dirs {
+            let got = fs::metadata(d).and_then(|m| m.modified()).ok();
+            if got.as_ref() != Some(want) {
+                return false;
+            }
+        }
+        for (f, want_t, want_len) in &self.files {
+            let Ok(meta) = fs::metadata(f) else { return false };
+            let got_t = meta.modified().ok();
+            if got_t.as_ref() != Some(want_t) || meta.len() != *want_len {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+struct ScanCacheEntry {
+    key: String,
+    output: String,
+    stamp: ScanStamp,
+}
+
+fn scan_cache() -> &'static Mutex<Vec<ScanCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Vec<ScanCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 命中返回上次输出；已失效的条目顺手淘汰。
+///
+/// 2026-11-15：`is_current()` 会对 stamp 里的**每个目录、每个文件**做 `fs::metadata`
+/// （大仓库上万次）。原实现全程持锁 ⇒ 4 路并行 `Grep` 实际被串行化。现在先摘出条目、
+/// 释放锁，再校验；校验期间若有别的线程放进同 key 的新条目，保留新的那条。
+fn scan_cache_get(key: &str) -> Option<String> {
+    let entry = {
+        let mut cache = scan_cache().lock().ok()?;
+        let pos = cache.iter().position(|e| e.key == key)?;
+        cache.remove(pos)
+    };
+    if !entry.stamp.is_current() {
+        return None;
+    }
+    let out = entry.output.clone();
+    if let Ok(mut cache) = scan_cache().lock() {
+        if cache.iter().any(|e| e.key == key) {
+            return Some(out);
+        }
+        cache.insert(0, entry);
+        cache.truncate(SCAN_CACHE_MAX);
+    }
+    Some(out)
+}
+
+fn scan_cache_put(key: String, output: &str, stamp: ScanStamp) {
+    let Ok(mut cache) = scan_cache().lock() else {
+        return;
+    };
+    cache.retain(|e| e.key != key);
+    cache.insert(
+        0,
+        ScanCacheEntry {
+            key,
+            output: output.to_string(),
+            stamp,
+        },
+    );
+    cache.truncate(SCAN_CACHE_MAX);
+}
+
 // ── Glob ─────────────────────────────────────────────────────────
 
 fn glob(ctx: &Ctx, input: &Value) -> Result<String, String> {
@@ -2367,32 +3133,53 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
         .build()
         .map_err(|e| format!("bad regex: {e}"))?;
 
+    // 重复扫描复用（§待办 1-17 第 6 条）：key 只由「参数 + 基目录」决定；
+    // 是否仍然有效由 `ScanStamp` 用目录 / 文件 mtime 判定（见文件头的注释）。
+    let cache_key = format!(
+        "grep\u{1f}{pattern}\u{1f}{}\u{1f}{}\u{1f}{ignore_case}",
+        base.display(),
+        filter.as_deref().unwrap_or("")
+    );
+    if let Some(out) = scan_cache_get(&cache_key) {
+        crate::log::info(format!(
+            "scan-cache hit: Grep `{pattern}` @ {}（目录与文件 mtime 未变，跳过重扫）",
+            base.display()
+        ));
+        return Ok(out);
+    }
+
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
     if base.is_file() {
         files.push(base.clone());
     } else {
-        walk(&base, 0, &mut files);
+        walk(&base, 0, &mut files, &mut dirs);
     }
 
     let mut hits: Vec<String> = Vec::new();
-    'files: for file in files {
+    'files: for file in &files {
         if let Some(f) = &filter {
-            if !filter_match(f, &file, &base) {
+            if !filter_match(f, file, &base) {
                 continue;
             }
         }
-        let Ok(meta) = fs::metadata(&file) else { continue };
+        let Ok(meta) = fs::metadata(file) else { continue };
         if meta.len() > MAX_TEXT_BYTES {
             continue;
         }
-        let Ok(bytes) = fs::read(&file) else { continue };
+        let Ok(bytes) = fs::read(file) else { continue };
         if is_binary(&bytes) {
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
         for (i, line) in text.lines().enumerate() {
             if re.is_match(line) {
-                hits.push(format!("{}:{}:{}", file.display(), i + 1, line.trim_end()));
+                hits.push(format!(
+                    "{}:{}:{}",
+                    file.display(),
+                    i + 1,
+                    clip_line(line.trim_end(), MAX_GREP_LINE_CHARS)
+                ));
                 if hits.len() >= MAX_ENTRIES {
                     break 'files;
                 }
@@ -2400,10 +3187,13 @@ fn grep(ctx: &Ctx, input: &Value) -> Result<String, String> {
         }
     }
 
-    if hits.is_empty() {
-        return Ok(format!("No matches for {pattern}"));
-    }
-    Ok(hits.join("\n"))
+    let out = if hits.is_empty() {
+        format!("No matches for {pattern}")
+    } else {
+        hits.join("\n")
+    };
+    scan_cache_put(cache_key, &out, ScanStamp::capture(&dirs, &files));
+    Ok(out)
 }
 
 // ── WebSearch ────────────────────────────────────────────────────
@@ -2419,12 +3209,17 @@ struct SearchHit {
 ///
 /// **不做「猜服务商」**：key 只发给用户明确选中的那一家 —— 猜错等于把密钥递给无关的
 /// 第三方服务器。未选 / 未知一律退回兜底源，并如实说明原因。
+///
+/// 例外是 `Deepseek`：它既是**模型供应商**又是**搜索供应商**，搜索与模型共用同一把 key
+///（`LUNAC_AGENT_TOKEN`）。所以在没配任何搜索服务商时，`web_search` 会走
+/// `vendor_search_target` 直接用它 —— 用户不必为了联网搜索再买一份搜索 API。
 #[derive(Clone, Copy)]
 enum SearchProvider {
     Bocha,
     Tavily,
     Exa,
     Firecrawl,
+    Deepseek,
 }
 
 impl SearchProvider {
@@ -2434,6 +3229,7 @@ impl SearchProvider {
             "tavily" => Some(Self::Tavily),
             "exa" => Some(Self::Exa),
             "firecrawl" => Some(Self::Firecrawl),
+            "deepseek" => Some(Self::Deepseek),
             _ => None,
         }
     }
@@ -2444,12 +3240,49 @@ impl SearchProvider {
             Self::Tavily => "tavily",
             Self::Exa => "exa",
             Self::Firecrawl => "firecrawl",
+            Self::Deepseek => "deepseek",
         }
     }
 }
 
+/// 「模型供应商自带搜索 API」的判据（纯函数，便于单测）。
+///
+/// 命中条件（任一）：`LUNAC_AI_PROVIDER` 是 `deepseek`，或 agent 端点域名是
+/// `api.deepseek.com`（自定义供应商填了 DeepSeek 地址也能识别）。`token` 为空直接不命中
+/// —— 没有 key 的「直连」必然失败，不如老实走无 key 的兜底源。
+///
+/// 当前只有 DeepSeek 提供这种「搜索与模型同一个 key」的官方 API；将来别家（如 xAI /
+/// Gemini grounding）接入时，在这里加分支并复用 `provider_search` 即可。
+fn vendor_search_target(
+    ai_provider: &str,
+    agent_base_url: &str,
+    token: &str,
+) -> Option<(SearchProvider, String)> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let provider = ai_provider.trim().to_ascii_lowercase();
+    let base = agent_base_url.trim().to_ascii_lowercase();
+    if provider == "deepseek" || base.contains("api.deepseek.com") {
+        Some((SearchProvider::Deepseek, token.to_string()))
+    } else {
+        None
+    }
+}
+
+/// 从进程环境读「供应商直连」的目标（宿主注入，见 `commands.rs::agent_envs`）
+fn vendor_search() -> Option<(SearchProvider, String)> {
+    vendor_search_target(
+        &std::env::var("LUNAC_AI_PROVIDER").unwrap_or_default(),
+        &std::env::var("LUNAC_AGENT_BASE_URL").unwrap_or_default(),
+        &std::env::var("LUNAC_AGENT_TOKEN").unwrap_or_default(),
+    )
+}
+
 /// 网页搜索。**主源 + 兜底**，两级都不调用模型：
-///   ① 主源 —— `LUNAC_SEARCH_PROVIDER` 选定的搜索 API（需 `LUNAC_SEARCH_KEY`）
+///   ① 主源 —— `LUNAC_SEARCH_PROVIDER` 选定的搜索 API（需 `LUNAC_SEARCH_KEY`）；
+///      没选服务商时，若**模型供应商自带搜索 API**（DeepSeek），用模型 key 直连
 ///   ② 兜底 —— Bing RSS → Bing HTML → 百度 HTML（无 key，见 `scraped_search`）
 ///
 /// 两级的失败原因会一并回给模型（`[fallback] …`），否则「为什么结果这么差」
@@ -2471,21 +3304,59 @@ fn web_search(input: &Value) -> Result<String, String> {
     let key = key.trim().to_string();
     let mut notes: Vec<String> = Vec::new();
 
-    // ① 主源：只有「服务商 + key」都配齐才发请求
+    // ① 主源
     if provider.is_empty() {
-        notes.push("未选择搜索服务商（设置 · AI · 搜索服务商），已直接走兜底源".into());
-    } else if key.is_empty() {
-        notes.push("未配置搜索 API 密钥（设置 · AI · 搜索 API 密钥），已直接走兜底源".into());
+        // 供应商直连：模型供应商自己提供搜索 API（当前 DeepSeek）⇒ 复用模型 key，
+        // 用户不必单独再配搜索服务商。这是「有内置搜索就直接用」的默认路径。
+        match vendor_search() {
+            Some((sp, vkey)) => {
+                crate::log::info(format!(
+                    "WebSearch 走供应商直连：{}（复用模型 key）",
+                    sp.name()
+                ));
+                match provider_search(sp, &query, count, &vkey) {
+                    Ok(hits) if !hits.is_empty() => {
+                        return Ok(format_hits(&query, sp.name(), &hits))
+                    }
+                    Ok(_) => notes.push(format!("{}（供应商直连）返回 0 条结果", sp.name())),
+                    Err(e) => notes.push(format!("{}（供应商直连）失败：{e}", sp.name())),
+                }
+            }
+            None => notes.push(
+                "未选择搜索服务商，当前模型供应商也不提供搜索 API，已直接走兜底源".into(),
+            ),
+        }
     } else {
         match SearchProvider::parse(&provider) {
             None => notes.push(format!(
-                "未知的搜索服务商 `{provider}`（可选 bocha / tavily / exa / firecrawl）"
+                "未知的搜索服务商 `{provider}`（可选 bocha / tavily / exa / firecrawl / deepseek）"
             )),
-            Some(sp) => match provider_search(sp, &query, count, &key) {
-                Ok(hits) if !hits.is_empty() => return Ok(format_hits(&query, sp.name(), &hits)),
-                Ok(_) => notes.push(format!("{} 返回 0 条结果", sp.name())),
-                Err(e) => notes.push(format!("{} 失败：{e}", sp.name())),
-            },
+            Some(sp) => {
+                // DeepSeek 的搜索与模型同源同 key：选了 deepseek 却没填搜索 key 时回落
+                // 模型 key —— 否则「选了却不生效」。
+                let key = if key.is_empty() && matches!(sp, SearchProvider::Deepseek) {
+                    std::env::var("LUNAC_AGENT_TOKEN")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                } else {
+                    key
+                };
+                if key.is_empty() {
+                    notes.push(
+                        "未配置搜索 API 密钥（设置 · AI · 搜索 API 密钥），已直接走兜底源"
+                            .into(),
+                    );
+                } else {
+                    match provider_search(sp, &query, count, &key) {
+                        Ok(hits) if !hits.is_empty() => {
+                            return Ok(format_hits(&query, sp.name(), &hits))
+                        }
+                        Ok(_) => notes.push(format!("{} 返回 0 条结果", sp.name())),
+                        Err(e) => notes.push(format!("{} 失败：{e}", sp.name())),
+                    }
+                }
+            }
         }
     }
 
@@ -2503,7 +3374,7 @@ fn web_search(input: &Value) -> Result<String, String> {
     }
 }
 
-/// 主源分发：四家只差 endpoint / 鉴权头 / 响应字段名
+/// 主源分发：五家只差 endpoint / 鉴权头 / 响应字段名
 fn provider_search(
     sp: SearchProvider,
     query: &str,
@@ -2515,6 +3386,7 @@ fn provider_search(
         SearchProvider::Tavily => tavily_search(query, count, key),
         SearchProvider::Exa => exa_search(query, count, key),
         SearchProvider::Firecrawl => firecrawl_search(query, count, key),
+        SearchProvider::Deepseek => deepseek_search(query, count, key),
     }
 }
 
@@ -2652,6 +3524,30 @@ fn firecrawl_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHi
         "title",
         "url",
         &["description"],
+    ))
+}
+
+/// DeepSeek 官方搜索：`POST /v1/tools/search` + 与模型**同一个** `Authorization: Bearer`。
+///
+/// 2026-11-05 接入。官方口径（docs.deepseek.com 的 Search / Fetch 工具页）：
+///   · `query` 1–128 字符（按字符，超长会被拒 ⇒ 这里先截断）
+///   · `count` 1–50（本侧上限 10，见 `SEARCH_MAX_COUNT`）
+///   · `results[]` 里 `summary` 是 600–800 字的摘要（给模型读），`snippet` 更短
+///   · `need_content=false`：不要整页正文 —— 需要全文时让模型再用 `WebFetch`
+/// 计费按「成功请求」计（$0.75/千次），所以失败/空结果不会产生费用。
+fn deepseek_search(query: &str, count: usize, key: &str) -> Result<Vec<SearchHit>, String> {
+    let q: String = query.chars().take(DEEPSEEK_QUERY_MAX_CHARS).collect();
+    let v = post_json(
+        DEEPSEEK_SEARCH_ENDPOINT,
+        reqwest::header::AUTHORIZATION.as_str(),
+        &format!("Bearer {key}"),
+        &json!({ "query": q, "count": count, "need_content": false }),
+    )?;
+    Ok(json_hits(
+        v.get("results").and_then(Value::as_array),
+        "title",
+        "url",
+        &["summary", "snippet"],
     ))
 }
 
@@ -2942,6 +3838,23 @@ fn head_chars(s: &str, n: usize) -> &str {
     }
 }
 
+/// 单行输出上限（2026-11-15）：压缩过的 JS / 单行 JSON 一行可达 2 MB，
+/// 一条命中就能单独顶满上下文；模型真正需要的通常只是这一行的开头。
+/// 截断处明确写出「还丢了多少字符」，避免模型误以为这行本来就短。
+const MAX_LINE_CHARS: usize = 512;
+const MAX_GREP_LINE_CHARS: usize = 300;
+
+/// 把一行裁到 `max` 字符，并在结尾标注被丢掉的字符数。
+fn clip_line(line: &str, max: usize) -> String {
+    let total = line.chars().count();
+    if total <= max {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(max).collect();
+    out.push_str(&format!("… (+{} chars)", total - max));
+    out
+}
+
 /// 按字符（不是字节）截断并加省略号
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -3036,7 +3949,9 @@ fn webfetch(input: &Value) -> Result<String, String> {
 
 /// URL 规范化：去空白、`http` 升级为 `https`（与旧 CLI 一致，避免明文抓取）、
 /// 长度封顶。不解析 host —— 拦截交给审批，这里只把明显不合法的挡掉。
-fn normalize_url(raw: &str) -> Result<String, String> {
+///
+/// `pub(crate)`：`WebBrowser` 复用同一套校验（不新造第二个 URL 判据）。
+pub(crate) fn normalize_url(raw: &str) -> Result<String, String> {
     let url = raw.trim();
     if url.is_empty() {
         return Err("url is empty".into());
@@ -3065,7 +3980,9 @@ fn looks_like_html(body: &str) -> bool {
 
 /// HTML → 纯文本。不引入 DOM / turndown 依赖：去掉脚本样式与注释、把块级
 /// 标签当换行、剥掉其余标签、解实体 —— 够读文档，不追求渲染级还原。
-fn html_to_text(html: &str) -> String {
+///
+/// `pub(crate)`：`WebBrowser` 把渲染后的 DOM 交给同一个函数转文本（**只许一份实现**）。
+pub(crate) fn html_to_text(html: &str) -> String {
     // 注意：Rust 正则**不支持反向引用**，所以开闭标签只能各自列一遍
     let Ok(drop) = regex::Regex::new(
         r"(?is)<(?:script|style|noscript|svg|template)\b[^>]*>.*?</(?:script|style|noscript|svg|template)\s*>",
@@ -3261,10 +4178,154 @@ fn ask_user_question(input: &Value) -> Result<String, String> {
 /// 这里只回一段确认文本 + 清单快照，让模型在后续轮次里能重新读到进度 —— 工具
 /// 自己**不维护状态**（清单的唯一真相就是模型最近一条 `tool_use`），所以进程
 /// 重启、多会话并行都不会串味。
+///
+/// **任务依赖（2026-10-31，§待办 3-22 S3 第一片）**：条目可带 `id`，并用 `blocked_by`
+/// 列出前置任务。这里做三件事，且**全是确定性的**（不调模型、不存状态）：
+///   ① 校验 —— 重复 id / 指向不存在的 id / 自依赖 / 依赖环，一律**报错让模型自己改**，
+///      绝不静默丢边（否则「以为串行、其实并行」是最难查的一类错）；
+///   ② 就绪判定 —— `ready` = 未完成且前置全部已完成；`blocked` = 未完成但还有前置没完成；
+///   ③ 把两组 id 回给模型（`Ready: … · Blocked: …`）。
+/// 只有清单里真的出现 `blocked_by` 时才多这一行 —— 不用依赖的老清单，回执逐字节不变。
 fn todo_write(input: &Value) -> Result<String, String> {
     let Some(list) = input.get("todos").and_then(Value::as_array) else {
         return Err("missing required parameter \"todos\"".into());
     };
+
+    // ── ① 收集 id（可缺省；给了就必须唯一且非空）──────────────────
+    let mut ids: Vec<(String, usize)> = Vec::new();
+    for (i, todo) in list.iter().enumerate() {
+        match todo.get("id") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(raw)) => {
+                let id = raw.trim();
+                if id.is_empty() {
+                    return Err(format!(
+                        "todos[{i}].id must not be empty — drop the field or give it a short name"
+                    ));
+                }
+                if ids.iter().any(|(seen, _)| seen == id) {
+                    return Err(format!(
+                        "todos[{i}].id \"{id}\" is used twice — every entry needs a unique id"
+                    ));
+                }
+                ids.push((id.to_string(), i));
+            }
+            Some(_) => return Err(format!("todos[{i}].id must be a string")),
+        }
+    }
+    let index_of = |id: &str| ids.iter().find(|(seen, _)| seen == id).map(|(_, i)| *i);
+
+    // ── ② 收集依赖边，逐条校验 ──────────────────────────────────
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); list.len()];
+    let mut any_edge = false;
+    for (i, todo) in list.iter().enumerate() {
+        let Some(raw) = todo.get("blocked_by") else {
+            continue;
+        };
+        let Some(deps) = raw.as_array() else {
+            return Err(format!(
+                "todos[{i}].blocked_by must be an array of task ids"
+            ));
+        };
+        for dep in deps {
+            let Some(id) = dep.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                return Err(format!(
+                    "todos[{i}].blocked_by contains an empty / non-string id"
+                ));
+            };
+            let Some(j) = index_of(id) else {
+                return Err(format!(
+                    "todos[{i}].blocked_by references \"{id}\", which is not an `id` of any entry \
+                     in this list — declare it first (ids only exist inside one TodoWrite call)"
+                ));
+            };
+            if j == i {
+                return Err(format!("todos[{i}] cannot be blocked by itself"));
+            }
+            if !edges[i].contains(&j) {
+                edges[i].push(j);
+                any_edge = true;
+            }
+        }
+    }
+
+    // ── ③ 环检测（DFS 三色）：依赖环等价于「永远等不到」，必须在写入前拒 ──
+    if any_edge {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            White,
+            Grey,
+            Black,
+        }
+        let mut marks = vec![Mark::White; list.len()];
+        let mut path: Vec<usize> = Vec::new();
+        // 迭代式 DFS（清单最多几十条，但避免递归爆栈的形式更省心）。
+        for start in 0..list.len() {
+            if marks[start] != Mark::White {
+                continue;
+            }
+            path.push(start);
+            let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+            marks[start] = Mark::Grey;
+            while let Some((node, next)) = stack.pop() {
+                if next < edges[node].len() {
+                    stack.push((node, next + 1));
+                    let to = edges[node][next];
+                    match marks[to] {
+                        Mark::Grey => {
+                            let mut chain: Vec<String> = path
+                                .iter()
+                                .skip_while(|n| **n != to)
+                                .map(|n| label_of(&ids, *n))
+                                .collect();
+                            chain.push(label_of(&ids, to));
+                            return Err(format!(
+                                "todos have a dependency cycle ({} → …) — remove one of those \
+                                 blocked_by entries",
+                                chain.join(" → ")
+                            ));
+                        }
+                        Mark::White => {
+                            marks[to] = Mark::Grey;
+                            path.push(to);
+                            stack.push((to, 0));
+                        }
+                        Mark::Black => {}
+                    }
+                } else {
+                    marks[node] = Mark::Black;
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    let completed: Vec<bool> = list
+        .iter()
+        .map(|t| t.get("status").and_then(Value::as_str) == Some("completed"))
+        .collect();
+
+    // ── ④ 就绪态是**硬约束**（§待办 3-22 分片 3）：前置没做完就不许开工 ──
+    //
+    // 只拦 `in_progress`，**不拦 `completed`**：已完成的那一步确实发生过，禁止记账是错的；
+    // 而且「把某个前置改回 pending 重新规划」是正常操作，拦 completed 会把人锁死在原地。
+    for (i, todo) in list.iter().enumerate() {
+        if todo.get("status").and_then(Value::as_str) != Some("in_progress") || edges[i].is_empty() {
+            continue;
+        }
+        let missing: Vec<String> = edges[i]
+            .iter()
+            .filter(|j| !completed[**j])
+            .map(|j| label_of(&ids, *j))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "todos[{i}] is in_progress but its prerequisite(s) {} are not completed — finish \
+                 them first, or leave this entry pending",
+                missing.join(", ")
+            ));
+        }
+    }
 
     let mut out = String::from(
         "Todos have been modified successfully. Keep the list up to date — at most one entry \
@@ -3279,8 +4340,62 @@ fn todo_write(input: &Value) -> Result<String, String> {
             _ => "pending",
         };
         out.push_str(&format!("\n{}. [{}] {}", i + 1, status, content));
+        let id = ids.iter().find(|(_, idx)| *idx == i).map(|(id, _)| id.as_str());
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(id) = id {
+            notes.push(format!("id: {id}"));
+        }
+        if !edges[i].is_empty() {
+            let names: Vec<String> = edges[i].iter().map(|j| label_of(&ids, *j)).collect();
+            notes.push(format!("blocked by {}", names.join(", ")));
+        }
+        if !notes.is_empty() {
+            out.push_str(&format!(" ({})", notes.join("; ")));
+        }
+    }
+
+    // 只有真用了依赖才追加就绪态 —— 老用法（不带 id / blocked_by）回执逐字节不变。
+    if any_edge {
+        let mut ready: Vec<String> = Vec::new();
+        let mut blocked: Vec<String> = Vec::new();
+        for i in 0..list.len() {
+            // 只报「还没开工」的：已 in_progress 的已经在做、已完成的不必再提，
+            // 把它们混进 Ready 会让「接下来该做哪条」读不出来。
+            if completed[i] || edges[i].is_empty() {
+                continue;
+            }
+            if list[i].get("status").and_then(Value::as_str) == Some("in_progress") {
+                continue;
+            }
+            if edges[i].iter().all(|j| completed[*j]) {
+                ready.push(label_of(&ids, i));
+            } else {
+                blocked.push(label_of(&ids, i));
+            }
+        }
+        out.push_str(&format!(
+            "\nReady: {} · Blocked: {}",
+            if ready.is_empty() {
+                "none".to_string()
+            } else {
+                ready.join(", ")
+            },
+            if blocked.is_empty() {
+                "none".to_string()
+            } else {
+                blocked.join(", ")
+            }
+        ));
     }
     Ok(out)
+}
+
+/// 条目在回执里的称呼：有 `id` 就用 id，否则用 `#<序号>`（1 基，与回执里的编号一致）。
+fn label_of(ids: &[(String, usize)], index: usize) -> String {
+    ids.iter()
+        .find(|(_, idx)| *idx == index)
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| format!("#{}", index + 1))
 }
 
 // ── PetControl（桌宠动作，2026-10-10）─────────────────────────────
@@ -3316,6 +4431,49 @@ fn pet_control(input: &Value) -> Result<String, String> {
     Ok(format!(
         "Pet action delivered to the avatar ({action} \"{name}\"). Stay in character — do not \
          describe this call or any parameter in your reply."
+    ))
+}
+
+// ── Preview（预览窗标签，2026-11-14）───────────────────────────────
+
+/// `Preview` 不改本机、不落盘、免审批 —— 与 `PetControl` 同型：效果全在前端。
+///
+/// 结构化载荷由 `main.rs` 的 `dispatch_tool` 发成 `system/preview_open`；
+/// 前端（v2 的聊天面板）收到后把标签放进 Rust 进程内队列，预览窗每秒取一次。
+/// 预览窗**不能内嵌原生窗口**，所以 `app` 类只是「外部窗口」的入口标签。
+///
+/// 名字不叫 `preview`：本文件已有一个同名的「内联预算预览」辅助函数（见 `apply_budget`），
+/// 重名会让单测里那次调用被解析成本函数。
+pub fn preview_tab(input: &Value) -> Result<String, String> {
+    let title = input
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let kind = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("app")
+        .trim();
+    let target = input
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if title.is_empty() {
+        return Err("Preview needs a non-empty \"title\".".into());
+    }
+    if !matches!(kind, "app" | "file" | "url" | "workspace") {
+        return Err(format!(
+            "Unsupported Preview kind \"{kind}\" — use app / file / url / workspace."
+        ));
+    }
+    if kind != "workspace" && target.is_empty() {
+        return Err(format!("Preview kind \"{kind}\" needs a non-empty \"target\"."));
+    }
+    Ok(format!(
+        "Preview tab delivered ({kind}: {title}). Do not describe this call in your reply — \
+         keep answering the user normally."
     ))
 }
 
@@ -3684,11 +4842,12 @@ fn exit_worktree(ctx: &Ctx) -> Result<String, String> {
 }
 
 /// 递归收集文本文件（跳过 SKIP_DIRS，深度与数量封顶）
-fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH || out.len() >= MAX_ENTRIES * 5 {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else { return };
+    dirs.push(dir.to_path_buf());
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
@@ -3697,7 +4856,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            walk(&path, depth + 1, out);
+            walk(&path, depth + 1, out, dirs);
         } else if ft.is_file() {
             out.push(path);
         }
@@ -3878,11 +5037,18 @@ fn extract_symbols(text: &str, ext: &str) -> Vec<String> {
 
 /// 递归收集源文件：跳过 `SKIP_DIRS`、跳过 `deny_read_dirs` 命中的目录（整棵子树）、
 /// 不追符号链接；文件数 / 深度封顶。
-fn collect_source_files(ctx: &Ctx, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_source_files(
+    ctx: &Ctx,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    dirs: &mut Vec<PathBuf>,
+) {
     if depth > REPO_MAP_MAX_DEPTH || out.len() >= REPO_MAP_MAX_FILES {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else { return };
+    dirs.push(dir.to_path_buf());
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -3921,7 +5087,7 @@ fn collect_source_files(ctx: &Ctx, dir: &Path, depth: usize, out: &mut Vec<PathB
         if out.len() >= REPO_MAP_MAX_FILES {
             return;
         }
-        collect_source_files(ctx, &d, depth + 1, out);
+        collect_source_files(ctx, &d, depth + 1, out, dirs);
     }
 }
 
@@ -3961,8 +5127,24 @@ fn repo_map(ctx: &Ctx, input: &Value) -> Result<String, String> {
     }
 
     let started = Instant::now();
+    // 重复扫描复用（§待办 1-17 第 6 条）：与 Grep 同一套 mtime 判据。
+    // deny 列表也进 key —— 它影响扫描范围（不同作用域不能共用一个结果）。
+    let cache_key = format!(
+        "repomap\u{1f}{}\u{1f}{:?}",
+        base.display(),
+        ctx.deny_read_dirs
+    );
+    if let Some(out) = scan_cache_get(&cache_key) {
+        crate::log::info(format!(
+            "scan-cache hit: RepoMap @ {}（目录与文件 mtime 未变，跳过重扫）",
+            base.display()
+        ));
+        return Ok(out);
+    }
+
     let mut files: Vec<PathBuf> = Vec::new();
-    collect_source_files(ctx, &base, 0, &mut files);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    collect_source_files(ctx, &base, 0, &mut files, &mut dirs);
     files.sort();
 
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -4045,11 +5227,13 @@ fn repo_map(ctx: &Ctx, input: &Value) -> Result<String, String> {
     ));
 
     if file_count == 0 {
-        return Ok(format!(
+        let out = format!(
             "[repo-map] No recognized source files under {} (looked for common source \
              extensions; skipped .git / node_modules / target and read-blocked directories).",
             base.display()
-        ));
+        );
+        scan_cache_put(cache_key, &out, ScanStamp::capture(&dirs, &files));
+        return Ok(out);
     }
 
     let entries: Vec<RepoEntry> = scored.into_iter().map(|(_, e)| e).collect();
@@ -4077,6 +5261,7 @@ fn repo_map(ctx: &Ctx, input: &Value) -> Result<String, String> {
              the map may be incomplete.]\n",
         );
     }
+    scan_cache_put(cache_key, &body, ScanStamp::capture(&dirs, &files));
     Ok(body)
 }
 
@@ -4259,9 +5444,886 @@ fn safe_name(name: &str) -> String {
         .collect()
 }
 
+// ── 定时任务：CronCreate / CronDelete / CronList（2026-10-17 阶段 1）──
+//
+// 数据契约（跨 crate 约定，详见 docs/todo.md §3-1d）：
+//   · `cron.json`       job 定义，**只有 agent 侧的 CronCreate / CronDelete 写**；
+//   · `cron-state.json` 运行态，**只有宿主调度器写**（agent 只读，用于 CronList 合并）；
+//   · `cron.lock`       两个写者共用的跨进程锁（create_new 获取 + 超时重试 + 释放即删）。
+// 路径的唯一真相源是宿主的 `storage::cron_dir()`；agent 只认 `LUNAC_CRON_DIR`，不猜路径。
+//
+// 单写者与锁并不冲突：锁保护的是「读 → 改 → 原子替换」这段临界区 —— 防止同一进程内的
+// 并发调用（以及未来可能的第二个写者）丢更新；当前每个文件仍只有一个写者。
+// 原子写 = 同目录 `*.json.tmp` + rename；Windows rename 不覆盖已存在文件，故冲突时先删旧
+// 再改名（仍在锁内，读者看到的要么是旧文件、要么是新文件）。
+
+/// `CronList` 预览的 prompt 字符上限。
+const CRON_PROMPT_PREVIEW_CHARS: usize = 200;
+/// 阶段 1 采纳的默认值 / 硬上限（与宿主 `cron.rs` 的调度器常量**同一口径**）。
+const CRON_MIN_EVERY_MINUTES: u64 = 15;
+const CRON_MAX_EVERY_MINUTES: u64 = 1440;
+const CRON_DEFAULT_MAX_RUNS_PER_DAY: u64 = 12;
+const CRON_HARD_MAX_RUNS_PER_DAY: u64 = 48;
+const CRON_MAX_JOBS: usize = 20;
+const CRON_MAX_PROMPT_CHARS: usize = 8000;
+/// 锁等待上限与「陈旧锁」判定（进程崩溃留下的锁文件可在 30s 后被接管）。
+const CRON_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const CRON_LOCK_STALE: Duration = Duration::from_secs(30);
+/// `schedulerAlive` 的心跳窗口（宿主每 30s 写一次 heartbeatAt）。
+const CRON_ALIVE_WINDOW_MS: u64 = 90_000;
+
+/// CronCreate 成功后回给模型的边界说明（用户已裁定：宿主不在就不跑、每次是新会话、
+/// 需审批的工具会被拒）。
+const CRON_CREATE_WARNING: &str = "The host application must be running for this job to run \
+    (there is no OS-level scheduler). Every run is a fresh read-only session with no \
+    conversation context, so the prompt must be self-contained. Tools that need approval \
+    (writes, shells, web access, subagents, cron tools) are denied; only read-only tools are \
+    available. Daily caps and a 10-minute wall-clock deadline apply.";
+
+/// 一个 cron 文件的读取结果（缺失与损坏分开，给模型一个可据以行动的 `reason`）。
+enum CronFile {
+    Missing,
+    Invalid(String),
+    Value(Value),
+}
+
+fn read_cron_file(path: &Path) -> CronFile {
+    match fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CronFile::Missing,
+        Err(e) => CronFile::Invalid(e.to_string()),
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(v) => CronFile::Value(v),
+            Err(e) => CronFile::Invalid(e.to_string()),
+        },
+    }
+}
+
+/// 定义文件的 job 数组：接受 `{ "jobs": [...] }`（正式形态）与裸数组（手写夹具容错）。
+fn cron_jobs_of(v: &Value) -> Option<Vec<Value>> {
+    v.get("jobs")
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array())
+        .cloned()
+}
+
+/// 把定义 + 运行态合并成给模型 / UI 的视图（纯函数，便于单测）。
+///
+/// 阶段 1 追加：`nextRunAt` / `nextRunAtLocal` / `consecutiveFailures` / `autoDisabled` /
+/// `todayRuns` / `heartbeatAt`（都来自宿主的 `cron-state.json`；缺失时给安全默认值）。
+fn cron_merge_jobs(jobs: Vec<Value>, state_jobs: &Value, include_disabled: bool) -> Vec<Value> {
+    let state_jobs = state_jobs.get("jobs");
+    jobs.into_iter()
+        .filter_map(|job| {
+            let mut obj = job.as_object()?.clone();
+            let id = obj.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            if !include_disabled && !enabled {
+                return None;
+            }
+            obj.insert("enabled".into(), json!(enabled));
+
+            let prompt = obj.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let prompt_chars = prompt.chars().count();
+            obj.insert(
+                "prompt".into(),
+                json!(prompt.chars().take(CRON_PROMPT_PREVIEW_CHARS).collect::<String>()),
+            );
+            obj.insert("promptChars".into(), json!(prompt_chars));
+            obj.insert(
+                "promptTruncated".into(),
+                json!(prompt_chars > CRON_PROMPT_PREVIEW_CHARS),
+            );
+
+            let st = state_jobs.and_then(|j| j.get(&id));
+            let pick = |key: &str| st.and_then(|s| s.get(key)).cloned();
+            obj.insert(
+                "lastRunAt".into(),
+                pick("lastRunAt").unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "nextRunAt".into(),
+                pick("nextRunAt").unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "nextRunAtLocal".into(),
+                pick("nextRunAtLocal").unwrap_or_else(|| json!("")),
+            );
+            obj.insert(
+                "lastStatus".into(),
+                pick("lastStatus").unwrap_or_else(|| json!("never")),
+            );
+            obj.insert("lastSummary".into(), pick("lastSummary").unwrap_or_else(|| json!("")));
+            obj.insert("lastError".into(), pick("lastError").unwrap_or_else(|| json!("")));
+            obj.insert(
+                "runCount".into(),
+                pick("runCount").unwrap_or_else(|| json!(0)),
+            );
+            obj.insert(
+                "failureCount".into(),
+                pick("failureCount").unwrap_or_else(|| json!(0)),
+            );
+            obj.insert(
+                "consecutiveFailures".into(),
+                pick("consecutiveFailures").unwrap_or_else(|| json!(0)),
+            );
+            obj.insert(
+                "autoDisabled".into(),
+                pick("autoDisabled").unwrap_or_else(|| json!(false)),
+            );
+            obj.insert(
+                "todayRuns".into(),
+                pick("todayRuns").unwrap_or_else(|| json!(0)),
+            );
+            Some(Value::Object(obj))
+        })
+        .collect()
+}
+
+fn cron_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// job / task id 的生成规则：`<prefix>_` + 8 位小写十六进制。
+///
+/// 不做 UUID 依赖：时间戳 + pid + 进程内序号混合后取 32 位即可满足本地唯一性；
+/// 同一毫秒内多次创建靠序号区分。
+fn local_id(prefix: &str) -> String {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u32;
+    let mixed = (cron_now_ms() as u32)
+        .wrapping_mul(2_654_435_761)
+        ^ (std::process::id()).rotate_left(16)
+        ^ seq.wrapping_mul(40_503);
+    format!("{prefix}_{mixed:08x}")
+}
+
+fn cron_new_id() -> String {
+    local_id("cron")
+}
+
+fn task_new_id() -> String {
+    local_id("task")
+}
+
+/// 严格解析 `HH:MM`（24 小时制、两位时 + 两位分）。
+fn cron_parse_hhmm(at: &str) -> Result<(u32, u32), String> {
+    let b = at.as_bytes();
+    if b.len() != 5 || b[2] != b':' {
+        return Err(format!("\"at\" must be a local time in HH:MM form (got {at:?})"));
+    }
+    if !b[..2].iter().all(u8::is_ascii_digit) || !b[3..].iter().all(u8::is_ascii_digit) {
+        return Err(format!("\"at\" must be digits in HH:MM form (got {at:?})"));
+    }
+    let hour: u32 = at[..2].parse().map_err(|_| format!("invalid hour in {at:?}"))?;
+    let minute: u32 = at[3..].parse().map_err(|_| format!("invalid minute in {at:?}"))?;
+    if hour > 23 || minute > 59 {
+        return Err(format!("\"at\" is out of range (got {at:?}, expected 00:00..23:59)"));
+    }
+    Ok((hour, minute))
+}
+
+/// 校验并规范化 `schedule`（阶段 1 只有两种简化形式，不解析 cron 表达式）。
+fn cron_validate_schedule(v: &Value) -> Result<Value, String> {
+    let kind = v
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("schedule.kind is required (\"every\" or \"daily\")")?;
+    match kind {
+        "every" => {
+            let n = v
+                .get("everyMinutes")
+                .and_then(Value::as_u64)
+                .ok_or("schedule.everyMinutes is required for kind \"every\"")?;
+            if !(CRON_MIN_EVERY_MINUTES..=CRON_MAX_EVERY_MINUTES).contains(&n) {
+                return Err(format!(
+                    "schedule.everyMinutes must be between {CRON_MIN_EVERY_MINUTES} and \
+                     {CRON_MAX_EVERY_MINUTES} minutes (got {n})"
+                ));
+            }
+            Ok(json!({ "kind": "every", "everyMinutes": n }))
+        }
+        "daily" => {
+            let at = v
+                .get("at")
+                .and_then(Value::as_str)
+                .ok_or("schedule.at is required for kind \"daily\"")?;
+            let (hour, minute) = cron_parse_hhmm(at)?;
+            Ok(json!({ "kind": "daily", "at": format!("{hour:02}:{minute:02}") }))
+        }
+        other => Err(format!(
+            "schedule.kind must be \"every\" or \"daily\" (got {other:?})"
+        )),
+    }
+}
+
+/// 定时任务存储目录（只认宿主注入的 `LUNAC_CRON_DIR`，绝不猜路径）。
+fn cron_store_dir() -> Result<PathBuf, String> {
+    match std::env::var("LUNAC_CRON_DIR") {
+        Ok(d) if !d.trim().is_empty() => Ok(PathBuf::from(d.trim())),
+        _ => Err("cron store is not configured: LUNAC_CRON_DIR is not set".into()),
+    }
+}
+
+/// 读 `cron.json` 并归一成 `{version, jobs}`；`None` = 文件不存在且 `missing_ok`。
+///
+/// 损坏时**拒绝覆盖**：返回可读错误，让模型 / 用户先修好文件，而不是静默清空他们的定义。
+fn cron_read_defs(dir: &Path, missing_ok: bool) -> Result<Option<Value>, String> {
+    match read_cron_file(&dir.join("cron.json")) {
+        CronFile::Missing => Ok(if missing_ok {
+            Some(json!({ "version": 1, "jobs": [] }))
+        } else {
+            None
+        }),
+        CronFile::Invalid(e) => Err(format!(
+            "cron.json is corrupt ({e}); refusing to modify it. Ask the user to fix or remove it."
+        )),
+        CronFile::Value(v) => {
+            if v.get("jobs").and_then(Value::as_array).is_some() {
+                Ok(Some(v))
+            } else if v.as_array().is_some() {
+                Ok(Some(json!({ "version": 1, "jobs": v })))
+            } else {
+                Err("cron.json must be an object with a \"jobs\" array (or a bare array)".into())
+            }
+        }
+    }
+}
+
+/// 原子写：同目录 tmp 后 rename；Windows 上 rename 不覆盖，冲突时删旧再改名。
+fn write_json_atomic(path: &Path, root: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(root).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("写 {} 失败: {e}", tmp.display()))?;
+    if let Err(first) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path).map_err(|e| {
+            format!(
+                "提交 {} 失败: {e}（首次 rename: {first}）",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// 跨进程锁：`<dir>\<name>`（`create_new` 获取 + 超时重试；释放即删）。
+/// 陈旧锁（进程崩溃遗留超过 30s）会被接管，避免一次崩溃永久堵死任务存储。
+struct StoreLock {
+    path: PathBuf,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_store_lock(dir: &Path, name: &str) -> Result<StoreLock, String> {
+    let path = dir.join(name);
+    let deadline = Instant::now() + CRON_LOCK_TIMEOUT;
+    loop {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                let _ = write!(f, "pid={} at={}", std::process::id(), cron_now_ms());
+                return Ok(StoreLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age > CRON_LOCK_STALE)
+                    .unwrap_or(false);
+                if stale {
+                    crate::log::warn(format!("{name} 已陈旧（>30s），接管"));
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "store is busy: could not acquire {} within {}s",
+                        path.display(),
+                        CRON_LOCK_TIMEOUT.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("创建 {} 失败: {e}", path.display())),
+        }
+    }
+}
+
+fn cron_acquire_lock(dir: &Path) -> Result<StoreLock, String> {
+    acquire_store_lock(dir, "cron.lock")
+}
+
+/// `CronCreate`：校验入参 → 锁内读改写 `cron.json`（原子替换）→ 回合并视图。
+fn cron_create(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    // 用户裁定：强制要求已配置工作区（否则无人值守的读会越出默认 transStorage）。
+    let workspace_configured = std::env::var("LUNAC_WORKSPACE_LOCKED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if !workspace_configured {
+        return Err(
+            "CronCreate requires a configured workspace: set an agent workspace in Lunac \
+             settings first. Without one, scheduled runs would read the default temp storage, \
+             which is not a meaningful working area."
+                .into(),
+        );
+    }
+
+    let schedule = cron_validate_schedule(
+        input
+            .get("schedule")
+            .ok_or("missing required parameter \"schedule\"")?,
+    )?;
+
+    let prompt = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or("missing required parameter \"prompt\"")?
+        .to_string();
+    let prompt_chars = prompt.chars().count();
+    if prompt_chars == 0 || prompt_chars > CRON_MAX_PROMPT_CHARS {
+        return Err(format!(
+            "prompt must be 1..{CRON_MAX_PROMPT_CHARS} characters (got {prompt_chars})"
+        ));
+    }
+    let report = crate::content_safety::analyze(&prompt);
+    if !report.is_clean() {
+        return Err(format!(
+            "prompt rejected: it contains credential-like content ({}). Cron prompts are stored \
+             on disk and replayed on every run, so they must not contain secrets.",
+            report.summary()
+        ));
+    }
+
+    // 阶段 1 只支持 global（pet 作用域需要单发消息带 source:"pet"，留到阶段 2）。
+    let scope = input.get("scope").and_then(Value::as_str).unwrap_or("global");
+    if scope == "pet" {
+        return Err(
+            "scope \"pet\" is not supported in phase 1: pet-scoped runs need a pet message \
+             source to select the pet memory scope. Use \"global\" (the default)."
+                .into(),
+        );
+    }
+    if scope != "global" {
+        return Err(format!("scope must be \"global\" in phase 1 (got {scope:?})"));
+    }
+
+    // 阶段 1 只接受空或当前工作区（配置工作区时 agent 的 cwd 就是它）。
+    let workspace = input
+        .get("workspace")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !workspace.is_empty() {
+        let given = normalize(Path::new(&workspace));
+        let cwd = normalize(&ctx.cwd);
+        // Windows 路径大小写不敏感；把 `/` 归一成 `\`，避免同一个目录因分隔符不同被拒。
+        let same = given.to_string_lossy().replace('/', "\\").to_lowercase()
+            == cwd.to_string_lossy().replace('/', "\\").to_lowercase();
+        if !same {
+            return Err(format!(
+                "workspace must be empty or the current workspace ({}) in phase 1 (got {workspace})",
+                ctx.cwd.display()
+            ));
+        }
+    }
+
+    let notify = input.get("notify").and_then(Value::as_str).unwrap_or("toast");
+    if !matches!(notify, "none" | "toast" | "sound" | "toast_sound") {
+        return Err(format!(
+            "notify must be one of none / toast / sound / toast_sound (got {notify:?})"
+        ));
+    }
+
+    let max_runs = input
+        .get("maxRunsPerDay")
+        .and_then(Value::as_u64)
+        .unwrap_or(CRON_DEFAULT_MAX_RUNS_PER_DAY);
+    if !(1..=CRON_HARD_MAX_RUNS_PER_DAY).contains(&max_runs) {
+        return Err(format!(
+            "maxRunsPerDay must be between 1 and {CRON_HARD_MAX_RUNS_PER_DAY} (got {max_runs})"
+        ));
+    }
+
+    let enabled = input.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let job = json!({
+        "id": cron_new_id(),
+        "schedule": schedule,
+        "prompt": prompt,
+        "enabled": enabled,
+        "createdAt": cron_now_ms(),
+        "scope": "global",
+        "workspace": workspace,
+        "notify": notify,
+        "maxRunsPerDay": max_runs,
+        // 「无人值守可写」（2026-10-27，阶段 2B）：**恒 false**，模型不能自己开。
+        // 只有用户在任务列表里逐 job 显式授权（宿主 `cron_set_write_access`）才会变成 true。
+        "writeAccess": false,
+    });
+
+    let dir = cron_store_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建 cron 目录失败: {e}"))?;
+    let _lock = cron_acquire_lock(&dir)?;
+    let mut root = cron_read_defs(&dir, true)?.unwrap_or_else(|| json!({ "version": 1, "jobs": [] }));
+    let jobs = root
+        .get_mut("jobs")
+        .and_then(Value::as_array_mut)
+        .ok_or("cron.json: \"jobs\" is not an array")?;
+    if jobs.len() >= CRON_MAX_JOBS {
+        return Err(format!(
+            "cron job limit reached: at most {CRON_MAX_JOBS} jobs are allowed (currently {})",
+            jobs.len()
+        ));
+    }
+    jobs.push(job.clone());
+    write_json_atomic(&dir.join("cron.json"), &root)?;
+    drop(_lock);
+
+    let view = cron_merge_jobs(vec![job], &json!({}), true)
+        .pop()
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "ok": true,
+        "job": view,
+        "warning": CRON_CREATE_WARNING,
+    })
+    .to_string())
+}
+
+/// `CronDelete`：幂等删除（不存在也返回成功），锁内读改写 + 原子替换。
+fn cron_delete(input: &Value) -> Result<String, String> {
+    let id = str_arg(input, "id")?.trim().to_string();
+    if id.is_empty() {
+        return Err("\"id\" must not be empty".into());
+    }
+    let dir = cron_store_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建 cron 目录失败: {e}"))?;
+    let _lock = cron_acquire_lock(&dir)?;
+    let Some(mut root) = cron_read_defs(&dir, true)? else {
+        return Ok(json!({ "ok": true, "deleted": false, "alreadyGone": true }).to_string());
+    };
+    let jobs = root
+        .get_mut("jobs")
+        .and_then(Value::as_array_mut)
+        .ok_or("cron.json: \"jobs\" is not an array")?;
+    let before = jobs.len();
+    jobs.retain(|j| j.get("id").and_then(Value::as_str) != Some(id.as_str()));
+    let deleted = jobs.len() != before;
+    if deleted {
+        write_json_atomic(&dir.join("cron.json"), &root)?;
+    }
+    drop(_lock);
+    Ok(json!({
+        "ok": true,
+        "deleted": deleted,
+        "alreadyGone": !deleted,
+        "id": id,
+    })
+    .to_string())
+}
+
+/// `CronList` 的入口：输出**始终是 JSON 文本**；缺失 / 损坏用 `reason` 表达，不 panic。
+fn cron_list(input: &Value) -> Result<String, String> {
+    let include_disabled = input
+        .get("includeDisabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let enabled_filter = input.get("enabled").and_then(Value::as_bool);
+    // `enabled:false` 要能列出被禁用的 job ⇒ 有显式过滤时先合并全部再筛。
+    let merge_disabled = include_disabled || enabled_filter.is_some();
+
+    let dir = match cron_store_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(json!({
+                "ok": false,
+                "reason": "not_configured",
+                "error": e,
+                "schedulerAlive": false,
+                "jobs": [],
+            })
+            .to_string())
+        }
+    };
+
+    let defs = read_cron_file(&dir.join("cron.json"));
+    let state = read_cron_file(&dir.join("cron-state.json"));
+    let (defs_tag, state_tag) = (
+        match &defs {
+            CronFile::Missing => "missing",
+            CronFile::Invalid(_) => "invalid",
+            CronFile::Value(_) => "ok",
+        },
+        match &state {
+            CronFile::Missing => "missing",
+            CronFile::Invalid(_) => "invalid",
+            CronFile::Value(_) => "ok",
+        },
+    );
+
+    let state_value = match &state {
+        CronFile::Value(s) => s.clone(),
+        _ => json!({}),
+    };
+    // 宿主每 30s 写一次心跳；90s 内算「调度器在跑」（与宿主 schedulerAlive 同口径）。
+    let scheduler_alive = state_value
+        .get("heartbeatAt")
+        .and_then(Value::as_u64)
+        .map(|h| cron_now_ms().saturating_sub(h) <= CRON_ALIVE_WINDOW_MS)
+        .unwrap_or(false);
+
+    let (mut jobs, ok, reason) = match defs {
+        CronFile::Missing => (Vec::new(), false, Some(json!("missing"))),
+        CronFile::Invalid(e) => {
+            crate::log::warn(format!("CronList: cron.json 解析失败: {e}"));
+            (Vec::new(), false, Some(json!("invalid")))
+        }
+        CronFile::Value(v) => match cron_jobs_of(&v) {
+            Some(jobs) => (
+                cron_merge_jobs(jobs, &state_value, merge_disabled),
+                true,
+                None,
+            ),
+            None => (Vec::new(), false, Some(json!("invalid"))),
+        },
+    };
+    if let Some(want) = enabled_filter {
+        jobs.retain(|j| j.get("enabled").and_then(Value::as_bool).unwrap_or(true) == want);
+    }
+
+    let count = jobs.len();
+    let mut out = json!({
+        "ok": ok,
+        "schedulerAlive": scheduler_alive,
+        "defs": defs_tag,
+        "state": state_tag,
+        "count": count,
+        "jobs": jobs,
+    });
+    if let Some(reason) = reason {
+        out["reason"] = reason;
+    }
+    Ok(out.to_string())
+}
+
+// ── 通用后台任务队列：TaskEnqueue / TaskList / TaskCancel（2026-10-22，S2）──
+//
+// 数据契约（与宿主 `task_queue.rs` 共用）：
+//   · `queue.json` = `{version, items:[...]}`；agent 侧只写「入队 / 取消」，宿主 worker
+//     写 running / done / failed / round / sessionId / summary；
+//   · `queue.lock` 跨进程锁（与 `cron.lock` 同一套 create_new + 超时重试 + 陈旧接管）。
+// 路径只认宿主注入的 `LUNAC_TASKS_DIR`（与 `LUNAC_CRON_DIR` 同一个 `ModuleData\tasks`）。
+//
+// 安全边界：任务由宿主以**只读档**执行（宿主侧固定 plan + 裁写类工具），
+// agent 这里只负责校验 / 落盘 / 读状态，不执行任何任务。
+
+const TASK_MAX_ITEMS: usize = 20;
+const TASK_DEFAULT_ROUNDS: u64 = 5;
+const TASK_HARD_ROUNDS: u64 = 20;
+const TASK_MAX_PROMPT_CHARS: usize = 8000;
+const TASK_PREVIEW_CHARS: usize = 200;
+
+const TASK_ENQUEUE_WARNING: &str = "The host application must be running for this task to run. \
+    It runs read-only in the background, one task at a time; later rounds continue the same \
+    session until the todo list is finished or maxRounds is reached. Tools that need approval \
+    (writes, shells, web access, subagents, cron/task tools) are denied. Each round has a \
+    10-minute wall-clock deadline.";
+
+fn task_store_dir() -> Result<PathBuf, String> {
+    match std::env::var("LUNAC_TASKS_DIR") {
+        Ok(d) if !d.trim().is_empty() => Ok(PathBuf::from(d.trim())),
+        _ => Err("task queue is not configured: LUNAC_TASKS_DIR is not set".into()),
+    }
+}
+
+/// 读 `queue.json` 并归一成 `{version, items}`；`missing_ok` 时缺失给空队列。
+fn task_read_queue(dir: &Path, missing_ok: bool) -> Result<Option<Value>, String> {
+    match read_cron_file(&dir.join("queue.json")) {
+        CronFile::Missing => Ok(if missing_ok {
+            Some(json!({ "version": 1, "items": [] }))
+        } else {
+            None
+        }),
+        CronFile::Invalid(e) => Err(format!(
+            "queue.json is corrupt ({e}); refusing to modify it. Ask the user to fix or remove it."
+        )),
+        CronFile::Value(v) => {
+            if v.get("items").and_then(Value::as_array).is_some() {
+                Ok(Some(v))
+            } else if v.as_array().is_some() {
+                Ok(Some(json!({ "version": 1, "items": v })))
+            } else {
+                Err("queue.json must be an object with an \"items\" array (or a bare array)".into())
+            }
+        }
+    }
+}
+
+/// `TaskList` 的视图（纯函数，便于单测）：预览 prompt、按 includeFinished 过滤。
+fn task_list_view(items: Vec<Value>, include_finished: bool) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let mut obj = item.as_object()?.clone();
+            let status = obj.get("status").and_then(Value::as_str).unwrap_or("pending");
+            if !include_finished && matches!(status, "done" | "failed" | "cancelled") {
+                return None;
+            }
+            let prompt = obj.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let chars = prompt.chars().count();
+            obj.insert(
+                "prompt".into(),
+                json!(prompt.chars().take(TASK_PREVIEW_CHARS).collect::<String>()),
+            );
+            obj.insert("promptChars".into(), json!(chars));
+            obj.insert("promptTruncated".into(), json!(chars > TASK_PREVIEW_CHARS));
+            Some(Value::Object(obj))
+        })
+        .collect()
+}
+
+fn task_enqueue(ctx: &Ctx, input: &Value) -> Result<String, String> {
+    let workspace_configured = std::env::var("LUNAC_WORKSPACE_LOCKED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if !workspace_configured {
+        return Err(
+            "TaskEnqueue requires a configured workspace: set an agent workspace in Lunac \
+             settings first. Background tasks must run against a real working area."
+                .into(),
+        );
+    }
+
+    let prompt = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or("missing required parameter \"prompt\"")?
+        .to_string();
+    let prompt_chars = prompt.chars().count();
+    if prompt_chars == 0 || prompt_chars > TASK_MAX_PROMPT_CHARS {
+        return Err(format!(
+            "prompt must be 1..{TASK_MAX_PROMPT_CHARS} characters (got {prompt_chars})"
+        ));
+    }
+    let report = crate::content_safety::analyze(&prompt);
+    if !report.is_clean() {
+        return Err(format!(
+            "prompt rejected: it contains credential-like content ({}). Task prompts are stored \
+             on disk and replayed, so they must not contain secrets.",
+            report.summary()
+        ));
+    }
+
+    let max_rounds = input
+        .get("maxRounds")
+        .and_then(Value::as_u64)
+        .unwrap_or(TASK_DEFAULT_ROUNDS);
+    if !(1..=TASK_HARD_ROUNDS).contains(&max_rounds) {
+        return Err(format!(
+            "maxRounds must be between 1 and {TASK_HARD_ROUNDS} (got {max_rounds})"
+        ));
+    }
+
+    let dir = task_store_dir()?;
+    let _lock = acquire_store_lock(&dir, "queue.lock")?;
+    let mut root = task_read_queue(&dir, true)?.unwrap_or_else(|| json!({"version":1,"items":[]}));
+    let items = root
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or("queue.json 的 items 不是数组")?;
+    if items.len() >= TASK_MAX_ITEMS {
+        return Err(format!(
+            "task queue is full ({TASK_MAX_ITEMS} items); wait for some to finish or cancel one"
+        ));
+    }
+    let id = task_new_id();
+    let now = cron_now_ms();
+    items.push(json!({
+        "id": id,
+        "prompt": prompt,
+        "cwd": ctx.cwd.to_string_lossy(),
+        "maxRounds": max_rounds,
+        "status": "pending",
+        "round": 0,
+        "createdAt": now,
+        "updatedAt": now,
+        "sessionId": "",
+        "summary": "",
+        "error": "",
+    }));
+    let position = items.len();
+    write_json_atomic(&dir.join("queue.json"), &root)?;
+    drop(_lock);
+    Ok(json!({
+        "ok": true,
+        "id": id,
+        "status": "pending",
+        "queuePosition": position,
+        "maxRounds": max_rounds,
+        "note": TASK_ENQUEUE_WARNING,
+    })
+    .to_string())
+}
+
+fn task_list(input: &Value) -> Result<String, String> {
+    let include_finished = input
+        .get("includeFinished")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let dir = match task_store_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(json!({
+                "ok": false,
+                "reason": "not_configured",
+                "error": e,
+                "items": [],
+            })
+            .to_string())
+        }
+    };
+    let (items, ok, reason) = match task_read_queue(&dir, true) {
+        Ok(Some(v)) => (
+            v.get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            true,
+            None,
+        ),
+        Ok(None) => (Vec::new(), false, Some(json!("missing"))),
+        Err(e) => {
+            crate::log::warn(format!("TaskList: queue.json 不可用: {e}"));
+            (Vec::new(), false, Some(json!("invalid")))
+        }
+    };
+    let total = items.len();
+    let views = task_list_view(items, include_finished);
+    let pending = views
+        .iter()
+        .filter(|i| i.get("status").and_then(Value::as_str) == Some("pending"))
+        .count();
+    let running = views
+        .iter()
+        .filter(|i| i.get("status").and_then(Value::as_str) == Some("running"))
+        .count();
+    let mut out = json!({
+        "ok": ok,
+        "count": views.len(),
+        "total": total,
+        "pending": pending,
+        "running": running,
+        "items": views,
+    });
+    if let Some(reason) = reason {
+        out["reason"] = reason;
+    }
+    Ok(out.to_string())
+}
+
+fn task_cancel(input: &Value) -> Result<String, String> {
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("missing required parameter \"id\"")?
+        .to_string();
+    let dir = task_store_dir()?;
+    let _lock = acquire_store_lock(&dir, "queue.lock")?;
+    let mut root = task_read_queue(&dir, true)?.unwrap_or_else(|| json!({"version":1,"items":[]}));
+    let items = root
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or("queue.json 的 items 不是数组")?;
+    let Some(index) = items
+        .iter()
+        .position(|i| i.get("id").and_then(Value::as_str) == Some(id.as_str()))
+    else {
+        drop(_lock);
+        return Ok(json!({
+            "ok": true,
+            "cancelled": false,
+            "alreadyGone": true,
+            "id": id,
+        })
+        .to_string());
+    };
+    let status = items[index]
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match status.as_str() {
+        "pending" => {
+            items[index]["status"] = json!("cancelled");
+            items[index]["updatedAt"] = json!(cron_now_ms());
+            items[index]["finishedAt"] = json!(cron_now_ms());
+            write_json_atomic(&dir.join("queue.json"), &root)?;
+            drop(_lock);
+            Ok(json!({
+                "ok": true,
+                "cancelled": true,
+                "alreadyGone": false,
+                "id": id,
+                "status": "cancelled",
+            })
+            .to_string())
+        }
+        "running" => Err(format!(
+            "task {id} is running; it cannot be cancelled from here (let it finish or stop the host)"
+        )),
+        other => {
+            drop(_lock);
+            Ok(json!({
+                "ok": true,
+                "cancelled": false,
+                "alreadyGone": true,
+                "id": id,
+                "status": other,
+            })
+            .to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AskUserQuestion` 的工具描述必须要求「先给一段可见上下文」（2026-11-03，§待办 1-10）。
+    ///
+    /// 工具描述是模型唯一能看到的调用纪律；措辞丢了，就等于没这条规则 —— 用户又会只看到
+    /// 一张孤立的提问卡。
+    #[test]
+    fn ask_user_question_requires_a_visible_summary_first() {
+        let tools = defs(&[]);
+        let ask = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(|value| value.as_str()) == Some("AskUserQuestion"))
+            .expect("AskUserQuestion 必须在默认工具集里");
+        let description = ask
+            .get("description")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            description.contains("Before calling it"),
+            "描述里没写「调用之前先输出一段上下文」"
+        );
+        assert!(
+            description.contains("visible reply"),
+            "没要求写进可见正文（thinking 块默认收起，用户看不到）"
+        );
+    }
 
     /// 只验证档位判据的最小上下文：不碰磁盘，两个标志都由测试自己摆。
     fn test_ctx() -> Ctx {
@@ -4281,6 +6343,8 @@ mod tests {
             shell_control: None,
             // 单测默认全局作用域；需要桌宠作用域时由用例自己摆（见 main.rs 的作用域注入）。
             memory_scope: MemoryScope::Global,
+            // 单测默认不在任何技能命名空间里（技能 fork 才置位）。
+            skill_scope: None,
         }
     }
 
@@ -4387,9 +6451,49 @@ mod tests {
             names(&all).contains(&"MemorySearch".to_string()),
             "MemorySearch（长期记忆只读检索，2026-10-17）必须在内置工具表里"
         );
+        assert!(
+            names(&all).contains(&"CronCreate".to_string())
+                && names(&all).contains(&"CronDelete".to_string())
+                && names(&all).contains(&"CronList".to_string()),
+            "CronCreate / CronDelete / CronList（定时任务，2026-10-17 阶段 1）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"TaskEnqueue".to_string())
+                && names(&all).contains(&"TaskList".to_string())
+                && names(&all).contains(&"TaskCancel".to_string()),
+            "TaskEnqueue / TaskList / TaskCancel（通用任务队列，2026-10-22）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"LSP".to_string()),
+            "LSP（语言服务器诊断，2026-10-23）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"WebBrowser".to_string()),
+            "WebBrowser（无头浏览器渲染，2026-10-23）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"ImageMeasure".to_string()),
+            "ImageMeasure（确定性像素测量，2026-10-30）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"ImageAnnotate".to_string()),
+            "ImageAnnotate（按规格 JSON 绘图，2026-10-30）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"Preview".to_string()),
+            "Preview（预览窗标签，2026-11-14）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"Screenshot".to_string()),
+            "Screenshot（抓屏到临时 PNG，§待办 3-28.5）必须在内置工具表里"
+        );
+        assert!(
+            names(&all).contains(&"ImageDiff".to_string()),
+            "ImageDiff（golden 图逐像素比对，§待办 3-28.5）必须在内置工具表里"
+        );
         assert_eq!(
-            total, 25,
-            "内置工具应为 25 件（24 件 + MemorySearch，2026-10-17）"
+            total, 38,
+            "内置工具应为 38 件（33 件 + ImageMeasure + ImageAnnotate + Preview + Screenshot + ImageDiff）"
         );
 
         let cut = defs(&["Agent".to_string()]);
@@ -4405,6 +6509,235 @@ mod tests {
             "disallowed 必须能裁掉 MemorySearch"
         );
         assert_eq!(cut.len(), total - 1);
+        // CronList 走同一条过滤（阶段 0：必须能被 `--disallowedTools` 裁掉）。
+        let cut = defs(&["CronList".to_string()]);
+        assert!(
+            !names(&cut).contains(&"CronList".to_string()),
+            "disallowed 必须能裁掉 CronList"
+        );
+        assert_eq!(cut.len(), total - 1);
+        // CronCreate / CronDelete（阶段 1）：同样必须可被 `--disallowedTools` 裁掉
+        // （cron 单发进程就靠它防「cron 再建 cron」）。
+        for tool in ["CronCreate", "CronDelete"] {
+            let cut = defs(&[tool.to_string()]);
+            assert!(
+                !names(&cut).contains(&tool.to_string()),
+                "disallowed 必须能裁掉 {tool}"
+            );
+            assert_eq!(cut.len(), total - 1);
+        }
+    }
+
+    /// `CronList`（2026-10-17 阶段 0）的口径：
+    ///   · 只读、免审批、只读档放行（不是「问了再做」）；
+    ///   · `prompt` 只回前 200 字符 + `promptChars` 原长度；
+    ///   · 定义 / 运行态合并；`includeDisabled` 默认 false；
+    ///   · 文件缺失 / 损坏给 `reason`，绝不在解析里 panic。
+    #[test]
+    fn cron_list_is_read_only_and_merges_state() {
+        assert!(!needs_approval("CronList"), "CronList 只读，免审批");
+        assert!(!gated_in_read_only("CronList"), "只读档放行");
+        assert!(!needs_bridge("CronList"), "CronList 不走 MCP 桥");
+
+        let prompt = "x".repeat(CRON_PROMPT_PREVIEW_CHARS + 37);
+        let jobs = vec![
+            json!({
+                "id": "cron_1", "schedule": { "kind": "every", "everyMinutes": 30 },
+                "prompt": prompt, "enabled": true,
+            }),
+            json!({
+                "id": "cron_2", "schedule": { "kind": "daily", "at": "09:05" },
+                "prompt": "off", "enabled": false,
+            }),
+        ];
+        let state = json!({
+            "jobs": {
+                "cron_1": {
+                    "lastRunAt": 1234, "lastStatus": "ok",
+                    "nextRunAt": 9999, "nextRunAtLocal": "2026-10-18 09:00",
+                    "runCount": 3, "failureCount": 1,
+                    "consecutiveFailures": 0, "autoDisabled": false,
+                    "lastSummary": "done", "lastError": "",
+                }
+            }
+        });
+
+        let only_enabled = cron_merge_jobs(jobs.clone(), &state, false);
+        assert_eq!(only_enabled.len(), 1, "默认不返回 disabled job");
+        let first = &only_enabled[0];
+        assert_eq!(first["prompt"].as_str().unwrap().chars().count(), 200);
+        assert_eq!(
+            first["promptChars"].as_u64().unwrap(),
+            (CRON_PROMPT_PREVIEW_CHARS + 37) as u64
+        );
+        assert_eq!(first["promptTruncated"], json!(true));
+        assert_eq!(first["runCount"], json!(3));
+        assert_eq!(first["failureCount"], json!(1));
+        assert_eq!(first["lastStatus"], json!("ok"));
+        assert_eq!(first["nextRunAt"], json!(9999), "必须带宿主的 nextRunAt");
+        assert_eq!(first["nextRunAtLocal"], json!("2026-10-18 09:00"));
+
+        let all = cron_merge_jobs(jobs, &state, true);
+        assert_eq!(all.len(), 2, "includeDisabled=true 返回全部");
+        assert_eq!(all[1]["lastStatus"], json!("never"));
+        assert_eq!(all[1]["runCount"], json!(0));
+
+        // 定义文件缺失 / 损坏 ⇒ 明确 reason，不 panic。
+        let dir = std::env::temp_dir().join(format!("lunac-cron-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(fs::read_to_string(dir.join("cron.json")).is_err());
+        let _ = fs::write(dir.join("cron.json"), "{not json");
+        match read_cron_file(&dir.join("cron.json")) {
+            CronFile::Invalid(_) => {}
+            _ => panic!("损坏的 cron.json 必须归类为 invalid"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 阶段 1 的审批 / 档位契约：
+    ///   · `CronCreate` 必须在审批集合里（持续成本 + 写盘）；
+    ///   · `CronDelete` 免审批（幂等删本地定义）；
+    ///   · 两件在只读档都**不放行**（由 `write_blocked` 直接拒）；
+    ///   · 都不进只读并行白名单；schema 钉住必填 `schedule` / `prompt`。
+    #[test]
+    fn cron_create_and_delete_match_the_approval_contract() {
+        assert!(needs_approval("CronCreate"), "CronCreate 必须审批");
+        assert!(!needs_approval("CronDelete"), "CronDelete 免审批（幂等）");
+        assert!(!gated_in_read_only("CronCreate"));
+        assert!(!gated_in_read_only("CronDelete"));
+        assert!(!parallel_safe("CronCreate") && !parallel_safe("CronDelete"));
+
+        let all = defs(&[]);
+        let create = all
+            .iter()
+            .find(|d| d.get("name").and_then(Value::as_str) == Some("CronCreate"))
+            .expect("CronCreate 必须在 defs() 里");
+        let req = create
+            .pointer("/input_schema/required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(req.contains(&json!("schedule")) && req.contains(&json!("prompt")));
+
+        let del = all
+            .iter()
+            .find(|d| d.get("name").and_then(Value::as_str) == Some("CronDelete"))
+            .expect("CronDelete 必须在 defs() 里");
+        assert!(del
+            .pointer("/input_schema/required")
+            .and_then(Value::as_array)
+            .map(|r| r.contains(&json!("id")))
+            .unwrap_or(false));
+    }
+
+    /// 阶段 1 的阈值（用户已裁定）：最小间隔 15 分钟、最大 1440；daily 只认严格 `HH:MM`。
+    #[test]
+    fn cron_schedule_validation_enforces_phase_one_limits() {
+        assert!(cron_validate_schedule(&json!({"kind":"every","everyMinutes":14})).is_err());
+        assert!(cron_validate_schedule(&json!({"kind":"every","everyMinutes":1441})).is_err());
+        assert_eq!(
+            cron_validate_schedule(&json!({"kind":"every","everyMinutes":15})).unwrap(),
+            json!({"kind":"every","everyMinutes":15})
+        );
+
+        for bad in ["9:05", "09:5", "24:00", "09:60", "0905", ""] {
+            assert!(
+                cron_validate_schedule(&json!({"kind":"daily","at":bad})).is_err(),
+                "非法 HH:MM 必须被拒: {bad:?}"
+            );
+        }
+        assert_eq!(
+            cron_validate_schedule(&json!({"kind":"daily","at":"09:05"})).unwrap(),
+            json!({"kind":"daily","at":"09:05"})
+        );
+        assert!(cron_validate_schedule(&json!({"kind":"cron","expr":"* * * * *"})).is_err());
+    }
+
+    /// id 规则与宿主同款：`cron_` + 8 位小写十六进制。
+    #[test]
+    fn cron_ids_use_the_shared_shape() {
+        let id = cron_new_id();
+        assert!(id.starts_with("cron_"), "id={id}");
+        let hex = id.strip_prefix("cron_").unwrap();
+        assert_eq!(hex.len(), 8, "id={id}");
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "id={id}"
+        );
+        assert_ne!(cron_new_id(), id, "同一进程内连续生成不得重复");
+    }
+
+    /// 定义文件损坏时 `CronCreate` / `CronDelete` 的底层读取必须报错（拒绝静默覆盖）。
+    #[test]
+    fn cron_read_defs_refuses_to_overwrite_corrupt_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-cron-corrupt-{}-{}",
+            std::process::id(),
+            cron_now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cron.json"), "{not json").unwrap();
+        assert!(cron_read_defs(&dir, true).is_err(), "损坏文件必须拒绝改写");
+        // 裸数组按正式形态归一，内容不丢。
+        fs::write(dir.join("cron.json"), r#"[{"id":"cron_1"}]"#).unwrap();
+        let root = cron_read_defs(&dir, true).unwrap().unwrap();
+        assert_eq!(root["jobs"][0]["id"], json!("cron_1"));
+        assert_eq!(root["version"], json!(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TaskEnqueue` / `TaskList` 的口径：id 前缀、预览截断、完成态过滤、审批档位。
+    #[test]
+    fn task_ids_and_list_view_keep_the_queue_contract() {
+        let id = task_new_id();
+        assert!(id.starts_with("task_"), "id={id}");
+        assert_eq!(id.len(), "task_".len() + 8, "id={id}");
+        assert_ne!(task_new_id(), id, "同一进程内连续生成不得重复");
+
+        let long = "x".repeat(TASK_PREVIEW_CHARS + 5);
+        let items = vec![
+            json!({"id":"task_1","status":"pending","prompt":long}),
+            json!({"id":"task_2","status":"done","prompt":"short"}),
+        ];
+        let all = task_list_view(items.clone(), true);
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all[0]["prompt"].as_str().unwrap().chars().count(),
+            TASK_PREVIEW_CHARS
+        );
+        assert_eq!(all[0]["promptChars"], json!(TASK_PREVIEW_CHARS + 5));
+        assert_eq!(all[0]["promptTruncated"], json!(true));
+
+        let active = task_list_view(items, false);
+        assert_eq!(active.len(), 1, "完成态默认被过滤");
+        assert_eq!(active[0]["id"], json!("task_1"));
+
+        assert!(needs_approval("TaskEnqueue"), "入队会产生后台 API 成本");
+        assert!(!needs_approval("TaskList"));
+        assert!(!needs_approval("TaskCancel"));
+    }
+
+    /// 队列文件：缺失按空队列、损坏拒绝覆盖、裸数组按正式形态归一。
+    #[test]
+    fn task_queue_read_normalizes_and_refuses_corruption() {
+        let dir = std::env::temp_dir().join(format!(
+            "lunac-task-queue-{}-{}",
+            std::process::id(),
+            cron_now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let empty = task_read_queue(&dir, true).unwrap().expect("缺失按空队列");
+        assert_eq!(empty["items"], json!([]));
+
+        fs::write(dir.join("queue.json"), "{not json").unwrap();
+        assert!(task_read_queue(&dir, true).is_err(), "损坏文件必须拒绝改写");
+
+        fs::write(dir.join("queue.json"), r#"[{"id":"task_1"}]"#).unwrap();
+        let root = task_read_queue(&dir, true).unwrap().unwrap();
+        assert_eq!(root["items"][0]["id"], json!("task_1"));
+        assert_eq!(root["version"], json!(1));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `NotebookEdit`（2026-10-11）的口径：
@@ -4541,6 +6874,50 @@ mod tests {
         let err = send_user_file(&ctx, &json!({ "file_path": dir.to_str().unwrap() }))
             .expect_err("目录必须被拒");
         assert!(err.contains("is a directory"), "应当说明是目录：{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 编码闸（2026-11-05，§待办 1-17 第 5 条）：
+    /// ① 写入一律剥掉 UTF-8 BOM；② `.cmd` / `.bat` 含非 ASCII 直接拒绝且不落盘。
+    #[test]
+    fn write_strips_bom_and_refuses_non_ascii_cmd() {
+        let dir = std::env::temp_dir().join(format!("lunac-encoding-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let ctx = test_ctx();
+
+        let txt = dir.join("note.txt");
+        write(
+            &ctx,
+            &json!({ "file_path": txt.to_str().unwrap(), "content": "\u{feff}hello\n" }),
+        )
+        .expect("普通文本应写入");
+        let bytes = fs::read(&txt).unwrap();
+        assert!(
+            !bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "写入必须剥掉 UTF-8 BOM"
+        );
+
+        let cmd = dir.join("run.cmd");
+        let err = write(
+            &ctx,
+            &json!({
+                "file_path": cmd.to_str().unwrap(),
+                "content": "@echo off\necho 你好\n"
+            }),
+        )
+        .expect_err("含中文的 .cmd 必须拒绝");
+        assert!(err.contains("non-ASCII"), "错误要说明原因：{err}");
+        assert!(!cmd.exists(), "被拒绝时不得落盘");
+
+        write(
+            &ctx,
+            &json!({
+                "file_path": cmd.to_str().unwrap(),
+                "content": "@echo off\r\nnode \"%~dp0run.mjs\" %*\r\n"
+            }),
+        )
+        .expect("纯 ASCII 的 .cmd 应允许");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -5248,6 +7625,8 @@ mod tests {
             [
                 "SessionSearch",
                 "MemorySearch",
+                "ResourceHubSearch",
+                "SourceInstall",
                 "ListMcpResourcesTool",
                 "ReadMcpResourceTool",
                 "ListMcpPromptsTool",
@@ -5299,7 +7678,7 @@ mod tests {
     /// 并行白名单：只读的可以并行；写类 / 命令 / MCP / 交互 / 技能一律串行
     #[test]
     fn only_read_only_tools_may_run_in_parallel() {
-        for n in ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"] {
+        for n in ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "ImageMeasure"] {
             assert!(parallel_safe(n), "{n} 应可并行");
         }
         for n in [
@@ -5308,6 +7687,8 @@ mod tests {
             "Cmd",
             "PowerShell",
             "AskUserQuestion",
+            // 写类：会生成一张新 PNG（§待办 3-19 第二步）—— 与 Write 同级，串行。
+            "ImageAnnotate",
             // 技能按最坏模式算：fork 会派生能写文件、发 API 的子代理（A5）。
             // A14 的「多子代理并发」同样**不从这里放行** —— 它按入参解析出 fork（见
             // main.rs 的 `subagent_call()`），走 `BatchKind::Subagent` 那条专用批。
@@ -5492,5 +7873,301 @@ mod tests {
             .collect();
         assert!(eligible_subdir(cwd, &Path::new(r"D:\ws").join(at_max)), "恰好到上限可以");
         assert!(!eligible_subdir(cwd, &Path::new(r"D:\ws").join(over)), "超过深度上限要跳过");
+    }
+
+    // ── TodoWrite 的任务依赖（§待办 3-22 S3 第一片，2026-10-31）──────
+
+    fn todo_input(items: Value) -> Value {
+        json!({ "todos": items })
+    }
+
+    /// 就绪 / 阻塞的判定：前置完成 ⇒ Ready；前置未完成 ⇒ Blocked。
+    #[test]
+    fn todo_dependencies_split_ready_and_blocked() {
+        let out = todo_write(&todo_input(json!([
+            { "id": "a", "content": "build", "status": "completed", "activeForm": "building" },
+            { "id": "b", "content": "test", "status": "pending", "activeForm": "testing", "blocked_by": ["a"] },
+            { "id": "c", "content": "ship", "status": "pending", "activeForm": "shipping", "blocked_by": ["b"] }
+        ])))
+        .expect("依赖关系合法，应通过");
+        assert!(out.contains("1. [completed] build (id: a)"), "{out}");
+        assert!(out.contains("(id: b; blocked by a)"), "{out}");
+        assert!(out.contains("(id: c; blocked by b)"), "{out}");
+        assert!(out.contains("Ready: b · Blocked: c"), "{out}");
+    }
+
+    /// 不用依赖时回执必须与改造前**逐字一致**（老清单不受影响）。
+    #[test]
+    fn todo_without_dependencies_keeps_the_old_receipt() {
+        let out = todo_write(&todo_input(json!([
+            { "content": "build", "status": "pending", "activeForm": "building" }
+        ])))
+        .unwrap();
+        assert_eq!(
+            out,
+            "Todos have been modified successfully. Keep the list up to date — at most one entry \
+             in_progress, and flip an entry to completed as soon as it is done.\n1. [pending] build"
+        );
+    }
+
+    /// 依赖环 / 未知 id / 自依赖 / 重复 id 一律报错，不静默丢边。
+    #[test]
+    fn todo_dependency_errors_are_rejected_with_actionable_messages() {
+        let cycle = todo_write(&todo_input(json!([
+            { "id": "a", "content": "A", "status": "pending", "activeForm": "a", "blocked_by": ["b"] },
+            { "id": "b", "content": "B", "status": "pending", "activeForm": "b", "blocked_by": ["a"] }
+        ])))
+        .expect_err("环必须拒");
+        assert!(cycle.contains("cycle") && cycle.contains("a") && cycle.contains("b"), "{cycle}");
+
+        let unknown = todo_write(&todo_input(json!([
+            { "id": "a", "content": "A", "status": "pending", "activeForm": "a", "blocked_by": ["nope"] }
+        ])))
+        .expect_err("未知 id 必须拒");
+        assert!(unknown.contains("nope"), "{unknown}");
+
+        let selfish = todo_write(&todo_input(json!([
+            { "id": "a", "content": "A", "status": "pending", "activeForm": "a", "blocked_by": ["a"] }
+        ])))
+        .expect_err("自依赖必须拒");
+        assert!(selfish.contains("itself"), "{selfish}");
+
+        let dup = todo_write(&todo_input(json!([
+            { "id": "a", "content": "A", "status": "pending", "activeForm": "a" },
+            { "id": "a", "content": "B", "status": "pending", "activeForm": "b" }
+        ])))
+        .expect_err("重复 id 必须拒");
+        assert!(dup.contains("twice"), "{dup}");
+    }
+
+    /// 就绪态是**硬约束**（§待办 3-22 分片 3）：前置没完成就不许标 in_progress。
+    #[test]
+    fn todo_refuses_to_start_a_step_whose_prerequisite_is_unfinished() {
+        let err = todo_write(&todo_input(json!([
+            { "id": "build", "content": "build", "status": "pending", "activeForm": "building" },
+            { "id": "test", "content": "test", "status": "in_progress", "activeForm": "testing",
+              "blocked_by": ["build"] }
+        ])))
+        .expect_err("前置未完成时开工必须拒");
+        assert!(err.contains("prerequisite") && err.contains("build"), "{err}");
+
+        // 前置完成后同一份清单就通过了，且 in_progress 的不再混进 Ready/Blocked。
+        let ok = todo_write(&todo_input(json!([
+            { "id": "build", "content": "build", "status": "completed", "activeForm": "building" },
+            { "id": "test", "content": "test", "status": "in_progress", "activeForm": "testing",
+              "blocked_by": ["build"] },
+            { "id": "ship", "content": "ship", "status": "pending", "activeForm": "shipping",
+              "blocked_by": ["test"] }
+        ])))
+        .expect("前置已完成 ⇒ 允许开工");
+        assert!(ok.contains("Ready: none · Blocked: ship"), "{ok}");
+    }
+
+    /// 反向保护：把某个前置改回 pending（重新规划）时，**已完成**的条目不受牵连。
+    #[test]
+    fn todo_completed_entries_are_not_blocked_by_a_reopened_prerequisite() {
+        let out = todo_write(&todo_input(json!([
+            { "id": "a", "content": "A", "status": "pending", "activeForm": "a" },
+            { "id": "b", "content": "B", "status": "completed", "activeForm": "b",
+              "blocked_by": ["a"] }
+        ])))
+        .expect("已完成条目不该因为前置被重开而报错");
+        assert!(out.contains("2. [completed] B (id: b; blocked by a)"), "{out}");
+    }
+
+    /// 供应商直连搜索（2026-11-05）：模型供应商自己提供搜索 API 时，
+    /// **不要求用户再配搜索服务商**，直接复用模型 key。
+    ///
+    /// 四条判据：① provider=deepseek 命中；② 大小写 / 空格不敏感；
+    /// ③ 自定义供应商但端点就是 DeepSeek 也命中；④ 其他供应商 / 空 token 一律不命中
+    ///（没有 key 的直连必然失败，不如老实走兜底源）。
+    #[test]
+    fn vendor_search_prefers_the_model_vendor_when_it_offers_search() {
+        assert_eq!(
+            SearchProvider::parse("deepseek").map(SearchProvider::name),
+            Some("deepseek")
+        );
+
+        let (sp, key) =
+            vendor_search_target("deepseek", "", "sk-test-1234").expect("DeepSeek 供应商必须命中");
+        assert_eq!(sp.name(), "deepseek");
+        assert_eq!(key, "sk-test-1234", "直连用的就是模型 key 本身");
+
+        assert!(
+            vendor_search_target("  DeepSeek ", "https://api.deepseek.com/anthropic", " k ")
+                .is_some(),
+            "大小写与空格不能影响判定"
+        );
+        assert!(
+            vendor_search_target("custom", "https://api.deepseek.com", "k").is_some(),
+            "自定义供应商填了 DeepSeek 端点也要能直连"
+        );
+        assert!(
+            vendor_search_target("anthropic", "https://api.anthropic.com", "k").is_none(),
+            "别家供应商没有这个同 key 搜索 API，不能猜"
+        );
+        assert!(
+            vendor_search_target("deepseek", "", "   ").is_none(),
+            "没有 key 的直连必然失败，应直接退回兜底源"
+        );
+    }
+
+    /// 只读扫描缓存（§待办 1-17 第 6 条）：**同参数 + 文件系统未变 ⇒ 复用**；
+    /// 文件内容或目录条目一变 ⇒ 立刻判失效（宁可多扫，也不返回过期结果）。
+    #[test]
+    fn scan_cache_reuses_only_while_the_stamp_is_current() {
+        let root = std::env::temp_dir().join(format!(
+            "lunac-scan-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("a.txt");
+        fs::write(&file, "needle\n").unwrap();
+
+        let key = format!("test\u{1f}{}", root.display());
+        let stamp = ScanStamp::capture(&[root.clone()], &[file.clone()]);
+        scan_cache_put(key.clone(), "OUT", stamp);
+        assert_eq!(scan_cache_get(&key).as_deref(), Some("OUT"), "未变化应命中");
+
+        // 文件内容（长度）变了 ⇒ 失效
+        fs::write(&file, "haystack\n").unwrap();
+        assert!(scan_cache_get(&key).is_none(), "文件变了必须失效");
+
+        // 目录里新增条目 ⇒ 目录 mtime 变 ⇒ 失效
+        let stamp = ScanStamp::capture(&[root.clone()], &[file.clone()]);
+        scan_cache_put(key.clone(), "OUT", stamp);
+        assert_eq!(scan_cache_get(&key).as_deref(), Some("OUT"));
+        thread::sleep(Duration::from_millis(10)); // 避开文件系统时间戳的粗粒度
+        fs::write(root.join("new.txt"), "x").unwrap();
+        assert!(scan_cache_get(&key).is_none(), "目录新增文件必须失效");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Grep 的端到端行为：缓存命中与否，**结果都必须反映当前盘上事实**。
+    #[test]
+    fn grep_reuses_scan_cache_until_the_tree_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "lunac-grep-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("a.txt");
+        fs::write(&file, "needle\n").unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.cwd = root.clone();
+        let input = json!({ "pattern": "needle", "path": root.display().to_string() });
+
+        let first = grep(&ctx, &input).unwrap();
+        assert!(first.contains("a.txt:1:needle"), "{first}");
+        let second = grep(&ctx, &input).unwrap();
+        assert_eq!(first, second, "文件系统没变时结果必须逐字一致");
+
+        // 内容变化 ⇒ 不得返回旧结果
+        fs::write(&file, "haystack\n").unwrap();
+        assert_eq!(
+            grep(&ctx, &input).unwrap(),
+            "No matches for needle",
+            "文件变了还在吃旧缓存"
+        );
+
+        // 目录新增匹配文件 ⇒ 重扫后必须看到
+        thread::sleep(Duration::from_millis(10));
+        fs::write(root.join("b.txt"), "needle again\n").unwrap();
+        let fourth = grep(&ctx, &input).unwrap();
+        assert!(fourth.contains("b.txt:1:needle again"), "{fourth}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `Preview`（2026-11-14）：只校验入参、不碰本机 —— 与 `PetControl` 同一纪律。
+    #[test]
+    fn preview_requires_a_title_and_a_known_kind() {
+        assert!(
+            preview_tab(&json!({ "title": "预览: 记事本", "kind": "app", "target": "notepad.exe" }))
+                .is_ok()
+        );
+        assert!(preview_tab(&json!({ "title": "工作区", "kind": "workspace" })).is_ok());
+
+        let no_title = preview_tab(&json!({ "kind": "workspace" })).expect_err("缺 title 必须拒");
+        assert!(no_title.contains("title"), "{no_title}");
+
+        let bad_kind = preview_tab(&json!({ "title": "x", "kind": "video", "target": "a.mp4" }))
+            .expect_err("未知 kind 必须拒");
+        assert!(bad_kind.contains("kind"), "{bad_kind}");
+
+        let no_target =
+            preview_tab(&json!({ "title": "x", "kind": "file" })).expect_err("file 缺 target 必须拒");
+        assert!(no_target.contains("target"), "{no_target}");
+    }
+
+    /// 单行封顶（2026-11-15）：短行原样、长行截到阈值并**如实标注丢了多少字符**，
+    /// 且必须按字符（不是字节）切 —— 否则中文会被切成非法 UTF-8。
+    #[test]
+    fn clip_line_truncates_long_lines_by_chars() {
+        // 短行 / 恰好等于阈值：一个字符都不动
+        assert_eq!(clip_line("short", MAX_GREP_LINE_CHARS), "short");
+        let exact = "x".repeat(MAX_GREP_LINE_CHARS);
+        assert_eq!(clip_line(&exact, MAX_GREP_LINE_CHARS), exact);
+
+        // 超长 ASCII：截到阈值 + 明确的剩余量
+        let long = "a".repeat(MAX_GREP_LINE_CHARS + 40);
+        let clipped = clip_line(&long, MAX_GREP_LINE_CHARS);
+        assert_eq!(
+            clipped,
+            format!("{}… (+40 chars)", "a".repeat(MAX_GREP_LINE_CHARS))
+        );
+
+        // 中文（多字节）：必须按字符数切，结果仍是合法 UTF-8 且长度按字符计
+        let han = "汉".repeat(MAX_LINE_CHARS + 3);
+        let clipped = clip_line(&han, MAX_LINE_CHARS);
+        assert!(clipped.starts_with(&"汉".repeat(MAX_LINE_CHARS)));
+        assert!(clipped.ends_with("… (+3 chars)"), "{clipped}");
+        assert_eq!(clipped.chars().filter(|c| *c == '汉').count(), MAX_LINE_CHARS);
+    }
+
+    /// 写类工具按路径互斥（2026-11-15）：并行子代理同时「读-改-写」同一文件时不能丢更新。
+    /// 这里直接钉住锁的语义：同路径（大小写不同也算）必串行。
+    #[test]
+    fn write_lock_serializes_read_modify_write_per_path() {
+        let dir = std::env::temp_dir().join(format!("lunac-write-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.txt");
+        std::fs::write(&path, "").unwrap();
+
+        // 同一路径 → 同一把锁（Windows 大小写不敏感）
+        let upper = PathBuf::from(path.to_string_lossy().to_uppercase());
+        assert!(
+            std::ptr::eq(write_lock_for(&path), write_lock_for(&upper)),
+            "大小写不同也必须落在同一把锁上"
+        );
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let _guard = write_lock_for(&path).lock().unwrap_or_else(|e| e.into_inner());
+                let prev = std::fs::read_to_string(&path).unwrap();
+                // 放大「读」与「写」之间的窗口：没有锁时这里必然丢更新。
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::fs::write(&path, format!("{prev}{index}\n")).unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 8, "丢更新：{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

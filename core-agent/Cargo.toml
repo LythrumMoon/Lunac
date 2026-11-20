@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# ⚠️ **不要**给 serde_json 打开 `preserve_order`（2026-10-27，§待办 3-16 P1-5）：
+#    未开时 `Map` 是 BTreeMap ⇒ JSON 键**恒按字典序**输出，工具 schema / 请求体的键序
+#    因此与构造路径无关、逐字节可复现（固定前缀缓存才不会被自己打掉）。
+#    打开它以后键序会跟随插入顺序，任何一处 `json!` 的书写顺序调整都会让整段前缀作废。
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 # P1 内置工具：Glob 的模式匹配、Grep 的正则
@@ -17,12 +21,47 @@ glob = "0.3"
 regex = "1"
 # A8 图片附件：把按路径读出来的图片字节转成端点要的 base64（与 src-tauri 同版本）
 base64 = "0.22"
+# §待办 3-19 `ImageMeasure`：解码本地图片并做确定性像素统计（bbox / 行·列剖面 / ASCII）。
+# **只开解码器**（默认特性会连带拉编码器与 rayon）—— 我们只读不写。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+] }
 # MCP OAuth（2026-10-01）：PKCE 的 S256 挑战要 SHA-256；code_verifier / state 要不可预测的随机数
 sha2 = "0.10"
 getrandom = "0.2"
+
+# §待办 3-19 第二步 `ImageAnnotate`（2026-10-30）：在图上画尺寸线 / 箭头 / **中文**文本。
+# 用系统 GDI+（`gdiplus.dll`）而不是随包分发字体：中文字形直接取系统已装字体
+# （微软雅黑优先），既不新增字体文件，也不再有「脚本文件编码」这一环 ——
+# 2026-10-27/29 那次会话里中文变乱码，根因正是 PowerShell 5.1 按 GB2312 读无 BOM 的 .ps1。
+# 与宿主 `app/src-tauri` 用同一个 `windows` 版本（该 crate 已在依赖缓存里，不新增下载）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_GdiPlus",
+    # `Screenshot`（§待办 3-28.5，2026-11-16）：GDI `BitBlt` 抓虚拟桌面
+    # （`CreateDCW` / `GetDIBits` 在 Gdi 里），屏幕尺寸用 `GetSystemMetrics`
+    # （在 WindowsAndMessaging 里，`SM_*VIRTUALSCREEN` 同模块）。
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# §待办 3-28.15 PTC（Code Mode，2026-11-19）：内嵌 QuickJS（C 源码随 crate 分发，
+# 用 mingw64 的 gcc 编）。只开默认特性 `std` —— **不要 `full`**（会连带 loader / phf /
+# chrono 等一整套，体积与供应链都没必要）。运行时默认关闭（`LUNAC_PTC=on` 才注册工具）。
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
-strip = true
+# ⚠️ **不要打开 `strip`**（2026-11-03 实测）：`strip = true` 产出的 4.68 MB 无符号
+# agent.exe 被 Windows Defender 判为 `Trojan:Win32/Bearfoos.A!ml`（文件级 ML，快速路径），
+# 构建完成即被隔离；同一份源码改成 `strip = "none"`（8.41 MB，带符号）后
+# `MpCmdRun -Scan` 明确返回「found no threats」。这是典型的「剥离符号 + LTO」ML 误报，
+# 与具体功能代码无关（详见 docs/todo.md §3-25 第十七轮）。
+strip = "none"

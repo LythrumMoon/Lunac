@@ -241,9 +241,10 @@ pub fn append(dir: &Path, scope: MemoryScope, entries: &[Conclusion]) {
 /// 只抽这三类（而非每条工具调用）是刻意的：**结论索引不是流水账**，抽太多等于把被丢的
 /// 内容按更差的形态搬回来，还挤占注入预算。
 pub fn extract_from_dropped(dropped: &[Value], meta: &Meta) -> Vec<Conclusion> {
-    // 先建 id → (工具名, 入参) 与 id → 错误文本 的索引（tool_result 自己只带 tool_use_id）。
+    // 先建 id → (工具名, 入参) 与 id → 错误 / 成功文本 的索引（tool_result 自己只带 tool_use_id）。
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
     let mut failures: HashMap<String, String> = HashMap::new();
+    let mut results: HashMap<String, String> = HashMap::new();
     for msg in dropped {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
@@ -260,9 +261,13 @@ pub fn extract_from_dropped(dropped: &[Value], meta: &Meta) -> Vec<Conclusion> {
                     }
                 }
                 Some("tool_result") => {
-                    if block.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
-                        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                    let is_error =
+                        block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                    if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        if is_error {
                             failures.insert(id.to_string(), tool_result_text(block));
+                        } else {
+                            results.insert(id.to_string(), tool_result_text(block));
                         }
                     }
                 }
@@ -314,6 +319,29 @@ pub fn extract_from_dropped(dropped: &[Value], meta: &Meta) -> Vec<Conclusion> {
                             refs: refs_from_input(&input),
                             reason,
                         }));
+                    } else if name == "WebSearch" {
+                        // S0「搜索溯源」（2026-10-22）：成功的搜索结果里带 URL ⇒ 留一条
+                        // 「查过什么 + 来源网址」的结论。**只在真能抽到网址时写**，避免把每条
+                        // 搜索都变成噪音；URL 归 `kind=url`（不再被误判成文件指针）。
+                        if let Some(text) = results.get(id) {
+                            let urls = urls_from_text(text);
+                            if !urls.is_empty() {
+                                let query = input
+                                    .get("query")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                out.push(meta.materialize(Partial {
+                                    status: STATUS_VERIFIED.to_string(),
+                                    conclusion: format!(
+                                        "WebSearch({query}) returned {} source(s)",
+                                        urls.len()
+                                    ),
+                                    keywords: extract_identifiers(query),
+                                    refs: urls,
+                                    reason: String::new(),
+                                }));
+                            }
+                        }
                     } else if matches!(name, "Write" | "Edit" | "NotebookEdit") {
                         let refs = refs_from_input(&input);
                         let target = refs
@@ -408,14 +436,17 @@ fn refs_from_input(input: &Value) -> Vec<Ref> {
     refs
 }
 
-/// 从一段自由文本里抽指针：识别含路径分隔符 / 常见源码扩展名的 token 当作文件指针。
+/// 从一段自由文本里抽指针：`http(s)://` 网址 + 含路径分隔符 / 常见源码扩展名的 token。
+///
+/// **网址先判**（2026-10-22，S0「搜索溯源」）：URL 里天然有 `/`，旧实现会把它当**文件指针**
+/// 收进 `kind=file` ⇒ 结论里挂的是「文件 https://…」。现在 URL 归 `kind=url` 并跳过路径判定。
 fn refs_from_text(text: &str) -> Vec<Ref> {
-    let mut refs: Vec<Ref> = Vec::new();
+    let mut refs: Vec<Ref> = urls_from_text(text);
     for tok in text.split_whitespace() {
         let t = tok.trim_matches(|c: char| {
             matches!(c, ',' | ';' | '.' | ':' | '(' | ')' | '"' | '\'' | '[' | ']' | '{' | '}' | '<' | '>' | '，' | '。' | '、')
         });
-        if t.chars().count() < 4 {
+        if t.chars().count() < 4 || is_url(t) || t.to_ascii_lowercase().contains("http") {
             continue;
         }
         let looks_path = t.contains('/')
@@ -429,6 +460,61 @@ fn refs_from_text(text: &str) -> Vec<Ref> {
     }
     refs.truncate(8);
     refs
+}
+
+/// 一段文本里的 `http(s)://` 网址 ⇒ `kind=url` 指针（去重、保序、最多 8 条）。
+///
+/// 判据刻意收窄：只认**完整带 scheme** 的网址（`www.` / 裸域名不猜）。**不能在空白切词后
+/// 再判** —— 中文里 URL 后面常直接跟标点 / 汉字（`https://a.com/)，也看`），那样的 token
+/// 既不是 URL 又含 `/`，会被误判成文件指针。这里按**字符扫描**：遇到空白或 `)]}>"'` 与中英
+/// 标点就截断，再去掉尾部 ASCII 标点。
+fn urls_from_text(text: &str) -> Vec<Ref> {
+    let mut out: Vec<Ref> = Vec::new();
+    let mut rest = text;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let pos = match (lower.find("https://"), lower.find("http://")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let tail = &rest[pos..];
+        let mut url = String::new();
+        for c in tail.chars() {
+            if c.is_whitespace()
+                || matches!(
+                    c, ')' | ']' | '}' | '>' | '"' | '\'' | '<'
+                        | '，' | '。' | '、' | '；' | '！' | '？' | '：'
+                )
+            {
+                break;
+            }
+            url.push(c);
+        }
+        let value = url
+            .trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '.' | '!' | '?' | '(' | '[' | '{'))
+            .to_string();
+        if is_url(&value) && !out.iter().any(|r| r.value == value) {
+            out.push(Ref { kind: "url".to_string(), value: value.chars().take(200).collect() });
+            if out.len() >= 8 {
+                break;
+            }
+        }
+        // 跳过已经扫过的那段（URL 为空时至少前进一个字节，防死循环）。
+        let consumed = if url.is_empty() { pos + 1 } else { pos + url.len() };
+        if consumed >= rest.len() {
+            break;
+        }
+        rest = &rest[consumed..];
+    }
+    out
+}
+
+/// 是否是一个完整 URL（只认 `http://` / `https://`，大小写不敏感）。
+fn is_url(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")) && t.chars().count() > 8
 }
 
 /// 精确标识符抽取（BM25 之外的「字面 / 标识符」通道）：含路径分隔符 / 下划线 / 点扩展名 /
@@ -828,6 +914,51 @@ mod tests {
             .find(|e| e.conclusion.contains("Edit") && e.conclusion.contains("src/main.rs"))
             .expect("成功的写类工具要留文件指针");
         assert!(edited.refs.iter().any(|r| r.kind == "file" && r.value == "src/main.rs"));
+    }
+
+    /// S0「搜索溯源」（2026-10-22）：文本里的完整 URL 归 `kind=url`，**不再**被路径判定
+    /// 误收成 `kind=file`；同一段里的真实文件仍然照旧收。
+    #[test]
+    fn urls_in_text_become_url_refs_not_file_refs() {
+        let dropped = vec![json!({"role":"user","content":[{"type":"text","text":
+            "参考 https://example.com/a/b?q=1 和 (https://docs.rs/serde/latest/serde/)，也看 src/main.rs"
+        }]})];
+        let entries = extract_from_dropped(&dropped, &meta(MemoryScope::Global));
+        let ask = entries.iter().find(|e| e.conclusion.contains("example.com")).unwrap();
+        assert!(ask.refs.iter().any(|r| r.kind == "url" && r.value == "https://example.com/a/b?q=1"));
+        assert!(ask
+            .refs
+            .iter()
+            .any(|r| r.kind == "url" && r.value == "https://docs.rs/serde/latest/serde/"));
+        assert!(
+            !ask.refs.iter().any(|r| r.kind == "file" && r.value.contains("http")),
+            "URL 不得再被当成文件指针"
+        );
+        assert!(ask.refs.iter().any(|r| r.kind == "file" && r.value == "src/main.rs"));
+    }
+
+    /// S0「搜索溯源」：成功的 `WebSearch` 结果里带 URL ⇒ 写一条「查过什么 + 来源网址」，
+    /// 每条来源都是 `kind=url` 指针（失败 / 无网址的搜索不写）。
+    #[test]
+    fn web_search_sources_are_indexed_with_url_refs() {
+        let dropped = vec![
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"s1","name":"WebSearch","input":{"query":"rust async book"}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"s1",
+                 "content":"1. https://rust-lang.github.io/async-book/\n2. https://tokio.rs/tokio/tutorial"}
+            ]}),
+        ];
+        let entries = extract_from_dropped(&dropped, &meta(MemoryScope::Global));
+        let hit = entries
+            .iter()
+            .find(|e| e.conclusion.starts_with("WebSearch(rust async book)"))
+            .expect("成功的搜索应留一条带来源的结论");
+        assert_eq!(hit.refs.iter().filter(|r| r.kind == "url").count(), 2);
+        assert!(hit.refs.iter().any(|r| r.value == "https://rust-lang.github.io/async-book/"));
+        assert!(hit.refs.iter().any(|r| r.value == "https://tokio.rs/tokio/tutorial"));
+        assert_eq!(hit.status, STATUS_VERIFIED);
     }
 
     /// 追加 + 读取 + 去重：同一批写两次只留一条；按 scope 分家（global 不掺 pet）。

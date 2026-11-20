@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "updated": "2026-11-19",
+  "maintainer": "Lunac 官方（随包）",
+  "note": "「精选」= 随包 6 个官方技能，按 SKILL.md 的 SHA-256 钉死。sha256 由 scripts/build-release-v2.ps1 在打包时从 agent-templates/skills/<key>/SKILL.md 重新计算并回写，不要手改。没有 sha256 的条目会被界面忽略（宁可不显示，也不做「看起来验证过」的假象）。",
+  "entries": [
+    {
+      "key": "code-review",
+      "description": "对当前改动做一次系统性代码审查：读 diff 与相关上下文，按正确性 / 安全 / 可维护性出结构化问题清单。用户说「审查一下这次改动」「review 这段代码」时用它。",
+      "source": "bundled",
+      "files": ["SKILL.md"],
+      "sha256": ""
+    },
+    {
+      "key": "commit",
+      "description": "根据当前改动起草并执行一次 git commit：读状态与 diff、写规范化的提交信息、只暂存该提交该带的文件。用户说「提交一下」「commit 这些改动」时用它。",
+      "source": "bundled",
+      "files": ["SKILL.md"],
+      "sha256": ""
+    },
+    {
+      "key": "debug",
+      "description": "系统化调试：先复现与收集证据，再提假设并最小验证，最后才改代码。适用于「测试挂了」「行为不对」「报错了但不知道为什么」这类需要查根因的场景。",
+      "source": "bundled",
+      "files": ["SKILL.md"],
+      "sha256": ""
+    },
+    {
+      "key": "mod-conflict",
+      "description": "模组/资源包冲突处置：先确认唯一提供者，再决定加载顺序；外部程序运行时不改它托管的文件。适用于游戏整合包、资源覆盖、加载器冲突这类「同一路径被多个包提供」的场景。",
+      "source": "bundled",
+      "files": ["SKILL.md"],
+      "sha256": ""
+    },
+    {
+      "key": "resource-hub",
+      "description": "给「阅读」插件编写、校验、安装漫画 / 小说 / 番剧 / 电视剧来源规则（RSP 声明式规则），或把用户想看的作品直接交给阅读窗搜索。用户要新增来源、把某个站点做成规则、转换 Kazumi 规则、排查来源失败时使用。",
+      "source": "bundled",
+      "files": ["SKILL.md"],
+      "sha256": ""
+    },
+    {
+      "key": "stuck-guard",
+      "description": "命令疑似卡住时的自检与处置：先判「在干活还是挂了」（实时输出 / CPU / 子进程 / 产物），在编译或持续出输出就继续等，确实卡死就中止，并核对 agent 日志。含「启动可能挂住的命令」的正确姿势。",
+      "source": "bundled",
+      "files": ["SKILL.md"],
+      "sha256": ""
+    }
+  ]
+}

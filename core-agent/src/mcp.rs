@@ -1366,12 +1366,11 @@ impl Bridge {
     }
 
     /// 检索往期会话正文 —— `SessionSearch` 工具的后端（同一个自定义方法通道）。
-    pub fn history_search(&mut self, query: &str, limit: u32) -> Result<String, String> {
-        let res = self.request(
-            "lunac/history_search",
-            json!({ "query": query, "limit": limit }),
-            CALL_TIMEOUT,
-        )?;
+    ///
+    /// `params` 里 `query` / `limit` 必有；`tags` / `date` / `session` / `task`
+    /// 是 2026-11-20 新增的图书馆索引收窄条件（宿主不认识的旧版本会忽略它们）。
+    pub fn history_search(&mut self, params: &Value) -> Result<String, String> {
+        let res = self.request("lunac/history_search", params.clone(), CALL_TIMEOUT)?;
         self.result_text(&res)
     }
 
@@ -1386,15 +1385,27 @@ impl Bridge {
 
     /// 写长期记忆（A4）—— `Remember` 工具的后端。
     ///
-    /// `scope` 决定写哪一份（`global` / `pet`）；`replace` = 整体替换（整理合并时用），
-    /// 默认按条目追加；服务端的去重与上限报错都会以 `isError` 回来 ⇒ 这里变成 `Err`，
-    /// 模型看得见原因，可自行改小重写。
-    pub fn memory_write(&mut self, content: &str, replace: bool, scope: &str) -> Result<String, String> {
-        let res = self.request(
-            "lunac/memory_write",
-            json!({ "content": content, "replace": replace, "scope": scope }),
-            CALL_TIMEOUT,
-        )?;
+    /// `scope` 决定写哪一份（`global` / `pet`）；`skill` 只在 `scope="skill"` 时给出
+    /// （§待办 3-28.10 ①：技能级命名空间）；`page` = 可选记忆页（§待办 3-24，形状由
+    /// **宿主**唯一定义与校验，这里只透传 —— 不在 agent 侧再抄一份规则）；`replace` =
+    /// 整体替换（整理合并时用，带 page 时只替换那一页）；默认按条目追加；
+    /// 服务端的去重与上限报错都会以 `isError` 回来 ⇒ 这里变成 `Err`，模型看得见原因，可自行改小重写。
+    pub fn memory_write(
+        &mut self,
+        content: &str,
+        replace: bool,
+        scope: &str,
+        skill: Option<&str>,
+        page: Option<&str>,
+    ) -> Result<String, String> {
+        let mut params = json!({ "content": content, "replace": replace, "scope": scope });
+        if let Some(skill) = skill {
+            params["skill"] = json!(skill);
+        }
+        if let Some(page) = page {
+            params["page"] = json!(page);
+        }
+        let res = self.request("lunac/memory_write", params, CALL_TIMEOUT)?;
         self.result_text(&res)
     }
 
@@ -1421,6 +1432,24 @@ impl Bridge {
         let res = self.request(
             "lunac/persona_suggestion_write",
             json!({ "content": content }),
+            CALL_TIMEOUT,
+        )?;
+        self.result_text(&res)
+    }
+
+    /// 资源库来源列表（A5，2026-10-18）—— `ResourceHubSearch` 的后端。
+    /// 宿主只回文件层数据；RSP 语义校验在插件侧。
+    pub fn resource_hub_sources(&mut self) -> Result<String, String> {
+        let res = self.request("lunac/resource_hub_sources", json!({}), CALL_TIMEOUT)?;
+        self.result_text(&res)
+    }
+
+    /// 安装一条资源库来源（A5）—— `SourceInstall` 的后端。
+    /// `force` = 覆盖同 id 的已有来源；用户审批在 agent 侧先过。
+    pub fn resource_hub_install(&mut self, source: &Value, force: bool) -> Result<String, String> {
+        let res = self.request(
+            "lunac/resource_hub_install",
+            json!({ "source": source, "force": force }),
             CALL_TIMEOUT,
         )?;
         self.result_text(&res)
@@ -2171,16 +2200,23 @@ impl McpSet {
             .ok_or_else(|| "MCP bridge is not connected".to_string())
     }
 
-    pub fn history_search(&mut self, query: &str, limit: u32) -> Result<String, String> {
-        self.lunac()?.history_search(query, limit)
+    pub fn history_search(&mut self, params: &Value) -> Result<String, String> {
+        self.lunac()?.history_search(params)
     }
 
     pub fn memory_read(&mut self, scope: &str) -> Result<String, String> {
         self.lunac()?.memory_read(scope)
     }
 
-    pub fn memory_write(&mut self, content: &str, replace: bool, scope: &str) -> Result<String, String> {
-        self.lunac()?.memory_write(content, replace, scope)
+    pub fn memory_write(
+        &mut self,
+        content: &str,
+        replace: bool,
+        scope: &str,
+        skill: Option<&str>,
+        page: Option<&str>,
+    ) -> Result<String, String> {
+        self.lunac()?.memory_write(content, replace, scope, skill, page)
     }
 
     pub fn pet_growth_read(&mut self) -> Result<String, String> {
@@ -2193,6 +2229,14 @@ impl McpSet {
 
     pub fn persona_suggestion_write(&mut self, content: &str) -> Result<String, String> {
         self.lunac()?.persona_suggestion_write(content)
+    }
+
+    pub fn resource_hub_sources(&mut self) -> Result<String, String> {
+        self.lunac()?.resource_hub_sources()
+    }
+
+    pub fn resource_hub_install(&mut self, source: &Value, force: bool) -> Result<String, String> {
+        self.lunac()?.resource_hub_install(source, force)
     }
 
     /// resources 读侧走**宿主那条桥**：用户工具定义（`tools\*.json`）在那边，
