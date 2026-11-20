@@ -557,6 +557,12 @@ void PluginWindow::EndResize() {
   if (!resizing_) {
     return;
   }
+  // Flutter 的 GestureDetector 在原生 SetCapture 之后可能收到一次 cancel，
+  // 会对这里发 resizeEnd；此时鼠标其实还按着，提前结束就会回到「只能放大
+  // 一点点」的旧问题。以真实左键状态为准，松开后才真正结束。
+  if ((::GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+    return;
+  }
   resizing_ = false;
   resize_hit_ = 0;
   if (::GetCapture() == GetHandle()) {
@@ -635,8 +641,9 @@ bool PluginWindow::OnCreate() {
             hit = HTBOTTOMRIGHT;
           }
           if (hit != 0) {
-            ::ReleaseCapture();
-            BeginResize(hit, /*capture=*/false);
+            // Dart 只负责「按下」这一下；窗口放大时鼠标会跑到窗口外，
+            // 必须由原生捕获后续 move / up，否则表现为「只能放大一点点」。
+            BeginResize(hit, /*capture=*/true);
           }
           result->Success(flutter::EncodableValue(hit != 0));
           return;
