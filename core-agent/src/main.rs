@@ -4332,6 +4332,9 @@ struct Cfg {
     client: reqwest::blocking::Client,
     endpoint: String,
     token: String,
+    /// 订阅式网关的附加请求头（占位符已替换，见 [`resolve_extra_headers`]）：
+    /// `model_post` 逐条加上。空 Vec = 行为与改造前逐字节一致。
+    extra_headers: Vec<(String, String)>,
     model: String,
     /// 当前生效的思考形态；400 降级后会被就地改写并缓存（Cell 便于 &Cfg 共享）
     thinking: Cell<Thinking>,
@@ -4371,10 +4374,13 @@ impl Cfg {
             .build()
             .map_err(|e| format!("build http client: {e}"))?;
 
+        let extra_headers = resolve_extra_headers(&model);
+
         Ok(Self {
             client,
             endpoint: format!("{}/v1/messages", base.trim_end_matches('/')),
             token,
+            extra_headers,
             model,
             thinking: Cell::new(Thinking::from_env()),
             last_input: Cell::new(0),
@@ -4406,6 +4412,7 @@ impl Cfg {
             client,
             endpoint: self.endpoint.clone(),
             token: self.token.clone(),
+            extra_headers: self.extra_headers.clone(),
             model: self.model.clone(),
             thinking: Cell::new(self.thinking.get()),
             last_input: Cell::new(0),
@@ -4416,9 +4423,311 @@ impl Cfg {
     }
 }
 
+// ── 订阅式网关的附加请求头（2026-11-21）─────────────────────────────
+//
+// 为什么要有这一层：主请求只发 `authorization` / `anthropic-version` /
+// `content-type` 三个头（见四处 `model_post` 调用点），而有些**订阅制**网关在自家的
+// Anthropic 兼容接口上还要求自己的会话头 —— opencode 的 Go 版缺 `x-opencode-session`
+// 直接回 `MissingSessionID`。与其为每家供应商在源码里加分支（加一家就得重编一次），
+// 这里开一个配置化的通用出口：
+//
+// ```json
+// { "extra_headers": { "x-opencode-session": "${session}" } }
+// ```
+//
+// 值里可用占位符：`${session}` = 本进程会话 id（`session_id()`），`${model}` = 当前
+// 模型名，`${env:NAME}` = 同名环境变量（未设置 ⇒ 整条头丢弃）。头名大小写不敏感，
+// 保留头（见 [`RESERVED_HEADERS`]）跳过并告警。
+
+/// 请求构造处自己决定的头，配置层不该覆盖它们。
+///
+/// `authorization` / `anthropic-version` / `content-type` 与请求体强绑定，`accept`
+/// 决定流式与否（`text/event-stream`）—— 让配置文件改它们等于给「请求长什么样」开
+/// 第二个真相来源，出问题时两处都要怀疑。
+const RESERVED_HEADERS: [&str; 4] =
+    ["authorization", "anthropic-version", "content-type", "accept"];
+
+/// 解析一份「头名 → 头值」JSON 对象（纯函数，单测不碰 env）。
+///
+/// 值接受 string / number / bool（后两者按 `to_string` 处理）；`null`、空串、空头名
+/// 整条跳过 —— 一个空的头值只会让服务端 400，不如当成「没配」。
+fn parse_extra_headers(raw: &str, source: &str) -> Result<Vec<(String, String)>, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("{source} 不是合法 JSON：{e}"))?;
+    let Some(object) = value.as_object() else {
+        return Err(format!("{source} 必须是 JSON 对象（头名 → 头值）"));
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, value) in object {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            log::warn(format!("{source}：{name} 由请求构造处决定，已忽略这条配置"));
+            continue;
+        }
+        let text = match value {
+            Value::String(s) => s.trim().to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => {
+                log::warn(format!("{source}：{name} 的值不是字符串 / 数字 / 布尔，已忽略"));
+                continue;
+            }
+        };
+        if text.is_empty() {
+            log::warn(format!("{source}：{name} 的值为空，已忽略"));
+            continue;
+        }
+        out.push((name.to_string(), text));
+    }
+    Ok(out)
+}
+
+/// 把占位符替换成真值：`${session}` / `${model}` / `${env:NAME}`。
+///
+/// 认不出的占位符**原样保留**（多半是用户打错，留在头值里比悄悄吞掉更容易看出来）；
+/// 但 `${env:NAME}` 指向的环境变量不存在或为空 ⇒ 返回 `None`，调用方据此**整条丢弃**
+/// 这个头：往请求里塞字面量 `${env:OPENCODE_KEY}` 只会换来 401，不如不带。
+fn substitute_placeholders(value: &str, session: &str, model: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut dropped = false;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            // 没有闭合 ⇒ 后面的部分当纯文本（不猜用户想写什么）。
+            out.push_str(&rest[start..]);
+            return if dropped { None } else { Some(out) };
+        };
+        let name = &after[..end];
+        match name {
+            "session" => out.push_str(session),
+            "model" => out.push_str(model),
+            other if other.starts_with("env:") => {
+                let key = other[4..].trim();
+                match std::env::var(key) {
+                    Ok(v) if !v.trim().is_empty() => out.push_str(v.trim()),
+                    _ => dropped = true,
+                }
+            }
+            other => {
+                out.push_str("${");
+                out.push_str(other);
+                out.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if dropped {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 附加请求头的**原始**配置（占位符未替换），进程内只解析一次。
+///
+/// 两个来源，前者优先：
+///   ① 环境变量 `LUNAC_AGENT_EXTRA_HEADERS`（JSON 对象，宿主可注入）；
+///   ② `<exe 根>\config\ai.json` 的 `extra_headers` 字段 —— 根由 `LUNAC_SKILLS_DIR`
+///      （`<根>\skills`）的父目录反推。留这一条是因为宿主那层是 Flutter 侧编译的，
+///      只重编 `agent.exe` 的人也该能用上这个能力（改配置即生效，不必动宿主）。
+fn raw_extra_headers() -> &'static Vec<(String, String)> {
+    static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        if let Ok(raw) = std::env::var("LUNAC_AGENT_EXTRA_HEADERS") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                match parse_extra_headers(raw, "LUNAC_AGENT_EXTRA_HEADERS") {
+                    Ok(headers) => return headers,
+                    Err(e) => log::warn(format!("{e}；改读 config\\ai.json 的 extra_headers")),
+                }
+            }
+        }
+        ai_json_extra_headers().unwrap_or_default()
+    })
+}
+
+/// 从 `<exe 根>\config\ai.json` 的 `extra_headers` 读一份。读不到一律 `None`（静默）：
+/// 没配这件事是最常见的情况，不该每次启动都留一行告警。
+fn ai_json_extra_headers() -> Option<Vec<(String, String)>> {
+    let skills_dir = std::env::var("LUNAC_SKILLS_DIR").ok()?;
+    let root = PathBuf::from(skills_dir.trim()).parent()?.to_path_buf();
+    read_extra_headers_from(&root.join("config").join("ai.json"))
+}
+
+/// [`ai_json_extra_headers`] 的纯文件半边（单测直接喂路径，不碰 env）。
+fn read_extra_headers_from(path: &Path) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    // 用记事本 / PowerShell 5.1 手改过 ai.json 会带 UTF-8 BOM，serde_json 见到它会报
+    // 「expected value at line 1 column 1」—— 这里先剥掉，免得「配置明明写了却不生效」。
+    let text = text.trim_start_matches('\u{feff}');
+    let value: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn(format!(
+                "{} 不是合法 JSON（{e}），extra_headers 已忽略",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let section = value.get("extra_headers")?;
+    if !section.is_object() {
+        log::warn(format!(
+            "{}：extra_headers 必须是 JSON 对象（头名 → 头值），已忽略",
+            path.display()
+        ));
+        return None;
+    }
+    let raw = serde_json::to_string(section).ok()?;
+    let headers = parse_extra_headers(&raw, &path.display().to_string()).ok()?;
+    if headers.is_empty() {
+        return None;
+    }
+    log::info(format!(
+        "附加请求头 {} 条（来自 {}）",
+        headers.len(),
+        path.display()
+    ));
+    Some(headers)
+}
+
+/// 本次运行的附加头：占位符已替换，拿不到值的整条丢弃。
+fn resolve_extra_headers(model: &str) -> Vec<(String, String)> {
+    let session = session_id();
+    raw_extra_headers()
+        .iter()
+        .filter_map(|(name, value)| match substitute_placeholders(value, session, model) {
+            Some(resolved) if !resolved.trim().is_empty() => {
+                Some((name.clone(), resolved.trim().to_string()))
+            }
+            _ => {
+                log::warn(format!("附加请求头 {name} 解析后为空或缺环境变量，已丢弃"));
+                None
+            }
+        })
+        .collect()
+}
+
 /// 发往模型端点的 POST 构造器（摘要 / 复盘 / 主请求共用同一个客户端与端点）。
+///
+/// 附加头在这里统一挂上：四处调用点（摘要、主请求、流式、单发）只认这一个出口，
+/// 免得「加了新供应商的头，漏改一处」—— 那类 bug 只在某个分支上出现，极难发现。
 fn model_post(cfg: &Cfg) -> reqwest::blocking::RequestBuilder {
-    cfg.client.post(&cfg.endpoint)
+    let mut builder = cfg.client.post(&cfg.endpoint);
+    for (name, value) in &cfg.extra_headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
+}
+
+#[cfg(test)]
+mod extra_headers_tests {
+    use super::{parse_extra_headers, read_extra_headers_from, substitute_placeholders};
+
+    /// 临时目录里放一份 `ai.json`，返回 (目录, 路径)。BOM 由调用方决定是否加。
+    fn write_ai_json(name: &str, body: &[u8], with_bom: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lunac-extra-headers-{name}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("ai.json");
+        let mut bytes = Vec::new();
+        if with_bom {
+            bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        }
+        bytes.extend_from_slice(body);
+        std::fs::write(&path, &bytes).expect("write ai.json");
+        (dir, path)
+    }
+
+    #[test]
+    fn reads_extra_headers_from_ai_json_even_with_bom() {
+        let (dir, path) = write_ai_json(
+            "bom",
+            br#"{"provider":"opencode","extra_headers":{"x-opencode-session":"${session}"}}"#,
+            true,
+        );
+        let got = read_extra_headers_from(&path).expect("BOM 不该让配置失效");
+        assert_eq!(
+            got,
+            vec![("x-opencode-session".to_string(), "${session}".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn absent_section_or_broken_json_is_silently_none() {
+        let (dir, path) = write_ai_json("absent", br#"{"provider":"deepseek"}"#, false);
+        assert!(read_extra_headers_from(&path).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (dir, path) = write_ai_json("broken", br#"{ "extra_headers": "#, false);
+        assert!(read_extra_headers_from(&path).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_object_and_keeps_custom_headers() {
+        let got = parse_extra_headers(
+            r#"{"x-opencode-session":"${session}","x-b":"2","x-c":true}"#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("x-b".to_string(), "2".to_string()),
+                ("x-c".to_string(), "true".to_string()),
+                ("x-opencode-session".to_string(), "${session}".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_non_object_and_bad_json() {
+        assert!(parse_extra_headers("[]", "test").is_err());
+        assert!(parse_extra_headers("{", "test").is_err());
+    }
+
+    #[test]
+    fn drops_reserved_and_empty_values() {
+        let got = parse_extra_headers(
+            r#"{"authorization":"Bearer x","Anthropic-Version":"2023-06-01","content-type":"x",
+                "accept":"text/event-stream","x-empty":"  ","x-null":null,"x-ok":"v"}"#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(got, vec![("x-ok".to_string(), "v".to_string())]);
+    }
+
+    #[test]
+    fn substitutes_session_and_model() {
+        let got = substitute_placeholders("s=${session};m=${model}", "sess_1_2", "m-1").unwrap();
+        assert_eq!(got, "s=sess_1_2;m=m-1");
+    }
+
+    #[test]
+    fn keeps_unknown_placeholder_verbatim() {
+        let got = substitute_placeholders("a${nope}b", "s", "m").unwrap();
+        assert_eq!(got, "a${nope}b");
+    }
+
+    #[test]
+    fn missing_env_placeholder_drops_the_header() {
+        let got = substitute_placeholders("Bearer ${env:LUNAC_TEST_ABSENT_HEADER_VAR}", "s", "m");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn present_env_placeholder_is_inlined_and_trimmed() {
+        std::env::set_var("LUNAC_TEST_PRESENT_HEADER_VAR", "  k-42  ");
+        let got = substitute_placeholders("${env:LUNAC_TEST_PRESENT_HEADER_VAR}", "s", "m");
+        assert_eq!(got, Some("k-42".to_string()));
+    }
 }
 
 // ── stdout 输出（前端逐行 JSON.parse）────────────────────────────
@@ -16324,6 +16633,7 @@ mod tests {
                 .expect("build test client"),
             endpoint: endpoint.to_string(),
             token: "test".to_string(),
+            extra_headers: Vec::new(),
             model: "test-model".to_string(),
             thinking: Cell::new(Thinking::Disabled),
             last_input: Cell::new(0),
