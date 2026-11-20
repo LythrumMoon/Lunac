@@ -310,7 +310,6 @@ fn format_report(state: &State) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn ctx_with(root: &std::path::Path) -> crate::tools::Ctx {
         use std::sync::atomic::AtomicBool;

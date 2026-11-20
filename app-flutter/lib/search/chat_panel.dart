@@ -84,7 +84,7 @@ class _ChatPanelState extends State<ChatPanel> {
 
   /// 历史列表是否打开（面板内切换，不新开窗口）。
   bool _historyOpen = false;
-  List<ChatHistorySession> _sessions = const [];
+  List<ChatHistoryMeta> _historyMeta = const [];
 
   /// 生成中按发送的两种语义（§待办 3-28.1）：
   /// `false` = **排队**（默认，回合结束后按原语义执行）；
@@ -1296,7 +1296,7 @@ class _ChatPanelState extends State<ChatPanel> {
       _showTransient('回合进行中，先停止再分叉');
       return;
     }
-    final sessions = loadChatHistory();
+    final sessions = loadChatHistoryMeta();
     final snapshot = _model.forkSnapshotAt(
       entry,
       existingTitles: {for (final session in sessions) session.title},
@@ -1316,7 +1316,7 @@ class _ChatPanelState extends State<ChatPanel> {
       _showTransient('分叉失败：分支记录无法读回');
       return;
     }
-    setState(() => _sessions = loadChatHistory());
+    setState(() => _historyMeta = loadChatHistoryMeta());
     _restoreSession(branch);
     _model.addNotice('已从这条回答分叉成新会话「${branch.title}」；原会话未改动，可在历史里切回。');
     _persist();
@@ -1550,12 +1550,22 @@ class _ChatPanelState extends State<ChatPanel> {
       return;
     }
     setState(() {
-      _sessions = loadChatHistory();
+      _historyMeta = loadChatHistoryMeta();
       _historyOpen = true;
       _moreOpen = false;
       _runModeConfirm = false;
       _armedRewind = null;
     });
+  }
+
+  /// 点历史行：只在这一刻读取完整 payload，避免首屏解析全部会话。
+  void _restoreSessionById(ChatHistoryMeta meta) {
+    final session = loadChatHistorySession(meta.id);
+    if (session == null) {
+      _showTransient('读取历史会话失败（记录可能已被删除）');
+      return;
+    }
+    _restoreSession(session);
   }
 
   /// 恢复一份历史会话：先落盘当前会话，再替换界面条目并回灌 agent 上下文。
@@ -1609,21 +1619,21 @@ class _ChatPanelState extends State<ChatPanel> {
     }
   }
 
-  void _deleteSession(ChatHistorySession session) {
+  void _deleteSession(ChatHistoryMeta session) {
     if (!deleteChatHistory(session.id)) {
       return;
     }
     // 会话没了 ⇒ 它在 temp/change-review 下的文件副本也不该留着（v1 `prune_frames`）。
     final survivors = [
-      for (final item in loadChatHistory()) item.id,
+      for (final item in loadChatHistoryMeta()) item.id,
       if (_model.sessionId != null && _model.sessionId != session.id)
         _model.sessionId!,
     ];
     pruneChangeSessions(survivors);
     final wasCurrent = _model.sessionId == session.id;
     setState(() {
-      _sessions = [
-        for (final item in _sessions)
+      _historyMeta = [
+        for (final item in _historyMeta)
           if (item.id != session.id) item,
       ];
     });
@@ -1651,6 +1661,16 @@ class _ChatPanelState extends State<ChatPanel> {
   /// 唯一规则）、**不在前端截断**（单字段 4000 字 / 2000 行 / 预览 256 KiB 都由宿主管）。
   void _showSessionTrace(ChatHistorySession session) =>
       _showTrace('轨迹：${session.title}', _sessionForExport(session));
+
+  /// 历史列表只有元数据；看轨迹时才按 id 读完整会话。
+  void _showSessionTraceMeta(ChatHistoryMeta meta) {
+    final session = loadChatHistorySession(meta.id);
+    if (session == null) {
+      _showTransient('读取历史会话失败（记录可能已被删除）');
+      return;
+    }
+    _showSessionTrace(session);
+  }
 
   /// 当前会话的轨迹（§待办 3-28.12 ②）：**不要求先落盘 / 先聊完一轮** ——
   /// 直接用内存里的 `historyJson()` 快照，进行中的回合也能看。
@@ -2596,7 +2616,7 @@ class _ChatPanelState extends State<ChatPanel> {
 
   Widget _buildHistory() {
     // v1 的对话记录是抽屉：顶部一行「对话记录」+ 右上角关闭（`#chat-drawer-header`）。
-    final body = _sessions.isEmpty
+    final body = _historyMeta.isEmpty
         ? Center(
             child: Text(
               '暂无对话记录。开始对话后会自动保存到这里。',
@@ -2606,8 +2626,9 @@ class _ChatPanelState extends State<ChatPanel> {
           )
         : ListView.builder(
             padding: const EdgeInsets.fromLTRB(10, 2, 10, 8),
-            itemCount: _sessions.length,
-            itemBuilder: (context, index) => _buildHistoryRow(_sessions[index]),
+            itemCount: _historyMeta.length,
+            itemBuilder: (context, index) =>
+                _buildHistoryRow(_historyMeta[index]),
           );
     return Column(
       children: [
@@ -2639,7 +2660,7 @@ class _ChatPanelState extends State<ChatPanel> {
     );
   }
 
-  Widget _buildHistoryRow(ChatHistorySession session) {
+  Widget _buildHistoryRow(ChatHistoryMeta session) {
     final active = session.id == _model.sessionId;
     final updated = session.updatedAt ?? session.createdAt;
     return Container(
@@ -2650,7 +2671,7 @@ class _ChatPanelState extends State<ChatPanel> {
       ),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
-        onTap: () => _restoreSession(session),
+        onTap: () => _restoreSessionById(session),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(10, 7, 4, 7),
           child: Row(
@@ -2667,7 +2688,7 @@ class _ChatPanelState extends State<ChatPanel> {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      '${_relativeTime(updated)} · ${session.messages.length} 条'
+                      '${_relativeTime(updated)} · ${session.messageCount} 条'
                       '${active ? ' · 当前' : ''}',
                       style: TextStyle(
                         color: LunacColors.textMuted,
@@ -2682,7 +2703,7 @@ class _ChatPanelState extends State<ChatPanel> {
                 icon: const Icon(Icons.account_tree_outlined, size: 15),
                 color: LunacColors.textMuted,
                 visualDensity: VisualDensity.compact,
-                onPressed: () => _showSessionTrace(session),
+                onPressed: () => _showSessionTraceMeta(session),
               ),
               IconButton(
                 tooltip: '删除会话',

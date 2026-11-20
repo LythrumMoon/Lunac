@@ -52,6 +52,26 @@ pub struct Hit {
     pub created_at: u64,
 }
 
+/// 检索库的只读体量快照（设置 / 日志用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stats {
+    pub entries: i64,
+    pub sessions: i64,
+    pub tasks: i64,
+    pub db_bytes: u64,
+}
+
+impl Stats {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "entries": self.entries,
+            "sessions": self.sessions,
+            "tasks": self.tasks,
+            "dbBytes": self.db_bytes,
+        })
+    }
+}
+
 /// 检索条件：`text` 为空 = 「按日期 / 对话 / 任务 / 标签浏览最近的」。
 pub struct Query<'a> {
     pub text: &'a str,
@@ -106,9 +126,50 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             session_id TEXT PRIMARY KEY,
             updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        -- 全文检索：CJK 必须用 trigram（unicode61 会把中文整段当一个 token）。
+        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+            text, task_title, tags,
+            content='entries', content_rowid='rowid', tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+            INSERT INTO entries_fts(rowid, text, task_title, tags)
+            VALUES (new.rowid, new.text, new.task_title, new.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+            INSERT INTO entries_fts(entries_fts, rowid, text, task_title, tags)
+            VALUES ('delete', old.rowid, old.text, old.task_title, old.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+            INSERT INTO entries_fts(entries_fts, rowid, text, task_title, tags)
+            VALUES ('delete', old.rowid, old.text, old.task_title, old.tags);
+            INSERT INTO entries_fts(rowid, text, task_title, tags)
+            VALUES (new.rowid, new.text, new.task_title, new.tags);
+        END;
         "#,
     )
-    .map_err(|e| format!("初始化检索库失败: {e}"))
+    .map_err(|e| format!("初始化检索库失败: {e}"))?;
+    // 旧库第一次升级到 FTS：一次性重建，之后靠触发器增量维护。
+    let ready: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = 'fts_ready'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("读取检索库版本失败: {e}"))?;
+    if ready == 0 {
+        conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')", [])
+            .map_err(|e| format!("重建全文索引失败: {e}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_ready', '1')",
+            [],
+        )
+        .map_err(|e| format!("记录全文索引版本失败: {e}"))?;
+    }
+    Ok(())
 }
 
 /// 重建一份**对话会话**的四层索引（`upsert` 后调用）。
@@ -199,6 +260,60 @@ pub fn remove_session(root: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 检索库体量快照（只读）。
+pub fn stats(root: &Path) -> Result<Stats, String> {
+    let conn = open(root)?;
+    stats_in(&conn, root)
+}
+
+fn stats_in(conn: &Connection, root: &Path) -> Result<Stats, String> {
+    let entries: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+        .map_err(|e| format!("统计检索条目失败: {e}"))?;
+    let sessions: i64 = conn
+        .query_row("SELECT COUNT(DISTINCT session_id) FROM entries", [], |row| row.get(0))
+        .map_err(|e| format!("统计对话数失败: {e}"))?;
+    let tasks: i64 = conn
+        .query_row("SELECT COUNT(DISTINCT task_id) FROM entries", [], |row| row.get(0))
+        .map_err(|e| format!("统计任务数失败: {e}"))?;
+    let db_bytes = std::fs::metadata(db_path(root))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    Ok(Stats {
+        entries,
+        sessions,
+        tasks,
+        db_bytes,
+    })
+}
+
+/// 日常维护：清掉已删会话的孤儿索引；库超过 32 MiB 时 `VACUUM` 回收页。
+///
+/// 返回维护后的体量快照；失败只返回错误，不影响正文保存。
+pub fn maintain(root: &Path) -> Result<Stats, String> {
+    let conn = open(root)?;
+    conn.execute(
+        "DELETE FROM entries
+          WHERE scope = ?1
+            AND session_id NOT IN (SELECT session_id FROM session_index)",
+        params![CHAT_SCOPE],
+    )
+    .map_err(|e| format!("清理孤儿索引失败: {e}"))?;
+    conn.execute(
+        "DELETE FROM session_index
+          WHERE session_id NOT IN (SELECT DISTINCT session_id FROM entries WHERE scope = ?1)",
+        params![CHAT_SCOPE],
+    )
+    .map_err(|e| format!("清理空会话索引失败: {e}"))?;
+    let before = stats_in(&conn, root)?;
+    if before.db_bytes > 32 * 1024 * 1024 {
+        conn.execute_batch("PRAGMA optimize; VACUUM;")
+            .map_err(|e| format!("整理检索库失败: {e}"))?;
+        return stats_in(&conn, root);
+    }
+    Ok(before)
+}
+
 /// 首次启动 / 旧版本升级后把现有 JSON 会话补进索引；已是同一版本的会话不重写。
 pub fn sync_sessions(root: &Path, sessions: &[Value]) -> Result<(), String> {
     let mut conn = open(root)?;
@@ -259,14 +374,23 @@ pub fn sync_sessions(root: &Path, sessions: &[Value]) -> Result<(), String> {
 /// `scope` = `global` / `pet` / `skill:<key>`；记忆条目没有「用户提问」，任务层用
 /// 页名（默认页记作「长期记忆」），操作层是一行 bullet。标签来自 bullet 正文。
 pub fn index_memory_text(root: &Path, scope: &str, date: &str, text: &str) -> Result<(), String> {
-    let conn = open(root)?;
-    replace_memory_scope(&conn, scope, date, text)
+    let mut conn = open(root)?;
+    replace_memory_scope(&mut conn, scope, date, text)
 }
 
-fn replace_memory_scope(conn: &Connection, scope: &str, date: &str, text: &str) -> Result<(), String> {
-    conn.execute("DELETE FROM entries WHERE scope = ?1", params![scope])
-        .map_err(|e| format!("清理记忆索引失败: {e}"))?;
+/// 记忆正文 → 索引：只 upsert 当前条目、删除已消失的条目。
+///
+/// 旧实现每次先 `DELETE scope` 再全量插入；记忆是追加式写入，这样会反复重写
+/// 整个 scope（24k 字时尤其明显）。现在按 `scope:p<page>:o<op>` 的稳定 id 做差量。
+fn replace_memory_scope(
+    conn: &mut Connection,
+    scope: &str,
+    date: &str,
+    text: &str,
+) -> Result<(), String> {
     let entries = memory_rows(text);
+    let mut wanted: HashSet<String> = HashSet::new();
+    let mut rows: Vec<(String, String, String, String, String, Vec<String>, i64)> = Vec::new();
     for (task_index, (page, bullets)) in entries.iter().enumerate() {
         let task_id = format!("{scope}:p{task_index}");
         let task_title = if page == "MEMORY" {
@@ -275,35 +399,71 @@ fn replace_memory_scope(conn: &Connection, scope: &str, date: &str, text: &str) 
             page.clone()
         };
         for (op_index, bullet) in bullets.iter().enumerate() {
+            let id = format!("{scope}:p{task_index}:o{op_index}");
             let entry_date = provenance_date(bullet).unwrap_or_else(|| date.to_string());
             let tags = extract_tags(&format!("{task_title} {bullet}"));
-            conn.execute(
-                "INSERT OR REPLACE INTO entries
-                 (id, scope, date, session_id, session_title, task_id, task_title,
-                  operation_id, ordinal, role, kind, text, tags, priority, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![
-                    format!("{scope}:p{task_index}:o{op_index}"),
-                    scope,
-                    entry_date,
-                    scope,
-                    task_title,
-                    task_id,
-                    task_title,
-                    format!("{task_id}:o{op_index}"),
-                    op_index as i64,
-                    "memory",
-                    "memory",
-                    clip(bullet),
-                    serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string()),
-                    priority("memory", "memory"),
-                    crate::cron::now_ms() as i64,
-                ],
-            )
-            .map_err(|e| format!("写记忆索引失败: {e}"))?;
+            wanted.insert(id.clone());
+            rows.push((
+                id,
+                entry_date,
+                task_id.clone(),
+                task_title.clone(),
+                clip(bullet),
+                tags,
+                op_index as i64,
+            ));
         }
     }
-    Ok(())
+
+    let existing: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM entries WHERE scope = ?1")
+            .map_err(|e| format!("读取记忆索引失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![scope], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("读取记忆索引失败: {e}"))?;
+        rows.flatten().collect()
+    };
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("打开记忆索引事务失败: {e}"))?;
+    for stale in existing {
+        if !wanted.contains(&stale) {
+            tx.execute("DELETE FROM entries WHERE id = ?1", params![stale])
+                .map_err(|e| format!("删除旧记忆索引失败: {e}"))?;
+        }
+    }
+    for (id, entry_date, task_id, task_title, body, tags, op_index) in rows {
+        // 先删后插：稳定 id 重新命中时也能让 FTS 的 delete/insert 触发器都跑到。
+        tx.execute("DELETE FROM entries WHERE id = ?1", params![id])
+            .map_err(|e| format!("更新记忆索引失败: {e}"))?;
+        tx.execute(
+            "INSERT INTO entries
+             (id, scope, date, session_id, session_title, task_id, task_title,
+              operation_id, ordinal, role, kind, text, tags, priority, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                id,
+                scope,
+                entry_date,
+                scope,
+                task_title,
+                task_id,
+                task_title,
+                format!("{task_id}:o{op_index}"),
+                op_index,
+                "memory",
+                "memory",
+                body,
+                serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string()),
+                priority("memory", "memory"),
+                crate::cron::now_ms() as i64,
+            ],
+        )
+        .map_err(|e| format!("写记忆索引失败: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("提交记忆索引失败: {e}"))
 }
 
 /// 清空某个 scope 的记忆索引（`/memory clear` / 技能记忆清空后调用）。
@@ -317,9 +477,34 @@ pub fn clear_scope(root: &Path, scope: &str) -> Result<(), String> {
 /// 检索。先按 scope / 日期 / 对话 / 任务粗筛，再按标签 + 关键词 + 优先级精排。
 pub fn search(root: &Path, query: &Query<'_>) -> Result<Vec<Hit>, String> {
     let conn = open(root)?;
+    let terms = query_terms(query.text);
+    // FTS5 trigram 对 <3 字符无法建索引；短查询继续走后面的 LIKE 路径。
+    let fts_ids: Option<HashSet<i64>> = if terms.join("").chars().count() >= 3 {
+        let fts_query = terms
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut ids = HashSet::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT rowid FROM entries_fts WHERE entries_fts MATCH ? LIMIT ?",
+        ) {
+            if let Ok(rows) = stmt.query_map(
+                params![fts_query, MAX_CANDIDATES as i64],
+                |row| row.get::<_, i64>(0),
+            ) {
+                for row in rows.flatten() {
+                    ids.insert(row);
+                }
+            }
+        }
+        if ids.is_empty() { None } else { Some(ids) }
+    } else {
+        None
+    };
     let mut sql = String::from(
         "SELECT date, session_id, session_title, task_id, task_title, role, kind, text,
-                tags, priority, created_at
+                tags, priority, created_at, entries.rowid
            FROM entries WHERE scope = ?",
     );
     let mut values: Vec<SqlValue> = vec![SqlValue::Text(query.scope.to_string())];
@@ -358,12 +543,11 @@ pub fn search(root: &Path, query: &Query<'_>) -> Result<Vec<Hit>, String> {
                     priority: row.get(9)?,
                     created_at: row.get::<_, i64>(10)? as u64,
                 },
-                0.0f64,
+                row.get::<_, i64>(11)?,
             ))
         })
         .map_err(|e| format!("读取检索结果失败: {e}"))?;
 
-    let terms = query_terms(query.text);
     let filter_tags: Vec<String> = query
         .tags
         .iter()
@@ -373,7 +557,12 @@ pub fn search(root: &Path, query: &Query<'_>) -> Result<Vec<Hit>, String> {
     let limit = query.limit.clamp(1, 30);
     let mut scored: Vec<(f64, Hit)> = Vec::new();
     for row in rows {
-        let (hit, _) = row.map_err(|e| format!("读取检索结果失败: {e}"))?;
+        let (hit, rowid) = row.map_err(|e| format!("读取检索结果失败: {e}"))?;
+        if let Some(ids) = &fts_ids {
+            if !ids.contains(&rowid) {
+                continue;
+            }
+        }
         let lower_text = hit.text.to_lowercase();
         let lower_title = hit.task_title.to_lowercase();
         let mut tag_hits = 0usize;
@@ -793,6 +982,20 @@ mod tests {
         assert!(hits
             .iter()
             .all(|hit| hit.task_title == "设置界面打开时标题栏拖不动"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stats_and_maintenance_report_and_clean_the_library() {
+        let root = temp_root("stats");
+        index_session(&root, &session("s1", 1_700_000_000_000)).unwrap();
+        let stats = stats(&root).unwrap();
+        assert!(stats.entries > 0);
+        assert_eq!(stats.sessions, 1);
+        assert!(stats.tasks >= 1);
+        assert!(stats.db_bytes > 0);
+        let after = maintain(&root).unwrap();
+        assert!(after.entries > 0, "维护不能误删正常会话的索引");
         let _ = std::fs::remove_dir_all(&root);
     }
 

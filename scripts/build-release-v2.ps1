@@ -17,7 +17,10 @@
 
 param(
     [string]$Version = "",
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    # Allow cargo / CMake warnings. By default any "warning:" fails the build so
+    # the 0-warning baseline stays enforced.
+    [switch]$AllowWarnings
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +38,40 @@ $Nsi = Join-Path $Root "scripts\lunac-v2-installer.nsi"
 $mingwBin = Join-Path $Root "mingw64\bin"
 if (Test-Path $mingwBin) {
     $env:PATH = $mingwBin + ";" + $env:PATH
+}
+
+function Invoke-CheckedBuild(
+    [string]$Label,
+    [string]$WorkDir,
+    [string]$Exe,
+    [string[]]$CmdArgs
+) {
+    $log = Join-Path ([IO.Path]::GetTempPath()) ("lunac-build-" + [guid]::NewGuid().ToString("N") + ".log")
+    $quoted = @()
+    foreach ($arg in $CmdArgs) {
+        if ($arg -match '\s') { $quoted += ('"' + $arg + '"') } else { $quoted += $arg }
+    }
+    $cmdLine = '"{0}" {1} > "{2}" 2>&1' -f $Exe, ($quoted -join ' '), $log
+    Push-Location $WorkDir
+    try {
+        cmd /c $cmdLine
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if (Test-Path $log) {
+        Get-Content $log -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+    }
+    if ($code -ne 0) {
+        Write-Host "  command: $cmdLine" -ForegroundColor DarkGray
+        Write-Host "  log kept for diagnosis: $log" -ForegroundColor DarkGray
+        throw "$Label failed (exit $code)"
+    }
+    $warnings = @(Select-String -Path $log -Pattern 'warning\s*:' -AllMatches -ErrorAction SilentlyContinue)
+    Remove-Item $log -Force -ErrorAction SilentlyContinue
+    if ($warnings.Count -gt 0 -and -not $AllowWarnings) {
+        throw "$Label produced $($warnings.Count) warning line(s); fix them or pass -AllowWarnings."
+    }
 }
 
 function Find-Tool([string[]]$Paths, [string]$Command) {
@@ -69,6 +106,9 @@ if (-not (Get-Command flutter -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "cargo not found on PATH."
 }
+# Full paths: cmd /c with a quoted bare "flutter" does not append .bat / .exe.
+$FlutterExe = (Get-Command flutter).Source
+$CargoExe = (Get-Command cargo).Source
 if (-not $Makensis) { throw "makensis not found (install NSIS or add it to PATH)." }
 if (-not (Test-Path $Nsi)) { throw "NSI script not found: $Nsi" }
 if (-not (Test-Path (Join-Path $CoreAgent "Cargo.toml"))) { throw "core-agent not found: $CoreAgent" }
@@ -123,20 +163,12 @@ Write-Host ""
 if (-not $NoBuild) {
     # ── 3. agent.exe (always fresh) ──────────────────────────────────
     Write-Host "[3/6] Building agent.exe (cargo build --release, core-agent)..." -ForegroundColor Yellow
-    Push-Location $CoreAgent
-    try {
-        cargo build --release
-        if ($LASTEXITCODE -ne 0) { throw "agent.exe build failed (exit $LASTEXITCODE)" }
-    } finally { Pop-Location }
+    Invoke-CheckedBuild "agent.exe build" $CoreAgent $CargoExe @("build", "--release")
     Write-Host ""
 
     # ── 4. Flutter release bundle ────────────────────────────────────
     Write-Host "[4/6] flutter build windows --release..." -ForegroundColor Yellow
-    Push-Location $AppFlutter
-    try {
-        flutter build windows --release
-        if ($LASTEXITCODE -ne 0) { throw "flutter build failed (exit $LASTEXITCODE)" }
-    } finally { Pop-Location }
+    Invoke-CheckedBuild "flutter build" $AppFlutter $FlutterExe @("build", "windows", "--release")
     Write-Host ""
 } else {
     Write-Host "[3/6] -NoBuild: reusing core-agent\target\release\agent.exe" -ForegroundColor DarkGray

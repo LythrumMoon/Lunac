@@ -546,6 +546,49 @@ pub extern "C" fn lunac_chat_history_delete(id: *const c_char) -> i32 {
     }
 }
 
+/// 历史列表元数据（JSON 数组：id / title / createdAt / updatedAt / messageCount）。
+///
+/// 只读，不含 `messages` / `steps`；点开某条历史时再走 `lunac_chat_history_session`。
+#[no_mangle]
+pub extern "C" fn lunac_chat_history_meta() -> *mut c_char {
+    ensure_data_root();
+    let Some(root) = exe_dir() else {
+        return to_c_string("[]".to_string());
+    };
+    to_c_string(chat_history::list_meta_json(&root))
+}
+
+/// 按 id 取完整会话（JSON；不存在 = `null`）。
+#[no_mangle]
+pub extern "C" fn lunac_chat_history_session(id: *const c_char) -> *mut c_char {
+    ensure_data_root();
+    let Some(root) = exe_dir() else {
+        return to_c_string("null".to_string());
+    };
+    to_c_string(chat_history::session_json(&root, read_arg(id).trim()))
+}
+
+/// 检索库体量快照（JSON：`{ok, entries, sessions, tasks, dbBytes, error}`）。
+///
+/// 只读；设置页 / 日志用它判断索引是否膨胀、是否需要重建。
+#[no_mangle]
+pub extern "C" fn lunac_library_stats() -> *mut c_char {
+    ensure_data_root();
+    let Some(root) = exe_dir() else {
+        return to_c_string(serde_json::json!({ "ok": false, "error": "无法定位数据目录" }).to_string());
+    };
+    match library::stats(&root) {
+        Ok(stats) => {
+            let mut value = stats.to_json();
+            value["ok"] = serde_json::json!(true);
+            to_c_string(value.to_string())
+        }
+        Err(reason) => {
+            to_c_string(serde_json::json!({ "ok": false, "error": reason }).to_string())
+        }
+    }
+}
+
 /// 系统强调色与深 / 浅色偏好（JSON：`accent` / `dark` / `source`）。
 ///
 /// 返回字符串由 Rust 分配，**调用方负责** `lunac_free_string`。

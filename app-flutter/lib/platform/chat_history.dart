@@ -19,6 +19,8 @@ typedef _SaveC = Int32 Function(Pointer<Utf8>);
 typedef _SaveDart = int Function(Pointer<Utf8>);
 typedef _DeleteC = Int32 Function(Pointer<Utf8>);
 typedef _DeleteDart = int Function(Pointer<Utf8>);
+typedef _SessionC = Pointer<Utf8> Function(Pointer<Utf8>);
+typedef _SessionDart = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _FreeC = Void Function(Pointer<Utf8>);
 typedef _FreeDart = void Function(Pointer<Utf8>);
 
@@ -39,6 +41,45 @@ class ChatHistoryMessage {
       return null;
     }
     return ChatHistoryMessage(role, content);
+  }
+}
+
+/// 历史列表的一行元数据（不含 messages / steps，首屏只读这一份）。
+class ChatHistoryMeta {
+  const ChatHistoryMeta({
+    required this.id,
+    required this.title,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.messageCount,
+  });
+
+  final String id;
+  final String title;
+  final DateTime? createdAt;
+  final DateTime? updatedAt;
+  final int messageCount;
+
+  static ChatHistoryMeta? fromJson(dynamic json) {
+    if (json is! Map) {
+      return null;
+    }
+    final id = json['id'];
+    if (id is! String || id.isEmpty) {
+      return null;
+    }
+    DateTime? time(dynamic value) => value is int && value > 0
+        ? DateTime.fromMillisecondsSinceEpoch(value)
+        : null;
+    return ChatHistoryMeta(
+      id: id,
+      title: json['title'] is String ? json['title'] as String : '未命名对话',
+      createdAt: time(json['createdAt']),
+      updatedAt: time(json['updatedAt']),
+      messageCount: json['messageCount'] is num
+          ? (json['messageCount'] as num).toInt()
+          : 0,
+    );
   }
 }
 
@@ -180,6 +221,72 @@ List<ChatHistorySession> loadChatHistory() {
   }
 }
 
+/// 读历史列表元数据（轻量；点开某条时才读完整 payload）。
+List<ChatHistoryMeta> loadChatHistoryMeta() {
+  final library = openLunacNative().library;
+  if (library == null) {
+    return const [];
+  }
+  Pointer<Utf8>? raw;
+  try {
+    raw = library.lookupFunction<_LoadC, _LoadDart>(
+      'lunac_chat_history_meta',
+    )();
+    if (raw == nullptr) {
+      return const [];
+    }
+    final value = jsonDecode(raw.toDartString());
+    if (value is! List) {
+      return const [];
+    }
+    return [for (final item in value) ?ChatHistoryMeta.fromJson(item)];
+  } catch (_) {
+    return const [];
+  } finally {
+    final pointer = raw;
+    if (pointer != null && pointer != nullptr) {
+      _freeQuietly(library, pointer);
+    }
+  }
+}
+
+/// 按 id 读完整会话；不存在 / 桥接缺失 = null。
+ChatHistorySession? loadChatHistorySession(String id) {
+  if (id.isEmpty) {
+    return null;
+  }
+  final library = openLunacNative().library;
+  if (library == null) {
+    return null;
+  }
+  Pointer<Utf8>? input;
+  Pointer<Utf8>? raw;
+  try {
+    input = id.toNativeUtf8();
+    raw = library.lookupFunction<_SessionC, _SessionDart>(
+      'lunac_chat_history_session',
+    )(input);
+    if (raw == nullptr) {
+      return null;
+    }
+    final text = raw.toDartString();
+    if (text == 'null') {
+      return null;
+    }
+    return ChatHistorySession.fromJson(jsonDecode(text));
+  } catch (_) {
+    return null;
+  } finally {
+    if (input != null) {
+      malloc.free(input);
+    }
+    final pointer = raw;
+    if (pointer != null && pointer != nullptr) {
+      _freeQuietly(library, pointer);
+    }
+  }
+}
+
 /// 写入 / 覆盖一条会话；返回 false = 桥接缺失或写失败。
 bool saveChatHistory(Map<String, Object?> session) {
   final library = openLunacNative().library;
@@ -188,8 +295,9 @@ bool saveChatHistory(Map<String, Object?> session) {
   }
   Pointer<Utf8>? pointer;
   try {
-    final save =
-        library.lookupFunction<_SaveC, _SaveDart>('lunac_chat_history_save');
+    final save = library.lookupFunction<_SaveC, _SaveDart>(
+      'lunac_chat_history_save',
+    );
     pointer = jsonEncode(session).toNativeUtf8();
     return save(pointer) == 0;
   } catch (_) {
@@ -212,8 +320,9 @@ bool deleteChatHistory(String id) {
   }
   Pointer<Utf8>? pointer;
   try {
-    final remove =
-        library.lookupFunction<_DeleteC, _DeleteDart>('lunac_chat_history_delete');
+    final remove = library.lookupFunction<_DeleteC, _DeleteDart>(
+      'lunac_chat_history_delete',
+    );
     pointer = id.toNativeUtf8();
     return remove(pointer) == 0;
   } catch (_) {

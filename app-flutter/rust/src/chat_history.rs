@@ -1,17 +1,19 @@
-//! 对话历史（v2 自管）：`<exe 根>/ModuleData/history/chat-history.v2.json`。
+//! 对话历史（v2 自管）：`<exe 根>/ModuleData/history/chat.db`。
 //!
-//! 为什么先不上 SQLite：v1 用 `chat.db`（rusqlite + FTS5）承载历史检索；v2 当前只需要
-//! 「列出 / 恢复 / 删除」三件事，JSON 文件足够且零新依赖。会话形状与 v1 的 `ChatSession`
-//! 同名同义（`id / title / createdAt / updatedAt / messages[{role,content}]`），并原样
-//! 透传 `steps`（过程快照：思考块 / 工具卡 / 已修改的文件，见 `ChatModel.stepsJson`）——
-//! 宿主不解析它，只保证不丢；M6 做数据迁移时可以整体导入。
+//! 2026-11-21 起从「整份 JSON 重写」改为 SQLite：upsert 只写一条会话，历史列表不再
+//! 每次保存都把 100 条会话完整序列化一遍。会话形状与 v1 `ChatSession` 同名同义
+//! （`id / title / createdAt / updatedAt / messages[{role,content}]`），并原样透传
+//! `steps`（过程快照：思考块 / 工具卡 / 已修改的文件，见 `ChatModel.stepsJson`）。
 //!
 //! 纪律：
 //!   · 一次 upsert 一条会话（按 `id` 覆盖），按 `updatedAt` 降序，最多保留 100 条；
 //!   · 单条消息截断到 20000 字、每会话最多 200 条（防无界增长）；
-//!   · 写盘用临时文件 + rename，写坏不会毁掉整份历史。
+//!   · SQLite 开 WAL；旧 `chat-history.v2.json` 只在首次升级时导入一次。
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use rusqlite::{params, Connection};
 
 /// 最多保留的会话数。
 const MAX_SESSIONS: usize = 100;
@@ -20,21 +22,116 @@ const MAX_MESSAGES_PER_SESSION: usize = 200;
 /// 单条消息最多保留的字符数。
 const MAX_MESSAGE_CHARS: usize = 20_000;
 
-/// 历史文件路径。
+/// 历史数据库路径。
+pub fn db_path(root: &Path) -> PathBuf {
+    root.join("ModuleData").join("history").join("chat.db")
+}
+
+/// 旧版 JSON 路径（只用于一次性迁移）。
 pub fn history_path(root: &Path) -> PathBuf {
     root.join("ModuleData")
         .join("history")
         .join("chat-history.v2.json")
 }
 
-/// 读全部会话（JSON 数组字符串；文件不存在 / 读坏 = `[]`）。
+fn open(root: &Path) -> Result<Connection, String> {
+    let path = db_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建历史目录失败（{}）: {e}", parent.display()))?;
+    }
+    let conn = Connection::open(&path).map_err(|e| format!("打开历史数据库失败: {e}"))?;
+    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sessions (
+            id         TEXT PRIMARY KEY,
+            title      TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            payload    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_at DESC);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        "#,
+    )
+    .map_err(|e| format!("初始化历史数据库失败: {e}"))?;
+    import_legacy_once(&conn, root)?;
+    Ok(conn)
+}
+
+/// 旧 JSON 只在首次升级时导入一次；之后空库就是空库，不会反复导回已删会话。
+fn import_legacy_once(conn: &Connection, root: &Path) -> Result<(), String> {
+    let imported: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = 'legacy_imported'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("读取历史迁移标记失败: {e}"))?;
+    if imported > 0 {
+        return Ok(());
+    }
+    let legacy = history_path(root);
+    if let Ok(text) = std::fs::read_to_string(&legacy) {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&text) {
+            for item in items {
+                if item.is_object() {
+                    let _ = insert_session(conn, &item);
+                }
+            }
+        }
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_imported', '1')",
+        [],
+    )
+    .map_err(|e| format!("记录历史迁移标记失败: {e}"))?;
+    Ok(())
+}
+
+fn insert_session(conn: &Connection, session: &serde_json::Value) -> Result<(), String> {
+    let Some(id) = session.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) else {
+        return Err("会话缺少 id".to_string());
+    };
+    let title = session.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let created = session.get("createdAt").and_then(|v| v.as_u64()).unwrap_or(0);
+    let updated = session.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(created);
+    let payload = serde_json::to_string(session).map_err(|e| format!("序列化会话失败: {e}"))?;
+    conn.execute(
+        "INSERT INTO sessions(id, title, created_at, updated_at, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             title = excluded.title,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at,
+             payload = excluded.payload",
+        params![id, title, created as i64, updated as i64, payload],
+    )
+    .map_err(|e| format!("写会话失败: {e}"))?;
+    Ok(())
+}
+
+/// 读全部会话（JSON 数组字符串；库不存在 / 读坏 = `[]`）。
 ///
-/// 顺手把 JSON 补进 `library.db` 的四层索引（日期 → 对话 → 任务 → 操作）：
+/// 顺手把会话补进 `library.db` 的四层索引（日期 → 对话 → 任务 → 操作）：
 /// 旧版本没有索引库时，第一次打开历史即可检索；同一 `updatedAt` 不会重复重建。
 pub fn load_json(root: &Path) -> String {
+    static MAINTENANCE: OnceLock<()> = OnceLock::new();
     let sessions = read_sessions(root);
     if let Err(reason) = crate::library::sync_sessions(root, &sessions) {
         eprintln!("[lunac-history] 同步检索索引失败: {reason}");
+    }
+    // 每次进程只做一次：清孤儿索引；库超过 32 MiB 才 VACUUM。
+    if MAINTENANCE.set(()).is_ok() {
+        match crate::library::maintain(root) {
+            Ok(stats) => crate::log::info(&format!(
+                "library: entries={} sessions={} tasks={} db={} bytes",
+                stats.entries, stats.sessions, stats.tasks, stats.db_bytes
+            )),
+            Err(reason) => eprintln!("[lunac-history] 检索库维护失败: {reason}"),
+        }
     }
     serde_json::to_string(&serde_json::Value::Array(sessions))
         .unwrap_or_else(|_| "[]".to_string())
@@ -52,70 +149,94 @@ pub fn upsert(root: &Path, session: &serde_json::Value) -> Result<(), String> {
     else {
         return Err("会话缺少 id".to_string());
     };
-    let mut sessions = read_sessions(root);
-    sessions.retain(|item| item.get("id").and_then(|value| value.as_str()) != Some(id));
     let mut session = session.clone();
     trim_session(&mut session);
-    sessions.push(session);
-    sessions.sort_by_key(|item| {
-        std::cmp::Reverse(item.get("updatedAt").and_then(|value| value.as_u64()).unwrap_or(0))
-    });
-    sessions.truncate(MAX_SESSIONS);
-    let saved = sessions
-        .iter()
-        .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
-        .cloned();
-    write_sessions(root, &sessions)?;
+    let conn = open(root)?;
+    insert_session(&conn, &session)?;
+    // 保留最近 100 条；按 updatedAt 降序，超过的直接删。
+    conn.execute(
+        "DELETE FROM sessions WHERE id NOT IN (
+             SELECT id FROM sessions ORDER BY updated_at DESC LIMIT ?1
+         )",
+        params![MAX_SESSIONS as i64],
+    )
+    .map_err(|e| format!("裁剪历史会话失败: {e}"))?;
     // 索引是正文的派生层：写失败不该让「历史已经保存成功」变成报错（检索会暂时退化）。
-    if let Some(saved) = saved {
-        if let Err(reason) = crate::library::index_session(root, &saved) {
-            eprintln!("[lunac-history] 重建会话索引失败（{id}）: {reason}");
-        }
+    if let Err(reason) = crate::library::index_session(root, &session) {
+        eprintln!("[lunac-history] 重建会话索引失败（{id}）: {reason}");
     }
     Ok(())
 }
 
 /// 删除一条会话；不存在也算成功。
 pub fn delete(root: &Path, id: &str) -> Result<(), String> {
-    let mut sessions = read_sessions(root);
-    let before = sessions.len();
-    sessions.retain(|item| item.get("id").and_then(|value| value.as_str()) != Some(id));
-    if sessions.len() == before {
+    let conn = open(root)?;
+    let changed = conn
+        .execute("DELETE FROM sessions WHERE id = ?1", params![id])
+        .map_err(|e| format!("删除会话失败: {e}"))?;
+    if changed == 0 {
         return Ok(());
     }
-    write_sessions(root, &sessions)?;
     if let Err(reason) = crate::library::remove_session(root, id) {
         eprintln!("[lunac-history] 删除会话索引失败（{id}）: {reason}");
     }
     Ok(())
 }
 
-fn read_sessions(root: &Path) -> Vec<serde_json::Value> {
-    let Ok(text) = std::fs::read_to_string(history_path(root)) else {
-        return Vec::new();
+/// 历史列表用的轻量元数据（不含 `messages` / `steps`，避免首屏解析大 payload）。
+pub fn list_meta_json(root: &Path) -> String {
+    let Ok(conn) = open(root) else {
+        return "[]".to_string();
     };
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(serde_json::Value::Array(items)) => {
-            items.into_iter().filter(|item| item.is_object()).collect()
-        }
-        _ => Vec::new(),
-    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, title, created_at, updated_at,
+                COALESCE(json_array_length(json_extract(payload, '$.messages')), 0)
+           FROM sessions ORDER BY updated_at DESC",
+    ) else {
+        return "[]".to_string();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, String>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "createdAt": row.get::<_, i64>(2)?,
+            "updatedAt": row.get::<_, i64>(3)?,
+            "messageCount": row.get::<_, i64>(4)?,
+        }))
+    }) else {
+        return "[]".to_string();
+    };
+    serde_json::to_string(&rows.flatten().collect::<Vec<_>>())
+        .unwrap_or_else(|_| "[]".to_string())
 }
 
-fn write_sessions(root: &Path, sessions: &[serde_json::Value]) -> Result<(), String> {
-    let path = history_path(root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建历史目录失败（{}）: {e}", parent.display()))?;
-    }
-    let text = serde_json::to_string(sessions)
-        .map_err(|e| format!("序列化对话历史失败: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)
-        .map_err(|e| format!("写对话历史失败（{}）: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("替换对话历史失败（{}）: {e}", path.display()))?;
-    Ok(())
+/// 按 id 取一份完整会话（点开历史行时才读 payload）；不存在 = `null`。
+pub fn session_json(root: &Path, id: &str) -> String {
+    let Ok(conn) = open(root) else {
+        return "null".to_string();
+    };
+    conn.query_row(
+        "SELECT payload FROM sessions WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_else(|_| "null".to_string())
+}
+
+fn read_sessions(root: &Path) -> Vec<serde_json::Value> {
+    let Ok(conn) = open(root) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT payload FROM sessions ORDER BY updated_at DESC") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|value| value.is_object())
+        .collect()
 }
 
 /// 往期会话检索（`SessionSearch` 的后端）。
@@ -388,6 +509,51 @@ mod tests {
         assert!(upsert(&root, &serde_json::json!([1, 2])).is_err());
         let loaded: serde_json::Value = serde_json::from_str(&load_json(&root)).unwrap();
         assert_eq!(loaded.as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_meta_is_light_and_session_loads_one_payload() {
+        let root = temp_root("meta");
+        upsert(&root, &session("a", 10)).unwrap();
+        upsert(&root, &session("b", 20)).unwrap();
+
+        let meta: serde_json::Value = serde_json::from_str(&list_meta_json(&root)).unwrap();
+        let rows = meta.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "b");
+        assert_eq!(rows[0]["title"], "title-b");
+        assert_eq!(rows[0]["messageCount"], 2);
+        // 列表只带元数据，不带 messages / steps。
+        assert!(rows[0].get("messages").is_none());
+        assert!(rows[0].get("steps").is_none());
+
+        let one: serde_json::Value = serde_json::from_str(&session_json(&root, "a")).unwrap();
+        assert_eq!(one["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(session_json(&root, "missing"), "null");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_json_is_imported_exactly_once() {
+        let root = temp_root("legacy");
+        let legacy = history_path(&root);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy,
+            serde_json::to_string(&serde_json::json!([session("old", 5)])).unwrap(),
+        )
+        .unwrap();
+
+        // 第一次读：旧 JSON 导进 SQLite。
+        let loaded: serde_json::Value = serde_json::from_str(&load_json(&root)).unwrap();
+        assert_eq!(loaded.as_array().unwrap().len(), 1);
+        assert_eq!(loaded[0]["id"], "old");
+
+        // 之后即使旧 JSON 还在，也不会把已删会话导回来（迁移只做一次）。
+        delete(&root, "old").unwrap();
+        let loaded: serde_json::Value = serde_json::from_str(&load_json(&root)).unwrap();
+        assert!(loaded.as_array().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

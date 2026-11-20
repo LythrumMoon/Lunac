@@ -19,11 +19,11 @@
 - **主线**：v2（`app-flutter/`，Flutter + Rust cdylib）为当前开发主线；v1（`app/`，Tauri）
   冻结保留，只修阻断性缺陷。
 - **共享内核**：`core-agent/`（agent）、`indexer/`、`tuning-engine/`、`app-flutter/rust/`。
-- **最近完成的检查**：
-  - `flutter analyze`：0 issue
+- **最近完成的检查（2026-11-21）**：
+  - `flutter analyze`：0 issue；`flutter test`：**320 passed**
   - `app-flutter/rust`：`cargo check --release` **0 warning**；`cargo test --lib`
-    **600 passed / 0 failed / 7 ignored**（连续跑 3 次全绿）
-  - `core-agent`：`cargo test --offline` **507 passed / 0 failed / 16 ignored**
+    **603 passed / 0 failed / 7 ignored**
+  - `core-agent`：`cargo test --offline` **507 passed / 0 failed / 16 ignored**，0 warning
   - `scripts\build-release-v2.ps1`：**exit 0、日志 0 warning**，产出
     `release\Lunac-1.0.0-Setup.exe`（约 21.6 MB），包内含 `agent.exe`、无 `cli.exe`
 - **本轮已完成（2026-11-20）**：
@@ -37,6 +37,12 @@
   - 稳定两个环境依赖测试：ruleset 回环请求改 `.no_proxy()`，ConPTY 用例转
     `#[ignore]`（真机用 `--ignored` 跑）；
   - 新增 `scripts/verify-v2.ps1` 一键验收入口，并已实跑通过。
+- **2026-11-21 优化收口**（详见 §6）：
+  - 构建脚本加入 **0 warning 守门**（`-AllowWarnings` 可放行），core-agent 测试告警清零；
+  - `chat_history` 改 SQLite（`ModuleData/history/chat.db`），历史列表改轻量元数据 +
+    点开再读完整会话；
+  - `library.db` 加 FTS5 trigram、体量统计、孤儿清理与超 32 MiB 的 `VACUUM`；
+  - 记忆索引改稳定 id 差量 upsert，不再整 scope 重写。
 
 ---
 
@@ -125,8 +131,9 @@
 
 ### 记忆 / 检索
 - `3-24` 记忆 wiki 化：多页、互链、自愈、去矛盾、定时维护。
-- 新增：检索库 `library.db` 的维护策略（保留上限、`VACUUM`、损坏重建）；
-- 新增：验证「只注入记忆索引 + 模型按需 `MemorySearch`」能否在 24k 额度下继续降上下文。
+- ~~检索库 `library.db` 的维护策略~~：FTS5 / 统计 / 孤儿清理 / `VACUUM` 已完成（§6）；
+  仍缺「库文件损坏时的自动重建」。
+- 验证「只注入记忆索引 + 模型按需 `MemorySearch`」能否在 24k 额度下继续降上下文（§6-3）。
 
 ### 代理 / 网络
 - `3-25` 自研代理引擎：按 `acceptance-map.md` 的缺口表继续补协议。
@@ -167,25 +174,40 @@
 
 ---
 
-## 6. 本轮新增的优化建议
+## 6. 本轮优化（2026-11-21 已落地）
 
-1. **把 warning 守门写进脚本**：`build-release-v2.ps1` 目前只检查 exit code；
-   可在 cargo 输出里断言 `warning:` 为 0（或提供 `-AllowWarnings` 开关），防止重新长回来。
-2. **检索库可观测性**：给 `library.db` 加 `entries` 行数 / 文件大小 / 最近重建时间的只读接口，
-   设置页或日志里能看见「索引是否膨胀 / 是否需要重建」。
-3. **记忆注入策略 A/B**：当前 24k 整段注入 + `MemorySearch` 按需检索并存；
-   可对比「整段注入」与「只注入索引 + 检索」两种方案的上下文占用与答对率。
-4. **`chat_history` 全量重写**：当前每次保存仍把 100 条会话的完整 JSON 序列化后整文件
-   rename；会话变多后写放大明显。可改成 SQLite 会话表（或按会话分片追加），并给历史列表
-   加分页，避免一次把全部 `messages` 读进内存。
-5. **检索库查询路径**：`library::search` 目前是 `LIKE + 内存打分`；数据量上来后可加
-   FTS5（CJK 用 trigram）或把 `tags` 拆成独立表，让「按标签/任务收窄」真正走索引。
-6. **记忆索引增量更新**：`memory::sync_index` 每次写入都重读整个 scope 再重建；可只
-   替换变化的那条 bullet，减少大记忆文件上的写放大。
-7. **`library.db` 生命周期**：补保留上限、过期日期清理、`VACUUM` 触发条件与损坏重建；
-   当前只有重建入口，没有长期维护策略。
-8. **Flutter 侧历史列表**：`loadChatHistory()` 一次返回全部会话；会话接近 100 条时，
-   首屏会解析大量 `messages`/`steps`。可改成元数据分页 + 点开再取详情。
+> 旧建议 1、2、4、5、6、7、8 已实现并有测试 / 构建取证；只剩 3 需要产品决策。
+
+1. **warning 守门已写进脚本**：`scripts/build-release-v2.ps1` 会收集 cargo / flutter
+   输出，出现 `warning:` 直接失败；确需放行时传 `-AllowWarnings`。最近一次完整构建
+   `exit 0`、日志 **0 warning**。
+2. **检索库可观测性**：`library::stats` + FFI `lunac_library_stats`
+   返回 `entries / sessions / tasks / dbBytes`；每次进程启动在日志里记一行
+   `library: entries=… sessions=… tasks=… db=… bytes`。
+3. **记忆注入策略 A/B（仍待做，需真实会话数据）**：当前 24k 整段注入 +
+   `MemorySearch` 按需检索并存；下一步对比「整段注入」与「只注入索引 + 检索」的
+   上下文占用与答对率，再决定默认策略。
+4. **`chat_history` 已改 SQLite**：`ModuleData/history/chat.db`，`sessions` 表按 id
+   upsert，只写一条会话；旧 `chat-history.v2.json` 首次升级导入一次（有
+   `legacy_imported` 标记，删掉的会话不会被导回）。
+5. **检索库查询已走 FTS5**：`entries_fts` 用 `tokenize='trigram'`（CJK 可检索），
+   由触发器增量维护；短查询（<3 字）继续走 `LIKE`。旧库首次打开自动 `rebuild`。
+6. **记忆索引增量更新**：`replace_memory_scope` 按稳定 id（`scope:p<page>:o<op>`）
+   只 upsert 当前条目、删除消失条目，单 scope 写入在一个事务里完成。
+7. **`library.db` 生命周期**：`library::maintain` 清理孤儿索引 / 空会话，库超过
+   32 MiB 时 `PRAGMA optimize; VACUUM;`；进程内只跑一次，失败只记日志。
+8. **Flutter 历史列表已分页/轻量化**：`lunac_chat_history_meta` 只返回
+   `id / title / createdAt / updatedAt / messageCount`，点开某行才通过
+   `lunac_chat_history_session` 读完整 payload；分叉只取标题也用元数据。
+
+验收口径（最近实跑）：
+
+- `powershell -ExecutionPolicy Bypass -File scripts\verify-v2.ps1` → 通过
+- `flutter test`：**320 passed**
+- `cargo test --lib`（`app-flutter/rust`）：**603 passed / 0 failed / 7 ignored**
+- `cargo test --offline`（`core-agent`）：**507 passed / 0 failed / 16 ignored**，0 warning
+- `scripts\build-release-v2.ps1`：**exit 0 / 0 warning**，产出
+  `release\Lunac-1.0.0-Setup.exe`
 
 ---
 

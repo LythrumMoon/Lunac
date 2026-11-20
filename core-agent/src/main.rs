@@ -9160,17 +9160,6 @@ fn preloaded_skill_refs<'a>(
 /// · 正文来自 `skills::instruction(skill, "")` —。`Skill` 工具注入同一份正文，
 ///   `$ARGUMENTS` 在预加载场景没有实参，替换成空串。
 /// · 超预算：能放多少放多少（按字符截断并。`。truncated)`），后面的整条跳过并记一行。
-/// 测试入口：直接按 key 列表生成区块（生产代码走 `preloaded_skill_refs` + `render_preloaded_skills`。
-/// 因为同一次解析还要拿来收窄工具集）。
-#[cfg(test)]
-fn preloaded_skills_section(
-    skills: &[skills::Skill],
-    keys: &[String],
-) -> Result<String, String> {
-    let picked = preloaded_skill_refs(skills, keys)?;
-    Ok(render_preloaded_skills(&picked))
-}
-
 fn render_preloaded_skills(preloaded: &[&skills::Skill]) -> String {
     if preloaded.is_empty() {
         return String::new();

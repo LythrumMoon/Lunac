@@ -1639,4 +1639,30 @@ void main() {
       );
     expect(restored.turnDurationsMs, hasLength(1));
   });
+
+  test('history metadata parses without loading messages or steps', () {
+    final meta = ChatHistoryMeta.fromJson({
+      'id': 's1',
+      'title': '鉴权接口',
+      'createdAt': 1700000000000,
+      'updatedAt': 1700000100000,
+      'messageCount': 7,
+    });
+    expect(meta, isNotNull);
+    expect(meta!.id, 's1');
+    expect(meta.title, '鉴权接口');
+    expect(meta.messageCount, 7);
+    expect(meta.createdAt!.millisecondsSinceEpoch, 1700000000000);
+    expect(meta.updatedAt!.millisecondsSinceEpoch, 1700000100000);
+
+    // 坏行 / 空 id 直接丢掉，列表不会出现点不开的幽灵行。
+    expect(ChatHistoryMeta.fromJson({'title': '没有 id'}), isNull);
+    expect(ChatHistoryMeta.fromJson({'id': ''}), isNull);
+    expect(ChatHistoryMeta.fromJson('not a map'), isNull);
+    // 老数据缺字段也要能读：标题兜底、计数归零。
+    final legacy = ChatHistoryMeta.fromJson({'id': 's2'});
+    expect(legacy!.title, '未命名对话');
+    expect(legacy.messageCount, 0);
+    expect(legacy.createdAt, isNull);
+  });
 }
