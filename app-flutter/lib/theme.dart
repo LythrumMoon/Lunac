@@ -151,7 +151,8 @@ ThemeData buildLunacTheme() {
     scaffoldBackgroundColor: LunacColors.background,
     textSelectionTheme: TextSelectionThemeData(
       cursorColor: LunacColors.accent,
-      selectionColor: LunacColors.accent.withValues(alpha: 0.2),
+      // 0.2 在深色玻璃底上几乎看不见（用户 2026-11-21 报障）；0.38 既可见又不遮字。
+      selectionColor: LunacColors.accent.withValues(alpha: 0.38),
       selectionHandleColor: LunacColors.accent,
     ),
     snackBarTheme: SnackBarThemeData(
@@ -231,7 +232,9 @@ class AppearanceBackdrop extends StatelessWidget {
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: [
-                    Colors.white.withValues(alpha: sheen.clamp(0.0, 1.0) * 0.22),
+                    Colors.white.withValues(
+                      alpha: sheen.clamp(0.0, 1.0) * 0.22,
+                    ),
                     Colors.transparent,
                   ],
                   stops: const [0, 0.35],

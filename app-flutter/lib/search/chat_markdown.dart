@@ -8,13 +8,14 @@
 // 只覆盖对话里真实出现的子集：标题 / 段落 / 无序与有序列表 / 引用 / 分隔线 /
 // 围栏代码块 / 管道表格 + 行内 `**粗体**`、`*斜体*`、`` `代码` ``、本机路径。
 // 不认识的语法一律按普通文本保留（不吞内容）。
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../platform/shell_actions.dart';
 import '../theme.dart';
 
 /// 行内元素类型。
-enum ChatInlineKind { text, bold, italic, code, path }
+enum ChatInlineKind { text, bold, italic, code, path, url }
 
 /// 一段行内内容。[text] 是**去掉标记后**的纯文本。
 class ChatInlineToken {
@@ -69,6 +70,9 @@ final RegExp _pathPattern = RegExp(
   r'(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s<>"|?*]+',
 );
 
+/// `http(s)://…` 的 URL（模型常把接口地址直接写进正文，也可能是 `…/chat/completions`）。
+final RegExp _urlPattern = RegExp(r'https?://[^\s<>"`]+', caseSensitive: false);
+
 /// 路径末尾常粘到的标点（中英文都要剥掉）。
 const String _pathTailPunctuation = '.,;:!?，。；：！？、）)】」』';
 
@@ -103,10 +107,14 @@ List<ChatInlineToken> parseChatInline(String source) {
         final inner = source.substring(i + 1, end);
         final whole = _pathPattern.matchAsPrefix(inner);
         final isWholePath = whole != null && whole.end == inner.length;
+        final wholeUrl = _urlPattern.matchAsPrefix(inner);
+        final isWholeUrl = wholeUrl != null && wholeUrl.end == inner.length;
         flush();
         tokens.add(
           isWholePath
               ? ChatInlineToken(ChatInlineKind.path, _trimPathTail(inner))
+              : isWholeUrl
+              ? ChatInlineToken(ChatInlineKind.url, _trimPathTail(inner))
               : ChatInlineToken(ChatInlineKind.code, inner),
         );
         i = end + 1;
@@ -138,6 +146,17 @@ List<ChatInlineToken> parseChatInline(String source) {
         flush();
         tokens.add(ChatInlineToken(ChatInlineKind.italic, inner));
         i = end + 1;
+        continue;
+      }
+    }
+    // URL：优先于本机路径匹配；点击在预览区打开。
+    final url = _urlPattern.matchAsPrefix(source, i);
+    if (url != null) {
+      final raw = _trimPathTail(url[0]!);
+      if (raw.length >= 8) {
+        flush();
+        tokens.add(ChatInlineToken(ChatInlineKind.url, raw));
+        i += raw.length;
         continue;
       }
     }
@@ -256,7 +275,8 @@ List<ChatBlock> parseChatBlocks(String source) {
         final cells = _tableCells(lines[i]);
         // 列数与表头不一致时补齐 / 截断，避免 Table 行长度不等直接断言
         rows.add([
-          for (var c = 0; c < header.length; c++) c < cells.length ? cells[c] : '',
+          for (var c = 0; c < header.length; c++)
+            c < cells.length ? cells[c] : '',
         ]);
         i++;
       }
@@ -317,25 +337,61 @@ List<ChatBlock> parseChatBlocks(String source) {
       body.add(lines[i].trim());
       i++;
     }
-    blocks.add(
-      ChatBlock(kind: ChatBlockKind.paragraph, text: body.join('\n')),
-    );
+    blocks.add(ChatBlock(kind: ChatBlockKind.paragraph, text: body.join('\n')));
   }
   return blocks;
 }
 
 /// 对话正文渲染：解析 + 画出块级结构，行内路径是可点击的小泡泡。
-class ChatMarkdownView extends StatelessWidget {
-  const ChatMarkdownView({super.key, required this.text, this.baseStyle});
+class ChatMarkdownView extends StatefulWidget {
+  const ChatMarkdownView({
+    super.key,
+    required this.text,
+    this.baseStyle,
+    this.onOpenUrl,
+  });
 
   final String text;
   final TextStyle? baseStyle;
 
+  /// URL 点击：由对话面板转到预览区打开；null = 只显示为普通可选中文本。
+  final void Function(String url)? onOpenUrl;
+
+  @override
+  State<ChatMarkdownView> createState() => _ChatMarkdownViewState();
+}
+
+class _ChatMarkdownViewState extends State<ChatMarkdownView> {
+  /// 链接用的手势识别器。每次重建前释放上一批，避免流式输出反复建链接泄漏。
+  final List<TapGestureRecognizer> _recognizers = <TapGestureRecognizer>[];
+
+  void _disposeRecognizers() {
+    for (final recognizer in _recognizers) {
+      recognizer.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  TapGestureRecognizer _urlRecognizer(String url) {
+    final recognizer = TapGestureRecognizer()
+      ..onTap = () => widget.onOpenUrl?.call(url);
+    _recognizers.add(recognizer);
+    return recognizer;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final style = baseStyle ??
+    _disposeRecognizers();
+    final style =
+        widget.baseStyle ??
         TextStyle(color: LunacColors.text, fontSize: 13, height: 1.55);
-    final blocks = parseChatBlocks(text);
+    final blocks = parseChatBlocks(widget.text);
     if (blocks.isEmpty) {
       return const SizedBox.shrink();
     }
@@ -388,9 +444,7 @@ class ChatMarkdownView extends StatelessWidget {
                     SizedBox(
                       width: block.kind == ChatBlockKind.ordered ? 20 : 14,
                       child: Text(
-                        block.kind == ChatBlockKind.ordered
-                            ? '${i + 1}.'
-                            : '•',
+                        block.kind == ChatBlockKind.ordered ? '${i + 1}.' : '•',
                         style: base.copyWith(
                           color: LunacColors.textDim,
                           height: 1.55,
@@ -470,9 +524,7 @@ class ChatMarkdownView extends StatelessWidget {
                 TextSpan(
                   children: _inlineSpans(
                     cell,
-                    header
-                        ? base.copyWith(fontWeight: FontWeight.w600)
-                        : base,
+                    header ? base.copyWith(fontWeight: FontWeight.w600) : base,
                   ),
                 ),
               ),
@@ -526,12 +578,98 @@ class ChatMarkdownView extends StatelessWidget {
               backgroundColor: LunacColors.surfaceHover,
             ),
           ),
+          ChatInlineKind.url => TextSpan(
+            text: token.text,
+            style: base.copyWith(
+              color: LunacColors.accent,
+              decoration: TextDecoration.underline,
+              decorationColor: LunacColors.accent,
+            ),
+            recognizer: widget.onOpenUrl == null
+                ? null
+                : _urlRecognizer(token.text),
+          ),
           ChatInlineKind.path => WidgetSpan(
             alignment: PlaceholderAlignment.middle,
             child: _PathChip(path: token.text),
           ),
         },
     ];
+  }
+}
+
+/// 纯文本里的 URL 链接化（工具输出 / 命令回显用）。
+///
+/// 与正文的 markdown 渲染分开：这里不解析粗体 / 列表，只把 `http(s)://...`
+/// 变成可点击的 `TextSpan`，并保留 `SelectionArea` 的选中高亮。
+class LinkifiedText extends StatefulWidget {
+  const LinkifiedText(this.text, {super.key, this.style, this.onOpenUrl});
+
+  final String text;
+  final TextStyle? style;
+  final void Function(String url)? onOpenUrl;
+
+  @override
+  State<LinkifiedText> createState() => _LinkifiedTextState();
+}
+
+class _LinkifiedTextState extends State<LinkifiedText> {
+  final List<TapGestureRecognizer> _recognizers = <TapGestureRecognizer>[];
+
+  void _disposeRecognizers() {
+    for (final recognizer in _recognizers) {
+      recognizer.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _disposeRecognizers();
+    final base =
+        widget.style ??
+        TextStyle(color: LunacColors.text, fontSize: 12, height: 1.45);
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final match in _urlPattern.allMatches(widget.text)) {
+      final raw = _trimPathTail(match[0]!);
+      if (raw.length < 8) {
+        continue;
+      }
+      if (match.start > cursor) {
+        spans.add(
+          TextSpan(
+            text: widget.text.substring(cursor, match.start),
+            style: base,
+          ),
+        );
+      }
+      final recognizer = TapGestureRecognizer()
+        ..onTap = () => widget.onOpenUrl?.call(raw);
+      _recognizers.add(recognizer);
+      spans.add(
+        TextSpan(
+          text: raw,
+          style: base.copyWith(
+            color: LunacColors.accent,
+            decoration: TextDecoration.underline,
+            decorationColor: LunacColors.accent,
+          ),
+          recognizer: widget.onOpenUrl == null ? null : recognizer,
+        ),
+      );
+      cursor = match.start + raw.length;
+    }
+    if (cursor < widget.text.length) {
+      spans.add(TextSpan(text: widget.text.substring(cursor), style: base));
+    }
+    return SelectionArea(child: Text.rich(TextSpan(children: spans)));
   }
 }
 

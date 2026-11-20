@@ -798,6 +798,11 @@ bool PluginWindow::OnCreate() {
           result->Success();
           return;
         }
+        if (call.method_name() == "isOpen") {
+          result->Success(flutter::EncodableValue(
+              PluginWindowManager::GetInstance()->IsOpen("sandbox")));
+          return;
+        }
         result->NotImplemented();
       });
 

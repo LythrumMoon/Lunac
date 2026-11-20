@@ -832,6 +832,19 @@ class _ChatPanelState extends State<ChatPanel> {
     }
   }
 
+  /// 点正文 / 工具输出里的 URL：在预览区打开对应 URL 标签。
+  ///
+  /// 这是纯展示通道：入队失败只在对话流里给一条旁注，不把错误抛给 agent。
+  void _openUrlPreview(String url) {
+    final error = _pushUrlPreview(url);
+    if (error == null) {
+      unawaited(openSandboxWindow());
+    } else {
+      _model.addNotice('打不开预览区：$error');
+      setState(() {});
+    }
+  }
+
   /// 一轮结束（`result`）把用量追加进本地日志（v1 `appendUsageLog` 同口径）。
   /// 没有模型名时宁可漏记，也不写一条「—」的错账。
   void _recordUsage(Map<String, dynamic> event) {
@@ -1245,45 +1258,6 @@ class _ChatPanelState extends State<ChatPanel> {
     return last == null ? 0 : _keptAssistantCount(last);
   }
 
-  /// 产出物行的「打开」（§待办 3-28.13 的 Open）：交给系统默认程序，不在预览区。
-  ///
-  /// 与「看 diff」是两个意图（`onOpenFile` 走预览区 diff），所以分成两个入口。
-  void _openChangedExternally(String path) {
-    if (!openPath(path)) {
-      _showTransient('打不开 ${fileBaseName(path)}（文件可能已被移走）');
-    }
-  }
-
-  /// 产出物卡上的「还原」（§待办 3-28.13）：只回退**这一个**文件到改动前。
-  ///
-  /// 走既有快照链路（`revertChanges`），不新开回滚机制；还原后把它从「改动文件」的
-  /// 三张表里一起摘掉 —— 否则抽屉里还挂着一条已经还原过的记录。
-  void _revertOneChange(String path) {
-    final result = revertChanges(path: path, session: _sessionKey);
-    if (!result.ok && result.paths.isEmpty) {
-      _showTransient(result.error.isEmpty ? '还原失败' : result.error);
-      return;
-    }
-    setState(() {
-      for (final changed in [path, ...result.paths]) {
-        _model.changedFiles.removeWhere(
-          (item) => item.toLowerCase() == changed.toLowerCase(),
-        );
-        _pendingChanges.removeWhere(
-          (item) => item.toLowerCase() == changed.toLowerCase(),
-        );
-        _changeStats.removeWhere(
-          (key, _) => key.toLowerCase() == changed.toLowerCase(),
-        );
-      }
-    });
-    _showTransient(
-      result.failed > 0
-          ? '还原有 ${result.failed} 条失败（见日志）'
-          : '已还原 ${fileBaseName(path)}',
-    );
-  }
-
   /// 回退到第 [kept] 回合之前：把该回合及之后改过的文件还原（v1 `revertFileSnapshots`）。
   void _revertFilesSince(int kept) {
     final result = revertChangesSince(kept, session: _sessionKey);
@@ -1382,6 +1356,11 @@ class _ChatPanelState extends State<ChatPanel> {
   /// 窗口由宿主建（复用插件窗口基础设施，id = `sandbox`）；没有窗口宿主
   /// （单测 / Linux）时如实提示，不假装打开了。
   Future<void> _openSandbox() async {
+    // 同一颗按钮第二次点击 = 关闭预览窗（用户 2026-11-21 口径）。
+    if (await isSandboxWindowOpen()) {
+      await closeSandboxWindow();
+      return;
+    }
     final opened = await openSandboxWindow();
     if (opened || !mounted) {
       return;
@@ -2379,10 +2358,16 @@ class _ChatPanelState extends State<ChatPanel> {
         return;
       }
       segment++;
+      // 2026-11-21：标题优先用该轮 TodoWrite 的待办内容；没有待办时才回落到
+      // 用户提问概括（旧会话 / 模型没写待办的情况）。
+      final title = turnIndex >= 0
+          ? (_model.todoTitleForTurn(turnIndex) ??
+                (taskTitle.isEmpty ? '过程记录' : taskTitle))
+          : '过程记录';
       blocks.add(
         _TaskDrawer(
           key: ValueKey('task-$turnIndex-$segment'),
-          title: taskTitle.isEmpty ? '过程记录' : taskTitle,
+          title: title,
           thinkingChars: thinking,
           tools: tools,
           results: results,
@@ -2510,11 +2495,7 @@ class _ChatPanelState extends State<ChatPanel> {
       key: ValueKey('artifacts-$turn'),
       paths: paths,
       diffStats: _changeStats,
-      // 命令产出的文件只有元数据指纹、没有前像 ⇒ 不显示「还原」（§待办 3-28.13 ②）。
-      nonRevertible: _cmdOutputs,
       onOpenFile: _openChangePreview,
-      onOpenExternal: _openChangedExternally,
-      onRevertFile: _revertOneChange,
     );
   }
 
@@ -2745,7 +2726,7 @@ class _ChatPanelState extends State<ChatPanel> {
             children: [
               // 轻量 markdown：标题 / 列表 / 表格 / 围栏代码 + 行内加粗、代码、
               // 本机路径小泡泡（v1 的 pre-wrap 会把 `**` 和 `|` 原样显示出来）。
-              ChatMarkdownView(text: entry.text),
+              ChatMarkdownView(text: entry.text, onOpenUrl: _openUrlPreview),
               // v1 `.flow-actions`：回答下方的图标动作条（复制 / 分叉）。
               // 2026-11-20（用户口径）：只有**全对话最后一条**总结正文才给这两颗键，
               // 阶段小总结（一段思考之后的自动输出）不再出现。
@@ -6263,10 +6244,7 @@ class _ArtifactsBlock extends StatefulWidget {
     super.key,
     required this.paths,
     this.diffStats = const {},
-    this.nonRevertible = const {},
     this.onOpenFile,
-    this.onOpenExternal,
-    this.onRevertFile,
   });
 
   /// 本轮写类工具（create / edit）改过的完整路径（`changedFilesOf` 去重后）。
@@ -6278,27 +6256,15 @@ class _ArtifactsBlock extends StatefulWidget {
   /// 点文件名 → 在预览区打开 diff（对话流里不内联渲染 diff，用户 2026-11-14 口径）。
   final void Function(String path)? onOpenFile;
 
-  /// 「打开」→ 用系统默认程序（与「看 diff」分成两个意图）。
-  final void Function(String path)? onOpenExternal;
-
-  /// 「还原」→ 走既有快照链路把这个文件写回改动前。
-  final void Function(String path)? onRevertFile;
-
-  /// 不可还原的产出物（命令类工具产生的文件：只有元数据指纹，没有前像）。
-  final Set<String> nonRevertible;
-
   @override
   State<_ArtifactsBlock> createState() => _ArtifactsBlockState();
 }
 
 class _ArtifactsBlockState extends State<_ArtifactsBlock> {
-  /// 产出物是否展开（默认收起：抽屉里再展开一层，页不会被撑长）。
-  bool _artifactsOpen = false;
-
-  /// 产出物卡的标题行 + 展开后的逐文件明细（§待办 3-28.13）。
+  /// 产出物：标题行只给总数与 diff 汇总，文件本身直接铺成可点击卡片。
   ///
-  /// 只统计**拿得到 diff** 的文件（`measured`）；拿不到的（二进制 / 快照被确认清掉）
-  /// 逐行标「无快照」—— 不把 0 当成「没改动」。
+  /// 用户 2026-11-21 口径：不再用「产出物 N 个文件 ▸」折一层，点文件卡片就是
+  /// 在预览区打开 diff；拿不到 diff 的文件也保留卡片并标「无快照 / 二进制」。
   Widget _buildArtifacts(
     List<String> paths,
     int added,
@@ -6309,39 +6275,72 @@ class _ArtifactsBlockState extends State<_ArtifactsBlock> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        InkWell(
-          borderRadius: BorderRadius.circular(4),
-          onTap: () => setState(() => _artifactsOpen = !_artifactsOpen),
-          child: Padding(
-            padding: const EdgeInsets.only(top: 2, left: 2),
-            child: Text(
-              '产出物 ${paths.length} 个文件'
-              '${measured > 0 ? ' · +$added −$removed' : ''}'
-              '${_artifactsOpen ? ' ▾' : ' ▸'}',
-              style: base.copyWith(
-                color: _artifactsOpen ? LunacColors.text : LunacColors.textDim,
-              ),
-            ),
+        Padding(
+          padding: const EdgeInsets.only(top: 2, left: 2),
+          child: Text(
+            '产出物 ${paths.length} 个文件'
+            '${measured > 0 ? ' · +$added −$removed' : ''}',
+            style: base,
           ),
         ),
-        if (_artifactsOpen)
-          Container(
-            margin: const EdgeInsets.only(top: 2, left: 2),
-            padding: const EdgeInsets.only(left: 8),
-            decoration: BoxDecoration(
-              border: Border(
-                left: BorderSide(
-                  color: LunacColors.text.withValues(alpha: 0.10),
-                  width: 2,
+        const SizedBox(height: 4),
+        Wrap(
+          spacing: 6,
+          runSpacing: 4,
+          children: [for (final path in paths) _buildArtifactChip(path)],
+        ),
+      ],
+    );
+  }
+
+  /// 一张文件卡片：图标 + 文件名 + diff 统计；点击在预览区打开。
+  Widget _buildArtifactChip(String path) {
+    final stat = widget.diffStats[path];
+    final hasStat = stat != null && stat.ok;
+    return Tooltip(
+      message: path,
+      waitDuration: const Duration(milliseconds: 400),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: widget.onOpenFile == null
+            ? null
+            : () => widget.onOpenFile!(path),
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 260),
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          decoration: BoxDecoration(
+            color: LunacColors.surfaceHover.withValues(alpha: 0.55),
+            border: Border.all(color: LunacColors.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.description_outlined,
+                size: 12,
+                color: LunacColors.textMuted,
+              ),
+              const SizedBox(width: 5),
+              Flexible(
+                child: Text(
+                  fileBaseName(path),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: LunacColors.text, fontSize: 11),
                 ),
               ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [for (final path in paths) _buildArtifactRow(path)],
-            ),
+              const SizedBox(width: 5),
+              Text(
+                hasStat
+                    ? '+${stat.added} −${stat.removed}'
+                    : (stat?.binary == true ? '二进制' : '无快照'),
+                style: TextStyle(color: LunacColors.textMuted, fontSize: 10),
+              ),
+            ],
           ),
-      ],
+        ),
+      ),
     );
   }
 
@@ -6364,76 +6363,21 @@ class _ArtifactsBlockState extends State<_ArtifactsBlock> {
       child: _buildArtifacts(widget.paths, added, removed, measured),
     );
   }
+}
 
-  /// 产出物一行：文件名（点开 diff）+ `+N −M` + 「还原」。
-  Widget _buildArtifactRow(String path) {
-    final stat = widget.diffStats[path];
-    final hasStat = stat != null && stat.ok;
-    return Row(
-      children: [
-        Icon(
-          Icons.description_outlined,
-          size: 11,
-          color: LunacColors.textMuted,
-        ),
-        const SizedBox(width: 5),
-        Expanded(
-          child: Tooltip(
-            message: path,
-            waitDuration: const Duration(milliseconds: 400),
-            child: InkWell(
-              onTap: widget.onOpenFile == null
-                  ? null
-                  : () => widget.onOpenFile!(path),
-              child: Text(
-                fileBaseName(path),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: LunacColors.text, fontSize: 11),
-              ),
-            ),
-          ),
-        ),
-        if (hasStat)
-          Padding(
-            padding: const EdgeInsets.only(left: 6),
-            child: Text(
-              '+${stat.added} −${stat.removed}',
-              style: TextStyle(color: LunacColors.textMuted, fontSize: 10),
-            ),
-          )
-        else
-          Padding(
-            padding: const EdgeInsets.only(left: 6),
-            child: Text(
-              stat?.binary == true ? '二进制' : '无快照',
-              style: TextStyle(color: LunacColors.textMuted, fontSize: 10),
-            ),
-          ),
-        if (widget.onOpenExternal != null)
-          IconButton(
-            tooltip: '用系统默认程序打开',
-            icon: const Icon(Icons.open_in_new, size: 12),
-            color: LunacColors.textMuted,
-            visualDensity: VisualDensity.compact,
-            constraints: const BoxConstraints(minWidth: 22, minHeight: 20),
-            padding: EdgeInsets.zero,
-            onPressed: () => widget.onOpenExternal!(path),
-          ),
-        if (widget.onRevertFile != null && !widget.nonRevertible.contains(path))
-          TextButton(
-            onPressed: () => widget.onRevertFile!(path),
-            style: TextButton.styleFrom(
-              foregroundColor: LunacColors.accent,
-              visualDensity: VisualDensity.compact,
-              minimumSize: const Size(0, 20),
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-            child: const Text('还原', style: TextStyle(fontSize: 10)),
-          ),
-      ],
-    );
+/// 入队一条 URL 预览标签；返回 null = 入队成功，否则是失败原因。
+String? _pushUrlPreview(String url) {
+  final uri = Uri.tryParse(url);
+  final label = uri == null
+      ? '预览: URL'
+      : (uri.path.isEmpty ? '预览: ${uri.host}' : '预览: ${uri.host}${uri.path}');
+  return pushPreviewTab({'title': label, 'kind': 'url', 'target': url});
+}
+
+/// 工具输出里的 URL：入队后把预览窗打开；失败不打扰对话流。
+void _openUrlFromTool(String url) {
+  if (_pushUrlPreview(url) == null) {
+    unawaited(openSandboxWindow());
   }
 }
 
@@ -6854,7 +6798,7 @@ class _ToolCardState extends State<_ToolCard> {
   }
 
   Widget _mono(String text, Color color) {
-    return Text(
+    return LinkifiedText(
       text,
       style: TextStyle(
         color: color,
@@ -6863,6 +6807,7 @@ class _ToolCardState extends State<_ToolCard> {
         fontFamily: 'Consolas',
         fontFamilyFallback: const ['Courier New', 'monospace'],
       ),
+      onOpenUrl: _openUrlFromTool,
     );
   }
 }

@@ -326,6 +326,31 @@ void main() {
     expect(title.contains('任务 1'), isFalse);
   });
 
+  test('task drawer title prefers the matching TodoWrite item', () {
+    final model = ChatModel()..addUser('把设置窗口的拖动修一下');
+    model.apply({
+      'type': 'assistant',
+      'message': {
+        'content': [
+          {
+            'type': 'tool_use',
+            'id': 't1',
+            'name': 'TodoWrite',
+            'input': {
+              'todos': [
+                {'content': '定位标题栏拖拽层', 'status': 'completed'},
+                {'content': '给设置标题栏接上拖动', 'status': 'in_progress'},
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    expect(model.todoTitleForTurn(0), '给设置标题栏接上拖动');
+    expect(model.todoTitleForTurn(1), isNull);
+  });
+
   test('restore puts back user questions missing from old process steps', () {
     final model = ChatModel()
       ..restore(

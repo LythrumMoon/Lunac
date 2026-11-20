@@ -4,23 +4,30 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:lunac/search/chat_markdown.dart';
 import 'package:lunac/theme.dart';
 
-Widget _wrap(String text) => MaterialApp(
-  theme: buildLunacTheme(),
-  home: Scaffold(
-    body: SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: ChatMarkdownView(text: text),
-    ),
-  ),
-);
+Widget _wrap(String text, {void Function(String url)? onOpenUrl}) =>
+    MaterialApp(
+      theme: buildLunacTheme(),
+      home: Scaffold(
+        body: SingleChildScrollView(
+          padding: const EdgeInsets.all(12),
+          child: ChatMarkdownView(text: text, onOpenUrl: onOpenUrl),
+        ),
+      ),
+    );
 
 void main() {
   test('inline parser strips markers and finds local paths', () {
     final tokens = parseChatInline(
       r'**重点** 与 `code` 看 D:\Lunac\temp\transStorage\a.glb。',
     );
-    expect(tokens.any((t) => t.kind == ChatInlineKind.bold && t.text == '重点'), isTrue);
-    expect(tokens.any((t) => t.kind == ChatInlineKind.code && t.text == 'code'), isTrue);
+    expect(
+      tokens.any((t) => t.kind == ChatInlineKind.bold && t.text == '重点'),
+      isTrue,
+    );
+    expect(
+      tokens.any((t) => t.kind == ChatInlineKind.code && t.text == 'code'),
+      isTrue,
+    );
     final path = tokens.where((t) => t.kind == ChatInlineKind.path).single;
     // 句末中文句号要剥掉，路径本身保持原样。
     expect(path.text, r'D:\Lunac\temp\transStorage\a.glb');
@@ -30,17 +37,17 @@ void main() {
     expect(quoted.single.kind, ChatInlineKind.path);
     expect(quoted.single.text, r'D:\Lunac\temp\transStorage\b.glb');
 
-    // http(s) 不是本机路径；未闭合的 ** 原样保留。
+    // http(s) 不是本机路径，而是可点击的 URL；未闭合的 ** 原样保留。
+    final url = parseChatInline('https://api.example.com/v1/chat/completions')
+        .single;
+    expect(url.kind, ChatInlineKind.url);
+    expect(url.text, 'https://api.example.com/v1/chat/completions');
     expect(
-      parseChatInline('https://example.com/a').every(
-        (t) => t.kind != ChatInlineKind.path,
-      ),
+      parseChatInline('https://example.com/a')
+          .every((t) => t.kind != ChatInlineKind.path),
       isTrue,
     );
-    expect(
-      parseChatInline('**没收尾').map((t) => t.text).join(),
-      '**没收尾',
-    );
+    expect(parseChatInline('**没收尾').map((t) => t.text).join(), '**没收尾');
   });
 
   test('block parser handles headings, lists, quotes, code and tables', () {
@@ -57,19 +64,16 @@ void main() {
       '| 唇 | 0.16 |\n\n'
       '---\n',
     );
-    expect(
-      blocks.map((b) => b.kind),
-      [
-        ChatBlockKind.heading,
-        ChatBlockKind.paragraph,
-        ChatBlockKind.bullet,
-        ChatBlockKind.ordered,
-        ChatBlockKind.quote,
-        ChatBlockKind.code,
-        ChatBlockKind.table,
-        ChatBlockKind.divider,
-      ],
-    );
+    expect(blocks.map((b) => b.kind), [
+      ChatBlockKind.heading,
+      ChatBlockKind.paragraph,
+      ChatBlockKind.bullet,
+      ChatBlockKind.ordered,
+      ChatBlockKind.quote,
+      ChatBlockKind.code,
+      ChatBlockKind.table,
+      ChatBlockKind.divider,
+    ]);
     expect(blocks[0].level, 1);
     expect(blocks[0].text, '标题');
     expect(blocks[1].text, '第一段\n第二行');
@@ -110,5 +114,26 @@ void main() {
       find.byTooltip(r'打开 D:\Lunac\temp\transStorage\npc-catalog\evelyn\a.glb'),
       findsOneWidget,
     );
+  });
+
+  testWidgets('clicking a URL hands it to the preview callback', (
+    tester,
+  ) async {
+    String? opened;
+    await tester.pumpWidget(
+      _wrap(
+        'POST https://api.example.com/v1/chat/completions 返回 401',
+        onOpenUrl: (url) => opened = url,
+      ),
+    );
+    await tester.pump();
+    await tester.tap(
+      find.textContaining(
+        'https://api.example.com/v1/chat/completions',
+        findRichText: true,
+      ),
+    );
+    await tester.pump();
+    expect(opened, 'https://api.example.com/v1/chat/completions');
   });
 }

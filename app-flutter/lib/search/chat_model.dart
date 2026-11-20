@@ -577,6 +577,12 @@ class ChatModel {
   /// 待办清单：`TodoWrite` 每轮发的是完整清单，整体替换（与 v1 任务抽屉同口径）。
   final List<TodoItem> todos = <TodoItem>[];
 
+  /// 按回合保存的待办快照（键 = 用户提问序号，0 起）。
+  ///
+  /// 任务抽屉的标题要用「这一轮对应的待办」，而不是把整段用户提问直接塞进标题；
+  /// `TodoWrite` 到达时记一份，后续该回合的抽屉都从这里取名。
+  final Map<int, List<TodoItem>> turnTodos = <int, List<TodoItem>>{};
+
   /// 后台运行中的命令（v1 `backgroundCmds`）：只由 `background_started` /
   /// `background_done` 两条事件驱动，前端不自己推断「跑完没有」。
   final List<BackgroundCommand> backgroundCommands = <BackgroundCommand>[];
@@ -751,6 +757,7 @@ class ChatModel {
     _pendingSteers.clear();
     _droppedSteer = null;
     todos.clear();
+    turnTodos.clear();
     changedFiles.clear();
     backgroundCommands.clear();
     turnDurationsMs.clear();
@@ -1623,6 +1630,29 @@ class ChatModel {
                   : 'pending',
             ),
       ]);
+    // 当前用户提问序号（0 起）；一条 TodoWrite 只更新它所属的那一轮。
+    final turn =
+        entries.where((entry) => entry.kind == ChatEntryKind.user).length - 1;
+    if (turn >= 0) {
+      turnTodos[turn] = List<TodoItem>.of(todos);
+    }
+  }
+
+  /// 某一轮任务抽屉的标题：优先取该轮待办（进行中 > 待办 > 最后一条完成）。
+  ///
+  /// 没有 TodoWrite 的回合返回 null，由调用方回落到用户提问概括。
+  String? todoTitleForTurn(int turn) {
+    final list = turnTodos[turn];
+    if (list == null || list.isEmpty) {
+      return null;
+    }
+    final active = list.where((item) => item.status == 'in_progress').toList();
+    final pending = list.where((item) => item.status == 'pending').toList();
+    final chosen = active.isNotEmpty
+        ? active.first
+        : (pending.isNotEmpty ? pending.first : list.last);
+    final title = summarizeTaskTitle(chosen.content);
+    return title.trim().isEmpty ? null : title;
   }
 
   void _applyPushNotification(dynamic notification) {

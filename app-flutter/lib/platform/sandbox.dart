@@ -454,10 +454,7 @@ class SandboxOpResult {
 
   static SandboxOpResult fromRaw(String? text) {
     if (text == null || text.isEmpty) {
-      return const SandboxOpResult(
-        ok: false,
-        error: '当前环境没有原生桥，文件操作不可用',
-      );
+      return const SandboxOpResult(ok: false, error: '当前环境没有原生桥，文件操作不可用');
     }
     try {
       final value = jsonDecode(text);
@@ -476,22 +473,26 @@ class SandboxOpResult {
 }
 
 /// 新建文本文件（相对沙箱根；同名已存在会被拒绝，不覆盖）。
-SandboxOpResult sandboxWriteFile(String path, String text) => SandboxOpResult.fromRaw(
-  _call1('lunac_sandbox_write', jsonEncode({'path': path, 'text': text})),
-);
+SandboxOpResult sandboxWriteFile(String path, String text) =>
+    SandboxOpResult.fromRaw(
+      _call1('lunac_sandbox_write', jsonEncode({'path': path, 'text': text})),
+    );
 
 /// 新建目录（上级目录必须已存在）。
-SandboxOpResult sandboxMkdir(String path) =>
-    SandboxOpResult.fromRaw(_call1('lunac_sandbox_mkdir', jsonEncode({'path': path})));
-
-/// 重命名 / 移动（同一沙箱内；目标不存在）。
-SandboxOpResult sandboxRename(String from, String to) => SandboxOpResult.fromRaw(
-  _call1('lunac_sandbox_rename', jsonEncode({'from': from, 'to': to})),
+SandboxOpResult sandboxMkdir(String path) => SandboxOpResult.fromRaw(
+  _call1('lunac_sandbox_mkdir', jsonEncode({'path': path})),
 );
 
+/// 重命名 / 移动（同一沙箱内；目标不存在）。
+SandboxOpResult sandboxRename(String from, String to) =>
+    SandboxOpResult.fromRaw(
+      _call1('lunac_sandbox_rename', jsonEncode({'from': from, 'to': to})),
+    );
+
 /// 删除文件 / 空目录（沙箱根不可删）。
-SandboxOpResult sandboxDelete(String path) =>
-    SandboxOpResult.fromRaw(_call1('lunac_sandbox_delete', jsonEncode({'path': path})));
+SandboxOpResult sandboxDelete(String path) => SandboxOpResult.fromRaw(
+  _call1('lunac_sandbox_delete', jsonEncode({'path': path})),
+);
 
 // ── 「添加到对话」队列（预览窗 → 聊天面板 / 主窗）─────────────────────
 
@@ -502,10 +503,7 @@ String? pushChatAttachments(List<String> paths) {
   if (paths.isEmpty) {
     return null;
   }
-  final text = _call1(
-    'lunac_chat_attach_push',
-    jsonEncode({'paths': paths}),
-  );
+  final text = _call1('lunac_chat_attach_push', jsonEncode({'paths': paths}));
   if (text == null) {
     return '当前环境不支持「添加到对话」';
   }
@@ -679,6 +677,21 @@ bool get sandboxWindowHostReady => _hostInstalled;
 /// 安装沙箱窗口通道（幂等）。主引擎与插件窗口引擎各调一次。
 void installSandboxWindowBridge() {
   _hostInstalled = true;
+}
+
+/// 预览窗是否开着（AI 标题栏按钮用它做「再点一次关闭」）。
+Future<bool> isSandboxWindowOpen() async {
+  if (!_hostInstalled) {
+    return false;
+  }
+  try {
+    final open = await _host.invokeMethod<bool>('isOpen');
+    return open == true;
+  } on MissingPluginException {
+    return false;
+  } on PlatformException {
+    return false;
+  }
 }
 
 /// 打开沙箱预览窗（已在则提到前台）。返回是否已打开。

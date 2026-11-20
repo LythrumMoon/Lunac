@@ -281,33 +281,26 @@ class _SandboxPanelState extends State<SandboxPanel>
       return panel;
     }
     // 独立窗口：面板从粘合线（窗口右缘）向左「拉开」，窗口本身已在最终尺寸。
-    return AnimatedBuilder(
-      animation: _reveal,
-      builder: (context, child) {
-        final t = Curves.easeOutCubic.transform(_reveal.value);
-        if (t >= 0.999) {
-          return child!;
-        }
-        final size = MediaQuery.of(context).size;
-        return Align(
-          alignment: Alignment.centerRight,
-          child: ClipRect(
-            child: SizedBox(
-              width: size.width * t,
-              height: size.height,
-              child: OverflowBox(
-                alignment: Alignment.centerRight,
-                minWidth: size.width,
-                maxWidth: size.width,
-                minHeight: size.height,
-                maxHeight: size.height,
-                child: child,
-              ),
-            ),
-          ),
-        );
-      },
-      child: panel,
+    //
+    // 2026-11-21：原实现每帧改 `SizedBox.width` + `OverflowBox`，等于让整棵预览
+    // 面板（文件树 / 终端 / 列表）每帧重新布局一次，打开动画明显卡顿。这里改成
+    // `FractionalTranslation`：只做**绘制平移**，子树尺寸不变、不触发布局，
+    // 由外层 `ClipRect` 裁掉滑出窗口的部分。
+    return ClipRect(
+      child: AnimatedBuilder(
+        animation: _reveal,
+        builder: (context, child) {
+          final t = Curves.easeOutCubic.transform(_reveal.value);
+          if (t >= 0.999) {
+            return child!;
+          }
+          return FractionalTranslation(
+            translation: Offset(1 - t, 0),
+            child: child,
+          );
+        },
+        child: panel,
+      ),
     );
   }
 
@@ -673,7 +666,10 @@ class _SandboxPanelState extends State<SandboxPanel>
                 if (listing != null)
                   Text(
                     '${listing.entries.length}',
-                    style: TextStyle(color: LunacColors.textMuted, fontSize: 10),
+                    style: TextStyle(
+                      color: LunacColors.textMuted,
+                      fontSize: 10,
+                    ),
                   ),
                 // 固定的「新建」入口（右键也能到，但不该只有右键一条路）。
                 Builder(
@@ -707,7 +703,10 @@ class _SandboxPanelState extends State<SandboxPanel>
               ? Center(
                   child: Text(
                     '不可用（rust 桥接未加载）',
-                    style: TextStyle(color: LunacColors.textMuted, fontSize: 12),
+                    style: TextStyle(
+                      color: LunacColors.textMuted,
+                      fontSize: 12,
+                    ),
                   ),
                 )
               : _buildFileList(listing, _treeEntries),
@@ -860,7 +859,10 @@ class _SandboxPanelState extends State<SandboxPanel>
   }
 
   /// 弹出一组菜单项；返回选中的 value（点外面 / Esc ⇒ null）。
-  Future<String?> _popupMenu(Offset position, List<PopupMenuEntry<String>> items) async {
+  Future<String?> _popupMenu(
+    Offset position,
+    List<PopupMenuEntry<String>> items,
+  ) async {
     final overlay = Overlay.of(context).context.findRenderObject();
     if (overlay is! RenderBox) {
       return null;
@@ -957,7 +959,10 @@ class _SandboxPanelState extends State<SandboxPanel>
     };
     final action = await _popupMenu(position, [
       const PopupMenuItem(value: 'close', child: Text('关闭')),
-      PopupMenuItem(value: 'close-others', child: Text('关闭其他标签（${_tabs.length - 1}）')),
+      PopupMenuItem(
+        value: 'close-others',
+        child: Text('关闭其他标签（${_tabs.length - 1}）'),
+      ),
       if (abs.isNotEmpty) ...[
         const PopupMenuDivider(),
         const PopupMenuItem(value: 'copy', child: Text('复制路径')),
@@ -1032,7 +1037,10 @@ class _SandboxPanelState extends State<SandboxPanel>
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: LunacColors.background,
-        title: Text(title, style: TextStyle(color: LunacColors.text, fontSize: 13.5)),
+        title: Text(
+          title,
+          style: TextStyle(color: LunacColors.text, fontSize: 13.5),
+        ),
         content: TextField(
           controller: controller,
           autofocus: true,
@@ -1059,10 +1067,17 @@ class _SandboxPanelState extends State<SandboxPanel>
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: LunacColors.background,
-        title: Text(title, style: TextStyle(color: LunacColors.text, fontSize: 13.5)),
+        title: Text(
+          title,
+          style: TextStyle(color: LunacColors.text, fontSize: 13.5),
+        ),
         content: Text(
           body,
-          style: TextStyle(color: LunacColors.textDim, fontSize: 12, height: 1.5),
+          style: TextStyle(
+            color: LunacColors.textDim,
+            fontSize: 12,
+            height: 1.5,
+          ),
         ),
         actions: [
           TextButton(
@@ -1119,9 +1134,7 @@ class _SandboxPanelState extends State<SandboxPanel>
   Future<void> _deleteEntry(SandboxEntry entry) async {
     final ok = await _confirm(
       '删除「${entry.name}」',
-      entry.isDir
-          ? '只能删除空文件夹；里面还有文件时会被拒绝。此操作不可撤销。'
-          : '文件会直接从沙箱盘删除，此操作不可撤销。',
+      entry.isDir ? '只能删除空文件夹；里面还有文件时会被拒绝。此操作不可撤销。' : '文件会直接从沙箱盘删除，此操作不可撤销。',
     );
     if (!ok) {
       return;
@@ -1138,7 +1151,9 @@ class _SandboxPanelState extends State<SandboxPanel>
       _file = null;
     }
     _refresh();
-    _setMessage('已删除 ${entry.path}${affected > 0 ? '（关闭了 $affected 个相关标签）' : ''}');
+    _setMessage(
+      '已删除 ${entry.path}${affected > 0 ? '（关闭了 $affected 个相关标签）' : ''}',
+    );
   }
 
   /// 关掉 target 落在 `rel` 之下（含自身）的文件标签，返回关掉的个数。
@@ -1211,7 +1226,10 @@ class _SandboxPanelState extends State<SandboxPanel>
                   }
                   final position = _tabScroll.position;
                   _tabScroll.jumpTo(
-                    (position.pixels + delta).clamp(0.0, position.maxScrollExtent),
+                    (position.pixels + delta).clamp(
+                      0.0,
+                      position.maxScrollExtent,
+                    ),
                   );
                 },
                 child: ListView(
@@ -1315,7 +1333,11 @@ class _SandboxPanelState extends State<SandboxPanel>
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(_tabIcon(tab.kind), size: 12, color: LunacColors.textMuted),
+                Icon(
+                  _tabIcon(tab.kind),
+                  size: 12,
+                  color: LunacColors.textMuted,
+                ),
                 const SizedBox(width: 5),
                 ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 160),
@@ -1404,7 +1426,9 @@ class _SandboxPanelState extends State<SandboxPanel>
   /// 两种都拿不到时如实说明原因，不假装渲染成功。
   Widget _buildAppTab(_PreviewTab tab) {
     final shot = _appShot;
-    final title = shot != null && shot.title.isNotEmpty ? shot.title : tab.target;
+    final title = shot != null && shot.title.isNotEmpty
+        ? shot.title
+        : tab.target;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1511,8 +1535,9 @@ class _SandboxPanelState extends State<SandboxPanel>
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Text(
-          _appError ?? '还没有画面：应用没在运行，或预览桥接不可用。\n'
-              '原生应用不能直接嵌进 Flutter，这里用的是抓帧 / 停靠两档。',
+          _appError ??
+              '还没有画面：应用没在运行，或预览桥接不可用。\n'
+                  '原生应用不能直接嵌进 Flutter，这里用的是抓帧 / 停靠两档。',
           textAlign: TextAlign.center,
           style: TextStyle(color: LunacColors.textMuted, fontSize: 11),
         ),
@@ -1620,7 +1645,10 @@ class _SandboxPanelState extends State<SandboxPanel>
         children: [
           Icon(Icons.language, size: 26, color: LunacColors.textMuted),
           const SizedBox(height: 8),
-          Text(tab.title, style: TextStyle(color: LunacColors.text, fontSize: 13)),
+          Text(
+            tab.title,
+            style: TextStyle(color: LunacColors.text, fontSize: 13),
+          ),
           const SizedBox(height: 4),
           Text(
             tab.target,
@@ -1682,7 +1710,10 @@ class _SandboxPanelState extends State<SandboxPanel>
                   ),
                   Text(
                     '+${diff.added} −${diff.removed}',
-                    style: TextStyle(color: LunacColors.textMuted, fontSize: 10.5),
+                    style: TextStyle(
+                      color: LunacColors.textMuted,
+                      fontSize: 10.5,
+                    ),
                   ),
                 ],
               ),
@@ -1692,7 +1723,10 @@ class _SandboxPanelState extends State<SandboxPanel>
                   Expanded(
                     child: Text(
                       '变更已完成 · 是否应用？',
-                      style: TextStyle(color: LunacColors.textDim, fontSize: 11),
+                      style: TextStyle(
+                        color: LunacColors.textDim,
+                        fontSize: 11,
+                      ),
                     ),
                   ),
                   TextButton(
@@ -1766,7 +1800,11 @@ class _SandboxPanelState extends State<SandboxPanel>
               : null,
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
           child: Text(
-            '${isAdd ? '+' : isDel ? '−' : ' '}${line.text}',
+            '${isAdd
+                ? '+'
+                : isDel
+                ? '−'
+                : ' '}${line.text}',
             style: TextStyle(
               color: isAdd
                   ? const Color(0xFF4ADE80)
