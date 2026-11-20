@@ -23,7 +23,7 @@
   - `flutter analyze`：0 issue；`flutter test`：**320 passed**
   - `app-flutter/rust`：`cargo check --release` **0 warning**；`cargo test --lib`
     **605 passed / 0 failed / 7 ignored**
-  - `core-agent`：`cargo test --offline` **508 passed / 0 failed / 16 ignored**，0 warning
+  - `core-agent`：`cargo test --offline` **509 passed / 0 failed / 16 ignored**，0 warning
   - `scripts\build-release-v2.ps1`：**exit 0、日志 0 warning**，产出
     `release\Lunac-1.0.0-Setup.exe`（约 21.6 MB），包内含 `agent.exe`、无 `cli.exe`
 - **本轮已完成（2026-11-20）**：
@@ -211,8 +211,14 @@
 
 | 日期 | 模式 | 会话数 | 平均注入字数 | MemorySearch 调用 | 答对率 | 结论 |
 |---|---|---|---|---|---|---|
-| 待填 | full | | | | | |
-| 待填 | index | | | | | |
+| 2026-11-21 | full（合成 24k 语料） | — | 22817 | — | — | 单测基线 |
+| 2026-11-21 | index（同上） | — | 2784（目录 2051） | — | — | 体积降到 12.2% |
+| 待填 | full（真实会话） | | | | | |
+| 待填 | index（真实会话） | | | | | |
+
+> 合成语料那一行由 `core-agent` 单测
+> `index_mode_shrinks_a_full_memory_block` 实测（`cargo test --offline … -- --nocapture`），
+> 只证明上下文占用；答对率必须用真实会话按上面步骤补。
 4. **`chat_history` 已改 SQLite**：`ModuleData/history/chat.db`，`sessions` 表按 id
    upsert，只写一条会话；旧 `chat-history.v2.json` 首次升级导入一次（有
    `legacy_imported` 标记，删掉的会话不会被导回）。
@@ -233,7 +239,7 @@
 - `powershell -ExecutionPolicy Bypass -File scripts\verify-v2.ps1` → 通过
 - `flutter test`：**320 passed**
 - `cargo test --lib`（`app-flutter/rust`）：**605 passed / 0 failed / 7 ignored**
-- `cargo test --offline`（`core-agent`）：**508 passed / 0 failed / 16 ignored**，0 warning
+- `cargo test --offline`（`core-agent`）：**509 passed / 0 failed / 16 ignored**，0 warning
 - `scripts\build-release-v2.ps1`：**exit 0 / 0 warning**，产出
   `release\Lunac-1.0.0-Setup.exe`
 

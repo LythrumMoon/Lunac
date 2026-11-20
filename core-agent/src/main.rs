@@ -15649,6 +15649,46 @@ mod tests {
         assert!(empty.contains("Add a fact with the `Remember` tool"), "{empty}");
     }
 
+    /// A/B 的体积侧回归：写满额度（约 24k 字）的真实形状语料，index 注入必须显著小于 full。
+    ///
+    /// 这条测试只证明「上下文占用」这一半；答对率仍要真实会话（见 docs/todo.md §6-3）。
+    #[test]
+    fn index_mode_shrinks_a_full_memory_block() {
+        use tools::MemoryScope;
+        let mut body = String::new();
+        for page in 0..6 {
+            body.push_str(&format!("## page-{page}\n"));
+            for n in 0..10 {
+                body.push_str(&format!(
+                    "- [2026-11-20 · global] 条目 {}：{}\n",
+                    page * 10 + n,
+                    "记忆内容".repeat(85)
+                ));
+            }
+        }
+        let full_body = cap_inject(&body);
+        let index_body = memory_index_text(&body);
+        let full_block =
+            memory_block_text_mode(MemoryMode::Full, true, &full_body, MemoryScope::Global);
+        let index_block =
+            memory_block_text_mode(MemoryMode::Index, true, &index_body, MemoryScope::Global);
+        let full_chars = full_block.chars().count();
+        let index_chars = index_block.chars().count();
+        eprintln!(
+            "A/B 注入体积（合成语料）：full={full_chars} 字，index={index_chars} 字（目录 {} 字）",
+            index_body.chars().count()
+        );
+        assert!(
+            index_body.chars().count() <= MEMORY_INDEX_CHARS + 200,
+            "目录必须有硬上限：{} 字",
+            index_body.chars().count()
+        );
+        assert!(
+            index_chars * 5 < full_chars,
+            "index 至少要压到 full 的 1/5：full={full_chars} index={index_chars}"
+        );
+    }
+
     /// 作用域（2026-10-13）：全局与桌宠各一段、表头可区分（互不掺入）；本轮作用域由
     /// user 消息的 `source` 推出，**只认 `pet`**，其余（含缺省 / 坏值）一律全局。
     #[test]
