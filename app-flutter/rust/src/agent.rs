@@ -285,6 +285,20 @@ pub struct LaunchSpec {
     pub env: Vec<(&'static str, String)>,
 }
 
+/// 记忆注入 A/B 开关的宿主侧读取：只在环境里有非空值时透传给 agent。
+///
+/// 用独立函数而不是内联 `std::env::var`，是为了让「空值 = 不传」这条规则可单测
+/// （空字符串传下去会让 agent 按非法值读成 `full`，行为虽然一样，但日志会误导）。
+fn memory_mode_env_from(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn memory_mode_env() -> Option<String> {
+    memory_mode_env_from(std::env::var("LUNAC_MEMORY_MODE").ok().as_deref())
+}
+
 /// 组装 agent 子进程的工作目录与环境变量（启动失败的原因原样返回）。
 pub fn launch_spec(root: &Path) -> Result<LaunchSpec, String> {
     let exe = find_agent_exe(root)
@@ -337,6 +351,11 @@ pub fn launch_spec(root: &Path) -> Result<LaunchSpec, String> {
         "LUNAC_MEMORY_DIR",
         root.join("ModuleData").join("memory").display().to_string(),
     ));
+    // 记忆注入 A/B（2026-11-21）：宿主若从环境继承了 `LUNAC_MEMORY_MODE` 就原样透传。
+    // 不设置时 agent 默认 `full`（行为与改造前一致）；A/B 时设 `index` 再重启应用即可。
+    if let Some(mode) = memory_mode_env() {
+        env.push(("LUNAC_MEMORY_MODE", mode));
+    }
     // PTC / Code Mode（§待办 3-28.15）：关着时 `RunScript` 不进工具表。
     env.push((
         "LUNAC_PTC",
@@ -679,6 +698,16 @@ mod tests {
         std::fs::write(&repo_debug, b"stub").unwrap();
         assert_eq!(find_agent_exe(&nested), Some(repo_debug));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记忆注入 A/B：宿主只透传非空的 `LUNAC_MEMORY_MODE`，空值不下发。
+    #[test]
+    fn memory_mode_env_passthrough_skips_empty_values() {
+        assert_eq!(memory_mode_env_from(None), None);
+        assert_eq!(memory_mode_env_from(Some("")), None);
+        assert_eq!(memory_mode_env_from(Some("   ")), None);
+        assert_eq!(memory_mode_env_from(Some(" index ")), Some("index".to_string()));
+        assert_eq!(memory_mode_env_from(Some("full")), Some("full".to_string()));
     }
 
     /// 实跑：需要 `core-agent/target/{release,debug}/agent.exe`。

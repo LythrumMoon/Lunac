@@ -22,8 +22,8 @@
 - **最近完成的检查（2026-11-21）**：
   - `flutter analyze`：0 issue；`flutter test`：**320 passed**
   - `app-flutter/rust`：`cargo check --release` **0 warning**；`cargo test --lib`
-    **604 passed / 0 failed / 7 ignored**
-  - `core-agent`：`cargo test --offline` **507 passed / 0 failed / 16 ignored**，0 warning
+    **605 passed / 0 failed / 7 ignored**
+  - `core-agent`：`cargo test --offline` **508 passed / 0 failed / 16 ignored**，0 warning
   - `scripts\build-release-v2.ps1`：**exit 0、日志 0 warning**，产出
     `release\Lunac-1.0.0-Setup.exe`（约 21.6 MB），包内含 `agent.exe`、无 `cli.exe`
 - **本轮已完成（2026-11-20）**：
@@ -42,7 +42,9 @@
   - `chat_history` 改 SQLite（`ModuleData/history/chat.db`），历史列表改轻量元数据 +
     点开再读完整会话；
   - `library.db` 加 FTS5 trigram、体量统计、孤儿清理与超 32 MiB 的 `VACUUM`；
-  - 记忆索引改稳定 id 差量 upsert，不再整 scope 重写。
+  - 记忆索引改稳定 id 差量 upsert，不再整 scope 重写；
+  - 记忆注入加 `LUNAC_MEMORY_MODE=full|index` A/B 开关（默认 `full`），index 模式只注入
+    2000 字目录并提示模型用 `MemorySearch` 取正文。
 
 ---
 
@@ -131,7 +133,8 @@
 
 ### 记忆 / 检索
 - `3-24` 记忆 wiki 化：多页、互链、自愈、去矛盾、定时维护。
-- 验证「只注入记忆索引 + 模型按需 `MemorySearch`」能否在 24k 额度下继续降上下文（§6-3）。
+- 验证「只注入记忆索引 + 模型按需 `MemorySearch`」能否在 24k 额度下继续降上下文：
+  开关与步骤见 §6-3，等真实会话对比结果。
 
 ### 代理 / 网络
 - `3-25` 自研代理引擎：按 `acceptance-map.md` 的缺口表继续补协议。
@@ -174,7 +177,8 @@
 
 ## 6. 本轮优化（2026-11-21 已落地）
 
-> 旧建议 1、2、4、5、6、7、8 已实现并有测试 / 构建取证；只剩 3 需要产品决策。
+> 旧建议 1、2、4、5、6、7、8 已实现并有测试 / 构建取证；3 的开关已落地，剩余真实会话
+> 对比（按下面步骤即可跑）。
 
 1. **warning 守门已写进脚本**：`scripts/build-release-v2.ps1` 会收集 cargo / flutter
    输出，出现 `warning:` 直接失败；确需放行时传 `-AllowWarnings`。最近一次完整构建
@@ -182,9 +186,33 @@
 2. **检索库可观测性**：`library::stats` + FFI `lunac_library_stats`
    返回 `entries / sessions / tasks / dbBytes`；每次进程启动在日志里记一行
    `library: entries=… sessions=… tasks=… db=… bytes`。
-3. **记忆注入策略 A/B（仍待做，需真实会话数据）**：当前 24k 整段注入 +
-   `MemorySearch` 按需检索并存；下一步对比「整段注入」与「只注入索引 + 检索」的
-   上下文占用与答对率，再决定默认策略。
+3. **记忆注入 A/B（开关已落地，待真实会话对比）**：`LUNAC_MEMORY_MODE=full|index`
+   （默认 `full`，行为与改造前逐字节一致）。
+   - `full`：24k 整段注入。
+   - `index`：只注入目录（页名 + 每条首行前 80 字，总长硬顶 2000 字），并提示模型
+     在依赖记忆前调用 `MemorySearch` 取命中条目；老格式（没有 bullet）自动退回整段注入。
+   - 宿主会把环境里的同名变量原样透传给 `agent.exe`；改完需重启应用 / agent。
+   - 测试：`core-agent` 的 `memory_mode_switch_and_index_directory` 覆盖解析、目录压缩、
+     预算截断、full/index 文案差异与固定前缀；`app-flutter/rust` 的
+     `memory_mode_env_passthrough_skips_empty_values` 覆盖透传。
+
+**A/B 操作步骤（真实会话）**
+
+1. 先跑 `full`（默认，不设变量）N 个有代表性的会话，记录每次启动日志里的
+   `长期记忆已注入（N 字）`。
+2. `setx LUNAC_MEMORY_MODE index`（或从终端 `set LUNAC_MEMORY_MODE=index` 后启动
+   `lunac.exe`），重启应用，再跑同类的 N 个会话。先确认工具编辑器里没有禁用
+   `MemorySearch`（index 模式依赖它取正文）。
+3. 对比三组数：
+   - 上下文体积：日志里的注入字数（`记忆注入模式：index` 会额外打一行）；
+   - 检索行为：`MemorySearch 命中 … 条` 的调用次数与 `reason=ok` 比例；
+   - 答对率：同一批问题的人工判定（正确 / 漏答 / 编造）。
+4. 结果写入本节下方表格；没有明显答对率下降就保留 `index`，否则回 `full`。
+
+| 日期 | 模式 | 会话数 | 平均注入字数 | MemorySearch 调用 | 答对率 | 结论 |
+|---|---|---|---|---|---|---|
+| 待填 | full | | | | | |
+| 待填 | index | | | | | |
 4. **`chat_history` 已改 SQLite**：`ModuleData/history/chat.db`，`sessions` 表按 id
    upsert，只写一条会话；旧 `chat-history.v2.json` 首次升级导入一次（有
    `legacy_imported` 标记，删掉的会话不会被导回）。
@@ -204,8 +232,8 @@
 
 - `powershell -ExecutionPolicy Bypass -File scripts\verify-v2.ps1` → 通过
 - `flutter test`：**320 passed**
-- `cargo test --lib`（`app-flutter/rust`）：**604 passed / 0 failed / 7 ignored**
-- `cargo test --offline`（`core-agent`）：**507 passed / 0 failed / 16 ignored**，0 warning
+- `cargo test --lib`（`app-flutter/rust`）：**605 passed / 0 failed / 7 ignored**
+- `cargo test --offline`（`core-agent`）：**508 passed / 0 failed / 16 ignored**，0 warning
 - `scripts\build-release-v2.ps1`：**exit 0 / 0 warning**，产出
   `release\Lunac-1.0.0-Setup.exe`
 

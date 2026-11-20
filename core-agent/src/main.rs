@@ -3844,6 +3844,125 @@ fn memory_enabled() -> bool {
     }
 }
 
+/// 注入模式（A/B 实验开关）：`LUNAC_MEMORY_MODE=full|index`。
+///
+/// · `full`（默认）：整份记忆正文注入（24k 字上限），行为与改造前逐字节一致。
+/// · `index`：只注入「页名 + 每条首行摘要」的目录（`MEMORY_INDEX_CHARS` 硬上限），
+///   并提示模型在依赖记忆前调用 `MemorySearch` 读命中条目。
+///
+/// 只影响**注入**，不影响写入 / 检索 / 复盘：两种模式读的是同一份 `MEMORY.md`，
+/// 所以同一份数据可以直接对比上下文体积与答对率。非法值按 `full` 处理（不因笔误
+/// 悄悄改变线上行为）。
+const MEMORY_MODE_ENV: &str = "LUNAC_MEMORY_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryMode {
+    Full,
+    Index,
+}
+
+impl MemoryMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            MemoryMode::Full => "full",
+            MemoryMode::Index => "index",
+        }
+    }
+}
+
+fn parse_memory_mode(raw: Option<&str>) -> MemoryMode {
+    match raw.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("index") => MemoryMode::Index,
+        _ => MemoryMode::Full,
+    }
+}
+
+fn memory_mode() -> MemoryMode {
+    parse_memory_mode(std::env::var(MEMORY_MODE_ENV).ok().as_deref())
+}
+
+/// index 目录总长硬上限（远小于 `MEMORY_INJECT_CHARS`）：目录只负责「告诉模型有什么」，
+/// 具体条目由 `MemorySearch` 取。
+const MEMORY_INDEX_CHARS: usize = 2_000;
+/// 目录里每条只保留首行前这么多字符。
+const MEMORY_INDEX_ENTRY_CHARS: usize = 80;
+
+/// 把完整记忆正文压成目录：`## 页名` + 每条 bullet 的首行摘要。
+///
+/// 输入形态见 `ModuleData/memory`（`MEMORY.md` + `memory/pages/<page>.md`，读取时拼成
+/// `## page` 小节）。这里只做**展示压缩**：不改条目、不跨页合并、不猜语义；超过
+/// `MEMORY_INDEX_CHARS` 就停止并标注还有多少条未展开。返回空串 = 没有可索引的 bullet
+/// （调用方会退回整段注入，避免老格式记忆被目录模式吞掉）。
+fn memory_index_text(body: &str) -> String {
+    let total = body
+        .lines()
+        .filter(|line| {
+            line.strip_prefix("- ")
+                .is_some_and(|rest| !rest.trim().is_empty())
+        })
+        .count();
+    if total == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut current_page = String::new();
+    let mut emitted_page = String::new();
+    let mut shown = 0usize;
+    let mut truncated = false;
+    for line in body.lines() {
+        if let Some(page) = line.strip_prefix("## ") {
+            current_page = page.trim().to_string();
+            continue;
+        }
+        if line.starts_with("→ refs:") {
+            continue;
+        }
+        let Some(entry) = line.strip_prefix("- ") else {
+            continue;
+        };
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if truncated {
+            continue;
+        }
+        let mut piece = String::new();
+        if current_page != emitted_page && !current_page.is_empty() {
+            piece.push_str(&format!("## {current_page}\n"));
+        }
+        piece.push_str("- ");
+        let mut chars = entry.chars();
+        let preview: String = chars.by_ref().take(MEMORY_INDEX_ENTRY_CHARS).collect();
+        piece.push_str(&preview);
+        if chars.next().is_some() {
+            piece.push('…');
+        }
+        piece.push('\n');
+        if out.chars().count() + piece.chars().count() > MEMORY_INDEX_CHARS {
+            truncated = true;
+            continue;
+        }
+        out.push_str(&piece);
+        emitted_page = current_page.clone();
+        shown += 1;
+    }
+    if shown < total {
+        out.push_str(&format!(
+            "- … ({} more entries are not shown here; use `MemorySearch` with a keyword to read them)\n",
+            total - shown
+        ));
+    }
+    out
+}
+
+fn log_memory_mode_once(mode: MemoryMode) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    if LOGGED.set(()).is_ok() {
+        crate::log::info(format!("记忆注入模式：{}（{MEMORY_MODE_ENV}）", mode.as_str()));
+    }
+}
+
 /// 注入侧长度上限。与服务端 `memory.rs::MAX_TOTAL_CHARS` 同值（2026-11-20 额度调高：
 /// 9000 → 24000 字符；正文额度 16000、单条 4000）。服务端按「正文额度 + 总长硬顶」管「写」，
 /// 这里按同一个**总长硬顶**管「发」⇒ 服务端允许落盘的文件能**整份**注入，不会在注入时
@@ -3903,6 +4022,8 @@ fn memory_block(
         eprintln!("[agent] 长期记忆已关闭（{MEMORY_ENV}=0）");
         return String::new();
     }
+    let mode = memory_mode();
+    log_memory_mode_once(mode);
     // 记忆正文（可能为空）。*空记忆不再直接返回空。*：改造前那样写，全新安装时提示词
     // 里完全没有 Remember 引导，模型不知道可以主动写、而唯一能播种的复盘又没触发 ⇒ 冷启动
     // 死锁（2026-10-11 修，方案 D）。改为「正文可空、引导照发」。
@@ -3910,10 +4031,21 @@ fn memory_block(
     // 超限时保留**较早**的部分（truncate_chars 留头部）：较早的条目是更 established 的约定，
     // 尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入已按同值封顶），
     // 尾部的新条目丢掉时至少下次还能再写一次。正常路径到不了这里（服务端写入已按同值封顶），
-    let body = fetch_memory(bridge, scope)
-        .map(|text| cap_inject(&text))
-        .unwrap_or_default();
-    let block = memory_block_text(remember_tool_on, &body, scope);
+    let raw = fetch_memory(bridge, scope).unwrap_or_default();
+    let body = match mode {
+        MemoryMode::Full => cap_inject(&raw),
+        MemoryMode::Index => {
+            let index = memory_index_text(&raw);
+            if index.is_empty() && !raw.trim().is_empty() {
+                // 老格式 / 没有 bullet：目录会空，宁可多注一点也别把记忆整份丢掉。
+                eprintln!("[agent] 记忆目录为空（无 bullet），本次退回整段注入");
+                cap_inject(&raw)
+            } else {
+                index
+            }
+        }
+    };
+    let block = memory_block_text_mode(mode, remember_tool_on, &body, scope);
     if block.is_empty() {
         return block;
     }
@@ -3940,8 +4072,21 @@ fn memory_block(
 /// 表头按 `scope` 区分（全局 / 桌宠各一段）：全局措辞**逐字节不变**（缓存不变量）。
 ///
 /// 空记忆 + 写侧不可用 ⇒ 空串：没有正文可注、也没有可写的工具，拿一句「记忆是空的」去占
-/// 空记忆 + 写侧不可用 ⇒ 空串：没有正文可注、也没有可写的工具，拿一句「记忆是空的」去占
+#[cfg(test)]
 fn memory_block_text(remember_tool_on: bool, body: &str, scope: tools::MemoryScope) -> String {
+    memory_block_text_mode(MemoryMode::Full, remember_tool_on, body, scope)
+}
+
+/// 与 `memory_block_text` 相同，但按注入模式决定「如何说明这份正文」。
+///
+/// `full` 分支必须与改造前**逐字节一致**（缓存不变量）；`index` 只在 provenance 与 tail 之间
+/// 多一行固定说明（模式在进程启动时固定，不会逐轮改写前缀）。
+fn memory_block_text_mode(
+    mode: MemoryMode,
+    remember_tool_on: bool,
+    body: &str,
+    scope: tools::MemoryScope,
+) -> String {
     if body.is_empty() && !remember_tool_on {
         return String::new();
     }
@@ -3968,12 +4113,18 @@ fn memory_block_text(remember_tool_on: bool, body: &str, scope: tools::MemorySco
             with [YYYY-MM-DD · pet]: the date is when the note was last confirmed, not when it \
             was first learned. An entry without that prefix is undated background recorded earlier.",
     };
+    let index_note = match mode {
+        MemoryMode::Full => "",
+        MemoryMode::Index => "- The entries below are only an INDEX (page names plus shortened \
+            first lines), not the full memory. Before relying on a remembered fact, call the \
+            `MemorySearch` tool with a keyword or phrase to read the matching full entries.\n",
+    };
     format!(
         "\n\n{header}\n\
          Durable facts saved in earlier sessions. Treat them as background you already know; \
          they are not part of the current request.\n\
          {provenance}\n\
-         {tail}\n\n{body}",
+         {index_note}{tail}\n\n{body}",
     )
 }
 
@@ -15442,6 +15593,60 @@ mod tests {
             full.starts_with(&empty),
             "空记忆的块必须是有记忆块的前缀（引导段不随正文变）"
         );
+    }
+
+    /// 记忆注入 A/B 开关（2026-11-21）：`full` 默认、逐字节兼容；`index` 只注入
+    /// 「页名 + 首行摘要」目录并提示用 `MemorySearch` 取正文。
+    #[test]
+    fn memory_mode_switch_and_index_directory() {
+        use tools::MemoryScope;
+        // 解析：缺省 / 空 / full / 非法值都落回 full（笔误不能悄悄改线上行为）。
+        assert_eq!(parse_memory_mode(None), MemoryMode::Full);
+        assert_eq!(parse_memory_mode(Some("")), MemoryMode::Full);
+        assert_eq!(parse_memory_mode(Some("full")), MemoryMode::Full);
+        assert_eq!(parse_memory_mode(Some("INDEX")), MemoryMode::Index);
+        assert_eq!(parse_memory_mode(Some(" index ")), MemoryMode::Index);
+        assert_eq!(parse_memory_mode(Some("weird")), MemoryMode::Full);
+
+        // 目录：保留页名与每条首行，丢掉续行 / refs；条目文字不改。
+        let body = "- [2026-11-20 · global] 构建用 cargo\n## build\n- 先跑 flutter test\n- 记忆额度 24000\n→ refs: other\n";
+        let index = memory_index_text(body);
+        assert!(index.contains("- [2026-11-20 · global] 构建用 cargo"));
+        assert!(index.contains("## build"));
+        assert!(index.contains("- 先跑 flutter test"));
+        assert!(!index.contains("→ refs:"), "refs 行不进目录");
+
+        // 长条目压成首行摘要 ⇒ 目录远小于正文。
+        let long = format!("- {}\n", "x".repeat(500));
+        let short = memory_index_text(&long);
+        assert!(short.chars().count() < 200, "长条目必须被截短：{short}");
+        assert!(short.contains('…'));
+
+        // 预算：超限时停止并标注还有多少条未展开。
+        let many = (0..300)
+            .map(|n| format!("- entry-{n}\n"))
+            .collect::<String>();
+        let capped = memory_index_text(&many);
+        assert!(
+            capped.chars().count() <= MEMORY_INDEX_CHARS + 200,
+            "目录必须有硬上限：{} 字",
+            capped.chars().count()
+        );
+        assert!(capped.contains("more entries are not shown"), "{capped}");
+
+        // index 注入段：MemorySearch 说明 + 目录；full 段不得出现该说明（缓存逐字节兼容）。
+        let full_block = memory_block_text_mode(MemoryMode::Full, true, &index, MemoryScope::Global);
+        let idx_block = memory_block_text_mode(MemoryMode::Index, true, &index, MemoryScope::Global);
+        assert!(idx_block.contains("call the `MemorySearch` tool"), "{idx_block}");
+        assert!(!full_block.contains("MemorySearch"), "{full_block}");
+        assert!(idx_block.ends_with(&index), "目录必须拼在引导之后");
+        let empty = memory_block_text_mode(MemoryMode::Index, true, "", MemoryScope::Global);
+        assert!(
+            idx_block.starts_with(&empty),
+            "空目录的块必须是有目录块的前缀（固定前缀纪律）"
+        );
+        // 空记忆 + 写侧可用：index 模式仍要有 Remember 冷启动引导。
+        assert!(empty.contains("Add a fact with the `Remember` tool"), "{empty}");
     }
 
     /// 作用域（2026-10-13）：全局与桌宠各一段、表头可区分（互不掺入）；本轮作用域由
