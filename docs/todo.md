@@ -22,7 +22,7 @@
 - **最近完成的检查（2026-11-21）**：
   - `flutter analyze`：0 issue；`flutter test`：**320 passed**
   - `app-flutter/rust`：`cargo check --release` **0 warning**；`cargo test --lib`
-    **603 passed / 0 failed / 7 ignored**
+    **604 passed / 0 failed / 7 ignored**
   - `core-agent`：`cargo test --offline` **507 passed / 0 failed / 16 ignored**，0 warning
   - `scripts\build-release-v2.ps1`：**exit 0、日志 0 warning**，产出
     `release\Lunac-1.0.0-Setup.exe`（约 21.6 MB），包内含 `agent.exe`、无 `cli.exe`
@@ -131,8 +131,6 @@
 
 ### 记忆 / 检索
 - `3-24` 记忆 wiki 化：多页、互链、自愈、去矛盾、定时维护。
-- ~~检索库 `library.db` 的维护策略~~：FTS5 / 统计 / 孤儿清理 / `VACUUM` 已完成（§6）；
-  仍缺「库文件损坏时的自动重建」。
 - 验证「只注入记忆索引 + 模型按需 `MemorySearch`」能否在 24k 额度下继续降上下文（§6-3）。
 
 ### 代理 / 网络
@@ -195,7 +193,9 @@
 6. **记忆索引增量更新**：`replace_memory_scope` 按稳定 id（`scope:p<page>:o<op>`）
    只 upsert 当前条目、删除消失条目，单 scope 写入在一个事务里完成。
 7. **`library.db` 生命周期**：`library::maintain` 清理孤儿索引 / 空会话，库超过
-   32 MiB 时 `PRAGMA optimize; VACUUM;`；进程内只跑一次，失败只记日志。
+   32 MiB 时 `PRAGMA optimize; VACUUM;`；进程内只跑一次，失败只记日志。库文件损坏
+   （不是合法 SQLite）时自动备份为 `library.db.corrupt-<时间戳>` 并重建，不让检索 /
+   保存历史一直报错。
 8. **Flutter 历史列表已分页/轻量化**：`lunac_chat_history_meta` 只返回
    `id / title / createdAt / updatedAt / messageCount`，点开某行才通过
    `lunac_chat_history_session` 读完整 payload；分叉只取标题也用元数据。
@@ -204,7 +204,7 @@
 
 - `powershell -ExecutionPolicy Bypass -File scripts\verify-v2.ps1` → 通过
 - `flutter test`：**320 passed**
-- `cargo test --lib`（`app-flutter/rust`）：**603 passed / 0 failed / 7 ignored**
+- `cargo test --lib`（`app-flutter/rust`）：**604 passed / 0 failed / 7 ignored**
 - `cargo test --offline`（`core-agent`）：**507 passed / 0 failed / 16 ignored**，0 warning
 - `scripts\build-release-v2.ps1`：**exit 0 / 0 warning**，产出
   `release\Lunac-1.0.0-Setup.exe`

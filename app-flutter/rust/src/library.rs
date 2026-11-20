@@ -84,6 +84,13 @@ pub struct Query<'a> {
 }
 
 fn open(root: &Path) -> Result<Connection, String> {
+    match open_once(root) {
+        Ok(conn) => Ok(conn),
+        Err(reason) => rebuild_corrupt(root, &reason),
+    }
+}
+
+fn open_once(root: &Path) -> Result<Connection, String> {
     let path = db_path(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -95,6 +102,49 @@ fn open(root: &Path) -> Result<Connection, String> {
     let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
     init_schema(&conn)?;
     Ok(conn)
+}
+
+/// 库文件损坏（断电 / 磁盘错误 / 手工改坏）时挪到一边重建。
+///
+/// 索引是正文的派生层：宁可空库重来，也不能让检索 / 保存历史一直报错。
+/// 下次 `chat_history::load_json` 的 `sync_sessions` 会按会话正文把索引补回来。
+fn rebuild_corrupt(root: &Path, reason: &str) -> Result<Connection, String> {
+    let lower = reason.to_ascii_lowercase();
+    // 只有「确实是坏库」才重建；权限 / 磁盘满等问题换个空库也没用，原样报错。
+    let corrupt = lower.contains("not a database")
+        || lower.contains("malformed")
+        || lower.contains("file is encrypted")
+        || lower.contains("database disk image");
+    if !corrupt {
+        return Err(reason.to_string());
+    }
+    let path = db_path(root);
+    if !path.exists() {
+        return Err(reason.to_string());
+    }
+    let stamp = crate::cron::now_ms();
+    let backup = path.with_file_name(format!("library.db.corrupt-{stamp}"));
+    std::fs::rename(&path, &backup).map_err(|e| {
+        format!(
+            "检索库损坏且无法备份（{}）: {e}；原始错误: {reason}",
+            path.display()
+        )
+    })?;
+    // WAL / SHM 跟着主文件一起挪走，避免新库误读旧日志。
+    for suffix in ["-wal", "-shm"] {
+        let from = path.with_file_name(format!("library.db{suffix}"));
+        if from.exists() {
+            let to = backup.with_file_name(format!(
+                "library.db.corrupt-{stamp}{suffix}"
+            ));
+            let _ = std::fs::rename(from, to);
+        }
+    }
+    eprintln!(
+        "[lunac-library] 检索库损坏，已重建（备份：{}）：{reason}",
+        backup.display()
+    );
+    open_once(root)
 }
 
 fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -996,6 +1046,36 @@ mod tests {
         assert!(stats.db_bytes > 0);
         let after = maintain(&root).unwrap();
         assert!(after.entries > 0, "维护不能误删正常会话的索引");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_library_is_backed_up_and_rebuilt() {
+        let root = temp_root("corrupt");
+        let path = db_path(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 不是 SQLite 文件：旧实现会让 stats / 检索 / 保存一直报错。
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+
+        let fresh = stats(&root).unwrap();
+        assert_eq!(fresh.entries, 0);
+        assert_eq!(fresh.sessions, 0);
+
+        let backups = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("library.db.corrupt-")
+            })
+            .count();
+        assert_eq!(backups, 1, "损坏库应备份一份而不是静默删除");
+
+        // 重建后的库可正常写入。
+        index_session(&root, &session("s1", 1_700_000_000_000)).unwrap();
+        assert_eq!(stats(&root).unwrap().sessions, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
