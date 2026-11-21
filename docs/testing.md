@@ -67,9 +67,13 @@ powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1 -Plugin <id>
 # 全量插件
 powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1
 
-# 发 Release（自更新用）/ 发插件到市场
+# 发 Release（自更新用）
 powershell -ExecutionPolicy Bypass -File scripts\publish-release.ps1
-powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1
+
+# 发插件到市场（构建 + 拷贝/索引 + push + 线上校验，一条命令）
+powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1 -Build
+# 或构建时直接带上发布（不再单独跑 publish）
+powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1 -Publish
 ```
 
 - **v2 打包口径**：`build-release-v2.ps1` 每次都**重编 `core-agent` release**（`agent.exe` 随包更新），
@@ -83,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1
 
 - **插件改源码 ≠ 生效**：运行读的是盘上 `Modules\<id>\index.js`。发布顺序固定：改源码 → `build-plugins.ps1`（先铺 dev 的 `target\debug\Modules\<id>\`、再铺 `release\ext-plugins\`）→ dev 验证 → `build-release.ps1` → `publish-plugins.ps1`。**先 publish 后 build = 把上一版推上去**。
 - **资源库（`resource-hub`）是外部工程插件（2026-11-01 起纳入正式插件包）**：它不在 `app/vite.plugins.config.ts` 的入口表里，产物由 `resource-hub` 自己的 `npm run build` 生成。**仍然只跑 `build-plugins.ps1`** —— 脚本会先构建它、再把 `apps\lunac-plugin\dist\` 拷进 `app\plugin-dist\resource-hub\`，之后走与其余插件完全相同的 zip / `ext-plugins` / dev `Modules` 三条路。它的**版本号唯一真相源**是 `resource-hub\apps\lunac-plugin\public\lunac-plugin.json`（发版前 +1 这一份，别在 `build-plugins.ps1` 里再抄一份）。
-- **发布是独立的人工步骤，绝不自动**；摘插件时同一批必须把市场索引也发出去（否则插件既不在 bundle 也不在市场）。
+- **发布仍是显式步骤，不会在构建时偷偷推**：一条命令是 `publish-plugins.ps1 -Build`（或 `build-plugins.ps1 -Publish`）。它只发每个 id 的最高版本，推完用 `gh api` 读回线上 `index.json` 与每个包的 size，逐条比对 id / version / sha256 / size，不一致就非 0 退出；本地内容没变时不制造空提交。**插件包可复现**：zip 条目按排序后的相对路径写入、时间戳钉死 2020-01-01，同样内容重建不会换 sha256。
 - **`build-release.ps1` 守卫**：第 ⓪ 步读回确认六处版本载体；`release\ext-plugins\` 用**新鲜度**判据（插件源码最新 mtime ≤ 暂存清单最旧 mtime，否则 `throw`）；打包前后双校验**必须含 `agent.exe`、不得含 `cli.exe`**。
 - **插件版本号与应用版本解耦**：包内容变了才 +1 那个插件自己的 `version`，别按内容哈希自动推版本。
 - **日常修改不打包**，做编译验证即可。

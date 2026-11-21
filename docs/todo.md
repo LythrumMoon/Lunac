@@ -210,6 +210,10 @@
 8. **Flutter 历史列表已分页/轻量化**：`lunac_chat_history_meta` 只返回
    `id / title / createdAt / updatedAt / messageCount`，点开某行才通过
    `lunac_chat_history_session` 读完整 payload；分叉只取标题也用元数据。
+9. **插件发布收成一条命令并带线上校验**：`scripts\publish-plugins.ps1` 新增 `-Build`
+   （构建 → 拷贝/索引 → push → `gh api` 读回比对 id/version/sha256/size），
+   `build-plugins.ps1` 新增 `-Publish`；zip 改可复现打包（排序 + 固定时间戳），
+   内容没变时重建不再换 sha256、也不制造空提交。2026-11-21 已把 8 个插件重新发布并校验通过。
 
 ### 记忆注入 A/B（真实会话操作步骤）
 

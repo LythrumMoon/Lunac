@@ -12,19 +12,23 @@
 #
 # 为什么单独立一个脚本、不塞进 build-release.ps1：
 #   · 安装包**不再**随包分发这些插件（用户按需从市场装），所以它与「打安装包」是两件事；
-#   · 发布插件要**上传**到 GitHub Release 才能被市场下载，那一步是人工的（见脚本末尾提示）。
+#   · 发布插件要**上传**到公开插件仓库才能被市场下载：现在由 scripts\publish-plugins.ps1
+#     完成；构建完加 -Publish 可直接触发，它会在推完后用 gh api 校验线上索引与包。
 #
 # 用法：powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1
 #   -Plugin music      只打某一个
 #   -NoBuild           跳过 vite 构建，只用现有 app\plugin-dist\ 重新打包+打 zip
+#   -Publish           构建完直接发布到插件市场（= publish-plugins.ps1，含线上校验）
 #
 # 流程：① vite 库模式构建出 app\plugin-dist\<id>\index.js（见 app/vite.plugins.config.ts）
 #       ② 按下面的元数据表生成每个插件的 lunac-plugin.json
-#       ③ 压成 zip（用 .NET 的 ZipFile，不依赖 7z / Compress-Archive 的目录层级怪癖）
+#       ③ 压成 zip（.NET ZipFile 逐条写入；排序 + 固定时间戳 ⇒ 可复现，不依赖 7z / Compress-Archive）
 
 param(
   [string[]]$Plugin = @(),
-  [switch]$NoBuild
+  [switch]$NoBuild,
+  # 构建完直接发布到公开插件仓库（调用 scripts\publish-plugins.ps1）。
+  [switch]$Publish
 )
 
 $ErrorActionPreference = "Stop"
@@ -634,17 +638,39 @@ foreach ($id in $Ids) {
 }
 
 # ── ③ 打 zip ───────────────────────────────────────────────────────
-# 用 ZipFile::CreateFromDirectory：包内是**目录内容**（lunac-plugin.json 在 zip 根），
-# 这正是 install_from_bytes 认的形状之一。
-Write-Host "[3/5] 打包 zip..." -ForegroundColor Yellow
+# **可复现打包**（2026-11-21）：不再用 ZipFile::CreateFromDirectory —— 它会把源文件
+# 的 mtime 写进 zip 头，vite 每次重建 index.js 都让「内容没变」的包换一份 sha256，
+# 市场索引跟着无意义地翻新。这里按**排序后的相对路径**逐条写入，并把时间戳钉死为
+# 2020-01-01：同样的插件内容 ⇒ 同样的 zip 字节 ⇒ 同样的 sha256。
+# 包内仍是**目录内容**（lunac-plugin.json 在 zip 根），正是 install_from_bytes 认的形状之一。
+# 两个程序集都要显式加载：ZipFile 在 System.IO.Compression.FileSystem，ZipArchiveMode 在
+# System.IO.Compression —— PS 5.1 不保证前者会顺带把后者带进来（2026-11-21 实测会 TypeNotFound）。
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+function New-PluginZip([string]$sourceDir, [string]$zipPath) {
+  if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+  $baseLen = $sourceDir.TrimEnd('\', '/').Length + 1
+  $files = @(Get-ChildItem -LiteralPath $sourceDir -Recurse -File | Sort-Object FullName)
+  $zip = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
+  try {
+    $stamp = [DateTimeOffset]::Parse('2020-01-01T00:00:00+00:00')
+    foreach ($f in $files) {
+      $rel = $f.FullName.Substring($baseLen).Replace('\', '/')
+      $entry = $zip.CreateEntry($rel, [IO.Compression.CompressionLevel]::Optimal)
+      $entry.LastWriteTime = $stamp
+      $input = [IO.File]::OpenRead($f.FullName)
+      try {
+        $output = $entry.Open()
+        try { $input.CopyTo($output) } finally { $output.Dispose() }
+      } finally { $input.Dispose() }
+    }
+  } finally { $zip.Dispose() }
+}
+
+Write-Host "[3/5] 打包 zip..." -ForegroundColor Yellow
 foreach ($id in $Ids) {
   $zip = Join-Path $OutDir "$id-$(Get-PluginVersion $id).zip"
-  if (Test-Path $zip) { Remove-Item $zip -Force }
-  [IO.Compression.ZipFile]::CreateFromDirectory(
-    (Join-Path $DistDir $id), $zip,
-    [IO.Compression.CompressionLevel]::Optimal, $false
-  )
+  New-PluginZip (Join-Path $DistDir $id) $zip
   $kb = [math]::Round((Get-Item $zip).Length / 1KB, 1)
   Write-Host "  $zip  ($kb KB)" -ForegroundColor Green
 }
@@ -791,25 +817,25 @@ if (Test-Path (Join-Path $DevRoot "lunac.exe")) {
 }
 
 Write-Host ""
-Write-Host "⓪ 桌宠的 Core 资产传过没有？那份 Release 资产**也是一次再分发** —— 要连着授权文件一起传：" -ForegroundColor Yellow
+Write-Host "⓪ 桌宠的 Core / ZipVoice 是**另发的 Release 资产**（一次性上传，之后不必每次发）：" -ForegroundColor Yellow
 Write-Host "     gh release create live2dcubismcore-5.1.0 ^"
 Write-Host "       release\deps\live2d\live2dcubismcore.min.js ^"
 Write-Host "       licenses\live2d-cubism-core\LICENSE.md licenses\live2d-cubism-core\RedistributableFiles.txt ^"
 Write-Host "       -R LythrumMoon/lunac-plugins -t 'Live2D Cubism Core 5.1.0'"
 Write-Host "   · 三份缺一不可：只挂 Core 不挂授权文件 = 没满足协议 5.1 的随附条件" -ForegroundColor DarkGray
+Write-Host "   · ZipVoice 同理：gh release create zipvoice-1.13.8 release\deps\zipvoice\zipvoice-1.13.8.7z -R LythrumMoon/lunac-plugins" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "⓪ 桌宠的 ZipVoice 语音资产传过没有？它也是一次再分发（CC-BY-NC / GPL-3.0 随附义务）：" -ForegroundColor Yellow
-Write-Host "     gh release create zipvoice-1.13.8 ^"
-Write-Host "       release\deps\zipvoice\zipvoice-1.13.8.7z ^"
-Write-Host "       -R LythrumMoon/lunac-plugins -t 'ZipVoice 语音资产 1.13.8'"
-Write-Host "   · 标签(`zipvoice-1.13.8`)与文件名(`zipvoice-1.13.8.7z`)必须与 pet 清单里的 url/sha256" -ForegroundColor DarkGray
-Write-Host "     逐字一致，否则市场安装会因 sha256 对不上而整包拒装" -ForegroundColor DarkGray
-Write-Host "   · 授权全文已随包（zipvoice\LICENSES\ + THIRD_PARTY_NOTICES.md），不必单独挂" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "下一步：把它发布到**公开**插件仓库（终端用户要能免鉴权直链下载）。" -ForegroundColor Yellow
-Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1"
-Write-Host "  · 默认目标仓库：LythrumMoon/lunac-plugins（公开；不存在时先用 gh repo create 建）"
-Write-Host "  · 它会把 zip 按分类放进 packages\<分类>\ 并生成 index.json，然后 commit + push"
-Write-Host "  · 宿主常量 INDEX_URL 指向该仓库的 index.json（见 src-tauri/src/plugin_market.rs）"
-Write-Host ""
-Write-Host "只想本机试装（不进市场）：把 zip 解到 <exe 根>\Modules\<id>\，再在 设置 → 插件 → 重新扫描。" -ForegroundColor DarkGray
+if ($Publish) {
+  Write-Host "发布到插件市场（拷贝 + 索引 + push + 线上校验）..." -ForegroundColor Yellow
+  & powershell -NoProfile -ExecutionPolicy Bypass -File "$Root\scripts\publish-plugins.ps1"
+  if ($LASTEXITCODE -ne 0) { throw "publish-plugins.ps1 失败（exit $LASTEXITCODE）" }
+} else {
+  Write-Host "下一步：发布到**公开**插件仓库（终端用户要能免鉴权直链下载）。" -ForegroundColor Yellow
+  Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1          # 只发布现有 zip"
+  Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\publish-plugins.ps1 -Build   # 构建 + 发布 + 线上校验"
+  Write-Host "  · 或直接跑本脚本加 -Publish：build-plugins.ps1 -Publish"
+  Write-Host "  · 默认目标仓库：LythrumMoon/lunac-plugins（公开；不存在时先用 gh repo create 建）"
+  Write-Host "  · 发布后脚本会用 gh api 读回 index.json 与每个包的 size，逐条比对 id/版本/sha256"
+  Write-Host ""
+  Write-Host "只想本机试装（不进市场）：把 zip 解到 <exe 根>\Modules\<id>\，再在 设置 → 插件 → 重新扫描。" -ForegroundColor DarkGray
+}
