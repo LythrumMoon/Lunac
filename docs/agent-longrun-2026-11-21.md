@@ -140,6 +140,20 @@ error: old_string not found in ...\target.txt; closest line 2: let value = compu
 call : WebBrowser http://127.0.0.1:18081/
 result: toolErrors 0（页面 hello-local）
 
+# 4. TaskPhase 顺序（新 build）
+first assistant message blocks: ["thinking", "TaskPhase", "TodoWrite"]   # 没有正文抢先
+actual tool sequence:
+  TaskPhase start "写 p1.txt"
+  TodoWrite  (p1 in_progress)
+  Write      p1.txt
+  TaskPhase done "已在工作区写入 p1.txt..."
+  TodoWrite  (p1 completed, p2 in_progress)
+  TaskPhase start "写 p2.txt"
+  Write      p2.txt
+  TaskPhase done "..."
+  TodoWrite  (p2 completed)
+```
+
 # 4. 测试与构建
 core-agent cargo test --offline : 512 passed / 0 failed / 16 ignored
 release build（--target-dir target-verify）: Finished，0 warning
