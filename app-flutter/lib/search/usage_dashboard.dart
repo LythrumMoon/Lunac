@@ -50,7 +50,12 @@ class UsageDashboard extends StatefulWidget {
 }
 
 class _UsageDashboardState extends State<UsageDashboard> {
-  bool _open = false;
+  /// 2026-11-21（用户口径）：用量与成本面板改为**独立浮层**，不再在对话底部
+  /// 撑开布局；表盘本身仍留在状态栏。
+  final OverlayPortalController _portal = OverlayPortalController();
+  final LayerLink _link = LayerLink();
+
+  bool get _open => _portal.isShowing;
   bool _loading = false;
   UsageCostData? _data;
 
@@ -67,9 +72,24 @@ class _UsageDashboardState extends State<UsageDashboard> {
   }
 
   void _toggle() {
-    setState(() => _open = !_open);
-    if (_open) {
+    if (_portal.isShowing) {
+      _portal.hide();
+    } else {
+      _portal.show();
       _reload();
+    }
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _close() {
+    if (!_portal.isShowing) {
+      return;
+    }
+    _portal.hide();
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -92,12 +112,42 @@ class _UsageDashboardState extends State<UsageDashboard> {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    return CompositedTransformTarget(
+      link: _link,
+      child: OverlayPortal(
+        controller: _portal,
+        overlayChildBuilder: _buildOverlay,
+        child: _buildBar(),
+      ),
+    );
+  }
+
+  /// 独立浮层：点击浮层外关闭；面板贴着表盘向上展开，不改变对话区高度。
+  Widget _buildOverlay(BuildContext context) {
+    return Stack(
       children: [
-        if (_open) _buildPanel(),
-        _buildBar(),
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: _close,
+          ),
+        ),
+        CompositedTransformFollower(
+          link: _link,
+          targetAnchor: Alignment.topLeft,
+          followerAnchor: Alignment.bottomLeft,
+          offset: const Offset(0, -6),
+          child: Material(
+            color: LunacColors.surface,
+            elevation: 12,
+            borderRadius: BorderRadius.circular(8),
+            clipBehavior: Clip.antiAlias,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 600, maxHeight: 440),
+              child: SingleChildScrollView(child: _buildPanel()),
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -109,6 +159,12 @@ class _UsageDashboardState extends State<UsageDashboard> {
     final input = hit + miss;
     final total = input + widget.session.output;
     final hitPct = input > 0 ? (hit / input * 100).round() : 0;
+    // 语义色：命中率高 = 绿，中 = 黄，低 = 红（2026-11-21 用户口径）。
+    final usageColor = input <= 0
+        ? LunacColors.surfaceHover
+        : (hitPct >= 60
+              ? LunacColors.success
+              : (hitPct >= 30 ? LunacColors.warning : LunacColors.danger));
     final compact = widget.session.elided + widget.session.dropped > 0
         ? ' · 压缩：省略 ${widget.session.elided} 个工具结果、丢弃 ${widget.session.dropped} 条早期消息'
         : '';
@@ -117,6 +173,7 @@ class _UsageDashboardState extends State<UsageDashboard> {
       child: SizedBox(
         height: 20,
         child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
             Tooltip(
               message:
@@ -131,12 +188,14 @@ class _UsageDashboardState extends State<UsageDashboard> {
                       if (input > 0) ...[
                         Expanded(
                           flex: hit,
-                          child: ColoredBox(color: LunacColors.accent),
+                          child: ColoredBox(color: usageColor),
                         ),
                         Expanded(
                           flex: miss,
                           child: ColoredBox(
-                            color: LunacColors.textMuted.withValues(alpha: 0.45),
+                            color: LunacColors.textMuted.withValues(
+                              alpha: 0.45,
+                            ),
                           ),
                         ),
                       ] else
@@ -150,16 +209,13 @@ class _UsageDashboardState extends State<UsageDashboard> {
               ),
             ),
             const SizedBox(width: 6),
-            Text(
-              '$hitPct%',
-              style: TextStyle(color: LunacColors.textMuted, fontSize: 11),
-            ),
+            Text('$hitPct%', style: TextStyle(color: usageColor, fontSize: 11)),
             const SizedBox(width: 8),
             Text(
               fmtDashboardTokens(total),
               style: TextStyle(color: LunacColors.textDim, fontSize: 11),
             ),
-            const Spacer(),
+            const SizedBox(width: 6),
             Icon(
               _open ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up,
               size: 14,
@@ -340,10 +396,9 @@ class _UsageDashboardState extends State<UsageDashboard> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              color: color ??
-                  (header
-                      ? LunacColors.textMuted
-                      : LunacColors.textDim),
+              color:
+                  color ??
+                  (header ? LunacColors.textMuted : LunacColors.textDim),
               fontSize: 10.5,
               fontWeight: bold ? FontWeight.w600 : FontWeight.w400,
             ),
@@ -356,45 +411,72 @@ class _UsageDashboardState extends State<UsageDashboard> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(children: [
-          for (var i = 0; i < headers.length; i++) cell(headers[i], i, header: true),
-        ]),
+        Row(
+          children: [
+            for (var i = 0; i < headers.length; i++)
+              cell(headers[i], i, header: true),
+          ],
+        ),
         Divider(height: 5, thickness: 0.5, color: LunacColors.border),
         for (final row in rows)
-          Row(children: [
-            cell(row.label, 0),
-            cell('${row.requests}', 1),
-            cell(fmtTokenCount(row.hit), 2),
-            cell(fmtTokenCount(row.miss), 3),
-            cell(fmtTokenCount(row.write), 4),
-            cell(fmtTokenCount(row.output), 5),
-            cell(
-              amountText(hasPrices, row.amount, row.exact),
-              6,
-              color: hasPrices ? LunacColors.text : LunacColors.textMuted,
-            ),
-            cell(perRequestText(row.miss, row.requests), 7),
-            cell(perRequestText(row.output, row.requests), 8),
-            cell(shareText(hasPrices, row.amount, totals.amount), 9),
-          ]),
-        const Divider(height: 5, thickness: 0.5),
-        Row(children: [
-          cell('合计', 0, bold: true, color: LunacColors.text),
-          cell('${totals.requests}', 1, bold: true, color: LunacColors.text),
-          cell(fmtTokenCount(totals.hit), 2, bold: true, color: LunacColors.text),
-          cell(fmtTokenCount(totals.miss), 3, bold: true, color: LunacColors.text),
-          cell(fmtTokenCount(totals.write), 4, bold: true, color: LunacColors.text),
-          cell(fmtTokenCount(totals.output), 5, bold: true, color: LunacColors.text),
-          cell(
-            amountText(hasPrices, totals.amount, totals.exact),
-            6,
-            bold: true,
-            color: LunacColors.text,
+          Row(
+            children: [
+              cell(row.label, 0),
+              cell('${row.requests}', 1),
+              cell(fmtTokenCount(row.hit), 2),
+              cell(fmtTokenCount(row.miss), 3),
+              cell(fmtTokenCount(row.write), 4),
+              cell(fmtTokenCount(row.output), 5),
+              cell(
+                amountText(hasPrices, row.amount, row.exact),
+                6,
+                color: hasPrices ? LunacColors.text : LunacColors.textMuted,
+              ),
+              cell(perRequestText(row.miss, row.requests), 7),
+              cell(perRequestText(row.output, row.requests), 8),
+              cell(shareText(hasPrices, row.amount, totals.amount), 9),
+            ],
           ),
-          cell(perRequestText(totals.miss, totals.requests), 7),
-          cell(perRequestText(totals.output, totals.requests), 8),
-          cell(shareText(hasPrices, totals.amount, totals.amount), 9),
-        ]),
+        const Divider(height: 5, thickness: 0.5),
+        Row(
+          children: [
+            cell('合计', 0, bold: true, color: LunacColors.text),
+            cell('${totals.requests}', 1, bold: true, color: LunacColors.text),
+            cell(
+              fmtTokenCount(totals.hit),
+              2,
+              bold: true,
+              color: LunacColors.text,
+            ),
+            cell(
+              fmtTokenCount(totals.miss),
+              3,
+              bold: true,
+              color: LunacColors.text,
+            ),
+            cell(
+              fmtTokenCount(totals.write),
+              4,
+              bold: true,
+              color: LunacColors.text,
+            ),
+            cell(
+              fmtTokenCount(totals.output),
+              5,
+              bold: true,
+              color: LunacColors.text,
+            ),
+            cell(
+              amountText(hasPrices, totals.amount, totals.exact),
+              6,
+              bold: true,
+              color: LunacColors.text,
+            ),
+            cell(perRequestText(totals.miss, totals.requests), 7),
+            cell(perRequestText(totals.output, totals.requests), 8),
+            cell(shareText(hasPrices, totals.amount, totals.amount), 9),
+          ],
+        ),
       ],
     );
   }

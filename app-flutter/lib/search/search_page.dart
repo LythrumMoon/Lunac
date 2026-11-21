@@ -310,7 +310,7 @@ class _SearchPageState extends State<SearchPage> with TickerProviderStateMixin {
     // 结果区只在「搜索框被选中」时展开（用户 2026-11-08 裁决）。
     _inputFocus.addListener(_onFocusChanged);
     // 附件抽屉是独立窗口：点它里面的 × 时由原生转回这里。
-    startAttachmentDrawerBridge(_removeAttachment);
+    startAttachmentDrawerBridge(_removeAttachment, onClear: _clearAttachments);
     // 插件窗与主窗的层级：主窗常驻置顶，有插件窗时让位（否则会把插件窗盖住）。
     _pluginClosedSubscription = pluginWindowClosed.listen((id) {
       if (id == 'pet' && mounted) {
@@ -1010,6 +1010,17 @@ class _SearchPageState extends State<SearchPage> with TickerProviderStateMixin {
     _attachments.removeAt(index);
     unawaited(syncAttachmentWindow(_attachments));
     _runSearch();
+  }
+
+  /// 附件抽屉顶部「一键删除」：清空全部附件并回到普通结果视图。
+  void _clearAttachments() {
+    if (_attachments.isEmpty) {
+      return;
+    }
+    _attachments.clear();
+    unawaited(syncAttachmentWindow(_attachments));
+    _runSearch();
+    _syncWindowHeight();
   }
 
   /// 可见结果行数；0 条结果时按一行空状态算。

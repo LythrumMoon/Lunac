@@ -58,11 +58,16 @@ Future<bool> isAppForeground() async {
   }
 }
 
-/// 抽屉窗口里点 × 时，原生把索引转回来。
-void startAttachmentDrawerBridge(void Function(int index) onRemove) {
+/// 抽屉窗口里点 × 时，原生把索引转回来；顶部「一键删除」浮层回 `clear`。
+void startAttachmentDrawerBridge(
+  void Function(int index) onRemove, {
+  void Function()? onClear,
+}) {
   _channel.setMethodCallHandler((call) async {
     if (call.method == 'remove' && call.arguments is int) {
       onRemove(call.arguments as int);
+    } else if (call.method == 'clear') {
+      onClear?.call();
     }
   });
 }

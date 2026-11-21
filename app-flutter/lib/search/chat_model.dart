@@ -296,9 +296,16 @@ class ChatEntry {
     this.fileKind = 'other',
     this.fileSize = 0,
     this.filePreview = '',
+    this.seq = 0,
   });
 
   final ChatEntryKind kind;
+
+  /// 条目在会话里的单调序号（由 `ChatModel._addEntry` 分配）。
+  ///
+  /// 任务抽屉按「待办阶段」分组时用它判断条目归属；不能用 `entries` 下标，
+  /// 因为流式阶段会移除「准备中」的工具卡，下标会整体前移。
+  int seq;
 
   /// 正文（用户消息 / 助手文本 / 思考 / 工具结果 / 提示 / 错误）。
   String text;
@@ -492,6 +499,31 @@ class TodoItem {
   final String status;
 }
 
+/// 一条待办在对话流里的「阶段」：从它成为当前待办开始，到下一次待办切换为止。
+///
+/// 2026-11-21 用户口径：任务抽屉要**按待办**分组，而不是按每条助手小输出分组；
+/// 且改一个待办的标题不能让其它待办的抽屉跟着变。阶段在 `TodoWrite` 到达时创建/
+/// 更新，`startSeq` 之后的条目归属这个阶段；标题在阶段里冻结，只有当前阶段被
+/// 重命名时才更新。
+class TodoPhase {
+  TodoPhase({
+    required this.id,
+    required this.startSeq,
+    required this.slot,
+    required this.content,
+    required this.title,
+  });
+
+  final int id;
+  final int startSeq;
+
+  /// 在 `TodoWrite` 清单里的下标（用于识别「同一个待办被改名」）。
+  final int slot;
+
+  String content;
+  String title;
+}
+
 /// 一次 `system/init` 的 SYSTEM / CONTEXT 快照（§待办 3-28.12 ① 的逐轮时间线）。
 ///
 /// 只存字符数与哈希，**不存正文** —— 系统提示词可能含人格 / 记忆原文，界面没有逐字
@@ -582,6 +614,42 @@ class ChatModel {
   /// 任务抽屉的标题要用「这一轮对应的待办」，而不是把整段用户提问直接塞进标题；
   /// `TodoWrite` 到达时记一份，后续该回合的抽屉都从这里取名。
   final Map<int, List<TodoItem>> turnTodos = <int, List<TodoItem>>{};
+
+  /// 待办阶段（2026-11-21）：每个待办从「成为当前项」到「下一次切换」是一段。
+  final List<TodoPhase> todoPhases = <TodoPhase>[];
+
+  /// 条目单调序号；只增不减（`clear` 后也继续，避免旧阶段误命中新条目）。
+  int _nextEntrySeq = 1;
+
+  int _nextPhaseId = 1;
+  TodoPhase? _currentPhase;
+
+  /// 当前回合第一条过程条目之前的位置（第一个 `TodoWrite` 用它认领本轮早先的思考）。
+  int _turnStartSeq = 0;
+
+  TodoPhase? get currentTodoPhase => _currentPhase;
+
+  TodoPhase? phaseById(int id) {
+    for (final phase in todoPhases) {
+      if (phase.id == id) {
+        return phase;
+      }
+    }
+    return null;
+  }
+
+  /// 某条对话条目属于哪个待办阶段；没有 `TodoWrite` 或早于第一个阶段 ⇒ null。
+  TodoPhase? phaseForEntry(ChatEntry entry) {
+    TodoPhase? found;
+    for (final phase in todoPhases) {
+      if (phase.startSeq <= entry.seq) {
+        found = phase;
+      } else {
+        break;
+      }
+    }
+    return found;
+  }
 
   /// 后台运行中的命令（v1 `backgroundCmds`）：只由 `background_started` /
   /// `background_done` 两条事件驱动，前端不自己推断「跑完没有」。
@@ -745,11 +813,17 @@ class ChatModel {
 
   int _assistantSinceUser = 0;
 
-  /// 单条正文上限：工具输出可能很大，界面只要尾部的关键信息。
+  /// 单条**工具输出**上限：工具输出可能很大，界面只要尾部的关键信息。
   static const int _maxEntryChars = 4000;
 
-  /// 过程快照落盘的体积上限（单条 `_maxEntryChars`，整会话 `_maxStepsChars`）。
-  static const int _maxStepsChars = 200000;
+  /// 单条**思考 / 正文 / 用户消息**的落盘上限（2026-11-21）。
+  ///
+  /// 4k 的尾部截断会把长思考的开头整段吃掉（用户报「历史里思考只剩 4001 字」）。
+  /// 这三类文本是对话过程本身，放宽到 200k；真正的工具输出仍按 4k 尾部裁剪。
+  static const int _maxTextStepChars = 200000;
+
+  /// 过程快照落盘的体积上限（单条按上面两类上限，整会话 2M）。
+  static const int _maxStepsChars = 2000000;
 
   void clear() {
     entries.clear();
@@ -758,6 +832,10 @@ class ChatModel {
     _droppedSteer = null;
     todos.clear();
     turnTodos.clear();
+    todoPhases.clear();
+    _currentPhase = null;
+    _nextPhaseId = 1;
+    _turnStartSeq = 0;
     changedFiles.clear();
     backgroundCommands.clear();
     turnDurationsMs.clear();
@@ -806,10 +884,16 @@ class ChatModel {
   /// 落一条用户提问。[steerInsert] = 这条是「立即插入」（进待确认队列，
   /// 由 `steer_inserted` / `steer_dropped` 二选一出队）。
   void addUser(String text, {bool steerInsert = false}) {
-    entries.add(ChatEntry(kind: ChatEntryKind.user, text: text));
+    final startingNewTurn = !busy;
+    _addEntry(ChatEntry(kind: ChatEntryKind.user, text: text));
     messages.add(ChatMessage('user', text));
     if (steerInsert) {
       _pendingSteers.add(entries.last);
+    }
+    if (startingNewTurn) {
+      // 新回合从这条提问之后开始算待办阶段；插入式提问（steer）不打断当前阶段。
+      _currentPhase = null;
+      _turnStartSeq = _nextEntrySeq;
     }
     _turnStartedAt = DateTime.now();
     sessionId ??= 'sess-${DateTime.now().microsecondsSinceEpoch}';
@@ -965,7 +1049,13 @@ class ChatModel {
         chip['detail'] = _clipStep(entry.detail!);
       }
       if (entry.text.isNotEmpty) {
-        chip['text'] = _clipStep(entry.text);
+        final keepHead =
+            entry.kind == ChatEntryKind.user ||
+            entry.kind == ChatEntryKind.assistant ||
+            entry.kind == ChatEntryKind.thinking;
+        chip['text'] = keepHead
+            ? _clipTextStep(entry.text)
+            : _clipStep(entry.text);
       }
       final size =
           '${chip['text'] ?? ''}'.length + '${chip['detail'] ?? ''}'.length;
@@ -1000,12 +1090,21 @@ class ChatModel {
     return start == 0 ? ordered : ordered.sublist(start);
   }
 
-  /// 落盘时的单条截断（保留尾部：工具输出真正有用的是结尾）。
+  /// 落盘时的工具输出截断（保留尾部：工具输出真正有用的是结尾）。
   static String _clipStep(String text) {
     if (text.length <= _maxEntryChars) {
       return text;
     }
     return '…${text.substring(text.length - _maxEntryChars)}';
+  }
+
+  /// 落盘时的思考 / 正文 / 提问截断：保留开头（对话过程从头读才有意义），
+  /// 只有超过 200k 的极端文本才截断。
+  static String _clipTextStep(String text) {
+    if (text.length <= _maxTextStepChars) {
+      return text;
+    }
+    return '${text.substring(0, _maxTextStepChars)}…';
   }
 
   /// 恢复一份历史会话：界面条目与纯文本消息一起替换。
@@ -1038,12 +1137,12 @@ class ChatModel {
     for (final step in steps) {
       final entry = stepEntryOf(step);
       if (entry != null) {
-        entries.add(entry);
+        _addEntry(entry);
       }
     }
     if (entries.isEmpty) {
       for (final message in messages) {
-        entries.add(
+        _addEntry(
           ChatEntry(
             kind: message.role == 'user'
                 ? ChatEntryKind.user
@@ -1111,7 +1210,7 @@ class ChatModel {
   }
 
   void addNotice(String text) {
-    entries.add(ChatEntry(kind: ChatEntryKind.notice, text: text));
+    _addEntry(ChatEntry(kind: ChatEntryKind.notice, text: text));
   }
 
   /// 已收到 `tool_result` 的 `tool_use_id`（活动面板判「还在跑」的唯一依据）。
@@ -1165,7 +1264,7 @@ class ChatModel {
   /// `/compact` 的占位旁注：立刻给一条反馈，压缩完成后原地改文字（与 v1 同口径）。
   void markCompactRequested() {
     _compactNote = ChatEntry(kind: ChatEntryKind.notice, text: '已请求压缩上下文，稍候…');
-    entries.add(_compactNote!);
+    _addEntry(_compactNote!);
   }
 
   /// `/rewind`：删掉最近一轮用户提问及其后的条目，返回被删的提问文本（给输入框回填）。
@@ -1233,7 +1332,7 @@ class ChatModel {
   }
 
   void addError(String text) {
-    entries.add(ChatEntry(kind: ChatEntryKind.error, text: text));
+    _addEntry(ChatEntry(kind: ChatEntryKind.error, text: text));
     busy = false;
   }
 
@@ -1534,7 +1633,7 @@ class ChatModel {
       return;
     }
     _planNote = ChatEntry(kind: ChatEntryKind.notice, text: text);
-    entries.add(_planNote!);
+    _addEntry(_planNote!);
   }
 
   /// 后台命令登记（v1 `backgroundCmds.set`）：同一个后台 id 只留一条。
@@ -1595,7 +1694,7 @@ class ChatModel {
       return;
     }
     final name = file['name'];
-    entries.add(
+    _addEntry(
       ChatEntry(
         kind: ChatEntryKind.file,
         filePath: path,
@@ -1616,26 +1715,69 @@ class ChatModel {
     if (list is! List) {
       return;
     }
+    final parsed = <TodoItem>[
+      for (final item in list)
+        if (item is Map)
+          TodoItem(
+            content: item['content'] is String ? item['content'] as String : '',
+            status: item['status'] is String
+                ? item['status'] as String
+                : 'pending',
+          ),
+    ];
     todos
       ..clear()
-      ..addAll([
-        for (final item in list)
-          if (item is Map)
-            TodoItem(
-              content: item['content'] is String
-                  ? item['content'] as String
-                  : '',
-              status: item['status'] is String
-                  ? item['status'] as String
-                  : 'pending',
-            ),
-      ]);
+      ..addAll(parsed);
     // 当前用户提问序号（0 起）；一条 TodoWrite 只更新它所属的那一轮。
     final turn =
         entries.where((entry) => entry.kind == ChatEntryKind.user).length - 1;
     if (turn >= 0) {
       turnTodos[turn] = List<TodoItem>.of(todos);
     }
+    if (parsed.isEmpty) {
+      _currentPhase = null;
+      return;
+    }
+
+    // 当前待办：进行中 > 待办 > 保持当前项（全部完成）> 最后一条。
+    var activeIndex = parsed.indexWhere((item) => item.status == 'in_progress');
+    if (activeIndex < 0) {
+      activeIndex = parsed.indexWhere((item) => item.status == 'pending');
+    }
+    final current = _currentPhase;
+    if (activeIndex < 0 && current != null) {
+      activeIndex = parsed.indexWhere(
+        (item) => item.content == current.content,
+      );
+    }
+    if (activeIndex < 0) {
+      activeIndex = parsed.length - 1;
+    }
+    final content = parsed[activeIndex].content.trim();
+    if (content.isEmpty) {
+      _currentPhase = null;
+      return;
+    }
+    final title = summarizeTaskTitle(content);
+    // 同一个待办被改名：只更新它自己的阶段；之前已经收口的阶段保持原名。
+    if (current != null && current.slot == activeIndex) {
+      current.content = content;
+      current.title = title;
+      return;
+    }
+    // 本轮第一个阶段认领本轮早先的过程条目；后续阶段从 TodoWrite 之后开始。
+    final startSeq = current == null && turn >= 0
+        ? _turnStartSeq
+        : _nextEntrySeq;
+    final phase = TodoPhase(
+      id: _nextPhaseId++,
+      startSeq: startSeq,
+      slot: activeIndex,
+      content: content,
+      title: title,
+    );
+    todoPhases.add(phase);
+    _currentPhase = phase;
   }
 
   /// 某一轮任务抽屉的标题：优先取该轮待办（进行中 > 待办 > 最后一条完成）。
@@ -1700,7 +1842,7 @@ class ChatModel {
           toolUseId: id,
           detail: '准备参数…',
         );
-        entries.add(entry);
+        _addEntry(entry);
         _draftToolCards[id] = entry;
         final index = _asInt(payload['index']);
         _toolJsonBuffers[index] = StringBuffer();
@@ -1753,6 +1895,12 @@ class ChatModel {
 
   ChatEntry _newEntry(ChatEntryKind kind) {
     final entry = ChatEntry(kind: kind);
+    return _addEntry(entry);
+  }
+
+  /// 统一入口：分配单调序号并加入 `entries`。
+  T _addEntry<T extends ChatEntry>(T entry) {
+    entry.seq = _nextEntrySeq++;
     entries.add(entry);
     return entry;
   }
@@ -1805,7 +1953,7 @@ class ChatModel {
             draft.detail = compactJson(block['input']);
             break;
           }
-          entries.add(
+          _addEntry(
             ChatEntry(
               kind: ChatEntryKind.toolUse,
               toolName: name,
@@ -1821,7 +1969,7 @@ class ChatModel {
       if (open != null) {
         open.text = joined; // 整包覆盖增量，避免重复
       } else {
-        entries.add(ChatEntry(kind: ChatEntryKind.assistant, text: joined));
+        _addEntry(ChatEntry(kind: ChatEntryKind.assistant, text: joined));
       }
       messages.add(ChatMessage('assistant', joined));
       _assistantSinceUser = 1;
@@ -1832,7 +1980,7 @@ class ChatModel {
       if (open != null) {
         open.text = joined;
       } else {
-        entries.add(ChatEntry(kind: ChatEntryKind.thinking, text: joined));
+        _addEntry(ChatEntry(kind: ChatEntryKind.thinking, text: joined));
       }
     }
     _openAssistant = null;
@@ -1892,7 +2040,7 @@ class ChatModel {
       kind: ChatEntryKind.toolResult,
       toolUseId: toolUseId,
     );
-    entries.add(entry);
+    _addEntry(entry);
     if (toolUseId != null) {
       _toolResults[toolUseId] = entry;
     }
@@ -1914,7 +2062,7 @@ class ChatModel {
     switch (subtype) {
       case 'can_use_tool':
         busy = true;
-        entries.add(
+        _addEntry(
           ChatEntry(
             kind: ChatEntryKind.approval,
             subtype: subtype,
@@ -1936,7 +2084,7 @@ class ChatModel {
         );
       case 'elicitation':
         busy = true;
-        entries.add(
+        _addEntry(
           ChatEntry(
             kind: ChatEntryKind.approval,
             subtype: subtype,
@@ -1950,7 +2098,7 @@ class ChatModel {
         );
       case 'mcp_trust':
         busy = true;
-        entries.add(
+        _addEntry(
           ChatEntry(
             kind: ChatEntryKind.approval,
             subtype: subtype,
@@ -1964,7 +2112,7 @@ class ChatModel {
         );
       case 'mcp_sampling':
         busy = true;
-        entries.add(
+        _addEntry(
           ChatEntry(
             kind: ChatEntryKind.approval,
             subtype: subtype,
@@ -2121,7 +2269,7 @@ class ChatModel {
     // 非流式（或模型只给了最终文本）时补一条助手消息。
     if (_assistantSinceUser == 0 && text is String && text.trim().isNotEmpty) {
       final finalText = text.trim();
-      entries.add(ChatEntry(kind: ChatEntryKind.assistant, text: finalText));
+      _addEntry(ChatEntry(kind: ChatEntryKind.assistant, text: finalText));
       messages.add(ChatMessage('assistant', finalText));
       _assistantSinceUser = 1;
     }

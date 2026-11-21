@@ -1364,6 +1364,117 @@ void main() {
     expect(model.todos, hasLength(1));
   });
 
+  test('todo phases keep one box per task and rename only that task', () {
+    final model = ChatModel()..addUser('开始');
+    void thinking(String text) => model.apply({
+      'type': 'stream_event',
+      'event': {
+        'type': 'content_block_delta',
+        'delta': {'type': 'thinking_delta', 'thinking': text},
+      },
+    });
+    void todo(List<Map<String, String>> list) => model.apply({
+      'type': 'assistant',
+      'message': {
+        'content': [
+          {
+            'type': 'tool_use',
+            'id': 'todo-${list.first['content']}',
+            'name': 'TodoWrite',
+            'input': {'todos': list},
+          },
+        ],
+      },
+    });
+
+    // 第一个 TodoWrite 之前的思考属于本轮第一个待办（不能另起一个空任务框）。
+    thinking('先看看项目');
+    final early = lastOf(model, ChatEntryKind.thinking);
+
+    todo([
+      {'content': '确认工具链', 'status': 'in_progress'},
+      {'content': '修复问题', 'status': 'pending'},
+    ]);
+    expect(model.todoPhases, hasLength(1));
+    final first = model.todoPhases.first;
+    expect(first.title, '确认工具链');
+    expect(model.phaseForEntry(early)?.id, first.id);
+
+    thinking('检查版本');
+    final firstThinking = lastOf(model, ChatEntryKind.thinking);
+    // 同一待办里再出现思考 / 工具 / 小输出，不会新开阶段。
+    expect(model.todoPhases, hasLength(1));
+    expect(model.phaseForEntry(firstThinking)?.id, first.id);
+
+    // 完成第一项、切到第二项 ⇒ 新阶段、新标题。
+    todo([
+      {'content': '确认工具链', 'status': 'completed'},
+      {'content': '修复问题', 'status': 'in_progress'},
+    ]);
+    expect(model.todoPhases, hasLength(2));
+    final second = model.todoPhases[1];
+    expect(second.title, '修复问题');
+    expect(model.phaseForEntry(firstThinking)?.id, first.id);
+
+    // 只改当前待办的名字：第二项更新，第一项保持原名。
+    todo([
+      {'content': '确认工具链', 'status': 'completed'},
+      {'content': '修复登录问题', 'status': 'in_progress'},
+    ]);
+    expect(model.todoPhases, hasLength(2), reason: '同一项改名不新开阶段');
+    expect(model.todoPhases[0].title, '确认工具链');
+    expect(model.todoPhases[1].title, '修复登录问题');
+
+    thinking('查日志');
+    final secondThinking = lastOf(model, ChatEntryKind.thinking);
+    expect(model.phaseForEntry(secondThinking)?.id, second.id);
+  });
+
+  test('history steps keep full long thinking, not a 4001-char tail', () {
+    final model = ChatModel()..addUser('q');
+    final text = List.filled(5000, '思').join();
+    model.apply({
+      'type': 'stream_event',
+      'event': {
+        'type': 'content_block_delta',
+        'delta': {'type': 'thinking_delta', 'thinking': text},
+      },
+    });
+    final steps = model.stepsJson();
+    final thinking = steps.firstWhere((item) => item['kind'] == 'thinking');
+    expect(thinking['text'], text, reason: '思考不能被裁成 4001 字的尾部');
+  });
+
+  test('early turns survive a much larger later turn in history steps', () {
+    final model = ChatModel()..addUser('第一问');
+    model.apply({
+      'type': 'stream_event',
+      'event': {
+        'type': 'content_block_delta',
+        'delta': {'type': 'thinking_delta', 'thinking': '最早的思考'},
+      },
+    });
+    model.addUser('第二问');
+    model.apply({
+      'type': 'stream_event',
+      'event': {
+        'type': 'content_block_delta',
+        'delta': {
+          'type': 'thinking_delta',
+          'thinking': List.filled(400000, '长').join(),
+        },
+      },
+    });
+    final steps = model.stepsJson();
+    expect(steps.first['kind'], 'user', reason: '最早的用户提问必须留下，不能被后来的大回合挤掉');
+    expect(
+      steps.any((item) => item['text'] == '最早的思考'),
+      isTrue,
+      reason: '最早的过程块也要能重现',
+    );
+    expect(steps.any((item) => item['text'] == '第二问'), isTrue);
+  });
+
   test('plan mode banner is a singleton that follows the agent state', () {
     final model = ChatModel()..addUser('q');
     model.apply({'type': 'system', 'subtype': 'plan_mode', 'state': 'on'});

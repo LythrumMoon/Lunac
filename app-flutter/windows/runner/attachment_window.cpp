@@ -144,6 +144,15 @@ bool AttachmentWindow::OnCreate() {
           result->Success();
           return;
         }
+        if (method == "clear") {
+          // 2026-11-21：抽屉顶部的「一键删除」浮层 → 主窗清空全部附件。
+          if (host_channel_ != nullptr) {
+            host_channel_->InvokeMethod(
+                "clear", std::make_unique<flutter::EncodableValue>());
+          }
+          result->Success();
+          return;
+        }
         result->NotImplemented();
       });
 

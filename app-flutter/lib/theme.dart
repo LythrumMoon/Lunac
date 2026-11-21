@@ -26,6 +26,7 @@ abstract final class LunacColors {
   static const Color _defaultTextMuted = Color(0xFF8B8E92);
   static const Color _defaultDanger = Color(0xFFE06C6C);
   static const Color _defaultWarning = Color(0xFFC6A86A);
+  static const Color _defaultSuccess = Color(0xFF6FCF97);
   static const Color _defaultTerminal = Color(0xFF0B0B0C);
 
   /// 窗口底色（= ui-style 的 `--surface-rgb` 22,24,27）。
@@ -53,6 +54,9 @@ abstract final class LunacColors {
 
   /// 警示 / 「已停止」等中间态（v1 `--yellow` 的 Flutter 等价物）。
   static Color warning = _defaultWarning;
+
+  /// 语义「正常 / 低占用」绿（用量条、上下文水位）。
+  static Color success = _defaultSuccess;
 
   /// 终端底（v1 xterm 卡的 `background: #0b0b0c`）。
   static Color terminal = _defaultTerminal;
@@ -131,6 +135,7 @@ abstract final class LunacColors {
     textMuted = _defaultTextMuted;
     danger = _defaultDanger;
     warning = _defaultWarning;
+    success = _defaultSuccess;
     terminal = _defaultTerminal;
     paletteRevision.value++;
   }

@@ -103,13 +103,17 @@ class _DrawerPageState extends State<_DrawerPage>
       _files
         ..clear()
         ..addAll(files);
+      if (files.isEmpty) {
+        // 窗口收起后鼠标不会再触发 onExit，主动复位。
+        _hovering = false;
+      }
     });
 
-    final targetWidth =
-        files.isEmpty ? 0.0 : drawerPanelWidthFor(files.map(fileNameOf));
+    final targetWidth = files.isEmpty
+        ? 0.0
+        : drawerPanelWidthFor(files.map(fileNameOf));
     // 空列表时保留高度：关闭动画期间面板还要有尺寸，宽度归零后原生隐藏窗口。
-    final height =
-        files.isEmpty ? _height : drawerPanelHeightFor(files.length);
+    final height = files.isEmpty ? _height : drawerPanelHeightFor(files.length);
 
     _height = height;
     // 窗口先撑到动画期间需要的最大宽度；动画只在 Flutter 内部揭开底板。
@@ -156,8 +160,37 @@ class _DrawerPageState extends State<_DrawerPage>
     _channel.invokeMethod<void>('resize', <double>[width, height]);
   }
 
+  /// 鼠标是否停在文件粘贴区：只有悬停时才显示顶部「一键删除」浮层。
+  bool _hovering = false;
+
   Future<void> _remove(int index) =>
       _channel.invokeMethod<void>('remove', index);
+
+  Future<void> _clear() async {
+    await _channel.invokeMethod<void>('clear');
+    if (mounted) {
+      setState(() => _hovering = false);
+    }
+  }
+
+  Widget _buildClearButton() {
+    return Container(
+      decoration: BoxDecoration(
+        color: LunacColors.surfaceHover.withValues(alpha: 0.94),
+        border: Border.all(color: LunacColors.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: IconButton(
+        tooltip: '清空全部附件',
+        icon: const Icon(Icons.delete_sweep_outlined, size: 16),
+        color: LunacColors.textDim,
+        visualDensity: VisualDensity.compact,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        constraints: const BoxConstraints(minWidth: 30, minHeight: 24),
+        onPressed: _clear,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -176,48 +209,86 @@ class _DrawerPageState extends State<_DrawerPage>
             child: SizedBox(
               width: width,
               height: _height,
-              child: ClipRRect(
-                // 左端圆角、右端贴着搜索栏（直角）。
-                borderRadius:
-                    const BorderRadius.horizontal(left: Radius.circular(12)),
-                // 最底层的纯色面板：抽屉是一整块面板，文件行画在它上面。
-                child: ColoredBox(
-                  color: LunacColors.surface,
-                  child: ClipRect(
-                    // 内容按最终宽度右锚定：动画只揭开底板，文件行不滑动。
-                    child: OverflowBox(
-                      alignment: Alignment.centerRight,
-                      minWidth: targetWidth,
-                      maxWidth: targetWidth,
-                      child: SizedBox(
-                        width: targetWidth,
-                        height: _height,
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: kDrawerPanelPadding,
-                            vertical: kDrawerPanelPadding,
-                          ),
-                          child: SingleChildScrollView(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                for (var index = 0;
-                                    index < _files.length;
-                                    index++)
-                                  SizedBox(
-                                    height: kDrawerRowHeight,
-                                    child: Align(
-                                      alignment: Alignment.centerLeft,
-                                      child: AttachmentChip(
-                                        name: fileNameOf(_files[index]),
-                                        onRemove: () => _remove(index),
-                                      ),
+              child: MouseRegion(
+                onEnter: (_) {
+                  if (!_hovering) {
+                    setState(() => _hovering = true);
+                  }
+                },
+                onExit: (_) {
+                  if (_hovering) {
+                    setState(() => _hovering = false);
+                  }
+                },
+                child: ClipRRect(
+                  // 左端圆角、右端贴着搜索栏（直角）。
+                  borderRadius: const BorderRadius.horizontal(
+                    left: Radius.circular(12),
+                  ),
+                  // 最底层的纯色面板：抽屉是一整块面板，文件行画在它上面。
+                  child: ColoredBox(
+                    color: LunacColors.surface,
+                    child: ClipRect(
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          // 内容按最终宽度右锚定：动画只揭开底板，文件行不滑动。
+                          Positioned.fill(
+                            child: OverflowBox(
+                              alignment: Alignment.centerRight,
+                              minWidth: targetWidth,
+                              maxWidth: targetWidth,
+                              child: SizedBox(
+                                width: targetWidth,
+                                height: _height,
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: kDrawerPanelPadding,
+                                    vertical: kDrawerPanelPadding,
+                                  ),
+                                  child: SingleChildScrollView(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        for (
+                                          var index = 0;
+                                          index < _files.length;
+                                          index++
+                                        )
+                                          SizedBox(
+                                            height: kDrawerRowHeight,
+                                            child: Align(
+                                              alignment: Alignment.centerLeft,
+                                              child: AttachmentChip(
+                                                name: fileNameOf(_files[index]),
+                                                onRemove: () => _remove(index),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
                                     ),
                                   ),
-                              ],
+                                ),
+                              ),
                             ),
                           ),
-                        ),
+                          // 一键删除：鼠标不进入粘贴区时完全隐藏；进入后浮在顶部中间。
+                          if (_files.isNotEmpty)
+                            Positioned(
+                              top: 2,
+                              left: 0,
+                              right: 0,
+                              child: IgnorePointer(
+                                ignoring: !_hovering,
+                                child: AnimatedOpacity(
+                                  opacity: _hovering ? 1 : 0,
+                                  duration: const Duration(milliseconds: 120),
+                                  child: Center(child: _buildClearButton()),
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                     ),
                   ),

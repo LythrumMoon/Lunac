@@ -972,6 +972,21 @@ class _ChatPanelState extends State<ChatPanel> {
       unawaited(_pasteIntoInput());
       return KeyEventResult.handled;
     }
+    // 输入框最多 8 行：Enter = 发送，Shift+Enter = 换行；中文输入法组词中的
+    // Enter 交给 IME（否则选词会被误当成发送）。
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.enter &&
+        !HardwareKeyboard.instance.isShiftPressed) {
+      if (_input.value.composing.isValid) {
+        return KeyEventResult.ignored;
+      }
+      if (!_slashHidden && _slashMatches.isNotEmpty) {
+        _adoptSlash();
+      } else {
+        _send();
+      }
+      return KeyEventResult.handled;
+    }
     if (event is! KeyDownEvent || _slashHidden || _slashMatches.isEmpty) {
       return KeyEventResult.ignored;
     }
@@ -989,9 +1004,7 @@ class _ChatPanelState extends State<ChatPanel> {
       });
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.tab ||
-        (key == LogicalKeyboardKey.enter &&
-            !HardwareKeyboard.instance.isShiftPressed)) {
+    if (key == LogicalKeyboardKey.tab) {
       _adoptSlash();
       return KeyEventResult.handled;
     }
@@ -2387,6 +2400,8 @@ class _ChatPanelState extends State<ChatPanel> {
     // 当前任务的主要内容概括（用户提问的首行）。2026-11-20 起抽屉标题只用它，
     // 不再显示「任务 N」；同一回合被正文分成多段时沿用同一标题。
     var taskTitle = '';
+    // 当前待办阶段（2026-11-21）：同一阶段只收一个抽屉，切待办时才 flush。
+    var currentPhaseId = 0;
 
     /// 收掉当前大抽屉（正文 / 用户气泡之前的进程块都要落进抽屉）。
     void flushTask({bool endOfTurn = false}) {
@@ -2414,15 +2429,18 @@ class _ChatPanelState extends State<ChatPanel> {
         return;
       }
       segment++;
-      // 2026-11-21：标题优先用该轮 TodoWrite 的待办内容；没有待办时才回落到
-      // 用户提问概括（旧会话 / 模型没写待办的情况）。
-      final title = turnIndex >= 0
-          ? (_model.todoTitleForTurn(turnIndex) ??
-                (taskTitle.isEmpty ? '过程记录' : taskTitle))
-          : '过程记录';
+      // 2026-11-21：标题优先用当前待办阶段的标题；没有阶段时才回落到用户提问概括。
+      // 每个阶段一个抽屉 ⇒ 改一个待办的名字只影响它自己，不会带着别的抽屉一起变。
+      final phase = _model.phaseById(currentPhaseId);
+      final title = phase != null && phase.title.trim().isNotEmpty
+          ? phase.title
+          : (turnIndex >= 0
+                ? (_model.todoTitleForTurn(turnIndex) ??
+                      (taskTitle.isEmpty ? '过程记录' : taskTitle))
+                : '过程记录');
       blocks.add(
         _TaskDrawer(
-          key: ValueKey('task-$turnIndex-$segment'),
+          key: ValueKey('task-$turnIndex-$segment-$currentPhaseId'),
           title: title,
           thinkingChars: thinking,
           tools: tools,
@@ -2448,17 +2466,28 @@ class _ChatPanelState extends State<ChatPanel> {
         if (entry.handled) {
           continue;
         }
+        final pid = _model.phaseForEntry(entry)?.id ?? 0;
+        if (pid != currentPhaseId) {
+          flushTask();
+          currentPhaseId = pid;
+        }
         flushGroup();
         approvals.add(entry);
         continue;
       }
       if (entry.kind == ChatEntryKind.toolUse) {
+        final pid = _model.phaseForEntry(entry)?.id ?? 0;
+        if (pid != currentPhaseId) {
+          flushTask();
+          currentPhaseId = pid;
+        }
         flushApprovals();
         group.add(entry);
         continue;
       }
       if (entry.kind == ChatEntryKind.user) {
         flushTask(endOfTurn: true);
+        currentPhaseId = 0;
         turnIndex++;
         segment = 0;
         taskTitle = summarizeTaskTitle(entry.text);
@@ -2466,6 +2495,11 @@ class _ChatPanelState extends State<ChatPanel> {
         continue;
       }
       if (entry.kind == ChatEntryKind.thinking) {
+        final pid = _model.phaseForEntry(entry)?.id ?? 0;
+        if (pid != currentPhaseId) {
+          flushTask();
+          currentPhaseId = pid;
+        }
         // 思考过程进抽屉（不单独占对话流）。
         flushGroup();
         flushApprovals();
@@ -2480,7 +2514,13 @@ class _ChatPanelState extends State<ChatPanel> {
       }
       if (entry.kind == ChatEntryKind.assistant) {
         // 正文（含阶段小总结）平铺；只有全对话最后一条总结带复制 / 分叉。
-        flushTask();
+        // **不 flush 任务抽屉**：同一条待办的小输出不再各自生成一个任务框；
+        // 抽屉在阶段切换 / 回合结束时统一收口。
+        final pid = _model.phaseForEntry(entry)?.id ?? 0;
+        if (pid != currentPhaseId) {
+          flushTask();
+          currentPhaseId = pid;
+        }
         blocks.add(
           _buildEntry(
             entry,
@@ -2492,7 +2532,12 @@ class _ChatPanelState extends State<ChatPanel> {
         continue;
       }
       // 其它（通知 / 错误 / 计划审批 / 文件卡）：不进抽屉，单独一块。
-      flushTask();
+      // 不 flush：否则同一待办会被切成两个抽屉。
+      final pid = _model.phaseForEntry(entry)?.id ?? 0;
+      if (pid != currentPhaseId) {
+        flushTask();
+        currentPhaseId = pid;
+      }
       blocks.add(
         _buildEntry(
           entry,
@@ -4076,6 +4121,12 @@ class _ChatPanelState extends State<ChatPanel> {
                     focusNode: _inputFocus,
                     style: TextStyle(color: LunacColors.text, fontSize: 13),
                     cursorColor: LunacColors.accent,
+                    // 2026-11-21 用户口径：长文本按可视宽度自动换行，最多显示 8 行；
+                    // 超过 8 行后输入框内部滚动（第一行向上移），不再挤成一行。
+                    minLines: 1,
+                    maxLines: 8,
+                    keyboardType: TextInputType.multiline,
+                    textInputAction: TextInputAction.newline,
                     decoration: InputDecoration(
                       isDense: true,
                       border: InputBorder.none,
@@ -4085,7 +4136,6 @@ class _ChatPanelState extends State<ChatPanel> {
                         fontSize: 13,
                       ),
                     ),
-                    onSubmitted: (_) => _send(),
                   ),
                 ),
                 if (_model.busy)
@@ -4147,11 +4197,23 @@ class _ChatPanelState extends State<ChatPanel> {
               ],
             ),
           ),
-          // 底部一行（用户 2026-11-20 口径）：上下文水位吐在**同一行**上，不再上下各占一行。
+          // 底部一行（用户 2026-11-21 口径）：用量/成本表盘在左，上下文水位在右。
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              // 上下文水位（§待办 3-28.8）：实测体积 / 预算，60% 起提示「可能压缩」。
+              // v1 `#status-bar` 的表盘：缓存命中率 + 累计 tokens；点开是独立浮层。
+              UsageDashboard(
+                session: UsageSessionStats(
+                  hit: _model.hitTokens,
+                  miss: _model.missTokens,
+                  output: _model.totalOutputTokens,
+                  elided: _model.elidedItems,
+                  dropped: _model.droppedItems,
+                  revision: _model.usageRevision,
+                ),
+              ),
+              const Spacer(),
+              // 上下文水位（§待办 3-28.8）：实测体积 / 预算，绿 / 黄 / 红三档。
               _ContextWaterBar(
                 level: contextLevelOf(
                   _model.contextWaterLevel,
@@ -4163,18 +4225,6 @@ class _ChatPanelState extends State<ChatPanel> {
                 limit: _model.contextLimit,
                 elideRatio: _model.elideRatio,
                 dropRatio: _model.dropRatio,
-              ),
-              const Spacer(),
-              // v1 `#status-bar` 的表盘：缓存命中率 + 累计 tokens，点开是「用量与成本」数据面板。
-              UsageDashboard(
-                session: UsageSessionStats(
-                  hit: _model.hitTokens,
-                  miss: _model.missTokens,
-                  output: _model.totalOutputTokens,
-                  elided: _model.elidedItems,
-                  dropped: _model.droppedItems,
-                  revision: _model.usageRevision,
-                ),
               ),
             ],
           ),
@@ -6180,6 +6230,10 @@ class _TaskDrawerState extends State<_TaskDrawer> {
     if (widget.thinkingChars > 0) {
       parts.add('思考 ${widget.thinkingChars} 字');
     }
+    final files = changedFilesOf(widget.tools).length;
+    if (files > 0) {
+      parts.add('$files 个文件');
+    }
     final groups = groupToolsByCategory(widget.tools);
     for (final category in toolCategoryOrder) {
       final items = groups[category];
@@ -7367,11 +7421,11 @@ class _ContextWaterBar extends StatelessWidget {
       return const SizedBox.shrink();
     }
     final percent = (ratio! * 100).floor();
-    final color = switch (level) {
-      ContextLevel.drop => LunacColors.danger,
-      ContextLevel.elide => LunacColors.warning,
-      _ => LunacColors.textMuted,
-    };
+    final color = level == ContextLevel.drop
+        ? LunacColors.danger
+        : (level == ContextLevel.elide || level == ContextLevel.watch
+              ? LunacColors.warning
+              : LunacColors.success);
     final hint = switch (level) {
       ContextLevel.drop =>
         '已过丢弃水位（${(dropRatio * 100).round()}%）：下一次请求会把旧消息换成摘要，前缀缓存整段作废',
