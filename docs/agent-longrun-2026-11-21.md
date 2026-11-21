@@ -108,6 +108,22 @@ harness 现在对所有 `can_use_tool` 自动回 `allow`，其余 subtype 一律
 - **产出物**：从任务条里移出，固定跟在大总结之后。
 - **历史压缩**：被裁掉过程的回合仍保留任务条，并标注「过程记录已压缩」。
 
+### 根据报告已落地的优化（2026-11-21）
+
+| 报告问题 | 修改 | 验证 |
+|---|---|---|
+| `Edit` 失败后整文件重读 | `Edit` 的 `old_string not found` 现在带**最近似行号 + 片段**（`nearest_line_hint`） | core-agent `edit_hint_points_at_the_closest_line` |
+| `WebBrowser https://127.0.0.1:18080/ → empty DOM` | 根因是 `normalize_url` 把本机 http 盲升 https；现在 localhost / 127/8 / 10/8 / 172.16/12 / 192.168/16 / `.local` 保持 http | `normalize_url_keeps_local_http_and_upgrades_public_hosts` |
+| 常驻无审批通道时写类工具干等 300 秒 | 常驻 + `--dangerously-skip-permissions` + 无 `--permission-prompt-tool` ⇒ 自动按无人值守放行；有 stdio 通道时仍由前端审批（桌面路径不变） | `cargo test` 512 passed；启动日志有明确 warn |
+| 长上下文压缩可能丢 TaskPhase 小总结 | `classify_message_layer` 把 `TaskPhase` 与 `TodoWrite` 一样判 L3（压缩时优先保留） | `classify_message_layer` 的 TaskPhase 断言 |
+| 第一段正文早于 TaskPhase start | 系统提示词改成「多步回合的**第一个动作**就是 TaskPhase start（不许先说话）」；前端仍保留合并兜底 | 提示词 + 已有 `preamble ... merges into that bar` widget test |
+
+`Edit` 的新错误形态：
+
+```text
+old_string not found in <path>; closest line 42: let value = compute();
+```
+
 ### Session B：3 小时连续跑
 
 Session A 展示了三个领域的完整覆盖，但墙钟只有 42.5 分钟。随后用

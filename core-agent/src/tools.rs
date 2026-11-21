@@ -2276,6 +2276,28 @@ fn write(ctx: &Ctx, input: &Value) -> Result<String, String> {
 
 // ── Edit ─────────────────────────────────────────────────────────
 
+/// `old_string` 没找到时的最近似行：取 `old` 里最长的一行（>= 8 字），在文件里按
+/// 空白折叠后匹配。命中就返回 1-based 行号 + 片段，让模型只重读这一小段。
+fn nearest_line_hint(text: &str, old: &str) -> Option<(usize, String)> {
+    let needle = old
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.chars().count() >= 8)
+        .max_by_key(|line| line.chars().count())?;
+    let needle = needle.split_whitespace().collect::<Vec<_>>().join(" ");
+    if needle.is_empty() {
+        return None;
+    }
+    for (index, line) in text.lines().enumerate() {
+        let candidate = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if candidate.contains(&needle) {
+            let snippet: String = line.trim().chars().take(160).collect();
+            return Some((index + 1, snippet));
+        }
+    }
+    None
+}
+
 fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     if let Some(why) = write_blocked(ctx, "Edit") {
         return Err(why);
@@ -2298,7 +2320,12 @@ fn edit(ctx: &Ctx, input: &Value) -> Result<String, String> {
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let count = text.matches(&old).count();
     if count == 0 {
-        return Err(format!("old_string not found in {}", path.display()));
+        // 2026-11-21 长跑：Edit 失败后模型会整文件重读再猜，140 次工具里最常见的浪费。
+        // 这里直接给最近似的一行（行号 + 片段），让它只重读那一小段。
+        let hint = nearest_line_hint(&text, &old)
+            .map(|(line, snippet)| format!("; closest line {line}: {snippet}"))
+            .unwrap_or_default();
+        return Err(format!("old_string not found in {}{hint}", path.display()));
     }
     if count > 1 && !replace_all {
         return Err(format!(
@@ -3980,14 +4007,50 @@ pub(crate) fn normalize_url(raw: &str) -> Result<String, String> {
     if url.chars().count() > MAX_URL_CHARS {
         return Err(format!("url is longer than {MAX_URL_CHARS} characters"));
     }
+    // 只对**公网**主机做 http→https 升级。localhost / 127.0.0.1 / 私网地址上的开发服务器
+    // 通常只监听 http，盲目升级会得到一个空 DOM（2026-11-21 长跑实测：127.0.0.1:18080
+    // 被改成 https 后 WebBrowser 直接失败）。
     let url = match url.strip_prefix("http://") {
-        Some(rest) => format!("https://{rest}"),
-        None => url.to_string(),
+        Some(rest) if !is_loopback_or_private_host(rest) => format!("https://{rest}"),
+        _ => url.to_string(),
     };
-    if !url.starts_with("https://") {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
         return Err(format!("only http/https URLs are supported: {url}"));
     }
     Ok(url)
+}
+
+/// `host[:port]/path` 里的 host 是否为 loopback / 私网 / 本地开发名。
+///
+/// 只用于决定「要不要把 http 升级成 https」，不做 DNS 解析（解析会把一次工具调用
+/// 变成网络请求，且会卡在坏 DNS 上）。无法解析成这些形态的，按公网处理。
+fn is_loopback_or_private_host(rest: &str) -> bool {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(inner) = host.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host = host.trim_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "0.0.0.0"
+        || host == "::1"
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Err(_) => false,
+    }
 }
 
 /// 响应体前若干字符里出现 html 特征 —— 有些站点不返回正确的 content-type
@@ -6808,6 +6871,46 @@ mod tests {
         assert_eq!(root["items"][0]["id"], json!("task_1"));
         assert_eq!(root["version"], json!(1));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `normalize_url`（2026-11-21 长跑修正）：公网 http→https；本机 / 私网保持 http。
+    #[test]
+    fn normalize_url_keeps_local_http_and_upgrades_public_hosts() {
+        assert_eq!(
+            normalize_url("http://127.0.0.1:18080/x").unwrap(),
+            "http://127.0.0.1:18080/x"
+        );
+        assert_eq!(
+            normalize_url("http://localhost:3000/").unwrap(),
+            "http://localhost:3000/"
+        );
+        assert_eq!(
+            normalize_url("http://192.168.1.5/a").unwrap(),
+            "http://192.168.1.5/a"
+        );
+        assert_eq!(
+            normalize_url("http://10.0.0.2").unwrap(),
+            "http://10.0.0.2"
+        );
+        assert_eq!(
+            normalize_url("http://example.com/a").unwrap(),
+            "https://example.com/a"
+        );
+        assert_eq!(
+            normalize_url("https://127.0.0.1").unwrap(),
+            "https://127.0.0.1"
+        );
+    }
+
+    /// `Edit` 失败时给的最近似行提示（减少整文件重读）。
+    #[test]
+    fn edit_hint_points_at_the_closest_line() {
+        let text = "alpha\n  let value = compute();\nomega\n";
+        let (line, snippet) =
+            nearest_line_hint(text, "nope\nlet  value = compute();\nmore").unwrap();
+        assert_eq!(line, 2);
+        assert!(snippet.contains("let value = compute();"), "{snippet}");
+        assert!(nearest_line_hint(text, "nothing like this at all").is_none());
     }
 
     /// `NotebookEdit`（2026-10-11）的口径：

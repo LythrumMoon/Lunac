@@ -1526,14 +1526,20 @@ fn classify_message_layer(msg: &Value, tool_name: Option<&str>) -> Layer {
     if has_result {
         return if elidable_tool(tool_name) { Layer::L5 } else { Layer::L6 };
     }
-    // ② assistant 的工具调用：TodoWrite = 未决待办（L3），其余 = 工作结论 / 决策（L2）。
+    // ② assistant 的工具调用：TodoWrite = 未决待办（L3）、TaskPhase = 阶段结论（L3），
+    //    其余 = 工作结论 / 决策（L2）。
     let mut has_tool_use = false;
     for b in blocks {
         if b.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
         has_tool_use = true;
-        if b.get("name").and_then(Value::as_str) == Some("TodoWrite") {
+        // TodoWrite = 未决待办；TaskPhase = 阶段标题 / 小总结（长跑里最容易被压缩掉的
+        // 「当前做到哪、上一步结论是什么」）。两者都按 L3 保住。
+        if matches!(
+            b.get("name").and_then(Value::as_str),
+            Some("TodoWrite") | Some("TaskPhase")
+        ) {
             return Layer::L3;
         }
     }
@@ -3177,7 +3183,7 @@ The user's newest message outranks everything you decided earlier: your Todo lis
 If a request needs more than one step, first write a Todo plan covering every step (TodoWrite), then execute the whole plan in this same turn. Do not stop to report progress, do not hand the user a partial result, and never ask the user to send "continue" or to re-send the same request in pieces. Only end a turn before the plan is complete when you are truly blocked (missing credentials, permission denied, or a tool failure you cannot work around) -- then say exactly what is blocking and what you tried. When the user does say "continue", resume from the first unfinished item and never repeat text that is already in the conversation.
 
 ## Task phases (hard rule, 2026-11-21)
-The chat panel renders a fixed layout per todo: [small task bar] -> [commands] -> [small summary]. Keep it aligned with TaskPhase: before the first command of a todo, call TaskPhase with state "start" and the title set to that todo item; after that todo's commands finish, call TaskPhase with state "done" and a one-or-two-sentence summary of what changed and what it proves, then mark the todo completed in TodoWrite. Use the exact todo text as the title and never rename an earlier phase. The final assistant message is the big summary: do not repeat it inside TaskPhase, and do not treat a TaskPhase summary as the final answer. Skip TaskPhase for a trivial single-step reply.
+The chat panel renders a fixed layout per todo: [small task bar] -> [commands] -> [small summary]. Keep it aligned with TaskPhase: the first action of a multi-step turn is TaskPhase with state "start" and the title set to the first todo item (no prose before it); after that todo's commands finish, call TaskPhase with state "done" and a one-or-two-sentence summary of what changed and what it proves, then mark the todo completed in TodoWrite. Use the exact todo text as the title and never rename an earlier phase. The final assistant message is the big summary: do not repeat it inside TaskPhase, and do not treat a TaskPhase summary as the final answer. Skip TaskPhase for a trivial single-step reply.
 
 ## Visible decisions (hard rule, 2026-11-03)
 When a step turns on a judgement that changes what you do next -- delete or keep, change or leave, install or skip, route A or route B, ask the user or decide yourself -- state that judgement in ONE short sentence in the visible reply, before you act on it. Never leave it only in thinking: thinking is collapsed, so a user who does not expand it sees you silently doing something else. Keep it to the conclusion plus the reason (e.g. "Nothing to delete in the module folder, so I am continuing with the rest."). Do not restate it afterwards, do not turn it into a plan, and do not add a second sentence of justification unless the user could reasonably disagree.
@@ -6888,6 +6894,16 @@ fn main() {
         });
         // 逐工具放行（2026-10-27，阶段 2B）：只在单发生效；常驻有审批卡，不需要也不接受。
         set_unattended_allow(effective_unattended_allow(&cli.unattended_allow));
+    } else if cli.skip_permissions && !cli.ask_permission {
+        // 常驻但**没有审批通道**（headless / CI / 直接喂 stdin 的服务）：skip 必须生效，
+        // 否则每个写类工具都会干等 300 秒。有 `--permission-prompt-tool stdio` 时仍由
+        // 前端审批（桌面端路径不变）。
+        set_approval_policy(ApprovalPolicy::UnattendedAllow);
+        log::warn("--dangerously-skip-permissions：常驻模式没有审批通道，已按无人值守放行");
+    } else if cli.skip_permissions {
+        log::warn(
+            "--dangerously-skip-permissions 在常驻模式由前端审批；无人值守请去掉 --permission-prompt-tool stdio",
+        );
     } else if !cli.unattended_allow.is_empty() {
         log::warn(
             "--unattended-allow 只在单发（--print）下生效：常驻模式有审批卡，参数已忽略",
@@ -16507,6 +16523,15 @@ mod tests {
             {"type":"tool_use","id":"t","name":"TodoWrite","input":{"todos":[]}}
         ]});
         assert_eq!(classify_message_layer(&l3, Some("TodoWrite")), Layer::L3);
+
+        // L3：TaskPhase 的阶段标题 / 小总结（2026-11-21，长跑里最容易被压缩掉）
+        let l3_phase = json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"p","name":"TaskPhase","input":{"state":"done","summary":"ok"}}
+        ]});
+        assert_eq!(
+            classify_message_layer(&l3_phase, Some("TaskPhase")),
+            Layer::L3
+        );
 
         // L4：`is_error` 的失败证据 —— 即使工具本身可重取（Cmd）也判 L4，**不是** L5
         let l4 = json!({"role":"user","content":[
