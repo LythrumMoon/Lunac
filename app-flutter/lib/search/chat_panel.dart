@@ -19,6 +19,7 @@ import '../platform/drop.dart';
 import '../platform/file_preview.dart';
 import '../platform/memory.dart';
 import '../platform/notify_sound.dart';
+import '../platform/pet.dart';
 import '../platform/plans.dart';
 import '../platform/sandbox.dart';
 import '../platform/security_ledger.dart';
@@ -890,6 +891,7 @@ class _ChatPanelState extends State<ChatPanel> {
       _persistTimer?.cancel();
       _persistTimer = null;
       _persist();
+      _speakPetReply();
     } else if (wasBusy || _model.busy) {
       // 流式中：节流落盘，防止强制结束 / 闪退把本回合整体吞掉。
       _schedulePersist();
@@ -1395,6 +1397,34 @@ class _ChatPanelState extends State<ChatPanel> {
       _persistTimer = null;
       _persist();
     });
+  }
+
+  /// 桌宠开着且语音可用时，用本轮最后一段正文朗读（规则见 `pet_voice.rs`）。
+  ///
+  /// 只在回合结束调一次；不读思考 / 工具输出，最多截 500 字，避免长文朗读
+  /// 拖住交互。宠物没开、语音关着、服务没起时 Rust 会直接跳过或只记日志。
+  void _speakPetReply() {
+    if (!readPetStatus().open) {
+      return;
+    }
+    String? reply;
+    for (final entry in _model.entries.reversed) {
+      if (entry.kind == ChatEntryKind.user) {
+        break;
+      }
+      if (entry.kind == ChatEntryKind.assistant &&
+          entry.text.trim().isNotEmpty) {
+        reply = entry.text.trim();
+        break;
+      }
+    }
+    if (reply == null) {
+      return;
+    }
+    if (reply.length > 500) {
+      reply = reply.substring(0, 500);
+    }
+    speakPetVoice(reply);
   }
 
   /// 打开沙箱盘预览窗（AI 的受控工作目录，`temp/transStorage`）。

@@ -100,12 +100,19 @@ class _PetPanelState extends State<PetPanel> {
   /// 语音朗读页（`config/pet-voice.json`）。
   PetVoiceStatus _voice = const PetVoiceStatus();
   late final TextEditingController _voiceText = TextEditingController();
+  late final TextEditingController _voiceServer = TextEditingController(
+    text: 'http://127.0.0.1:9880',
+  );
+  late final TextEditingController _voiceSteps = TextEditingController(
+    text: '4',
+  );
   late final TextEditingController _voiceSpeed = TextEditingController(
     text: '1.0',
   );
   late final TextEditingController _voiceVolume = TextEditingController(
     text: '100',
   );
+  String _voiceEngine = 'gpt_sovits';
   String? _voiceMessage;
   bool _voiceError = false;
   bool _voiceBusy = false;
@@ -186,6 +193,8 @@ class _PetPanelState extends State<PetPanel> {
     _proactiveDebounce?.cancel();
     _personaText.dispose();
     _voiceText.dispose();
+    _voiceServer.dispose();
+    _voiceSteps.dispose();
     _voiceSpeed.dispose();
     _voiceVolume.dispose();
     _proactiveInterval.dispose();
@@ -893,8 +902,7 @@ class _PetPanelState extends State<PetPanel> {
             ),
           ),
           TextButton(
-            onPressed: () =>
-                _saveProactive(pr.copyWith(enabled: !pr.enabled)),
+            onPressed: () => _saveProactive(pr.copyWith(enabled: !pr.enabled)),
             style: TextButton.styleFrom(
               foregroundColor: pr.enabled
                   ? LunacColors.text
@@ -980,12 +988,14 @@ class _PetPanelState extends State<PetPanel> {
                 onChanged: (_) {
                   // 与 v1 的「逐次保存」等价，但不打断输入：停止键入 500ms 后写盘。
                   _proactiveDebounce?.cancel();
-                  _proactiveDebounce = Timer(const Duration(milliseconds: 500), () {
-                    _commitProactiveField(controller, apply);
-                  });
+                  _proactiveDebounce = Timer(
+                    const Duration(milliseconds: 500),
+                    () {
+                      _commitProactiveField(controller, apply);
+                    },
+                  );
                 },
-                onSubmitted: (_) =>
-                    _commitProactiveField(controller, apply),
+                onSubmitted: (_) => _commitProactiveField(controller, apply),
               ),
             ),
           ),
@@ -1031,10 +1041,7 @@ class _PetPanelState extends State<PetPanel> {
   }
 
   /// 数字框当前对应的配置值（用于「原样还原」）。
-  int _proactiveValueOf(
-    ProactiveConfig pr,
-    TextEditingController controller,
-  ) {
+  int _proactiveValueOf(ProactiveConfig pr, TextEditingController controller) {
     if (identical(controller, _proactiveInterval)) {
       return pr.intervalMin;
     }
@@ -1111,7 +1118,9 @@ class _PetPanelState extends State<PetPanel> {
 
   void _playMotion(int index) {
     final result = playPetMotion(index);
-    final name = index < _motionFiles.length ? _motionFiles[index].name : '$index';
+    final name = index < _motionFiles.length
+        ? _motionFiles[index].name
+        : '$index';
     _motionToast(
       result.ok ? '正在播放：$name' : (result.error ?? '播放失败'),
       error: !result.ok,
@@ -1189,10 +1198,7 @@ class _PetPanelState extends State<PetPanel> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: Text(
-              '删除',
-              style: TextStyle(color: LunacColors.danger),
-            ),
+            child: Text('删除', style: TextStyle(color: LunacColors.danger)),
           ),
         ],
       ),
@@ -1675,10 +1681,7 @@ class _PetPanelState extends State<PetPanel> {
                     minimumSize: Size.zero,
                     visualDensity: VisualDensity.compact,
                   ),
-                  child: const Text(
-                    '从模型导入表情',
-                    style: TextStyle(fontSize: 11),
-                  ),
+                  child: const Text('从模型导入表情', style: TextStyle(fontSize: 11)),
                 ),
                 const SizedBox(width: 8),
                 _motionAction(
@@ -1784,7 +1787,10 @@ class _PetPanelState extends State<PetPanel> {
     final voice = readPetVoice();
     setState(() {
       _voice = voice;
+      _voiceEngine = voice.engine;
       _voiceText.text = voice.referenceText;
+      _voiceServer.text = voice.serverUrl;
+      _voiceSteps.text = voice.sampleSteps.toString();
       _voiceSpeed.text = voice.speed.toStringAsFixed(1);
       _voiceVolume.text = '${(voice.volume * 100).round()}';
       if (voice.error != null) {
@@ -1823,7 +1829,10 @@ class _PetPanelState extends State<PetPanel> {
     if (status != null) {
       setState(() {
         _voice = status;
+        _voiceEngine = status.engine;
         _voiceText.text = status.referenceText;
+        _voiceServer.text = status.serverUrl;
+        _voiceSteps.text = status.sampleSteps.toString();
         _voiceSpeed.text = status.speed.toStringAsFixed(1);
         _voiceVolume.text = '${(status.volume * 100).round()}';
       });
@@ -1840,13 +1849,42 @@ class _PetPanelState extends State<PetPanel> {
   void _commitVoiceFields() {
     final speed = double.tryParse(_voiceSpeed.text.trim()) ?? _voice.speed;
     final volumePercent =
-        int.tryParse(_voiceVolume.text.trim()) ??
-        (_voice.volume * 100).round();
+        int.tryParse(_voiceVolume.text.trim()) ?? (_voice.volume * 100).round();
+    final steps = int.tryParse(_voiceSteps.text.trim()) ?? _voice.sampleSteps;
     _saveVoice({
+      'engine': _voiceEngine,
+      'serverUrl': _voiceServer.text.trim(),
+      'sampleSteps': steps,
       'referenceText': _voiceText.text.trim(),
       'speed': speed,
       'volume': (volumePercent.clamp(0, 100)) / 100.0,
     }, '语音配置已保存');
+  }
+
+  /// 「试听」：先保存当前控件值（引擎 / 服务 / 步数 / 参考文本），再用当前音色读一句。
+  void _previewVoice() {
+    if (_voiceBusy) {
+      return;
+    }
+    _commitVoiceFields();
+    final result = speakPetVoice('你好呀，我今天也会好好陪着你。');
+    if (!result.ok) {
+      _voiceToast(result.error ?? '试听失败', error: true);
+      return;
+    }
+    _voiceToast('正在合成并播放…');
+  }
+
+  /// 「选择参考音频」：导入后立刻保存路径（参考文本仍需用户填写）。
+  void _pickVoiceAudio() {
+    if (_voiceBusy) {
+      return;
+    }
+    final path = pickPetVoiceAudio();
+    if (path == null || path.isEmpty) {
+      return;
+    }
+    _saveVoice({'referenceAudio': path}, '已导入参考音频');
   }
 
   Widget _buildVoicePage() {
@@ -1874,8 +1912,8 @@ class _PetPanelState extends State<PetPanel> {
           ),
           const SizedBox(height: 2),
           Text(
-            'v1 的朗读是 ZipVoice 零样本克隆：给一段 3~10 秒参考录音 + 对应文字，'
-            '用该音色朗读。本版只保存配置并体检资产，合成通路尚未移植。',
+            'GPT-SoVITS（V5 / gsv.cpp）：先启动本机 gsv_server（默认 9880），'
+            '再导入 3~10 秒参考录音 + 参考文本；试听和桌宠朗读都走这个服务。',
             style: TextStyle(
               color: LunacColors.textMuted,
               fontSize: 10,
@@ -1898,6 +1936,42 @@ class _PetPanelState extends State<PetPanel> {
               onChanged: _voiceBusy ? (_) {} : _toggleVoice,
             ),
             const SizedBox(height: 6),
+            Row(
+              children: [
+                SizedBox(
+                  width: 64,
+                  child: Text(
+                    '引擎',
+                    style: TextStyle(color: LunacColors.textDim, fontSize: 11),
+                  ),
+                ),
+                _button(
+                  'GPT-SoVITS',
+                  () => setState(() => _voiceEngine = 'gpt_sovits'),
+                  active: _voiceEngine == 'gpt_sovits',
+                ),
+                const SizedBox(width: 8),
+                _button(
+                  'ZipVoice（旧）',
+                  () => setState(() => _voiceEngine = 'zipvoice'),
+                  active: _voiceEngine == 'zipvoice',
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            _voiceFieldRow(
+              label: '服务',
+              hint: 'http://127.0.0.1:9880',
+              controller: _voiceServer,
+              width: 240,
+              keyboardType: TextInputType.url,
+            ),
+            _voiceFieldRow(
+              label: '采样步数',
+              hint: 'v5turbo 4 / v5dev 32',
+              controller: _voiceSteps,
+              width: 74,
+            ),
             _voiceFieldRow(
               label: '语速',
               hint: speedHint,
@@ -1948,11 +2022,20 @@ class _PetPanelState extends State<PetPanel> {
               ),
             ),
             const SizedBox(height: 6),
-            _infoLine(
-              '参考音色',
-              voice.referenceAudio.isEmpty ? '未导入' : voice.referenceAudio,
+            Row(
+              children: [
+                Expanded(
+                  child: _infoLine(
+                    '参考音色',
+                    voice.referenceAudio.isEmpty
+                        ? '未导入（3~10 秒）'
+                        : voice.referenceAudio,
+                  ),
+                ),
+                _button('选择音频', _pickVoiceAudio),
+              ],
             ),
-            _infoLine('资产目录', voice.assetDir),
+            if (voice.engine != 'gpt_sovits') _infoLine('资产目录', voice.assetDir),
             if (voice.missingAssets.isNotEmpty)
               _infoLine('缺失', voice.missingAssets.join(' / ')),
             if (voice.reasonText.isNotEmpty)
@@ -1961,7 +2044,9 @@ class _PetPanelState extends State<PetPanel> {
                 child: Text(
                   voice.reasonText,
                   style: TextStyle(
-                    color: voice.reason == 'assets_missing'
+                    color:
+                        voice.reason == 'assets_missing' ||
+                            voice.reason == 'gsv_server_unreachable'
                         ? LunacColors.danger
                         : LunacColors.textMuted,
                     fontSize: 10,
@@ -1975,14 +2060,20 @@ class _PetPanelState extends State<PetPanel> {
                 _button(
                   _voiceBusy ? '保存中…' : '保存',
                   _commitVoiceFields,
+                  primary: true,
                 ),
                 const SizedBox(width: 10),
-                // 合成通路没移植：不留「点了没反应」的按钮，直接写清楚为什么。
-                Text(
-                  voice.canSpeak ? '' : '试听不可用：缺 ZipVoice 运行库与模型',
-                  style: TextStyle(
-                    color: LunacColors.textMuted,
-                    fontSize: 10,
+                _button('试听', _previewVoice, active: voice.canSpeak),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    voice.canSpeak ? '服务已连通' : '服务未就绪',
+                    style: TextStyle(
+                      color: voice.canSpeak
+                          ? LunacColors.success
+                          : LunacColors.textMuted,
+                      fontSize: 10,
+                    ),
                   ),
                 ),
               ],
@@ -2012,6 +2103,7 @@ class _PetPanelState extends State<PetPanel> {
     required String hint,
     required TextEditingController controller,
     required double width,
+    TextInputType? keyboardType,
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -2029,9 +2121,9 @@ class _PetPanelState extends State<PetPanel> {
             child: TextField(
               controller: controller,
               enabled: !_voiceBusy,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
+              keyboardType:
+                  keyboardType ??
+                  const TextInputType.numberWithOptions(decimal: true),
               style: TextStyle(color: LunacColors.text, fontSize: 11),
               decoration: InputDecoration(
                 isDense: true,

@@ -3534,9 +3534,9 @@ pub extern "C" fn lunac_pet_set_proactive(json: *const c_char) -> *mut c_char {
     to_c_string(pet::set_proactive_json(&read_arg(json)))
 }
 
-/// 桌宠语音状态：v1 `config/pet-voice.json` 的配置 + ZipVoice 资产体检 + 一句原因。
+/// 桌宠语音状态：配置 + GPT-SoVITS 服务 / 参考音色体检 + 一句原因。
 ///
-/// 本版**只做配置与体检**，不做合成（运行库 / 模型是外部资产，见 `pet_voice.rs` 文件头）。
+/// 合成由外部 `gsv_server` 提供；本函数只做 HTTP 连通性与参数检查。
 #[no_mangle]
 pub extern "C" fn lunac_pet_voice_status() -> *mut c_char {
     let root = exe_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -3548,6 +3548,19 @@ pub extern "C" fn lunac_pet_voice_status() -> *mut c_char {
 pub extern "C" fn lunac_pet_voice_set(json: *const c_char) -> *mut c_char {
     let root = exe_dir().unwrap_or_else(|| PathBuf::from("."));
     to_c_string(pet_voice::set_json(&root, &read_arg(json)))
+}
+
+/// 朗读一段文本（GPT-SoVITS / gsv.cpp）；返回 `{ok, queued, error}`，播放后台进行。
+#[no_mangle]
+pub extern "C" fn lunac_pet_voice_speak(text: *const c_char) -> *mut c_char {
+    let root = exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    to_c_string(pet_voice::speak_json(&root, &read_arg(text)))
+}
+
+/// 选择参考音频（单选）；返回 `{ok, canceled, path}`。
+#[no_mangle]
+pub extern "C" fn lunac_pet_voice_pick_audio() -> *mut c_char {
+    to_c_string(pet_voice::pick_audio_json())
 }
 
 /// 读桌宠旁挂文件（`kind`：`hotkeys` / `chains`）；返回 `{"ok":true,"text":...}`。

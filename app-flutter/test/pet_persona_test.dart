@@ -250,36 +250,49 @@ void main() {
   test('voice status maps config, assets and the honest reason', () {
     final voice = PetVoiceStatus.fromJson(<String, dynamic>{
       'enabled': false,
+      'engine': 'gpt_sovits',
+      'serverUrl': 'http://127.0.0.1:9880',
+      'sampleSteps': 4,
+      'textLang': 'all_zh',
       'referenceAudio': r'D:\ref.wav',
       'referenceText': '这是参考',
       'speed': 1.4,
       'volume': 0.35,
       'numSteps': 8,
       'numThreads': 4,
-      'assetsReady': false,
-      'assetDir': r'D:\Lunac\Modules\pet\zipvoice',
-      'missingAssets': ['vocos_24khz.onnx', ''],
+      'assetsReady': true,
+      'serverReady': true,
+      'assetDir': r'D:\Lunac\Modules\pet\gsv',
+      'missingAssets': [''],
       'speedMin': 0.5,
       'speedMax': 2.0,
       'volumeMin': 0.0,
       'volumeMax': 1.0,
-      'reason': 'assets_missing',
-      'reasonText': '语音资产缺失或损坏：vocos_24khz.onnx',
-      'canSpeak': false,
+      'reason': 'ready',
+      'reasonText': 'GPT-SoVITS 已就绪',
+      'canSpeak': true,
       'path': r'D:\Lunac\config\pet-voice.json',
     })!;
     expect(voice.enabled, isFalse);
+    expect(voice.engine, 'gpt_sovits');
+    expect(voice.serverUrl, 'http://127.0.0.1:9880');
+    expect(voice.sampleSteps, 4);
     expect(voice.speed, 1.4);
     expect(voice.volume, 0.35);
-    expect(voice.assetsReady, isFalse);
-    expect(voice.missingAssets, ['vocos_24khz.onnx'], reason: '空串要丢掉');
-    expect(voice.reason, 'assets_missing');
-    expect(voice.canSpeak, isFalse);
+    expect(voice.assetsReady, isTrue);
+    expect(voice.serverReady, isTrue);
+    expect(voice.missingAssets, isEmpty, reason: '空串要丢掉');
+    expect(voice.reason, 'ready');
+    expect(voice.canSpeak, isTrue);
     expect(voice.ok, isTrue);
 
-    // 缺字段：回落默认值（v1 缺省 true / 1.0）。
+    // 缺字段：回落默认值（GPT-SoVITS / 9880 / 4 步）。
     final empty = PetVoiceStatus.fromJson(<String, dynamic>{})!;
     expect(empty.enabled, isTrue);
+    expect(empty.engine, 'gpt_sovits');
+    expect(empty.serverUrl, 'http://127.0.0.1:9880');
+    expect(empty.sampleSteps, 4);
+    expect(empty.textLang, 'all_zh');
     expect(empty.speed, 1.0);
     expect(empty.volume, 1.0);
     expect(PetVoiceStatus.fromJson(null), isNull);

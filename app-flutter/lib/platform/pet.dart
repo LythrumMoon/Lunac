@@ -185,7 +185,8 @@ class PetConfig {
       expressions: expressions(),
       params: params(),
       proactive: ProactiveConfig.fromJson(json['proactive']),
-      motionTemplateIncludePhysics: json['motionTemplateIncludePhysics'] == true,
+      motionTemplateIncludePhysics:
+          json['motionTemplateIncludePhysics'] == true,
     );
   }
 }
@@ -532,8 +533,9 @@ class _Bridge {
     final b = second.toNativeUtf8();
     final c = third.toNativeUtf8();
     try {
-      final call = library
-          .lookupFunction<_ThreeStrArgC, _ThreeStrArgDart>(symbol);
+      final call = library.lookupFunction<_ThreeStrArgC, _ThreeStrArgDart>(
+        symbol,
+      );
       raw = call(a, b, c);
       if (raw == nullptr) {
         return null;
@@ -600,7 +602,9 @@ PetConfig savePetConfig(Map<String, Object?> patch) {
 
 /// 合并保存「主动反应」配置（v1 `ProactiveCfg`）。返回 `(config, error)`：
 /// 出错时 config 是盘上现值，error 是一句人话（面板据此红字提示）。
-({PetConfig config, String? error}) savePetProactive(Map<String, Object?> patch) {
+({PetConfig config, String? error}) savePetProactive(
+  Map<String, Object?> patch,
+) {
   final bridge = _bridge();
   if (bridge == null) {
     return (config: const PetConfig(), error: '不可用（rust 桥接未加载）');
@@ -822,13 +826,17 @@ PetSideFile readPetSide(String modelPath, String kind) {
   return (path: path is String ? path : null, error: null);
 }
 
-/// 桌面宠语音状态（v1 `config/pet-voice.json` 的配置 + ZipVoice 资产体检）。
+/// 桌面宠语音状态（`config/pet-voice.json` + GPT-SoVITS / ZipVoice 体检）。
 ///
-/// 本版**只做配置与体检**：合成通路（sherpa-onnx + ZipVoice 模型）是外部资产，
-/// 未移植；[canSpeak] 恒为 false，[reasonText] 是 Rust 给的**一句人话**。
+/// 默认引擎是 GPT-SoVITS：`serverUrl` 指向本机 gsv.cpp 的 `/tts` 服务；
+/// `canSpeak` 只有在服务连通、参考音频文件存在、参考文本非空时才为 true。
 class PetVoiceStatus {
   const PetVoiceStatus({
     this.enabled = true,
+    this.engine = 'gpt_sovits',
+    this.serverUrl = 'http://127.0.0.1:9880',
+    this.sampleSteps = 4,
+    this.textLang = 'all_zh',
     this.referenceAudio = '',
     this.referenceText = '',
     this.speed = 1.0,
@@ -836,6 +844,7 @@ class PetVoiceStatus {
     this.numSteps = 8,
     this.numThreads = 4,
     this.assetsReady = false,
+    this.serverReady = false,
     this.assetDir = '',
     this.missingAssets = const [],
     this.speedMin = 0.5,
@@ -850,6 +859,10 @@ class PetVoiceStatus {
   });
 
   final bool enabled;
+  final String engine;
+  final String serverUrl;
+  final int sampleSteps;
+  final String textLang;
   final String referenceAudio;
   final String referenceText;
   final double speed;
@@ -857,6 +870,7 @@ class PetVoiceStatus {
   final int numSteps;
   final int numThreads;
   final bool assetsReady;
+  final bool serverReady;
   final String assetDir;
   final List<String> missingAssets;
   final double speedMin;
@@ -864,7 +878,8 @@ class PetVoiceStatus {
   final double volumeMin;
   final double volumeMax;
 
-  /// 机器可读原因：`assets_missing` / `no_reference` / `synthesis_not_ported`。
+  /// 机器可读原因：`gsv_server_unreachable` / `no_reference` / `reference_missing` /
+  /// `no_reference_text` / `ready` / 旧 ZipVoice 的 `assets_missing` 等。
   final String reason;
 
   /// 面板直接展示的一句话。
@@ -885,12 +900,21 @@ class PetVoiceStatus {
     }
     double number(Object? value, double fallback) =>
         value is num ? value.toDouble() : fallback;
-    int integer(Object? value, int fallback) =>
-        value is int ? value : fallback;
+    int integer(Object? value, int fallback) => value is int ? value : fallback;
     String text(Object? value) => value is String ? value : '';
     final missing = json['missingAssets'];
     return PetVoiceStatus(
       enabled: json['enabled'] != false,
+      engine: text(json['engine']).isEmpty
+          ? 'gpt_sovits'
+          : text(json['engine']),
+      serverUrl: text(json['serverUrl']).isEmpty
+          ? 'http://127.0.0.1:9880'
+          : text(json['serverUrl']),
+      sampleSteps: integer(json['sampleSteps'], 4),
+      textLang: text(json['textLang']).isEmpty
+          ? 'all_zh'
+          : text(json['textLang']),
       referenceAudio: text(json['referenceAudio']),
       referenceText: text(json['referenceText']),
       speed: number(json['speed'], 1.0),
@@ -898,6 +922,7 @@ class PetVoiceStatus {
       numSteps: integer(json['numSteps'], 8),
       numThreads: integer(json['numThreads'], 4),
       assetsReady: json['assetsReady'] == true,
+      serverReady: json['serverReady'] == true,
       assetDir: text(json['assetDir']),
       missingAssets: [
         for (final item in (missing is List ? missing : const []))
@@ -949,6 +974,35 @@ PetVoiceStatus readPetVoice() {
         : (error is String && error.isNotEmpty ? error : '保存语音配置失败'),
     status: PetVoiceStatus.fromJson(value['status']),
   );
+}
+
+/// 朗读一段文本（GPT-SoVITS / gsv.cpp）；返回 `(ok, error)`，音频在后台播放。
+({bool ok, String? error}) speakPetVoice(String text) {
+  final bridge = _bridge();
+  if (bridge == null) {
+    return (ok: false, error: '不可用（rust 桥接未加载）');
+  }
+  final value = _decode(bridge.callStringArg('lunac_pet_voice_speak', text));
+  final ok = value['ok'] == true;
+  final error = value['error'];
+  return (
+    ok: ok,
+    error: ok ? null : (error is String && error.isNotEmpty ? error : '朗读失败'),
+  );
+}
+
+/// 选择参考音频（单选）；取消 / 桥接缺失返回 null。
+String? pickPetVoiceAudio() {
+  final bridge = _bridge();
+  if (bridge == null) {
+    return null;
+  }
+  final value = _decode(bridge.callString('lunac_pet_voice_pick_audio'));
+  if (value['canceled'] == true || value['ok'] != true) {
+    return null;
+  }
+  final path = value['path'];
+  return path is String && path.isNotEmpty ? path : null;
 }
 
 /// 一条桌宠热键（`lunac-live2d/lunac.hotkeys.json` 的 `hotkeys[]`）。
@@ -1216,12 +1270,7 @@ class PetMotionFile {
     return (path: null, error: '不可用（rust 桥接未加载）');
   }
   final value = _decode(
-    bridge.callThreeStringArgs(
-      'lunac_pet_motion_rename',
-      modelPath,
-      from,
-      to,
-    ),
+    bridge.callThreeStringArgs('lunac_pet_motion_rename', modelPath, from, to),
   );
   if (value['ok'] != true) {
     return (
@@ -1234,7 +1283,9 @@ class PetMotionFile {
 }
 
 /// 递归列出模型目录下的 `*.exp3.json`（热键导入的回落数据源）。
-({List<PetMotionFile> files, String? error}) readPetExp3Files(String modelPath) {
+({List<PetMotionFile> files, String? error}) readPetExp3Files(
+  String modelPath,
+) {
   final bridge = _bridge();
   if (bridge == null) {
     return (files: const [], error: '不可用（rust 桥接未加载）');
