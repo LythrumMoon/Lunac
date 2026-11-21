@@ -609,6 +609,24 @@ pub fn defs(disallowed: &[String]) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "TaskPhase",
+            "description": "Record the user-visible phase of a multi-step task so the desktop UI \
+                can render the agreed layout: [small task bar] -> [commands] -> [small summary]. \
+                Call state=\"start\" with the exact todo title BEFORE the step's first command, \
+                and call state=\"done\" with a 1-2 sentence outcome AFTER the step's commands \
+                finish. Never rename a previous phase; never use it for the final answer (the \
+                final assistant message is the big summary); skip it for a trivial one-step reply.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "enum": ["start", "done"] },
+                    "title": { "type": "string", "description": "Small task title shown on the bar (required for start)" },
+                    "summary": { "type": "string", "description": "1-2 sentence result of this step (required for done)" }
+                },
+                "required": ["state"]
+            }
+        }),
+        json!({
             "name": "PetControl",
             "description": "Control the on-screen desktop pet avatar (its Live2D model) so it \
                 reacts physically while you talk. Use it to trigger one of the user's \
@@ -1749,6 +1767,9 @@ pub fn run(ctx: &Ctx, name: &str, input: &Value) -> Result<String, String> {
         "WebBrowser" => crate::webbrowser::run(input),
         "AskUserQuestion" => ask_user_question(input),
         "TodoWrite" => todo_write(input),
+        // TaskPhase（2026-11-21）：只回回执、不碰本机；真正的效果在前端分节渲染。
+        // `start` = 开一条「小待办任务」，`done` = 它的「小总结输出」。
+        "TaskPhase" => task_phase(input),
         // PTC / Code Mode（§待办 3-28.15）：一次跑完多次只读调用。只读绑定 + 硬预算
         // 在 `ptc.rs` 里；外层审批在 `needs_approval`。开关关着时它不在工具表里，
         // 但这里仍保留分支 —— 手工构造的调用会走进 `ptc::run` 自己那道预算与白名单。
@@ -4398,6 +4419,51 @@ fn label_of(ids: &[(String, usize)], index: usize) -> String {
         .unwrap_or_else(|| format!("#{}", index + 1))
 }
 
+// ── TaskPhase（2026-11-21）────────────────────────────────────────
+
+/// `TaskPhase` 只做一件事：把模型的工作阶段翻译成前端能稳定渲染的两个锚点。
+///
+/// 为什么不用助手正文猜边界：模型会在阶段中间穿插大量小输出，前端按「文本位置」
+/// 推断总会出现「小总结漂到任务条上方」「上一轮任务被改名」。这里让模型显式声明
+/// `start` / `done`，前端按到达顺序分节，正文位置不再影响结构。
+///
+/// 不维护状态（与 TodoWrite 同口径）：清单 / 阶段边界的唯一真相是历史里最近的
+/// 两条 `tool_use`；进程重启、多会话并行都不会串味。
+fn task_phase(input: &Value) -> Result<String, String> {
+    let state = input
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match state {
+        "start" => {
+            let title = input
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if title.is_empty() {
+                return Err("TaskPhase start requires a non-empty \"title\"".into());
+            }
+            Ok(format!("phase started: {title}"))
+        }
+        "done" => {
+            let summary = input
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if summary.is_empty() {
+                return Err("TaskPhase done requires a non-empty \"summary\"".into());
+            }
+            Ok("phase summary recorded".to_string())
+        }
+        other => Err(format!(
+            "TaskPhase \"state\" must be \"start\" or \"done\", got \"{other}\""
+        )),
+    }
+}
+
 // ── PetControl（桌宠动作，2026-10-10）─────────────────────────────
 
 /// `PetControl` 不改本机、不落盘、也不需要审批 —— 与 `TodoWrite` 同型：**效果全在前端**。
@@ -6491,9 +6557,13 @@ mod tests {
             names(&all).contains(&"ImageDiff".to_string()),
             "ImageDiff（golden 图逐像素比对，§待办 3-28.5）必须在内置工具表里"
         );
+        assert!(
+            names(&all).contains(&"TaskPhase".to_string()),
+            "TaskPhase（任务分节锚点，2026-11-21）必须在内置工具表里"
+        );
         assert_eq!(
-            total, 38,
-            "内置工具应为 38 件（33 件 + ImageMeasure + ImageAnnotate + Preview + Screenshot + ImageDiff）"
+            total, 39,
+            "内置工具应为 39 件（33 件 + ImageMeasure + ImageAnnotate + Preview + Screenshot + ImageDiff + TaskPhase）"
         );
 
         let cut = defs(&["Agent".to_string()]);
@@ -7908,6 +7978,23 @@ mod tests {
             "Todos have been modified successfully. Keep the list up to date — at most one entry \
              in_progress, and flip an entry to completed as soon as it is done.\n1. [pending] build"
         );
+    }
+
+    // ── TaskPhase（2026-11-21）──────────────────────────────────────
+
+    #[test]
+    fn task_phase_validates_state_and_text() {
+        assert_eq!(
+            task_phase(&json!({"state":"start","title":" 第一步 "})).unwrap(),
+            "phase started: 第一步"
+        );
+        assert_eq!(
+            task_phase(&json!({"state":"done","summary":"完成"})).unwrap(),
+            "phase summary recorded"
+        );
+        assert!(task_phase(&json!({"state":"start"})).is_err());
+        assert!(task_phase(&json!({"state":"done","summary":" "})).is_err());
+        assert!(task_phase(&json!({"state":"other"})).is_err());
     }
 
     /// 依赖环 / 未知 id / 自依赖 / 重复 id 一律报错，不静默丢边。

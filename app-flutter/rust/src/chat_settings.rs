@@ -40,7 +40,7 @@ fn run_mode_profile(mode: &str) -> &'static str {
 
 /// 工具黑名单候选（与 v1 `TOOL_BLACKLIST_CANDIDATES` 同名单；MCP 用户工具名运行期才知道，
 /// 不在此列）。
-pub const TOOL_CANDIDATES: [&str; 34] = [
+pub const TOOL_CANDIDATES: [&str; 35] = [
     "Read",
     "Write",
     "Edit",
@@ -53,6 +53,7 @@ pub const TOOL_CANDIDATES: [&str; 34] = [
     "WebFetch",
     "AskUserQuestion",
     "TodoWrite",
+    "TaskPhase",
     "SessionSearch",
     "MemorySearch",
     "CronList",

@@ -1416,18 +1416,69 @@ void main() {
     expect(second.title, '修复问题');
     expect(model.phaseForEntry(firstThinking)?.id, first.id);
 
-    // 只改当前待办的名字：第二项更新，第一项保持原名。
+    // 只改当前待办的名字：**旧阶段保持原名**，新名字从下一条条目开始算新阶段
+    // （2026-11-21 用户报障：以前会改上一次小待办任务的名字）。
     todo([
       {'content': '确认工具链', 'status': 'completed'},
       {'content': '修复登录问题', 'status': 'in_progress'},
     ]);
-    expect(model.todoPhases, hasLength(2), reason: '同一项改名不新开阶段');
+    expect(model.todoPhases, hasLength(3), reason: '改名要开新阶段，不能改旧标题');
     expect(model.todoPhases[0].title, '确认工具链');
-    expect(model.todoPhases[1].title, '修复登录问题');
+    expect(model.todoPhases[1].title, '修复问题');
+    expect(model.todoPhases[2].title, '修复登录问题');
 
     thinking('查日志');
     final secondThinking = lastOf(model, ChatEntryKind.thinking);
-    expect(model.phaseForEntry(secondThinking)?.id, second.id);
+    expect(model.phaseForEntry(secondThinking)?.id, model.todoPhases[2].id);
+  });
+
+  test('TaskPhase becomes start/done anchors and hides its tool card', () {
+    final model = ChatModel()..addUser('q');
+    model.apply({
+      'type': 'assistant',
+      'message': {
+        'role': 'assistant',
+        'content': [
+          {
+            'type': 'tool_use',
+            'id': 'p1',
+            'name': 'TaskPhase',
+            'input': {'state': 'start', 'title': '第一步'},
+          },
+          {
+            'type': 'tool_use',
+            'id': 'p2',
+            'name': 'TaskPhase',
+            'input': {'state': 'done', 'summary': '第一步完成'},
+          },
+          {
+            'type': 'tool_use',
+            'id': 'p3',
+            'name': 'TaskPhase',
+            'input': {'state': 'done', 'summary': '   '},
+          },
+        ],
+      },
+    });
+    final phases = model.entries
+        .where(
+          (e) =>
+              e.kind == ChatEntryKind.taskPhaseStart ||
+              e.kind == ChatEntryKind.taskPhaseDone,
+        )
+        .toList();
+    expect(phases, hasLength(2), reason: '空 summary 不落锚点');
+    expect(phases[0].kind, ChatEntryKind.taskPhaseStart);
+    expect(phases[0].text, '第一步');
+    expect(phases[1].kind, ChatEntryKind.taskPhaseDone);
+    expect(phases[1].text, '第一步完成');
+    expect(
+      model.entries.any(
+        (e) => e.kind == ChatEntryKind.toolUse && e.toolName == 'TaskPhase',
+      ),
+      isFalse,
+      reason: 'TaskPhase 不占命令卡',
+    );
   });
 
   test('history steps keep full long thinking, not a 4001-char tail', () {

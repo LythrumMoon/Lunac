@@ -2359,31 +2359,62 @@ class _ChatPanelState extends State<ChatPanel> {
           break;
       }
     }
-    // 2026-11-20（用户口径）：对话流按「待办任务大抽屉」归类。
-    //   · 每个任务段把**思考过程 / 工具调用 / 命令执行 / 审批**收进一个默认折叠的
-    //     大抽屉（运行中也不自动摊开，点标题才展开）；
-    //   · 模型输出的正文仍平铺可见 —— 阶段小总结不再带复制 / 分叉，
-    //     只有**全对话最后一条**总结正文带；
-    //   · 耗时 / 失败 / 产出文件由对话顶端常驻统计条承载（见 `_buildTopStats`）。
+    // 2026-11-21（用户口径）：对话流固定成
+    //   小待办任务 → 命令 → 小总结输出 → 小待办任务 → … → 大总结输出 → 产出物
+    //
+    // 分节优先用 `TaskPhase`（默认工具）显式给出的边界；老会话 / 模型没调用时退回
+    // TodoWrite 的阶段边界；再没有就一轮一个任务条。任务条标题在开节时冻结，
+    // 后来的 TodoWrite 改名不会再改上一次任务的名字。
+    final last = _model.entries.last;
+    final lastText = _lastAssistantText();
+    // 每一轮独立选择分节模式：这一轮出现过 TaskPhase 就用显式锚点，否则退回
+    // TodoWrite 阶段（老会话 / 模型没调新工具时不能把整场都降级成「一轮一条」）。
+    final toolTurns = <int>{};
+    var scanTurn = -1;
+    for (final entry in _model.entries) {
+      if (entry.kind == ChatEntryKind.user) {
+        scanTurn++;
+      } else if (entry.kind == ChatEntryKind.taskPhaseStart) {
+        toolTurns.add(scanTurn);
+      }
+    }
+
     final blocks = <Widget>[];
-    final taskBody = <Widget>[];
-    final taskTools = <ChatEntry>[];
     final group = <ChatEntry>[];
     final approvals = <ChatEntry>[];
-    var taskThinking = 0;
-    var taskPending = 0;
+    final sectionBody = <Object>[];
+    final sectionTools = <ChatEntry>[];
+    var sectionSlot = -1;
+    var sectionSerial = 0;
+    var sectionKey = 0;
+    var sectionTitle = '';
+    var sectionThinking = 0;
+    var sectionPending = 0;
+    String? sectionSummary;
+    var sectionLive = false;
+    // 当前分节是不是显式任务条（TaskPhase / TodoWrite 阶段）。false = 用户提问兜底，
+    // 遇到第一个真正的待办时应「改名合并」而不是再开一条（避免多出空任务条）。
+    var sectionExplicit = false;
+    // 大总结已经渲染（它之后的迟到 TaskPhase 不再制造任务条）。
+    var finalEmitted = false;
 
-    void flushGroup() {
+    var turnIndex = -1;
+    var taskTitle = '';
+    var currentPhaseId = 0;
+    var turnHadSection = false;
+    var artifactsTurn = -1;
+
+    void absorbGroup() {
       if (group.isEmpty) {
         return;
       }
       final uses = List<ChatEntry>.of(group);
       group.clear();
-      taskTools.addAll(uses);
-      taskBody.add(
+      sectionTools.addAll(uses);
+      sectionBody.add(
         _ToolGroup(
           key: ValueKey(
-            'tool-group-${uses.first.toolUseId ?? taskBody.length}',
+            'tool-group-${uses.first.toolUseId ?? sectionBody.length}',
           ),
           tools: uses,
           results: results,
@@ -2400,7 +2431,7 @@ class _ChatPanelState extends State<ChatPanel> {
 
     // 多条命令同时等审批时只画**一张**大卡（用户 2026-11-14 要求）：
     // 每条一行「工具名 + 省略的命令」+ 勾 / ×，顶部再给「全部允许 / 全部取消 / 拒绝并暂停」。
-    void flushApprovals() {
+    void absorbApprovals() {
       if (approvals.isEmpty) {
         return;
       }
@@ -2410,18 +2441,17 @@ class _ChatPanelState extends State<ChatPanel> {
       if (pending.isEmpty) {
         return; // 全部处理完 ⇒ 整块消失
       }
-      taskPending += pending.length;
+      sectionPending += pending.length;
       if (pending.length == 1) {
-        // 只剩一条时回到详细卡（命令原文看得全）。
-        taskBody.add(
+        sectionBody.add(
           _buildEntry(pending.first, results: results, streaming: false),
         );
         return;
       }
-      taskBody.add(
+      sectionBody.add(
         _ApprovalGroup(
           key: ValueKey(
-            'approval-group-${pending.first.requestId ?? taskBody.length}',
+            'approval-group-${pending.first.requestId ?? sectionBody.length}',
           ),
           entries: pending,
           onAllow: (entry) => _respond(entry, true),
@@ -2432,84 +2462,191 @@ class _ChatPanelState extends State<ChatPanel> {
       );
     }
 
-    final last = _model.entries.last;
-    final lastText = _lastAssistantText();
-    // 第几条用户提问（回合序号）：与 `turnDurationsMs` 同口径（0 起）。
-    var turnIndex = -1;
-    var segment = 0;
-    // 当前任务的主要内容概括（用户提问的首行）。2026-11-20 起抽屉标题只用它，
-    // 不再显示「任务 N」；同一回合被正文分成多段时沿用同一标题。
-    var taskTitle = '';
-    // 当前待办阶段（2026-11-21）：同一阶段只收一个抽屉，切待办时才 flush。
-    var currentPhaseId = 0;
-    // 本轮抽屉是否已经收口：最终正文前会先收一次，回合结束时不能重复制造空抽屉。
-    var turnClosed = false;
-    // 已经挂过产出物的回合（防止「最终正文前收口」与「循环结束再收口」重复挂同一份）。
-    var artifactsTurn = -1;
+    List<Widget> sectionChildren() {
+      final children = <Widget>[];
+      for (final item in sectionBody) {
+        if (item is Widget) {
+          children.add(item);
+        } else if (item is ChatEntry) {
+          children.add(
+            _buildEntry(
+              item,
+              results: results,
+              streaming: _model.busy && identical(item, last),
+            ),
+          );
+        }
+      }
+      final pending = approvals.where((item) => !item.handled).toList();
+      if (pending.length == 1) {
+        children.add(
+          _buildEntry(pending.first, results: results, streaming: false),
+        );
+      } else if (pending.length > 1) {
+        children.add(
+          _ApprovalGroup(
+            key: ValueKey(
+              'approval-group-live-${pending.first.requestId ?? children.length}',
+            ),
+            entries: pending,
+            onAllow: (entry) => _respond(entry, true),
+            onDeny: (entry) => _respond(entry, false),
+            onAllowAll: () => _respondAll(pending, true),
+            onDenyAll: () => _respondAll(pending, false),
+          ),
+        );
+      }
+      return children;
+    }
 
-    /// 收掉当前大抽屉（正文 / 用户气泡之前的进程块都要落进抽屉）。
-    void flushTask({bool endOfTurn = false}) {
-      flushGroup();
-      flushApprovals();
-      if (taskBody.isEmpty && !endOfTurn) {
+    void refreshSection() {
+      if (sectionSlot < 0) {
         return;
       }
-      // 本轮已经在最终正文前收口 ⇒ 回合结束不再补一个空抽屉。
-      if (taskBody.isEmpty && turnClosed) {
+      final livePending =
+          sectionPending + approvals.where((item) => !item.handled).length;
+      blocks[sectionSlot] = _sectionBlock(
+        results: results,
+        sectionKey: sectionKey,
+        title: sectionTitle,
+        thinkingChars: sectionThinking,
+        tools: sectionTools,
+        pendingApprovals: livePending,
+        busy: sectionLive && _model.busy,
+        forceOpen: sectionLive && _model.busy,
+        summary: sectionSummary,
+        children: sectionChildren(),
+      );
+    }
+
+    void flushSection() {
+      absorbGroup();
+      absorbApprovals();
+      if (sectionSlot < 0) {
+        group.clear();
+        approvals.clear();
         return;
       }
-      final children = List<Widget>.of(taskBody);
-      taskBody.clear();
-      final tools = List<ChatEntry>.of(taskTools);
-      taskTools.clear();
-      final thinking = taskThinking;
-      taskThinking = 0;
-      final pending = taskPending;
-      taskPending = 0;
-      // 本轮产出物（§待办 3-28.13）跟着本轮的最后一个抽屉走。
-      if (endOfTurn && turnIndex >= 0 && artifactsTurn != turnIndex) {
-        artifactsTurn = turnIndex;
-        final artifacts = _artifactsBlock(turnIndex, results);
-        if (artifacts != null) {
-          children.add(artifacts);
+      // 没有显式小总结时：本节最后一条助手正文就是小总结；**全对话最后一条**除外
+      // （它是大总结，渲染在所有任务条之后）。
+      if (sectionSummary == null) {
+        for (var i = sectionBody.length - 1; i >= 0; i--) {
+          final item = sectionBody[i];
+          if (item is ChatEntry &&
+              item.kind == ChatEntryKind.assistant &&
+              item.text.trim().isNotEmpty &&
+              !identical(item, lastText)) {
+            sectionSummary = item.text.trim();
+            sectionBody.removeAt(i);
+            break;
+          }
         }
       }
-      if (children.isEmpty) {
-        // 第一条用户消息之前（turnIndex = -1）没有任务可收；其它情况才补「过程已压缩」。
-        if (!endOfTurn || turnIndex < 0) {
-          return;
-        }
-        // 历史体积上限（`stepsJson` 的 _maxStepsChars）会先丢最早的**过程**条目、
-        // 但保留用户提问。结果是 4 个提问只剩 2 个任务抽屉 —— 看上去像丢任务。
-        // 这里仍然给这一轮一个抽屉，并如实说明过程已被压缩（不是空白框）。
-        children.add(_drawerEmpty('这一轮的过程记录已压缩，没有可展开的条目'));
+      sectionLive = false;
+      refreshSection();
+      sectionSlot = -1;
+      sectionBody.clear();
+      sectionTools.clear();
+      sectionThinking = 0;
+      sectionPending = 0;
+      sectionSummary = null;
+      sectionExplicit = false;
+    }
+
+    void startSection(String title, {bool explicit = false}) {
+      flushSection();
+      sectionSlot = blocks.length;
+      blocks.add(const SizedBox.shrink());
+      sectionKey = sectionSerial++;
+      sectionTitle = title.trim().isEmpty ? '过程记录' : title.trim();
+      sectionBody.clear();
+      sectionTools.clear();
+      sectionThinking = 0;
+      sectionPending = 0;
+      sectionSummary = null;
+      sectionLive = true;
+      sectionExplicit = explicit;
+      turnHadSection = true;
+    }
+
+    /// 把「用户提问兜底」分节改名成第一个真正的待办，而不是再开一条空任务条。
+    void retitleSection(String title) {
+      final trimmed = title.trim();
+      if (trimmed.isNotEmpty) {
+        sectionTitle = trimmed;
       }
-      segment++;
-      // 2026-11-21：标题优先用当前待办阶段的标题；没有阶段时才回落到用户提问概括。
-      // 每个阶段一个抽屉 ⇒ 改一个待办的名字只影响它自己，不会带着别的抽屉一起变。
+      sectionExplicit = true;
+      refreshSection();
+    }
+
+    void ensureSection() {
+      if (sectionSlot >= 0) {
+        return;
+      }
       final phase = _model.phaseById(currentPhaseId);
-      final title = phase != null && phase.title.trim().isNotEmpty
-          ? phase.title
-          : (turnIndex >= 0
-                ? (_model.todoTitleForTurn(turnIndex) ??
-                      (taskTitle.isEmpty ? '过程记录' : taskTitle))
-                : '过程记录');
+      startSection(
+        phase != null && phase.title.trim().isNotEmpty
+            ? phase.title
+            : (taskTitle.isEmpty ? '过程记录' : taskTitle),
+      );
+    }
+
+    void flushGroup() {
+      if (group.isEmpty) {
+        return;
+      }
+      ensureSection();
+      absorbGroup();
+      refreshSection();
+    }
+
+    void flushApprovals() {
+      if (approvals.isEmpty) {
+        return;
+      }
+      ensureSection();
+      absorbApprovals();
+      refreshSection();
+    }
+
+    void handleProcess(ChatEntry entry) {
+      if (!toolTurns.contains(turnIndex)) {
+        final pid = _model.phaseForEntry(entry)?.id ?? 0;
+        if (pid != currentPhaseId) {
+          currentPhaseId = pid;
+          final phase = _model.phaseById(pid);
+          final title = phase != null && phase.title.trim().isNotEmpty
+              ? phase.title
+              : (taskTitle.isEmpty ? '过程记录' : taskTitle);
+          if (sectionSlot >= 0 && !sectionExplicit) {
+            retitleSection(title);
+          } else {
+            startSection(title, explicit: true);
+          }
+        }
+      }
+      ensureSection();
+    }
+
+    void emitTrimmedTurn() {
+      if (turnIndex < 0 || turnHadSection) {
+        return;
+      }
+      turnHadSection = true;
       blocks.add(
-        _TaskDrawer(
-          key: ValueKey('task-$turnIndex-$segment-$currentPhaseId'),
-          title: title,
-          thinkingChars: thinking,
-          tools: tools,
+        _sectionBlock(
           results: results,
-          // 只有「本回合最后一段」在跑时才挂进度点（前面的段已经结束）。
-          busy: _model.busy && endOfTurn,
-          pendingApprovals: pending,
-          children: children,
+          sectionKey: sectionSerial++,
+          title: taskTitle.isEmpty ? '过程记录' : taskTitle,
+          thinkingChars: 0,
+          tools: const [],
+          pendingApprovals: 0,
+          busy: false,
+          forceOpen: false,
+          summary: null,
+          children: [_drawerEmpty('这一轮的过程记录已压缩，没有可展开的条目')],
         ),
       );
-      if (endOfTurn) {
-        turnClosed = true;
-      }
     }
 
     for (final entry in _model.entries) {
@@ -2519,96 +2656,102 @@ class _ChatPanelState extends State<ChatPanel> {
           toolIds.contains(entry.toolUseId)) {
         continue;
       }
+      if (entry.kind == ChatEntryKind.taskPhaseStart) {
+        if (finalEmitted) {
+          continue;
+        }
+        if (sectionSlot >= 0 && !sectionExplicit) {
+          retitleSection(entry.text);
+        } else {
+          startSection(entry.text, explicit: true);
+        }
+        currentPhaseId = 0;
+        continue;
+      }
+      if (entry.kind == ChatEntryKind.taskPhaseDone) {
+        // 没有开节（模型漏了 start）或大总结已出：不补空任务条，避免结构错位。
+        if (finalEmitted || sectionSlot < 0) {
+          continue;
+        }
+        sectionSummary = entry.text.trim().isEmpty ? null : entry.text.trim();
+        flushSection();
+        continue;
+      }
       // 命令审批：连续的一段合并；已处理的直接消失。
       if (entry.kind == ChatEntryKind.approval &&
           entry.subtype == 'can_use_tool') {
         if (entry.handled) {
           continue;
         }
-        final pid = _model.phaseForEntry(entry)?.id ?? 0;
-        if (pid != currentPhaseId) {
-          flushTask();
-          currentPhaseId = pid;
-        }
+        handleProcess(entry);
         flushGroup();
         approvals.add(entry);
+        refreshSection();
         continue;
       }
       if (entry.kind == ChatEntryKind.toolUse) {
-        final pid = _model.phaseForEntry(entry)?.id ?? 0;
-        if (pid != currentPhaseId) {
-          flushTask();
-          currentPhaseId = pid;
-        }
+        handleProcess(entry);
         flushApprovals();
         group.add(entry);
+        refreshSection();
         continue;
       }
       if (entry.kind == ChatEntryKind.user) {
-        flushTask(endOfTurn: true);
+        flushSection();
+        emitTrimmedTurn();
         currentPhaseId = 0;
         turnIndex++;
-        segment = 0;
-        turnClosed = false;
         taskTitle = summarizeTaskTitle(entry.text);
+        turnHadSection = false;
         blocks.add(_buildEntry(entry, results: results, streaming: false));
         continue;
       }
       if (entry.kind == ChatEntryKind.thinking) {
-        final pid = _model.phaseForEntry(entry)?.id ?? 0;
-        if (pid != currentPhaseId) {
-          flushTask();
-          currentPhaseId = pid;
-        }
-        // 思考过程进抽屉（不单独占对话流）。
+        handleProcess(entry);
         flushGroup();
         flushApprovals();
-        taskThinking += entry.text.length;
-        taskBody.add(
+        sectionThinking += entry.text.length;
+        sectionBody.add(
           _ThinkingBlock(
             text: entry.text,
             streaming: _model.busy && identical(entry, last),
           ),
         );
+        refreshSection();
         continue;
       }
       if (entry.kind == ChatEntryKind.assistant) {
-        // 正文分两档（2026-11-21 用户口径修正）：
-        //   · **全对话最后一条**总结正文平铺在任务抽屉下方，带复制 / 分叉；
-        //   · 其余阶段小输出收进当前任务抽屉 —— 不再漂在任务条上方自成一块。
-        final pid = _model.phaseForEntry(entry)?.id ?? 0;
-        if (pid != currentPhaseId) {
-          flushTask();
-          currentPhaseId = pid;
-        }
-        if (identical(entry, lastText)) {
-          // 流式输出期间不要先收口：否则每来一段正文都会多一个抽屉。
-          // 回合结束（busy=false）后重建成「抽屉在上、最终正文在下」的稳定顺序。
-          if (!_model.busy) {
-            flushTask(endOfTurn: true);
-          }
+        // 大总结 = 全对话最后一条正文（不忙时）；其余正文都是过程 / 小总结，
+        // 收进当前任务分节，最后由该节的小总结槽位渲染。
+        if (identical(entry, lastText) && !_model.busy) {
+          flushSection();
+          emitTrimmedTurn();
           blocks.add(
             _buildEntry(
               entry,
               results: results,
-              streaming: _model.busy && identical(entry, last),
-              showActions: !_model.busy,
+              streaming: false,
+              showActions: true,
             ),
           );
+          finalEmitted = true;
+          if (turnIndex >= 0 && artifactsTurn != turnIndex) {
+            artifactsTurn = turnIndex;
+            final artifacts = _artifactsBlock(turnIndex, results);
+            if (artifacts != null) {
+              blocks.add(artifacts);
+            }
+          }
         } else {
+          handleProcess(entry);
           flushGroup();
           flushApprovals();
-          taskBody.add(_buildEntry(entry, results: results, streaming: false));
+          sectionBody.add(entry);
+          refreshSection();
         }
         continue;
       }
-      // 其它（通知 / 错误 / 计划审批 / 文件卡）：不进抽屉，单独一块。
-      // 不 flush：否则同一待办会被切成两个抽屉。
-      final pid = _model.phaseForEntry(entry)?.id ?? 0;
-      if (pid != currentPhaseId) {
-        flushTask();
-        currentPhaseId = pid;
-      }
+      // 通知 / 错误 / 文件卡：不埋进折叠抽屉，平铺在流里。
       blocks.add(
         _buildEntry(
           entry,
@@ -2617,7 +2760,14 @@ class _ChatPanelState extends State<ChatPanel> {
         ),
       );
     }
-    flushTask(endOfTurn: true);
+    flushSection();
+    emitTrimmedTurn();
+    if (turnIndex >= 0 && artifactsTurn != turnIndex) {
+      final artifacts = _artifactsBlock(turnIndex, results);
+      if (artifacts != null) {
+        blocks.add(artifacts);
+      }
+    }
     return ListView.builder(
       controller: _scroll,
       padding: const EdgeInsets.fromLTRB(14, 4, 14, 10),
@@ -2964,6 +3114,10 @@ class _ChatPanelState extends State<ChatPanel> {
         return _buildApproval(entry);
       case ChatEntryKind.file:
         return _buildFileCard(entry);
+      case ChatEntryKind.taskPhaseStart:
+      case ChatEntryKind.taskPhaseDone:
+        // 分节锚点由 `_buildBody` 消费；单条渲染路径不会拿到它们。
+        return const SizedBox.shrink();
     }
   }
 
@@ -4322,6 +4476,54 @@ class _ChatPanelState extends State<ChatPanel> {
   /// 后台命令 / 改动文件，**同一份事件流**，不新建状态源。
   /// 位置与 v1 相同（输入框正上方）；「改动文件」点一行**只在预览区打开**该文件，
   /// 不在对话流里画 diff（用户 2026-11-14 口径）。
+  /// 一个「小待办任务」分节：任务条 + 过程（折叠）+ 小总结（常显在条下）。
+  ///
+  /// 结构固定为「任务条 → 命令 → 小总结输出」；产出物不放在这里 —— 它跟在大总结
+  /// 之后（见 `_buildBody` 的最终正文分支）。
+  Widget _sectionBlock({
+    required Map<String, ChatEntry> results,
+    required int sectionKey,
+    required String title,
+    required int thinkingChars,
+    required List<ChatEntry> tools,
+    required int pendingApprovals,
+    required bool busy,
+    required bool forceOpen,
+    required String? summary,
+    required List<Widget> children,
+  }) {
+    final summaryText = summary?.trim() ?? '';
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _TaskDrawer(
+            key: ValueKey('task-section-$sectionKey'),
+            title: title,
+            thinkingChars: thinkingChars,
+            tools: tools,
+            results: results,
+            busy: busy,
+            pendingApprovals: pendingApprovals,
+            forceOpen: forceOpen,
+            children: children.isEmpty && summaryText.isEmpty
+                ? [_drawerEmpty('这一轮的过程记录已压缩，没有可展开的条目')]
+                : children,
+          ),
+          if (summaryText.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 4, 10, 6),
+              child: ChatMarkdownView(
+                text: summaryText,
+                onOpenUrl: _openUrlPreview,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildTodoStrip() {
     final todos = _model.todos;
     final files = _model.changedFiles;
@@ -6266,6 +6468,7 @@ class _TaskDrawer extends StatefulWidget {
     required this.busy,
     required this.pendingApprovals,
     required this.children,
+    this.forceOpen = false,
   });
 
   /// 任务标题：该任务里主要内容的首行概括（不再用「任务 1 / 2」编号）。
@@ -6287,6 +6490,10 @@ class _TaskDrawer extends StatefulWidget {
   /// 抽屉内容（思考块 / 命令组 / 审批卡 / 产出物）。
   final List<Widget> children;
 
+  /// 当前正在跑的任务分节：强制展开，让流式正文在任务条下方可见。
+  /// 用户手动点过之后仍以 `_manualOpen` 为准（本字段只在没点过时生效）。
+  final bool forceOpen;
+
   @override
   State<_TaskDrawer> createState() => _TaskDrawerState();
 }
@@ -6295,7 +6502,10 @@ class _TaskDrawerState extends State<_TaskDrawer> {
   /// null = 跟随默认（折叠）；用户点过就固定住。
   bool? _manualOpen;
 
-  bool get _open => widget.pendingApprovals > 0 || (_manualOpen ?? false);
+  bool get _open =>
+      widget.pendingApprovals > 0 ||
+      (widget.forceOpen && _manualOpen == null) ||
+      (_manualOpen ?? false);
 
   int get _fails => widget.tools.where((tool) {
     final id = tool.toolUseId;

@@ -269,6 +269,13 @@ enum ChatEntryKind {
   error,
   approval,
   file,
+
+  /// `TaskPhase {state:"start", title}`：用户可见的「小待办任务」条。
+  /// 只作为分节锚点，正文由紧随其后的过程条目填充。
+  taskPhaseStart,
+
+  /// `TaskPhase {state:"done", summary}`：该小待办的小总结，固定渲染在任务条/命令之后。
+  taskPhaseDone,
 }
 
 class ChatEntry {
@@ -780,6 +787,9 @@ class ChatModel {
   /// `TodoWrite` 的 tool_use id：它的结果不进对话流（清单只在任务抽屉里）。
   final Set<String> _todoToolIds = <String>{};
 
+  /// `TaskPhase` 的 tool_use id：它只产出「任务条 / 小总结」两个锚点，结果同样不进对话流。
+  final Set<String> _taskPhaseToolIds = <String>{};
+
   /// `/compact` 的占位旁注：agent 回 `context_compacted` 时原地改成结果（不新建节点）。
   ChatEntry? _compactNote;
 
@@ -870,6 +880,7 @@ class ChatModel {
     _draftByIndex.clear();
     _toolResults.clear();
     _todoToolIds.clear();
+    _taskPhaseToolIds.clear();
     _compactNote = null;
     _planNote = null;
     _assistantSinceUser = 0;
@@ -1052,7 +1063,9 @@ class ChatModel {
         final keepHead =
             entry.kind == ChatEntryKind.user ||
             entry.kind == ChatEntryKind.assistant ||
-            entry.kind == ChatEntryKind.thinking;
+            entry.kind == ChatEntryKind.thinking ||
+            entry.kind == ChatEntryKind.taskPhaseStart ||
+            entry.kind == ChatEntryKind.taskPhaseDone;
         chip['text'] = keepHead
             ? _clipTextStep(entry.text)
             : _clipStep(entry.text);
@@ -1759,10 +1772,11 @@ class ChatModel {
       return;
     }
     final title = summarizeTaskTitle(content);
-    // 同一个待办被改名：只更新它自己的阶段；之前已经收口的阶段保持原名。
-    if (current != null && current.slot == activeIndex) {
-      current.content = content;
-      current.title = title;
+    // 同一个待办被改名：**不原地改旧阶段的标题**（用户 2026-11-21 报障：会改上一次
+    // 小待办任务的名字）。名字变了就开一个新阶段，旧抽屉保持创建时的名字。
+    if (current != null &&
+        current.slot == activeIndex &&
+        current.content == content) {
       return;
     }
     // 本轮第一个阶段认领本轮早先的过程条目；后续阶段从 TodoWrite 之后开始。
@@ -1778,6 +1792,30 @@ class ChatModel {
     );
     todoPhases.add(phase);
     _currentPhase = phase;
+  }
+
+  /// `TaskPhase` 的入参 → 两个锚点条目（start / done）。
+  ///
+  /// 只接受 `state` + `title` / `summary`；两端文字都 trim，空值直接忽略，
+  /// 不让模型发一条空的任务条或空白小总结。
+  void _applyTaskPhase(dynamic input) {
+    if (input is! Map) {
+      return;
+    }
+    final state = input['state'];
+    final title = input['title'];
+    final summary = input['summary'];
+    if (state == 'start' && title is String && title.trim().isNotEmpty) {
+      _addEntry(
+        ChatEntry(kind: ChatEntryKind.taskPhaseStart, text: title.trim()),
+      );
+      return;
+    }
+    if (state == 'done' && summary is String && summary.trim().isNotEmpty) {
+      _addEntry(
+        ChatEntry(kind: ChatEntryKind.taskPhaseDone, text: summary.trim()),
+      );
+    }
   }
 
   /// 某一轮任务抽屉的标题：优先取该轮待办（进行中 > 待办 > 最后一条完成）。
@@ -1832,8 +1870,9 @@ class ChatModel {
         if (id is! String || id.isEmpty) {
           return;
         }
-        if (block['name'] == 'TodoWrite') {
-          // TodoWrite 不占命令卡（清单在任务抽屉里）；这里也不建，免得闪一下又消失。
+        if (block['name'] == 'TodoWrite' || block['name'] == 'TaskPhase') {
+          // TodoWrite 只画待办清单、TaskPhase 只产出任务条/小总结，都不占命令卡
+          // （这里也不建草稿卡，免得闪一下又消失）。
           return;
         }
         final entry = ChatEntry(
@@ -1949,6 +1988,18 @@ class ChatModel {
             }
             break;
           }
+          // TaskPhase（2026-11-21）：把「小待办任务 / 小总结输出」做成真正的条目，
+          // 不再靠助手正文位置猜边界 —— 前端按 start → 命令 → done 的顺序渲染。
+          if (name == 'TaskPhase') {
+            if (draft != null) {
+              entries.remove(draft);
+            }
+            _applyTaskPhase(block['input']);
+            if (id is String) {
+              _taskPhaseToolIds.add(id);
+            }
+            break;
+          }
           if (draft != null) {
             draft.detail = compactJson(block['input']);
             break;
@@ -2002,8 +2053,9 @@ class ChatModel {
       final id = block['tool_use_id'] is String
           ? block['tool_use_id'] as String
           : null;
-      if (id != null && _todoToolIds.contains(id)) {
-        continue; // 待办清单的结果不进对话流（与 v1 同口径）。
+      if (id != null &&
+          (_todoToolIds.contains(id) || _taskPhaseToolIds.contains(id))) {
+        continue; // 待办清单 / 任务阶段的结果不进对话流（与 v1 同口径）。
       }
       final text = _contentText(block['content']);
       final isError = block['is_error'] == true;
@@ -2025,7 +2077,8 @@ class ChatModel {
     final id = event['tool_use_id'] is String
         ? event['tool_use_id'] as String
         : null;
-    if (id != null && _todoToolIds.contains(id)) {
+    if (id != null &&
+        (_todoToolIds.contains(id) || _taskPhaseToolIds.contains(id))) {
       return;
     }
     _append(_resultEntry(id), chunk);
@@ -2519,6 +2572,8 @@ ChatEntry? stepEntryOf(dynamic item) {
       case ChatEntryKind.thinking:
       case ChatEntryKind.notice:
       case ChatEntryKind.error:
+      case ChatEntryKind.taskPhaseStart:
+      case ChatEntryKind.taskPhaseDone:
         return ChatEntry(kind: value, text: text);
       case ChatEntryKind.toolUse:
         return ChatEntry(
