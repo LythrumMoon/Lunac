@@ -3971,7 +3971,15 @@ fn webfetch(input: &Value) -> Result<String, String> {
     let (body, oversized) = read_body_capped(resp, FETCH_MAX_BYTES)?;
 
     if !status.is_success() {
-        return Err(format!("WebFetch {url} → HTTP {status}"));
+        // 2026-11-22 长跑：模型连续猜了 6 个过期的厂商文档 URL（404/403）。
+        // 错误里直接给出下一步动作，比让它继续换 URL 猜更快。
+        let hint = match status.as_u16() {
+            401 | 403 | 404 | 410 => {
+                " - the URL is stale or blocked; use WebSearch to find the current address first"
+            }
+            _ => "",
+        };
+        return Err(format!("WebFetch {url} → HTTP {status}{hint}"));
     }
 
     let text = if ctype.contains("html") || looks_like_html(&body) {

@@ -250,9 +250,20 @@ fn render(
         ));
     }
     if dom.trim().is_empty() {
-        return Err(format!(
-            "WebBrowser {url} → empty DOM (the page may require interaction or blocked the browser)"
-        ));
+        // PDF 在 headless 浏览器里通常只触发下载 / 内置查看器，dump-dom 拿不到正文。
+        // 2026-11-22 长跑里 WebBrowser 对数据手册 PDF 返回空 DOM，模型又去猜 URL。
+        let is_pdf = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url)
+            .to_ascii_lowercase()
+            .ends_with(".pdf");
+        let hint = if is_pdf {
+            " - PDFs are not rendered as DOM; download the file (or use WebFetch) and read it locally"
+        } else {
+            " (the page may require interaction or blocked the browser)"
+        };
+        return Err(format!("WebBrowser {url} → empty DOM{hint}"));
     }
 
     let title = extract_title(&dom);

@@ -2669,9 +2669,14 @@ class _ChatPanelState extends State<ChatPanel> {
         continue;
       }
       if (entry.kind == ChatEntryKind.taskPhaseDone) {
-        // 没有开节（模型漏了 start）或大总结已出：不补空任务条，避免结构错位。
-        if (finalEmitted || sectionSlot < 0) {
+        // 大总结之后迟到的 done 不再制造任务条。
+        if (finalEmitted) {
           continue;
+        }
+        // 模型漏了 start 时：仍给小总结一个任务条（标题回落到用户提问），
+        // 而不是把这段结论丢掉。长跑里 15 轮出现了 5 次。
+        if (sectionSlot < 0) {
+          startSection(taskTitle.isEmpty ? '过程记录' : taskTitle);
         }
         sectionSummary = entry.text.trim().isEmpty ? null : entry.text.trim();
         flushSection();

@@ -159,11 +159,60 @@ core-agent cargo test --offline : 512 passed / 0 failed / 16 ignored
 release build（--target-dir target-verify）: Finished，0 warning
 ```
 
-### Session B：3 小时连续跑
+### Session B：3 小时连续跑（2026-11-21 21:48 – 2026-11-22 00:48）
 
-Session A 展示了三个领域的完整覆盖，但墙钟只有 42.5 分钟。随后用
-`lunac-harness.exe` + 危险命令拒绝策略启动了 3 小时连续跑（同一工作区，
-继续同一产品/硬件/商品上下文）。结果与逐轮指标在本节追加。
+| 指标 | 值 |
+|---|---|
+| 墙钟时长 | **3.00 小时**（结束原因 `deadline`） |
+| 完成回合 | 15 / 15 |
+| 工具调用 | 1,242（错误 21） |
+| TaskPhase | start 53 / done 60；15/15 回合都用了 |
+| TodoWrite | 46 |
+| 上下文压缩 | 29 次 |
+| Token | 输入 4,610,616（缓存读 399,114,880）/ 输出 599,352 |
+| 预估费用 | ¥14.99 |
+| 回合耗时 | p50 544.3s / p95 1707.8s |
+
+逐轮：
+
+| # | 秒 | 工具 | 错误 | TaskPhase | TodoWrite |
+|---|---|---|---|---|---|
+| 1 | 366 | 62 | 1 | 3/4 | 4 |
+| 2 | 1153 | 130 | 7 | 4/4 | 5 |
+| 3 | 425 | 64 | 0 | 3/3 | 4 |
+| 4 | 350 | 52 | 0 | 4/4 | 4 |
+| 5 | 544 | 48 | 0 | 4/4 | 3 |
+| 6 | 270 | 34 | 0 | 3/3 | 4 |
+| 7 | 849 | 114 | 0 | 3/4 | 3 |
+| 8 | 1416 | 137 | 0 | 2/4 | 3 |
+| 9 | 299 | 39 | 0 | 4/4 | 1 |
+| 10 | 1708 | 196 | 5 | 5/4 | 2 |
+| 11 | 751 | 93 | 1 | 4/4 | 3 |
+| 12 | 431 | 60 | 2 | 4/4 | 2 |
+| 13 | 478 | 48 | 0 | 4/5 | 3 |
+| 14 | 632 | 74 | 1 | 4/5 | 2 |
+| 15 | 1101 | 91 | 4 | 2/4 | 3 |
+
+错误分布：
+
+| 工具 | 次数 | 说明 |
+|---|---|---|
+| Edit | 8 | `old_string not found`（本轮跑的是带 hint 之前的 build） |
+| PowerShell | 6 | harness 拒绝危险命令（`User denied this action`），是安全闸生效，不是 agent 故障 |
+| WebFetch | 6 | 连续猜过期的厂商文档 URL：404 ×5 / 403 ×1 |
+| WebBrowser | 1 | 数据手册 PDF 渲染成空 DOM |
+
+Session B 之后新增的修正：
+
+1. `WebFetch` 对 401/403/404/410 的错误里附上
+   `use WebSearch to find the current address first`，不再让模型连续换 URL 猜。
+2. `WebBrowser` 对 `.pdf` 的空 DOM 明确提示「PDF 不会被渲染成 DOM，下载后用本地读取」。
+3. `TaskPhase done` 没有对应 `start` 时，前端不再丢弃总结：以用户提问为标题补一个任务条
+   （Session B 里出现 5 次）。
+4. Session B 用的是加「first action = TaskPhase start」之前的二进制；新 build 的端到端
+   验证已经看到首个 assistant 块为 `[thinking, TaskPhase, TodoWrite]`，没有正文抢先。
+5. `Edit` 最近似行提示、`TaskPhase` L3 压缩保留、本机 http 不升 https 都在 Session B
+   之后提交，尚未在长跑里复测。
 
 ## 复现
 

@@ -151,6 +151,31 @@ void main() {
     expect(find.text('先说明一下。'), findsOneWidget);
   });
 
+  testWidgets('TaskPhase done without start still shows its summary', (
+    tester,
+  ) async {
+    chatSession.restore(
+      id: 'test-task-phase-orphan-done',
+      messages: const [
+        ChatMessage('user', '做一件事'),
+        ChatMessage('assistant', '大总结。'),
+      ],
+      steps: const [
+        {'kind': 'user', 'text': '做一件事'},
+        {'kind': 'taskPhaseDone', 'text': '孤儿小总结'},
+        {'kind': 'assistant', 'text': '大总结。'},
+      ],
+    );
+    await pumpPanel(tester);
+
+    // 漏了 start 也要给结论一个任务条（标题回落到用户提问），不能把总结丢掉。
+    expect(find.byIcon(Icons.checklist_rtl), findsOneWidget);
+    expect(find.text('孤儿小总结'), findsOneWidget);
+    final summary = tester.getTopLeft(find.text('孤儿小总结')).dy;
+    final big = tester.getTopLeft(find.text('大总结。')).dy;
+    expect(summary, lessThan(big));
+  });
+
   testWidgets('TaskPhase renders bar -> commands -> small summary in order', (
     tester,
   ) async {
