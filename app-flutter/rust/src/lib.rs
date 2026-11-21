@@ -3557,6 +3557,19 @@ pub extern "C" fn lunac_pet_voice_speak(text: *const c_char) -> *mut c_char {
     to_c_string(pet_voice::speak_json(&root, &read_arg(text)))
 }
 
+/// 打开桌宠 / 点「启动服务」：自动拉起 gsv_server（有 Start.bat 优先用它）。
+#[no_mangle]
+pub extern "C" fn lunac_pet_voice_start() -> *mut c_char {
+    let root = exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    to_c_string(pet_voice::start_service_json(&root))
+}
+
+/// 停掉由本进程启动的 gsv_server（换模型目录时用）。
+#[no_mangle]
+pub extern "C" fn lunac_pet_voice_stop() -> *mut c_char {
+    to_c_string(pet_voice::stop_service_json())
+}
+
 /// 选择参考音频（单选）；返回 `{ok, canceled, path}`。
 #[no_mangle]
 pub extern "C" fn lunac_pet_voice_pick_audio() -> *mut c_char {

@@ -14,6 +14,8 @@
 //! `vocos_24khz.onnx` 被镜像站的 HTML 落地页顶掉，尺寸还对得上，喂进 ONNX Runtime 直接带走进程。
 
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -60,10 +62,41 @@ pub struct PetVoiceConfig {
     pub reference_audio: String,
     /// 参考音频对应的那句话（GSV / ZipVoice 都需要）。
     pub reference_text: String,
+    /// 模型 / gsv.cpp 运行包所在目录（空 = `<exe>/Modules/pet/gsv`）。
+    #[serde(default)]
+    pub model_dir: String,
+    /// `vulkan`（默认，独显）或 `cpu`。
+    #[serde(default = "default_device")]
+    pub device: String,
+    /// 打开桌宠插件时自动启动 gsv_server。
+    #[serde(default = "yes_bool")]
+    pub auto_start: bool,
+    /// 「GitHub 下载」按钮打开的地址（用户自己的仓库 / Release）。
+    #[serde(default = "default_github_url")]
+    pub github_url: String,
+    /// 「HuggingFace 下载」按钮打开的地址。
+    #[serde(default = "default_hf_url")]
+    pub hf_url: String,
     pub num_steps: i32,
     pub num_threads: i32,
     pub speed: f32,
     pub volume: f32,
+}
+
+fn default_device() -> String {
+    "vulkan".to_string()
+}
+
+fn yes_bool() -> bool {
+    true
+}
+
+fn default_github_url() -> String {
+    "https://github.com/LythrumMoon/lunac-plugins/releases".to_string()
+}
+
+fn default_hf_url() -> String {
+    "https://huggingface.co/KakaruHayate/GSV.CPP".to_string()
 }
 
 fn default_engine() -> String {
@@ -93,6 +126,11 @@ impl Default for PetVoiceConfig {
             text_lang: default_text_lang(),
             reference_audio: String::new(),
             reference_text: String::new(),
+            model_dir: String::new(),
+            device: default_device(),
+            auto_start: true,
+            github_url: default_github_url(),
+            hf_url: default_hf_url(),
             num_steps: STEPS_DEFAULT,
             num_threads: THREADS_DEFAULT,
             speed: 1.0,
@@ -119,6 +157,17 @@ impl PetVoiceConfig {
         self.sample_steps = clamp_int(self.sample_steps, (1, 32), GSV_SAMPLE_STEPS_DEFAULT);
         self.reference_audio = self.reference_audio.trim().to_string();
         self.reference_text = self.reference_text.trim().to_string();
+        self.model_dir = self.model_dir.trim().to_string();
+        self.device = match self.device.trim().to_ascii_lowercase().as_str() {
+            "cpu" => "cpu".to_string(),
+            _ => "vulkan".to_string(),
+        };
+        if self.github_url.trim().is_empty() {
+            self.github_url = default_github_url();
+        }
+        if self.hf_url.trim().is_empty() {
+            self.hf_url = default_hf_url();
+        }
         self.num_steps = clamp_int(self.num_steps, STEPS_RANGE, STEPS_DEFAULT);
         self.num_threads = clamp_int(self.num_threads, THREADS_RANGE, THREADS_DEFAULT);
         self.speed = if self.speed.is_finite() {
@@ -180,9 +229,216 @@ pub fn save(root: &Path, config: &PetVoiceConfig) -> Result<(), String> {
 //  资产体检（v1 `dir_assets_ready` 同口径，只认文件头）
 // ══════════════════════════════════════════════════════════════════
 
-/// 资产目录：`<exe 根>\Modules\pet\zipvoice`（v1 由桌宠插件清单装入，宿主只读）。
+/// 资产目录（旧 ZipVoice 布局，兼容读取）。
 pub fn assets_dir(root: &Path) -> PathBuf {
     root.join("Modules").join("pet").join("zipvoice")
+}
+
+/// GPT-SoVITS 运行包 / 模型目录：用户可整目录替换（配置里的 `modelDir`）。
+pub fn model_dir(root: &Path, config: &PetVoiceConfig) -> PathBuf {
+    let configured = config.model_dir.trim();
+    if configured.is_empty() {
+        root.join("Modules").join("pet").join("gsv")
+    } else {
+        PathBuf::from(configured)
+    }
+}
+
+/// 递归数 `.gguf` 模型文件（最多 4 层，避免扫整个磁盘）。
+fn count_gguf(dir: &Path, depth: u8) -> usize {
+    if depth == 0 {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += count_gguf(&path, depth - 1);
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// 找到可启动 gsv 服务的脚本 / 可执行文件（优先 `.bat`，它会同时拉起文本 sidecar）。
+fn find_launcher(dir: &Path, depth: u8) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    for name in [
+        "start_server.bat",
+        "StartServer.bat",
+        "start.bat",
+        "start.cmd",
+        "gsv_server.exe",
+        "Start GAG.bat",
+    ] {
+        let path = dir.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_launcher(&path, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_models_dir(dir: &Path, depth: u8) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let models = dir.join("models");
+    if models.is_dir() && count_gguf(&models, 2) > 0 {
+        return Some(models);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_models_dir(&path, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn url_port(url: &str) -> u16 {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.port_or_known_default())
+        .unwrap_or(GSV_PORT_DEFAULT)
+}
+
+/// 进程内唯一的 gsv 服务子进程（脚本启动时子进程树由 Job Object 兜底回收）。
+fn service_slot() -> &'static Mutex<Option<(Child, PathBuf)>> {
+    static SLOT: OnceLock<Mutex<Option<(Child, PathBuf)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// 打开桌宠 / 点「启动服务」时调用：已有服务直接复用，否则后台拉起并等端口。
+///
+/// 立即返回 `{ok, queued|already, error}`；真正的等待在后台线程里，避免堵 UI。
+pub fn start_service_json(root: &Path) -> String {
+    let config = load(root);
+    let dir = model_dir(root, &config);
+    if server_reachable(&config.server_url) {
+        return serde_json::json!({ "ok": true, "already": true }).to_string();
+    }
+    if !dir.is_dir() {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("资产目录不存在：{}（先点 GitHub / HuggingFace 下载并解压）", dir.display()),
+        })
+        .to_string();
+    }
+    let Some(launcher) = find_launcher(&dir, 4) else {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("目录里没找到 Start GAG.bat / gsv_server.exe：{}", dir.display()),
+        })
+        .to_string();
+    };
+
+    let mut slot = match service_slot().lock() {
+        Ok(slot) => slot,
+        Err(_) => {
+            return serde_json::json!({ "ok": false, "error": "服务进程锁不可用" }).to_string()
+        }
+    };
+    if let Some((child, running_dir)) = slot.as_mut() {
+        let alive = child.try_wait().ok().flatten().is_none();
+        if alive && running_dir == &dir {
+            return serde_json::json!({ "ok": true, "already": true }).to_string();
+        }
+        let _ = child.kill();
+        *slot = None;
+    }
+
+    let is_bat = launcher
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"));
+    let mut command = if is_bat {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(&launcher);
+        cmd
+    } else {
+        let mut cmd = Command::new(&launcher);
+        if let Some(models) = find_models_dir(&dir, 4) {
+            cmd.arg("--models").arg(models);
+        }
+        cmd.arg("--device").arg(&config.device);
+        cmd.arg("--port").arg(url_port(&config.server_url).to_string());
+        cmd
+    };
+    command
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(reason) => {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("启动 gsv 服务失败：{reason}"),
+            })
+            .to_string()
+        }
+    };
+    crate::child_job::assign(&child);
+    *slot = Some((child, dir.clone()));
+
+    let url = config.server_url.clone();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        while std::time::Instant::now() < deadline {
+            if server_reachable(&url) {
+                crate::log::info(format!("[pet-tts] gsv 服务已启动：{url}"));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        crate::log::warn(format!("[pet-tts] gsv 服务 45 秒内未就绪：{url}"));
+    });
+    serde_json::json!({ "ok": true, "queued": true }).to_string()
+}
+
+/// 停掉由本进程启动的 gsv 服务（换模型目录时调用；外部启动的服务不受影响）。
+pub fn stop_service_json() -> String {
+    let Ok(mut slot) = service_slot().lock() else {
+        return serde_json::json!({ "ok": false, "error": "服务进程锁不可用" }).to_string();
+    };
+    if let Some((mut child, _)) = slot.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    serde_json::json!({ "ok": true }).to_string()
 }
 
 /// 必须存在的五个文件（相对资产目录）。
@@ -229,17 +485,32 @@ pub fn missing_assets(root: &Path) -> Vec<String> {
 pub fn status_json(root: &Path) -> String {
     let config = load(root);
     let gsv = config.engine == ENGINE_GSV;
+    let gsv_dir = model_dir(root, &config);
+    let model_files = if gsv { count_gguf(&gsv_dir, 4) } else { 0 };
+    let model_ready = if gsv {
+        find_launcher(&gsv_dir, 4).is_some() && model_files > 0
+    } else {
+        true
+    };
     let server_ready = gsv && server_reachable(&config.server_url);
     let reference_file_ready =
         !config.reference_audio.is_empty() && Path::new(&config.reference_audio).is_file();
     let missing = if gsv { Vec::new() } else { missing_assets(root) };
-    let assets_ready = if gsv { server_ready } else { missing.is_empty() };
+    let assets_ready = if gsv { model_ready } else { missing.is_empty() };
     let (reason, reason_text) = if gsv {
-        if !server_ready {
+        if !model_ready {
+            (
+                "model_missing",
+                format!(
+                    "资产目录里没找到运行包或模型：{}。点 GitHub / HuggingFace 下载并解压到这里。",
+                    gsv_dir.display()
+                ),
+            )
+        } else if !server_ready {
             (
                 "gsv_server_unreachable",
                 format!(
-                    "GPT-SoVITS 服务未连通（{}）。先启动 gsv.cpp 的 Start GAG.bat / gsv_server，再点试听。",
+                    "GPT-SoVITS 服务未连通（{}）。打开桌宠会自动启动；也可点「启动服务」重试。",
                     config.server_url
                 ),
             )
@@ -283,6 +554,7 @@ pub fn status_json(root: &Path) -> String {
     };
     let can_speak = config.enabled
         && gsv
+        && model_ready
         && server_ready
         && reference_file_ready
         && !config.reference_text.is_empty();
@@ -292,6 +564,12 @@ pub fn status_json(root: &Path) -> String {
         "serverUrl": config.server_url,
         "sampleSteps": config.sample_steps,
         "textLang": config.text_lang,
+        "modelDir": gsv_dir.display().to_string(),
+        "modelFiles": model_files,
+        "device": config.device,
+        "autoStart": config.auto_start,
+        "githubUrl": config.github_url,
+        "hfUrl": config.hf_url,
         "referenceAudio": config.reference_audio,
         "referenceText": config.reference_text,
         "numSteps": config.num_steps,
@@ -301,11 +579,13 @@ pub fn status_json(root: &Path) -> String {
         "assetsReady": assets_ready,
         "serverReady": server_ready,
         "assetDir": if gsv {
-            root.join("Modules").join("pet").join("gsv").display().to_string()
+            gsv_dir.display().to_string()
         } else {
             assets_dir(root).display().to_string()
         },
-        "missingAssets": if gsv && !server_ready {
+        "missingAssets": if gsv && !model_ready {
+            vec![format!("{} 下缺少 gsv_server/Start 脚本或 .gguf 模型", gsv_dir.display())]
+        } else if gsv && !server_ready {
             vec!["gsv_server (HTTP 未连通)".to_string()]
         } else {
             missing
@@ -370,6 +650,21 @@ pub fn set_json(root: &Path, patch: &str) -> String {
         }
         if let Some(text) = object.get("referenceText").and_then(|v| v.as_str()) {
             current.reference_text = text.to_string();
+        }
+        if let Some(text) = object.get("modelDir").and_then(|v| v.as_str()) {
+            current.model_dir = text.to_string();
+        }
+        if let Some(text) = object.get("device").and_then(|v| v.as_str()) {
+            current.device = text.to_string();
+        }
+        if let Some(on) = object.get("autoStart").and_then(|v| v.as_bool()) {
+            current.auto_start = on;
+        }
+        if let Some(text) = object.get("githubUrl").and_then(|v| v.as_str()) {
+            current.github_url = text.to_string();
+        }
+        if let Some(text) = object.get("hfUrl").and_then(|v| v.as_str()) {
+            current.hf_url = text.to_string();
         }
         if let Some(steps) = object.get("numSteps").and_then(|v| v.as_i64()) {
             current.num_steps = steps as i32;
@@ -586,8 +881,13 @@ mod tests {
         // 默认引擎 = GPT-SoVITS；服务没起 ⇒ gsv_server_unreachable。
         let status: serde_json::Value = serde_json::from_str(&status_json(&root)).unwrap();
         assert_eq!(status["engine"], ENGINE_GSV);
-        assert_eq!(status["reason"], "gsv_server_unreachable");
+        assert_eq!(status["reason"], "model_missing");
         assert_eq!(status["canSpeak"], false);
+
+        let model = model_dir(&root, &load(&root));
+        std::fs::create_dir_all(model.join("models")).unwrap();
+        std::fs::write(model.join("Start.bat"), "@echo off\n").unwrap();
+        std::fs::write(model.join("models").join("a.gguf"), b"gguf").unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -599,6 +899,7 @@ mod tests {
         );
         let reply: serde_json::Value = serde_json::from_str(&set_json(&root, &patch)).unwrap();
         assert_eq!(reply["ok"], true);
+        assert_eq!(reply["status"]["modelFiles"], 1);
         assert_eq!(reply["status"]["serverReady"], true);
         assert_eq!(reply["status"]["reason"], "ready");
         assert_eq!(reply["status"]["canSpeak"], true);

@@ -18,16 +18,26 @@
 其他候选（Ming-3.0-tts-0.5B、Fun-CosyVoice3-0.5B、Qwen3-TTS-0.6B）中文指标也很强，
 但都需要 PyTorch/CUDA 运行时，打包与维护成本高于 gsv.cpp；本项目先落地 GPT-SoVITS。
 
-## 安装 gsv.cpp
+## 模型不分发，由用户下载
 
-1. 下载 Windows 一键包（含引擎、嵌入式 Python、模型、GAG GUI）：
-   <https://huggingface.co/KakaruHayate/GSV.CPP> → `windows/GSV.CPP-win64-*.zip`
-   （镜像：`https://hf-mirror.com/KakaruHayate/GSV.CPP`）。
-2. 解压到任意目录（不要放进 `Modules/pet`，模型较大，单独管理）。
-3. 运行 `Start GAG.bat`，确认服务监听 `127.0.0.1:9880`。
-   - 也可以在解压目录手动启动 `gsv_server --models models --device vulkan --port 9880`
-     和文本前端 sidecar（见 gsv.cpp 的 `docs/build.md`）。
-   - 没有 Vulkan 显卡时用 `--device cpu`，但实时性会明显下降。
+Lunac 安装包**不包含** gsv.cpp / 模型。桌宠控制台「语音朗读」的**资产目录**一行提供：
+
+- **GitHub 下载**：打开 `githubUrl`（默认 `LythrumMoon/lunac-plugins` 的 Releases；可把自制的运行包上传到那里）
+- **HuggingFace 下载**：打开 `hfUrl`（默认 gsv.cpp 官方模型仓库）
+- **选择目录**：选择整个 gsv.cpp 运行包目录（不是单个模型文件；gsv 需要同目录的 `models/`、文本前端、`Start` 脚本等）
+- **启动服务**：按目录里的脚本 / `gsv_server.exe` 启动，默认 Vulkan 独显
+
+默认资产目录：`<exe 根>/Modules/pet/gsv`。
+把下载的 Windows 包解压到该目录（或任意目录后用「选择目录」指过去）。
+目录里需要能找到 `Start*.bat` / `gsv_server.exe` 和至少一个 `.gguf` 模型；
+状态行会显示识别到的模型文件数。
+
+## 自动启动
+
+- `config/pet-voice.json` 的 `autoStart` 默认 `true`。
+- 打开桌宠插件（控制台 / 形象窗）时，宿主会检查 `serverUrl`；没连通就按资产目录启动服务。
+- 换模型目录时先停掉本进程拉起的旧服务，再用新目录重启。
+- 外部已启动的服务不会被重复拉起，也不会被停掉。
 
 ## 在 Lunac 桌宠控制台配置
 
@@ -48,6 +58,11 @@
   "serverUrl": "http://127.0.0.1:9880",
   "sampleSteps": 4,
   "textLang": "all_zh",
+  "modelDir": "D:/Lunac/Modules/pet/gsv",
+  "device": "vulkan",
+  "autoStart": true,
+  "githubUrl": "https://github.com/LythrumMoon/lunac-plugins/releases",
+  "hfUrl": "https://huggingface.co/KakaruHayate/GSV.CPP",
   "referenceAudio": "D:/voices/me.wav",
   "referenceText": "这是参考录音里说的那句话。",
   "speed": 1.0,

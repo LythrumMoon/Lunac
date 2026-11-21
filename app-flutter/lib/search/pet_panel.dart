@@ -19,7 +19,9 @@ import 'package:flutter/services.dart';
 
 import '../platform/agent.dart' show startAgent, stopAgent;
 import '../platform/pet.dart';
+import '../platform/shell_actions.dart';
 import '../theme.dart';
+import 'folder_picker.dart';
 
 /// v1 控制台的六个页签（顺序与文案逐字取 `pet.ts` 的 `settingsHtml` + i18n）。
 const List<({String id, String label})> _petTabs = [
@@ -113,6 +115,9 @@ class _PetPanelState extends State<PetPanel> {
     text: '100',
   );
   String _voiceEngine = 'gpt_sovits';
+  String _voiceDevice = 'vulkan';
+  bool _voiceAutoStart = true;
+  String _voiceModelDir = '';
   String? _voiceMessage;
   bool _voiceError = false;
   bool _voiceBusy = false;
@@ -157,6 +162,9 @@ class _PetPanelState extends State<PetPanel> {
     _loadLists();
     _refreshHotkeys();
     _refreshVoice();
+    if (readPetVoice().autoStart) {
+      startPetVoiceService();
+    }
     _poll = Timer.periodic(const Duration(milliseconds: 700), (_) {
       final events = pollPetEvents();
       if (!mounted || events.isEmpty) {
@@ -545,6 +553,20 @@ class _PetPanelState extends State<PetPanel> {
             ),
         ],
       ),
+    );
+  }
+
+  Widget _miniButton(String label, VoidCallback onPressed) {
+    return TextButton(
+      onPressed: onPressed,
+      style: TextButton.styleFrom(
+        foregroundColor: LunacColors.accent,
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        textStyle: const TextStyle(fontSize: 10.5),
+      ),
+      child: Text(label),
     );
   }
 
@@ -1788,6 +1810,9 @@ class _PetPanelState extends State<PetPanel> {
     setState(() {
       _voice = voice;
       _voiceEngine = voice.engine;
+      _voiceDevice = voice.device;
+      _voiceAutoStart = voice.autoStart;
+      _voiceModelDir = voice.modelDir;
       _voiceText.text = voice.referenceText;
       _voiceServer.text = voice.serverUrl;
       _voiceSteps.text = voice.sampleSteps.toString();
@@ -1830,6 +1855,9 @@ class _PetPanelState extends State<PetPanel> {
       setState(() {
         _voice = status;
         _voiceEngine = status.engine;
+        _voiceDevice = status.device;
+        _voiceAutoStart = status.autoStart;
+        _voiceModelDir = status.modelDir;
         _voiceText.text = status.referenceText;
         _voiceServer.text = status.serverUrl;
         _voiceSteps.text = status.sampleSteps.toString();
@@ -1855,6 +1883,9 @@ class _PetPanelState extends State<PetPanel> {
       'engine': _voiceEngine,
       'serverUrl': _voiceServer.text.trim(),
       'sampleSteps': steps,
+      'modelDir': _voiceModelDir,
+      'device': _voiceDevice,
+      'autoStart': _voiceAutoStart,
       'referenceText': _voiceText.text.trim(),
       'speed': speed,
       'volume': (volumePercent.clamp(0, 100)) / 100.0,
@@ -1887,6 +1918,46 @@ class _PetPanelState extends State<PetPanel> {
     _saveVoice({'referenceAudio': path}, '已导入参考音频');
   }
 
+  /// 选择整个模型 / 运行包目录（不是单个文件：gsv 需要同目录的参数与模型）。
+  Future<void> _pickVoiceModelDir() async {
+    final dir = await pickFolderDialog(
+      context,
+      title: '选择 GPT-SoVITS 运行包目录',
+      initialPath: _voiceModelDir,
+    );
+    if (dir == null || dir.isEmpty || !mounted) {
+      return;
+    }
+    // 换目录先停掉本进程拉起的旧服务，保存后再启动新目录。
+    stopPetVoiceService();
+    setState(() => _voiceModelDir = dir);
+    _saveVoice({'modelDir': dir}, '已切换模型目录');
+    final started = startPetVoiceService();
+    if (!started.ok) {
+      _voiceToast(started.error ?? '启动服务失败', error: true);
+    }
+  }
+
+  void _openVoiceDownload(String url) {
+    if (!openExternalUrl(url)) {
+      _voiceToast('无法打开下载页面', error: true);
+    }
+  }
+
+  void _startVoiceService() {
+    final result = startPetVoiceService();
+    if (!result.ok) {
+      _voiceToast(result.error ?? '启动服务失败', error: true);
+      return;
+    }
+    _voiceToast(result.already ? '服务已在运行' : '正在启动服务…');
+    Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        _refreshVoice();
+      }
+    });
+  }
+
   Widget _buildVoicePage() {
     final voice = _voice;
     final speedHint =
@@ -1912,8 +1983,8 @@ class _PetPanelState extends State<PetPanel> {
           ),
           const SizedBox(height: 2),
           Text(
-            'GPT-SoVITS（V5 / gsv.cpp）：先启动本机 gsv_server（默认 9880），'
-            '再导入 3~10 秒参考录音 + 参考文本；试听和桌宠朗读都走这个服务。',
+            'GPT-SoVITS V5（gsv.cpp，Vulkan 独显）：点下方按钮从 GitHub / HuggingFace '
+            '下载运行包并解压到资产目录；打开桌宠会自动启动服务。',
             style: TextStyle(
               color: LunacColors.textMuted,
               fontSize: 10,
@@ -1957,6 +2028,36 @@ class _PetPanelState extends State<PetPanel> {
                   active: _voiceEngine == 'zipvoice',
                 ),
               ],
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                SizedBox(
+                  width: 64,
+                  child: Text(
+                    '显卡',
+                    style: TextStyle(color: LunacColors.textDim, fontSize: 11),
+                  ),
+                ),
+                _button(
+                  'Vulkan 独显',
+                  () => setState(() => _voiceDevice = 'vulkan'),
+                  active: _voiceDevice == 'vulkan',
+                ),
+                const SizedBox(width: 8),
+                _button(
+                  'CPU',
+                  () => setState(() => _voiceDevice = 'cpu'),
+                  active: _voiceDevice == 'cpu',
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            _switchRow(
+              title: '打开桌宠时自动启动服务',
+              subtitle: _voiceAutoStart ? '已开启' : '已关闭',
+              value: _voiceAutoStart,
+              onChanged: (on) => setState(() => _voiceAutoStart = on),
             ),
             const SizedBox(height: 6),
             _voiceFieldRow(
@@ -2035,7 +2136,28 @@ class _PetPanelState extends State<PetPanel> {
                 _button('选择音频', _pickVoiceAudio),
               ],
             ),
-            if (voice.engine != 'gpt_sovits') _infoLine('资产目录', voice.assetDir),
+            _infoLine(
+              '资产目录',
+              _voiceModelDir.isEmpty ? voice.modelDir : _voiceModelDir,
+            ),
+            Wrap(
+              spacing: 2,
+              runSpacing: 2,
+              children: [
+                _miniButton(
+                  'GitHub 下载',
+                  () => _openVoiceDownload(voice.githubUrl),
+                ),
+                _miniButton(
+                  'HuggingFace 下载',
+                  () => _openVoiceDownload(voice.hfUrl),
+                ),
+                _miniButton('选择目录', _pickVoiceModelDir),
+                _miniButton('启动服务', _startVoiceService),
+              ],
+            ),
+            if (voice.engine != 'gpt_sovits')
+              _infoLine('旧资产目录', voice.assetDir),
             if (voice.missingAssets.isNotEmpty)
               _infoLine('缺失', voice.missingAssets.join(' / ')),
             if (voice.reasonText.isNotEmpty)

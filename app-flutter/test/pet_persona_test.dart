@@ -254,6 +254,12 @@ void main() {
       'serverUrl': 'http://127.0.0.1:9880',
       'sampleSteps': 4,
       'textLang': 'all_zh',
+      'modelDir': r'D:\Lunac\Modules\pet\gsv',
+      'modelFiles': 8,
+      'device': 'vulkan',
+      'autoStart': false,
+      'githubUrl': 'https://github.com/LythrumMoon/lunac-plugins/releases',
+      'hfUrl': 'https://huggingface.co/KakaruHayate/GSV.CPP',
       'referenceAudio': r'D:\ref.wav',
       'referenceText': '这是参考',
       'speed': 1.4,
@@ -277,6 +283,10 @@ void main() {
     expect(voice.engine, 'gpt_sovits');
     expect(voice.serverUrl, 'http://127.0.0.1:9880');
     expect(voice.sampleSteps, 4);
+    expect(voice.modelDir, r'D:\Lunac\Modules\pet\gsv');
+    expect(voice.modelFiles, 8);
+    expect(voice.device, 'vulkan');
+    expect(voice.autoStart, isFalse);
     expect(voice.speed, 1.4);
     expect(voice.volume, 0.35);
     expect(voice.assetsReady, isTrue);
@@ -293,6 +303,8 @@ void main() {
     expect(empty.serverUrl, 'http://127.0.0.1:9880');
     expect(empty.sampleSteps, 4);
     expect(empty.textLang, 'all_zh');
+    expect(empty.device, 'vulkan');
+    expect(empty.autoStart, isTrue);
     expect(empty.speed, 1.0);
     expect(empty.volume, 1.0);
     expect(PetVoiceStatus.fromJson(null), isNull);

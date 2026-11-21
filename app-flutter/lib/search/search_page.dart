@@ -1964,6 +1964,10 @@ class _SearchPageState extends State<SearchPage> with TickerProviderStateMixin {
     if (!mounted) {
       return;
     }
+    // 桌宠语音服务随插件一起拉起（模型已下载且 autoStart 开着时）。
+    if (readPetVoice().autoStart) {
+      startPetVoiceService();
+    }
     switch (result) {
       case PluginOpenResult.opened:
         setState(() => _petWindowOpen = true);

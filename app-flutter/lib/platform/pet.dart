@@ -837,6 +837,12 @@ class PetVoiceStatus {
     this.serverUrl = 'http://127.0.0.1:9880',
     this.sampleSteps = 4,
     this.textLang = 'all_zh',
+    this.modelDir = '',
+    this.modelFiles = 0,
+    this.device = 'vulkan',
+    this.autoStart = true,
+    this.githubUrl = 'https://github.com/LythrumMoon/lunac-plugins/releases',
+    this.hfUrl = 'https://huggingface.co/KakaruHayate/GSV.CPP',
     this.referenceAudio = '',
     this.referenceText = '',
     this.speed = 1.0,
@@ -863,6 +869,12 @@ class PetVoiceStatus {
   final String serverUrl;
   final int sampleSteps;
   final String textLang;
+  final String modelDir;
+  final int modelFiles;
+  final String device;
+  final bool autoStart;
+  final String githubUrl;
+  final String hfUrl;
   final String referenceAudio;
   final String referenceText;
   final double speed;
@@ -915,6 +927,16 @@ class PetVoiceStatus {
       textLang: text(json['textLang']).isEmpty
           ? 'all_zh'
           : text(json['textLang']),
+      modelDir: text(json['modelDir']),
+      modelFiles: integer(json['modelFiles'], 0),
+      device: text(json['device']).isEmpty ? 'vulkan' : text(json['device']),
+      autoStart: json['autoStart'] != false,
+      githubUrl: text(json['githubUrl']).isEmpty
+          ? 'https://github.com/LythrumMoon/lunac-plugins/releases'
+          : text(json['githubUrl']),
+      hfUrl: text(json['hfUrl']).isEmpty
+          ? 'https://huggingface.co/KakaruHayate/GSV.CPP'
+          : text(json['hfUrl']),
       referenceAudio: text(json['referenceAudio']),
       referenceText: text(json['referenceText']),
       speed: number(json['speed'], 1.0),
@@ -989,6 +1011,31 @@ PetVoiceStatus readPetVoice() {
     ok: ok,
     error: ok ? null : (error is String && error.isNotEmpty ? error : '朗读失败'),
   );
+}
+
+/// 启动 GPT-SoVITS 服务（有 Start.bat 优先用它）；已有服务直接复用。
+({bool ok, bool already, String? error}) startPetVoiceService() {
+  final bridge = _bridge();
+  if (bridge == null) {
+    return (ok: false, already: false, error: '不可用（rust 桥接未加载）');
+  }
+  final value = _decode(bridge.callString('lunac_pet_voice_start'));
+  final ok = value['ok'] == true;
+  final error = value['error'];
+  return (
+    ok: ok,
+    already: value['already'] == true,
+    error: ok ? null : (error is String && error.isNotEmpty ? error : '启动服务失败'),
+  );
+}
+
+/// 停掉由本进程启动的服务（换模型目录时用）。
+void stopPetVoiceService() {
+  final bridge = _bridge();
+  if (bridge == null) {
+    return;
+  }
+  _decode(bridge.callString('lunac_pet_voice_stop'));
 }
 
 /// 选择参考音频（单选）；取消 / 桥接缺失返回 null。
