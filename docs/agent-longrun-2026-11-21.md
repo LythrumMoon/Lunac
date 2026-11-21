@@ -124,6 +124,27 @@ harness 现在对所有 `can_use_tool` 自动回 `allow`，其余 subtype 一律
 old_string not found in <path>; closest line 42: let value = compute();
 ```
 
+### 优化后的端到端验证
+
+```text
+# 1. 常驻无审批通道（新 build，去掉 --permission-prompt-tool stdio）
+prompt: 在工作区 verify.txt 写一行 ok
+result: duration 7.35s / toolUses 2 / toolErrors 0
+verify.txt = ok
+
+# 2. Edit 近似提示
+call : Edit old_string = "let  value = compute();"（两个空格，故意不匹配）
+error: old_string not found in ...\target.txt; closest line 2: let value = compute();
+
+# 3. 本机 http 不再盲升 https
+call : WebBrowser http://127.0.0.1:18081/
+result: toolErrors 0（页面 hello-local）
+
+# 4. 测试与构建
+core-agent cargo test --offline : 512 passed / 0 failed / 16 ignored
+release build（--target-dir target-verify）: Finished，0 warning
+```
+
 ### Session B：3 小时连续跑
 
 Session A 展示了三个领域的完整覆盖，但墙钟只有 42.5 分钟。随后用
