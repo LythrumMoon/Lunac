@@ -45,6 +45,7 @@ class ChatPanel extends StatefulWidget {
     this.initialQuery = '',
     this.title = 'AI 对话',
     this.windowControls,
+    this.autoStart = true,
   });
 
   /// 关闭面板（Esc / 返回按钮）；agent 进程保持常驻（与 v1 一致）。
@@ -63,6 +64,13 @@ class ChatPanel extends StatefulWidget {
   /// 非 null ⇒ 窗口栏与面板头部**合并成一行**（v1 的聊天窗只有一个 `#detached-header`），
   /// 面板不再画「返回」；null ⇒ 内嵌模式，保留「返回 + 标题」。
   final Widget? windowControls;
+
+  /// 是否在 `initState` 里拉起 agent。
+  ///
+  /// 只给 widget test 用：测试环境没有 Rust 桥接，`startAgent()` 必然失败并让面板
+  /// 切到「AI 未配置」空态，任务抽屉 / 用量表盘就没法断言。生产路径永远是 true。
+  @visibleForTesting
+  final bool autoStart;
 
   @override
   State<ChatPanel> createState() => _ChatPanelState();
@@ -217,7 +225,9 @@ class _ChatPanelState extends State<ChatPanel> {
       _input.text = text.trim().isEmpty ? '$tokens ' : '$text $tokens ';
       _input.selection = TextSelection.collapsed(offset: _input.text.length);
     }
-    _start();
+    if (widget.autoStart) {
+      _start();
+    }
     // 预览窗在另一个 engine：它在预览里「全部应用 / 撤销」后，抽屉靠落盘标记
     // 每秒比对一次（没有事件通道，也不该为一个开关加跨窗协议）。
     _changeTimer = Timer.periodic(
@@ -2432,12 +2442,20 @@ class _ChatPanelState extends State<ChatPanel> {
     var taskTitle = '';
     // 当前待办阶段（2026-11-21）：同一阶段只收一个抽屉，切待办时才 flush。
     var currentPhaseId = 0;
+    // 本轮抽屉是否已经收口：最终正文前会先收一次，回合结束时不能重复制造空抽屉。
+    var turnClosed = false;
+    // 已经挂过产出物的回合（防止「最终正文前收口」与「循环结束再收口」重复挂同一份）。
+    var artifactsTurn = -1;
 
     /// 收掉当前大抽屉（正文 / 用户气泡之前的进程块都要落进抽屉）。
     void flushTask({bool endOfTurn = false}) {
       flushGroup();
       flushApprovals();
       if (taskBody.isEmpty && !endOfTurn) {
+        return;
+      }
+      // 本轮已经在最终正文前收口 ⇒ 回合结束不再补一个空抽屉。
+      if (taskBody.isEmpty && turnClosed) {
         return;
       }
       final children = List<Widget>.of(taskBody);
@@ -2449,14 +2467,22 @@ class _ChatPanelState extends State<ChatPanel> {
       final pending = taskPending;
       taskPending = 0;
       // 本轮产出物（§待办 3-28.13）跟着本轮的最后一个抽屉走。
-      if (endOfTurn && turnIndex >= 0) {
+      if (endOfTurn && turnIndex >= 0 && artifactsTurn != turnIndex) {
+        artifactsTurn = turnIndex;
         final artifacts = _artifactsBlock(turnIndex, results);
         if (artifacts != null) {
           children.add(artifacts);
         }
       }
       if (children.isEmpty) {
-        return;
+        // 第一条用户消息之前（turnIndex = -1）没有任务可收；其它情况才补「过程已压缩」。
+        if (!endOfTurn || turnIndex < 0) {
+          return;
+        }
+        // 历史体积上限（`stepsJson` 的 _maxStepsChars）会先丢最早的**过程**条目、
+        // 但保留用户提问。结果是 4 个提问只剩 2 个任务抽屉 —— 看上去像丢任务。
+        // 这里仍然给这一轮一个抽屉，并如实说明过程已被压缩（不是空白框）。
+        children.add(_drawerEmpty('这一轮的过程记录已压缩，没有可展开的条目'));
       }
       segment++;
       // 2026-11-21：标题优先用当前待办阶段的标题；没有阶段时才回落到用户提问概括。
@@ -2481,6 +2507,9 @@ class _ChatPanelState extends State<ChatPanel> {
           children: children,
         ),
       );
+      if (endOfTurn) {
+        turnClosed = true;
+      }
     }
 
     for (final entry in _model.entries) {
@@ -2520,6 +2549,7 @@ class _ChatPanelState extends State<ChatPanel> {
         currentPhaseId = 0;
         turnIndex++;
         segment = 0;
+        turnClosed = false;
         taskTitle = summarizeTaskTitle(entry.text);
         blocks.add(_buildEntry(entry, results: results, streaming: false));
         continue;
@@ -2543,22 +2573,33 @@ class _ChatPanelState extends State<ChatPanel> {
         continue;
       }
       if (entry.kind == ChatEntryKind.assistant) {
-        // 正文（含阶段小总结）平铺；只有全对话最后一条总结带复制 / 分叉。
-        // **不 flush 任务抽屉**：同一条待办的小输出不再各自生成一个任务框；
-        // 抽屉在阶段切换 / 回合结束时统一收口。
+        // 正文分两档（2026-11-21 用户口径修正）：
+        //   · **全对话最后一条**总结正文平铺在任务抽屉下方，带复制 / 分叉；
+        //   · 其余阶段小输出收进当前任务抽屉 —— 不再漂在任务条上方自成一块。
         final pid = _model.phaseForEntry(entry)?.id ?? 0;
         if (pid != currentPhaseId) {
           flushTask();
           currentPhaseId = pid;
         }
-        blocks.add(
-          _buildEntry(
-            entry,
-            results: results,
-            streaming: _model.busy && identical(entry, last),
-            showActions: identical(entry, lastText) && !_model.busy,
-          ),
-        );
+        if (identical(entry, lastText)) {
+          // 流式输出期间不要先收口：否则每来一段正文都会多一个抽屉。
+          // 回合结束（busy=false）后重建成「抽屉在上、最终正文在下」的稳定顺序。
+          if (!_model.busy) {
+            flushTask(endOfTurn: true);
+          }
+          blocks.add(
+            _buildEntry(
+              entry,
+              results: results,
+              streaming: _model.busy && identical(entry, last),
+              showActions: !_model.busy,
+            ),
+          );
+        } else {
+          flushGroup();
+          flushApprovals();
+          taskBody.add(_buildEntry(entry, results: results, streaming: false));
+        }
         continue;
       }
       // 其它（通知 / 错误 / 计划审批 / 文件卡）：不进抽屉，单独一块。
@@ -4368,7 +4409,12 @@ class _ChatPanelState extends State<ChatPanel> {
           ),
           if (_todoOpen)
             ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 170),
+              // 抽屉高度跟着窗口走：4 条待办在常见窗口下都能看到；极端长清单才滚动。
+              constraints: BoxConstraints(
+                maxHeight: (MediaQuery.sizeOf(context).height * 0.34)
+                    .clamp(120.0, 320.0)
+                    .toDouble(),
+              ),
               child: ListView(
                 shrinkWrap: true,
                 padding: const EdgeInsets.fromLTRB(10, 0, 10, 6),
@@ -4751,15 +4797,21 @@ class _ChatPanelState extends State<ChatPanel> {
   }
 
   Widget _drawerTab(String page, String label) {
-    final active = page == _todoPage;
+    // 2026-11-21（用户口径）：再次点当前页签 = 收起已展开的面板；点别的页签 = 切过去并展开。
+    final active = page == _todoPage && _todoOpen;
     return InkWell(
       borderRadius: BorderRadius.circular(5),
       onTap: () {
+        final closing = _todoOpen && _todoPage == page;
         setState(() {
-          _todoPage = page;
-          _todoOpen = true;
+          if (closing) {
+            _todoOpen = false;
+          } else {
+            _todoPage = page;
+            _todoOpen = true;
+          }
         });
-        if (page == 'files') {
+        if (!closing && page == 'files') {
           _computeChangeStats();
         }
       },

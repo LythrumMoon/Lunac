@@ -123,7 +123,14 @@ class _UsageDashboardState extends State<UsageDashboard> {
   }
 
   /// 独立浮层：点击浮层外关闭；面板贴着表盘向上展开，不改变对话区高度。
+  ///
+  /// 2026-11-21（用户口径）：面板尺寸跟着**窗口**走，而不是写死 600×440。
+  /// 未定价 / 候选价格再长也有换行空间；表格本身仍可横向滚动。
   Widget _buildOverlay(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    final maxWidth = (screen.width - 24).clamp(320.0, 760.0).toDouble();
+    final maxHeight = (screen.height - 24).clamp(220.0, 600.0).toDouble();
+    final minWidth = maxWidth < 380 ? maxWidth : 380.0;
     return Stack(
       children: [
         Positioned.fill(
@@ -143,7 +150,11 @@ class _UsageDashboardState extends State<UsageDashboard> {
             borderRadius: BorderRadius.circular(8),
             clipBehavior: Clip.antiAlias,
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 600, maxHeight: 440),
+              constraints: BoxConstraints(
+                minWidth: minWidth,
+                maxWidth: maxWidth,
+                maxHeight: maxHeight,
+              ),
               child: SingleChildScrollView(child: _buildPanel()),
             ),
           ),
@@ -178,34 +189,37 @@ class _UsageDashboardState extends State<UsageDashboard> {
             Tooltip(
               message:
                   '本轮累计 · 命中 ${fmtDashboardTokens(hit)} / 未命中 ${fmtDashboardTokens(miss)} / 合计 ${fmtDashboardTokens(total)}$compact',
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(3),
-                child: SizedBox(
-                  width: 66,
-                  height: 6,
-                  child: Row(
-                    children: [
-                      if (input > 0) ...[
-                        Expanded(
-                          flex: hit,
-                          child: ColoredBox(color: usageColor),
-                        ),
-                        Expanded(
-                          flex: miss,
-                          child: ColoredBox(
+              // 缓存命中率 = 图标 + 占用条 + 百分比（2026-11-21 用户口径：
+              // 只有数字时看不出占比，占用条不能省；0% 也保留灰色底槽）。
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.cached, size: 12, color: usageColor),
+                  const SizedBox(width: 4),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(3),
+                    child: SizedBox(
+                      width: 66,
+                      height: 6,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          ColoredBox(
                             color: LunacColors.textMuted.withValues(
-                              alpha: 0.45,
+                              alpha: 0.18,
                             ),
                           ),
-                        ),
-                      ] else
-                        ColoredBox(
-                          color: LunacColors.surfaceHover,
-                          child: const SizedBox.expand(),
-                        ),
-                    ],
+                          if (input > 0)
+                            FractionallySizedBox(
+                              alignment: Alignment.centerLeft,
+                              widthFactor: (hit / input).clamp(0.0, 1.0),
+                              child: ColoredBox(color: usageColor),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
             ),
             const SizedBox(width: 6),
@@ -274,72 +288,81 @@ class _UsageDashboardState extends State<UsageDashboard> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _kv('价格表', data.hasPrices ? (data.pricing?.updatedAt ?? '—') : '—'),
-            const SizedBox(width: 10),
-            if (models.isEmpty)
-              _kv('模型', '—')
-            else if (models.length == 1)
-              _kv('模型', modelLabel(models.single))
-            else
-              _kvWidget(
-                '模型',
-                _Dropdown<String?>(
-                  value: _model,
-                  items: [
-                    (value: null, label: '总计'),
-                    for (final model in models)
-                      (value: model, label: modelLabel(model)),
-                  ],
-                  onChanged: (value) => setState(() => _model = value),
+            Wrap(
+              spacing: 12,
+              runSpacing: 2,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                _kv(
+                  '价格表',
+                  data.hasPrices ? (data.pricing?.updatedAt ?? '—') : '—',
                 ),
-              ),
-            if (totals.unpriced.isNotEmpty) ...[
-              const SizedBox(width: 10),
-              Flexible(
-                child: _kv('未定价', unpricedLabels(totals.unpriced).join(', ')),
-              ),
-            ],
-            if (data.pending != null) ...[
-              const SizedBox(width: 10),
-              Flexible(
-                child: _kv(
-                  '候选价格',
-                  data.state?.pendingPath.isNotEmpty == true
-                      ? data.state!.pendingPath
-                      : '—',
-                ),
-              ),
-            ],
-            const Spacer(),
-            _Dropdown<String>(
-              value: _source ?? 'all',
-              items: const [
-                (value: 'all', label: '全部'),
-                (value: 'pet', label: '桌宠'),
-                (value: 'chat', label: '普通聊天'),
-                (value: 'cron', label: '定时任务'),
+                if (models.isEmpty)
+                  _kv('模型', '—')
+                else if (models.length == 1)
+                  _kv('模型', modelLabel(models.single))
+                else
+                  _kvWidget(
+                    '模型',
+                    _Dropdown<String?>(
+                      value: _model,
+                      items: [
+                        (value: null, label: '总计'),
+                        for (final model in models)
+                          (value: model, label: modelLabel(model)),
+                      ],
+                      onChanged: (value) => setState(() => _model = value),
+                    ),
+                  ),
+                if (totals.unpriced.isNotEmpty)
+                  _kvWrapped('未定价', unpricedLabels(totals.unpriced).join(', ')),
+                if (data.pending != null)
+                  _kvWrapped(
+                    '候选价格',
+                    data.state?.pendingPath.isNotEmpty == true
+                        ? data.state!.pendingPath
+                        : '—',
+                  ),
               ],
-              onChanged: (value) => setState(
-                () => _source = value == null || value == 'all' ? null : value,
-              ),
             ),
-            const SizedBox(width: 8),
-            _Dropdown<String>(
-              value: _range.value,
-              items: [
-                (value: 'today', label: '今天'),
-                (value: 'days:7', label: '近 7 天'),
-                (value: 'days:30', label: '近 30 天'),
-                for (final day in data.days.reversed)
-                  (value: 'date:${day.date}', label: day.date),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                _Dropdown<String>(
+                  value: _source ?? 'all',
+                  items: const [
+                    (value: 'all', label: '全部'),
+                    (value: 'pet', label: '桌宠'),
+                    (value: 'chat', label: '普通聊天'),
+                    (value: 'cron', label: '定时任务'),
+                  ],
+                  onChanged: (value) => setState(
+                    () => _source = value == null || value == 'all'
+                        ? null
+                        : value,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                _Dropdown<String>(
+                  value: _range.value,
+                  items: [
+                    (value: 'today', label: '今天'),
+                    (value: 'days:7', label: '近 7 天'),
+                    (value: 'days:30', label: '近 30 天'),
+                    for (final day in data.days.reversed)
+                      (value: 'date:${day.date}', label: day.date),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) {
+                      setState(() => _range = UsageRange.parse(value));
+                    }
+                  },
+                ),
               ],
-              onChanged: (value) {
-                if (value != null) {
-                  setState(() => _range = UsageRange.parse(value));
-                }
-              },
             ),
           ],
         ),
@@ -490,6 +513,43 @@ class _UsageDashboardState extends State<UsageDashboard> {
       style: TextStyle(color: LunacColors.textDim, fontSize: 10.5),
     ),
   );
+
+  /// 头部的长值（未定价模型 / 候选价格路径）：最多三行、超出省略，并带完整值 tooltip。
+  /// 2026-11-21：以前用 `Flexible` 塞在单行 `Row` 里，值一长就把面板顶出可视区域。
+  Widget _kvWrapped(String key, String value) {
+    final maxWidth = (MediaQuery.sizeOf(context).width - 80)
+        .clamp(200.0, 560.0)
+        .toDouble();
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            key,
+            style: TextStyle(color: LunacColors.textMuted, fontSize: 10.5),
+          ),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Tooltip(
+              message: value,
+              child: Text(
+                value,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: LunacColors.textDim,
+                  fontSize: 10.5,
+                  height: 1.35,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _kvWidget(String key, Widget value) {
     return Row(
