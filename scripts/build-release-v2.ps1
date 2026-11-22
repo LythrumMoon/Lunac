@@ -254,6 +254,13 @@ Write-Host ""
 # ── 6. makensis + package verification ─────────────────────────────
 Write-Host "[6/6] makensis..." -ForegroundColor Yellow
 
+# Keep the MUI art in sync with the theme before makensis reads it.
+$artScript = Join-Path $Root "scripts\make-installer-art.ps1"
+if (Test-Path $artScript) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $artScript
+    if ($LASTEXITCODE -ne 0) { throw "installer art generation failed (exit $LASTEXITCODE)" }
+}
+
 # Rewrite PRODUCT_VERSION (BOM-safe: the NSI is ASCII, so write UTF-8 without BOM).
 $nsiBytes = [IO.File]::ReadAllBytes($Nsi)
 $nsiBom = 0

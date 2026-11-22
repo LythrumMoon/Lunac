@@ -1,4 +1,4 @@
-; Lunac v2 (Flutter) installer -- NSIS 3.x
+﻿; Lunac v2 (Flutter) installer -- NSIS 3.x
 ; Produced by scripts\build-release-v2.ps1; staging dir = release\LunacV2\
 ;
 ; Differences from lunac-installer.nsi (v1 / Tauri):
@@ -7,7 +7,17 @@
 ;   - No bundled ext-plugins sections: v2 installs plugins from the market into
 ;     Modules\ (never wiped on upgrade -- we only add/overwrite files here).
 ;
+; Front-end (2026-11-22):
+;   - Lunac dark palette (#16181B / #1B1E22 / accent #CFC8BB) on the MUI pages.
+;   - One combined page for the install folder + "start on boot" + desktop shortcut.
+;   - The finish page has an "Open Lunac now" checkbox (checked by default).
+;
 ; ASCII only on purpose: NSIS + PS 5.1 both mis-decode BOM-less CJK.
+
+; Lunac dark palette must be defined before MUI2 loads: MUI_INTERFACE applies
+; its defaults there, and later defines do not always win for page titles.
+!define MUI_BGCOLOR "16181B"
+!define MUI_TEXTCOLOR "F2F1EE"
 
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
@@ -17,6 +27,7 @@
 !cd ${__FILEDIR__}\..\release
 
 Name "Lunac"
+BrandingText "Lunac"
 !define PRODUCT_VERSION "1.0.1"
 OutFile "Lunac-${PRODUCT_VERSION}-Setup.exe"
 InstallDir "$LOCALAPPDATA\Lunac"
@@ -24,43 +35,114 @@ InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac
 RequestExecutionLevel user
 SetCompressor lzma
 
+; ── Lunac theme ────────────────────────────────────────────────────
 !define MUI_ABORTWARNING
+!define MUI_ICON "${__FILEDIR__}\..\app-flutter\windows\runner\resources\app_icon.ico"
+!define MUI_UNICON "${__FILEDIR__}\..\app-flutter\windows\runner\resources\app_icon.ico"
+!define MUI_HEADERIMAGE
+!define MUI_HEADERIMAGE_RIGHT
+!define MUI_HEADERIMAGE_BITMAP "${__FILEDIR__}\installer-header.bmp"
+!define MUI_WELCOMEFINISHPAGE_BITMAP "${__FILEDIR__}\installer-welcome.bmp"
+
+!define MUI_WELCOMEPAGE_TITLE "Welcome to Lunac"
+!define MUI_WELCOMEPAGE_TEXT "Lunac is a local-first desktop AI assistant: search, chat, plugins and a desktop pet, all running on your machine.$\r$\n$\r$\nThis wizard installs Lunac for the current user. No administrator rights are required."
+
+!define MUI_FINISHPAGE_TITLE "Lunac is ready"
+!define MUI_FINISHPAGE_TEXT "Lunac has been installed. You can open it now, or start it later from the Start menu or the tray."
+!define MUI_FINISHPAGE_RUN "$INSTDIR\lunac.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "Open Lunac now"
+!define MUI_FINISHPAGE_RUN_CHECKED
+!define MUI_CUSTOMFUNCTION_GUIINIT LunacGuiInit
 
 Var AutoStart
 Var CreateDesktopShortcut
+Var InstallDirField
 
+; ── Pages ─────────────────────────────────────────────────────────
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_DIRECTORY
-Page custom FinishOptions FinishOptionsLeave
+Page custom InstallOptionsPage InstallOptionsLeave
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_LANGUAGE "English"
 
-Function FinishOptions
+; Paint the outer dialog (the strip behind the title and the button bar) so the
+; native white chrome does not clash with the dark page body.
+Function LunacGuiInit
+  SetCtlColors $HWNDPARENT "F2F1EE" "16181B"
+  ; Branding strip in the bottom-left (control ids used by MUI2).
+  GetDlgItem $0 $HWNDPARENT 1028
+  SetCtlColors $0 "" "16181B"
+  GetDlgItem $0 $HWNDPARENT 1256
+  SetCtlColors $0 "8B8E92" "16181B"
+FunctionEnd
+
+; ── Install folder + startup options (one page) ───────────────────
+Function InstallOptionsPage
   nsDialogs::Create 1018
   Pop $0
   ${If} $0 == error
     Abort
   ${EndIf}
+  ; The MUI colours cover standard pages; custom pages need the dialog
+  ; handle painted explicitly.
+  SetCtlColors $0 "F2F1EE" "16181B"
+  SetCtlColors $HWNDPARENT "F2F1EE" "16181B"
 
-  ${NSD_CreateLabel} 0 0 100% 14u "Startup & shortcuts:"
+  ${NSD_CreateLabel} 0 0 100% 14u "Install Lunac"
   Pop $0
-  CreateFont $1 "$(^Font)" "$(^FontSize)" "700"
+  CreateFont $1 "$(^Font)" "12" "700"
   SendMessage $0 ${WM_SETFONT} $1 1
+  SetCtlColors $0 "CFC8BB" "16181B"
 
-  ${NSD_CreateCheckbox} 10u 24u 100% 12u "Start on boot (auto-start Lunac at login)"
+  ${NSD_CreateLabel} 0 16u 100% 12u "Choose where Lunac lives and how it starts."
+  Pop $0
+  SetCtlColors $0 "8B8E92" "16181B"
+
+  ${NSD_CreateLabel} 0 38u 100% 10u "Install folder"
+  Pop $0
+  SetCtlColors $0 "C2C3C4" "16181B"
+
+  ${NSD_CreateDirRequest} 0 50u 78% 13u "$INSTDIR"
+  Pop $InstallDirField
+  SetCtlColors $InstallDirField "F2F1EE" "1B1E22"
+
+  ${NSD_CreateBrowseButton} 80% 50u 20% 13u "Browse..."
+  Pop $0
+  ${NSD_OnClick} $0 OnBrowseInstallDir
+
+  ${NSD_CreateLabel} 0 67u 100% 10u "Installs for this Windows user; no administrator rights needed."
+  Pop $0
+  SetCtlColors $0 "8B8E92" "16181B"
+
+  ${NSD_CreateCheckbox} 0 88u 100% 12u "Start Lunac on boot (runs in the tray at login)"
   Pop $AutoStart
+  SetCtlColors $AutoStart "F2F1EE" "16181B"
 
-  ${NSD_CreateCheckbox} 10u 42u 100% 12u "Create desktop shortcut"
+  ${NSD_CreateCheckbox} 0 106u 100% 12u "Create a desktop shortcut"
   Pop $CreateDesktopShortcut
-
+  SetCtlColors $CreateDesktopShortcut "F2F1EE" "16181B"
   ${NSD_Check} $CreateDesktopShortcut
 
   nsDialogs::Show
 FunctionEnd
 
-Function FinishOptionsLeave
+Function OnBrowseInstallDir
+  Pop $0 ; control handle
+  nsDialogs::SelectFolderDialog "Select the Lunac install folder" "$INSTDIR"
+  Pop $0
+  ${If} $0 != error
+    ${NSD_SetText} $InstallDirField "$0"
+  ${EndIf}
+FunctionEnd
+
+Function InstallOptionsLeave
+  ${NSD_GetText} $InstallDirField $0
+  ${If} $0 == ""
+    MessageBox MB_ICONEXCLAMATION|MB_OK "Choose an install folder first."
+    Abort
+  ${EndIf}
+  StrCpy $INSTDIR $0
   ${NSD_GetState} $AutoStart $0
   ${NSD_GetState} $CreateDesktopShortcut $1
 FunctionEnd

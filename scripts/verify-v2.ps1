@@ -50,6 +50,32 @@ function Invoke-Step([string]$Name, [string]$WorkDir, [string[]]$Command) {
     }
 }
 
+function Assert-InstallerLayout {
+    $nsi = Join-Path $Root "scripts\lunac-v2-installer.nsi"
+    if (-not (Test-Path $nsi)) { throw "installer script not found: $nsi" }
+    $text = [IO.File]::ReadAllText($nsi)
+    $checks = @(
+        @{ Pattern = 'Page custom InstallOptionsPage'; Why = "combined install folder + options page" },
+        @{ Pattern = 'NSD_CreateDirRequest'; Why = "install folder field" },
+        @{ Pattern = 'NSD_CreateCheckbox[^\r\n]*Start Lunac on boot'; Why = "auto-start checkbox on the same page" },
+        @{ Pattern = 'MUI_FINISHPAGE_RUN\s+'; Why = "finish-page run option" },
+        @{ Pattern = 'MUI_FINISHPAGE_RUN_CHECKED'; Why = "run option checked by default" }
+    )
+    foreach ($check in $checks) {
+        if ($text -notmatch $check.Pattern) {
+            throw "installer layout missing: $($check.Why)"
+        }
+    }
+    if ($text -match 'MUI_PAGE_DIRECTORY') {
+        throw "MUI_PAGE_DIRECTORY must not be used: folder and auto-start are one page"
+    }
+    foreach ($art in @("installer-welcome.bmp", "installer-header.bmp")) {
+        $path = Join-Path $Root "scripts\$art"
+        if (-not (Test-Path $path)) { throw "installer art missing: $path (run scripts\make-installer-art.ps1)" }
+    }
+    Write-Host "  installer layout OK (combined options page + finish run option + themed art)" -ForegroundColor Green
+}
+
 $flutter = Require-Command "flutter"
 $cargo = Require-Command "cargo"
 
@@ -57,6 +83,8 @@ Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Lunac v2 verification" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+
+Assert-InstallerLayout
 
 Invoke-Step "flutter analyze" $AppFlutter @($flutter, "analyze")
 if (-not $SkipTests) {

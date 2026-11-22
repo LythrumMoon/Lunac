@@ -218,6 +218,10 @@
     新增默认工具 `TaskPhase`（`start` 开条 / `done` 小总结），前端按显式锚点分节；
     旧会话回退 TodoWrite 阶段，再回退「一轮一条」。任务条标题在开节时冻结，
     TodoWrite 改名不再改上一次任务；产出物从任务条移到最终大总结之后。
+11. **安装包前端**：安装目录、开机自启、桌面快捷方式合并到**同一页**；完成页有
+    「Open Lunac now」（默认勾选）；欢迎 / 完成页用 Lunac 深色主题（#16181B /
+    accent #CFC8BB）与侧栏、页眉位图。`scripts\make-installer-art.ps1` 生成 24-bit BMP，
+    `verify-v2.ps1` 增加了页面结构 / 主题图的静态守卫。
 
 ### 记忆注入 A/B（真实会话操作步骤）
 
