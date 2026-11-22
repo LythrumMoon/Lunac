@@ -51,6 +51,7 @@ core/
 paddle-ocr/
 # 本地 gcc 工具链
 mingw64/
+tools/
 # 本地模型
 local-models/
 

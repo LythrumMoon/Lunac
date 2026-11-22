@@ -53,7 +53,8 @@ cd ..\.. ; npm run verify
 ## §测试 2 打包链（仅在用户明确说「打包」时执行）
 
 ```powershell
-# v2（Flutter）安装包：编 core-agent release + flutter release + 暂存 + NSIS
+# v2（Flutter）安装包：编 core-agent release + flutter release + 暂存 + Inno Setup
+#   （没装 Inno Setup 6.7+ 时自动退回 NSIS 脚本）
 powershell -ExecutionPolicy Bypass -File scripts\build-release-v2.ps1
 #   -Version 1.0.1 显式指定版本（并写回 app-flutter\pubspec.yaml）；-NoBuild 只重暂存 + 打包
 # 产物：release\Lunac-<version>-Setup.exe（暂存目录 release\LunacV2\）
@@ -80,10 +81,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1 -Publish
   再 `flutter build windows --release`；CMake 的 `lunac_core` 按 `$<CONFIG>` 走
   `rust\build.ps1 -Profile Release`，DLL 取 `rust\target\release\lunac_core.dll`。
   暂存只收 Flutter 运行必需文件（exe / DLL / `data\` / `Modules\pet\engine` / `skills` / `tools`），
-  明确剔除 `config\`、`ModuleData\`、`temp\`、`*.pdb` 等 dev 残留；makensis 之后用 7z 复核
+  明确剔除 `config\`、`ModuleData\`、`temp\`、`*.pdb` 等 dev 残留；Inno Setup 编译成功即视为打包成功
+  （Inno 输出是单文件 LZMA2，7z 无法再列目录）；退回 NSIS 时仍用 7z 复核
   **必含 `agent.exe` / `lunac.exe` / `lunac_core.dll` / `flutter_windows.dll` / `icudtl.dat`、不得含 `cli.exe`**。
-- **安装包布局变了就别复用旧 NSI**：v2 用 `scripts\lunac-v2-installer.nsi`（`File /r "LunacV2\*"`）；
-  v1 的 `lunac-installer.nsi` 只认 `release\Lunac\` 且不含 Flutter 的 `data\`。
+- **安装包前端优先用 Inno Setup 6.7+**：`scripts\lunac-v2-installer.iss` 用内置
+  `WizardStyle=modern dark includetitlebar`（页面 / 按钮 / 标题栏全暗色），目录页上直接挂
+  「开机自启 / 桌面快捷方式」两个复选框，完成页用 `postinstall` 给「Open Lunac now」。
+  找不到 `ISCC.exe` 时退回 `scripts\lunac-v2-installer.nsi`（MUI 深色版，按钮为原生控件）。
+  构建机安装 Inno Setup 后，`build-release-v2.ps1` 会自动优先使用它（也认
+  `tools\InnoSetup6\ISCC.exe` 与 `%LOCALAPPDATA%\Programs\Inno Setup 6\`）。
 
 - **插件改源码 ≠ 生效**：运行读的是盘上 `Modules\<id>\index.js`。发布顺序固定：改源码 → `build-plugins.ps1`（先铺 dev 的 `target\debug\Modules\<id>\`、再铺 `release\ext-plugins\`）→ dev 验证 → `build-release.ps1` → `publish-plugins.ps1`。**先 publish 后 build = 把上一版推上去**。
 - **资源库（`resource-hub`）是外部工程插件（2026-11-01 起纳入正式插件包）**：它不在 `app/vite.plugins.config.ts` 的入口表里，产物由 `resource-hub` 自己的 `npm run build` 生成。**仍然只跑 `build-plugins.ps1`** —— 脚本会先构建它、再把 `apps\lunac-plugin\dist\` 拷进 `app\plugin-dist\resource-hub\`，之后走与其余插件完全相同的 zip / `ext-plugins` / dev `Modules` 三条路。它的**版本号唯一真相源**是 `resource-hub\apps\lunac-plugin\public\lunac-plugin.json`（发版前 +1 这一份，别在 `build-plugins.ps1` 里再抄一份）。

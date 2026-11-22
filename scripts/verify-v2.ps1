@@ -51,29 +51,43 @@ function Invoke-Step([string]$Name, [string]$WorkDir, [string[]]$Command) {
 }
 
 function Assert-InstallerLayout {
+    $iss = Join-Path $Root "scripts\lunac-v2-installer.iss"
     $nsi = Join-Path $Root "scripts\lunac-v2-installer.nsi"
-    if (-not (Test-Path $nsi)) { throw "installer script not found: $nsi" }
-    $text = [IO.File]::ReadAllText($nsi)
-    $checks = @(
-        @{ Pattern = 'Page custom InstallOptionsPage'; Why = "combined install folder + options page" },
-        @{ Pattern = 'NSD_CreateDirRequest'; Why = "install folder field" },
-        @{ Pattern = 'NSD_CreateCheckbox[^\r\n]*Start Lunac on boot'; Why = "auto-start checkbox on the same page" },
-        @{ Pattern = 'MUI_FINISHPAGE_RUN\s+'; Why = "finish-page run option" },
-        @{ Pattern = 'MUI_FINISHPAGE_RUN_CHECKED'; Why = "run option checked by default" }
+    if (-not (Test-Path $iss)) { throw "Inno Setup script not found: $iss" }
+    if (-not (Test-Path $nsi)) { throw "NSIS fallback script not found: $nsi" }
+
+    $issText = [IO.File]::ReadAllText($iss)
+    $issChecks = @(
+        @{ Pattern = 'WizardStyle=modern dark'; Why = "Inno dark wizard (themed buttons)" },
+        @{ Pattern = 'AutoStartCheckBox'; Why = "auto-start checkbox on the directory page" },
+        @{ Pattern = 'DesktopIconCheckBox'; Why = "desktop shortcut checkbox on the directory page" },
+        @{ Pattern = 'WizardForm\.DirEdit\.Parent'; Why = "checkboxes parented to the directory page" },
+        @{ Pattern = 'postinstall'; Why = "finish-page run option" },
+        @{ Pattern = 'WizardImageFile=installer-welcome\.bmp'; Why = "themed welcome art" },
+        @{ Pattern = 'WizardSmallImageFile=installer-small\.bmp'; Why = "themed small art" }
     )
-    foreach ($check in $checks) {
-        if ($text -notmatch $check.Pattern) {
+    foreach ($check in $issChecks) {
+        if ($issText -notmatch $check.Pattern) {
             throw "installer layout missing: $($check.Why)"
         }
     }
-    if ($text -match 'MUI_PAGE_DIRECTORY') {
+
+    $nsiText = [IO.File]::ReadAllText($nsi)
+    if ($nsiText -notmatch 'Page custom InstallOptionsPage') {
+        throw "NSIS fallback is missing the combined options page"
+    }
+    if ($nsiText -match 'MUI_PAGE_DIRECTORY') {
         throw "MUI_PAGE_DIRECTORY must not be used: folder and auto-start are one page"
     }
-    foreach ($art in @("installer-welcome.bmp", "installer-header.bmp")) {
+    if ($nsiText -notmatch 'MUI_FINISHPAGE_RUN') {
+        throw "NSIS fallback is missing the finish-page run option"
+    }
+
+    foreach ($art in @("installer-welcome.bmp", "installer-header.bmp", "installer-small.bmp")) {
         $path = Join-Path $Root "scripts\$art"
         if (-not (Test-Path $path)) { throw "installer art missing: $path (run scripts\make-installer-art.ps1)" }
     }
-    Write-Host "  installer layout OK (combined options page + finish run option + themed art)" -ForegroundColor Green
+    Write-Host "  installer layout OK (Inno dark wizard + combined options page + finish run option)" -ForegroundColor Green
 }
 
 $flutter = Require-Command "flutter"

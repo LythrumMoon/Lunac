@@ -33,6 +33,7 @@ $RunnerRelease = Join-Path $AppFlutter "build\windows\x64\runner\Release"
 $ReleaseDir = Join-Path $Root "release"
 $Stage = Join-Path $ReleaseDir "LunacV2"
 $Nsi = Join-Path $Root "scripts\lunac-v2-installer.nsi"
+$Iss = Join-Path $Root "scripts\lunac-v2-installer.iss"
 
 # rustc needs the repo-local mingw toolchain on PATH (same as rust\build.ps1).
 $mingwBin = Join-Path $Root "mingw64\bin"
@@ -109,8 +110,10 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 # Full paths: cmd /c with a quoted bare "flutter" does not append .bat / .exe.
 $FlutterExe = (Get-Command flutter).Source
 $CargoExe = (Get-Command cargo).Source
-if (-not $Makensis) { throw "makensis not found (install NSIS or add it to PATH)." }
+# The installer compiler is chosen in step 6: Inno Setup 6.7+ is preferred,
+# makensis is the fallback. Do not require makensis here.
 if (-not (Test-Path $Nsi)) { throw "NSI script not found: $Nsi" }
+if (-not (Test-Path $Iss)) { throw "Inno Setup script not found: $Iss" }
 if (-not (Test-Path (Join-Path $CoreAgent "Cargo.toml"))) { throw "core-agent not found: $CoreAgent" }
 if (-not (Test-Path (Join-Path $AppFlutter "pubspec.yaml"))) { throw "app-flutter\pubspec.yaml not found" }
 
@@ -251,28 +254,18 @@ foreach ($rel in $required) {
 Write-Host "  OK: lunac.exe + agent.exe + lunac_core.dll + data\" -ForegroundColor Green
 Write-Host ""
 
-# ── 6. makensis + package verification ─────────────────────────────
-Write-Host "[6/6] makensis..." -ForegroundColor Yellow
+# ── 6. Inno Setup (preferred) / makensis fallback ──────────────────
+# Inno Setup 6.7+ has a built-in dark wizard (page, buttons and title bar), which
+# is what the Lunac theme needs. When it is not installed, fall back to NSIS so
+# the build still works on a clean machine.
+Write-Host "[6/6] Packaging installer..." -ForegroundColor Yellow
 
-# Keep the MUI art in sync with the theme before makensis reads it.
+# Keep the wizard art in sync with the theme before either compiler reads it.
 $artScript = Join-Path $Root "scripts\make-installer-art.ps1"
 if (Test-Path $artScript) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $artScript
     if ($LASTEXITCODE -ne 0) { throw "installer art generation failed (exit $LASTEXITCODE)" }
 }
-
-# Rewrite PRODUCT_VERSION (BOM-safe: the NSI is ASCII, so write UTF-8 without BOM).
-$nsiBytes = [IO.File]::ReadAllBytes($Nsi)
-$nsiBom = 0
-while ($nsiBom * 3 + 2 -lt $nsiBytes.Length -and
-       $nsiBytes[$nsiBom * 3] -eq 0xEF -and $nsiBytes[$nsiBom * 3 + 1] -eq 0xBB -and $nsiBytes[$nsiBom * 3 + 2] -eq 0xBF) { $nsiBom++ }
-$nsiText = [Text.Encoding]::UTF8.GetString($nsiBytes, $nsiBom * 3, $nsiBytes.Length - $nsiBom * 3)
-$newDefine = '!define PRODUCT_VERSION "' + $Version + '"'
-$nsiText = [regex]::Replace($nsiText, '!define PRODUCT_VERSION "[^"]*"', $newDefine)
-if ($nsiText -notmatch [regex]::Escape($newDefine)) {
-    throw "Failed to update PRODUCT_VERSION in $Nsi"
-}
-[IO.File]::WriteAllText($Nsi, $nsiText, (New-Object System.Text.UTF8Encoding($false)))
 
 $SetupPath = Join-Path $ReleaseDir "Lunac-$Version-Setup.exe"
 if (Test-Path $SetupPath) {
@@ -283,30 +276,72 @@ if (Test-Path $SetupPath) {
     }
 }
 
-Push-Location $ReleaseDir
-try {
-    $output = & $Makensis $Nsi 2>&1
-    Write-Host $output -ForegroundColor DarkGray
-    if ($LASTEXITCODE -ne 0) { throw "makensis failed (exit $LASTEXITCODE)" }
-} finally { Pop-Location }
+$isccPaths = @(
+    (Join-Path $Root "tools\InnoSetup6\ISCC.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+)
+if ($env:ProgramFiles) { $isccPaths += (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe") }
+if (${env:ProgramFiles(x86)}) { $isccPaths += (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe") }
+$Iscc = Find-Tool $isccPaths "iscc"
 
-if (-not (Test-Path $SetupPath)) {
-    throw "Setup.exe not produced: $SetupPath"
-}
+if ($Iscc -and (Test-Path $Iss)) {
+    Write-Host "  Inno Setup: $Iscc" -ForegroundColor DarkGray
+    Push-Location $Root
+    try {
+        $output = & $Iscc "/DMyAppVersion=$Version" $Iss 2>&1
+        Write-Host $output -ForegroundColor DarkGray
+        if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
 
-if ($SevenZip) {
-    $packed = ((& $SevenZip l $SetupPath 2>&1) -join "`n") -replace '\s+', ''
-    if ($packed -match 'cli\.exe') {
-        throw "Installer contains cli.exe (upstream CLI, must not be redistributed)"
+    if (-not (Test-Path $SetupPath)) {
+        throw "Setup.exe not produced: $SetupPath"
     }
-    foreach ($needle in @('agent\.exe', 'lunac\.exe', 'lunac_core\.dll', 'flutter_windows\.dll', 'icudtl\.dat')) {
-        if ($packed -notmatch $needle) {
-            throw "Installer is missing $($needle -replace '\\', '') -- package check failed"
-        }
+    if ((Get-Item $SetupPath).Length -lt 10MB) {
+        throw "Installer is suspiciously small: $SetupPath"
     }
-    Write-Host "  Package OK: contains agent.exe; no cli.exe" -ForegroundColor Green
+    Write-Host "  Package OK (Inno Setup dark wizard): Lunac-$Version-Setup.exe" -ForegroundColor Green
 } else {
-    Write-Host "  [SKIP] 7z.exe not found; package content check skipped" -ForegroundColor Yellow
+    Write-Host "  [fallback] Inno Setup 6.7+ not found; using makensis" -ForegroundColor Yellow
+    if (-not $Makensis) { throw "Neither ISCC.exe nor makensis was found" }
+
+    # Rewrite PRODUCT_VERSION (BOM-safe: the NSI is ASCII, so write UTF-8 without BOM).
+    $nsiBytes = [IO.File]::ReadAllBytes($Nsi)
+    $nsiBom = 0
+    while ($nsiBom * 3 + 2 -lt $nsiBytes.Length -and
+           $nsiBytes[$nsiBom * 3] -eq 0xEF -and $nsiBytes[$nsiBom * 3 + 1] -eq 0xBB -and $nsiBytes[$nsiBom * 3 + 2] -eq 0xBF) { $nsiBom++ }
+    $nsiText = [Text.Encoding]::UTF8.GetString($nsiBytes, $nsiBom * 3, $nsiBytes.Length - $nsiBom * 3)
+    $newDefine = '!define PRODUCT_VERSION "' + $Version + '"'
+    $nsiText = [regex]::Replace($nsiText, '!define PRODUCT_VERSION "[^"]*"', $newDefine)
+    if ($nsiText -notmatch [regex]::Escape($newDefine)) {
+        throw "Failed to update PRODUCT_VERSION in $Nsi"
+    }
+    [IO.File]::WriteAllText($Nsi, $nsiText, (New-Object System.Text.UTF8Encoding($false)))
+
+    Push-Location $ReleaseDir
+    try {
+        $output = & $Makensis $Nsi 2>&1
+        Write-Host $output -ForegroundColor DarkGray
+        if ($LASTEXITCODE -ne 0) { throw "makensis failed (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
+
+    if (-not (Test-Path $SetupPath)) {
+        throw "Setup.exe not produced: $SetupPath"
+    }
+
+    if ($SevenZip) {
+        $packed = ((& $SevenZip l $SetupPath 2>&1) -join "`n") -replace '\s+', ''
+        if ($packed -match 'cli\.exe') {
+            throw "Installer contains cli.exe (upstream CLI, must not be redistributed)"
+        }
+        foreach ($needle in @('agent\.exe', 'lunac\.exe', 'lunac_core\.dll', 'flutter_windows\.dll', 'icudtl\.dat')) {
+            if ($packed -notmatch $needle) {
+                throw "Installer is missing $($needle -replace '\\', '') -- package check failed"
+            }
+        }
+        Write-Host "  Package OK (NSIS): contains agent.exe; no cli.exe" -ForegroundColor Green
+    } else {
+        Write-Host "  [SKIP] 7z.exe not found; package content check skipped" -ForegroundColor Yellow
+    }
 }
 
 $setupMb = [math]::Round((Get-Item $SetupPath).Length / 1MB, 1)

@@ -109,3 +109,16 @@ New-LunacBitmap -Width 150 -Height 57 -Path (Join-Path $outDir "installer-header
     $accentBrush.Dispose()
     $mutedBrush.Dispose()
 }
+
+New-LunacBitmap -Width 55 -Height 55 -Path (Join-Path $outDir "installer-small.bmp") -Draw {
+    param($g, $w, $h)
+    $accentBrush = New-Brush $accent
+    $mutedBrush = New-Brush $muted
+
+    $g.FillRectangle($accentBrush, 12, 12, 2, 31)
+    $titleFont = New-Font 15 ([System.Drawing.FontStyle]::Bold)
+    $g.DrawString("L", $titleFont, $accentBrush, 20, 12)
+    $titleFont.Dispose()
+    $accentBrush.Dispose()
+    $mutedBrush.Dispose()
+}
