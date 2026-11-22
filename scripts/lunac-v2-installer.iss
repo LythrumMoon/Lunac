@@ -104,7 +104,8 @@ var
   OldDir: String;
 begin
   // Migrate the directory chosen by the old NSIS installer, if present.
-  if ({#MyMigrateOldDir} = 1) and
+  // Skip when the wrapper already passed an explicit /DIR (old updater /D=).
+  if (Pos('/DIR', Uppercase(GetCmdTail)) = 0) and ({#MyMigrateOldDir} = 1) and
      RegQueryStringValue(HKCU,
        'Software\Microsoft\Windows\CurrentVersion\Uninstall\Lunac',
        'InstallLocation', OldDir) and (OldDir <> '') then

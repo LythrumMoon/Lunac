@@ -58,7 +58,14 @@ ISCC.exe /DMyAppVersion=1.0.1 scripts\lunac-v2-installer.iss
 4. `PATH` 里的 `iscc`
 
 找不到时打印 `[fallback]`，改用 `scripts\lunac-v2-installer.nsi`（`makensis`）。
-构建机装一次 [Inno Setup 6.7+](https://jrsoftware.org/isdl.php) 即可。
+构建机装一次 [Inno Setup 6.7+](https://jrsoftware.org/isdl.php) 即可；也可以直接跑：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-innosetup.ps1
+```
+
+它用 `gh release download` 把官方安装包装进 `tools\InnoSetup6`（该目录在
+`.gitignore` 里，不进仓库），之后 `build-release-v2.ps1` 会自动找到它。
 
 ## 主题资源
 
@@ -72,6 +79,31 @@ ISCC.exe /DMyAppVersion=1.0.1 scripts\lunac-v2-installer.iss
 
 颜色取 Lunac 默认主题：背景 `#16181B`、卡片 `#1B1E22`、主色 `#CFC8BB`、
 次要文字 `#8B8E92`。
+
+## 自动更新兼容（`/S` 包装层）
+
+旧版本（1.0.1 NSIS）的更新器执行：
+
+```text
+Setup.exe /S /D=<当前安装目录>
+```
+
+Inno Setup 只认 `/SILENT` 与 `/DIR=`。因此最终发布文件不是 Inno 的原始输出，
+而是一个**不可见的 NSIS 包装层**：
+
+```text
+Lunac-<ver>-Setup.exe（NSIS，SilentInstall silent）
+  └─ 释放并运行内嵌的 Inno 安装包
+       /S   → /SILENT
+       /D=x → /DIR="x"
+       退出码原样传回
+```
+
+- 手动双击：包装层不可见，直接出现 Inno 暗色向导。
+- 旧更新器 `/S /D=`：包装层静默，内嵌 Inno 用 `/SILENT /DIR=` 安装，退出码一致。
+- 包装层脚本：`scripts\lunac-setup-wrapper.nsi`。
+- 因此构建机需要 **Inno Setup 6.7+ 与 NSIS 两者**；只有 ISCC 时会明确报错，
+  只有 NSIS 时走原来的 MUI 回退。
 
 ## 从旧 NSIS 安装迁移
 

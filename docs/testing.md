@@ -87,6 +87,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build-plugins.ps1 -Publish
 - **安装包前端优先用 Inno Setup 6.7+**：`scripts\lunac-v2-installer.iss` 用内置
   `WizardStyle=modern dark includetitlebar`（页面 / 按钮 / 标题栏全暗色），目录页上直接挂
   「开机自启 / 桌面快捷方式」两个复选框，完成页用 `postinstall` 给「Open Lunac now」。
+  最终 `Setup.exe` 外套 `scripts\lunac-setup-wrapper.nsi`（不可见，负责把旧更新器的
+  `/S /D=` 翻译成 Inno 的 `/SILENT /DIR=`，并传回退出码）。构建机需要 Inno 6.7+ 与 NSIS；
   找不到 `ISCC.exe` 时退回 `scripts\lunac-v2-installer.nsi`（MUI 深色版，按钮为原生控件）。
   构建机安装 Inno Setup 后，`build-release-v2.ps1` 会自动优先使用它（也认
   `tools\InnoSetup6\ISCC.exe` 与 `%LOCALAPPDATA%\Programs\Inno Setup 6\`）。

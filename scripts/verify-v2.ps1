@@ -83,6 +83,15 @@ function Assert-InstallerLayout {
         throw "NSIS fallback is missing the finish-page run option"
     }
 
+    $wrapper = Join-Path $Root "scripts\lunac-setup-wrapper.nsi"
+    if (-not (Test-Path $wrapper)) { throw "setup wrapper not found: $wrapper" }
+    $wrapperText = [IO.File]::ReadAllText($wrapper)
+    foreach ($needle in @('INNER_SETUP', '"/S"', '/SILENT', '/DIR=', 'SetErrorLevel')) {
+        if ($wrapperText -notmatch [regex]::Escape($needle)) {
+            throw "setup wrapper is missing $needle (old /S auto-update compatibility)"
+        }
+    }
+
     foreach ($art in @("installer-welcome.bmp", "installer-header.bmp", "installer-small.bmp")) {
         $path = Join-Path $Root "scripts\$art"
         if (-not (Test-Path $path)) { throw "installer art missing: $path (run scripts\make-installer-art.ps1)" }

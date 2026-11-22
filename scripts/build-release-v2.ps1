@@ -34,6 +34,7 @@ $ReleaseDir = Join-Path $Root "release"
 $Stage = Join-Path $ReleaseDir "LunacV2"
 $Nsi = Join-Path $Root "scripts\lunac-v2-installer.nsi"
 $Iss = Join-Path $Root "scripts\lunac-v2-installer.iss"
+$WrapperNsi = Join-Path $Root "scripts\lunac-setup-wrapper.nsi"
 
 # rustc needs the repo-local mingw toolchain on PATH (same as rust\build.ps1).
 $mingwBin = Join-Path $Root "mingw64\bin"
@@ -114,6 +115,7 @@ $CargoExe = (Get-Command cargo).Source
 # makensis is the fallback. Do not require makensis here.
 if (-not (Test-Path $Nsi)) { throw "NSI script not found: $Nsi" }
 if (-not (Test-Path $Iss)) { throw "Inno Setup script not found: $Iss" }
+if (-not (Test-Path $WrapperNsi)) { throw "Setup wrapper script not found: $WrapperNsi" }
 if (-not (Test-Path (Join-Path $CoreAgent "Cargo.toml"))) { throw "core-agent not found: $CoreAgent" }
 if (-not (Test-Path (Join-Path $AppFlutter "pubspec.yaml"))) { throw "app-flutter\pubspec.yaml not found" }
 
@@ -286,12 +288,32 @@ $Iscc = Find-Tool $isccPaths "iscc"
 
 if ($Iscc -and (Test-Path $Iss)) {
     Write-Host "  Inno Setup: $Iscc" -ForegroundColor DarkGray
+    $InnerSetup = Join-Path $ReleaseDir "Lunac-$Version-Setup-inner.exe"
+    if (Test-Path $InnerSetup) { Remove-Item $InnerSetup -Force }
     Push-Location $Root
     try {
-        $output = & $Iscc "/DMyAppVersion=$Version" $Iss 2>&1
+        $output = & $Iscc "/DMyAppVersion=$Version" "/DMyOutputBaseFilename=Lunac-$Version-Setup-inner" $Iss 2>&1
         Write-Host $output -ForegroundColor DarkGray
         if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
     } finally { Pop-Location }
+
+    if (-not (Test-Path $InnerSetup)) {
+        throw "Inno Setup did not produce: $InnerSetup"
+    }
+
+    # Old Lunac builds auto-update with `/S /D=<dir>` (NSIS flags). The wrapper is
+    # invisible, embeds the Inno installer and translates those flags to
+    # `/SILENT /DIR=...`; interactive installs get the Inno dark wizard directly.
+    if (-not $Makensis) {
+        throw "makensis is required for the /S compatibility wrapper. Install NSIS (or use the NSIS-only fallback)."
+    }
+    Push-Location $ReleaseDir
+    try {
+        $output = & $Makensis "/DINNER_SETUP=$InnerSetup" "/DOUTER_SETUP=$SetupPath" "/DPRODUCT_VERSION=$Version" $WrapperNsi 2>&1
+        Write-Host $output -ForegroundColor DarkGray
+        if ($LASTEXITCODE -ne 0) { throw "setup wrapper failed (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
+    Remove-Item $InnerSetup -Force -ErrorAction SilentlyContinue
 
     if (-not (Test-Path $SetupPath)) {
         throw "Setup.exe not produced: $SetupPath"
@@ -299,7 +321,7 @@ if ($Iscc -and (Test-Path $Iss)) {
     if ((Get-Item $SetupPath).Length -lt 10MB) {
         throw "Installer is suspiciously small: $SetupPath"
     }
-    Write-Host "  Package OK (Inno Setup dark wizard): Lunac-$Version-Setup.exe" -ForegroundColor Green
+    Write-Host "  Package OK (Inno dark wizard + /S compatibility wrapper): Lunac-$Version-Setup.exe" -ForegroundColor Green
 } else {
     Write-Host "  [fallback] Inno Setup 6.7+ not found; using makensis" -ForegroundColor Yellow
     if (-not $Makensis) { throw "Neither ISCC.exe nor makensis was found" }

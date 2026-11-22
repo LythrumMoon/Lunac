@@ -220,9 +220,10 @@
     TodoWrite 改名不再改上一次任务；产出物从任务条移到最终大总结之后。
 11. **安装包前端**：主用 **Inno Setup 6.7+ 的暗色向导**（`WizardStyle=modern dark`，页面 /
     按钮 / 标题栏全主题化）；安装目录、开机自启、桌面快捷方式合并到**同一页**；完成页有
-    「Open Lunac now」（默认勾选）。没装 ISCC 时自动退回 NSIS MUI 深色版。
+    「Open Lunac now」（默认勾选）。最终 exe 外套一个不可见的 NSIS `/S` 兼容层，
+    旧更新器的 `/S /D=` 仍能静默升级；没装 ISCC 时自动退回 NSIS MUI 深色版。
     `scripts\make-installer-art.ps1` 生成 24-bit BMP（欢迎页 / 页眉 / 小图），
-    `verify-v2.ps1` 增加了 Inno/NSIS 页面结构与主题图的静态守卫。
+    `verify-v2.ps1` 增加了 Inno/NSIS/包装层的静态守卫。
 
 ### 记忆注入 A/B（真实会话操作步骤）
 
