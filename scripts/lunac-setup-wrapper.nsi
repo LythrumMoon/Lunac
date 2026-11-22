@@ -24,13 +24,21 @@ ${Using:StrFunc} StrStr
   !define PRODUCT_VERSION "1.0.1"
 !endif
 
-Name "Lunac"
+Name "Lunac Setup"
 OutFile "${OUTER_SETUP}"
 InstallDir "$LOCALAPPDATA\Lunac"
 RequestExecutionLevel user
 SetCompressor lzma
 SilentInstall silent
 ShowInstDetails nevershow
+Icon "${__FILEDIR__}\..\app-flutter\windows\runner\resources\app_icon.ico"
+
+VIProductVersion "${PRODUCT_VERSION}.0"
+VIAddVersionKey /LANG=1033 "ProductName" "Lunac"
+VIAddVersionKey /LANG=1033 "FileDescription" "Lunac Setup"
+VIAddVersionKey /LANG=1033 "FileVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=1033 "ProductVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "Lunac"
 
 Var InnoArgs
 Var InnerExe
